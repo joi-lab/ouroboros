@@ -398,6 +398,62 @@ test('a resize that waited on the owed scrolls keeps where they end; at rest it 
     assert.equal(feed.scrollTop, 450, 'at rest a resize keeps the place read before it');
 });
 
+test('rows are lazy only while the width keeps moving; once it holds, every row is laid out and the place re-applied', t => {
+    const previous = globalThis.requestAnimationFrame, frames = [];
+    globalThis.requestAnimationFrame = callback => frames.push(callback);
+    t.after(() => { globalThis.requestAnimationFrame = previous; });
+    const frame = () => frames.splice(0).forEach(callback => callback());
+    const marks = new Set(), settled = [];
+    const feed = { scrollTop: 100, scrollHeight: 1000, clientHeight: 400, clientWidth: 385, offsetWidth: 400,
+        ownerDocument: {}, addEventListener() {}, removeEventListener() {}, contains: node => node === feed,
+        toggleAttribute: (name, on) => { if (on) marks.add(name); else marks.delete(name); return on; },
+        dispatchEvent: event => { settled.push([event.type, event.bubbles, feed.scrollTop]); return true; } };
+    const width = value => Object.assign(feed, { offsetWidth: value, clientWidth: value ? value - 15 : 0 });
+    // Laying the rows out again at the held width moves the passage; restoring the place puts it back.
+    let restores = 0;
+    const reading = createChatReadingPosition({ feed, visible: () => true, alive: () => true, ready: () => true,
+        anchors: { capture: () => ({ top: 100 }), restore: anchor => { restores++; feed.scrollTop = anchor.top; return true; },
+            serialize: () => null }, changed() {}, afterWrite() {}, activity() {}, updateButton() {} });
+    reading.stick = false; reading.remember(true);
+    const lazy = () => marks.has('data-resizing');
+    feed.clientWidth = 400; reading.reflow();
+    assert.equal(lazy(), false, 'a scrollbar coming or going changes only the content width: no move');
+    width(380); reading.reflow(); frame();
+    assert.equal(lazy(), false, 'one move (a window jump, a layout switch) is laid out at once');
+    for (let i = 0; i < 3; i++) frame();
+    assert.equal(frames.length, 0, 'and nothing keeps counting after it');
+    assert.deepEqual(settled, [], 'nothing was skipped, so nothing waits to be measured');
+    width(360); reading.reflow(); frame();
+    width(340); reading.reflow();
+    assert.equal(lazy(), true, 'the width keeps moving: rows off the screen keep their size');
+    for (let i = 0; i < 6; i++) frame();
+    width(320); reading.reflow(); // the drag goes on: the hold starts again
+    for (let i = 0; i < 11; i++) frame();
+    assert.equal(lazy(), true, 'still within the hold after the last move');
+    feed.scrollTop = 140; // the rows above the passage were laid out at the new width
+    const before = restores;
+    frame();
+    assert.equal(lazy(), false, 'the width held: every row is laid out again');
+    assert.deepEqual([restores - before, feed.scrollTop], [1, 100], 'and the place is re-applied in that same frame');
+    assert.deepEqual(settled, [['ouro:feed-width-settled', true, 100]],
+        'then the rows are announced as laid out, once, for whatever measures them (the answer folds)');
+    for (let i = 0; i < 20; i++) frame();
+    assert.equal(frames.length, 0, 'nothing keeps counting at rest');
+    // A feed hidden and shown again at another width (another room was open) is not a move.
+    width(0); reading.reflow(); frame();
+    width(300); reading.reflow(); frame();
+    assert.equal(lazy(), false);
+    // Following the newest message, the held width lands at the new bottom.
+    reading.stick = true;
+    width(310); reading.reflow(); frame();
+    width(320); reading.reflow();
+    assert.equal(lazy(), true);
+    for (let i = 0; i < 11; i++) frame();
+    feed.scrollHeight = 1300;
+    frame();
+    assert.deepEqual([lazy(), feed.scrollTop], [false, 1300]);
+});
+
 test('reading inside a box ends what an earlier feed gesture still owes, not a scrollbar still held', t => {
     const f = fixture(t);
     f.feed.ownerDocument.defaultView = { getComputedStyle: node => ({ overflowY: node.overflowY || 'visible' }) };

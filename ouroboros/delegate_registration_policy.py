@@ -49,6 +49,7 @@ def review_owned_source(source: Any) -> bool:
 # it was made from, but nothing it produces is ever integrated into that tree.
 INVESTIGATION_AUTHORITY = "investigation"
 _NO_APPLY_AUTHORITY_SOURCES = frozenset({INVESTIGATION_AUTHORITY, "readonly"})
+INVESTIGATION_NOTE = "Evidence-only investigation: the captured changes are retained as evidence and never applied."
 
 
 def no_write_authority(root: str, *, investigation: bool) -> dict:
@@ -60,6 +61,14 @@ def no_write_authority(root: str, *, investigation: bool) -> dict:
 
 def _fact(record: Any, key: str) -> Any:
     return record.get(key) if isinstance(record, dict) else getattr(record, key, None)
+
+
+def evidence_only(record: Any) -> bool:
+    """The positive evidence-only purpose (#1609): no read of its capture asks for
+    apply/reject. Keyed on the recorded investigation source, not on
+    ``candidate_apply_possible`` being false, which also covers degenerate rows
+    with no source and no capture binding."""
+    return str(_fact(record, "authority_source") or "") == INVESTIGATION_AUTHORITY
 
 
 def candidate_apply_possible(record: Any) -> bool:

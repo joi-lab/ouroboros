@@ -118,14 +118,12 @@ test('live media and quiz-state writes use the injected content boundary', () =>
     const handlers = new Map();
     const seen = new Set();
     let mutations = 0;
-    let unread = 0;
     try {
         fx.controller.wireDeliveries({
             onWs(type, handler) { handlers.set(type, handler); },
             isMyThread: () => true,
             hideTypingIndicatorOnly() {},
             syncChatStatus() {},
-            incrementUnreadIfNeeded() { unread += 1; },
             seenMessageKeys: seen,
             rememberMessageKey(key) { seen.add(key); },
             chatMediaMessageKey: (msg) => `media:${msg.task_id}:${msg.ts}`,
@@ -146,7 +144,6 @@ test('live media and quiz-state writes use the injected content boundary', () =>
         handlers.get('quiz_state')({ quiz_id: 'q1', changed: false });
         handlers.get('quiz_state')({ quiz_id: 'q1', changed: true });
         assert.equal(mutations, 4);
-        assert.equal(unread, 2);
         assert.equal(fx.inserted.length, 1);
         assert.equal(fx.inserted[0].querySelectorAll('.chat-gallery-item').length, 2);
     } finally {
@@ -474,7 +471,7 @@ test('live gallery items adopt separate history identities and older photos do n
         const seen = new Set();
         const delivery = fx.controller.wireDeliveries({
             onWs() {}, isMyThread: () => true, hideTypingIndicatorOnly() {}, syncChatStatus() {},
-            incrementUnreadIfNeeded() {}, seenMessageKeys: seen,
+            seenMessageKeys: seen,
             rememberMessageKey: (key) => seen.add(key),
             chatMediaMessageKey: (msg) => `photo:${msg.task_id}:${msg.ts}`,
             documentMessageKey: (msg) => `file:${msg.task_id}:${msg.ts}`,
@@ -746,8 +743,8 @@ test('owner attachments mount above the caption from the shared atoms and releas
         assert.ok(block.querySelectorAll('.chat-file-item')[1].classList.contains('is-unavailable'));
         assert.ok(block.innerHTML.includes('ZIP · Unavailable'),
             'an unavailable card says so in words, not only by its dimmed style');
-        assert.equal(block.innerHTML.match(/aria-haspopup="dialog"/g)?.length, 1,
-            'the live card announces the file dialog it opens, as a delivered card does; the inert one opens nothing');
+        assert.equal(block.innerHTML.match(/aria-haspopup="dialog"/g)?.length, 3,
+            'each photo tile and the live card announce the dialog they open, as delivered ones do; the inert card opens nothing');
         assert.ok(fx.tracker.adds > adds, 'listeners belong to the media controller');
         const single = new NodeStub('div', fx.tracker);
         single.innerHTML = '<div class="sender">You</div><div class="message"></div>';

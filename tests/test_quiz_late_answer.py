@@ -12,6 +12,8 @@ invariants live in ``tests/test_quiz_answer.py``; the durable evidence half is
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 
 import pytest
@@ -58,7 +60,7 @@ def _inbox(bridge):
 
 def _accepted_rows(tmp_path, client_message_id):
     return [row for row in (json.loads(line) for line in
-                            (tmp_path / "logs" / "chat.jsonl").read_text().splitlines())
+                            dialogue_test.log_text(tmp_path / "logs" / "chat.jsonl").splitlines())
             if row.get("client_message_id") == client_message_id]
 
 

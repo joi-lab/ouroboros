@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import copy
 import hashlib
 import json
@@ -679,7 +681,6 @@ def test_multi_improvement_explicit_selection_binds_exact_answer_before_single_d
     import supervisor.events as supervisor_events
     import supervisor.message_bus as message_bus
     import supervisor.state as supervisor_state
-    from ouroboros.review_substrate import ReviewRunResult
     from ouroboros.tools.registry import ToolRegistry
     from supervisor.terminal_delivery import already_delivered, pending_deliveries
 
@@ -688,12 +689,11 @@ def test_multi_improvement_explicit_selection_binds_exact_answer_before_single_d
     responses = iter([
         "Initial complete draft.", _finish_response("Controlled answer v1."),
         _finish_response("Free-form improvement v2."), _finish_response("Free-form improvement v3."),
-        stale_envelope, _finish_response(decoded), _finish_response(decoded),
+        stale_envelope, _finish_response(decoded),
     ])
     model_calls = []
-    acceptance_inputs = []
-    acceptance_candidates = []
-    acceptance_bindings = []
+    reviewed = []
+    reviewed_candidates = []
     lineage_flags = []
     nudge_calls = 0
 
@@ -704,9 +704,6 @@ def test_multi_improvement_explicit_selection_binds_exact_answer_before_single_d
     def fake_call(_llm, request_messages, *_args, **_kwargs):
         model_calls.append([dict(row) for row in request_messages])
         response = next(responses)
-        observer = _kwargs.get("model_context_observer")
-        if callable(observer):  # like the real transport: a returned request reports what Main received
-            observer(request_messages)
         return ({"role": "assistant", **response} if isinstance(response, dict)
                 else {"role": "assistant", "content": response}), 0.0
 
@@ -715,52 +712,20 @@ def test_multi_improvement_explicit_selection_binds_exact_answer_before_single_d
         nudge_calls += 1
         return nudge_calls == 1
 
-    def fake_panel(review_ctx):
-        content = review_ctx.content
-        acceptance_inputs.append(content)
-        acceptance_candidates.append(review_ctx.tools._ctx._delivery_candidate)
-        acceptance_bindings.append(copy.deepcopy(review_ctx.review_binding))
-        lineage_flags.append(acceptance_candidates[-1].control_episode_seen)
-        if len(acceptance_inputs) < 4:
-            return ReviewRunResult(
-                request={"surface": "task_acceptance"},
-                actors=[{
-                    "slot_id": "host-issue-449",
-                    "signal": "FAIL",
-                    "parsed": {
-                        "outcome_tier": "best_effort",
-                        "completion_coach": "Revise the complete answer.",
-                    },
-                }],
-                parsed_findings=[{
-                    "severity": "major",
-                    "item": "complete_answer_revision",
-                    "recommendation": "Revise the complete answer.",
-                }],
-                aggregate_signal="FAIL",
-            )
-        return ReviewRunResult(
-            request={"surface": "task_acceptance"},
-            actors=[{
-                "slot_id": "host-issue-449",
-                "signal": "PASS",
-                "parsed": {
-                    "outcome_tier": "solved",
-                    "completion_coach": "Ship the decoded answer.",
-                    "criteria_used": [{
-                        "criterion": "complete answer",
-                        "status": "supported",
-                        "evidence_refs": ["final_answer_marker"],
-                    }],
-                },
-            }],
-            parsed_findings=[],
-            aggregate_signal="PASS",
-        )
+    def review_at_delivery(ctx, content, _llm_trace, hold):
+        # Blocking holds a failed result until a review passes it: three reviews ask for a
+        # revised complete answer and show their findings; the fourth passes the decoded one.
+        reviewed.append(content)
+        reviewed_candidates.append(ctx._delivery_candidate)
+        lineage_flags.append(reviewed_candidates[-1].control_episode_seen)
+        if len(reviewed) < 4:
+            hold("[Result review] FAIL — complete_answer_revision: Revise the complete answer.")
+            return True
+        return False
 
     monkeypatch.setattr(loop, "call_llm_with_retry", fake_call)
     monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", first_nudge_only)
-    monkeypatch.setattr(loop, "_execute_task_acceptance_panel", fake_panel)
+    monkeypatch.setattr("ouroboros.tools.review_result.result_review_at_delivery", review_at_delivery)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "required")
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "4")
@@ -792,7 +757,6 @@ def test_multi_improvement_explicit_selection_binds_exact_answer_before_single_d
     )
 
     decoded_sha = hashlib.sha256(decoded.encode("utf-8")).hexdigest()
-    raw_sha = hashlib.sha256(stale_envelope.encode("utf-8")).hexdigest()
     prompt_counts = [
         sum(
             "[DELIVERY_FINALIZATION_CONTROL]" in str(row.get("content") or "")
@@ -800,18 +764,15 @@ def test_multi_improvement_explicit_selection_binds_exact_answer_before_single_d
         )
         for call in model_calls
     ]
-    # Six authored rounds plus the one in which the settled PASS reached Main before
-    # its kept decoded answer was delivered (G1 #1737/D12); no further panel was paid.
-    assert len(model_calls) == 7
-    assert any(source.get("settled") and source.get("binding_hash") == trace["review_runs"][-1]["binding_hash"]
-               for row in model_calls[-1] for source in row.get("review_feedback") or [])
+    # Six authored rounds: the review that passes the decoded answer delivers it in its own round.
+    assert len(model_calls) == 6
     assert prompt_counts[0] == 0 and all(count >= 1 for count in prompt_counts[1:])
     assert all(
         "[DELIVERY_CONTROL_REPAIR]" not in str(row.get("content") or "")
         for call in model_calls
         for row in call
     )
-    assert acceptance_inputs == [
+    assert reviewed == [
         "Controlled answer v1.",
         "Free-form improvement v2.",
         "Free-form improvement v3.",
@@ -820,17 +781,11 @@ def test_multi_improvement_explicit_selection_binds_exact_answer_before_single_d
     assert lineage_flags == [True, True, True, True]
     assert result == decoded
     assert result != stale_envelope
-    assert acceptance_candidates[-1].full_text == decoded
-    assert acceptance_candidates[-1].revision == 5
+    assert reviewed_candidates[-1].full_text == decoded
+    assert reviewed_candidates[-1].revision == 5
     assert trace["delivery_candidate"]["content_sha256"] == decoded_sha
     binding = trace["delivery_candidate"]["acceptance_binding"]
     assert binding["candidate_sha256"] == decoded_sha
-    assert binding["binding_hash"] == trace["review_decision"]["binding_hash"]
-    assert acceptance_bindings[-1]["candidate_hash"] == decoded_sha
-    assert acceptance_bindings[-1]["binding_hash"] == binding["binding_hash"]
-    assert trace["review_runs"][-1]["candidate_hash"] == decoded_sha
-    assert trace["review_runs"][-1]["candidate_hash"] != raw_sha
-    assert trace["review_runs"][-1]["authority"] == "host_root"
 
     drive_logs = tmp_path / "pipeline-logs"
     drive_logs.mkdir()
@@ -901,10 +856,7 @@ def test_multi_improvement_explicit_selection_binds_exact_answer_before_single_d
 
     assert transported == [(7, decoded)]
     assert pending_deliveries(tmp_path) == []
-    chat_rows = [
-        json.loads(line)
-        for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
+    chat_rows = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     delivered_rows = [row for row in chat_rows if row.get("task_id") == "issue-449"]
     assert [row["text"] for row in delivered_rows] == [decoded]
     assert delivered_rows[0]["format"] == "markdown"

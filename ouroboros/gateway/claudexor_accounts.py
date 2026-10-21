@@ -256,7 +256,7 @@ _STATUS_LOCK = threading.Lock()
 _STATUS_IN_FLIGHT: Dict[bool, Future] = {}
 _FACET_MEMORY: Dict[Tuple[str, str, bool], Dict[str, Any]] = {}
 _FACET_FIELDS = {"catalog": ("harnesses",), "accounts": ("profiles",),
-                 "quota": ("quota", "quota_absences", "resources")}
+                 "quota": ("quota", "quota_absences", "resources", "availability_scope")}
 
 
 def _status_payload(include_models: bool, *, join: bool = True) -> Dict[str, Any]:
@@ -368,6 +368,7 @@ def _read_status_payload(include_models: bool) -> Dict[str, Any]:
             payload["daemon"]["engine_version"] = gateway.engine_version
 
             def _quota_state() -> Dict[str, Any]:
+                from ouroboros.claudexor_observations import read_quota
                 from ouroboros.gateways.claudexor import account_resource_capabilities
 
                 try:
@@ -379,15 +380,10 @@ def _read_status_payload(include_models: bool) -> Dict[str, Any]:
                 payload["resource_capabilities"] = capabilities
                 reader = getattr(gateway, "quota_state", None)
                 if callable(reader):
-                    if capabilities["read"]:
-                        result = reader(view="resources")
-                        if not isinstance(result, dict) or not isinstance(result.get("resources"), list):
-                            raise ClaudexorUnavailable("malformed_response", "Account resources were not returned")
-                        return result
-                    return reader()
+                    return read_quota(gateway, require_resources=capabilities["read"])
                 # Compatibility for old embedded gateway doubles. The shipped
-                # gateway has quota_state, so the live status path always uses
-                # one physical GET and one evidence epoch.
+                # gateway has quota_state; its shared reader preserves one
+                # complete evidence epoch, including negotiated legacy resources.
                 return {"snapshots": gateway.quota_snapshots(), "absences": []}
             # The catalog, manifest, profile and quota reads are INDEPENDENT GETs
             # over one thread-safe httpx client, and each costs SECONDS daemon-side
@@ -536,6 +532,8 @@ def _read_status_payload(include_models: bool) -> Dict[str, Any]:
             ]
             if isinstance(quota.get("resources"), list):
                 payload["resources"] = quota["resources"]
+            if "availability_scope" in quota:
+                payload["availability_scope"] = quota["availability_scope"]
     except ClaudexorUnavailable as exc:
         payload["daemon"]["state"] = "unreachable"
         payload["daemon"]["last_error"] = f"{exc.code}: {exc}"

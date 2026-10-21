@@ -672,26 +672,25 @@ def review_pool_save_judgement(raw: Any, stored: Dict[str, Any], *, allow_empty:
     return review_pool_save_error(posted, allow_empty=False)
 
 
-def _review_pool_costs(items: list, snapshot: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+def _review_pool_costs(items: list) -> Dict[str, Dict[str, Any]]:
     """The price of every catalog row. A session, or a model call through a subscription,
-    uses a seat and time; an API row's ``usd_per_review`` is ``review_row_call_usd``: one
-    full call of the row, the number ``## Review`` shows for its seat (a reading reviewer
-    makes several); a route without a tariff stays unknown — there are no price tables."""
-    from ouroboros.model_slots import resolve_processing_preference
-    from ouroboros.provider_models import provider_for_model
-    from ouroboros.tools.review_helpers import review_row_call_usd
+    uses a seat and time; an API row's price is what one review by that row actually cost
+    (``review_price``: the median of its recent reviews on its model, with their count and
+    range), the number ``## Review`` shows for its seat; a row without history stays unknown."""
+    from ouroboros.provider_models import provider_for_model, review_model_uses_local
+    from ouroboros.review_price import review_price
 
     costs: Dict[str, Dict[str, Any]] = {}
     for item in items:
         row_id, route = str(item.get("subagent_id") or ""), item.get("route") or {}
         target = str(route.get("target_id") or "")
         seat = route.get("kind") == "agent_session" or provider_for_model(target) == "claudexor"
-        usd = None if seat or not target else review_row_call_usd({
-            "slot_id": row_id, "model": target, "profile_id": str(route.get("credential_profile_id") or ""),
-            "processing_preference": resolve_processing_preference(
-                override=item.get("processing_preference") or None, settings=snapshot)})
+        if target and not seat and review_model_uses_local(target):
+            costs[row_id] = {"usd_per_review": 0.0, "basis": "local_route"}
+            continue
+        price = None if seat or not target else review_price(DATA_DIR, row_id, target)
         costs[row_id] = ({"usd_per_review": None, "basis": "subscription_seat" if seat else "unknown"}
-                         if usd is None else {"usd_per_review": float(usd), "basis": "route_tariff"})
+                         if price is None else price.as_cost())
     return costs
 
 
@@ -738,7 +737,7 @@ def review_pool_payload(snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, 
     from ouroboros.configured_subagents import MAX_CONFIGURED_SUBAGENTS, SUBAGENTS_SETTING, parse_configured_subagents, roster_handles
     from ouroboros.provider_models import model_has_credentials_in_settings
     from ouroboros.review_pool_receipts import document_as_read
-    from ouroboros.reviewer_slot_config import review_pool_slots, review_pool_state, reviewer_slot_last_executions
+    from ouroboros.reviewer_slot_config import public_slot_executions, review_pool_slots, review_pool_state, reviewer_slot_last_executions
     from ouroboros.server_maintenance import review_pool_migration_payload
     from ouroboros.settings_integrity import runtime_environ
 
@@ -755,7 +754,7 @@ def review_pool_payload(snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, 
         "limits": {"rows": MAX_CONFIGURED_SUBAGENTS},
         "catalog": {"present": bool(raw.strip()), "enabled": bool(raw.strip()) and document.get("enabled") is not False,
                     "rows": len(items), "eligible": sum(1 for item in items if item.get("review_eligible") is True)},
-        "pool": [], "excluded": [], "last_executions": reviewer_slot_last_executions(), "row_costs": {},
+        "pool": [], "excluded": [], "last_executions": public_slot_executions(reviewer_slot_last_executions()), "row_costs": {},
         "config_error": "", "migration": review_pool_migration_payload(env, document=settings_document),
         "pool_without_credentials": [],
     }
@@ -769,7 +768,7 @@ def review_pool_payload(snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, 
     except ValueError as exc:
         payload["config_error"] = str(exc)
         return payload
-    payload["row_costs"] = _review_pool_costs(items, env)
+    payload["row_costs"] = _review_pool_costs(items)
     payload["pool"], payload["excluded"] = review_pool_rows(
         items, slots, handles, payload["last_executions"], payload["row_costs"])
     payload["pool_without_credentials"] = [row["subagent_id"] for row in payload["pool"]  # seats log in themselves

@@ -1,0 +1,346 @@
+"""Completed unbound HTTP failures retain unknown money, not a live writer.
+
+Real sync/async accounting, store, Continue admission/selection and paused-task
+Resume run here. Provider outcomes are local callbacks; no provider is called.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import subprocess
+import sys
+import threading
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from ouroboros import model_wait, usage_accounting as ua, usage_store
+from ouroboros.task_results import write_task_result
+from supervisor.continuation_admission import action_writers, admit_continuation, conflicting_writers
+from tests._budget_pause_exact_helpers import _install_queue
+from tests.test_owner_continue import NONCE, _interrupted
+
+pytestmark = pytest.mark.serial
+
+# These waits synchronize events, not a latency promise. Store creation and
+# admission can take seconds under load; keep one bounded deadlock escape.
+_EVENT_TIMEOUT = 60
+
+
+def _request(root):
+    return ua.AttemptRequest(model="m", provider="test", reservation_usd=.2,
+                             drive_root=root, task_id="root", root_task_id="root")
+
+
+def _http_error():
+    response = httpx.Response(400, request=httpx.Request("POST", "https://provider.invalid/model"),
+                              json={"error": {"type": "invalid_request", "message": "rejected"}})
+    return httpx.HTTPStatusError("request rejected", request=response.request, response=response)
+
+
+def _row(root, attempt_id):
+    with usage_store.read(root) as txn:
+        return txn.attempt(attempt_id)
+
+
+def _assert_http_failure(attempt):
+    facts = attempt["physical_failure"]
+    assert facts["stage"] == "raised_exception"
+    assert type(facts["provider_status_code"]) is int and facts["provider_status_code"] == 400
+    assert facts["transport_cause_type"] is None
+
+
+def _handoffs(queue):
+    return [row for row in conflicting_writers(queue, "root") if row["kind"] == "model_handoff"]
+
+
+def _failed_send(root, *, asynchronous=False, owner=None, error=None, while_sending=None):
+    reservations = []
+    error = error or _http_error()
+
+    def send():
+        if while_sending:
+            while_sending()
+        raise error
+
+    async def async_send():
+        return send()
+
+    def before(reservation):
+        reservations.append(reservation)
+
+    scope = ua.UsageScope(drive_root=root, task_id="root", root_task_id="root")
+    with ua.usage_scope(scope), (model_wait.operation_wait_scope(owner) if owner else contextlib.nullcontext()):
+        with pytest.raises(type(error)):
+            if asynchronous:
+                asyncio.run(ua.execute_physical_attempt_async(_request(root), async_send, before_dispatch=before))
+            else:
+                ua.execute_physical_attempt(_request(root), send, before_dispatch=before)
+    return reservations[0]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("bound", [False, True], ids=["unbound", "bound"])
+def test_producer_to_continue_preserves_live_receiver_and_late_money(tmp_path, monkeypatch, asynchronous, bound):
+    from supervisor.events_budget import observe_held_budget_selection
+
+    queue, _, _ = _install_queue(tmp_path, monkeypatch)
+    write_task_result(tmp_path, "root", "running", root_task_id="root")
+    owner = model_wait.TaskModelWait(task={"id": "root", "_attempt": 1}, drive_root=tmp_path,
+                                    event_queue=None, worker_slot_held=True) if bound else None
+    inflight = []
+    try:
+        reservation = _failed_send(tmp_path, asynchronous=asynchronous, owner=owner,
+                                    while_sending=lambda: inflight.extend(_handoffs(queue)))
+        assert len(inflight) == 1, "the real sender is still a writer before its error returns"
+        before = _row(tmp_path, reservation.attempt_id)
+        assert before["state"] == "unresolved" and before.get("cost_usd") is None
+        assert before.get("cost_final") is not True
+        _assert_http_failure(before)
+        _interrupted(tmp_path, "root")
+        money = ua.usage_projection(tmp_path)
+
+        assert bool(_handoffs(queue)) is bound
+        admitted = admit_continuation("root", action_nonce=NONCE)
+        assert admitted["ok"] and admitted["held"] is bound, admitted
+        assert _row(tmp_path, reservation.attempt_id) == before
+        assert ua.usage_projection(tmp_path) == money
+        if owner:
+            held = observe_held_budget_selection(queue, admitted["successor_task_id"])
+            assert [b["kind"] for b in held["blockers"]] == ["model_handoff"]
+            owner.close()
+            assert observe_held_budget_selection(queue, admitted["successor_task_id"])["blockers"] == []
+
+        ua.settle_attempt(reservation, {"prompt_tokens": 1}, cost_usd=.03, cost_final=True)
+        after = _row(tmp_path, reservation.attempt_id)
+        assert after["settle_reason"] == "late_receipt" and after["cost_usd"] == .03
+        assert after["cost_final"] is True and after["physical_failure"] == before["physical_failure"]
+    finally:
+        if owner:
+            owner.close()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("terminal_http", [False, True], ids=["transport-unknown", "http-finished"])
+def test_actual_paused_task_resume_observes_completion(tmp_path, monkeypatch, asynchronous, terminal_http):
+    from ouroboros import budget_pause, owner_pause
+    from supervisor.events_budget import install_exact_budget_pause
+    from supervisor.owner_pause_control import request_owner_pause
+    from tests.test_owner_pause import _owner_park
+
+    queue, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda _st, **_kw: 5.0)
+    write_task_result(tmp_path, "root", "running", root_task_id="root", chat_id=0)
+    workers.RUNNING["root"] = {"task": {"id": "root", "type": "task", "chat_id": 0,
+                                        "root_task_id": "root"}, "worker_id": 0, "attempt": 1}
+    reservation = _failed_send(tmp_path, asynchronous=asynchronous,
+                                error=_http_error() if terminal_http else httpx.ReadTimeout("outcome unknown"))
+    before = _row(tmp_path, reservation.attempt_id)
+    assert request_owner_pause("root", request_id="pause")["ok"]
+    pause = _owner_park(tmp_path, monkeypatch, "root", [], root="root")
+    context = SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING=workers.RUNNING, PENDING=workers.PENDING,
+                              WORKERS=workers.WORKERS, sort_pending=lambda: None,
+                              persist_queue_snapshot=queue.persist_queue_snapshot, bridge=None)
+    install_exact_budget_pause(context, "root", budget_pause.exact_pause_marker(pause)["checkpoint"])
+
+    fence_before = owner_pause.read_fence(tmp_path, "root")
+    assert fence_before["state"] == (owner_pause.FENCE_PAUSED if terminal_http else owner_pause.FENCE_REQUESTED)
+    outcome = queue.resume_budget_paused_task("root")
+    assert outcome["ok"] is terminal_http, outcome
+    if not terminal_http:
+        assert outcome["error"] == "owner_pause_effects_unsettled"
+        assert [b["kind"] for b in outcome["blockers"]] == ["model_handoff"]
+    assert _row(tmp_path, reservation.attempt_id) == before
+    assert owner_pause.read_fence(tmp_path, "root") == fence_before
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_observed_http_response_is_held_until_unbound_send_exits(tmp_path, monkeypatch, asynchronous):
+    from supervisor.events_budget import observe_held_budget_selection
+
+    queue, _, _ = _install_queue(tmp_path, monkeypatch)
+    write_task_result(tmp_path, "root", "running", root_task_id="root")
+    observed, release = threading.Event(), threading.Event()
+    reservations, failures = [], []
+    error = _http_error()  # A response exists; the physical callback has not exited.
+
+    def receiving():
+        observed.set()
+        assert release.wait(_EVENT_TIMEOUT)
+
+    def caller():
+        try:
+            reservations.append(_failed_send(tmp_path, asynchronous=asynchronous,
+                                               error=error, while_sending=receiving))
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=caller)
+    thread.start()
+    try:
+        assert observed.wait(_EVENT_TIMEOUT)
+        with usage_store.read(tmp_path) as txn:
+            attempt, = txn.open_attempts(root_task_id="root")
+        assert attempt["state"] == "dispatched" and "physical_failure" not in attempt
+        _interrupted(tmp_path, "root")
+        admitted = admit_continuation("root", action_nonce=NONCE)
+        assert admitted["ok"] and admitted["held"], admitted
+        selection = observe_held_budget_selection(queue, admitted["successor_task_id"])
+        assert [b["kind"] for b in selection["blockers"]] == ["model_handoff"]
+    finally:
+        release.set()
+        thread.join(_EVENT_TIMEOUT)
+    assert not thread.is_alive() and not failures, failures
+    completed = _row(tmp_path, reservations[0].attempt_id)
+    _assert_http_failure(completed)
+    assert completed["state"] == "unresolved" and completed.get("cost_usd") is None
+    assert observe_held_budget_selection(queue, admitted["successor_task_id"])["blockers"] == []
+    resumed = queue.resume_budget_paused_task(admitted["successor_task_id"])
+    assert resumed["ok"], resumed
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_failed_completion_evidence_write_keeps_continue_held(tmp_path, monkeypatch, asynchronous):
+    queue, _, _ = _install_queue(tmp_path, monkeypatch)
+    write_task_result(tmp_path, "root", "running", root_task_id="root")
+
+    def failed_write(*_a, **_kw):
+        raise OSError("evidence unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(usage_store.Txn, "record_evidence", failed_write)
+        reservation = _failed_send(tmp_path, asynchronous=asynchronous)
+    before = _row(tmp_path, reservation.attempt_id)
+    assert before["state"] == "unresolved" and "physical_failure" not in before
+    assert before.get("cost_usd") is None
+    _interrupted(tmp_path, "root")
+    admitted = admit_continuation("root", action_nonce=NONCE)
+    assert admitted["ok"] and admitted["held"], admitted
+    assert _row(tmp_path, reservation.attempt_id) == before
+
+
+def test_abandoned_receiver_stays_dispatched_until_sender_finishes(tmp_path, monkeypatch):
+    from ouroboros import owner_pause
+    from ouroboros._usage_wait import receiver_abandonable
+
+    queue, _, _ = _install_queue(tmp_path, monkeypatch)
+    write_task_result(tmp_path, "root", "running", root_task_id="root")
+    entered, release, returned, settled = (threading.Event() for _ in range(4))
+    reservations, errors = [], []
+
+    def send():
+        entered.set()
+        assert release.wait(_EVENT_TIMEOUT)
+        raise _http_error()
+
+    def caller():
+        try:
+            with ua.usage_scope(ua.UsageScope(drive_root=tmp_path, task_id="root", root_task_id="root")):
+                with receiver_abandonable():
+                    ua.execute_physical_attempt(_request(tmp_path), send,
+                        before_dispatch=lambda r: reservations.append(r),
+                        late_owner=lambda *_: settled.set())
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            returned.set()
+
+    thread = threading.Thread(target=caller)
+    thread.start()
+    try:
+        assert entered.wait(_EVENT_TIMEOUT)
+        owner_pause.install_fence(tmp_path, "root", request_id="pause")
+        assert returned.wait(_EVENT_TIMEOUT) and getattr(errors[0], "receiver_abandoned", False)
+        before = _row(tmp_path, reservations[0].attempt_id)
+        assert before["state"] == "dispatched" and "physical_failure" not in before
+        assert len(_handoffs(queue)) == 1
+    finally:
+        release.set()
+        thread.join(_EVENT_TIMEOUT)
+    assert settled.wait(_EVENT_TIMEOUT) and not thread.is_alive()
+    after = _row(tmp_path, reservations[0].attempt_id)
+    assert after["state"] == "unresolved" and after.get("cost_usd") is None
+    _assert_http_failure(after)
+    assert _handoffs(queue) == []
+
+
+def _legacy(root, *, pid, facts=None, state="unresolved", **binding):
+    reservation = ua.reserve_attempt(_request(root))
+    ua.mark_dispatched(reservation, local_answer_owner_pid=pid)
+    with usage_store.hold(root) as txn:
+        current = txn.attempt(reservation.attempt_id)
+        txn.record_evidence(reservation.attempt_id, {"physical_failure": facts or {
+            "stage": "raised_exception", "provider_status_code": 400, "transport_cause_type": None}},
+            expected_revision=current["revision"])
+    if state == "unresolved":
+        ua._transition(reservation, state, reason="retained failure", **binding)
+    return reservation
+
+
+@pytest.mark.parametrize("pid_state", ["dead", "live", "missing", "inaccessible"])
+def test_historic_http_failure_uses_only_addressed_open_rows_without_pid_gate(tmp_path, monkeypatch, pid_state):
+    from ouroboros import platform_layer
+
+    queue, _, _ = _install_queue(tmp_path, monkeypatch)
+    pid = os.getpid() if pid_state == "live" else None
+    if pid_state == "dead":
+        # A real reaped PID, with no birth/consumer/task-attempt: the incident's shape.
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait(10)
+        pid = child.pid
+    if pid_state == "inaccessible":
+        pid = 424242
+        monkeypatch.setattr(platform_layer, "pid_provably_gone", lambda _pid: False)
+    reservation = _legacy(tmp_path, pid=pid)
+    _interrupted(tmp_path, "root")
+    before = _row(tmp_path, reservation.attempt_id)
+    _assert_http_failure(before)
+    assert not any(before.get(k) for k in ("local_answer_consumer_id", "local_answer_owner_birth",
+                                         "local_answer_task_attempt"))
+    read_attempts = usage_store.Txn.attempts
+    open_reads = []
+    with monkeypatch.context() as patch:
+        def addressed_open_only(txn, where="1", params=()):
+            if (where, tuple(params)) != (f"{usage_store._OPEN_PREDICATE} AND root_task_id=?", ("root",)):
+                pytest.fail("completed request classification must read only this root's open attempts")
+            open_reads.append((where, tuple(params)))
+            return read_attempts(txn, where, params)
+        patch.setattr(usage_store.Txn, "attempts", addressed_open_only)
+        assert action_writers(queue, "root") == []
+        admitted = admit_continuation("root", action_nonce=NONCE)
+        assert admitted["ok"] and not admitted["held"], admitted
+    assert open_reads
+    assert _row(tmp_path, reservation.attempt_id) == before
+
+
+@pytest.mark.parametrize("case", ["unknown-status", "string-status", "bool-status", "float-status",
+                                   "success-status", "out-of-range-status", "body-error", "transport-cause",
+                                   "missing-cause", "false-cause", "zero-cause", "empty-cause",
+                                   "bound", "partial-birth", "partial-attempt", "still-dispatched"])
+def test_ambiguous_or_bound_failures_keep_continue_held(tmp_path, monkeypatch, case):
+    queue, _, _ = _install_queue(tmp_path, monkeypatch)
+    facts = {"stage": "raised_exception", "provider_status_code": 400, "transport_cause_type": None}
+    statuses = {"unknown-status": None, "string-status": "400", "bool-status": True,
+                "float-status": 400.0, "success-status": 200, "out-of-range-status": 600}
+    if case in statuses:
+        facts["provider_status_code"] = statuses[case]
+    if case == "body-error":
+        facts["stage"] = "response_body_error"
+    causes = {"transport-cause": "ReadError", "false-cause": False, "zero-cause": 0, "empty-cause": ""}
+    if case in causes:
+        facts["transport_cause_type"] = causes[case]
+    if case == "missing-cause":
+        facts.pop("transport_cause_type")
+    binding = {"bound": {"local_answer_consumer_id": "receiver"},
+               "partial-birth": {"local_answer_owner_birth": "100.boot"},
+               "partial-attempt": {"local_answer_task_attempt": 0}}.get(case, {})
+    reservation = _legacy(tmp_path, pid=os.getpid(), facts=facts,
+                           state="dispatched" if case == "still-dispatched" else "unresolved", **binding)
+    _interrupted(tmp_path, "root")
+    before = _row(tmp_path, reservation.attempt_id)
+    admitted = admit_continuation("root", action_nonce=NONCE)
+    assert admitted["ok"] and admitted["held"], admitted
+    assert [b["kind"] for b in action_writers(queue, "root")] == ["model_handoff"]
+    assert _row(tmp_path, reservation.attempt_id) == before

@@ -2,6 +2,7 @@
 from pathlib import Path
 
 import pytest
+from ouroboros.test_evidence import diagnostic_directory
 
 pytest_plugins = ('tests.test_ui_smoke_playwright',)
 
@@ -70,10 +71,11 @@ def test_engine_facts_status_line_at_both_widths(direct_server_with_data, tmp_pa
                 page.locator('.harness-account-row[data-profile="kept-account"]').wait_for(state='visible')
                 assert line.evaluate('(el) => el.scrollWidth <= el.clientWidth + 1')
                 line.scroll_into_view_if_needed()
-                destination = tmp_path / f'engine-facts-{name}.png'
+                output = diagnostic_directory(tmp_path, "engine-facts")
+                destination = output / f'engine-facts-{name}.png'
                 page.screenshot(path=str(destination))
                 print(f'UI_ENGINE_EVIDENCE {destination}')
-                line.screenshot(path=str(tmp_path / f'engine-line-{name}.png'))
+                line.screenshot(path=str(output / f'engine-line-{name}.png'))
                 page.close()
         finally:
             browser.close()

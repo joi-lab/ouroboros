@@ -326,8 +326,13 @@ def test_worktree_prune_missing(tmp_path):
     wtroot = tmp_path / "wtroot"
     h = sw.provision_worktree(repo_dir=repo, task_id="t2", worktree_root=wtroot, data_dir=data)
     import shutil
+    from ouroboros.task_results import write_task_result
     shutil.rmtree(h.path)
-    res = sw.prune_orphans(worktree_root=wtroot, data_dir=data, retention_days=9999)
+    # A missing checkout is forgotten only once its task is proven over (C10: terminal row, negative probe).
+    kept = sw.prune_orphans(worktree_root=wtroot, data_dir=data, retention_days=9999, live=lambda _task: True)
+    assert kept["removed"] == 0 and kept["kept"] == 1
+    write_task_result(data, "t2", "completed")
+    res = sw.prune_orphans(worktree_root=wtroot, data_dir=data, retention_days=9999, live=lambda _task: False)
     assert res["removed"] == 1 and res["kept"] == 0
 
 

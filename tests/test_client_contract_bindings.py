@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib
 import pathlib
 import re
+import threading
 import typing
 
 import pytest
@@ -107,6 +108,10 @@ def test_the_project_journey_answers_its_published_shapes(client):
     assert assert_bound("POST /api/projects/from-task", client.post("/api/projects/from-task", json={})) == "ErrorResponse"
     deleted = client.post(f"/api/projects/{project['id']}/delete", json={})
     assert assert_bound("POST /api/projects/{project_id}/delete", deleted) == "ProjectDeleteResponse"
+    # The answer precedes the Project's cancellation worker; the journey that started it joins it.
+    for worker in [thread for thread in threading.enumerate() if thread.name == f"project-delete-{project['id']}"]:
+        worker.join(timeout=60)
+        assert not worker.is_alive(), "the Project deletion worker never finished"
 
 
 def test_settings_language_and_desktop_routes_answer_their_published_shapes(client, monkeypatch):
@@ -160,9 +165,8 @@ def test_skill_and_marketplace_reads_answer_their_published_shapes(client):
     assert bad_toggle.status_code == 400 and assert_bound("POST /api/skills/{skill}/toggle", bad_toggle)
     history = client.get("/api/skills/nothing/review-history/job-1")
     assert history.status_code == 404 and assert_bound("GET /api/skills/{skill}/review-history/{job_id}", history)
-    for market in ("clawhub", "ouroboroshub"):
-        token = f"GET /api/marketplace/{market}/installed"
-        assert assert_bound(token, client.get(f"/api/marketplace/{market}/installed")) == "MarketplaceInstalledResponse"
+    token = "GET /api/marketplace/clawhub/installed"
+    assert assert_bound(token, client.get("/api/marketplace/clawhub/installed")) == "MarketplaceInstalledResponse"
     missing = client.post("/api/marketplace/clawhub/install", json={})
     assert missing.status_code == 400 and assert_bound("POST /api/marketplace/clawhub/install", missing)
 
@@ -217,8 +221,9 @@ def test_model_mcp_and_control_routes_answer_their_published_shapes(client, monk
 
 
 def test_the_update_status_review_pool_and_spend_answer_their_published_shapes(client, monkeypatch):
-    # A row's price may need a live tariff read; the shape does not, so the test stays offline.
-    monkeypatch.setattr("ouroboros.tools.review_helpers.review_row_call_usd", lambda *_a, **_kw: None)
+    # A row's price is measured from the process data root's usage ledger, which this disposable
+    # root does not own; the shape does not need it, so every row reads as unpriced.
+    monkeypatch.setattr("ouroboros.review_price.review_price", lambda *_a, **_kw: None)
     status = client.get("/api/update/status")
     assert assert_bound("GET /api/update/status", status) == "UpdateStatusResponse"
     assert status.json()["check_ok"] is None and status.json()["update_tx"]["active"] in {True, False}
@@ -256,7 +261,7 @@ def test_every_published_and_owned_shape_has_one_field_identical_browser_twin():
 def test_every_request_and_header_fact_is_published_for_the_journeys():
     requests = {token: entry.get("request", {}).get("schemas") for token, entry in BY_TOKEN.items()}
     for token in ("POST /api/files/write", "POST /api/projects/from-task", "POST /api/skills/{skill}/toggle",
-                  "POST /api/claudexor/login", "POST /api/marketplace/ouroboroshub/install", "POST /api/command",
+                  "POST /api/claudexor/login", "POST /api/skill-catalog/install", "POST /api/command",
                   "POST /api/schedules", "POST /api/owner/context-mode", "DELETE /api/chat/upload"):
         assert requests[token] and requests[token] != [], token
     assert BY_TOKEN["POST /api/claudexor/maintenance/operations"]["headers"] == ["Idempotency-Key!"]

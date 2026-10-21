@@ -6,7 +6,6 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +16,8 @@ import ouroboros.presence_delivery as delivery
 from ouroboros.gateway.host_service import create_host_service_app
 from tests.test_host_service_api import FakeBridge, _seed_presence_behavior, _seed_token
 from tests._store_shared import seed_result
+from tests._dialogue import chat_rows, import_all
+from ouroboros import dialogue_store as ds
 
 
 @pytest.fixture(autouse=True)
@@ -56,8 +57,7 @@ def _post(client, payload):
 
 
 def _rows(tmp_path):
-    path = tmp_path / "logs/chat.jsonl"
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+    return chat_rows(tmp_path)
 
 
 @pytest.mark.parametrize("state,direction", [
@@ -78,6 +78,8 @@ def test_http_records_exact_facts_with_nonterminal_history_type(tmp_path, state,
         assert row["transport"][key] == payload[key]
     from ouroboros.gateway.history import make_chat_history_endpoint
 
+    from ouroboros.dialogue_import import export_for_older_body
+    export_for_older_body(tmp_path)  # Transition (unit H): history endpoint still owns the file reader.
     request = Request({"type": "http", "method": "GET", "path": "/api/chat/history", "query_string": b"", "headers": []})
     response = asyncio.run(make_chat_history_endpoint(tmp_path)(request))
     projected = [item for item in json.loads(response.body)["messages"] if item.get("text") == payload["text"]]
@@ -124,29 +126,17 @@ def test_duplicate_conflict_physical_parts_and_distinct_skill(tmp_path):
     assert len(_rows(tmp_path)) == 4
 
 
-def test_large_cold_history_is_scanned_once_then_updated_incrementally(tmp_path, monkeypatch):
-    path = tmp_path / "logs/chat.jsonl"
-    path.parent.mkdir()
-    path.write_text("".join(json.dumps({"direction": "in", "text": str(n)}) + "\n" for n in range(20_000)), encoding="utf-8")
-    real_reader = delivery.jsonl_chain_handles
-    scans = []
+def test_receipt_reads_are_addressed_and_repeated_callbacks_reuse_the_named_fact(tmp_path, monkeypatch):
+    from tests.test_dialogue_addressed_readers import metered
 
-    @contextmanager
-    def counted(*args, **kwargs):
-        scans.append(kwargs)
-        with real_reader(*args, **kwargs) as handles:
-            yield handles
-
-    monkeypatch.setattr(delivery, "jsonl_chain_handles", counted)
+    ds.append(tmp_path, "chat", {"chat_id": 1, "text": "foreign"})
     recorder = delivery.PresenceDeliveryRecorder(tmp_path)
-    recorder.record("transport", _payload())
-    assert len(scans) == 1 and scans[0]["strict"] is True
-    for n in range(100):
-        payload = _payload(delivery_id=f"send:{n}")
-        assert recorder.record("transport", payload)["duplicate"] is False
-        assert recorder.record("transport", payload)["duplicate"] is True
-    assert len(scans) == 1
-    assert len(_rows(tmp_path)) == 20_101
+    with metered(monkeypatch) as first:
+        recorder.record("transport", _payload())
+    with metered(monkeypatch) as duplicate:
+        assert recorder.record("transport", _payload())["duplicate"]
+    assert first["steps"] > 0 and duplicate["steps"] == 0
+    assert len(_rows(tmp_path)) == 2
 
 
 def test_simultaneous_identical_callbacks_write_one_row(tmp_path):
@@ -161,8 +151,8 @@ def test_rotation_and_restart_keep_receipt_identity(tmp_path):
     recorder = delivery.PresenceDeliveryRecorder(tmp_path)
     recorder.record("transport", _payload())
     archive = tmp_path / "archive"
-    archive.mkdir()
-    (tmp_path / "logs/chat.jsonl").rename(archive / "chat_20260918.jsonl")
+    archive.mkdir(exist_ok=True)
+    (archive / "chat_20260918.jsonl").write_text("frozen archive is not read\n", encoding="utf-8")
     assert recorder.record("transport", _payload())["duplicate"] is True
     assert recorder.record("transport", _payload(delivery_id="later"))["duplicate"] is False
     restarted = delivery.PresenceDeliveryRecorder(tmp_path)
@@ -170,7 +160,7 @@ def test_rotation_and_restart_keep_receipt_identity(tmp_path):
     assert restarted.record("transport", _payload(delivery_id="later"))["duplicate"] is True
     with pytest.raises(delivery.PresenceDeliveryConflict):
         restarted.record("transport", _payload(text="conflict after restart"))
-    assert len(_rows(tmp_path)) == 1
+    assert len(_rows(tmp_path)) == 2
 
 
 @pytest.mark.parametrize("landed", [False, True])
@@ -202,9 +192,8 @@ def test_gapped_retained_chain_accepts_with_explicit_uncertainty(tmp_path):
     assert response.status_code == 200
     assert response.json() == {"ok": True, "recorded": True, "duplicate": False,
                                "history_coverage": "gapped"}
-    lines = (tmp_path / "logs/chat.jsonl").read_text(encoding="utf-8").splitlines()
-    assert lines[0] == "{broken"
-    assert json.loads(lines[1])["type"] == "presence_delivery"
+    assert ds.range_coverage(tmp_path, "chat")["gaps"] == 1
+    assert _rows(tmp_path)[0]["type"] == "presence_delivery"
     # A readable later receipt keeps its exact identity even across a gap.
     restarted = delivery.PresenceDeliveryRecorder(tmp_path)
     assert restarted.record("transport", _payload())["duplicate"] is True
@@ -215,56 +204,55 @@ def test_gapped_retained_chain_accepts_with_explicit_uncertainty(tmp_path):
 def test_readable_history_conflict_still_refuses_even_when_other_rows_are_gapped(tmp_path):
     client = _client(tmp_path)
     assert _post(client, _payload()).status_code == 200
-    path = tmp_path / "logs/chat.jsonl"
-    original = path.read_text(encoding="utf-8")
-    row = json.loads(original)
-    row["text"] = "conflicting retained text"
-    path.write_text(original + "{broken\n" + json.dumps(row) + "\n", encoding="utf-8")
+    row = _rows(tmp_path)[0]
+    ds.append(tmp_path, "chat", {**row, "text": "conflicting retained text"})
     with pytest.raises(OSError, match="conflicting retained"):
-        delivery.PresenceDeliveryRecorder(tmp_path).record("transport", _payload(delivery_id="later"))
+        delivery.PresenceDeliveryRecorder(tmp_path).record("transport", _payload())
 
 
 def test_receipt_after_torn_tail_starts_a_new_parseable_record(tmp_path):
     recorder = delivery.PresenceDeliveryRecorder(tmp_path)
     assert recorder.record("transport", _payload())["recorded"] is True
     path = tmp_path / "logs/chat.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("ab") as handle:
         handle.write(b'{"interrupted":')
+    import_all(tmp_path)
     assert recorder.record("transport", _payload(delivery_id="next"))["recorded"] is True
-    lines = path.read_text(encoding="utf-8").splitlines()
-    assert lines[-2] == '{"interrupted":'
-    assert json.loads(lines[-1])["transport"]["delivery"]["delivery_id"] == "next"
+    assert ds.range_coverage(tmp_path, "chat")["gaps"] == 1
+    assert _rows(tmp_path)[-1]["transport"]["delivery"]["delivery_id"] == "next"
     # Cold reconstruction cannot prove whether the broken row was a receipt.
     late = delivery.PresenceDeliveryRecorder(tmp_path).record("transport", _payload(delivery_id="third"))
     assert late["history_coverage"] == "gapped"
 
 
 def test_required_writer_refusal_does_not_ack_or_fill_index(tmp_path, monkeypatch):
-    import supervisor.message_bus as bus
 
     client = _client(tmp_path)
-    append = bus.append_jsonl
-    monkeypatch.setattr(bus, "append_jsonl", lambda *args, **kwargs: False)
+    append = ds.append
+
+    def fail(*args, **kwargs):
+        raise ds.StoreError("required dialogue append failed")
+
+    monkeypatch.setattr(ds, "append", fail)
     assert _post(client, _payload()).status_code == 503
     assert client.app.state.host_service_context.presence_deliveries._index is None
     assert _rows(tmp_path) == []
-    monkeypatch.setattr(bus, "append_jsonl", append)
+    monkeypatch.setattr(ds, "append", append)
     assert _post(client, _payload()).json()["duplicate"] is False
 
 
 def test_cold_chain_io_failure_remains_retryable(tmp_path, monkeypatch):
-    real_reader = delivery.jsonl_chain_handles
+    real_reader = ds.require_imported
 
-    @contextmanager
     def unavailable(*args, **kwargs):
-        raise OSError("retained generation is temporarily unreadable")
-        yield  # pragma: no cover - establishes the context-manager protocol
+        raise ds.StoreMigrating("Dialogue history is still importing")
 
     client = _client(tmp_path)
-    monkeypatch.setattr(delivery, "jsonl_chain_handles", unavailable)
+    monkeypatch.setattr(ds, "require_imported", unavailable)
     assert _post(client, _payload()).status_code == 503
     assert _rows(tmp_path) == []
-    monkeypatch.setattr(delivery, "jsonl_chain_handles", real_reader)
+    monkeypatch.setattr(ds, "require_imported", real_reader)
     assert _post(client, _payload()).json()["duplicate"] is False
 
 

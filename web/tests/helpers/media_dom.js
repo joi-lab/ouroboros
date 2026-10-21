@@ -7,6 +7,7 @@ class Classes {
     constructor(node) { this.node = node; this.values = new Set(); }
     set(value) { this.values = new Set(String(value || '').split(/\s+/).filter(Boolean)); }
     add(...values) { values.forEach((value) => this.values.add(value)); }
+    remove(...values) { values.forEach((value) => this.values.delete(value)); }
     contains(value) { return this.values.has(value); }
     toggle(value, force) {
         const enabled = force === undefined ? !this.contains(value) : Boolean(force);

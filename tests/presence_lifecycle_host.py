@@ -1,4 +1,10 @@
-"""Child-only TCP fixture; never point its root or control routes at an installation."""
+"""Child-only TCP fixture; never point its root or control routes at an installation.
+
+The author parks through the kept trigger (``tests/test_presence_continuation.py``):
+it reviews its own result with ``review_change(subject="result")``, the held
+reviewer writes an addressed message to its mailbox, the author leaves only its
+own wait, and its next plain prose parks on that review.
+"""
 from __future__ import annotations
 
 import json
@@ -57,7 +63,7 @@ def seed(data):
                 permissions=["presence"], manifest_permissions=["presence"])
     folder = data / "skills" / "external" / "lifecycle-helper"
     folder.mkdir(parents=True)
-    names = ["chat_history", "task_acceptance_review", "get_task_result"]
+    names = ["chat_history", "review_change", "get_task_result"]
     (folder / "SKILL.md").write_text(
         "---\nname: lifecycle-helper\ndescription: Isolated report helper.\nversion: 0.1\n"
         "type: instruction\npresence:\n  instructions: Prepare reports and explicitly review substantive results.\n"
@@ -79,6 +85,14 @@ def seed(data):
     return binding
 
 
+def _last_review_left(messages):
+    """The latest tool result is a review its author left for an addressed message."""
+    from tests.test_presence_continuation import LEFT
+
+    tools = [row for row in messages if row.get("role") == "tool"]
+    return bool(tools) and LEFT in str(tools[-1].get("content"))
+
+
 def main(root, generation, mode, scenario="incoming", with_event_bus=False):
     import pytest
     import uvicorn
@@ -90,7 +104,8 @@ def main(root, generation, mode, scenario="incoming", with_event_bus=False):
     from ouroboros.presence_runner import run_presence_turn
     from ouroboros.task_status import reconcile_orphaned_running_tasks
     from supervisor import queue as _task_queue  # noqa: F401 -- normal supervisor import order for Panic
-    from tests.test_presence_continuation_bootstrap import install_bootstrap_harness, finish, nominate
+    from tests.test_presence_continuation import review, waits
+    from tests.test_presence_continuation_bootstrap import install_bootstrap_harness, finish
     from tests.test_presence_continuation_process import ROOT, ANSWER, MANUAL, LATE_CHILD, REVISED_ANSWER
 
     assert Path(os.environ["OUROBOROS_DATA_DIR"]).resolve() == (root / "data").resolve()
@@ -146,6 +161,10 @@ def main(root, generation, mode, scenario="incoming", with_event_bus=False):
         if generation > 1:
             assert MANUAL in str(messages), "restart attempted inference without a fresh manual event"
             return finish("manual", message="Continued after the explicit request.")
+        if h.calls == 1:
+            return review(answer=ANSWER)  # the author reviews its own result and waits for it
+        if h.calls in (2, 4) and _last_review_left(messages):
+            return waits()  # it left that review for the addressed message: plain prose parks on it
         if scenario == "late_child" and h.calls == 3:
             from ouroboros.task_results import write_task_result
 
@@ -164,22 +183,10 @@ def main(root, generation, mode, scenario="incoming", with_event_bus=False):
                               root_task_id=LATE_CHILD, description="Compile the independent report",
                               metadata={"presence": dict(ctx.task_metadata["presence"])})
             ctx._swarm_handoff_attempt = {"status": "scheduled", "task_id": LATE_CHILD}
-            return nominate(REVISED_ANSWER)
-        if h.calls > 1:
-            candidate = h.agents[0].tools._ctx._delivery_candidate
-            return finish("select", outcome="tool_delivered" if scenario == "tool_delivered" else "message",
-                          answer_sha256=candidate.content_sha256,
-                          **({"pending_review": "finish"} if mode == "advisory" else {}))
-        result = nominate(ANSWER)
+            return review(answer=REVISED_ANSWER)
         if scenario == "tool_delivered":
-            arguments = json.loads(result["tool_calls"][-1]["function"]["arguments"])
-            arguments["outcome"] = "tool_delivered"
-            result["tool_calls"][-1]["function"]["arguments"] = json.dumps(arguments)
-        if mode == "advisory":
-            arguments = json.loads(result["tool_calls"][-1]["function"]["arguments"])
-            arguments["pending_review"] = "finish"
-            result["tool_calls"][-1]["function"]["arguments"] = json.dumps(arguments)
-        return result
+            return finish("select", outcome="tool_delivered")
+        return finish("select", message=REVISED_ANSWER if scenario == "late_child" else ANSWER)
 
     h.script = script
 

@@ -145,7 +145,7 @@ def test_typed_error_and_empty_result_remain_known_through_real_main_seals_and_a
     request = _request(messages, 1)
     request = replace(request, working_note="The failed commands returned exit 17.", keep_unit_ids=(),
                       expected_view_revision=request.transcript_sha256)
-    authored, author_receipt, _ = cc.compact_tool_history_llm(messages, request=request,
+    authored, author_receipt = cc.compact_tool_history_llm(messages, request=request,
         observed_messages=messages, fit_candidate=lambda *_: {"accepted": True},
         drive_root=f.ctx.drive_root, task_id=f.ctx.task_id)
     assert author_receipt.status == "applied"

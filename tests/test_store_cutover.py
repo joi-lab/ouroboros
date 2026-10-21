@@ -145,6 +145,7 @@ _TABLES = re.compile(r"\bFROM\s+(tasks|task_bodies|obligations|custody_runs|hand
 
 def captured_statements(monkeypatch, call) -> list:
     """``(sql, params)`` of every read over the store's tables that ``call`` made."""
+    store.close_connections()  # install the recorder before opening the persistent connection
     real = sqlite3.connect
 
     def recording(*args, factory=sqlite3.Connection, **kwargs):  # over the store's own connection class
@@ -186,7 +187,6 @@ def runtime_reads(root):
         ("read_document", lambda: task_store.read_document(root, "t5")),
         ("signature", lambda: task_store.signature(root, "t5")),
         ("owner-held members", lambda: obligations.members(root, "custody_open")),
-        ("review collection candidates", lambda: list(task_store.review_collection_candidates(root))),
     ]
 
 

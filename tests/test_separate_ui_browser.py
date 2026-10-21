@@ -519,17 +519,19 @@ def test_stop_ends_a_held_task_and_the_core_records_the_stop(stack):
 
 def _seed_late_quiz(core, question: str) -> tuple[str, str]:
     """A question its (completed) task asked in Main, written by the core's own writers."""
-    from ouroboros.owner_quiz import record_asked
+    from ouroboros import dialogue_store
+    from ouroboros.owner_quiz import record_asked, record_publication
     from ouroboros.task_results import write_task_result
 
     task_id, quiz_id = "separate-ui-late-task", "late-q"
     write_task_result(core.data_dir, task_id, "completed", chat_id=1)
     record_asked(core.data_dir, task_id, quiz_id=quiz_id, question=question, options=["Keep", "Change"], chat_id=1)
+    # The publication writer binds the card's address before exposing it; only that address takes a late answer (#1899).
+    record_publication(core.data_dir, task_id, quiz_id, 1)
     quiz = {"quiz_id": quiz_id, "question": question, "state": "open", "chat_id": 1,
             "options": [{"label": "Keep"}, {"label": "Change"}], "asked_at": "2026-10-13T00:00:00Z"}
-    with (core.data_dir / "logs" / "chat.jsonl").open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps({"ts": "2026-10-13T00:00:00Z", "direction": "out", "chat_id": 1, "text": question,
-                                 "type": "quiz", "task_id": task_id, "quiz": quiz}) + "\n")
+    dialogue_store.append(core.data_dir, "chat", {"ts": "2026-10-13T00:00:00Z", "direction": "out", "chat_id": 1,
+                                                  "text": question, "type": "quiz", "task_id": task_id, "quiz": quiz})
     return task_id, quiz_id
 
 

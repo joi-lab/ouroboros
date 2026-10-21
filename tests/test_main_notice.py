@@ -144,18 +144,17 @@ def host(tmp_path, monkeypatch):
     from ouroboros.utils import append_jsonl
     from supervisor import events_chat_delivery as delivery, message_bus
 
-    frames, advanced = [], []
+    frames = []
     bridge = message_bus.LocalChatBridge({})
     bridge._broadcast_fn = frames.append
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
     monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
-    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", advanced.append)
     monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
     monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
     ctx = types.SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING={}, append_jsonl=append_jsonl,
                                 send_with_budget=message_bus.send_with_budget)
-    return types.SimpleNamespace(ctx=ctx, frames=frames, advanced=advanced,
+    return types.SimpleNamespace(ctx=ctx, frames=frames,
                                  handle=lambda evt: delivery._handle_send_message(evt, ctx))
 
 
@@ -194,7 +193,9 @@ class TestDeliveryAndReplay:
         assert notice["chat_id"] == 1 and not notice.get("project_thread")
         assert notice["task_id"] == "root-project"
         assert reply["chat_id"] == project_chat and reply.get("project_thread") is True
-        assert host.advanced == [1, project_chat]  # the notice never bumps Project unread
+        from ouroboros import dialogue_store
+        assert dialogue_store.room(tmp_path, 1)["revision"] == 1
+        assert dialogue_store.room(tmp_path, project_chat)["revision"] == 1
 
         main_rows = _history(tmp_path, 1)
         project_rows = _history(tmp_path, project_chat)

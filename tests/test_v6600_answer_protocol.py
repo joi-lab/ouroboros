@@ -1,5 +1,6 @@
-"""v6.60.0 (Phase 4) — answer protocol (contract-gated FINAL ANSWER), blocking
-widening, and the bytes_equal verification mode.
+"""v6.60.0 (Phase 4) — answer protocol (contract-gated FINAL ANSWER) and the
+bytes_equal verification mode. (The blocking widening of acceptance obligations
+retired with the task-acceptance machine.)
 """
 from __future__ import annotations
 
@@ -75,44 +76,6 @@ def test_protocol_facts_state_the_latch_without_marker_instructions():
     assert _final_answer_fact(protocol) == "FINAL ANSWER line latched: none"
     protocol._execution_trace["best_valid_final_answer"] = "42"
     assert _final_answer_fact(protocol) == "FINAL ANSWER line latched: yes, current"
-
-
-# --- 4.2 blocking widening --------------------------------------------------------
-
-def _result(signal, findings, tiers=("solved",)):
-    from types import SimpleNamespace
-
-    actors = [
-        {"slot_id": f"s{i}", "signal": signal, "parsed": {"outcome_tier": tier}}
-        for i, tier in enumerate(tiers)
-    ]
-    return SimpleNamespace(aggregate_signal=signal, actors=actors, parsed_findings=findings)
-
-
-def test_obligations_widen_to_high_only_on_failing_aggregate():
-    from ouroboros.loop import _collect_acceptance_obligations
-
-    high_finding = {"severity": "high", "slot_id": "s0", "item": "missed requirement", "recommendation": "implement X"}
-    critical_finding = {"severity": "critical", "slot_id": "s0", "item": "broken", "recommendation": "fix Y"}
-
-    # PASS aggregate: high findings do NOT become obligations (critical-only bar).
-    trace_pass = {}
-    _collect_acceptance_obligations(trace_pass, _result("PASS", [high_finding, critical_finding]))
-    items = {o["item"] for o in trace_pass["acceptance_obligations"]}
-    assert items == {"broken"}
-
-    # FAIL aggregate: high + critical both become obligations.
-    trace_fail = {}
-    _collect_acceptance_obligations(trace_fail, _result("FAIL", [high_finding, critical_finding]))
-    items_fail = {o["item"] for o in trace_fail["acceptance_obligations"]}
-    assert items_fail == {"missed requirement", "broken"}
-
-    # blocked_with_evidence tier (even on non-FAIL signal): widened too.
-    trace_blocked = {}
-    _collect_acceptance_obligations(
-        trace_blocked, _result("PASS", [high_finding], tiers=("blocked_with_evidence",))
-    )
-    assert {o["item"] for o in trace_blocked["acceptance_obligations"]} == {"missed requirement"}
 
 
 # --- 4.3 bytes_equal ---------------------------------------------------------------

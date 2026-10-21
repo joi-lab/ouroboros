@@ -14,6 +14,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from ouroboros.extension_loader import list_routes, snapshot
+from ouroboros.gateway.contributions import contribution_catalog
 from ouroboros.gateway._helpers import (
     coerce_bool,
     json_error,
@@ -23,11 +24,7 @@ from ouroboros.gateway._helpers import (
     request_repo_dir as _request_repo_dir,
 )
 from ouroboros.gateway.extension_receipts import extension_process_receipt, extension_reconcile_receipt
-from ouroboros.marketplace.ouroboroshub import display_catalog_files
-from ouroboros.skill_lifecycle_queue import (
-    queue_snapshot,
-    run_blocking_preserving_cancellation,
-)
+from ouroboros.skill_lifecycle_queue import queue_snapshot
 from ouroboros.skill_loader import (
     discover_skills,
     find_skill,
@@ -113,31 +110,12 @@ async def _read_child_dispatch_body(request: Request) -> bytes:
 def _review_fields(
     loaded: Any, *, stale: bool | None = None, gate: dict[str, Any] | None = None,
     github_token_configured: bool | None = None,
-    hub_catalog_files: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stale = loaded.review.is_stale_for(loaded.content_hash) if stale is None else stale
     gate = loaded.review.gate_for(loaded.content_hash) if gate is None else gate
-    source = str(getattr(loaded, "source", "") or "")
-    # Hub hint: matched against the display-plane catalog view (§7.1a) the caller
-    # peeked, never fetched here — a local listing must not wait for the network.
-    # None = no fresh view yet; the page re-reads once its own catalog read lands.
-    # With a view, an unreadable payload is a definitive negative for THIS row —
-    # never a 500 for the whole listing.
-    official_hub_verified: bool | None = False
-    if source == "ouroboroshub":
-        from ouroboros.skill_review import hub_payload_matches
-
-        if hub_catalog_files is None:
-            official_hub_verified = None
-        else:
-            try:
-                official_hub_verified = hub_payload_matches(loaded, hub_catalog_files.__getitem__)
-            except Exception:
-                official_hub_verified = False
-    owner_attestable = official_hub_verified if source == "ouroboroshub" else (
-        source not in {"native", "clawhub"}
-        and (source == "external" or bool(getattr(loaded, "is_self_authored", False)))
-    )
+    # The owner may skip the review for the exact bytes of a skill from any origin
+    # (skill_owner_attestation); the endpoint repeats the authoritative checks.
+    owner_attestable = not loaded.load_error and bool(loaded.content_hash)
     # FR1: the host computes the single Submit-to-Hub eligibility verdict so the card
     # renders it instead of recomputing a divergent clean-only rule (the SSOT shared with
     # the backend gate). The github-token check is request-INVARIANT, so the index builder
@@ -160,7 +138,6 @@ def _review_fields(
         # from a normal LLM-clean verdict, and hide the "Skip review" action once attested.
         "review_profile": getattr(loaded.review, "review_profile", ""),
         # UI hint only: the owner-attestation endpoint repeats the authoritative checks.
-        "official_hub_verified": official_hub_verified,
         "owner_attestable": owner_attestable,
         # FR1: SSOT publish-eligibility verdict {visible, disabled, reason}.
         "submit_hub": submit_hub,
@@ -239,7 +216,9 @@ def _build_extensions_index(drive_root, repo_path):
     from ouroboros.extension_loader import extension_name_prefix, runtime_state_for_loaded_skill
 
     live_snapshot = snapshot()
-    hub_catalog_files = display_catalog_files()  # one view per response, never a fetch
+    from ouroboros.skill_source_catalog import listing_install_fields, listing_snapshots
+
+    source_snapshots = listing_snapshots(drive_root)  # cached catalogs only, never a fetch
     # Scan data plane plus optional external checkout; bootstrap copies native refs.
     skills = discover_skills(drive_root, repo_path=repo_path)
     unique_skills = [
@@ -341,7 +320,6 @@ def _build_extensions_index(drive_root, repo_path):
                 "review_gate": gate,
                 "executable_review": False,
                 "review_profile": "",
-                "official_hub_verified": False,
                 "owner_attestable": False,
                 "submit_hub": _passive_submit_hub(
                     s,
@@ -357,6 +335,9 @@ def _build_extensions_index(drive_root, repo_path):
                 "review_findings": [],
                 "skill_review": {},
                 "grants": {},
+                "install": None,
+                "category": [],
+                "removal": "",
             })
             catalog.append(entry)
             continue
@@ -364,8 +345,9 @@ def _build_extensions_index(drive_root, repo_path):
         health = read_extension_health(drive_root, s.name) if s.manifest.is_extension() else None
         entry.update({
             **_review_fields(
-                s, github_token_configured=_gh_token_configured, hub_catalog_files=hub_catalog_files,
+                s, github_token_configured=_gh_token_configured,
             ),
+            **listing_install_fields(drive_root, s, source_snapshots),
             "conflict": skill_conflict_status(s, skills),
             "load_error": runtime_states.get(s.name, {}).get("load_error", s.load_error),
             "desired_live": runtime_states.get(s.name, {}).get("desired_live", False),
@@ -432,7 +414,8 @@ def _build_extensions_index(drive_root, repo_path):
                         "registry_url": prov.get("registry_url", ""),
                     })
         catalog.append(entry)
-    return {"skills": catalog, "live": live_snapshot}
+    return {"skills": catalog, "live": live_snapshot,
+            **contribution_catalog(drive_root, repo_path, skills=skills, live=live_snapshot)}
 
 
 async def api_extension_manifest(request: Request) -> JSONResponse:
@@ -457,10 +440,7 @@ async def api_extension_manifest(request: Request) -> JSONResponse:
     load_error = runtime_state.get("load_error")
     if not isinstance(load_error, str) or not load_error.strip():
         load_error = loaded.load_error
-    # The hub hint hashes payload bytes: off the event loop, like the index.
-    review_fields = await asyncio.to_thread(
-        lambda: _review_fields(loaded, hub_catalog_files=display_catalog_files()),
-    )
+    review_fields = await asyncio.to_thread(lambda: _review_fields(loaded))
     return JSONResponse(
         {
             "name": loaded.name,
@@ -475,6 +455,7 @@ async def api_extension_manifest(request: Request) -> JSONResponse:
                 "env_from_settings": list(loaded.manifest.env_from_settings or []),
                 "scheduled_tasks": list(getattr(loaded.manifest, "scheduled_tasks", []) or []),
                 "ui_tab": loaded.manifest.ui_tab,
+                "contributes": list(getattr(loaded.manifest, "contributes", []) or []),
             },
             "enabled": loaded.enabled,
             **review_fields,
@@ -681,6 +662,8 @@ async def api_skill_toggle(request: Request) -> JSONResponse:
     payload = await _run_owner_skill_action(request, skill_name, "enable" if enabled else "disable", body)
     if payload.get("error"):
         return JSONResponse(payload, status_code=int(payload.get("status_code") or 400))
+    if payload.get("pending"):  # still installing packages: the running job answers
+        return JSONResponse({"skill": skill_name, **payload})
     return JSONResponse({
         "skill": payload.get("skill", skill_name), "enabled": payload.get("enabled", False),
         "review_status": payload.get("review_status"), "review_stale": payload.get("review_stale"),
@@ -709,19 +692,29 @@ async def _run_owner_skill_action(request: Request, skill_name: str, action: str
     from ouroboros.config import get_skills_repo_path
     from ouroboros.skill_lifecycle_actions import run_skill_action
 
+    from ouroboros.skill_lifecycle_queue import answer_or_job
+
     ctx = _ApiReviewCtx(_request_drive_root(request), _request_repo_dir(request))
     ctx.task_id = ""  # A UI lifecycle action is not a managed task.
     ctx._skill_owner_client_host = str(getattr(getattr(request, "client", None), "host", "") or "")
-    payload = await run_blocking_preserving_cancellation(
-        run_skill_action, ctx, skill_name, action,
-        expected_content_hash=str(body.get("expected_content_hash") or ""),
-        items=_grant_items_from_body(body) if action == "grant" else None,
-        payload_root=str(body.get("payload_root") or ""),
-        repo_path=get_skills_repo_path(), _owner_actor="owner_ui",
-        log_label=f"skill {action} lifecycle operation",
-    )
-    _broadcast_extension_lifecycle(request, skill_name, payload.get("extension_action"), payload.get("extension_reason"))
-    return payload
+
+    def work(handle):  # one job, one progress target: the request's own handle
+        return run_skill_action(
+            ctx, skill_name, action, expected_content_hash=str(body.get("expected_content_hash") or ""),
+            items=_grant_items_from_body(body) if action == "grant" else None,
+            payload_root=str(body.get("payload_root") or ""), repo_path=get_skills_repo_path(),
+            _owner_actor="owner_ui", _progress=handle,
+            _enable_after_grant=action == "grant" and body.get("enable_after_grant") is True)
+
+    def after(payload):
+        if not payload.get("error"):
+            _broadcast_extension_lifecycle(request, skill_name, payload.get("extension_action") or action,
+                                           payload.get("extension_reason"))
+
+    # Preserve the upstream success-only broadcast, even when the request has answered pending.
+    preferences = {value.strip().lower() for value in getattr(request, "headers", {}).get("prefer", "").split(",")}
+    return await answer_or_job(work, log_label=f"skill {action} lifecycle operation", after=after,
+                               allow_pending="respond-async" in preferences)
 
 
 async def api_skill_review(request: Request) -> JSONResponse:
@@ -754,6 +747,8 @@ async def api_owner_skill_attest_review(request: Request) -> JSONResponse:
     if not isinstance(body, dict):
         return json_error("request body must be a JSON object", 400)
     payload = await _run_owner_skill_action(request, skill_name, "attest", body)
+    if payload.get("pending"):
+        payload = {"skill": skill_name, "status": "pending", **payload}
     return JSONResponse(payload, status_code=200 if payload.get("ok") else int(payload.get("status_code") or 409))
 
 
@@ -973,12 +968,14 @@ async def api_skill_grants(request: Request) -> JSONResponse:
     body = await request_json_or(request, {}, exceptions=(Exception,))
     if not isinstance(body, dict):
         return json_error("request body must be a JSON object", 400)
+    if "enable_after_grant" in body and not isinstance(body["enable_after_grant"], bool):
+        return json_error("'enable_after_grant' must be a boolean", 400)
     payload = await _run_owner_skill_action(request, skill_name, "grant", body)
     return JSONResponse(payload, status_code=int(payload.get("status_code") or 200))
 
 
 async def api_skill_reconcile(request: Request) -> JSONResponse:
-    """Re-run the extension load gate after launcher-owned grants change."""
+    """Re-run the load gate, including after grants from older frozen launchers."""
     from ouroboros.config import get_skills_repo_path, load_settings
     from ouroboros import extension_loader
 
@@ -987,23 +984,16 @@ async def api_skill_reconcile(request: Request) -> JSONResponse:
         return json_error("missing skill name", 400)
 
     drive_root = _request_drive_root(request)
-    repo_path = get_skills_repo_path()
     state = await asyncio.to_thread(
         extension_loader.reconcile_extension,
-        skill_name,
-        drive_root,
-        load_settings,
-        repo_path=repo_path,
-        retry_load_error=True,
+        skill_name, drive_root, load_settings,
+        repo_path=get_skills_repo_path(), retry_load_error=True,
     )
     _broadcast_extension_lifecycle(
-        request,
-        skill_name,
-        state.get("action"),
-        state.get("reason"),
+        request, skill_name, state.get("action"), state.get("reason"),
     )
-    # Reconcile can flip grants/load state, so refresh schedule readiness now —
-    # off the event loop: the resync waits for the supervisor queue lock.
+    # Reconcile can flip grants/load state: refresh schedule readiness off the
+    # event loop because the schedule resync waits for a lock.
     try:
         from supervisor.queue import resync_skill_schedules
 

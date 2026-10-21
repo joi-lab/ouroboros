@@ -1,15 +1,11 @@
-"""Durable terminal-answer delivery, shared by completion, cancellation and reap.
+"""Terminal delivery for completion, cancellation and reap, without model rounds.
 
-``register_delivery`` atomically dedupes every delivery-id-bearing send through
-``state/terminal_deliveries.json``; the owed outbox replays across restart.
-Registration follows the send, so a crash between them can duplicate delivery:
-external transports remain at-least-once, prioritizing no lost answer.
-
-Completed tasks keep review-aware delivery via ``task_finalization``. Cancelled
-or non-retry-reaped tasks use ``deliver_unreviewed_salvage``: an UNREVIEWED
-banner, bounded preview with exact omitted count, full-copy path/size/hash and
-optional subtree digest, routed by task lineage. Retryable reap sends nothing.
-These delivery paths buy no model rounds; outcome routing stays with callers.
+The bounded terminal_deliveries.json outbox owns exact-id debt across restart.
+Send precedes its receipt: a crash in between remains at-least-once externally.
+Completed answers remain review-aware through task_finalization; cancellation and
+non-retry reap use lineage-routed unreviewed salvage (banner, bounded preview with
+omitted count, full-copy path/size/hash, optional subtree digest). Retryable reap
+sends nothing; callers retain outcome routing.
 """
 
 from __future__ import annotations
@@ -22,6 +18,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from ouroboros.observability import without_finalization_timing
+from ouroboros.store import bounded_wait
 from ouroboros.utils import update_json_locked, utc_now_iso
 from ouroboros.task_store import patch_document
 from ouroboros.task_finalization import (
@@ -85,16 +82,11 @@ _TERMINAL_ANSWER_ID = re.compile(r"final:(?P<task>[^:]+):[0-9a-f]{16}")
 # (``cascade:<root>:<request_id>``). Exactly three parts, so a ``:custody_notice`` /
 # ``:terminal_incident`` suffix, the Main mirror (``project-completion:``) and every
 # other row are never the answer. The Done gate reads debt through THIS family set.
-_TERMINAL_MESSAGE_ID = re.compile(r"(?:final|cancel|cascade):(?P<task>[^:]+):(?P<episode>[^:]+)")
+TERMINAL_MESSAGE_ID = re.compile(r"(?:final|cancel|cascade):(?P<task>[^:]+):(?P<episode>[^:]+)")
 
 
 def _mapping_rows(current: Dict[str, Any], key: str, *, strict: bool = False) -> Dict[str, Any]:
-    """Read a registry mapping; strict mutations preserve malformed forensic bytes.
-
-    Both pending rows and emitted receipts use this contract. Missing/None is
-    empty; other non-objects raise on strict reads, never silently vanish
-    when a mutator rewrites the whole registry.
-    """
+    """Missing/None mappings mean empty; strict mutations preserve malformed forensic bytes."""
     value = current.get(key)
     if isinstance(value, dict):
         return dict(value)
@@ -106,11 +98,8 @@ def _mapping_rows(current: Dict[str, Any], key: str, *, strict: bool = False) ->
 def _registry_document(current: Dict[str, Any], rows: List[str], pending: Dict[str, Any],
                        receipts: Optional[Dict[str, Any]] = None,
                        exhausted: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """The whole registry a mutator writes: every mutator keeps the receipts and exhausted rows it did not touch.
-
-    ``exhausted`` holds the rows the host gave up delivering (replay cap reached or
-    evicted by the pending capacity), payload included, keyed by delivery id: a
-    disposition the Done card reads, retired only by a later real receipt of that id."""
+    """Keep untouched receipts/exhausted payloads (replay/capacity limit). Their Done-card disposition
+    retires only on a real receipt of that id."""
     receipts = _mapping_rows(current, "receipts", strict=True) if receipts is None else receipts
     exhausted = _mapping_rows(current, "exhausted", strict=True) if exhausted is None else exhausted
     document = {"schema_version": _SCHEMA_VERSION, "delivered": rows[-_REGISTRY_CAP:], "pending": pending}
@@ -134,7 +123,7 @@ def _capture_emitted_answer(drive_root: Any, delivery_id: str, emitted: Dict[str
         from ouroboros.artifacts import store_actor_source_bytes
 
         record = {"delivery_id": delivery_id, "task_id": task_id, "chat_id": int(emitted["chat_id"]),
-                  "text": text, "sent_at": utc_now_iso(), "basis": "send_handler_returned",
+                  "text": text, "sent_at": emitted.get("sent_at") or utc_now_iso(), "basis": "send_handler_returned",
                   **{key: str(emitted.get(key) or "") for key in ("format", "role", "system_type", "terminal_origin")}}
         if isinstance(emitted.get("routing"), dict):
             record["routing"] = dict(emitted["routing"])
@@ -185,7 +174,7 @@ def terminal_answer_receipts(drive_root: Any, task_id: str) -> Dict[str, Any]:
         return fact
 
     def answer(did: str) -> bool:
-        match = _TERMINAL_MESSAGE_ID.fullmatch(did)
+        match = TERMINAL_MESSAGE_ID.fullmatch(did)
         return match is not None and match.group("task") == str(task_id)
 
     for did in (item for item in delivered if answer(item)):
@@ -254,14 +243,13 @@ def _delivered_rows(current: Dict[str, Any], *, strict: bool = False) -> List[st
     return []
 
 
-def register_delivery(drive_root: Any, delivery_id: str, *, emitted: Optional[Dict[str, Any]] = None) -> bool:
-    """Register an id AFTER a successful send and clear its owed row atomically.
+def register_delivery(drive_root: Any, delivery_id: str, *, emitted: Optional[Dict[str, Any]] = None,
+                      strict: bool = False) -> bool:
+    """After send, retain exact bytes/ack and atomically retire the owed row.
 
-    Return whether the id is new. A send that raises remains owed; old ids age
-    out of the bounded newest-last registry after their replay lifetime.
-    ``emitted`` contains the handler's exact text, routed chat and task; its
-    first retained receipt supplies ``terminal_answer_receipts``. Registration
-    failure is disclosed and returns True so the live send still counts."""
+    Return whether the bounded delivered-id registry gained an id. Strict callers
+    retain debt on any receipt failure; legacy callers still count the live send.
+    """
     did = str(delivery_id or "").strip()
     if not did:
         return True
@@ -272,6 +260,8 @@ def register_delivery(drive_root: Any, delivery_id: str, *, emitted: Optional[Di
                               publication_token=(emitted or {}).get("terminal_projection_token"))
     fresh = {"value": False}
     receipt = _capture_emitted_answer(drive_root, did, emitted) if isinstance(emitted, dict) else None
+    if strict and emitted and _TERMINAL_ANSWER_ID.fullmatch(did) and receipt is None:
+        raise RuntimeError("terminal answer receipt capture deferred")
 
     def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         rows: List[str] = _delivered_rows(current, strict=True)
@@ -280,31 +270,35 @@ def register_delivery(drive_root: Any, delivery_id: str, *, emitted: Optional[Di
         exhausted = _mapping_rows(current, "exhausted", strict=True)
         target = pending.get(did)
         if target is not None and not isinstance(target, dict):
-            # GR6-3: a malformed owed ROW is corruption — clearing it as part
-            # of "delivered" would silently destroy the forensic bytes.
-            raise ValueError(
-                f"terminal-delivery registry pending row for {did} is malformed"
-            )
-        had_pending = pending.pop(did, None) is not None
+            # GR6-3: never clear a corrupt owed row and destroy its forensic bytes.
+            raise ValueError(f"terminal-delivery registry pending row for {did} is malformed")
+        had_pending = target is not None and (not target.get("terminal_projection_token")
+            or target["terminal_projection_token"] == (emitted or {}).get("terminal_projection_token"))
+        if had_pending:
+            pending.pop(did)
         # A real receipt retires only ITS exhausted mark: the answer reached the chat after all.
         was_exhausted = exhausted.pop(did, None) is not None
         new_receipt = receipt is not None and did not in receipts
         if new_receipt:
             receipts[did] = receipt
-        if did in rows:
-            if not had_pending and not new_receipt and not was_exhausted:
-                return None
-        else:
+        if did not in rows:
             rows.append(did)
             fresh["value"] = True
+        elif not (had_pending or new_receipt or was_exhausted):
+            return None
         return _registry_document(current, rows, pending, receipts, exhausted)
 
     try:
-        update_json_locked(_registry_path(drive_root), _mutate, strict_existing_dict=True)
+        update_json_locked(_registry_path(drive_root), _mutate, strict_existing_dict=True,
+                           timeout_sec=bounded_wait(4.0))
     except ValueError:
         _log_registry_corrupt(drive_root, did, op="register_delivery")
+        if strict:
+            raise
         return True
     except Exception:
+        if strict:
+            raise
         log.warning("terminal-delivery registry write failed for %s", did, exc_info=True)
         return True
     return fresh["value"]
@@ -331,30 +325,34 @@ def _log_registry_corrupt(drive_root: Any, delivery_id: str, *, op: str) -> None
 
 
 def register_pending_delivery(drive_root: Any, event: Dict[str, Any]) -> bool:
-    """Record a terminal send as owed BEFORE enqueue, for boot/tick replay.
+    """Owe exact bytes before enqueue; retire only after confirmed send/receipt.
 
-    ``register_delivery`` clears it only after a confirmed send. The outbox
-    retains the newest ``_PENDING_CAP`` rows and discloses every eviction.
-    True means newly owed, already owed or delivered; False means a missing id
-    or a disclosed write failure. Cancel callers leave the intent open on
-    False; ordinary completion still tries the live send."""
+    Newest _PENDING_CAP rows survive; eviction retains and discloses the payload.
+    Deferred handlers retain timestamps/sent facts. False is missing id or disclosed
+    failure (cancel stays open); True includes owed/delivered. Completion still tries live send."""
     did = str(event.get("delivery_id") or "").strip()
     if not did:
         return False
+    token = event.get("terminal_projection_token")
+    if token and already_delivered(drive_root, did, task_id=str(event.get("task_id") or ""), publication_token=token):
+        return True
+    event = {**event, "ts": event.get("ts") or utc_now_iso()}
     evicted: List[Dict[str, Any]] = []
 
     def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         evicted.clear()
         rows: List[str] = _delivered_rows(current, strict=True)
-        if did in rows:
+        if did in rows and not token:
             return None  # already delivered: nothing is owed
         pending = _mapping_rows(current, "pending", strict=True)
         exhausted = _mapping_rows(current, "exhausted", strict=True)
-        if did in pending:
-            if not isinstance(pending.get(did), dict):
-                # A malformed row cannot count as durably owed: replay cannot send it.
-                raise ValueError(f"terminal-delivery registry pending row for {did} is malformed")
-            return None
+        if did in pending and not isinstance(pending[did], dict):
+            raise ValueError(f"terminal-delivery registry pending row for {did} is malformed")
+        if did in pending and pending[did].get("terminal_projection_token") == token:
+            if "delivery_deferred" not in event:
+                return None
+            pending[did].update({key: event[key] for key in ("ts", "delivery_deferred", "emitted", "transport_failed") if key in event})
+            return _registry_document(current, rows, pending, exhausted=exhausted)
         pending[did] = {**without_finalization_timing(event), "registered_at": utc_now_iso()}
         pending[did].pop("type", None)
         if len(pending) > _PENDING_CAP:
@@ -369,14 +367,18 @@ def register_pending_delivery(drive_root: Any, event: Dict[str, Any]) -> bool:
         return _registry_document(current, rows, pending, exhausted=exhausted)
 
     try:
-        update_json_locked(_registry_path(drive_root), _mutate, strict_existing_dict=True)
+        if token:
+            from ouroboros.terminal_projection import main_delivery_current
+            if not main_delivery_current(drive_root, str(event.get("task_id") or ""), token):
+                return True  # an older send cannot replace the current publication's debt
+        update_json_locked(_registry_path(drive_root), _mutate, strict_existing_dict=True,
+                           timeout_sec=bounded_wait(4.0))
     except ValueError:
         _log_registry_corrupt(drive_root, did, op="register_pending_delivery")
         _log_unregistered_delivery(drive_root, event, did)
         return False
     except Exception:
-        # The send itself still happens on the caller's live path; the answer
-        # just lost its crash insurance — disclosed, never silent (GR3-4).
+        # Failed crash insurance is disclosed; the caller still tries the live send (GR3-4).
         log.error("terminal-delivery pending registration failed for %s", did, exc_info=True)
         _log_unregistered_delivery(drive_root, event, did)
         return False
@@ -391,7 +393,7 @@ def withdraw_stop_episode(drive_root: Any, task_id: str) -> bool:
     Running custody owes its salvage before the terminal write; when the monotonic
     guard keeps the worker's own completed row instead, that undelivered row (and
     its undelivered receipt block) would hold the Done card and later replay a
-    false "was cancelled" message. A delivered id is history and stays.
+    false "was stopped" message. A delivered id is history and stays.
     """
     tid = str(task_id or "")
     did = _stop_episode_delivery_id(pathlib.Path(drive_root), tid)
@@ -472,7 +474,7 @@ def pending_deliveries(
             # Quarantine and disclose; strict mutations preserve these bytes on disk.
             malformed.append(str(did))
             continue
-        if str(did) in delivered_ids:
+        if str(did) in delivered_ids and not row.get("terminal_projection_token"):
             continue
         rows.append({**row, "delivery_id": str(did)})
     if malformed:
@@ -498,11 +500,10 @@ def _exhausted_row(row: Dict[str, Any], *, reason: str) -> Dict[str, Any]:
 
 
 def _bump_replay_attempts(drive_root: Any, ids: List[str]) -> None:
-    """Count one REAL replay enqueue per id and stamp ``last_replay_at`` for the backoff.
-
-    Attempts are never counted for a copy that was not enqueued (still queued,
-    being handled, or an unobservable queue). Exhaustion is a separate
-    transition (``_retire_exhausted``), decided before the next enqueue."""
+    """Count admitted copies/failed physical retries on the existing backoff.
+    Queued/in-flight/unknown membership or busy pre-send storage spends nothing.
+    Exhaustion is a separate transition before retry.
+    """
     def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         pending = _mapping_rows(current, "pending", strict=True)
         changed = False
@@ -519,7 +520,7 @@ def _bump_replay_attempts(drive_root: Any, ids: List[str]) -> None:
         return _registry_document(current, rows, pending)
 
     try:
-        update_json_locked(_registry_path(drive_root), _mutate, strict_existing_dict=True)
+        update_json_locked(_registry_path(drive_root), _mutate, strict_existing_dict=True, timeout_sec=bounded_wait(4.0))
     except ValueError:
         _log_registry_corrupt(drive_root, ",".join(ids), op="bump_replay_attempts")
     except Exception:
@@ -698,26 +699,27 @@ def _disclose_exhausted_delivery(
 
 
 def replay_pending_deliveries(drive_root: Any, *, event_queue: Any = None) -> List[str]:
-    """Re-enqueue every terminal answer still owed. Returns the replayed ids.
+    """Continue deferred writes/sends/receipts off-consumer; replay lost queued sends.
 
-    Called on boot and on the supervisor tick. Idempotent by construction: the
-    send handler suppresses an id already in the delivered registry, and a
-    successful send clears the pending row in the same write. A row younger than
-    ``_REPLAY_MIN_AGE_SEC`` is left alone — an ordinary send still working its
-    way through the event queue is not a lost answer — and each row gets a
-    BOUNDED number of replays so an unreachable chat cannot turn the outbox into
-    a tick-rate retry storm.
+    Deferred work uses the same outbox and exact id; queued originals keep bus membership.
+    Lost sends keep the age/backoff/attempt cap; a strict receipt retires debt atomically.
+    Corruption is disclosed, never proof that no debt remains. Returns continued/replayed ids.
     """
-    # GR5-6: the replay lane is an enforcement read — a corrupt registry is
-    # disclosed through the typed corruption event, not read as "nothing owed".
     rows = pending_deliveries(drive_root, disclose_corruption=True)
+    from supervisor.events_chat_delivery import replay_deferred_deliveries
+    continued = replay_deferred_deliveries(drive_root, rows, event_queue=event_queue)
+    rows = [row for row in rows if not row.get("delivery_deferred")]
     # Cached Main debt goes through its settlement (supervisor queue): the canonical claim is its one retry clock.
     from ouroboros.terminal_projection import settle_terminal_projection
+    from ouroboros.install_identity import StoreForeign
     for task_id in sorted({str(r.get("task_id") or "") for r in rows if r.get("terminal_projection_token")} - {""}):
-        settle_terminal_projection(drive_root, task_id, event_queue=event_queue)
+        try:
+            settle_terminal_projection(drive_root, task_id, event_queue=event_queue)
+        except StoreForeign as exc:  # a copy's debt never stops this replay; the room shows it foreign
+            log.debug("Main delivery of %s retained: %s", task_id, exc)
     owed = [row for row in rows if not row.get("terminal_projection_token") and _replay_due(row)]
     if not owed:
-        return []
+        return continued
     if event_queue is None:
         try:
             from supervisor import workers
@@ -725,7 +727,7 @@ def replay_pending_deliveries(drive_root: Any, *, event_queue: Any = None) -> Li
             event_queue = workers.get_event_q(create=False)
         except Exception:
             log.warning("terminal-delivery replay could not reach the event queue", exc_info=True)
-            return []
+            return continued
     spent = [row for row in owed if _replay_attempts(row) >= _PENDING_MAX_REPLAYS]
     if spent:
         # The cap is reached: the debt TRANSITIONS to exhausted (payload kept, copy
@@ -739,7 +741,7 @@ def replay_pending_deliveries(drive_root: Any, *, event_queue: Any = None) -> Li
             _retire_exhausted(drive_root, done)
         owed = [row for row in owed if row not in spent]
     if not owed:
-        return []
+        return continued
     replayed: List[str] = []
     for row in owed:
         did = str(row.get("delivery_id") or "")
@@ -759,19 +761,15 @@ def replay_pending_deliveries(drive_root: Any, *, event_queue: Any = None) -> Li
         # retries while the message already stands in the queue).
         _bump_replay_attempts(drive_root, replayed)
         log.info("Replayed %d undelivered terminal answer(s): %s", len(replayed), replayed)
-    return replayed
+    return continued + replayed
 
 
 def _put_unless_outstanding(event_queue: Any, event: Dict[str, Any]) -> Optional[bool]:
-    """Enqueue a replay copy only when the bus holds no copy of this delivery id.
+    """Atomically enqueue only with proven absent delivery membership (INTERFACES I1).
 
-    The bus (``supervisor/event_observation.py``, INTERFACES I1) counts every
-    ``send_message`` put by delivery id from the put until the consumer's handler
-    finished — the worker's original included. True: enqueued, the one attempt that
-    counts. False: a copy is still queued or being handled; nothing is enqueued or
-    counted. None: unobservable (a bus without membership, a proxy error): nothing is
-    enqueued or counted either — unknown is not "lost"; the next sweep and the boot
-    replay on a fresh bus generation cover it.
+    The bus holds each id from put through physical handler completion. True spends
+    one retry; False means queued/in-flight; None means missing/broken observation.
+    Neither refusal spends a retry; the next sweep or fresh boot bus can retry.
     """
     put = getattr(event_queue, "put_unless_outstanding", None)
     if put is None:
@@ -1127,6 +1125,7 @@ def deliver_miss_lane_outcome(
             )
             return owed
         from ouroboros.observability import preserved_salvage_path
+        from supervisor.cancel_publication import stop_notice_outcome
 
         _note, text, path = salvage_cancelled_output(
             pathlib.Path(drive_root), task_drive, task_id,
@@ -1141,16 +1140,15 @@ def deliver_miss_lane_outcome(
         # GR4-1: the owed registration happens FIRST so its result is
         # observable; the shared seam below re-registers idempotently (and
         # records the typed handoff row when there is no lineage chat).
+        outcome = stop_notice_outcome(row.get("cancel_origin"))
         event = build_unreviewed_salvage_event(
-            pathlib.Path(drive_root), row, task_id, outcome="cancelled",
+            pathlib.Path(drive_root), row, task_id, outcome=outcome,
             salvaged_text=text, preserved_path=path, settled_status="cancelled",
             unreconciled_runs=list(unreconciled_runs or []),
         )
-        owed = True
-        if event is not None:
-            owed = register_pending_delivery(pathlib.Path(drive_root), event)
+        owed = True if event is None else register_pending_delivery(pathlib.Path(drive_root), event)
         deliver_unreviewed_salvage(
-            pathlib.Path(drive_root), row, task_id, outcome="cancelled",
+            pathlib.Path(drive_root), row, task_id, outcome=outcome,
             salvaged_text=text, preserved_path=path,
             settled_status="cancelled", event_queue=event_queue,
             unreconciled_runs=list(unreconciled_runs or []),
@@ -1374,7 +1372,7 @@ def _persist_cancel_receipt(
 
 
 def record_cancel_receipt_delivery(
-    drive_root: Any, task_id: str, delivery_id: str, chat_id: int,
+    drive_root: Any, task_id: str, delivery_id: str, chat_id: int, *, strict: bool = False,
 ) -> None:
     """Record the actual sent destination on the matching existing receipt.
 
@@ -1392,6 +1390,8 @@ def record_cancel_receipt_delivery(
 
         patch_document(pathlib.Path(drive_root), task_id, _mutate)
     except Exception:
+        if strict:
+            raise
         log.debug("cancel-receipt delivery evidence failed for %s", task_id, exc_info=True)
 
 
@@ -1560,7 +1560,7 @@ def deliver_unreviewed_salvage(
     chat send with its ordinary formatting and transport behavior.
 
     ``unreconciled_runs`` names delegated runs the teardown could NOT settle
-    (engine unreachable): the owner is being told the task is cancelled, so a run
+    (engine unreachable): the owner is being told the task is stopped, so a run
     that may still be mutating the tree belongs in the same message.
     """
     event = build_unreviewed_salvage_event(

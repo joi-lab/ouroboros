@@ -5,20 +5,25 @@ Use `python -I -S scripts/safe_test.py --temp-parent /tmp -- <venv-python> -m py
 This stdlib launcher audits its environment helper before loading it, then prints
 the boundary before starting the command. It installs nothing and is not a sandbox.
 
-It never deletes the tree it creates. A command's descendants can outlive the
-command, and exit status is not proof that they are gone, so the launcher keeps
-the new root in place and prints its exact path (`SAFE_TEST_RETAINED`); whoever
-later proves the run's processes gone removes it. Retention is ordinary, not a
-failure: the exit status is the command's own.
+Stage two retains complete raw output and declared diagnostics, reaps the
+contained command, then releases declared reproducible test scratch on green
+and red. Unknown command data, debug and unconfirmed teardown stay in place.
+The last stderr line names the root once: `SAFE_TEST_RETAINED` or
+`SAFE_TEST_RELEASED` describes that path, not every process anywhere.
 
-`--timeout SECONDS` is a deadline that stops everything the command started, which
-`subprocess.run(timeout=)`, `perl -e 'alarm N; exec ...'` or killing the runner's PID
-do not: `node --test`, for one, keeps each test file in a child that outlives its
-runner. The command gets a session of its own; at the deadline its group and every
-descendant (captured first, whatever group it joined) get SIGTERM, SIGKILL ten
-seconds later, and the launcher exits 124 like GNU `timeout`. A SIGINT, SIGTERM or
-SIGHUP that stops the launcher stops the command the same way. Windows force-stops
-the tree at once with `taskkill /T`.
+`--timeout SECONDS` is a deadline for everything the command started, which
+`subprocess.run(timeout=)` or killing the runner's PID is not: `node --test`, for
+one, keeps each test file in a child that outlives its runner. At the deadline
+the attributed tree gets SIGTERM, ten seconds of grace, then the forced reap;
+the launcher exits 124 like GNU `timeout`. A first SIGINT, SIGTERM or SIGHUP is
+passed to stage two, which exits 128+signal; repeated signals never interrupt
+teardown. SIGTERM and SIGHUP stop the tree the same way. SIGINT first reaches
+only the command's root, which gets the ten seconds to export its results
+(pytest's JUnit and KeyboardInterrupt report; `scripts/run_tests.py` passes it on
+to its pytest within them); whatever remains, even once the root has exited,
+then gets SIGTERM, grace and the forced reap. Windows has no tree-wide SIGTERM:
+its kill-on-close Job stops the tree at once, and the console's Ctrl-C already
+reaches stage two, so nothing is forwarded there.
 """
 from __future__ import annotations
 
@@ -32,10 +37,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
-
-_KILL_AFTER_SECONDS = 10  # --timeout: from SIGTERM to SIGKILL
-_TIMEOUT_STATUS = 124  # GNU timeout's status for an expired deadline
 
 
 def _git_ancestor(path: Path):
@@ -46,90 +47,39 @@ def _git_ancestor(path: Path):
     return None
 
 
-def _descendants(root: int) -> list[int]:
-    """Every descendant of ``root`` in one ``ps`` snapshot, whatever process group it joined."""
-    try:
-        listing = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True,
-                                 timeout=10, check=True).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    children: dict[int, list[int]] = {}
-    for line in listing.splitlines():
-        fields = line.split()
-        if len(fields) == 2 and fields[0].isdigit() and fields[1].isdigit():
-            children.setdefault(int(fields[1]), []).append(int(fields[0]))
-    found: list[int] = []
-    frontier = [root]
-    while frontier:
-        for child in children.get(frontier.pop(), ()):
-            if child not in found:
-                found.append(child)
-                frontier.append(child)
-    return found
+def _wait_owning(argv: list[str], repo: Path, env: dict) -> int:
+    """Start stage two and wait for it; a first POSIX stop signal is passed on, never acted on here."""
+    received: list[int] = []
+    supervisor = None
 
+    def forward(signum, _frame):
+        # Windows Popen.send_signal(SIGINT) is invalid; that console's Ctrl-C reached stage two itself.
+        if not received:
+            received.append(signum)
+            if supervisor is not None and os.name != "nt":
+                try:
+                    supervisor.send_signal(signum)
+                except OSError:
+                    pass  # Already gone: its own exit status says how.
 
-def _signal_all(group: int, members: list[int], signum: int) -> None:
-    for send, target in ((os.killpg, group), *((os.kill, pid) for pid in members)):
-        try:
-            send(target, signum)
-        except OSError:  # already gone, or no longer ours to signal
-            pass
-
-
-def _exists(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        pass  # EPERM: it exists, but is not ours
-    return True
-
-
-def _stop(process: subprocess.Popen) -> None:
-    """Stop the command's group and every descendant. The tree is captured before the first
-    signal: a parent that dies first orphans its children, and a test may have moved them
-    into groups of their own (``tests/group_run.py``)."""
-    if os.name == "nt":  # a console tree has no group SIGTERM
-        subprocess.call(["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    else:
-        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            signal.signal(signum, signal.SIG_IGN)  # a second signal must not abandon a half-stopped tree
-        members = _descendants(process.pid)
-        _signal_all(process.pid, members, signal.SIGTERM)
-        grace = time.monotonic() + _KILL_AFTER_SECONDS
-        while time.monotonic() < grace and (process.poll() is None or any(map(_exists, members))):
-            time.sleep(0.1)
-        late = _descendants(process.pid) if process.poll() is None else []
-        _signal_all(process.pid, members + late, signal.SIGKILL)
-    process.wait()
-
-
-def _call_with_deadline(command: list[str], repo: Path, env: dict, seconds: float) -> int:
-    """``subprocess.call`` whose deadline, or a signal that stops the launcher, stops the whole tree."""
-    if os.name == "nt":
-        process = subprocess.Popen(command, cwd=repo, env=env,
-                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
-    else:
-        process = subprocess.Popen(command, cwd=repo, env=env, start_new_session=True)
-        for signum in (signal.SIGTERM, signal.SIGHUP):  # the command's own session no longer gets them
-            signal.signal(signum, lambda received, _frame: sys.exit(128 + received))
-    try:
-        return process.wait(timeout=seconds)
-    except subprocess.TimeoutExpired:
-        print(f"SAFE_TEST_TIMEOUT after {seconds:g}s: stopping the command and every process it started",
-              file=sys.stderr, flush=True)
-        _stop(process)
-        return _TIMEOUT_STATUS
-    except BaseException:  # Ctrl-C, or SIGTERM/SIGHUP turned into SystemExit above
-        _stop(process)
-        raise
+    stops = ([signal.SIGINT] if os.name == "nt"
+             else [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+    for signum in stops:
+        signal.signal(signum, forward)
+    if received:  # A stop before stage two existed: nothing to run or tear down.
+        return 128 + received[0]
+    supervisor = subprocess.Popen(argv, cwd=repo, env=env)
+    if received and os.name != "nt":
+        supervisor.send_signal(received[0])  # Arrived while Popen was starting it.
+    code = supervisor.wait()  # Handlers return, so PEP 475 resumes this wait.
+    return code if code >= 0 else 128 - code
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--temp-parent", type=Path)
+    parser.add_argument("--evidence-dir", type=Path, help="persistent parent for a fresh evidence directory")
+    parser.add_argument("--keep", action="store_true", help="retain the complete scratch environment for debugging")
     parser.add_argument("--timeout", type=float, metavar="SECONDS",
                         help="stop the command and every process it started after SECONDS; exit 124")
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -160,6 +110,14 @@ def main() -> int:
     if ancestor is not None:
         # The same hazard one level up: any enclosing checkout, not only this one.
         parser.error(f"--temp-parent must not be inside a Git working tree ({ancestor})")
+    # Importing ouroboros runs its pending-adoption hook. Verification must not
+    # accidentally switch the source checkout before loading stage two.
+    git_dir = repo / ".git"
+    if git_dir.is_file():
+        target = git_dir.read_text(encoding="utf-8").removeprefix("gitdir:").strip()
+        git_dir = (repo / target).resolve()
+    if (git_dir / "ouroboros-body-adoption").exists():
+        parser.error("source checkout has a pending body adoption; finish it before verification")
     # Short on purpose: server sockets live several levels below this root and
     # macOS caps an AF_UNIX path at 104 bytes.
     root = Path(tempfile.mkdtemp(prefix="ob-", dir=parent)).resolve()
@@ -167,9 +125,14 @@ def main() -> int:
         env = boundary(root, repo, keep=(
             "OUROBOROS_RUN_UI_SMOKE", "OUROBOROS_EXPECT_BROWSER_ENGINES",
             "OUROBOROS_PREFLIGHT_TEST_WORKERS", "OUROBOROS_PREFLIGHT_SERIAL",
-            "PLAYWRIGHT_BROWSERS_PATH", "OUROBOROS_E2E_DEEP", "OUROBOROS_UI_EVIDENCE_DIR",
+            # CI requires these test dependencies; without them a missing plugin or Node skips.
+            "OUROBOROS_PREFLIGHT_REQUIRE_PLUGINS", "OUROBOROS_PREFLIGHT_REQUIRE_NODE",
+            "PLAYWRIGHT_BROWSERS_PATH", "OUROBOROS_E2E_DEEP",
+            # Opt-in native Windows desktop qualification (tests/test_windows_computer_use_native.py).
+            "OUROBOROS_WINDOWS_DESKTOP_QA",
+            "OUROBOROS_TEST_EVIDENCE_ROOT", *environment["DIAGNOSTIC_OUTPUT_KEYS"],
         ))
-        # Each pytest controller claims its own fresh basetemp beneath this retained
+        # Each pytest controller claims its own fresh basetemp beneath this owned
         # root (tests/conftest.py): pytest deletes an EXISTING --basetemp, so no two
         # invocations — e.g. run_tests.py's two passes — may ever share one.
         env["OUROBOROS_TEST_TEMP_ROOT"] = str(root)
@@ -178,11 +141,27 @@ def main() -> int:
               or key.startswith("OUROBOROS_")}), flush=True)
         # Complete environment replacement reaches the interpreter BEFORE site,
         # plugins, conftest or any application module can import.
-        if args.timeout is None:
-            return subprocess.call(command, cwd=repo, env=env)
-        return _call_with_deadline(command, repo, env, args.timeout)
+        bootstrap = (
+            "import sys; sys.dont_write_bytecode=True; "
+            "sys.path.insert(0, sys.argv[1]); "
+            "from ouroboros.safe_test_supervisor import main; "
+            "raise SystemExit(main(sys.argv[2], sys.argv[1], sys.argv[6:], "
+            "evidence_parent=sys.argv[3] or None, keep=sys.argv[4]=='1', "
+            "timeout=float(sys.argv[5]) if sys.argv[5] else None))"
+        )
+        return _wait_owning(
+            [sys.executable, "-I", "-S", "-c", bootstrap, str(repo), str(root),
+             str(args.evidence_dir.resolve()) if args.evidence_dir else "", "1" if args.keep else "0",
+             repr(args.timeout) if args.timeout is not None else "", *command],
+            repo, env,
+        )
     finally:
-        print(f"SAFE_TEST_RETAINED {root}", file=sys.stderr, flush=True)
+        # The one final line: stage two has ended (or never started), so this
+        # describes the root as it is now. A failed stderr cannot change the status.
+        try:
+            print(f"SAFE_TEST_{'RETAINED' if root.exists() else 'RELEASED'} {root}", file=sys.stderr, flush=True)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

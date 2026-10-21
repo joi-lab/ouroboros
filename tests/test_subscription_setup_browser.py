@@ -16,6 +16,7 @@ from tests.test_onboarding_complete_endpoint import (
     LIVE_SNAPSHOT, _profile, _profile_account,
     onboarding as onboarding,  # explicit re-export of the real atomic settings fixture
 )
+from tests.ui_chat_viewport_smoke import wait_drawer_closed
 
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 WEB = Path(__file__).resolve().parents[1] / "web"
@@ -352,7 +353,7 @@ def test_settings_accounts_and_model_roles_use_the_same_compact_components(subsc
     assert main.locator('input').first.evaluate('(el) => getComputedStyle(el).fontSize') == '14px'
     capture(page, 'settings-models-desktop')
     page.set_viewport_size({'width': 390, 'height': 844})
-    page.wait_for_function("() => document.querySelector('#primary-sidebar').getBoundingClientRect().right <= 1")
+    wait_drawer_closed(page)
     assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
     capture(page, 'settings-models-narrow')
 

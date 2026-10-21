@@ -70,7 +70,7 @@ test('Show details hydrates retention on the real finished card and live retry c
         const card = walkCard(globalThis.document.byId.get('chat-messages'), id);
         assert.equal(card.dataset.finished, '1');
         assert.doesNotMatch(card.querySelector('[data-live-meta]').innerHTML, /history/i);
-        const toggle = () => card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+        const toggle = () => card.querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
         if (card.dataset.expanded === '1') toggle();
         toggle();
         assert.equal(card.dataset.expanded, '1');

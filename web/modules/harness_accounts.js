@@ -506,6 +506,19 @@ function daemonBaseStatusLine(payload, { checking = false, reads = null } = {}) 
         const gap = gapNames ? `${capitalize(gapNames)} were not read` : 'The status answer did not complete';
         return { tone: 'warn', text: `${gap}${daemon.last_error ? `: ${daemon.last_error}` : ''}. Claudexor ${target} is staged and activates after the daemon next restarts.` };
     }
+    // A LOWER pin never activates: planned restarts keep the newer engine, and
+    // after it stops the older one may refuse data the newer one served. The
+    // same facet gate decides whether the line may say what is serving.
+    if (runtimeState === 'newer_serving') {
+        const pinned = runtime.target_version || '?';
+        const refusal = `After a Restart, Panic or engine exit, ${pinned} may refuse data a newer engine served.`;
+        if (!unread.length) {
+            return { tone: 'warn', text: `Engine ${daemon.engine_version || '?'} keeps serving; this Ouroboros version pins older Claudexor ${pinned}. ${refusal}` };
+        }
+        const gap = gapNames ? `${capitalize(gapNames)} were not read` : 'The status answer did not complete';
+        const pinNote = `Last observed engine ${daemon.engine_version || '?'}. This Ouroboros version pins older Claudexor ${pinned}. ${refusal}`;
+        return { tone: 'warn', pinNote, text: `${gap}${daemon.last_error ? `: ${daemon.last_error}` : ''}. ${pinNote}` };
+    }
     if (status === 'running') {
         // A REAL refusal (a read that was made and did not land) demotes the
         // green line: "ready" would be an overclaim about the facets. A gap
@@ -837,7 +850,8 @@ function faultOutranksReassurance(service, note) {
     if (GENERIC_FACET_NOTE_YIELDS.has(note.tone) && serviceSpeaksFirst) {
         return { tone: service.tone, text: service.text };
     }
-    return { tone: note.tone, text: note.text };
+    // A failed facet owns its diagnosis, not the separate lower-pin warning.
+    return { tone: note.tone, text: `${note.text}${service?.pinNote ? ` ${service.pinNote}` : ''}` };
 }
 
 export function serviceBannerLine(store, { wakeError = '', wakeBusy = false } = {}) {

@@ -524,9 +524,10 @@ def test_nested_precheck_near_expiry_keeps_the_outer_publication_deadline(tmp_pa
 
 
 @pytest.mark.parametrize("reservation_race", [2], indirect=True)
-def test_dispatch_reacquisition_refreshes_attempt_and_billing(tmp_path, monkeypatch, reservation_race):
-    from ouroboros.task_results import write_task_result
-
+def test_dispatch_reacquisition_refreshes_the_attempt_after_a_custody_write(tmp_path, monkeypatch, reservation_race):
+    """A custody write that lands while the dispatch waits out a publication moves the reserved row's
+    revision; the reacquired dispatch transitions that CURRENT row, keeping the write, and sends once.
+    (The billing it sends under is the binding as recorded: no owner amendment overlays it any more.)"""
     held, _, _ = reservation_race
     prepared, sent = [], []
 
@@ -539,18 +540,12 @@ def test_dispatch_reacquisition_refreshes_attempt_and_billing(tmp_path, monkeypa
             assert row["state"] == "reserved"
             assert view.record_recovery(attempt_id, {"observation": "during_publication"},
                                         expected_revision=row["revision"])
-        write_task_result(tmp_path, ROOT, "running", acceptance_root_cap_amendments=[{
-            "accounting_root_task_id": ROOT, "source_identity": "amended",
-            "source_ref": "owner-message", "recorded_at": OLD_TS, "new_cap_usd": 0.5,
-        }])
         _publish(tmp_path)
 
     def send():
         [row] = ua.read_usage_records(tmp_path)
         assert row["state"] == "dispatched" and row["revision"] == 3
         assert row["recovery"] == {"observation": "during_publication"}
-        assert row["root_limit_usd"] == row["billing_group_limit_usd"] == 0.5
-        assert row["root_limit_revision"] == row["billing_group_limit_revision"] == "amended"
         sent.append(row["attempt_id"])
         return {"usage": {"cost": 0.02}}
 

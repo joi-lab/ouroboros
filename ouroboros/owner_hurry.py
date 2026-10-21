@@ -18,14 +18,12 @@ This module owns everything hurry-specific so the pinned surfaces
   ``supervisor/workers.py`` crash-requeue);
 - the non-chat ``owner_hurry`` event family (phases requested | applied |
   effect | not_applied, always ``is_progress=False``);
-- the effective acceptance-pacing overlay (remaining improvement passes -> 0)
-  and the task-local advisory plan-review projection.
+- the task-local advisory plan-review projection.
 
-Effects are HOST RAILS only: skip the next otherwise-eligible acceptance
-panel (typed reason ``owner_hurry``), zero remaining improvement passes, and a
-task-local advisory reading of an open force-plan gate. Commit triad/scope,
-advisory pre-review, deterministic P3 gates, and safety NEVER consult hurry
-(§19.7.2 item 10); no global setting is read or written.
+Effects are HOST RAILS only: a task-local advisory reading of an open
+force-plan gate. Commit triad/scope, advisory pre-review, deterministic P3
+gates, and safety NEVER consult hurry (§19.7.2 item 10); no global setting is
+read or written.
 """
 
 from __future__ import annotations
@@ -41,11 +39,10 @@ from ouroboros.store import StoreError
 
 log = logging.getLogger(__name__)
 
-# The finite typed acceptance-skip reason (§19.7.2 item 8) — SSOT in
-# ``outcomes.py`` beside the acceptance-decision vocabulary. Deliberately NOT a
-# member of outcomes.ACCEPTANCE_BYPASS_REASON_BY_RAIL, lifecycle vocabulary,
-# truncation vocabulary, or BEST_EFFORT_REASON_CODES: hurry is an owner-approved
-# acceptance-skip/detail fact, never a forced-rail or lifecycle reason.
+# The finite typed hurry reason (§19.7.2 item 8) every hurry block and event names —
+# SSOT in ``outcomes.py``, where older task records also read it. Deliberately NOT a
+# member of lifecycle vocabulary, truncation vocabulary, or BEST_EFFORT_REASON_CODES:
+# hurry is an owner-approved detail fact, never a forced-rail or lifecycle reason.
 from ouroboros.outcomes import (  # noqa: E402
     REASON_ACCEPTANCE_SKIPPED_OWNER_HURRY as REASON_OWNER_HURRY,
 )
@@ -214,11 +211,6 @@ def record_applied(
         log.debug("owner_hurry applied projection write failed for %s", task_id, exc_info=True)
 
 
-def record_effect(drive_root: Any, task_id: str, *, attempt: int, effect: str, value: str) -> None:
-    """Record one named effect status on the current block — fail-soft."""
-    record_applied(drive_root, task_id, attempt=attempt, effects={effect: value})
-
-
 def reconcile_terminal(drive_root: Any, task_id: str) -> bool:
     """task_done reconciliation: a still-``requested`` block lost the terminal
     race and is honestly ``not_applied_before_terminal`` — never a successful
@@ -340,8 +332,6 @@ def apply_latch(ctx: Any, entry: Dict[str, Any], *, event_queue: Any = None) -> 
     record_applied(
         root, task_id, attempt=attempt,
         effects={
-            "improvement_passes": "zeroed_for_attempt",
-            "task_acceptance": "skip_next_panel",
             "plan_review": "task_local_advisory",
         },
     )
@@ -361,87 +351,8 @@ def _canonical_root(ctx: Any) -> Optional[pathlib.Path]:
 
 
 # ---------------------------------------------------------------------------
-# Effects: acceptance pacing overlay, acceptance skip, plan-review projection
+# Effects: plan-review projection
 # ---------------------------------------------------------------------------
-
-def effective_budget_profile(ctx: Any, profile: Any) -> Any:
-    """The acceptance-pacing overlay (§19.7.2 item 7).
-
-    While the latch is armed, EVERY production acceptance-pacing read resolves
-    an effective profile with an explicit ``max_improvement_passes=0`` — the
-    real ``improvement_pass_allowed`` call and the remaining-pass display/rails
-    consume the same object. The immutable ``task_contract.budget_profile`` is
-    never mutated; unlatched tasks get the input back unchanged.
-    """
-    if latched(ctx) is None:
-        return profile
-    if isinstance(profile, dict):
-        # An explicit cap is authoritative under EVERY policy in
-        # ``task_pacing.effective_max_improvement_passes`` — including
-        # Required+Blocking, whose implicit local loop is otherwise bounded only
-        # by the shared review-cycle cap (or unbounded when that is unlimited).
-        return {**profile, "max_improvement_passes": 0}
-    return profile
-
-
-def acceptance_skip_decision(ctx: Any) -> Optional[Dict[str, Any]]:
-    """The typed skip for the next otherwise-eligible acceptance panel.
-
-    Returns None when no latch is armed; otherwise the exact
-    ``_set_acceptance_decision`` payload (§19.7.2 item 8). The caller marks the
-    host panel complete for this attempt and launches ZERO reviewer calls; a
-    physically in-flight panel is neither cancelled nor relabeled.
-    """
-    if latched(ctx) is None:
-        return None
-    return {
-        "status": "finalized_unaccepted",
-        "reason": REASON_OWNER_HURRY,
-        "source": REASON_OWNER_HURRY,
-        "rationale": (
-            "Owner requested acceleration (hurry): the next otherwise-eligible "
-            "acceptance panel is skipped for this attempt with zero reviewer calls."
-        ),
-    }
-
-
-def acceptance_skip_applied(
-    ctx: Any,
-    llm_trace: Dict[str, Any],
-    *,
-    task_id: str,
-    drive_root: Any,
-    set_decision: Callable[[Dict[str, Any], Dict[str, Any]], Any],
-    emit_progress: Callable[[str], None],
-) -> bool:
-    """Consume an armed latch at the ONE acceptance launch site (loop.py).
-
-    Extracted from ``loop._run_task_acceptance_review_once`` (byte offset for
-    the pinned ``loop.py``). Marks the host panel complete for this attempt,
-    stamps the typed trace decision through the caller-supplied
-    ``set_decision`` seam, records the durable effect, and reports the skip via
-    progress. Returns False untouched when no latch is armed.
-    """
-    skip = acceptance_skip_decision(ctx)
-    if skip is None:
-        return False
-    ctx._task_acceptance_reviewed = True
-    llm_trace["review_decision"].update(
-        {"trigger": "owner_hurry", "skipped": "owner_hurry"},
-    )
-    set_decision(llm_trace, skip)
-    from ouroboros.acceptance_history import seed_acceptance_history
-    seed_acceptance_history(ctx, llm_trace, REASON_OWNER_HURRY)
-    root = getattr(ctx, "budget_drive_root", "") or drive_root
-    if root:
-        record_effect(
-            root, task_id,
-            attempt=attempt_key(getattr(ctx, "task_attempt", None)),
-            effect="task_acceptance", value="skipped_owner_hurry",
-        )
-    emit_progress("Task acceptance review skipped: owner requested acceleration (hurry).")
-    return True
-
 
 def _plan_facts(ctx: Any) -> tuple[Dict[str, Any], Dict[str, Any], bool]:
     """``(record, legacy, unreadable)``: the task's plan record, the read-only projection of

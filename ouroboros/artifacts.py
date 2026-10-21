@@ -10,13 +10,13 @@ import stat
 import pathlib
 import re
 import shutil
-import uuid
 import zipfile
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Dict, Iterable, List, Optional, Union
 
+from ouroboros.artifact_storage import clone_file, temporary_sibling
 from ouroboros.utils import atomic_write_json, read_json_dict, update_json_locked, write_bytes_atomic
 from ouroboros.headless import ARTIFACT_STATUS_FAILED, ARTIFACT_STATUS_READY, SCRATCH_MANIFEST_NAME, task_artifacts_dir
 from ouroboros.outcome_receipt_store import is_verification_receipts_path
@@ -764,6 +764,7 @@ def read_task_result_source_bytes(
     review = result.get("review_projection")
     panels = review.get("panels") if isinstance(review, dict) else []
     refs = [row.get("applied_source_ref") for row in (panels if isinstance(panels, list) else []) if isinstance(row, dict)]
+    # completion observations, and the historical source an older record's acceptance debt pinned (read-only)
     for key in ("completion_observations", "acceptance_debt"):
         if isinstance(value := result.get(key), dict):
             refs.append(value.get("source_ref"))
@@ -791,134 +792,6 @@ def persist_exact_text_source(
             "status": "source_unavailable",
             "reason": f"{type(exc).__name__}: {exc}",
         }
-
-
-def persist_tool_trajectory_source(
-    drive_root: Union[pathlib.Path, str], task_id: str, tool_calls: Any,
-) -> Dict[str, Any]:
-    """Persist the complete redacted tool-call corpus behind acceptance views."""
-    try:
-        from ouroboros.observability import redact_projection
-
-        calls = [dict(call) for call in (tool_calls or []) if isinstance(call, dict)]
-        projected = redact_projection(calls).value
-        data = json.dumps(projected, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
-        stored_ref = store_actor_source_bytes(
-            drive_root, task_id, category="tool_results",
-            source_id="acceptance_tool_trajectory", data=data, extension="json",
-        )
-        path = str(stored_ref["path"])
-        return {
-            **stored_ref,
-            "reader": "read_file",
-            "artifact_ref": f"artifact_store:{path}#chars=0-{len(data.decode('utf-8'))}",
-        }
-    except Exception:
-        log.warning("acceptance tool trajectory source persistence failed", exc_info=True)
-        return {}
-
-
-def collect_exact_repo_diff(repo: Any, *, include_recent_commit: bool = False) -> str:
-    """Project the unbounded, hook-disabled repository diff of ONE bytes capture.
-
-    The text is the decoded, REDACTED projection of `repo_diff_capture`, not a
-    second read of the tree, and it carries the capture's own gap disclosure: an
-    unreadable or partially captured repository reads as a stated gap, never as
-    a clean (empty) diff. The EXACT bytes stay with the capture, which this
-    legacy text-only path releases once projected.
-    """
-    from ouroboros.repo_diff_capture import capture_repo_diff, repo_diff_projection_text
-
-    if not repo:
-        return ""
-    capture = capture_repo_diff(repo, include_recent_commit=include_recent_commit)
-    try:
-        return repo_diff_projection_text(capture)
-    finally:
-        capture.release()
-
-
-def materialize_repo_diff_evidence(
-    repo: Any, drive_root: Any, task_id: str, *, limit: int = 20000,
-    include_recent_commit: bool = False, capture: Any = None,
-) -> tuple[str, Dict[str, Any]]:
-    """Return a redacted exact diff or a typed cannot-verify projection.
-
-    ``capture`` is the ALREADY-TAKEN bytes capture of this acceptance round: the
-    packet preview and this exact source must describe the same tree, so the
-    second independent `git` read is gone. A caller without one (a direct/legacy
-    call) still gets its own single capture.
-
-    Two identities leave here, and they are not interchangeable: the EXACT bytes
-    are retained privately (`retain_private_capture`, never returned to a
-    reviewer, a log, an export or a download), and the redacted TEXT projection
-    is what the packet and the actor-readable source handle carry.
-    """
-    from ouroboros.repo_diff_capture import (
-        capture_disclosure, capture_repo_diff, repo_diff_projection, retain_private_capture,
-    )
-    from ouroboros.utils import truncate_review_artifact
-
-    if capture is None:
-        capture = capture_repo_diff(repo, include_recent_commit=include_recent_commit)
-    # Decoded and redacted WHOLE by the projection, before any bound below.
-    try:
-        redacted, decode_gaps = repo_diff_projection(capture)
-        disclosure = capture_disclosure(capture, decode_gaps)
-    except BaseException:
-        capture.release()
-        raise
-    meta: Dict[str, Any] = {"capture_disclosure": disclosure}
-    # Host-private forensics; deliberately NOT part of the evidence packet. Every
-    # exact-source materialization streams the bytes it projected into the
-    # private CAS (spooled sections included, so a source past the memory
-    # ceiling is kept whole), and the packet SAYS whether that happened rather
-    # than letting a digest imply a retention that never took place.
-    private_ref = retain_private_capture(drive_root, capture)
-    if private_ref.get("blob_ref"):
-        meta["private_source_ref"] = private_ref
-    disclosure["raw_retained"] = bool(private_ref.get("blob_ref"))
-    if private_ref.get("status") == "unavailable":
-        disclosure["raw_retention"] = {"status": "unavailable", "reason": "private capture retention failed"}
-    if not capture.available:
-        # An unreadable repository is unknown, never a clean tree.
-        meta.update(complete=False, issue={
-            "tool": "repo_diff", "status": "source_unavailable",
-            "reason": "repo_diff_capture_unavailable", "source_ref": {},
-            "gaps": disclosure["gaps"],
-        })
-        return redacted, meta
-    if not redacted:
-        meta.update(complete=False, issue={
-            "tool": "repo_diff", "status": "source_unavailable",
-            "reason": "partial_repo_diff_without_exact_source", "source_ref": {},
-        })
-        return "", meta
-    if len(redacted) <= limit and disclosure["complete"]:
-        meta["complete"] = True
-        return redacted, meta
-    if drive_root is not None and str(task_id or ""):
-        # The generic exact-text source writer is unchanged: it persists the
-        # REDACTED projection for the actor/reviewer, never the raw bytes.
-        exact, source_ref, issue = persist_exact_text_source(
-            drive_root, str(task_id), source_id="acceptance_repo_diff", text=redacted,
-        )
-        if exact:
-            meta.update(complete=disclosure["complete"], source_ref=source_ref)
-            if not disclosure["complete"]:
-                meta["issue"] = {"tool": "repo_diff", "status": "partial_source_gaps",
-                                 "reason": "repo_diff_capture_gaps", "source_ref": source_ref,
-                                 "gaps": disclosure["gaps"]}
-            return exact, meta
-        meta.update(complete=False, source_ref=source_ref, issue={
-            "tool": "repo_diff", **issue, "source_ref": source_ref,
-        })
-        return truncate_review_artifact(redacted, limit=limit), meta
-    meta.update(complete=False, issue={
-        "tool": "repo_diff", "status": "source_unavailable",
-        "reason": "partial_repo_diff_without_task_source_ref", "source_ref": {},
-    })
-    return truncate_review_artifact(redacted, limit=limit), meta
 
 
 def _matching_projection(drive_root: Any, call: Dict[str, Any]) -> Dict[str, Any]:
@@ -1227,17 +1100,28 @@ def stream_artifact_file(path: Any, sink: Any = None, *, expected: Any = None) -
 
 def copy_artifact_file(source: Any, destination: pathlib.Path, *, expected: Any = None) -> Dict[str, Any]:
     """Publish a verified file copy atomically; preserve any prior bytes on failure. Inside a
-    ``task_custody.publication_fence`` a closed generation starts no copy."""
-    source_path = pathlib.Path(source) if isinstance(source, (str, os.PathLike)) else None
-    destination = pathlib.Path(destination)
+    ``task_custody.publication_fence`` a closed generation starts no copy. A block-sharing clone
+    (``artifact_storage``) is taken where the filesystem gives one, its own bytes verified; else streamed."""
+    source_path, destination = (pathlib.Path(source) if isinstance(source, (str, os.PathLike)) else None), pathlib.Path(destination)
     if source_path is not None and not destination.is_symlink() and source_path.resolve(strict=False) == destination.resolve(strict=False):
         return stream_artifact_file(source, expected=expected)
     fence_publication()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{uuid.uuid4().hex}.tmp")
+    temporary = temporary_sibling(destination)  # the atomic signature the temp sweep reaps after a hard kill
+    from ouroboros.store import is_sqlite_file, is_wal_index  # a store file streams: a clone opens and closes it
+
     try:
-        with temporary.open("xb") as sink:
-            measured = stream_artifact_file(source, sink, expected=expected)
+        if (source_path is not None and not is_sqlite_file(source_path) and not is_wal_index(source_path)
+                and clone_file(source_path, temporary)):
+            try:
+                measured = stream_artifact_file(temporary, expected=expected)
+            except ArtifactIdentityError:
+                # Retention watches the source's stable failure, never a disposable clone's inode.
+                stream_artifact_file(source_path, expected=expected)
+                raise
+        else:
+            with temporary.open("xb") as sink:
+                measured = stream_artifact_file(source, sink, expected=expected)
         if source_path is not None:
             shutil.copystat(source_path, temporary)
         temporary.replace(destination)
@@ -1247,13 +1131,9 @@ def copy_artifact_file(source: Any, destination: pathlib.Path, *, expected: Any 
 
 
 def artifact_record(path: pathlib.Path, *, kind: str = "task_artifact", source_path: str = "") -> Dict[str, Any]:
-    record: Dict[str, Any] = {
-        "kind": kind, "name": pathlib.Path(path).name, "path": str(path),
-        **stream_artifact_file(path), "status": ARTIFACT_STATUS_READY, "errors": [],
-    }
-    if source_path:
-        record["source_path"] = source_path
-    return record
+    return {"kind": kind, "name": pathlib.Path(path).name, "path": str(path),
+            **stream_artifact_file(path), "status": ARTIFACT_STATUS_READY, "errors": [],
+            **({"source_path": source_path} if source_path else {})}
 
 
 def store_task_artifact_bytes(
@@ -1269,7 +1149,7 @@ def store_task_artifact_bytes(
         raise ValueError("task artifact name is reserved")
     artifact_dir = task_artifact_dir_path(drive_root, task_id, create=True)
     path = artifact_dir / safe_name
-    temporary = path.with_name(f".{uuid.uuid4().hex}.tmp")
+    temporary = temporary_sibling(path)
 
     def publish(_current):
         try:
@@ -1278,11 +1158,10 @@ def store_task_artifact_bytes(
             if (exc.errno not in {errno.EEXIST, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EPERM, errno.EXDEV, errno.ENOSYS}
                     and getattr(exc, "winerror", None) != 50):
                 raise
-            if path.exists():
-                if path.read_bytes() != data:
-                    raise ValueError(f"task artifact collision: {safe_name}")
-            else:
+            if not path.exists():
                 temporary.replace(path)
+            elif path.read_bytes() != data:
+                raise ValueError(f"task artifact collision: {safe_name}")
     try:
         write_bytes_atomic(temporary, data)
         update_json_locked(artifact_dir / _ARTIFACT_MANIFEST, publish)
@@ -1290,8 +1169,7 @@ def store_task_artifact_bytes(
         temporary.unlink(missing_ok=True)
     record = {**artifact_record(path, kind=kind), "immutable": True}
     _register_task_artifact_records(artifact_dir, [record])
-    return {"root": "artifact_store", "path": safe_name, "sha256": record["sha256"],
-            "bytes": record["size"], "kind": kind}
+    return {"root": "artifact_store", "path": safe_name, "sha256": record["sha256"], "bytes": record["size"], "kind": kind}
 
 
 def _register_task_artifact_records(artifact_dir: pathlib.Path, records: Iterable[Dict[str, Any]]) -> None:
@@ -1452,10 +1330,15 @@ def copy_directory_to_task_artifacts(
         members = sorted(p for p in iter_artifact_tree(source) if p.is_file() and not p.is_symlink())
     else:
         members = sorted(pathlib.Path(p) for p in member_paths)
+    from ouroboros.store import is_wal_index  # shared memory no raw reader opens; a copy rebuilds its own
+
+    indexes = [p for p in members if is_wal_index(p)]
+    excluded = [{"path": os.path.relpath(p, source).replace(os.sep, "/"), "reason": "SQLite WAL index"} for p in indexes]
+    members = [p for p in members if p not in indexes]
     file_records: List[Dict[str, Any]] = []
     tree_hasher = sha256(str(source).encode("utf-8", errors="replace") + b"\0")
-    tmp_zip_path = artifact_dir / f".directory.{uuid.uuid4().hex}.tmp"
-    tmp_ledger_path = artifact_dir / f".directory.{uuid.uuid4().hex}.json.tmp"
+    tmp_zip_path = temporary_sibling(artifact_dir / "directory.zip")
+    tmp_ledger_path = temporary_sibling(artifact_dir / "directory.json")
     try:
         with zipfile.ZipFile(tmp_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for path in members:
@@ -1482,6 +1365,7 @@ def copy_directory_to_task_artifacts(
                 "source_path": str(source),
                 "file_count": len(file_records),
                 "files": file_records,
+                **({"excluded": excluded} if excluded else {}),
                 "zip_name": zip_path.name,
             },
             trailing_newline=True,
@@ -1491,8 +1375,7 @@ def copy_directory_to_task_artifacts(
     except Exception:
         for tmp_path in (tmp_zip_path, tmp_ledger_path):
             try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
+                tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
         raise
@@ -1566,7 +1449,6 @@ def collect_task_artifact_records(
 
 def merge_artifact_records(*groups: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     merged: Dict[str, Dict[str, Any]] = {}
-    order: List[str] = []
     for group in groups:
         for item in group:
             if not isinstance(item, dict):
@@ -1575,7 +1457,6 @@ def merge_artifact_records(*groups: Iterable[Dict[str, Any]]) -> List[Dict[str, 
             if not key:
                 continue
             if key not in merged:
-                order.append(key)
                 merged[key] = dict(item)
                 continue
             existing = merged[key]
@@ -1594,4 +1475,4 @@ def merge_artifact_records(*groups: Iterable[Dict[str, Any]]) -> List[Dict[str, 
                     merged[key][meta_key] = existing[meta_key]
             if existing.get("name") and fresh.get("kind") == "task_artifact":
                 merged[key]["name"] = existing["name"]
-    return [merged[key] for key in order]
+    return list(merged.values())

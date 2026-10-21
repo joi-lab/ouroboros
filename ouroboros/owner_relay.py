@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 
 from ouroboros.chat_chain import format_address, row_address
+from ouroboros.context_budget import OWNER_WORDS_KIND
 
 KIND_RELAY = "relay_entry"
 
@@ -43,7 +44,11 @@ def held_owner_messages(ctx) -> dict:
         from ouroboros.project_dialogue import resolve_owner_message_source
         from ouroboros.tool_access import canonical_data_root
         if ref := metadata.get("origin_message_ref"):
-            row = resolve_owner_message_source(canonical_data_root(ctx), ref)
+            from ouroboros.store import StoreError
+            try:
+                row = resolve_owner_message_source(canonical_data_root(ctx), ref)
+            except StoreError:  # its archive is still importing: nothing held yet, never a failed turn
+                row = None
             if _owner_row(row):
                 held[format_address(row_address(row))] = row
         persist_held_state(ctx)
@@ -155,7 +160,7 @@ def inject_relay(ctx, entry: dict, messages: list) -> None:
         if row.get("attachments"):
             body += "\n[Host-retained attachments]\n" + json.dumps(row["attachments"], ensure_ascii=False)
         content = quote_content(ctx, entry, row, body)
-        loop._append_or_merge_user_message(messages, content, slot=ctx)
+        loop._append_or_merge_user_message(messages, content, slot=ctx, kind=OWNER_WORDS_KIND)
     note = str(entry.get("text") or "")
     relay = entry["relay"]
     loop._append_or_merge_user_message(messages,
@@ -234,24 +239,14 @@ def publish_relay(root, target: str, entry: dict, bridge, task=None) -> None:
     """One target chat row, even after an append-before-receipt crash."""
     from supervisor.message_ingress import _INGRESS_LOCK
     from supervisor.message_bus import log_chat
+    from ouroboros import dialogue_store
     from ouroboros.chat_references import projection_fields
-    from ouroboros.chat_chain import chat_chain_paths
     facts = relay_target_facts(root, target, task)
     with _INGRESS_LOCK:
-        stored = None
-        for path in chat_chain_paths(root):
-            if not path.exists():
-                continue
-            for line in path.read_text(encoding="utf-8").splitlines():
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if row.get("client_message_id") == entry["msg_id"] and row.get("type") == KIND_RELAY:
-                    stored = row
-                    break
-            if stored:
-                break
+        # The saved row of this relay id, by its indexed client id: an append-before-receipt crash
+        # finds it here (a relay saved before the upgrade, once its archive segment is imported).
+        stored = next((dict(found.row) for found in dialogue_store.rows_by_client_id(root, entry["msg_id"])
+                       if found.row.get("type") == KIND_RELAY), None)
         if stored is None:
             stored = log_chat("out", facts["project_chat_id"], 0, entry["text"], ts=entry["ts"],
                               task_id=target, record_type=KIND_RELAY, client_message_id=entry["msg_id"],

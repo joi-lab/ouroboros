@@ -490,7 +490,7 @@ def _install_model_operation_fake(stack: contextlib.ExitStack, recorder: _Record
     gateway.lose_create = bool(spec.get("lose_model_create_reply"))
     gateway.pending = bool(spec.get("cancel_model_after_create"))
     recorder.model_gateway = gateway
-    stack.enter_context(mock.patch.object(llm_claudexor, "ensure_owned_gateway", lambda: gateway))
+    stack.enter_context(mock.patch.object(llm_claudexor, "ensure_owned_gateway", lambda **_kw: gateway))
 
 
 # ---------------------------------------------------------------------------

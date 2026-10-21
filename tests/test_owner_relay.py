@@ -1,5 +1,4 @@
 """A relay's authority follows exact retained owner rows, independently of lane."""
-import json
 import queue
 from types import SimpleNamespace
 
@@ -7,15 +6,16 @@ import pytest
 
 from ouroboros.chat_chain import format_address, row_address
 from ouroboros.owner_relay import held_owner_messages, quote_rows, write_relay, select_return
+from ouroboros import dialogue_store
 from ouroboros.loop_round_limits import _drain_incoming_messages
 from ouroboros.owner_mailbox import drain_owner_entries
-from ouroboros.utils import append_jsonl
+from tests import _dialogue as dialogue_test
 
 
 def source(tmp_path):
     row = {"chat_id": 1, "direction": "in", "ts": "2026-10-01T00:00:00Z", "text": "  exact\nowner words  ",
            "client_message_id": "owner-1", "attachments": []}
-    append_jsonl(tmp_path / "logs/chat.jsonl", row)
+    dialogue_store.append(tmp_path, "chat", row)
     return row, format_address(row_address(row))
 
 
@@ -83,8 +83,7 @@ def test_cross_room_paused_target_keeps_mail_without_resuming_and_dedupes_genera
     assert q.ACCEPTANCE_FENCES["receiver"]["owner_message_generation"] == 3
     assert ctx.PENDING == [target] and target["_owner_hold"] is True
     assert len(drain_owner_entries(tmp_path, "receiver")) == 1
-    rows = [json.loads(line) for line in (tmp_path / "logs/chat.jsonl").read_text(encoding="utf-8").splitlines()]
-    relays = [r for r in rows if r.get("type") == "relay_entry"]
+    relays = [r for r in dialogue_test.chat_rows(tmp_path) if r.get("type") == "relay_entry"]
     assert len(relays) == 1 and relays[0]["text"] == "note"
     assert relays[0]["relay"]["text"] == row["text"]
 

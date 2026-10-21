@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { NodeStub, countPropertyWrites, fixture, turn, WS_MSG } from './chat_decision_fixture.js';
+// The head's shared status mark (web/modules/status_mark.js): [shape, hue, hidden].
+const markOf = (card) => { const mark = card.querySelector('.chat-quiz-mark'); return [mark.dataset.shape, mark.dataset.hue, mark.hidden]; };
 test('targeted detail preserves normalized option details, single-flight, and the existing answer form', async () => {
     let calls = 0;
     const block = { ...WS_MSG, options: ['Yes', 'No'], option_details: ['Immediate release', 'Wait for CI'], asked_at: WS_MSG.ts };
@@ -42,6 +44,7 @@ test('closing a native card with its × keeps focus on the question, not the pag
         assert.equal(card.dataset.state, 'closed');
         assert.equal(card.querySelector('.chat-quiz-close'), null, 'the × leaves with the settled state');
         assert.equal(document.activeElement, card.querySelector('.chat-quiz-question'));
+        assert.deepEqual(markOf(card), ['dot', 'ink', false], 'a closed question wears the head\'s disabled ink');
     } finally { fx.restore(); }
 });
 
@@ -122,10 +125,12 @@ test('required question renders waiting identically from live and stored frames'
         const live = { ...WS_MSG, quiz_id: 'required-live', wait_for_answer: true, assumption: '' };
         const card = fx.decision.buildQuizCard(live);
         assert.match(card.querySelector('.chat-quiz-assumption').textContent, /Waiting for your answer/);
+        assert.deepEqual(markOf(card), ['dot', 'owner', false], 'the owner\'s amber dot while the task waits');
         const stored = { task_id: 't-1', text: live.question, quiz: { ...live, quiz_id: 'required-replay' } };
         const replay = fx.decision.buildQuizCard(stored);
         assert.equal(replay.querySelector('.chat-quiz-assumption').textContent,
                      card.querySelector('.chat-quiz-assumption').textContent);
+        assert.deepEqual(markOf(replay), markOf(card));
     } finally { fx.restore(); }
 });
 
@@ -139,12 +144,15 @@ test('required waiting copy ends when the answer settles, including history repl
         assert.equal(card.dataset.state, 'answered');
         assert.equal(card.querySelector('.chat-quiz-assumption'), null);
         assert.ok(card.querySelectorAll('.chat-quiz-option').every((btn) => btn.disabled));
+        assert.deepEqual(markOf(card), ['dot', 'ok', false]);
+        const hues = { answered: 'ok', expired_terminal: 'neutral', superseded: 'ink' };
         for (const state of ['answered', 'expired_terminal', 'superseded']) {
             const replay = fx.decision.buildQuizCard({
                 task_id: 't-1', text: required.question,
                 quiz: { ...required, state, wait_for_answer: false, wait_ended_at: "earlier", quiz_id: `closed-${state}` },
             });
             assert.equal(replay.querySelector('.chat-quiz-assumption'), null);
+            assert.deepEqual(markOf(replay), ['dot', hues[state], false], state);
         }
     } finally { fx.restore(); }
 });
@@ -159,6 +167,7 @@ test('quiz card renders full anatomy from a WS frame', () => {
         assert.match(card.querySelector('.chat-quiz-stake').textContent, /At stake: release timing/);
         assert.match(card.querySelector('.chat-quiz-assumption').textContent, /Continuing meanwhile: continuing with the merge/);
         assert.equal(card.querySelector('.chat-quiz-status-text').textContent, 'Unanswered');
+        assert.deepEqual(markOf(card), ['dot', 'neutral', false], 'no wait evidence, no amber');
         const buttons = card.querySelectorAll('.chat-quiz-option');
         assert.equal(buttons.length, 2);
         assert.equal(buttons[1].querySelector('.chat-quiz-option-detail').textContent, 'wait for CI');
@@ -220,6 +229,7 @@ test('a required card that outlived its task stops claiming the task is waiting'
         assert.equal(card.querySelector('.chat-quiz-wait'), null);
         assert.ok(card.querySelector('.chat-quiz-comment'));
         assert.ok(card.querySelectorAll('.chat-quiz-option').every((btn) => !btn.disabled));
+        assert.deepEqual(markOf(card), ['dot', 'neutral', false], 'answerable, but nothing waits for the owner');
     } finally { fx.restore(); }
 });
 
@@ -654,6 +664,7 @@ test('an actionable refusal renders the picker card; other statuses fall back to
         const card = bubble.querySelector('.chat-routing-card');
         assert.ok(card);
         assert.equal(card.dataset.state, 'open');
+        assert.deepEqual(markOf(card), ['dot', 'owner', false], 'a destination only the owner can choose is the owner\'s move');
         const buttons = card.querySelectorAll('.chat-quiz-option');
         assert.equal(buttons.length, 2);
         assert.equal(buttons[0].querySelector('.chat-quiz-option-label').textContent, 'Fix CI');
@@ -738,6 +749,20 @@ test('a routing click posts the routing decision id with a STABLE request id', a
         assert.ok(body.request_id);
         assert.equal(card.dataset.state, 'answered');
         assert.ok(card.querySelectorAll('.chat-quiz-option')[1].classList.contains('chosen'));
+        assert.deepEqual(markOf(card), ['dot', 'ok', false]);
+    } finally { fx.restore(); }
+});
+
+test('a superseded routing card keeps the head\'s disabled ink', async () => {
+    const fx = fixture({ fetchImpl: async () => ({ ok: false, status: 409, json: async () => ({ state: 'superseded' }) }) });
+    try {
+        const bubble = routingBubble('cm-6');
+        fx.decision.renderRoutingDecision(bubble, ROUTING_ANNOTATION);
+        const card = bubble.querySelector('.chat-routing-card');
+        card.querySelectorAll('.chat-quiz-option')[0].click();
+        await turn();
+        assert.equal(card.dataset.state, 'superseded');
+        assert.deepEqual(markOf(card), ['dot', 'ink', false]);
     } finally { fx.restore(); }
 });
 
@@ -854,17 +879,20 @@ test('a bounded wait that closed stops saying waiting while the card stays answe
         const card = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-w', wait_for_answer: true });
         const quizCard = card;
         assert.match(quizCard.querySelector('.chat-quiz-wait').textContent, /Waiting for your answer/);
+        assert.deepEqual(markOf(quizCard), ['dot', 'owner', false]);
         const root = { querySelector: (sel) => (sel.includes('qz-w') ? quizCard : null) };
         const applied = fx.decision.applyQuizStateFrame(root, { quiz_id: 'qz-w', task_id: 't-1', state: 'open', wait_for_answer: false });
         assert.equal(applied, true);
         assert.equal(quizCard.querySelector('.chat-quiz-wait'), null);
         assert.match(quizCard.querySelector('.chat-quiz-assumption').textContent, /wait ended/);
         assert.equal(quizCard.dataset.state, 'open');
+        assert.deepEqual(markOf(quizCard), ['dot', 'neutral', false], 'the bound closed: no longer the owner\'s move');
         // History replay renders the ended wait from the projection (wait_ended_at, no wait_for_answer).
         const replayed = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-r', wait_ended_at: '2026-08-31T10:05:00Z' });
         const rcard = replayed;
         assert.match(rcard.querySelector('.chat-quiz-assumption').textContent, /wait ended/);
         assert.equal(rcard.querySelector('.chat-quiz-wait'), null);
+        assert.deepEqual(markOf(rcard), ['dot', 'neutral', false]);
     } finally { fx.restore(); }
 });
 
@@ -874,11 +902,15 @@ test('reconciling a replayed row into an existing card projects the closed bound
         const card = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-m', wait_for_answer: true });
         const quizCard = card;
         assert.match(quizCard.querySelector('.chat-quiz-wait').textContent, /Waiting for your answer/);
+        const mark = quizCard.querySelector('.chat-quiz-mark');
+        assert.deepEqual(markOf(quizCard), ['dot', 'owner', false]);
         // The owner was disconnected during the timeout: no frame arrived, history replays the row
         // with the closed bound and reconciles it into the SAME card.
         assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-m', wait_ended_at: '2026-08-31T10:05:00Z' }), null);
         assert.equal(quizCard.querySelector('.chat-quiz-wait'), null);
         assert.match(quizCard.querySelector('.chat-quiz-assumption').textContent, /wait ended/);
+        assert.deepEqual(markOf(quizCard), ['dot', 'neutral', false]);
+        assert.equal(quizCard.querySelector('.chat-quiz-mark'), mark, 'the same mark is repainted, never replaced');
     } finally { fx.restore(); }
 });
 

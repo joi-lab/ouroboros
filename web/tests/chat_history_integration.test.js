@@ -117,15 +117,16 @@ test('R3 a terminal census before first history preserves source narration and i
     const card = walkCard(f.messages, progress.task_id);
     assert.ok(card);
     assert.equal(card.querySelector('[data-live-title]').textContent, text);
-    assert.equal(card.querySelector('[data-live-phase]').textContent, 'Cancelled');
-    assert.equal(card.querySelector('[data-live-phase]').dataset.motion, '0');
+    assert.equal(card.querySelector('[data-live-phase]').textContent, 'Stopped');
+    const mark = card.querySelector('[data-live-phase]').firstElementChild;
+    assert.deepEqual([mark.dataset.shape, mark.dataset.hue], ['dot', 'neutral'], 'Stopped is a neutral dot, nothing moves');
     assert.equal(card.dataset.finished, '1');
     assert.equal(card.dataset.ts, String(Date.parse(progress.ts)));
     assert.ok(markup.some(value => value.includes(text) && value.includes('chat-live-line')), 'the retained source row is rendered');
     assert.ok(f.messages.children.indexOf(card) < f.messages.children.findIndex(node => node.dataset.historyId === 'chat:12'));
     await f.refresh();
     assert.equal(walkCard(f.messages, progress.task_id), card);
-    assert.equal(card.querySelector('[data-live-phase]').textContent, 'Cancelled', 'replay without a terminal row keeps the known census outcome');
+    assert.equal(card.querySelector('[data-live-phase]').textContent, 'Stopped', 'replay without a terminal row keeps the known census outcome');
 });
 
 // One saved message and nothing else: every page below it is empty down to the

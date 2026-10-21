@@ -834,6 +834,8 @@ def handle_worker_quiescent(event: dict, ctx: Any) -> None:
                 and _births_agree(slot.process_birth, event.get("process_birth"))
                 and event.get("token") == slot.quiescence_token and slot.quiescence_token):
             slot.quiescence_confirmed = True
+            # Best-effort dialogue rows it still holds: counted lost only if this slot is retired.
+            slot.quiescence_retained_rows = max(0, int(event.get("retained_rows") or 0))
 
 
 def retire_quiescent_worker(slot: Any) -> bool:
@@ -895,8 +897,10 @@ def reap_idle_worker(job: dict) -> None:
     with _WORKER_LIFECYCLE_LOCK:
         outcome = _idle_retirement_current(job, slot) and retire_or_replace_worker(slot.wid, slot)
     if outcome:
+        lost = int(getattr(slot, "quiescence_retained_rows", 0) or 0)
         _supervisor_row({"type": "worker_retired", "worker_id": slot.wid, "pid": _slot_pid(slot), "token": job["token"],
-                         "process_birth": slot.process_birth, "replaced": outcome == "replaced"})
+                         "process_birth": slot.process_birth, "replaced": outcome == "replaced",
+                         **({"dialogue_rows_lost": lost} if lost else {})})
 
 
 @_serialized_worker_lifecycle

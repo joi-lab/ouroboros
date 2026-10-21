@@ -10,6 +10,7 @@ from ouroboros.chat_chain import format_address, row_address
 from ouroboros.gateway.control import api_command
 from ouroboros.gateway.ws import ws_endpoint
 from supervisor import message_bus
+from tests import _dialogue as dialogue_test
 from tests.test_ws_ingress_off_loop import bridge, _OpenSocket  # noqa: F401
 
 
@@ -32,7 +33,7 @@ def test_http_reply_resolves_and_rejects_client_authored_previews(bridge):  # no
         client_message_id="http-reply", ts="2026-10-01T00:00:00Z")
     assert metadata_read_by_consumer["reply_reference"]["address"] == address
     assert item["task_metadata"]["reply_reference"]["snippet"] == "Earlier answer"
-    rows = [json.loads(line) for line in (bridge.drive / "logs/chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = dialogue_test.chat_rows(bridge.drive)
     assert len(rows) == 2 and rows[-1]["reply_to"]["address"] == address
 
 

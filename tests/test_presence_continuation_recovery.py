@@ -63,7 +63,7 @@ def test_terminal_record_is_not_reclassified_by_an_author_witness(status):
 def test_every_continuation_work_state_preserves_independent_child_discovery(status, record):
     row = {"status": status, "presence_continuation": record}
     code, body = pc.work_view(row, "author")
-    assert code == (202 if status == "running" else 200)
+    assert code == (200 if status in {"completed", "failed", "cancelled"} else 202)  # ended-ness: retained_work_view
     assert body["work_ref"] == body["continuation_ref"] == "author"
     assert body["child_work_ref"] == "work-late"
 

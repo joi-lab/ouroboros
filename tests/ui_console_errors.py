@@ -4,11 +4,13 @@ The direct-mode UI fixture runs no Claudexor engine. Since #1670 the Accounts se
 the engine's program inventory once at boot (`web/modules/harness_accounts.js` `_init`), and
 the host answers with its typed refusal, 503 (docs/architecture/06-agent-core.md "Vendor
 program maintenance": inspection never starts an engine). The page shows "Program inspection
-unavailable"; only the browser's own network line reaches the console. Nothing else is set aside.
+unavailable"; only the browser's own network line reaches the console. Nothing else is set aside,
+apart from the one WebKit page error ``PageErrors`` names.
 """
 
 from __future__ import annotations
 
+import re
 from urllib.parse import urlsplit
 
 ENGINE_READS = frozenset({"/api/claudexor/maintenance/harnesses"})
@@ -45,3 +47,77 @@ def unexpected_console_errors(console_errors, failed_loads) -> list[str]:
         if match is not None:
             left.remove(match)
     return [text for text, _source in left]
+
+
+_WEBKIT_OWN_FETCH = re.compile(r"^(?:Fetch API cannot load )?(\S+) due to access control checks\.$")
+
+
+def _origin(url: str) -> tuple[str, str, int] | None:
+    try:
+        parts = urlsplit(url)
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            return None
+        port = parts.port if parts.port is not None else (443 if parts.scheme == "https" else 80)
+        return parts.scheme, parts.hostname, port
+    except ValueError:
+        return None
+
+
+def _fetch_origin(error, text: str) -> tuple[str, str, int] | None:
+    match = _WEBKIT_OWN_FETCH.fullmatch(text)
+    if not match:
+        return None
+    url = match.group(1)
+    # Playwright's WebKit splitErrorMessage splits at the first colon, consuming
+    # the following character too: "Fetch API cannot load http://host/..." becomes
+    # name="Fetch API cannot load http", message="/host/...". Recover the scheme
+    # from that name, never from the page (which could be on a different scheme).
+    name = re.fullmatch(r"(?:Fetch API cannot load )?(https?)", getattr(error, "name", "") or "")
+    if name and url.startswith("/"):
+        url = name.group(1) + ":/" + url
+    return _origin(url)
+
+
+class _PageError(str):
+    """One recorded page error's text, carrying its own verdict: a list operation that moves,
+    removes or clears entries can never hand an exemption to another error."""
+
+    own_fetch = False
+
+
+class PageErrors(list):
+    """Every uncaught page error as text, recorded from ``page`` once constructed.
+
+    ``unexpected()`` sets aside one engine artifact (#1468). WebKit reports a fetch of the page's
+    OWN origin that it could not complete (cancelled or never sent because a navigation unloaded
+    the document, or refused while a test restarts the server) as "<url> due to access control
+    checks.", even when the page caught it. Only that text for the current committed
+    HTTP(S) origin (scheme, host and port) is set aside, at the time the error arrives.
+    Before a navigation commits, this is still the document being left; earlier visited
+    origins are not exemptions. A delayed cancellation from a different origin after
+    commit still counts. The text cannot prove cancellation, so another same-origin
+    error with exactly this engine wording is indistinguishable; pageerror supplies no
+    initiating-frame/request identity. If Playwright split
+    the URL, its error name must supply the scheme; an ambiguous bare URL counts."""
+
+    def __init__(self, page, engine: str) -> None:
+        super().__init__()
+        self._webkit = engine == "webkit"
+        self._origin = _origin(page.main_frame.url)
+        page.on("pageerror", self._record)
+
+        def committed(frame):
+            if frame == page.main_frame:
+                self._origin = _origin(frame.url)
+
+        page.on("framenavigated", committed)
+
+    def _record(self, error) -> None:
+        entry = _PageError(str(error))
+        entry.own_fetch = (self._webkit and self._origin is not None
+                           and _fetch_origin(error, entry) == self._origin)
+        self.append(entry)
+
+    def unexpected(self) -> list[str]:
+        """Every entry but the set-aside ones; an entry this class did not record counts."""
+        return [str(text) for text in self if not getattr(text, "own_fetch", False)]

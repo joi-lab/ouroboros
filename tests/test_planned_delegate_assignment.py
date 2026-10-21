@@ -30,7 +30,8 @@ pytestmark = pytest.mark.serial
 def prepared(host, tmp_path, monkeypatch, request):  # noqa: F811
     import ouroboros.claudexor_daemon as daemon
 
-    scoped, timed = request.param if isinstance(request.param, tuple) else (request.param, False)
+    options = request.param if isinstance(request.param, tuple) else (request.param, False)
+    scoped, timed = options[:2]
     if timed:
         from datetime import datetime, timezone
         import time
@@ -74,6 +75,18 @@ def prepared(host, tmp_path, monkeypatch, request):  # noqa: F811
     atomic_write_json(host.root / "state/delegate_supervision/child1.json", {
         "schema": 1, "run_id": "run-1", "status": "sleeping", "journal_cursor": 7,
     })
+    if len(options) > 2 and options[2] == "resumed":
+        from ouroboros.budget_pause import STATE_RESUMED, set_budget_pause
+
+        # The loop has consumed its explicit Resume and is now supervising run-1.
+        grant = {"grant_id": "spent-resume", "authority": "explicit_resume", "generation": 1,
+                 "consumed_at": "2026-10-20T00:00:00Z", "selected_by": "owner"}
+        source = {"path": "saved-source", "sha256": "a" * 64}
+        set_budget_pause(host.root, "child1", {"state": STATE_RESUMED, "pause_id": "prior-pause",
+            "source_ref": source, "grant": grant, "task_attempt": 1, "resume_generation": 1})
+        task["_budget_pause_resume"] = {"pause_id": "prior-pause", "grant_id": "spent-resume",
+            "source_ref": source, "authority": "explicit_resume", "grant_generation": 1,
+            "pause": {"exact_continuation": True, "checkpoint": {"pause_id": "prior-pause"}}}
     selected = recovery.prepare_planned_restart_handoffs(host.root, host.running)
     assert selected == {"child1"}
     handoff = recovery._read(host.root, "child1")
@@ -82,7 +95,15 @@ def prepared(host, tmp_path, monkeypatch, request):  # noqa: F811
         preserve_running_task_ids=selected, reconcile_delegate_custody=False, archive_service_logs=False,
     )
     assert not process.is_alive() and not host.running
+    cleanups = [json.loads(line) for line in (host.root / "logs/supervisor.jsonl").read_text().splitlines()
+                if json.loads(line).get("type") == "zombie_prevention_cleanup"]
+    assert cleanups[-1]["preserved_successors"] == ["child1"]
     assert host.pending[0]["_attempt"] == handoff["new_attempt"]
+    if len(options) > 2:
+        assert host.pending[0]["_budget_pause_resume"]["grant_id"] == "spent-resume"
+        assert workers.kill_workers(terminal_status="cancelled", result_reason="Second stop door",
+                                    reconcile_delegate_custody=False, archive_service_logs=False)
+        assert len(host.pending) == 1
     assert queue.persist_queue_snapshot()
     monkeypatch.setattr(recovery.os, "getpid", lambda: handoff["supervisor_pid"] + 100_000)
     monkeypatch.setattr(recovery, "IS_WINDOWS", True)
@@ -98,7 +119,8 @@ def restore(case):
     assert case.host.pending[0]["_project_admission_restore_hold"]
 
 
-@pytest.mark.parametrize("prepared", [False, True], indirect=True, ids=["unscoped", "project"])
+@pytest.mark.parametrize("prepared", [False, True, (False, False, "resumed"), (True, False, "resumed")],
+                         indirect=True, ids=["unscoped", "project", "resumed-unscoped", "resumed-project"])
 @pytest.mark.parametrize("adopt_before_restore", [False, True], ids=["startup-order", "pre-adopted-snapshot"])
 def test_exact_planned_handoff_reaches_worker_once(prepared, monkeypatch, adopt_before_restore):
     from ouroboros.contracts.task_constraint import normalize_task_constraint
@@ -131,6 +153,45 @@ def test_exact_planned_handoff_reaches_worker_once(prepared, monkeypatch, adopt_
     assert result["status"] == "configured_session_started"
     assert result["recovery"]["status"] == "adopted" and result["run_id"] == "run-1"
     assert recovery._read(case.host.root, "child1")["status"] == "adopted"
+
+
+@pytest.mark.parametrize("prepared", [False, True], indirect=True)
+@pytest.mark.parametrize("reason", ["stale_queue_row_grant_consumed", "stale_resume_grant_superseded"])
+@pytest.mark.parametrize("basis", ["valid", "foreign", "unreadable"])
+def test_legacy_spent_hold_is_redecided_on_first_restore(prepared, monkeypatch, reason, basis):
+    from supervisor.events_budget import BUDGET_HOLD_KEY, budget_hold_fact, hold_budget_row, hold_selectable
+
+    case = prepared
+    task = case.host.pending[0]
+    hold_budget_row(task, reason=reason, extra={"pause_id": "prior-pause", "grant_id": "spent-resume"})
+    assert not hold_selectable(task, task[BUDGET_HOLD_KEY])
+    assert "_budget_pause_resume" not in task and "_budget_pause_consumed" not in task
+    path = recovery._path(case.host.root, "child1")
+    if basis == "foreign":
+        row = recovery._read(case.host.root, "child1")
+        row["new_attempt"] += 1
+        atomic_write_json(path, row)
+    elif basis == "unreadable":
+        path.write_text("{torn", encoding="utf-8")
+    assert queue.persist_queue_snapshot()
+    case.host.pending.clear()
+    count = queue.restore_pending_from_snapshot()
+    if basis == "foreign":
+        assert count == 0 and not case.host.pending
+        from ouroboros.cancel_intents import has_active_intent
+        assert has_active_intent(case.host.root, "child1")
+        return
+    assert count == 1
+    if basis == "unreadable":
+        assert budget_hold_fact(case.host.pending[0])["reason"] == reason
+        return
+    assert budget_hold_fact(case.host.pending[0]) is None
+    assert recovery.pre_adopt_planned_handoffs(case.host.root, case.host.pending) == {"child1"}
+    sent = worker(case.host, monkeypatch)
+    workers.assign_tasks()
+    workers.assign_tasks()
+    assert len(sent) == 1 and sent[0]["_attempt"] == case.handoff["new_attempt"]
+    assert custody.open_runs(case.host.root)[0].run_id == "run-1"
 
 
 @pytest.mark.parametrize("prepared", [False, True], indirect=True, ids=["unscoped", "project"])

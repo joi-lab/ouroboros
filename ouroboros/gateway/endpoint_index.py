@@ -56,6 +56,10 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/tasks/{task_id}/continue",
     "POST /api/tasks/{task_id}/resume",
     "POST /api/decisions",
+    "GET /api/cards/{card_id}",
+    "GET /api/cards/{card_id}/app",
+    "POST /api/cards/{card_id}/pin",
+    "DELETE /api/cards/{card_id}/pin",
     "GET /api/schedules",
     "POST /api/schedules",
     "POST /api/schedules/{schedule_id}/action",
@@ -72,6 +76,10 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/cost-breakdown",
     "GET /api/storage",
     "POST /api/storage/measure",
+    "POST /api/storage/measure/cancel",
+    "POST /api/storage/free/preview",
+    "POST /api/storage/free",
+    "POST /api/storage/free/cancel",
     "GET /api/evolution-data",
     "GET /api/projects",
     "POST /api/projects",
@@ -115,6 +123,8 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/extensions",
     "GET /api/extensions/{skill}/manifest",
     "GET /api/extensions/{skill}/module/{entry:path}",
+    "GET /api/extensions/{skill}/ui/{revision}/{path:path}",
+    "GET /api/ui/contributions",
     "GET /api/extensions/{skill}/settings_section",
     "ANY /api/extensions/{skill}/{rest:path}",
     "GET /api/skills/daemons",
@@ -127,18 +137,27 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/skills/{skill}/reconcile",
     "GET /api/marketplace/clawhub/search",
     "GET /api/marketplace/clawhub/installed",
+    "GET /api/marketplace/ouroboroshub/installed",
     "GET /api/marketplace/clawhub/info/{slug:path}",
     "GET /api/marketplace/clawhub/preview/{slug:path}",
     "POST /api/marketplace/clawhub/install",
     "POST /api/marketplace/clawhub/update/{name}",
     "POST /api/marketplace/clawhub/uninstall/{name}",
-    "GET /api/marketplace/ouroboroshub/catalog",
-    "GET /api/marketplace/ouroboroshub/installed",
-    "GET /api/marketplace/ouroboroshub/preview/{slug:path}",
-    "POST /api/marketplace/ouroboroshub/install",
-    "POST /api/marketplace/ouroboroshub/update/{name}",
-    "POST /api/marketplace/ouroboroshub/publication/{name}/clear",
-    "POST /api/marketplace/ouroboroshub/uninstall/{name}",
+    "POST /api/skills/{skill}/publication/clear",
+    "GET /api/skill-sources",
+    "POST /api/skill-sources",
+    "POST /api/skill-sources/probe",
+    "POST /api/skill-sources/my-skills",
+    "POST /api/skill-sources/{source_id}",
+    "POST /api/skill-sources/{source_id}/remove",
+    "POST /api/skill-sources/{source_id}/refresh",
+    "GET /api/skill-catalog",
+    "GET /api/skill-catalog/search",
+    "GET /api/skill-catalog/item/{source_id}/{name}",
+    "POST /api/skill-catalog/install",
+    "POST /api/skills/{skill}/update",
+    "POST /api/skills/{skill}/uninstall",
+    "GET /api/onboarding/starter-skills",
     # The wizard PAGE (one onboarding host: desktop setup window, blocking
     # overlay frame, plain browser). /api/onboarding stays the readiness probe.
     "GET /onboarding",
@@ -164,7 +183,7 @@ class Shape(NamedTuple):
 
     ``responses`` reads ``"200:TaskCreateResponse 400,409,503:ErrorResponse"``: statuses, then
     a body that is a contract TypedDict name (JSON), a media kind (``json`` = JSON whose shape is
-    not published, ``html``, ``sse``, ``file``, ``zip``, ``js``, ``empty``, ``any``), a kind with
+    not published, ``html``, ``text``, ``sse``, ``file``, ``zip``, ``js``, ``empty``, ``any``), a kind with
     the TypedDict its items follow (``sse/TaskEvent``), or alternatives joined by ``|``.
     ``request`` uses the same body words (plus ``multipart``); ``query`` names the parameters
     the handler reads and ``headers`` the request headers it reads (a ``!`` suffix: required).
@@ -188,6 +207,8 @@ _MAINTENANCE = "400,409,503:ClaudexorMaintenanceProblem"
 _CLAWHUB_ERRORS = "400,404,429,502:ErrorResponse"
 _INSTALL = "200:MarketplaceInstallResponse 400:MarketplaceInstallResponse|ErrorResponse 404,429:MarketplaceInstallResponse"
 _IN_LANE = "runs in the one skill lifecycle lane until it settles (watch GET /api/skills/lifecycle-queue)"
+_SOURCES_WRITE = "503:SettingsWriteRefusal"
+_INSTALL_REFUSAL = "404,409,429,502:SkillCatalogInstallResponse"
 _ENGINE = "relays the bundled Claudexor engine"
 
 HTTP_SHAPES: dict[str, Shape] = {
@@ -212,6 +233,7 @@ HTTP_SHAPES: dict[str, Shape] = {
     "POST /api/settings/secret": Shape("200:SettingsSecretResponse 400,404,409:ErrorResponse", "SettingsSecretRequest",
                                        note="reveals one stored secret, no-store; writes nothing"),
     "GET /api/ui/preferences": Shape("200:UiPreferencesResponse"),
+    "GET /api/ui/contributions": Shape("200:UiContributionsResponse", note="live contributions, offers and owner preferences; no-store"),
     "POST /api/ui/preferences": Shape("200:UiPreferencesResponse 400,503:ErrorResponse", "json"),
     "GET /api/ui/i18n": Shape("200:UiI18nResponse"),
     "POST /api/ui/i18n/language": Shape(
@@ -247,8 +269,9 @@ HTTP_SHAPES: dict[str, Shape] = {
         "409:SkillActionRefusal|ErrorResponse", "OwnerSkillPresenceRuntimeRequest",
         note="compare-and-set on expected_state_fingerprint (409 presence_state_conflict when it moved)"),
     "POST /api/skills/{skill}/publish-preflight": Shape(
-        "200,400,404,409,503:SkillPublishPreflightResponse",
-        note="read-only; every status carries the same shape; state hard_block is a refusal"),
+        "200,400,404,409,503:SkillPublishPreflightResponse", "SkillPublishPreflightRequest",
+        note="read-only; every status carries the same shape; state hard_block is a refusal; destination "
+             "{source_id, mode} picks where it would go (default: the skill's origin, else the hub)"),
     "GET /api/model-catalog": Shape("200:ModelCatalogResponse 400:ErrorResponse", query="source_id credential_profile_id",
                                     note="read-only; a provider that failed is an errors row, not a failed read"),
     "POST /api/providers/test": Shape("200:ProviderTestResponse 400:ErrorResponse", "ProviderTestRequest",
@@ -277,7 +300,13 @@ HTTP_SHAPES: dict[str, Shape] = {
                                               note="a budget-paused task; not idempotent: a repeat is refused"),
     "POST /api/decisions": Shape(
         "200,202:DecisionResponse 400,404:ErrorResponse 409:DecisionResponse|ErrorResponse 501,503:ErrorResponse",
-        "DecisionRequest", note="request_id is the idempotency key; the first answer wins"),
+        "DecisionRequest", note="request_id is the idempotency key; the first answer wins (a card press: unless once)"),
+    "GET /api/cards/{card_id}": Shape("200:CardResponse 404:ErrorResponse", note="read-only; the current body and presses"),
+    "GET /api/cards/{card_id}/app": Shape(
+        "200:text 404:ErrorResponse", note="the app's HTML as text/plain for a sandboxed srcdoc; never served as a page"),
+    "POST /api/cards/{card_id}/pin": Shape(
+        "200:CardPinResponse 404,409,503:ErrorResponse", note="component cards only; broadcasts extension_lifecycle"),
+    "DELETE /api/cards/{card_id}/pin": Shape("200:CardPinResponse 503:ErrorResponse", note="a repeat answers pinned false"),
     "GET /api/chat/history": Shape(
         "200,400,409,503:ChatHistoryResponse", query="chat_id cursor around n_human n_progress limit",
         note="an error page echoes the cursor sent, so the same request can be repeated"),
@@ -289,7 +318,7 @@ HTTP_SHAPES: dict[str, Shape] = {
                                 note="401 error_code auth_required: the git clone needs credentials (not the network gate)"),
     "POST /api/projects/from-task": Shape("200:ProjectFromTaskResponse 400,409,500:ErrorResponse", "ProjectFromTaskRequest",
                                           note="409: the task already belongs to another project"),
-    "POST /api/projects/{project_id}/update": Shape("200:ProjectUpdateResponse 400,404,500:ErrorResponse",
+    "POST /api/projects/{project_id}/update": Shape("200:ProjectUpdateResponse 400,404,409,500:ErrorResponse",
                                                     "ProjectUpdateRequest"),
     "POST /api/projects/{project_id}/delete": Shape("200:ProjectDeleteResponse 404,500:ErrorResponse"),
     "GET /api/fs/dirs": Shape("200:FsDirsResponse 400,403,404,500:ErrorResponse", query="path"),
@@ -311,6 +340,7 @@ HTTP_SHAPES: dict[str, Shape] = {
     "GET /api/extensions/{skill}/module/{entry:path}": Shape("200:js 400,404,409:ErrorResponse",
                                                             note="reviewed module text; host protocol: docs/WIDGET_HOST_PROTOCOL.md"),
     "GET /api/extensions/{skill}/settings_section": Shape("200:ExtensionSettingsSectionResponse 400:ErrorResponse"),
+    "GET /api/extensions/{skill}/ui/{revision}/{path:path}": Shape("200:any 404:empty", note="captured live ui assets; stale revisions are unavailable"),
     "ANY /api/extensions/{skill}/{rest:path}": Shape(
         "200:any 404,405,409,413,502:ErrorResponse", "any", note="the skill's own route, inside its own prefix"),
     "POST /api/skills/{skill}/toggle": Shape(f"200:SkillToggleResponse {_SKILL_REFUSAL}", "SkillToggleRequest",
@@ -328,23 +358,48 @@ HTTP_SHAPES: dict[str, Shape] = {
         f"200:MarketplaceSearchResponse {_CLAWHUB_ERRORS}",
         query="q query sort limit include_plugins official only_official cursor"),
     "GET /api/marketplace/clawhub/installed": Shape("200:MarketplaceInstalledResponse"),
+    "GET /api/marketplace/ouroboroshub/installed": Shape("200:MarketplaceInstalledResponse"),
     "GET /api/marketplace/clawhub/info/{slug:path}": Shape(f"200:MarketplaceSkillSummary {_CLAWHUB_ERRORS}"),
     "GET /api/marketplace/clawhub/preview/{slug:path}": Shape(f"200:ClawHubPreviewResponse {_CLAWHUB_ERRORS}",
                                                              query="version"),
     "POST /api/marketplace/clawhub/install": Shape(_INSTALL, "MarketplaceInstallRequest", note=_IN_LANE),
     "POST /api/marketplace/clawhub/update/{name}": Shape(_INSTALL, "MarketplaceUpdateRequest", note=_IN_LANE),
     "POST /api/marketplace/clawhub/uninstall/{name}": Shape("200,400:MarketplaceUninstallResponse", note=_IN_LANE),
-    "GET /api/marketplace/ouroboroshub/catalog": Shape("200:HubCatalogResponse 502:ErrorResponse", query="q query"),
-    "GET /api/marketplace/ouroboroshub/installed": Shape("200:MarketplaceInstalledResponse"),
-    "GET /api/marketplace/ouroboroshub/preview/{slug:path}": Shape("200:HubPreviewResponse 404:ErrorResponse"),
-    "POST /api/marketplace/ouroboroshub/install": Shape(
-        "200:MarketplaceInstallResponse 400,409:MarketplaceInstallResponse|ErrorResponse 502:MarketplaceInstallResponse",
-        "MarketplaceInstallRequest", note=f"install, or adopt a local copy; {_IN_LANE}"),
-    "POST /api/marketplace/ouroboroshub/update/{name}": Shape(
-        "200,400:MarketplaceInstallResponse 409:ErrorResponse", note=f"reads no body; {_IN_LANE}"),
-    "POST /api/marketplace/ouroboroshub/publication/{name}/clear": Shape(
-        "200:HubPublicationClearResponse 400,409:ErrorResponse", "HubPublicationClearRequest"),
-    "POST /api/marketplace/ouroboroshub/uninstall/{name}": Shape("200,400:MarketplaceUninstallResponse", note=_IN_LANE),
+    "POST /api/skills/{skill}/publication/clear": Shape(
+        "200:HubPublicationClearResponse 400,409:ErrorResponse", "HubPublicationClearRequest",
+        note="forgets the local receipt only; the pull request and the payload stay"),
+    "GET /api/skill-sources": Shape("200:SkillSourcesResponse 500:ErrorResponse"),
+    "POST /api/skill-sources": Shape(
+        f"200:SkillSourceChangeResponse 400:ErrorResponse|SkillSourceChangeResponse {_SOURCES_WRITE}",
+        "SkillSourceAddRequest", note="reads the address once before saving; a saved repository starts a background fetch"),
+    "POST /api/skill-sources/probe": Shape("200:SkillSourceProbeResponse 400:ErrorResponse", "SkillSourceProbeRequest",
+                                           note="read-only; the address is fetched into a scratch folder that is removed"),
+    "POST /api/skill-sources/my-skills": Shape("200,400,403,502:MySkillsResponse", "MySkillsRequest"),
+    "POST /api/skill-sources/{source_id}": Shape(
+        f"200:SkillSourceChangeResponse 400:ErrorResponse|SkillSourceChangeResponse {_SOURCES_WRITE}",
+        "SkillSourceChangeRequest", note="a trust change never rewrites an existing install"),
+    "POST /api/skill-sources/{source_id}/remove": Shape(
+        f"200,400:SkillSourceChangeResponse {_SOURCES_WRITE}", note="installed skills keep working"),
+    "POST /api/skill-sources/{source_id}/refresh": Shape("200:SkillSourceChangeResponse 404:ErrorResponse",
+                                                         note="starts a background fetch and answers at once"),
+    "GET /api/skill-catalog": Shape("200:SkillCatalogResponse 500:ErrorResponse", query="refresh",
+                                    note="local cache only; a stale cache or refresh=1 starts a background fetch"),
+    "GET /api/skill-catalog/search": Shape("200:SkillCatalogSearchResponse 500:ErrorResponse", query="q source",
+                                           note="registry (ClawHub) hits need the network; a failure is registry_error"),
+    "GET /api/skill-catalog/item/{source_id}/{name}": Shape(
+        "200:SkillCatalogItemDetailResponse 404,500:ErrorResponse",
+        note="a pointer entry's files are fetched at its exact commit"),
+    "POST /api/skill-catalog/install": Shape(
+        f"200:SkillCatalogInstallResponse 400:ErrorResponse|SkillCatalogInstallResponse {_INSTALL_REFUSAL}",
+        "SkillCatalogInstallRequest", note=f"answers the started job at once; {_IN_LANE}"),
+    "POST /api/skills/{skill}/update": Shape(
+        "200:SkillUpdateResponse 400:ErrorResponse|SkillUpdateResponse 404,409,429,502:SkillUpdateResponse",
+        "SkillUpdateRequest",
+        note=f"replace answers the started job; keep and merge answer when done; {_IN_LANE}"),
+    "POST /api/skills/{skill}/uninstall": Shape("200:SkillUninstallResponse 404,409:SkillUninstallResponse",
+                                                note=_IN_LANE),
+    "GET /api/onboarding/starter-skills": Shape("200:StarterSkillsResponse 500:ErrorResponse",
+                                                note="local data; may start a background fetch of the hub"),
     "GET /api/schedules": Shape("200:ScheduledTasksResponse 503:ErrorResponse"),
     "POST /api/schedules": Shape("200:ScheduleUpsertResponse 400,409:ErrorResponse", "ScheduleUpsertRequest"),
     "POST /api/schedules/{schedule_id}/action": Shape("200:ScheduleActionResponse 400:ErrorResponse",
@@ -369,8 +424,15 @@ HTTP_SHAPES: dict[str, Shape] = {
         note="200: inspect status (manual, assisted_started, restart_required, or ok with restarting); adoption requires the landed transaction/merge identity and running_sha after startup"),
     "GET /api/cost-breakdown": Shape("200:CostBreakdownResponse 503:ErrorResponse",
                                      note="503: the ledger is unavailable (accounting.available false); spend is unknown, not zero"),
-    "GET /api/storage": Shape("200:StorageResponse"),
-    "POST /api/storage/measure": Shape("202:StorageResponse"),
+    "GET /api/storage": Shape("200:StorageResponse", query="count",
+                              note="passive; ?count=<finished_at> omits a count the client already holds"),
+    "POST /api/storage/measure": Shape("202:StorageResponse", note="starts one count in a child, or joins the running one"),
+    "POST /api/storage/measure/cancel": Shape("202:StorageResponse", note="kills the running count; the saved count stays"),
+    "POST /api/storage/free/preview": Shape("202:StorageResponse",
+                                            note="a pure preview of what the retirers would remove now; a second preview joins"),
+    "POST /api/storage/free": Shape("202:StorageResponse", "StorageFreeRequest",
+                                    note="frees exactly the previewed items of the named groups; started/reason say whether it ran"),
+    "POST /api/storage/free/cancel": Shape("202:StorageResponse", note="stops the listing or the run; what was freed stays freed"),
     "GET /api/evolution-data": Shape("200:EvolutionDataResponse", query="force"),
     "POST /api/openai-compatible/models": Shape("200:OpenAICompatibleModelsResponse 400,502:ErrorResponse",
                                                 "OpenAICompatibleModelsRequest", note="lists {baseUrl}/models once; saves nothing"),
@@ -460,6 +522,8 @@ WS_SHAPES: dict[str, tuple[str, str]] = {
     "links": ("", "LinksOutbound"),
     "quiz": ("", "QuizOutbound"),
     "quiz_state": ("", "QuizStateOutbound"),
+    "card": ("", "CardOutbound"),
+    "card_state": ("", "CardStateOutbound"),
     "typing": ("", "TypingOutbound"),
     "log": ("", "LogOutbound"),
     "heartbeat": ("", "HeartbeatOutbound"),

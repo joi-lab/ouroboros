@@ -227,16 +227,17 @@ def _fail(message):
 
 
 @pytest.mark.serial
-@pytest.mark.parametrize("stage", ["gateway", "source", "checking", "budget"])
+@pytest.mark.parametrize("stage", ["gateway", "checking", "budget"])
 def test_a_refusal_raised_before_the_paid_stamp_is_never_a_reached_reviewer_on_the_organ(tmp_path, monkeypatch, fake_route, stage):  # noqa: F811
-    """03 P2's organ leg, after M1–M4: the gateway, source, checking and budget refusals used to
+    """03 P2's organ leg, after M1–M4: the gateway, checking and budget refusals used to
     settle as a performed-but-failed seat (live) and recover as UNKNOWN (cold), so a Swarm
     force_plan counted them as a reached reviewer. Both readings are now the positive
     not_dispatched; the organ's facts withdraw the dispatch flag; the record reads the ask as
-    attempted — disclosed, never held — and never as reached."""
+    attempted — disclosed, never held — and never as reached. (The session-source stage left
+    with task acceptance's retrieving source preparation.)"""
     from dataclasses import replace
 
-    from ouroboros import acceptance_retrieving, budget_pause, review_checking, review_execution, review_substrate, subagents
+    from ouroboros import budget_pause, review_checking, review_execution, review_substrate, subagents
     from ouroboros.tools.plan_ask import reply_facts_from_row
     from ouroboros.tools.plan_review_runtime import _plan_row_from_actor
     from tests._review_session_route_shared import FakeLLM, _agent_request, _agent_slot
@@ -246,8 +247,6 @@ def test_a_refusal_raised_before_the_paid_stamp_is_never_a_reached_reviewer_on_t
     slot = _agent_slot(session_access="readonly")
     if stage == "gateway":
         monkeypatch.setattr("ouroboros.claudexor_daemon.ensure_owned_gateway", _fail("gateway unavailable"))
-    elif stage == "source":
-        monkeypatch.setattr(acceptance_retrieving, "prepare_session_source", _fail("source unavailable"))
     elif stage == "checking":
         slot = replace(slot, session_access="workspace_write")
         monkeypatch.setattr(review_checking, "session_checking", _fail("checking unavailable"))

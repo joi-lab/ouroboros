@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 import tests.test_project_unread_opening_browser as opening
-from tests.test_project_unread_read_band_browser import _seed_room, _wait_for
+from tests.test_project_unread_read_band_browser import _seed_room, _unread, _wait_for
 from tests.test_ui_smoke_playwright import direct_server_with_data as direct_server_with_data
 from tests.ui_chat_viewport_smoke import _SETTLE_RESTORE_FRAMES, _emit_ws_frame
 
@@ -61,7 +61,7 @@ class _Race:
     def __init__(self, browser, server, monkeypatch, project_id, question=False):
         self.data, self.monkeypatch, self.project_id = server["data_dir"], monkeypatch, project_id
         self.candidate = server["candidate_identity"]
-        self.chat_id, _log, self.initial = _backlog(self.data, project_id)
+        self.chat_id, self.initial = _backlog(self.data, project_id)
         self.question = _question(self.data, project_id, self.chat_id) if question else None
         self.room = opening._Room(browser, server["url"], project_id, hold=5,
                                   init=(opening._read_receipts(LATEST),))
@@ -92,9 +92,9 @@ class _Race:
         self.room.page.on("response", record)
 
     def admit(self, kind="named"):
-        """``named``: 160 child words; the reconnect's fresh read names the reply. ``searched``: 610 (460
-        archived and long, the reviewed counterexample): its bounded search runs out first. ``arrived``:
-        160 child words read by a state refresh, whose read of the arrivals holds the reply."""
+        """``named``: 160 child words; the reconnect's fresh read names the reply. ``searched``: 1310, more
+        than the recent read's window and its search past it cover: its bounded search runs out first.
+        ``arrived``: 160 child words read by a state refresh, whose read of the arrivals holds the reply."""
         room = self.room
         room.open()
         assert _wait_for(room.page, lambda: len(room.held) == 1, attempts=250), room.older
@@ -104,8 +104,7 @@ class _Race:
         assert room.messages.locator(".chat-bubble").filter(has_text="Owner backlog note 1099:").count() == 1
         self.monkeypatch.setattr(opening, "REPLY", LATEST)
         _chat, self.revision = opening._buried_room(
-            self.data, self.monkeypatch, self.project_id, *((610, 130) if kind == "searched" else (160, 0)),
-            chat_id=self.chat_id)
+            self.data, self.monkeypatch, self.project_id, 1310 if kind == "searched" else 160, chat_id=self.chat_id)
         before, arrived = len(self.recent), len(self.arrivals)
         if kind == "arrived":
             # The refresh's read of the arrivals; one that found nothing yet names no message.
@@ -115,8 +114,13 @@ class _Race:
             assert _wait_for(room.page, lambda: named() is not None, attempts=150), self.history
             self.fresh = named()
         else:
+            sockets = room.page.evaluate("() => window.__testSockets.length")
             room.page.evaluate(_RECONNECT)
-            assert _wait_for(room.page, lambda: len(self.recent) > before, attempts=150), self.history
+            # The socket reopens on its own, and only then the room reads its newest page whole: on a loaded host
+            # both take their time, the server's search of the long room above all, so each is waited for itself.
+            room.page.wait_for_function("n => window.__testSockets.length > n && window.__testSockets.at(-1).readyState === 1",
+                                        arg=sockets, timeout=60_000)
+            assert _wait_for(room.page, lambda: len(self.recent) > before, attempts=600), self.history
             self.fresh = self.recent[-1]
         latest = self.fresh["window"]["latest_message"]
         if kind == "searched":
@@ -126,7 +130,7 @@ class _Race:
         texts = [row.get("text") for row in self.fresh.get("messages", [])]
         assert (LATEST in texts) == (kind == "arrived"), ("only a read of the arrivals holds the reply", kind)
         room.page.evaluate(_SETTLE_RESTORE_FRAMES)
-        assert room.seen() == [] and room.row.locator(".nav-unread-dot").count() == 1, room.acks
+        assert room.seen() == [] and _unread(room.row).count() == 1, room.acks
 
     def evidence(self, engine, suffix, **facts):
         name = f"unread-race-{engine}-{suffix}"
@@ -188,7 +192,7 @@ def test_a_new_offpage_reply_replaces_the_openings_frozen_target(direct_server_w
                     ("one return to the fresh snapshot, no old-chain page after it", chains)
             if kind == "named":
                 assert len(race.recent) == before_return + 1, ("one pager return to the fresh snapshot", race.history)
-            room.row.locator(".nav-unread-dot").wait_for(state="detached")
+            _unread(room.row).wait_for(state="detached")
             pages, recent = len(room.older), len(race.recent)
             # A completed opening owns no later refresh: no repeated return, old-chain walk or jump.
             opening._wheel(room, False)
@@ -244,7 +248,7 @@ def test_cancelling_a_rebased_opening_never_resumes_it(direct_server_with_data, 
             assert room.seen() == [] and len(room.older) == pages, (room.acks, room.older)
             assert set(race.chains()) == {race.chains()[0]}, ("no page of a new chain after cancellation", race.chains())
             # A searched read names no newest message, so state refreshes re-read the unread room
-            # (DESIGN "Project unread dot"); a named or arrived one is covered and re-reads nothing.
+            # (DESIGN "Unread"); a named or arrived one is covered and re-reads nothing.
             if kind != "searched":
                 assert len(race.recent) == before_return + (stage == "pager-return"), race.history
             _emit_ws_frame(room.page, {"type": "projects_changed"})
@@ -254,7 +258,7 @@ def test_cancelling_a_rebased_opening_never_resumes_it(direct_server_with_data, 
             race.evidence(engine, f"cancel-{stage}-{move}-{kind}", pages=pages, before=top, after=after,
                           before_return=before_return, recent_reads=len(race.recent), asked=asked)
             assert len(room.older) == pages and not opening._on_screen(room.shown()), race.history
-            assert room.seen() == [] and room.row.locator(".nav-unread-dot").count() == 1, room.acks
+            assert room.seen() == [] and _unread(room.row).count() == 1, room.acks
             assert abs(after - top) <= 1, ("a later read cannot revive a cancelled opening", top, after)
             if asked:
                 assert asked["focused"] and asked["feedTop"] <= asked["top"] < asked["feedBottom"], asked

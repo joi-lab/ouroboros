@@ -27,6 +27,11 @@ class DirectActivityEntry:
     phase: str = "preparing"
     started_at: float = field(default_factory=time.time)
     origin_message_ref: Dict[str, Any] = field(default_factory=dict)
+    # Reply-preparation facts (DESIGN §9, Telegram typing), never census fields:
+    # the owner's door stamped this turn, so its answer is expected where it is
+    # routed; and that answer has entered the host's delivery path.
+    reply_expected: bool = False
+    reply_handed_off: bool = False
 
     actor: Any = field(default=None, repr=False, compare=False)
     active_llm_call: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
@@ -126,6 +131,7 @@ class DirectActivityRegistry:
         phase: str = "preparing",
         origin_message_ref: Optional[Dict[str, Any]] = None,
         actor: Any = None,
+        reply_expected: bool = False,
     ) -> DirectActivityEntry:
         aid = str(activity_id or "").strip()
         if not aid:
@@ -140,6 +146,7 @@ class DirectActivityRegistry:
             started_at=time.time(),
             origin_message_ref=dict(origin_message_ref or {}),
             actor=actor,
+            reply_expected=bool(reply_expected),
         )
         with self._lock:
             self._activities[aid] = entry
@@ -192,6 +199,33 @@ _DIRECT_ACTIVITY_REGISTRY = DirectActivityRegistry()
 
 def get_direct_activity_registry() -> DirectActivityRegistry:
     return _DIRECT_ACTIVITY_REGISTRY
+
+
+def reply_expected(record: Any) -> bool:
+    """Whether the owner awaits this root's answer: the owner's door stamped it
+    (``run_origin``'s ``owner_ingress``, which promoted, continued and retried roots
+    carry by value) and it is no Presence correspondent's turn. Consciousness,
+    schedule and API/CLI roots never carry that stamp; a child counts through its root."""
+    from ouroboros.dialogue_provenance import is_presence_task, run_origin
+
+    source = record if isinstance(record, dict) else {}
+    return bool(run_origin(source)["owner_ingress"]) and not is_presence_task(source)
+
+
+def mark_reply_handed_off(task_id: str, running: Any = None) -> None:
+    """The task's terminal answer entered the delivery path: its reply is no longer prepared.
+
+    Process-local like both owners it marks, the direct turn's entry or the RUNNING
+    row's meta (never the persisted task record), so post-answer work that keeps
+    either alive cannot read as preparation (``gateway/reply_preparation.py``).
+    """
+    tid = str(task_id or "").strip()
+    meta = running.get(tid) if isinstance(running, dict) and tid else None
+    if isinstance(meta, dict):
+        meta["reply_handed_off"] = True
+    entry = get_direct_activity_registry().get(tid) if tid else None
+    if entry is not None:
+        entry.reply_handed_off = True
 
 
 @contextmanager

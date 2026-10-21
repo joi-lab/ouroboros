@@ -232,9 +232,9 @@ def test_quiet_executor_label_matrix_and_details_by_pointer_keyboard_touch(engin
         const probe = document.createElement('div'); probe.innerHTML = html;
         return html.includes('"none"') && probe.innerHTML === html;
     }''', unreadable)
-    # Pointer: the card's own summary opens the sentence as ordinary meta text.
+    # Pointer: the card's Show details button opens the sentence as ordinary meta text.
     mixed = cards['m-mixed']
-    part(mixed, '[data-live-title]').click()
+    part(mixed, '[data-live-disclosure]').click()
     assert mixed.get_attribute('data-expanded') == '1'
     detail_text = part(mixed, '.chat-live-executor-detail .chat-live-meta-text')
     assert detail_text.is_visible()
@@ -247,8 +247,7 @@ def test_quiet_executor_label_matrix_and_details_by_pointer_keyboard_touch(engin
     assert cards['m-assigned'].locator(':scope > .chat-live-summary-button [data-live-phase]').inner_text() == 'Working'
     capture(page, f'{shot}-expanded')
     # Keyboard: Enter closes and Space reopens through the same control.
-    summary = mixed.locator(':scope > .chat-live-summary-button')
-    summary.focus()
+    mixed.locator(':scope > .chat-live-summary-button [data-live-disclosure]').focus()
     page.keyboard.press('Enter')
     assert mixed.get_attribute('data-expanded') == '0' and not detail_text.is_visible()
     page.keyboard.press(' ')
@@ -272,7 +271,7 @@ def test_quiet_executor_label_matrix_and_details_by_pointer_keyboard_touch(engin
     touch = ui['new_page'](has_touch=True, viewport={'width': 375, 'height': 812})
     open_matrix(ui, touch, theme, {'width': 375, 'height': 812})
     unverified = touch.locator('#executor-matrix [data-task-id="m-unverified"]')
-    unverified.locator(':scope > .chat-live-summary-button [data-live-title]').tap()
+    unverified.locator(':scope > .chat-live-summary-button [data-live-disclosure]').tap()
     assert unverified.get_attribute('data-expanded') == '1'
     assert part(unverified, '.chat-live-executor-detail .chat-live-meta-text').is_visible()
     capture(touch, f'{shot}-touch-expanded')

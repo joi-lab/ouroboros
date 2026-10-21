@@ -10,6 +10,8 @@ is written; a write that cannot be confirmed answers one 503.
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import json
 import pathlib
@@ -49,9 +51,7 @@ def _client(tmp_path: pathlib.Path, *, granted: bool = True):
 
 def _rows(tmp_path: pathlib.Path) -> list[dict]:
     path = tmp_path / "logs" / "chat.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return dialogue_test.log_rows(path)
 
 
 def test_identity_advertises_the_notify_route(tmp_path: pathlib.Path) -> None:

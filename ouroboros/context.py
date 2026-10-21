@@ -303,6 +303,7 @@ from ouroboros.context_runtime_facts import (  # noqa: E402,F401 — re-exported
     _runtime_budget_info,
     task_execution_clock_fact,
     task_schedule_fact,
+    storage_fact,
 )
 
 
@@ -311,12 +312,9 @@ def _task_authority_projection(env: Any, task: Dict[str, Any]) -> Dict[str, Any]
     canonical_root = pathlib.Path(
         task.get("budget_drive_root") or getattr(env, "budget_drive_root", None) or env.drive_root
     )
-    from ouroboros.main_context_authority import project_main_task_authority, project_predecessor_review_views
+    from ouroboros.main_context_authority import project_main_task_authority
 
-    projection = project_main_task_authority(task, drive_root=canonical_root)
-    # Only a lineage root re-reads its named predecessor's history; a helper keeps its brief.
-    projection = project_predecessor_review_views(projection, task=task, drive_root=canonical_root,
-        repo_roots=(task.get("workspace_root"), getattr(env, "repo_dir", None)))
+    projection = project_main_task_authority(task)
     task_id = str(task.get("id") or "").strip()
     if not task_id:
         return projection
@@ -429,13 +427,21 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
     from ouroboros.settings_scales import effort_range
 
     runtime_data["effort_range"] = {**effort_range(), "binds": effort_range_binds(task.get("metadata"))}
+    # What Ouroboros owns on disk, from the last finished count (Dashboard -> Storage): a fact, no threshold.
+    storage = storage_fact(pathlib.Path(task.get("budget_drive_root") or getattr(env, "budget_drive_root", None) or env.drive_root))
+    if storage is not None:
+        runtime_data["storage"] = storage
     runtime_data.update(_task_authority_projection(env, task))
     if supplementary_messages_out is not None:
+        from ouroboros.main_context_authority import predecessor_notes_message
         from ouroboros.review_history_view import capture_review_history_messages
 
+        canonical_root = pathlib.Path(task.get("budget_drive_root") or getattr(env, "budget_drive_root", None) or env.drive_root)
         runtime_data, supplemental = capture_review_history_messages(runtime_data, task_id=str(task.get("id") or ""),
-            drive_root=pathlib.Path(task.get("budget_drive_root") or getattr(env, "budget_drive_root", None) or env.drive_root))
-        supplementary_messages_out.extend(supplemental)
+                                                                     drive_root=canonical_root)
+        # The predecessor mind's notes are the first row after the assignment (never a declared input).
+        notes = None if declared else predecessor_notes_message(task, drive_root=canonical_root)
+        supplementary_messages_out.extend([*([notes] if notes else []), *supplemental])
     if declared:
         runtime_data["task_constraint"] = task.get("task_constraint") or getattr(ctx, "task_constraint", {})
     runtime_data["operational_reality_rule"] = (
@@ -609,8 +615,8 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
                     "If the task is genuinely AMBIGUOUS (several defensible readings/formats "
                     "survive your research), you may add an optional block before that line: "
                     "`CANDIDATES:` on its own line, then one `- <candidate> — <why/when it holds>` "
-                    "per line, then the `FINAL ANSWER:` line with your chosen one — the "
-                    "candidates are latched for the acceptance reviewer to adjudicate. "
+                    "per line, then the `FINAL ANSWER:` line with your chosen one — a "
+                    "review of your result reads the candidates beside your choice. "
                     "The internal review-ledger identifiers `best_effort` and "
                     "`blocked_with_evidence` are metadata, never the answer: even when "
                     "blocked, the FINAL ANSWER line must carry your best-supported actual "

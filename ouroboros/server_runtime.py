@@ -52,6 +52,9 @@ _SHIPPED_LEGACY_HEAVY_DEFAULTS = frozenset({
 })
 # The slots that take a provider proposal while nobody authored them.
 MODEL_SLOT_KEYS = _ALL_MODEL_SLOT_KEYS = tuple(_MODEL_ROLE_SETTING_KEYS.values())
+# The model roles whose saved value, blank included, beats an operator variable: those slots plus
+# Vision and Consciousness, whose blank is the owner's "use Main" and which take no proposal.
+SAVED_MODEL_ROLE_KEYS = (*MODEL_SLOT_KEYS, "OUROBOROS_MODEL_VISION", "OUROBOROS_MODEL_CONSCIOUSNESS")
 _SCOPE_REVIEW_LEGACY_DEFAULTS = frozenset({
     "",
     "anthropic/claude-opus-4.6",
@@ -366,9 +369,9 @@ def propose_unauthored_model_slots(settings: dict, authored) -> dict:
 
 def repropose_unedited_slots(settings: dict, document, written, shown) -> set[str]:
     """The Settings save's rule: the ``unedited_unauthored_slots`` are re-proposed in ``settings``
-    for the access the save now carries, and returned so the caller does not persist them. One an
-    operator's variable sets (``settings_integrity.operator_variables``) keeps that value, as the
-    next read takes it: in this process, its children and the next task."""
+    for the access the save now carries (Vision/Consciousness take none), and returned so the caller
+    does not persist them. One an operator's variable sets (``settings_integrity.operator_variables``)
+    keeps that value, as the next read takes it: in this process, its children and the next task."""
     from ouroboros.settings_integrity import operator_variables
 
     unauthored = unedited_unauthored_slots(document, written, shown)
@@ -379,12 +382,12 @@ def repropose_unedited_slots(settings: dict, document, written, shown) -> set[st
 
 
 def unedited_unauthored_slots(document, written, shown) -> set[str]:
-    """The slots a write leaves unauthored: absent from the ``document`` on disk and either not
-    ``written`` or written exactly as the writer read them (``shown``; for the Settings save, what
+    """The ``SAVED_MODEL_ROLE_KEYS`` a write leaves unauthored: absent from the ``document`` on disk and
+    either not ``written`` or written exactly as the writer read them (``shown``; for the Settings save, what
     GET showed, respelled onto the exclusive provider: an operator's ``openai/x`` reads ``openai::x``).
     Settings posts every model role and an owner endpoint writes back the whole document, so posting
     a proposal back unchanged is not a choice; the key stays absent and keeps following the configured access."""
-    return {key for key in _ALL_MODEL_SLOT_KEYS if key not in authored_model_slots(document)
+    return {key for key in SAVED_MODEL_ROLE_KEYS if key not in document
             and (key not in written or str(written[key]) == str(shown.get(key)))}
 
 

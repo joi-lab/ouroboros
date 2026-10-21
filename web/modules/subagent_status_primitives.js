@@ -5,7 +5,7 @@
 // this module only decides which positive/negative facts a card may honestly
 // claim.
 
-import { accountRows, familyLabel, nextUpAccount, quotaConstraintFact } from './claudexor_status_store.js';
+import { accountRows, familyLabel, nextUpAccount } from './claudexor_status_store.js';
 import {
     ROUTE_KIND_AGENT_SESSION,
     describeExecutionEvidence,
@@ -54,37 +54,32 @@ export function harnessMap(snapshot) {
         .map((harness) => [String(harness.id), harness]));
 }
 
-function modelScopeMatches(model, aliases) {
-    const routeModel = String(model || '').trim().toLowerCase();
-    const scopes = (Array.isArray(aliases) ? aliases : [])
-        .map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
-    if (!scopes.length || !routeModel) return true;
-    return scopes.some((scope) => scope === routeModel
-        || routeModel.includes(scope) || scope.includes(routeModel));
-}
-
-/** UI projection of the same positive quota facts dispatch checks again. */
-function routeQuotaFact(snapshot, harness, model, profileId = '', nowMs = Date.now()) {
+/** Engine verdict for an honored exact scope, as in claudexor_observations.
+ * Catalog/account facts remain useful when quota scope is unknown; neither a
+ * model-name substring nor a raw ratio certifies this actor's availability.
+ */
+function routeQuotaFact(snapshot, harness, model, profileId = '') {
+    const scope = snapshot?.availability_scope;
+    const unknown = { known: false, exhausted: false };
+    if (!scope || !Object.hasOwn(scope, 'model') || scope.model !== (model || null)
+        || scope.requestKind !== 'text' || scope.basis !== 'quota_block') return unknown;
     const pin = String(profileId || '');
-    let observed = false;
-    let usable = false;
-    let spent = false;
-    let unknown = false;
-    for (const row of snapshot?.quota || []) {
-        const subject = row?.subject || {};
-        if (String(subject.harness || '') !== String(harness || '')) continue;
-        if (pin && String(subject.subject_id || '') !== pin) continue;
-        if (String(row?.freshness || '') !== 'fresh') continue;
-        observed = true;
-        const facts = (row?.constraints || [])
-            .filter((constraint) => modelScopeMatches(model, constraint?.applies_to_models))
-            .map((constraint) => quotaConstraintFact(constraint, nowMs));
-        const spentHere = facts.some((fact) => fact.exhausted);
-        if (spentHere) spent = true;
-        else if (facts.some((fact) => fact.unknown)) unknown = true;
-        else usable = true;
-    }
-    return { known: usable || (observed && !unknown), exhausted: spent && !usable && !unknown };
+    const aliases = pin === `${harness}-default` && Array.isArray(snapshot?.profiles?.accountPools)
+        && Array.isArray(snapshot?.profiles?.profiles)
+        && snapshot.profiles.profiles.some((row) => row?.profile?.harness_id === harness
+            && row.profile.profile_id === pin);
+    const subjectRows = (rows) => {
+        const relevant = (Array.isArray(rows) ? rows : []).filter((row) => row?.subject?.harness === harness);
+        const exact = relevant.filter((row) => !pin || row.subject.subject_id === pin);
+        return exact.length ? exact : relevant.filter((row) => aliases
+            && [null, undefined, ''].includes(row.subject.subject_id));
+    };
+    const rows = subjectRows(snapshot?.quota);
+    if (!rows.length || subjectRows(snapshot?.quota_absences).length) return unknown;
+    if (rows.some((row) => !(row.freshness === 'fresh' || (Array.isArray(row.constraints)
+            && row.constraints.some((constraint) => constraint?.freshness === 'fresh')))
+        || !['available', 'exhausted', 'cooldown'].includes(row.availability?.state))) return unknown;
+    return { known: true, exhausted: !rows.some((row) => row.availability.state === 'available') };
 }
 
 // One verdict per branch: the short `label` (what a card head has room for),
@@ -108,7 +103,7 @@ function routePin(route) {
     return String(route?.credential_profile_id || route?.profile_id || '');
 }
 
-export function sessionRouteVerdict(row, state, nowMs = Date.now()) {
+function sessionRouteAvailability(row, state, nowMs) {
     const { harness, model } = splitSessionTarget(row?.route?.target_id);
     if (!state?.catalogKnown || !state?.accountsKnown) {
         return verdict(NOT_CHECKED, 'Agent session · live availability not checked');
@@ -120,11 +115,6 @@ export function sessionRouteVerdict(row, state, nowMs = Date.now()) {
         return verdict(NOT_CHECKED, `${harness} · model availability not checked`);
     }
     const matches = sessionModelMatches(harnessEntry, model);
-    const available = (text, applicable = matches) => {
-        const baseOnly = applicable.length && applicable.every((match) => match.basis === 'claude_1m_base');
-        return { ...verdict(AVAILABLE, `${text}${baseOnly ? ` · ${CLAUDE_BASE_QUALIFIER}` : ''}`),
-            ...(baseOnly ? { qualifier: CLAUDE_BASE_QUALIFIER } : {}) };
-    };
     if (model && !matches.length) {
         return verdict(UNAVAILABLE, `${harness} · selected model ${model} currently unavailable`, { specific: true });
     }
@@ -140,7 +130,7 @@ export function sessionRouteVerdict(row, state, nowMs = Date.now()) {
         const quota = routeQuotaFact(state.snapshot, harness, model, pin, nowMs);
         if (quota.exhausted) return verdict(LIMIT, `${harness} · pinned account ${pin} limit reached`, { specific: true });
         if (!quota.known) return verdict(NOT_CHECKED, `${harness} · pinned account ready; quota availability not proven`);
-        return available(`${harness} · available now`);
+        return verdict(AVAILABLE, `${harness} · available now`);
     }
 
     // The owner's switch refuses, exactly as dispatch reads it; the aggregate doctor
@@ -167,14 +157,29 @@ export function sessionRouteVerdict(row, state, nowMs = Date.now()) {
     }
     const carriers = new Set(applicable.map((match) => match.profile));
     const attributed = carriers.size && !carriers.has('');
-    if (!attributed && (pool?.kind === 'profile' || pool?.kind === 'native')) {
-        return available(`${harness} · compatible account selected; exact model quota checked at start`, applicable);
-    }
     const quotaSnapshot = attributed ? { ...state.snapshot, quota: (state.snapshot.quota || []).filter((row) => carriers.has(String(row?.subject?.subject_id || ''))) } : state.snapshot;
     const quota = routeQuotaFact(quotaSnapshot, harness, model, '', nowMs);
     if (quota.exhausted) return verdict(LIMIT, `${harness} · all known accounts reached a limit`, { specific: true });
-    if (quota.known) return available(`${harness} · available now`, applicable);
+    if (quota.known) return verdict(AVAILABLE, `${harness} · available now`);
     return verdict(NOT_CHECKED, `${harness} · live availability not checked`);
+}
+
+// Catalog evidence is independent of whether quota scope was checked. Reuse
+// the account-scoped matcher; an unusable sibling cannot supply the qualifier.
+function sessionCatalogQualifier(row, state) {
+    if (!state?.catalogKnown || !state?.accountsKnown) return '';
+    const { harness, model } = splitSessionTarget(row?.route?.target_id);
+    const pin = routePin(row?.route);
+    const catalog = accountScopedModelCatalog(harnessMap(state.snapshot)[harness], pin);
+    if (!catalog || !harnessModelsKnown(catalog, state.catalogKnown)) return '';
+    const matches = sessionModelMatches(catalog, model, { snapshot: state.snapshot, pin });
+    return matches.length && matches.every((match) => match.basis === 'claude_1m_base') ? CLAUDE_BASE_QUALIFIER : '';
+}
+
+export function sessionRouteVerdict(row, state, nowMs = Date.now()) {
+    const live = sessionRouteAvailability(row, state, nowMs);
+    const qualifier = sessionCatalogQualifier(row, state);
+    return qualifier ? { ...live, text: `${live.text} · ${qualifier}`, qualifier } : live;
 }
 
 // The card head carries the AVAILABILITY axis alone: one short word and its
@@ -232,8 +237,8 @@ function executionFor(snapshot, subagentId) {
 // stamped by the save attempt on the rows that existed then — an entry added
 // afterwards is fresh again); the neutral hint while its route is still
 // unchosen (a fresh entry is an invitation, not an error); a twin; the
-// conditional qualifier of an Available session verdict (a Claude `[1m]`
-// judged by its listed base); nothing.
+// catalog qualifier of a session model (Claude `[1m]` listed only by its base,
+// even when quota availability is Not checked); nothing.
 // History and the stored spelling live in the card's Details (`rowTaskRun`).
 export function rowMeta(row, state, errors) {
     if (row._uiAttempted && errors.length) return { text: errors[0], tone: 'error' };
@@ -246,8 +251,8 @@ export function rowMeta(row, state, errors) {
     const items = state.setting?.items || [];
     const twin = sameEngineAs(items, items.indexOf(row), state.processingPreference);
     if (twin >= 0 && !reviewTwinAllowed(items[twin], row)) return { text: `Runs the same engine as Subagent ${twin + 1} — change one of them to tell them apart.`, tone: '' };
-    // A conditional availability qualifier must stay readable where no hover exists.
-    const qualifier = session ? sessionRouteVerdict(row, state).qualifier : '';
+    // The independent catalog qualifier stays readable where no hover exists.
+    const qualifier = session ? sessionCatalogQualifier(row, state) : '';
     return qualifier ? { text: qualifier, tone: '', qualifier: true } : { text: '', tone: '' };
 }
 

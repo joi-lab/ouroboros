@@ -1,5 +1,5 @@
 """Delivery candidates and delivery control: child-result dispositions, the
-delivery evidence state, acceptance bindings, candidate publish/replace/degrade,
+delivery evidence state, the candidate binding, candidate publish/replace/degrade,
 the delivery-control prompt cycle, the subagent handoff and the no-tool final
 answer. Extracted from loop.py (v7 L-B split); loop.py re-exports every name.
 
@@ -25,10 +25,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from ouroboros import working_checkpoint
 from ouroboros.config import get_context_mode
 from ouroboros.observability import timed_phase
-from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_FINALIZED_UNACCEPTED, reviewable_effect_projection
+from ouroboros.outcomes import reviewable_effect_projection
 from ouroboros.task_finalization import set_terminal_host_notice
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.utils import sanitize_tool_result_for_log
+from ouroboros.task_carrier import execution_kind
 
 
 from typing import TYPE_CHECKING
@@ -69,7 +70,7 @@ class DeliveryCandidate:
     model_text: str = ""
     # Sticky loop-local provenance that this lineage has SEEN a host-issued
     # delivery-control episode (#447/issue-449): every replacement inherits it,
-    # including ordinary acceptance improvements, so a later control-shaped
+    # including ordinary improvements, so a later control-shaped
     # answer under a lost latch is still read as protocol rather than prose.
     control_episode_seen: bool = False
     effective_criteria: Any = None
@@ -188,7 +189,6 @@ def delivery_subject_projection(
     text = full_answer if full_answer is not None else getattr(candidate, "full_text", "")
     return {
         "candidate_sha256": hashlib.sha256(str(text).encode("utf-8")).hexdigest(),
-        "produced_sources": (llm_trace.get("acceptance_material") or {}).get("sources", []),
         "effective_criteria": _effective_delivery_criteria(tool_ctx),
         "material_evidence_fingerprint": delivery_evidence_fingerprint(tool_ctx, llm_trace),
     }
@@ -205,10 +205,9 @@ def delivery_subject_hash(
 
 def apply_delivery_subject_decision(
     tools: ToolRegistry, ctx: _RoundLimitContext, llm_trace: Dict[str, Any], subject: Dict[str, Any],
-    *, author_decision: dict | None = None,
 ) -> tuple[bool, str]:
     """Apply Main's source-addressed criteria/evidence choice atomically."""
-    from ouroboros.loop_acceptance import acknowledge_acceptance_observation
+    from ouroboros.loop_messages import acknowledge_acceptance_observation
 
     if not isinstance(subject, dict) or getattr(subject, "duplicate_keys", set()) or set(subject) - {
         "owner_source_sha256", "effective_criteria", "material_tool_indices",
@@ -231,14 +230,9 @@ def apply_delivery_subject_decision(
         return False, f"{ack.cause} {json.dumps(ack.facts, ensure_ascii=False, sort_keys=True, default=str)}"
     tools._ctx._delivery_effective_criteria = json.loads(json.dumps(criteria, ensure_ascii=False, default=str))
     tools._ctx._delivery_material_tool_indices = tuple(sorted(set(indices)))
-    if author_decision is not None:
-        from ouroboros.loop_acceptance import merge_agent_acceptance_stance
-        merge_agent_acceptance_stance(llm_trace, author_decision, tools._ctx)
     revision, fingerprint = _loop()._delivery_evidence_state(tools, ctx, llm_trace)
     candidate = getattr(tools._ctx, "_delivery_candidate", None)
     if isinstance(candidate, DeliveryCandidate):
-        if not fingerprint:
-            _loop()._supersede_delivery_acceptance_binding(tools, llm_trace, candidate, reason="delivery_subject_unverifiable")
         candidate.effective_criteria = tools._ctx._delivery_effective_criteria
         candidate.material_tool_indices = tools._ctx._delivery_material_tool_indices
         candidate.owner_source_sha256 = source
@@ -256,9 +250,7 @@ def delivery_evidence_fingerprint(
 ) -> str:
     """Fingerprint only evidence that can invalidate a complete answer.
 
-    ``effective_criteria`` permits an explicit criteria projection. Local
-    preparation uses its separate content identity, never this paid subject's
-    tool history or indices.
+    ``effective_criteria`` permits an explicit criteria projection.
     """
 
     from ouroboros.outcomes import read_context_verification_receipts
@@ -307,7 +299,7 @@ def delivery_evidence_fingerprint(
         # Task-scoped service teardown can register declared outputs or
         # surface an output-finalization failure. Those facts arise outside an
         # ordinary tool call, so bind their stable projection explicitly; else
-        # a host acceptance panel could review the pre-teardown state.
+        # a result review could judge the pre-teardown state.
         "service_finalization": _loop()._service_finalization_evidence(llm_trace),
     }
     return hashlib.sha256(json.dumps(
@@ -330,15 +322,9 @@ def observed_delivery_evidence(tool_ctx: Any, llm_trace: Dict[str, Any], **bound
 
 def _delivery_evidence_state(tools: ToolRegistry, ctx: _RoundLimitContext, llm_trace: Dict[str, Any]) -> tuple[int, str]:
     """Track the shared answer-invalidating evidence fingerprint (every retention,
-    nomination, post-tool, control, publication, delivery and forced-exit path). UNKNOWN (#1224)
-    bumps no revision, keeps the last KNOWN fingerprint and supersedes no binding —
-    missing evidence is not a change; a KNOWN candidate compared against it is
-    re-retained explicitly by its caller, its unverifiable approval superseded."""
-    retained = _preparation_choice_candidate(tools._ctx, llm_trace)
-    if retained is not None:
-        # Retention only, never a new evidence identity or a paid binding. The
-        # published projection below explicitly states that freshness is unknown.
-        return retained.evidence_revision, retained.evidence_fingerprint
+    post-tool, control, publication, delivery and forced-exit path). UNKNOWN (#1224)
+    bumps no revision and keeps the last KNOWN fingerprint — missing evidence is not
+    a change; a KNOWN candidate compared against it is re-retained explicitly by its caller."""
     revision = int(getattr(tools._ctx, "_delivery_evidence_revision", 0) or 0)
     fingerprint = observed_delivery_evidence(
         tools._ctx, llm_trace, task_id=ctx.task_id, root_task_id=ctx.root_task_id,
@@ -347,11 +333,6 @@ def _delivery_evidence_state(tools: ToolRegistry, ctx: _RoundLimitContext, llm_t
     if not fingerprint:
         return revision, ""
     if fingerprint != str(getattr(tools._ctx, "_delivery_evidence_fingerprint", "") or ""):
-        candidate = getattr(tools._ctx, "_delivery_candidate", None)
-        if isinstance(candidate, _loop().DeliveryCandidate) and candidate.evidence_fingerprint not in {"", fingerprint}:
-            _loop()._supersede_delivery_acceptance_binding(
-                tools, llm_trace, candidate, reason="delivery_evidence_changed_after_host_acceptance",
-            )
         revision += 1
         tools._ctx._delivery_evidence_fingerprint = fingerprint
         tools._ctx._delivery_evidence_revision = revision
@@ -377,72 +358,6 @@ def _unaccepted_delivery_binding(
     }
 
 
-def _delivery_acceptance_binding(
-    tools: ToolRegistry,
-    llm_trace: Dict[str, Any],
-    candidate_hash: str,
-) -> Dict[str, Any]:
-    """Refresh a candidate from one exact, complete, active host-root verdict."""
-
-    binding = _unaccepted_delivery_binding(tools, candidate_hash)
-    if _preparation_choice_candidate(tools._ctx, llm_trace) is not None:
-        return binding
-    review_decision = llm_trace.get("review_decision") if isinstance(llm_trace.get("review_decision"), dict) else {}
-    expected_panel = str(review_decision.get("panel_id") or "")
-    expected_binding = str(review_decision.get("binding_hash") or "")
-    # Candidate text alone is not a review identity: the same full answer
-    # can be regenerated after tool/child/verification evidence changes.
-    # Refresh host authority only from the panel this pass names; an older
-    # exact-text run must never be rediscovered by hash-only scan.
-    if not expected_panel or not expected_binding:
-        return binding
-    for raw_run in reversed(llm_trace.get("review_runs") or []):
-        if not isinstance(raw_run, dict):
-            continue
-        if raw_run.get("authority") != "host_root" or raw_run.get("superseded_by_revision"):
-            continue
-        run_candidate = str(
-            raw_run.get("candidate_hash") or raw_run.get("candidate_sha256") or ""
-        )
-        if run_candidate != candidate_hash:
-            continue
-        run_panel = str(raw_run.get("panel_id") or "")
-        run_binding = str(raw_run.get("binding_hash") or "")
-        if not run_panel or not run_binding:
-            continue
-        if run_panel != expected_panel:
-            continue
-        if run_binding != expected_binding:
-            continue
-        verdict = str(
-            raw_run.get("aggregate_signal") or raw_run.get("semantic_verdict") or ""
-        ).strip().lower()
-        if not verdict:
-            continue
-        binding.update({
-            "acceptance_status": verdict,
-            "authoritative": True,
-            "panel_id": run_panel,
-            "binding_hash": run_binding,
-            "fence_hash": str(raw_run.get("fence_hash") or binding["fence_hash"]),
-            "review_evidence_revision": str(raw_run.get("evidence_revision") or ""),
-        })
-        break
-    return binding
-
-
-def _preparation_choice_candidate(tool_ctx: Any, llm_trace: Dict[str, Any]) -> Optional[DeliveryCandidate]:
-    from ouroboros.acceptance_preparation import preparation_delivery_choice
-
-    candidate = getattr(tool_ctx, "_delivery_candidate", None)
-    if (not isinstance(candidate, DeliveryCandidate)
-            or candidate.finalization_control in _DELIVERY_HOLD_CONTROLS
-            or candidate.finalization_control == "owner_revision_required"
-            or _loop()._delivery_replace_required(candidate)):
-        return None
-    return candidate if preparation_delivery_choice(tool_ctx, llm_trace) else None
-
-
 def _publish_delivery_candidate(
     tools: ToolRegistry,
     candidate: DeliveryCandidate,
@@ -452,9 +367,8 @@ def _publish_delivery_candidate(
     from ouroboros.observability import redact_projection
 
     current_fp = str(getattr(tools._ctx, "_delivery_evidence_fingerprint", "") or "")
-    local_choice = _preparation_choice_candidate(tools._ctx, llm_trace) is candidate
-    subject = ""  # empty for an informed local choice, unknown evidence, or a subject the host could not compute
-    if not local_choice and candidate.evidence_fingerprint:
+    subject = ""  # empty for unknown evidence or a subject the host could not compute
+    if candidate.evidence_fingerprint:
         try:
             subject = delivery_subject_hash(tools._ctx, llm_trace, candidate.full_text)
         except Exception:  # the host's own subject computation failed: published as unavailable, never as approved
@@ -473,9 +387,9 @@ def _publish_delivery_candidate(
         "effective_criteria": redact_projection(candidate.effective_criteria).value,
         "material_tool_indices": list(candidate.material_tool_indices),
         "owner_source_sha256": candidate.owner_source_sha256,
-        "owner_source_current": not _loop()._task_acceptance_owner_generation_changed(tools._ctx),
+        "owner_source_current": not _loop()._owner_generation_changed(tools._ctx),
         "subject_sha256": subject,
-        **({} if subject else {"evidence_status": "unavailable_local_preparation"}),
+        **({} if subject else {"evidence_status": "unavailable"}),
     }
 
 
@@ -493,20 +407,7 @@ def _replace_delivery_candidate(
         full_text if model_text is None else model_text
     )
     previous_candidate = getattr(tools._ctx, "_delivery_candidate", None)
-    retained = _preparation_choice_candidate(tools._ctx, llm_trace)
-    if retained is not None:
-        # An incident-bound finish/stop chooses the retained work, not a fresh
-        # nomination through the very fingerprint whose preparation failed.
-        if full_text != retained.full_text:
-            retained.full_text, retained.model_text = full_text, model_text
-            retained.content_sha256 = hashlib.sha256(full_text.encode("utf-8")).hexdigest()
-            retained.revision, retained.quiet = retained.revision + 1, False  # new bytes are new words
-            retained.acceptance_binding = _unaccepted_delivery_binding(tools, retained.content_sha256)
-        tools._ctx._delivery_control_required = False
-        _loop()._publish_delivery_candidate(tools, retained, llm_trace)
-        return retained
-    from ouroboros.loop_acceptance import acknowledge_acceptance_observation
-    from ouroboros.loop_messages import owner_source_sha256
+    from ouroboros.loop_messages import acknowledge_acceptance_observation, owner_source_sha256
 
     observed = getattr(tools._ctx, "_acceptance_observation", {})
     if previous_candidate is None and observed.get("owner_source_sha256"):
@@ -524,13 +425,6 @@ def _replace_delivery_candidate(
         return previous_candidate
     # Retention never waits on the evidence read (#1224): unknown evidence keeps the answer.
     evidence_revision, evidence_fingerprint = _loop()._delivery_evidence_state(tools, ctx, llm_trace)
-    if isinstance(previous_candidate, _loop().DeliveryCandidate):
-        _loop()._supersede_delivery_acceptance_binding(
-            tools,
-            llm_trace,
-            previous_candidate,
-            reason="delivery_candidate_replaced",
-        )
     content_hash = hashlib.sha256(full_text.encode("utf-8")).hexdigest()
     revision = int(getattr(tools._ctx, "_delivery_candidate_revision", 0) or 0) + 1
     tools._ctx._delivery_candidate_revision = revision
@@ -554,6 +448,9 @@ def _replace_delivery_candidate(
     )
     tools._ctx._delivery_candidate = candidate
     tools._ctx._delivery_control_required = False
+    from ouroboros.tools.review_result import supersede_result_runs
+
+    supersede_result_runs(llm_trace, f"candidate-{revision}")  # forced rails replace here too
     _loop()._publish_delivery_candidate(tools, candidate, llm_trace)
     return candidate
 
@@ -614,17 +511,8 @@ def _current_delivery_candidate(
     candidate = _loop()._live_delivery_candidate(ctx)
     if candidate is None:
         return None
-    if _loop()._task_acceptance_owner_generation_changed(ctx.tools._ctx):
+    if _loop()._owner_generation_changed(ctx.tools._ctx):
         return None
-    if candidate.acceptance_binding.get("authoritative") is True:
-        if not candidate.evidence_fingerprint:
-            return None  # Unknown equality cannot validate a prior approval.
-        current_binding = _delivery_acceptance_binding(ctx.tools, llm_trace, candidate.content_sha256)
-        if not current_binding.get("authoritative") or any(
-            current_binding.get(key) != candidate.acceptance_binding.get(key)
-            for key in ("panel_id", "binding_hash")
-        ):
-            return None  # Matching answer bytes cannot revive a superseded host verdict.
     evidence_revision, evidence_fingerprint = _loop()._delivery_evidence_state(
         ctx.tools, ctx, llm_trace,
     )
@@ -699,7 +587,7 @@ def completion_schema(tools: ToolRegistry, schemas: list | None = None) -> str:
         return name
     schema = getter(name)
     if schema is None:
-        return "task_acceptance_review (author_action compatibility)" if getter("task_acceptance_review") else "no currently permitted completion tool"
+        return "no currently permitted completion tool"
     if schemas is not None and not any(row.get("function", {}).get("name") == name for row in schemas):
         schemas.append(schema)
         invalidate_task_cache_splits(getattr(ctx, "task_id", ""))
@@ -738,28 +626,15 @@ def hold_completion_response(content: Any, tools: ToolRegistry, ctx: Any, trace:
         _loop()._publish_delivery_candidate(tools, candidate, trace)
 
 
-def completion_feedback(trace: dict) -> dict:
-    """Only feedback positively exposed in a returned request, never mere arrival."""
-    feedback = next((run for run in reversed(trace.get("review_runs") or [])
-                     if isinstance(run, dict) and run.get("authority") == "host_root"
-                     and run.get("feedback_delivered")), None)
-    if feedback is None and (trace.get("acceptance_review_outcome") or {}).get("feedback_delivered"):
-        feedback = trace["acceptance_review_outcome"]
-    return feedback or {}
-
-
 def completion_observation(ctx: Any, trace: dict) -> dict:
     """Freeze facts Main observed, before any sibling of its response executes."""
     import copy
     from ouroboros.loop_messages import owner_source_sha256
-    feedback = completion_feedback(trace)
     return {"subject": copy.deepcopy(getattr(ctx, "_acceptance_observation", {})),
             "tool_count": len(trace.get("tool_calls") or []),
             "owner_directives": len(getattr(ctx, "_owner_directives", []) or []),
             "owner_source_sha256": owner_source_sha256(ctx),
-            "evidence_fingerprint": observed_delivery_evidence(ctx, trace),
-            "feedback": copy.deepcopy(feedback or {}),
-            "preparation": copy.deepcopy(trace.get("acceptance_preparation") or {})}
+            "evidence_fingerprint": observed_delivery_evidence(ctx, trace)}
 
 
 def selected_completion_text(request: dict, candidate: Any, messages: list,
@@ -806,23 +681,14 @@ def consume_completion_request(tools: ToolRegistry, ctx: Any, trace: dict, conte
     delivered = (getattr(tool_ctx, "_presence_completion", None) or {}).get("outcome") == "tool_delivered"
     if delivered:
         unseen = [call for call in unseen if not call.get("presence_delivery_confirmed") or call.get("is_error")]
-    decision = request.get("agent_decision") or {"explicit_finish": True, "author_action": request["action"],
-        "rationale": request.get("rationale") or ""}
-    decision = {**decision, "observation": observation}
-    from ouroboros.loop_acceptance import merge_agent_acceptance_stance
-    # Activate the existing incident-bound retention path only after admissibility;
-    # it must precede a fresh read of the evidence whose preparation already failed.
-    author_decision = decision if not error and not (request["action"] == "finish" and unseen) else None
     subject = request.get("acceptance_subject")
     if not error and subject is not None:
         previous = getattr(tool_ctx, "_acceptance_observation", {})
         tool_ctx._acceptance_observation = observation.get("subject", {})
         try:
-            applied, error = apply_delivery_subject_decision(tools, ctx, trace, subject, author_decision=author_decision)
+            applied, error = apply_delivery_subject_decision(tools, ctx, trace, subject)
         finally:
             tool_ctx._acceptance_observation = previous
-    elif author_decision is not None:
-        merge_agent_acceptance_stance(trace, author_decision, tool_ctx)
     if text is not None and not error:
         candidate = _loop()._replace_delivery_candidate(tools, ctx, trace, text, control="selected")
         candidate.quiet = bool(request.get("wake_silent"))
@@ -844,7 +710,6 @@ def consume_completion_request(tools: ToolRegistry, ctx: Any, trace: dict, conte
         tool_ctx._presence_completion["message"] = text
         tool_ctx._presence_forced_declaration = {"status": "missing", "reason": "completion has not passed the common finalization gates"}
     tool_ctx._acceptance_pending_review_choice = request.get("pending_review", "wait")
-    merge_agent_acceptance_stance(trace, decision, tool_ctx)
     return True
 
 
@@ -867,28 +732,15 @@ def _arm_delivery_control(
     candidate = getattr(tools._ctx, "_delivery_candidate", None)
     if not isinstance(candidate, _loop().DeliveryCandidate):
         return
-    if _preparation_choice_candidate(tools._ctx, llm_trace) is candidate:
-        return  # No new freshness claim/control round for an informed local finish/stop.
-    if control == "acceptance_feedback" and (
-        candidate.finalization_control in _DELIVERY_HOLD_CONTROLS
-        or candidate.finalization_control == "owner_revision_required"
-        or _delivery_replace_required(candidate)
-        or (getattr(tools._ctx, "_delivery_control_required", False)
-            and not candidate.finalization_control.startswith("acceptance_feedback"))
-    ):
-        return  # A pending panel never relaxes another gate's existing control.
     _loop()._delivery_evidence_state(tools, ctx, llm_trace)
     candidate.finalization_control = control
     tools._ctx._delivery_control_required = True
-    from ouroboros.acceptance_settlement import acceptance_choice_offered
+    from ouroboros.tools.review_result import pending_review_choice_offered
 
     control_prompt = _delivery_control_prompt(
-        candidate,
-        pending_review_choice=bool(getattr(tools._ctx, "_task_acceptance_pending", "")
-                                   and acceptance_choice_offered()),
-    )
-    # ``skip_if_unchanged`` is the repeated re-offer (every acceptance wake shows
-    # the selection contract): unchanged facts render identical bytes, so the
+        candidate, pending_review_choice=pending_review_choice_offered(tools._ctx))
+    # ``skip_if_unchanged`` is a repeated re-offer of the selection contract:
+    # unchanged facts render identical bytes, so the
     # transcript's control history is not repeated, the way
     # ``prepare_acceptance_observation`` skips an unchanged observation. Every
     # other caller arms because something changed and always appends. ``slot``
@@ -900,7 +752,7 @@ def _arm_delivery_control(
         _loop()._append_or_merge_user_message(ctx.messages, control_prompt, slot=tools._ctx)
     candidate.control_episode_seen = True
     completion_schema(tools, getattr(ctx, "tool_schemas", None))
-    from ouroboros.loop_acceptance import capture_acceptance_observation, acceptance_observation_prompt
+    from ouroboros.loop_messages import capture_acceptance_observation, acceptance_observation_prompt
 
     observed = capture_acceptance_observation(tools._ctx, llm_trace, getattr(ctx, "incoming_messages", None))
     if prompt := acceptance_observation_prompt(tools._ctx, observed):
@@ -1116,7 +968,7 @@ def _resolve_delivery_control(content: Any, tools: ToolRegistry, ctx: Any, llm_t
                     or _delivery_replace_required(candidate))
     if not required:
         if candidate.finalization_control == "owner_revision_required":
-            from ouroboros.loop_acceptance import acknowledge_acceptance_observation
+            from ouroboros.loop_messages import acknowledge_acceptance_observation
             observed = getattr(tools._ctx, "_acceptance_observation", {})
             if observed.get("owner_source_sha256"):
                 acknowledge_acceptance_observation(tools._ctx, observed["owner_source_sha256"])
@@ -1146,34 +998,31 @@ def _plan_review_only_awaited(llm_trace: Dict[str, Any]) -> bool:
 
 @timed_phase("admission_seal")
 def _seal_admission_before_delivery(tools: ToolRegistry, limit_ctx: Any, llm_trace: Dict[str, Any]) -> bool:
-    """Seal root admission once more right before delivery; False arms the owner-revision round.
+    """Seal root admission at an author stop, right before delivery; False holds the answer.
 
-    The queue's typed answer decides. ``ok`` seals, and a generation mismatch (also one seen
-    locally while the transport was silent) is a real owner follow-up. A begin ``refused``
-    because the root is already ``sealed`` is the worker's own earlier seal whose ack was
-    lost. Any other refusal keeps the revision path. ``unknown`` is a gap — never a refusal,
-    a verdict or an owner message: the answer is delivered with ``admission_released=False``
-    (the durable ``supervisor_ack_unavailable`` row is the record) and a blocking install
-    whose reviewers approved this subject says so on the card (owner decision 2A).
-    """
+    Only owner facts revise: a generation mismatch (also one seen locally while the transport
+    was silent) or pending owner mail. A begin ``refused`` because the root is already ``sealed``
+    is the worker's own lost ack; a pooled attempt refused ``stale_attempt`` lost its queue
+    ownership and never publishes. Any other refusal, like ``unknown``, is the host's own state:
+    delivered with ``admission_released=False`` (``supervisor_ack_unavailable`` keeps the cause)."""
     tool_ctx = tools._ctx
-    from ouroboros.loop_acceptance_review import _resolve_ctx_lineage
-    if not _resolve_ctx_lineage(tool_ctx, limit_ctx.task_id)["is_root_task"]:
+    from ouroboros.task_results import resolve_ctx_lineage
+    if not resolve_ctx_lineage(tool_ctx, limit_ctx.task_id)["is_root_task"]:
         return True  # Local child completion has no authority to seal its parent's root.
     opened, _token = _loop()._begin_task_acceptance_fence(tool_ctx, limit_ctx.task_id)
-    stopping = (getattr(tool_ctx, "_completion_selected", None) or {}).get("action") == "stop"
-    answer = opened and _loop()._end_task_acceptance_fence(tool_ctx, outcome="author_stop" if stopping else "terminal")
+    answer = opened and _loop()._end_task_acceptance_fence(tool_ctx, outcome="author_stop")
     own_seal = (opened.status, opened.reason) == ("refused", "sealed")
-    if own_seal and stopping:
+    if own_seal:
         answer = _loop()._end_task_acceptance_fence(tool_ctx, outcome="author_stop")
         own_seal = bool(answer)
     from ouroboros.loop_messages import _pending_owner_input_kinds
 
     # The wait for a silent supervisor is long enough for the owner to write: their mail is durable
     # before any generation moves, so the local mailbox is read once more before a gap delivers.
-    gap = not answer and not own_seal and answer.status == "unknown" and not _pending_owner_input_kinds(tool_ctx)
+    superseded = answer.reason == "stale_attempt" and execution_kind(tool_ctx) == "pooled"  # lost its queue ownership
+    gap = not answer and not own_seal and not superseded and not _pending_owner_input_kinds(tool_ctx)  # owner facts revise
     if getattr(tool_ctx, "_task_acceptance_fence_generation_mismatch", False) or not (answer or own_seal or gap):
-        _loop()._supersede_task_acceptance_for_owner_followup(tool_ctx, llm_trace)
+        _loop()._release_for_owner_followup(tool_ctx, llm_trace)
         admission_lock = getattr(tool_ctx, "owner_message_admission_lock", None)
         admission_agent = getattr(tool_ctx, "owner_message_admission_agent", None)
         if admission_lock is not None and admission_agent is not None:
@@ -1182,16 +1031,7 @@ def _seal_admission_before_delivery(tools: ToolRegistry, limit_ctx: Any, llm_tra
         _loop()._arm_delivery_control(tools, limit_ctx, llm_trace, control="owner_revision_required")
         return False
     if not answer and not own_seal:
-        from ouroboros.review_projection import publish_acceptance_checkpoint
-        from ouroboros.tools.review_helpers import review_enforcement_blocks
-
         llm_trace.setdefault("review_decision", {})["admission_released"] = False
-        decision = llm_trace.get("acceptance_decision") if isinstance(llm_trace.get("acceptance_decision"), dict) else {}
-        if (decision.get("status") == ACCEPTANCE_ACCEPTED and review_enforcement_blocks()
-                and decision.get("reason") in ("clean_pass", "clean_pass_obligations_closed")):
-            _loop()._set_acceptance_decision(llm_trace, {**decision, "status": ACCEPTANCE_ACCEPTED, "reason": "admission_close_unconfirmed",
-                "rationale": "Quorum PASS accepted the deliverable; the supervisor did not confirm that task admission was closed."})
-            publish_acceptance_checkpoint(tool_ctx, llm_trace)
     return True
 
 
@@ -1243,7 +1083,7 @@ def _no_tool_final_answer(
     incoming_messages: queue.Queue,
     owner_msg_seen: set,
     emit_progress: Callable[[str], None],
-    *, review_only: bool = False, explicit_candidate: bool = False, resume_candidate: bool = False,
+    *, explicit_candidate: bool = False, resume_candidate: bool = False,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
     """Run the no-tool finalization gates; ``None`` requests another model round."""
     messages = limit_ctx.messages
@@ -1309,8 +1149,8 @@ def _no_tool_final_answer(
                 _loop()._arm_delivery_control(tools, limit_ctx, llm_trace)
             return held()
 
-    # Declared service outputs and teardown failures are acceptance evidence:
-    # finalize them before the host panel and, when that changes evidence,
+    # Declared service outputs and teardown failures are evidence of the result:
+    # finalize them before its review and, when that changes evidence,
     # require one replacement answer bound to the new revision (idempotent helper).
     service_exit_ctx = _loop()._LoopExitContext(
         tools=tools,
@@ -1336,7 +1176,7 @@ def _no_tool_final_answer(
             if content and str(content).strip():
                 messages.append({"role": "assistant", "content": str(content)})
             llm_trace["reasoning_notes"].append(
-                "Task services were finalized before acceptance; the complete answer must bind the resulting evidence."
+                "Task services were finalized before delivery; the complete answer must bind the resulting evidence."
             )
             _loop()._disclose_service_finalization(limit_ctx, llm_trace)
             _loop()._arm_delivery_control(tools, limit_ctx, llm_trace)
@@ -1362,41 +1202,19 @@ def _no_tool_final_answer(
             _loop()._publish_delivery_candidate(tools, candidate, llm_trace)
         content = candidate.full_text
 
-    _rails_ceiling = getattr(tools._ctx, "_cost_ceiling", None)
-    tools._ctx._acceptance_loop_rails = {
-        "round_idx": limit_ctx.round_idx,
-        "max_rounds": limit_ctx.max_rounds,
-        "task_cost_usd": limit_ctx.accumulated_usage.get("cost"),
-        "cost_ceiling_usd": getattr(_rails_ceiling, "ceiling_usd", None),
-    }
-    # v6.78.0 (owner Q20/Q22): mirror the host-attested native-retrieval
-    # fact into the trace so `build_task_acceptance_evidence` can show the
-    # reviewer whether the answer was grounded in fetched pages. Reviewer-side
-    # only — the agent gets the improvement capsule, not the evidence packet.
-    _retrieval = limit_ctx.accumulated_usage.get("retrieval")
-    if isinstance(_retrieval, dict) and _retrieval:
-        llm_trace["retrieval"] = dict(_retrieval)
-    if not stopping and _loop()._run_task_acceptance_review_once(
-        tools=tools,
-        content=content or "",
-        task_id=limit_ctx.task_id,
-        task_type=limit_ctx.task_type,
-        llm_trace=llm_trace,
-        drive_root=limit_ctx.drive_root,
-        messages=messages,
-        emit_progress=emit_progress,
-    ):
-        # The author can continue working freely; its next complete answer is selected explicitly.
+    def _hold_for_review(text: str) -> None:
+        if content and str(content).strip():
+            messages.append({"role": "assistant", "content": str(content)})
+        _loop()._append_or_merge_user_message(messages, text)
+        emit_progress("Result review outcome shown before delivery.")
+        llm_trace["reasoning_notes"].append("Result review outcome shown before delivery.")
+
+    from ouroboros.tools.review_result import result_review_at_delivery
+
+    if not stopping and result_review_at_delivery(tools._ctx, content or "", llm_trace, _hold_for_review):
+        # The author continues freely; its next complete answer is selected explicitly.
         return held()
     candidate = getattr(tools._ctx, "_delivery_candidate", None)
-    if isinstance(candidate, _loop().DeliveryCandidate):
-        candidate.acceptance_binding = _delivery_acceptance_binding(
-            tools, llm_trace, candidate.content_sha256,
-        )
-        _loop()._publish_delivery_candidate(tools, candidate, llm_trace)
-
-    if review_only:
-        return held()  # The explicit entry shares readiness/review, never seals or delivers.
 
     # Close delivery under the same lock as routing, then drain once. A follow-up
     # either forces another round or is rejected after the fence, never stranded.
@@ -1404,10 +1222,7 @@ def _no_tool_final_answer(
     admission_agent = getattr(tools._ctx, "owner_message_admission_agent", None)
     if admission_lock is not None and admission_agent is not None:
         before_directives = len(getattr(tools._ctx, "_owner_directives", []) or [])
-        acceptance_was_terminal = bool(
-            getattr(tools._ctx, "_task_acceptance_reviewed", False)
-            or getattr(tools._ctx, "_task_acceptance_sealed_fence_token", None)
-        )
+        sealed = bool(getattr(tools._ctx, "_task_acceptance_sealed_fence_token", None))
         provisional_assistant = {"role": "assistant", "content": content} if content else None
         if provisional_assistant is not None:
             messages.append(provisional_assistant)
@@ -1421,20 +1236,18 @@ def _no_tool_final_answer(
                 )
         if len(getattr(tools._ctx, "_owner_directives", []) or []) > before_directives:
             with admission_lock:
-                if acceptance_was_terminal:
-                    _loop()._supersede_task_acceptance_for_owner_followup(
-                        tools._ctx, llm_trace, admission_locked=True,
-                    )
+                if sealed:
+                    _loop()._release_for_owner_followup(tools._ctx, llm_trace, admission_locked=True)
                 if (
                     getattr(admission_agent, "_busy", False)
                     and str(getattr(admission_agent, "_current_task_id", "") or "") == limit_ctx.task_id
                 ):
                     admission_agent._accepting_owner_messages = True
-            if acceptance_was_terminal:
-                emit_progress("Owner follow-up awaits Main's decision about the retained acceptance subject.")
+            if sealed:
+                emit_progress("An owner follow-up reopened the sealed task; Main decides about the retained answer.")
             if isinstance(candidate, _loop().DeliveryCandidate):
                 candidate.finalization_control = "owner_revision_required"
-                if candidate.control_episode_seen or acceptance_was_terminal:
+                if candidate.control_episode_seen or sealed:
                     _loop()._arm_delivery_control(tools, limit_ctx, llm_trace, control="owner_revision_required")
                 else:
                     tools._ctx._delivery_control_required = False
@@ -1458,60 +1271,23 @@ def _no_tool_final_answer(
             or candidate.evidence_fingerprint != evidence_fingerprint
         )
     ):
-        acceptance_was_terminal = bool(
-            getattr(tools._ctx, "_task_acceptance_reviewed", False)
-            or getattr(tools._ctx, "_task_acceptance_sealed_fence_token", None)
-        )
-        if acceptance_was_terminal:
-            decision = (
-                llm_trace.get("review_decision")
-                if isinstance(llm_trace.get("review_decision"), dict)
-                else {}
-            )
-            expected_panel = str(decision.get("panel_id") or "")
-            expected_binding = str(decision.get("binding_hash") or "")
-            active_run = next(
-                (
-                    run
-                    for run in reversed(llm_trace.get("review_runs") or [])
-                    if isinstance(run, dict)
-                    and run.get("authority") == "host_root"
-                    and not run.get("superseded_by_revision")
-                    and str(run.get("panel_id") or "") == expected_panel
-                    and str(run.get("binding_hash") or "") == expected_binding
-                ),
-                None,
-            )
-            _loop()._supersede_task_acceptance_for_evidence_change(
-                tools._ctx,
-                llm_trace,
-                active_run,
-                "delivery_evidence_changed_after_host_acceptance",
-                messages,
-                emit_progress,
-            )
         if candidate.full_text:
             messages.append({"role": "assistant", "content": candidate.full_text})
         llm_trace["reasoning_notes"].append(
-            "Delivery evidence changed after host acceptance; a complete replacement answer is required."
+            "Delivery evidence changed after the answer was retained; a complete replacement answer is required."
             if evidence_fingerprint else
             "Delivery evidence can no longer be verified; the complete answer must be restated and is retained over unknown evidence."
         )
         _loop()._arm_delivery_control(tools, limit_ctx, llm_trace)
         return held()
     if isinstance(candidate, _loop().DeliveryCandidate):
-        candidate.acceptance_binding = _delivery_acceptance_binding(
-            tools, llm_trace, candidate.content_sha256,
-        )
         _loop()._publish_delivery_candidate(tools, candidate, llm_trace)
         content = candidate.full_text
     if stopping:
         request = tools._ctx._completion_selected
         record_stopped_completion(tools, limit_ctx, llm_trace, request, candidate)
-    if (getattr(tools._ctx, "_task_acceptance_reviewed", False) or stopping) and (
-            (stopping or not getattr(tools._ctx, "_task_acceptance_sealed_fence_token", None))
-            and not _seal_admission_before_delivery(tools, limit_ctx, llm_trace)):
-        return held()
+        if not _seal_admission_before_delivery(tools, limit_ctx, llm_trace):
+            return held()
     if isinstance(getattr(tools._ctx, "_presence_completion", None), dict):
         # Only this successful common exit accepts the requested outcome. Holds,
         # owner controls and budget exits must not inherit an earlier silent/send.
@@ -1568,33 +1344,7 @@ def finish_completed_stop(tools: ToolRegistry, ctx: Any, emit_progress: Any,
 
 def record_stopped_completion(tools: ToolRegistry, ctx: Any, trace: dict, request: dict,
                               candidate: DeliveryCandidate) -> None:
-    """A local stop is truthful for every task; roots retain its author disposition."""
+    """A stop is the author's own act, truthful for every task; it grants no approval and buys no review."""
+    del tools, ctx
     trace["task_completion"] = {"action": "stop", "rationale": request["rationale"],
         "answer_sha256": candidate.content_sha256, "source": request.get("source", "finish_task")}
-    from ouroboros.loop_acceptance_review import _resolve_ctx_lineage
-    from ouroboros.review_records import build_author_disposition
-    # Stop grants no approval and buys no panel. Preserve it even when Auto has
-    # no nomination, Required has no production, or new reviews are Off.
-    if not _resolve_ctx_lineage(tools._ctx, ctx.task_id)["is_root_task"]:
-        return
-    from ouroboros.review_dispatch import reconcile_pending_acceptance_runs
-    from ouroboros.task_results import project_task_acceptance_review_capacity
-    try:
-        reconcile_pending_acceptance_runs(trace, drive_root=ctx.drive_root or tools._ctx.drive_root, usage_ctx=tools._ctx)
-    except Exception:
-        trace["task_completion"]["review_collection"] = "unavailable"
-        log.warning("Stopped task retains unreconciled review custody", exc_info=True)
-    feedback = completion_feedback(trace) or request.get("observation", {}).get("feedback") or {}
-    capacity = project_task_acceptance_review_capacity(tools._ctx, task_id=ctx.task_id)
-    terminal_reason = "review_cycles_exhausted" if capacity.get("reason") == "review_cycles_exhausted" else "author_stop"
-    stance = request.get("agent_decision") or {}
-    author = build_author_disposition(disposition=stance.get("disposition", ""),
-        rationale=request["rationale"], subject_hash=candidate.content_sha256,
-        reviewer_signal=str(feedback.get("aggregate_signal") or ""), action="stop",
-        enforcement=_loop().get_review_enforcement())
-    _loop()._set_acceptance_decision(trace, {"status": ACCEPTANCE_FINALIZED_UNACCEPTED, "reason": terminal_reason,
-        "review_capacity": capacity, "author_action": "stop", "source": "task_acceptance_review", "author_disposition": author,
-        "reviewer_signal": author["reviewer_signal"], "reviewer_binding_hash": feedback.get("binding_hash")})
-    tools._ctx._task_acceptance_reviewed = True
-    tools._ctx._task_acceptance_reviewed_subject = ""
-    tools._ctx._task_acceptance_pending = ""

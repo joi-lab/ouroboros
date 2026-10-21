@@ -551,14 +551,14 @@ DEEPSEEK_DIRECT_DEFAULTS = {
 }
 
 ANTHROPIC_DIRECT_DEFAULTS = {
-    "main": "anthropic::claude-opus-5",
+    "main": "anthropic::claude-opus-5-5",
     "heavy": "",
     "light": "anthropic::claude-sonnet-5",
     "fallback": "anthropic::claude-sonnet-5",
     # Deep self-review is a real slot with a SHIPPED default; without a
     # per-provider value a direct-only install keeps an unreachable
     # OpenRouter-form id it has no credential for (v6.82.0).
-    "deep_self_review": "anthropic::claude-opus-5",
+    "deep_self_review": "anthropic::claude-opus-5-5",
 }
 
 DIRECT_PROVIDER_DEFAULTS = {
@@ -592,6 +592,7 @@ _ANTHROPIC_MODEL_ALIASES = {
     "claude-opus-4.7": "claude-opus-4-7",
     "claude-opus-4.8": "claude-opus-4-8",
     "claude-sonnet-4.6": "claude-sonnet-4-6",
+    "claude-opus-5.5": "claude-opus-5-5",
 }
 
 

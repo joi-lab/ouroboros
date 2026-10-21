@@ -1,22 +1,25 @@
 /* The room's work status (DESIGN "Room work status"; web/modules/room_work.js). The status control is a
    status sentence right after the room's title in its bar; in every room its list is one Shade, the bar's
-   own material unfolding from the bar's bottom edge. The control's tone comes with its word from one
-   producer (chat_activity.js: live, queued, wait for the owner's question, held for a pause, an access wait or
-   a hold, unknown, and the connection's own). A row's tone comes from the presenter's facts, never from text,
-   always beside a word and a dot:
-     live       confirmed motion: the accent ink, three moving dots
-     wait       the owner's turn, a pause, an access or Project wait: the warn ink, one amber dot
-     queued     neutral, three still dots;   unknown: neutral, a hollow ring
-     done / caution / failed   a known outcome in its status foreground, one dot
+   own material unfolding from the bar's bottom edge. The control's tone (its word's ink) comes with its word
+   and mark from one producer (work_status.roomStatusView over the server's room: live, queued, wait for the
+   owner's question, held for a pause or a wait, unknown, and the connection's own). A row's tone comes from
+   its work's facts, never from text, always beside a word and one mark:
+     live       working: the accent ink
+     wait       a wait on the owner's own question: the warn ink
+     held       a pause or a wait nothing needs the owner for: neutral
+     queued     neutral;   unknown: neutral
+     done / stopped / failed   a known outcome in its status foreground
+   The mark is the shared one (status_mark.js, drawn by the recipe at the end of ui.css): the work's shape in
+   its word's ink, a known outcome's dot in that outcome's hue, and the amber dot in its place while something
+   waits for the owner (a question or an action only the owner takes), beside any word. This file only places it.
    Names stay --text-primary at 400; local dimensions are variables on .rw-surface, never a type size. */
 
 /* ---- the status control ---------------------------------------------------------------------------
-   The short word in its status ink, then one mark (three dots or one), as on the sidebar's rows; nothing is
-   filled. Pressing is the only fill: a neutral tint on hover and while open.
-   It follows the title, so a longer word takes the title's room, never a neighbour's; it stays whole until the
-   title reaches its floor, and is said whole in the control's name either way. */
+   The short word in its status ink, then one mark, as on the sidebar's rows; nothing is filled. Pressing is
+   the only fill: a neutral tint on hover and while open.
+   It follows the title and takes only room the title leaves; on a short row it shows its mark alone, and the
+   control's name says the whole status either way. */
 .rw-trigger {
-    --rw-dot: var(--text-disabled);
     gap: var(--space-2);
     min-width: 0;
     max-width: 100%;
@@ -31,12 +34,13 @@
 .rw-trigger[hidden] { display: none; }
 .rw-trigger:disabled { cursor: default; opacity: 1; }
 .rw-trigger:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
-/* The status follows the room's title in its bar. The status never shrinks while the title can: the title
-   yields its ellipsis first and keeps a 5ch floor, because the status may never take more than the row less 5ch;
-   only past that floor does the status word ellipsize inside its cap. Neither moves the bar's other controls: the
-   bar decides its rows by the title block's basis, never by these words. */
+/* The status follows the room's title in its bar. The place's name wins (DESIGN "Shell"): when the row is short
+   the status word yields first (its dot and caret stay, and the control's name keeps the whole status), and only
+   then does the title ellipsize; the control never goes under the touch minimum. Neither moves the bar's other
+   controls: each bar is one row whose commands keep their width while its title block yields to them. */
 :is(.chat-page-header, .project-panel-bar) .app-page-title-row > .rw-trigger {
-    flex: 0 0 auto; min-width: 0; max-width: calc(100% - 5ch); margin-left: var(--space-1); padding-inline: 10px;
+    flex: 0 1000 auto; min-width: var(--touch-target-min); max-width: 100%; justify-content: center;
+    margin-left: var(--space-1); padding-inline: 10px;
 }
 :is(.chat-page-header, .project-panel-bar) .app-page-title-row > .app-page-title {
     flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -56,29 +60,29 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-weight: 500;
+    /* The clip box reaches a little past the line so descenders (g, p, y) are not cut; the margin gives the room back. */
+    padding-block: 0.15em;
+    margin-block: -0.15em;
 }
+/* A row too short for the name, the word and the mark keeps the name and the mark: the word goes whole instead of
+   showing a cut fragment ("Wor…"); room_work.js measures it (fitWord). */
+.rw-trigger[data-word="off"] .status-badge { display: none; }
 /* (0,5,0) outranks the light theme's connection colours (0,4,0): the tone below owns the word's ink. */
 :root .rw-trigger[data-tone] .status-badge.status-badge { color: inherit; }
-/* Tones (one producer, chat_activity.js): crimson is live work, amber only the owner's own question, green the
-   room at rest; a pause, an access wait, a hold, starting and reconnecting are neutral facts. */
-.rw-trigger[data-tone="live"] { --rw-dot: var(--accent); color: var(--accent-light); }
-.rw-trigger[data-tone="wait"] { --rw-dot: var(--amber); color: var(--status-warn-fg); }
-.rw-trigger:is([data-tone="queued"], [data-tone="held"], [data-tone="starting"]) { --rw-dot: var(--text-meta); color: var(--text-meta); }
+/* Tones (one producer, work_status.roomStatusView): crimson is live work, amber only the owner's own question, green
+   the room at rest; a pause, an access wait, a hold, starting and reconnecting are neutral facts. The mark after the
+   word takes the word's ink. */
+.rw-trigger[data-tone="live"] { color: var(--accent-light); }
+.rw-trigger[data-tone="wait"] { color: var(--status-warn-fg); }
+.rw-trigger:is([data-tone="queued"], [data-tone="held"], [data-tone="starting"]) { color: var(--text-meta); }
 .rw-trigger[data-tone="unknown"] { color: var(--status-neutral-fg); }
-.rw-trigger[data-tone="online"] { --rw-dot: var(--green); color: var(--status-ok-fg); }
+.rw-trigger[data-tone="online"] { color: var(--status-ok-fg); }
 .rw-trigger[data-tone="offline"] { color: var(--text-secondary); }
 .rw-trigger:not(:disabled):hover { background: rgba(var(--neutral-rgb), 0.07); }
 .rw-trigger[data-open="1"] { background: rgba(var(--neutral-rgb), 0.11); }
 
-/* ---- marks shared by the control and the rows ------------------------------------------------------ */
-.rw-lead, .rw-mark { flex: none; box-sizing: border-box; width: 7px; height: 7px; border-radius: 50%; background: var(--rw-dot); }
-.rw-lead[hidden], .rw-mark[hidden], .rw-caret[hidden], .rw-secondary[hidden], .rw-where[hidden], .rw-chev[hidden] { display: none; }
-.rw-trigger[data-tone="unknown"] .rw-mark,
-.rw-row:is([data-tone="unknown"], [data-tone="ended"]) .rw-lead { background: transparent; border: 1.5px solid currentColor; }
-/* The status's one mark follows its word; a question waiting for the owner turns that mark amber (the word keeps its
-   ink), so live work with a question shows amber moving dots, never a second mark. */
-.rw-trigger[data-wait="1"] { --rw-dot: var(--amber); }
-.rw-trigger[data-wait="1"] .rw-dots { color: var(--amber); }
+/* ---- carets and hidden parts, shared by the control and the rows --------------------------------------- */
+.rw-caret[hidden], .rw-secondary[hidden], .rw-where[hidden], .rw-chev[hidden] { display: none; }
 .rw-caret, .rw-chev { flex: none; display: inline-flex; width: 10px; height: 10px; align-items: center; justify-content: center; }
 .rw-caret::before, .rw-chev::before {
     content: '';
@@ -147,7 +151,6 @@
 .rw-shade .rw-list { padding: var(--space-1) var(--space-2) var(--space-3); }
 .rw-group { padding: var(--space-3) 6px var(--space-1); font-size: var(--type-meta); line-height: var(--line-meta); color: var(--text-meta); }
 .rw-row {
-    --rw-dot: var(--text-disabled);
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto var(--rw-more);
     grid-template-areas: "main verb more" "detail detail detail";
@@ -211,22 +214,44 @@
 /* One flow: every row says its state under its name, so a long phase never starves the name. */
 .rw-row .rw-state { grid-column: 1 / -1; grid-row: 2; }
 .rw-word { font-weight: 400; }
-/* An outcome's quieter second fact (Finalizing…, a wait beside Failed), one accessible status with it. */
+/* The word's quieter line (its reason and what still runs, Finalizing… beside an outcome), one accessible status with
+   it. The separator ends the word, so a line that wraps under it on a narrow row never starts with a stray dot. */
 .rw-secondary { color: var(--text-meta); }
 .rw-secondary::before { content: '· '; }
+@supports selector(:has(*)) {
+    .rw-secondary::before { content: none; }
+    .rw-word:has(+ .rw-secondary:not([hidden]))::after { content: '\00a0·'; color: var(--text-meta); font-weight: 400; }
+}
 /* Where a press found its message is said in the row's details; only the chevron shows, beside the state. */
 .rw-where { display: inline-flex; align-items: center; gap: 6px; }
 .rw-chev { color: var(--text-primary); }
-.rw-row[data-tone="live"] { --rw-dot: var(--accent); }
-.rw-row:is([data-tone="wait"], [data-tone="caution"]) { --rw-dot: var(--amber); }
-.rw-row[data-tone="done"] { --rw-dot: var(--green); }
-.rw-row[data-tone="failed"] { --rw-dot: var(--red); }
-.rw-row[data-tone="live"] :is(.rw-word, .rw-row-dots) { color: var(--accent-light); }
-.rw-row[data-tone="live"] .rw-word { font-weight: 500; }
-.rw-row:is([data-tone="wait"], [data-tone="caution"]) .rw-word { color: var(--status-warn-fg); font-weight: 500; }
-.rw-row[data-tone="done"] .rw-word { color: var(--status-ok-fg); font-weight: 500; }
-.rw-row[data-tone="failed"] .rw-word { color: var(--status-error-fg); font-weight: 500; }
+/* A row's tone is its state's ink: the word takes it and so does the mark before it, while the reason beside it stays
+   quieter. Queued, held and unknown keep the state's neutral ink. */
+.rw-row[data-tone="live"] .rw-state { color: var(--accent-light); }
+.rw-row[data-tone="wait"] .rw-state { color: var(--status-warn-fg); }
+.rw-row[data-tone="done"] .rw-state { color: var(--status-ok-fg); }
+.rw-row[data-tone="stopped"] .rw-state { color: var(--status-neutral-fg); }
+.rw-row[data-tone="failed"] .rw-state { color: var(--status-error-fg); }
 .rw-row[data-tone="ended"] .rw-state { color: var(--text-secondary); }
+.rw-row:is([data-tone="live"], [data-tone="wait"], [data-tone="done"], [data-tone="stopped"], [data-tone="failed"]) .rw-word {
+    font-weight: 500;
+}
+/* The episode's own focus line (Ouroboros writes it, update_focus): quieter, under the state, at most two lines. */
+.rw-row .rw-focus {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    margin-top: 1px;
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    color: var(--text-secondary);
+}
+.rw-row .rw-focus[hidden] { display: none; }
 
 /* ---- verbs and the bare ⋯ ---------------------------------------------------------------------------- */
 .rw-verb { grid-area: verb; display: inline-flex; align-items: center; gap: var(--space-1); }

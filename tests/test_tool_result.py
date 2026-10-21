@@ -41,7 +41,7 @@ _ACTING_BUILTIN_TEXT = (
     "⚠️ ACTING_SUBAGENT_BLOCKED: this mutative subagent may read and "
     "write inside its assigned write root and run shell/services "
     "there, but may not call first-party tool 'commit_reviewed'. It cannot "
-    "commit the live body, run review/runtime/skills lifecycle, enable "
+    "commit the live body, run review gates/runtime/skills lifecycle, enable "
     "tools, or write identity or scratchpad (chronicle pages and parts only "
     "as its own drafts); the parent applies isolated patches or verifies "
     "shared external files and is the sole live-body committer."

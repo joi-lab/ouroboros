@@ -50,7 +50,7 @@ export function normalizeReplyRef(raw) {
         author_label: oneSpace(raw.author_label) || authorOf(role),
         kind: KINDS.includes(raw.kind) ? raw.kind : 'message',
         snippet: oneSpace(raw.snippet),
-        // The host could not resolve the address (the row is gone or never was): the quote says so, never a guess.
+        // The acceptance-time lookup was unresolved; a click retries the current source state.
         unresolved: raw.unresolved === true,
         ts: oneSpace(raw.ts),
         task_id: oneSpace(raw.task_id),
@@ -119,7 +119,7 @@ export function createReplyQuote(raw, { onJump = null, onCancel = null, composer
     head.append(node('span', 'chat-quote-author', author));
     if (when) head.append(node('span', 'chat-quote-when', `· ${when}`));
     // A message with no words (a photo, a file) has no snippet: the panel names what it holds instead of staying empty.
-    const snippet = ref.snippet || (ref.unresolved ? tr('chat.reply.unresolved', 'The quoted message is not available')
+    const snippet = ref.snippet || (ref.unresolved ? tr('chat.reply.unresolved_retry', 'Open quoted message')
         : ref.media ? tr('chat.reply.photo', 'Photo') : tr('chat.reply.attachment', 'Attachment'));
     // One line, cut on a word with a clean ending (text_fit.js), never a CSS ellipsis after a full stop.
     main.append(head, fitText(node('span', 'chat-quote-text'), snippet, 1));

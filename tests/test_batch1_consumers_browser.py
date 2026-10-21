@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from tests.candidate_checkout import candidate_checkout
+from tests._shared import producer_evidence_dir
 from tests.system_e2e.harness import (
     ArtifactOracle,
     KeylessIsolatedServer,
@@ -320,12 +321,12 @@ def _card_lines(page, task_id):
 
 def _expand(page, task_id):
     """Open a live card's timeline, so a screenshot shows its rows, not only the summary."""
-    button = _card(page, task_id).locator("[data-live-summary-button]")
+    button = _card(page, task_id).locator(":scope > [data-live-summary-button] [data-live-disclosure]")
     button.wait_for(state="attached", timeout=30000)
     if button.get_attribute("aria-expanded") != "true":
         button.click()
     page.wait_for_function("id => document.querySelector(`#page-chat .chat-live-card[data-task-id=\"${id}\"] "
-                           "[data-live-summary-button]`)?.getAttribute('aria-expanded') === 'true'",
+                           "> [data-live-summary-button] [data-live-disclosure]`)?.getAttribute('aria-expanded') === 'true'",
                            arg=task_id, timeout=15000)
 
 
@@ -381,7 +382,8 @@ def test_batch1_unknown_controls_and_tool_history_reach_the_real_spa(batch1_clon
 
     from ouroboros.tool_call_log import logical_calls
 
-    evidence = Path(os.environ.get("OUROBOROS_BROWSER_EVIDENCE_OUT") or tmp_path / "evidence")
+    evidence = producer_evidence_dir(tmp_path / "evidence", "batch1-consumers",
+                                     env="OUROBOROS_BROWSER_EVIDENCE_OUT")
     evidence.mkdir(parents=True, exist_ok=True)
     receipt: dict = {"assertions": [], "red": []}
 

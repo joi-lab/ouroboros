@@ -12,8 +12,16 @@ journal era.
 
 ## 1. Schema
 
-The database runs a rollback journal (`journal_mode=DELETE`) with
-`synchronous=FULL`.
+The shared store core defaults to `journal_mode=PERSIST`, `synchronous=FULL`
+and a 64 MiB idle journal size limit. A retained rollback journal avoids file
+creation/deletion on every commit; DELETE-mode older writers can interleave.
+WAL keeps FULL and requires all three facts: SQLite >= 3.51.3 (or the 3.50
+branch >= 3.50.7 / 3.44 branch >= 3.44.6), enforced locks, and a proven local
+filesystem. Darwin/FreeBSD use `statfs` (apfs/hfs/ufs); Linux uses mountinfo
+and known local filesystem types, with every overlay backing directory
+verified; Windows requires `GetDriveTypeW` = DRIVE_FIXED for the containing
+volume. Unknown or remote filesystems keep PERSIST. A working lock probe alone
+does not prove WAL shared-memory support.
 
 | table | holds |
 |---|---|
@@ -99,6 +107,13 @@ new receipt, failure, missing result or live ownership keeps the debt. A
 batched task-store query finds missing results before ownership reads. Their
 exact revisions stay, so a result landing after the last receipt (child
 copyback or quarantine restore) is projected later without a new receipt.
+`review_price.py` prices one review by one reviewer row from the same rows:
+`review_seat_costs` groups the review category's attempts by
+`(review_wave_id, review_slot_id)` through the `(category, ts_last)` index,
+summing every physical attempt of a seat in one wave; the median of a row's
+recent waves on its current model is shown with its count and range, no
+history reads `cost unknown`, and one process keeps the table for half an hour
+so `## Review` never waits on the ledger.
 
 ## 5. Lock tiers
 
@@ -112,9 +127,40 @@ connections per inode, and every raw read in a process that may hold a store
 (the header probe, the Files panel, the read tools, artifact capture:
 `store.open_for_read`, `iter_file_bytes`, `read_file_bytes`, `copy_file_bytes`)
 borrows one shared descriptor per inode that closes only when no counted
-connection has the file open, as SQLite's unix VFS defers its own closes. The connection, tier,
+connection has the file open, as SQLite's unix VFS defers its own closes. Under
+WAL every open connection also holds locks on the `-shm` index, so these readers
+refuse a WAL index, told on every OS by its name and identity (the regular file
+the volume resolves a SQLite database's name plus `-shm` to), before opening it
+(`store.is_wal_index`, `WalIndexRefused`; the Files panel answers 403); the folder
+copies, captures, delegated snapshots and artifact listings built on them leave
+it out as an excluded member, tracked or not, never read and with no content
+baseline (a copy rebuilds its own from the copied `-wal`, which carries no lock),
+and search skips SQLite's journal and WAL files. The rule assumes this process's
+own databases never end in `-shm`. Under WAL a byte copy of a live store (a
+download, a file or folder copy) can hold an older state (newer commits stay in
+its `-wal`), be torn by a checkpoint running meanwhile, or fail to open when a
+folder copy pairs the file with a `-wal` taken at another moment; an exact copy
+comes from a stopped Ouroboros, whose last close checkpoints the log into the
+file. The connection, tier,
 file-identity and transaction core is `ouroboros/store.py`, shared with the
 current-facts store; `usage_store` keeps the money error vocabulary over it.
+
+Ordinary transactions lease one lazy connection per process, file and thread.
+Durability pragmas run at connection open; acquisition and commit waits retain
+their existing per-operation budgets. Returning a lease leaves no transaction
+open. Thread exit, fork, file replacement, export and a folder's move
+(`close_connections_under`, each process its own) release cached handles;
+the raw descriptor follows the last connection. Fork callers must be outside
+transactions. Export/retire closes all idle handles and leaves DELETE mode
+after checkpointing, before a rename; an active lease refuses handoff with the
+usual busy outcome. Any switch that retains a store while changing to an older
+SQLite runtime must also call `store.prepare_handoff` after quiescing writers.
+This includes switches whose target still contains the store module.
+Sibling import builds also close in DELETE mode before publication, so no
+temporary journal or WAL is left under the pre-rename filename.
+Caller-owned raw connections must also close before rename on every platform.
+At normal interpreter exit the pool closes before Python clears the inode registry
+and its locks; thread exit closes that thread's connections earlier.
 
 - `enforced`: SQLite's own file locks. `usage_store.hold` is the acquisition
   primitive the existing waits slice (`_usage_wait`): sends retry it in short
@@ -274,8 +320,8 @@ facts. A different final price is a conflict, never last-write-wins. Receipt
 retention precedes application; repeating `--apply` recovers an interrupted run.
 Existing dirty-owner maintenance refreshes terminal task/root projections after
 the ledger write, including after restart. Completed review attribution permits
-price recovery; live review operations (including late acceptance after the
-author task ends), live owners and post-task work remain protected. Price
+price recovery; live review operations (including a review wave that settles after
+the author's task ends), live owners and post-task work remain protected. Price
 uncertainty grants no continuation rights. Applying a price to an unresolved attempt closes its monetary row, removing that row's model-handoff blocker; separate live ownership checks and incomplete-response facts remain. Refining an already-settled nonfinal row never expands the open-attempt set.
 
 Standalone command custody uses the selected data root's existing current queue

@@ -8,73 +8,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { ElementStub } from './chat_dom_fixture.js';
-import {
-    applyHandle, createComposerOwnerControls, createEffortRangeControl, snapRange,
-} from '../modules/composer_owner_controls.js';
-
-/* A document whose listeners can be fired, and a window that may or may not hover. */
-function stubDocument() {
-    const listeners = new Map();
-    const doc = {
-        byId: new Map(), activeElement: null,
-        createElement: (tag) => new ElementStub(tag, doc),
-        addEventListener(type, fn) { listeners.set(type, [...(listeners.get(type) || []), fn]); },
-        removeEventListener(type, fn) { listeners.set(type, (listeners.get(type) || []).filter((f) => f !== fn)); },
-        fire(type, event) { for (const fn of listeners.get(type) || []) fn(event); },
-        count: (type) => (listeners.get(type) || []).length,
-    };
-    return doc;
-}
-const hoverWindow = (matches) => ({ matchMedia: (query) => ({ matches: matches && query === '(hover: hover) and (pointer: fine)' }) });
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-function mount({ hover = false, save, win } = {}) {
-    const doc = stubDocument();
-    const row = doc.createElement('div');
-    row.className = 'chat-toolbar-row';
-    row.getBoundingClientRect = () => ({ top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0 });  // not laid out: no fit
-    const toasts = [];
-    const refreshes = [];
-    const layouts = [];
-    const saves = [];
-    const control = createEffortRangeControl({
-        row, doc, win: win === undefined ? hoverWindow(hover) : win,
-        saveEffortRange: save || (async (triple) => { saves.push(triple); return { ok: true, effort_range: triple }; }),
-        showToast: (message, tone) => toasts.push([message, tone]),
-        refreshState: (force) => refreshes.push(force),
-        onLayout: () => layouts.push(control?.isOpen?.()),
-    });
-    const el = control.el;
-    const segs = el.querySelectorAll('.chat-effort-seg');
-    // The strip has layout: seven 40px segments, so a boundary is x / 40.
-    segs.forEach((seg, i) => { seg.offsetLeft = i * 40; seg.offsetWidth = 40; });
-    const head = el.querySelector('.chat-effort-head');
-    const strip = el.querySelector('[data-effort-strip]');
-    const handles = { min: el.querySelector('.chat-effort-min'), rec: el.querySelector('.chat-effort-rec'), max: el.querySelector('.chat-effort-max') };
-    const fire = (node, type, event) => { for (const fn of node.listeners.get(type) || []) fn(event); };
-    const last = (node, type) => (node.listeners.get(type) || []).at(-1);
-    const pointer = (clientX, { handle = null, pointerId = 1, clientY = 10 } = {}) => ({
-        button: 0, clientX, clientY, pointerId, pointerType: 'mouse', preventDefault() {},
-        target: { closest: (selector) => (selector === '[data-handle]' ? handle : null) },
-    });
-    return {
-        control, el, row, doc, head, strip, handles, segs, toasts, refreshes, layouts, saves,
-        headClick: (detail = 1) => fire(head, 'click', { detail }),
-        key: (which, key) => fire(handles[which], 'keydown', { key, currentTarget: handles[which], preventDefault() {} }),
-        down: (x, options) => fire(strip, 'pointerdown', pointer(x, options)),
-        move: (x, pointerId = 1) => last(strip, 'pointermove')?.(pointer(x, { pointerId })),
-        up: (x, pointerId = 1) => last(strip, 'pointerup')?.(pointer(x, { pointerId })),
-        cancel: (pointerId = 1) => last(strip, 'pointercancel')?.(pointer(0, { pointerId })),
-        enter: (pointerType = 'mouse') => fire(el, 'pointerenter', { pointerType }),
-        // The stub control's rectangle is x 0..100, y 0..20; the default leave point is far outside the zone.
-        leave: (pointerType = 'mouse', { x = 500, y = 500 } = {}) => fire(el, 'pointerleave', { pointerType, clientX: x, clientY: y }),
-        docMove: (x, y) => doc.fire('pointermove', { pointerType: 'mouse', clientX: x, clientY: y }),
-        outside: () => doc.fire('pointerdown', { target: new ElementStub('div', doc) }),
-        inside: () => doc.fire('pointerdown', { target: head }),
-        escape: () => doc.fire('keydown', { key: 'Escape' }),
-        settle: () => control.pendingSave(),
-    };
-}
+import { applyHandle, createEffortRangeControl, snapRange } from '../modules/composer_owner_controls.js';
+import { hoverWindow, mount, mountPair, sleep, stubDocument } from './composer_controls_fixture.js';
 
 test('primary and helper bounds are independent, and helper bounds cannot cross', () => {
     const base = { min: 1, rec: 2, max: 3 };
@@ -547,52 +482,6 @@ test('destroy removes the element, its document listeners and its timers', async
     assert.equal(m.control.isOpen(), false, 'the hover timer died with the control');
 });
 
-/* Both capsules in one composer row, as chat.js builds it: the pills, then the context anchor. */
-function mountPair({ hover = false, reply, win, withBox = false, projectId = '' } = {}) {
-    const doc = stubDocument();
-    const box = doc.createElement('section');
-    const row = doc.createElement('div');
-    box.appendChild(row);
-    row.className = 'chat-toolbar-row';
-    row.getBoundingClientRect = () => ({ top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0 });  // not laid out: no fit
-    const pills = doc.createElement('div');
-    pills.className = 'chat-composer-pills';
-    row.appendChild(pills);
-    const contextEl = doc.createElement('div');
-    contextEl.className = 'chat-context-mode';
-    contextEl.dataset.contextMode = 'max';
-    row.appendChild(contextEl);
-    const posts = [];
-    const toasts = [];
-    const refreshes = [];
-    const answer = { value: reply || { ok: true } };
-    const effortAnswer = { value: null };
-    const controls = createComposerOwnerControls({
-        projectId, row, box: withBox ? box : null, doc, win: win || hoverWindow(hover), byId: (suffix) => (suffix === 'context-mode' ? contextEl : null),
-        apiFetch: async (url, init) => {
-            const body = JSON.parse(init.body); posts.push([url, body]);
-            const response = await answer.value;
-            return response.json ? response : { ...response, json: async () => ({ project_id: projectId, context_mode: body.mode }) };
-        },
-        saveEffortRange: async (body) => { posts.push(['/api/owner/effort-range', body]); return effortAnswer.value || { project_id: projectId, effort_range: body }; },
-        showToast: (message, tone) => toasts.push([message, tone]),
-        refreshState: (force) => refreshes.push(force),
-    });
-    const fire = (node, type, event) => Promise.all((node.listeners.get(type) || []).map((fn) => fn(event)));
-    const effortEl = controls.effort.el;
-    const seg = (mode) => contextEl.querySelectorAll('.chat-seg').find((node) => node.dataset.mode === mode);
-    return {
-        controls, row, box, doc, contextEl, effortEl, posts, toasts, refreshes, answer, effortAnswer, seg,
-        contextHead: contextEl.querySelector('.chat-context-head'), effortHead: effortEl.querySelector('.chat-effort-head'),
-        press: (head, detail = 1) => fire(head, 'click', { detail }),
-        choose: (mode) => fire(contextEl, 'click', { target: { closest: (selector) => (selector === '.chat-seg' ? seg(mode) : null) } }),
-        key: (mode, key) => fire(contextEl.querySelector('.chat-context-strip'), 'keydown', {
-            key, preventDefault() {}, target: { closest: (selector) => (selector === '.chat-seg' ? seg(mode) : null) },
-        }),
-        docDown: (target) => doc.fire('pointerdown', { target }),
-    };
-}
-
 test('the context capsule: ring, Context and the mode; it opens into exactly three modes, one tab stop among them', async () => {
     const m = mountPair();
     assert.ok(m.contextEl.classList.contains('chat-capsule'));
@@ -613,9 +502,14 @@ test('the context capsule: ring, Context and the mode; it opens into exactly thr
     assert.equal(m.contextHead.getAttribute('aria-expanded'), 'true');
     assert.deepEqual(segs.map((node) => node.tabIndex), [-1, -1, 0], 'one tab stop: the chosen mode');
     assert.equal(m.doc.activeElement, m.seg('max'), 'the keyboard lands on the chosen mode');
-    m.doc.fire('keydown', { key: 'Escape' });
+    const escape = { key: 'Escape', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+    m.doc.fire('keydown', escape);
     assert.equal(m.contextEl.dataset.open, 'false');
+    assert.equal(escape.defaultPrevented, true, 'the capsule took the Escape: a Project room under it stays open');
     assert.equal(m.doc.activeElement, m.contextHead, 'Esc returns focus to the head');
+    const later = { key: 'Escape', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+    m.doc.fire('keydown', later);
+    assert.equal(later.defaultPrevented, false, 'a closed capsule leaves Escape to the room');
     m.controls.syncState({ context_mode: 'nano' });
     assert.equal(m.contextEl.dataset.contextMode, 'nano', 'the Main composer reads Main mode');
     assert.equal(m.contextEl.querySelector('.chat-capsule-value').textContent, 'Nano');
@@ -742,6 +636,21 @@ test('closed, the capsules keep their names while the line holds them; a narrowe
     m.contextHead.listeners.get('click').forEach((fn) => fn({ detail: 1 }));
     m.controls.syncState({});
     assert.equal(m.row.dataset.ownerCompact, undefined, 'never decided while a strip is open');
+    m.controls.destroy();
+});
+
+test('a phone\'s ☰, gone down beside the field while the row folds, is not the line the capsules are read by', () => {
+    const m = mountPair();
+    const menu = new ElementStub('button', m.doc);
+    menu.className = 'mobile-nav-toggle composer-menu';
+    menu.getBoundingClientRect = () => ({ top: 21, bottom: 53, width: 32 });  // composer_fold.js: at the field's middle
+    m.row.prepend(menu);
+    m.effortEl.getBoundingClientRect = () => ({ top: 40, bottom: 72, width: 130 });  // the names push Effort onto a second line
+    m.controls.syncState({});
+    assert.equal(m.row.dataset.ownerCompact, 'true', 'the capsules\' own line still wraps: the row keeps its fit');
+    m.effortEl.getBoundingClientRect = () => ({ top: 0, bottom: 32, width: 130 });
+    m.controls.syncState({});
+    assert.equal(m.row.dataset.ownerCompact, undefined, 'room again: the names come back');
     m.controls.destroy();
 });
 

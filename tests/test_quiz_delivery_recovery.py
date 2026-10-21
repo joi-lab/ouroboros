@@ -1,11 +1,11 @@
 """Canonical accepted quiz effects recover automatically with bounded durable retries."""
 import asyncio
 import base64
-import json
 import queue as queue_module
 import threading
 
 import pytest
+from tests._dialogue import chat_rows
 
 from ouroboros.gateway.task_decision import recover_question_deliveries
 from ouroboros.owner_quiz import (
@@ -82,7 +82,7 @@ def test_live_answer_mailbox_failure_then_terminal_recovers_through_accepted_ing
     assert status == 503 and reply["question_delivery"]["reason_code"] == "mailbox_write_failed"
     original = block(runtime)
     assert original["delivery"]["history_at"] and not original.get("answered_after_terminal")
-    original_history = (runtime.root / "logs/chat.jsonl").read_text(encoding="utf-8")
+    original_history = chat_rows(runtime.root)
     monkeypatch.setattr(queue, "RUNNING", {})
     write_task_result(runtime.root, runtime.task["id"], "completed", result="finished before delivery")
     monkeypatch.setattr(owner_mailbox, "write_owner_message", real_write)
@@ -92,7 +92,7 @@ def test_live_answer_mailbox_failure_then_terminal_recovers_through_accepted_ing
     assert repaired["delivery_after_terminal"] is True and not repaired.get("answered_after_terminal")
     assert repaired["answered_at"] == original["answered_at"]
     assert repaired["delivery"]["attempts"] == 2
-    rows = [json.loads(line) for line in (runtime.root / "logs/chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = chat_rows(runtime.root)
     assert len([row for row in rows if row.get("type") == "quiz_answer"]) == 1
     [accepted] = [row for row in rows if row.get("client_message_id") == "quiz_late_answer:task-quiz:q"]
     ref = late_answer_ref(accepted["late_answer"])
@@ -110,7 +110,7 @@ def test_live_answer_mailbox_failure_then_terminal_recovers_through_accepted_ing
     assert "My exact alternative" in frame and "without choosing an offered option" in frame
     assert "could not be read" not in frame
     assert "answer_snapshot" not in late_answer_ref({**ref, "quiz_id": "other"})
-    assert original_history in (runtime.root / "logs/chat.jsonl").read_text(encoding="utf-8")
+    assert chat_rows(runtime.root)[:len(original_history)] == original_history
 
 
 def test_closed_history_failure_recovers_without_owner_answer(runtime, monkeypatch):
@@ -131,7 +131,7 @@ def test_closed_history_failure_recovers_without_owner_answer(runtime, monkeypat
     assert settled["state"] == "closed" and settled["discharged_at"]
     assert "answered_at" not in settled and "answered_index" not in settled
     assert drain_owner_entries(runtime.root, runtime.task["id"], set()) == []
-    rows = [json.loads(line) for line in (runtime.root / "logs/chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = chat_rows(runtime.root)
     assert not [row for row in rows if row.get("type") == "quiz_answer"]
     [closed] = [row for row in rows if row.get("type") == "quiz_closed"]
     assert closed["text"] == settled["closed_reason"]
@@ -173,14 +173,15 @@ def migrated_without_address(runtime):
     two chats: the one-time import keeps it a typed ``question:`` unknown, never a guessed chat."""
     from ouroboros.obligations import members
     from ouroboros.startup_migrations import migrate_question_publications
-    from ouroboros.utils import append_jsonl
+    from ouroboros import dialogue_store as ds
 
     def legacy(quizzes):
         for key in ("publication_chat_id", "publication_evidence", "publication_bound_at", "published_at", "delivery"):
             quizzes["q"].pop(key, None)
         return True
     _mutate_projection(runtime.root, runtime.task["id"], legacy)
-    append_jsonl(runtime.root / "logs/chat.jsonl", {"direction": "out", "type": "quiz", "task_id": runtime.task["id"],
+    # Two imported publication witnesses disagree on the address.
+    ds.append(runtime.root, "chat", {"direction": "out", "type": "quiz", "task_id": runtime.task["id"],
                                                     "chat_id": 2, "quiz": {"quiz_id": "q"}})
     assert migrate_question_publications(runtime.root) == {"bound": 0, "unknown": 1}
     assert members(runtime.root, "unknowns")["question:task-quiz:q"]["reason"] == "publication_address_ambiguous"
@@ -231,7 +232,7 @@ def test_live_author_receives_an_answer_whose_card_address_is_unknown_once(runti
     assert recover(runtime) == {"attempted": 1, "delivered": 1, "pending": 0}
     settled = block(runtime)
     assert settled["discharged_at"] and not settled.get("delivery_after_terminal")
-    rows = [json.loads(line) for line in (runtime.root / "logs/chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = chat_rows(runtime.root)
     [row] = [row for row in rows if row.get("type") == "quiz_answer"]
     assert row["chat_id"] == 1 and row["quiz"]["comment"] == " exact words "
     assert not [row for row in rows if row.get("client_message_id") == "quiz_late_answer:task-quiz:q"]
@@ -258,7 +259,7 @@ def test_owner_closure_reaches_a_live_author_while_its_row_waits_for_an_address(
     due(runtime)
     assert recover(runtime) == {"attempted": 1, "delivered": 1, "pending": 0}
     assert len(drain_owner_entries(runtime.root, runtime.task["id"], set())) == 1
-    rows = [json.loads(line) for line in (runtime.root / "logs/chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = chat_rows(runtime.root)
     assert [row["text"] for row in rows if row.get("type") == "quiz_closed"] == ["Withdrawn"]
 
 
@@ -284,13 +285,17 @@ def test_a_closure_owing_its_unpublished_ask_is_no_import_unknown(runtime, monke
     def questions():
         return {key for key in obligations.members(runtime.root, "unknowns") if key.startswith("question:")}
     report = startup_migrations.prepare_startup_state(runtime.root, rebuild=door == "rebuild")
+    if door == "rollback":
+        from ouroboros.store_import import run_legacy_reconcile
+        assert report["question_publications"] == {}
+        report = run_legacy_reconcile(runtime.root)
     assert report["question_publications"] == {"bound": 0, "unknown": 1}
     assert questions() == {f"question:{tid}:older"}
     assert recover(runtime) == {"attempted": 1, "delivered": 1, "pending": 0}
     settled = block(runtime)
     assert (settled["publication_chat_id"], settled["publication_evidence"]) == (1, "pre_exposure")
     assert settled["discharged_at"] and settled["delivery"]["state"] == "delivered"
-    rows = [json.loads(line) for line in (runtime.root / "logs/chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = chat_rows(runtime.root)
     assert [(row["chat_id"], row["text"]) for row in rows if row.get("type") == "quiz_closed"] == [(1, "Withdrawn")]
     monkeypatch.setattr(startup_migrations, "_legacy_question_publications", lambda *a: pytest.fail("repeat import"))
     assert startup_migrations.prepare_startup_state(runtime.root)["question_publications"] == {}
@@ -406,7 +411,7 @@ def test_late_enqueue_failure_is_not_acknowledged_as_delivery_on_automatic_retry
     retained = block(runtime)
     assert retained["delivery"]["reason_code"] == "late_answer_delivery_unknown"
     assert not retained.get("discharged_at") and runtime.bridge._inbox.empty()
-    rows = [json.loads(line) for line in (runtime.root / "logs/chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = chat_rows(runtime.root)
     assert len([row for row in rows if row.get("client_message_id") == "quiz_late_answer:task-quiz:q"]) == 1
     # No retry learns more than the lost witness: automatic attempts stop, the debt stays current,
     # and the card says unknown rather than pending.
@@ -441,7 +446,7 @@ def test_owner_removes_an_unknown_late_answer_from_current_questions_without_res
     from ouroboros.project_dialogue import project_question_pointer
 
     unknown_late_delivery(runtime, monkeypatch)
-    before, history = block(runtime), (runtime.root / "logs/chat.jsonl").read_text(encoding="utf-8")
+    before, history = block(runtime), chat_rows(runtime.root)
     assert runtime.task["id"] in members(runtime.root, "owner_questions")
     assert _decide(runtime, request_id="rm-1", action="dismiss", comment="no")[1]["reason_code"] == "dismiss_payload_invalid"
     assert _decide(runtime, request_id="rm-1", action="dismiss", decision_id="quiz:task-quiz:other")[0] == 404
@@ -464,7 +469,7 @@ def test_owner_removes_an_unknown_late_answer_from_current_questions_without_res
     due(runtime)
     assert recover(runtime)["attempted"] == 0 and runtime.bridge._inbox.empty()
     unchanged = lambda delivery: {key: value for key, value in delivery.items() if key != "next_retry_at"}  # due() clears it
-    assert (runtime.root / "logs/chat.jsonl").read_text(encoding="utf-8") == history
+    assert chat_rows(runtime.root) == history
     assert unchanged(block(runtime)["delivery"]) == unchanged(removed["delivery"])  # no attempt, failure or settlement
     pointer = project_question_pointer({"task_id": runtime.task["id"], "quiz_id": "q"}, block(runtime),
                                        {"id": "p", "chat_id": 1, "name": "Project"})
@@ -488,14 +493,14 @@ def test_removal_refuses_an_answer_whose_delivery_still_retries(runtime, monkeyp
     """Only an unknown dispatch is removable: removing a retrying debt would silence its delivery."""
     prepare(runtime)
     monkeypatch.setattr(queue, "RUNNING", {})
-    real_log = message_bus.log_chat
+    real_accept = message_bus.accept_chat
     def write_then_raise(*args, **kwargs):
-        row = real_log(*args, **kwargs)
+        receipt = real_accept(*args, **kwargs)
         if kwargs.get("client_message_id") == "quiz_late_answer:task-quiz:q":
             raise OSError("write returned an error after durable append")
-        return row
+        return receipt
     with monkeypatch.context() as failing:
-        failing.setattr(message_bus, "log_chat", write_then_raise)
+        failing.setattr(message_bus, "accept_chat", write_then_raise)
         assert _answer(runtime, "q", request_id="committed", index=1)[0] == 503
     owed = block(runtime)["delivery"]
     assert owed["state"] == "owed" and owed["reason_code"] != "late_answer_delivery_unknown"
@@ -509,20 +514,19 @@ def test_removal_refuses_an_answer_whose_delivery_still_retries(runtime, monkeyp
 def test_proven_undispatched_acceptance_recovers_its_saved_snapshot_automatically(runtime, monkeypatch):
     prepare(runtime)
     monkeypatch.setattr(queue, "RUNNING", {})
-    real_log = message_bus.log_chat
+    real_accept = message_bus.accept_chat
     def write_then_raise(*args, **kwargs):
-        row = real_log(*args, **kwargs)
+        receipt = real_accept(*args, **kwargs)
         if kwargs.get("client_message_id") == "quiz_late_answer:task-quiz:q":
             raise OSError("write returned an error after durable append")
-        return row
-    monkeypatch.setattr(message_bus, "log_chat", write_then_raise)
+        return receipt
+    monkeypatch.setattr(message_bus, "accept_chat", write_then_raise)
     assert _answer(runtime, "q", request_id="committed", index=1, comment=" exact ")[0] == 503
     assert runtime.bridge._inbox.empty()
-    monkeypatch.setattr(message_bus, "log_chat", real_log)
+    monkeypatch.setattr(message_bus, "accept_chat", real_accept)
     due(runtime)
     assert recover(runtime) == {"attempted": 1, "delivered": 1, "pending": 0}
-    [accepted] = [json.loads(line) for line in (runtime.root / "logs/chat.jsonl").read_text(encoding="utf-8").splitlines()
-                  if json.loads(line).get("client_message_id") == "quiz_late_answer:task-quiz:q"]
+    [accepted] = [row for row in chat_rows(runtime.root) if row.get("client_message_id") == "quiz_late_answer:task-quiz:q"]
     queued = runtime.bridge._inbox.get_nowait()
     # The retry's attempt stamps differ; saved ingress authority wins verbatim.
     assert queued["task_metadata"]["late_answer"] == accepted["late_answer"]

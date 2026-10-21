@@ -428,12 +428,6 @@ _PRODUCER_SHAPES = (
     ("followup_data_root_unresolved", "schedule_followup",
      "ERROR: FOLLOWUP_DATA_ROOT_UNRESOLVED: task drive root is not under the owner data root",
      "TOOL_ERROR", ()),
-    ("followup_cap_reached", "schedule_followup",
-     "ERROR: FOLLOWUP_CAP_REACHED: this task already holds 2 pending follow-up(s) of the "
-     "2 allowed: followup-root-1-a1b2c3 (fires at/after 2030-01-01T00:00:00+00:00); "
-     "followup-root-1-d4e5f6 (fires at/after 2030-02-01T00:00:00+00:00). Each fires once; "
-     "wait for one to fire, or the owner can disable/delete records from the Schedules surface.",
-     "RESOURCE_CONSTRAINT_BLOCKED", ()),
     ("followup_persist_failed", "schedule_followup",
      "ERROR: FOLLOWUP_PERSIST_FAILED: OSError: [Errno 28] No space left on device",
      "TOOL_ERROR", ()),

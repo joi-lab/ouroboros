@@ -16,7 +16,7 @@ import logging
 import pathlib
 import subprocess
 from contextlib import ExitStack
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.headless import (
@@ -76,6 +76,22 @@ def _capture_failed_refusal(rid: str, cap_status: str, note: str) -> str:
         "execution snapshot (if present) is preserved. Inspect the snapshot "
         "directly, then retry this call."
     )
+
+
+def prepared_capture_inspection(rid: str, decision: str, applies_changes: bool,
+                                describe: Callable[[], Dict[str, Any]], *, prepared: bool) -> str:
+    """A capture this call prepared, or one that finished while it waited for the lock, was
+    never available for inspection: an apply of its changes returns it instead (#1969). A
+    capture ready before the call keeps the ordinary contract (its caller decides); this proves
+    no reading of it. "" lets the call proceed; nothing here applies, records or releases.
+    """
+    if decision != "apply" or not applies_changes or not prepared:
+        return ""
+    return (f"⚠️ INTEGRATE_DELEGATED_INSPECT_CAPTURE: run {rid}'s captured result was NOT applied: it was "
+            "prepared during this call, so it was not available for inspection. Read it (manifest_read, its "
+            "file artifacts, and patch_read when present); a later apply decides this same retained capture. "
+            "No target files changed; the snapshot and the capture stay retained.\n"
+            + json.dumps(describe(), ensure_ascii=False, indent=2))
 
 
 def _capture_at_disposition(
@@ -168,10 +184,11 @@ def _delegated_disposition_refusal(status: str, entry: Any, rid: str,
             f"⚠️ INTEGRATE_DELEGATED_ALREADY_DISPOSED: run {rid}'s patch was already "
             f"{entry.patch_disposed}. A disposition is final; nothing was changed."
         )
-    if not entry.settled:
+    if not (entry.settled or entry.terminal_state in custody.TERMINAL_STATES):
+        # Execution end, not money: a pending ledger never holds a finished run's result (#1969).
         return (
-            f"⚠️ INTEGRATE_DELEGATED_NOT_TERMINAL: run {rid} has not settled yet. "
-            "delegate_wait it to terminal first — its patch is captured there."
+            f"⚠️ INTEGRATE_DELEGATED_NOT_TERMINAL: run {rid} has no observed terminal, so it may still be "
+            "running. delegate_wait it to its terminal; this call then prepares any capture still owed."
         )
     if entry.patch_apply_pending and not acknowledge_ambiguous:
         # CR1-3: a durable apply-intent row with no resolution/disposition — a
@@ -251,7 +268,9 @@ def _dispose_delegated(drive: Any, entry: Any, snapshot_key: str, reason: str,
             removed = remove_execution_snapshot(snapshot_key)
         except Exception:
             removed = False
-        note = "" if removed else " (snapshot cleanup deferred to the startup GC.)"
+        note = "" if removed else (
+            " (snapshot cleanup deferred to custody GC at boot or a later custody pass, "
+            "once the owning task is proven over.)")
     return True, note
 
 
@@ -304,13 +323,13 @@ def retain_investigation_evidence(drive: Any, entry: Any, block: Dict[str, Any],
     import hashlib
 
     from ouroboros import delegate_custody as custody
-    from ouroboros.delegate_registration_policy import candidate_apply_possible
+    from ouroboros.delegate_registration_policy import INVESTIGATION_NOTE, candidate_apply_possible
 
     ready = {"ready", ARTIFACT_STATUS_READY_WITH_CHANGES, ARTIFACT_STATUS_READY_NO_CHANGES}
     if (candidate_apply_possible(entry) or block.get("status") not in ready
             or entry.patch_disposed not in ("", custody.EVIDENCE_RETAINED)):
         return block
-    retained_note = "Evidence-only investigation: the captured changes are retained as evidence and never applied."
+    retained_note = INVESTIGATION_NOTE
     directory = str(block.get("capture_kind") or "") == "engine_directory"
     named = {} if directory else _retain_named_evidence(drive, entry, reread=bool(entry.patch_disposed))
     shown = {**block, **({"named_evidence": named} if named else {})}
@@ -524,6 +543,7 @@ def _integrate_delegated_patch(
     status, entry, _ = orphan_disposition_status(ctx, drive, rid)
     if status != custody.OWNED or entry is None:
         return _delegated_disposition_refusal(status, entry, rid, acknowledge_ambiguous)
+    captured_before = bool(entry.patch_captured)  # before any wait: a capture made meanwhile was never shown
     lock_path = custody.disposition_lock_path(drive, entry)  # one per snapshot, shared by a continuation chain
     try:
         lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=20.0, owner_aware_stale=True)
@@ -537,7 +557,8 @@ def _integrate_delegated_patch(
 
         if handover := disposition_refusal(drive, run(drive, rid)):
             return handover
-        result = _integrate_delegated_patch_locked(ctx, rid, decision, reason, acknowledge_ambiguous, paths)
+        result = _integrate_delegated_patch_locked(ctx, rid, decision, reason, acknowledge_ambiguous, paths,
+                                                   captured_before=captured_before)
         from ouroboros.delegate_terminal import refresh_disposed_reconciliation
 
         try:
@@ -565,6 +586,7 @@ def _integrate_delegated_patch_locked(
     reason: str = "",
     acknowledge_ambiguous: bool = False,
     paths: List[str] | None = None,
+    captured_before: bool | None = None,
 ) -> str:
     """The C1 explicit acceptance seam: apply or reject ONE delegated run's captured patch.
 
@@ -581,6 +603,8 @@ def _integrate_delegated_patch_locked(
     ``acknowledge_ambiguous`` (CR2-1) is the owner exit from the AMBIGUOUS
     crash state: it resolves the stale intent durably and re-runs this normal
     flow, whose own guards re-verify the tree. A no-op when nothing is pending.
+    A capture still owed by a finished run is prepared here, under the shared lock, and
+    returned for inspection instead of being applied in the same call (#1969).
     """
     from ouroboros import delegate_custody as custody, delegate_source_coverage
     from ouroboros.delegate_shared import orphan_disposition_status
@@ -588,6 +612,8 @@ def _integrate_delegated_patch_locked(
     rid = run_id
     drive = custody.custody_root(ctx)
     status, entry, orphan_of = orphan_disposition_status(ctx, drive, rid)
+    if captured_before is None and entry is not None:
+        captured_before = bool(entry.patch_captured)
     orphan_note = f"(orphan of terminal task {orphan_of}) " if orphan_of else ""
     refusal = _delegated_disposition_refusal(status, entry, rid, acknowledge_ambiguous)
     if refusal:
@@ -603,7 +629,8 @@ def _integrate_delegated_patch_locked(
                 return integrate_directory_result(ctx, entry, decision, reason, gateway,
                                                   acknowledge_ambiguous=acknowledge_ambiguous,
                                                   paths=paths, orphan=bool(orphan_of),
-                                                  admission_check=lambda: _current_disposition_refusal(ctx, rid))
+                                                  admission_check=lambda: _current_disposition_refusal(ctx, rid),
+                                                  prepared=not captured_before)
         except Exception as exc:
             return f"⚠️ INTEGRATE_DELEGATED_APPLY_UNCONFIRMED: {type(exc).__name__}: {exc}. Retain this run; no replacement was started."
     # Directory selections have their own semantics. On whole-capture paths,
@@ -618,6 +645,7 @@ def _integrate_delegated_patch_locked(
     cap_dir = custody.delegated_capture_dir(drive, entry.task_id, custody.capture_key(entry))
     manifest_path = cap_dir / "workspace_patch.json"
     patch_path = cap_dir / "workspace.patch"
+    prepared = not (captured_before and _manifest_capture_status(manifest_path) in _READY_CAPTURE_STATUSES)
     capture_refusal = _si()._capture_at_disposition(drive, entry, rid, manifest_path, decision)
     if capture_refusal:
         return capture_refusal
@@ -630,6 +658,13 @@ def _integrate_delegated_patch_locked(
             manifest = loaded if isinstance(loaded, dict) else {}
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             return f"⚠️ INTEGRATE_MANIFEST_UNREADABLE: {manifest_path}: {type(exc).__name__}: {exc}."
+    from ouroboros.delegate_collection import capture_projection
+
+    if inspection := prepared_capture_inspection(
+            rid, decision, manifest.get("status") == ARTIFACT_STATUS_READY_WITH_CHANGES,
+            lambda: capture_projection(drive, entry, reader_task_id=str(getattr(ctx, "task_id", "") or "")) or {},
+            prepared=prepared):
+        return inspection
     if entry.authority_source == "skill_payload" or str(manifest.get("capture_kind") or "") == "skill_payload":
         # The exact-payload branch (R1 item 3) lives in delegate_integration:
         # fresh semantic rebinding, whole-payload CAS, reserved-path whole-apply

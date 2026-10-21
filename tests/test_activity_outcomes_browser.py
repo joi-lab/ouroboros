@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests._budget_pause_exact_helpers import _install_queue
+from tests._work_projection_shared import state_fields, with_work_fields
 
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 WEB = Path(__file__).resolve().parents[1] / "web"
@@ -76,7 +77,6 @@ def _seed(root, monkeypatch):
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
 def test_activity_outcome_rows_and_their_controls_in_a_real_browser(tmp_path, monkeypatch, engine):
     from playwright.sync_api import expect, sync_playwright
-    from ouroboros.gateway.state import _chat_activities_snapshot_safe
     from ouroboros.gateway.tasks import _queue_snapshot
     from ouroboros.outcomes import public_task_result
     from ouroboros.task_results import load_task_result
@@ -98,11 +98,14 @@ def test_activity_outcome_rows_and_their_controls_in_a_real_browser(tmp_path, mo
         elif path == "state":
             if reads["state"] == "failed":
                 return route.fulfill(status=503, content_type="application/json", body='{"error": "offline"}')
+            # The real census and the server's own work projection of it (its Resume controls included).
             availability = {"complete": True}
-            rows = _chat_activities_snapshot_safe(tmp_path, availability=availability)
+            fields = state_fields(tmp_path, availability=availability)
             if reads["state"] == "partial":  # one readable row; the rest of the census is unknown
-                rows, availability["complete"] = [r for r in rows if r["activity_id"] == "failed-root"], False
-            body = {"bg_consciousness_enabled": False, "active_chat_activities": rows,
+                fields = with_work_fields({"active_chat_activities_complete": False, "active_chat_activities": [
+                    r for r in fields["active_chat_activities"] if r["activity_id"] == "failed-root"]})
+                availability["complete"] = False
+            body = {"bg_consciousness_enabled": False, **fields,
                     "active_chat_activities_complete": availability["complete"]}
         elif path == "schedules":
             body = {"tasks": []}
@@ -162,23 +165,30 @@ def test_activity_outcome_rows_and_their_controls_in_a_real_browser(tmp_path, mo
                     expect(row("child-1").locator("[data-activity-phase]")).to_have_count(0)
                     expect(row("child-1")).to_contain_text("running")
                     expect(row("paused-root")).to_contain_text("paused (budget)")
-                    # The outcome chip is drawn in the error pair, the second fact in the quiet meta ink.
+                    # The outcome chip is drawn in the error pair with the failed dot, the second fact in the quiet
+                    # meta ink; Stop… is the neutral shared trigger, never a danger button.
                     colours = page.evaluate("""() => {
                         const probe = document.createElement('span');
                         document.body.append(probe);
                         const ink = (value) => { probe.style.color = value; return getComputedStyle(probe).color; };
                         const chip = document.querySelector('[data-id="failed-root"]').closest('.activity-row')
                             .querySelector('[data-activity-phase]');
+                        const mark = chip.querySelector(':scope > .status-mark');
+                        const stop = document.querySelector('[data-act="task-control"][data-id="failed-root"]');
                         const scroll = document.querySelector('.activity-scroll');
                         const out = {chip: getComputedStyle(chip).color, chipBg: getComputedStyle(chip).backgroundColor,
                             second: getComputedStyle(chip.nextElementSibling).color, error: ink('var(--status-error-fg)'),
                             errorBg: ink('var(--status-error-bg)'), meta: ink('var(--text-meta)'),
+                            mark: `${mark.dataset.shape}/${mark.dataset.hue}`, markInk: getComputedStyle(mark).color,
+                            red: ink('var(--red)'), stop: stop.className,
                             overflow: scroll.scrollWidth - scroll.clientWidth};
                         probe.remove();
                         return out;
                     }""")
                     assert colours["chip"] == colours["error"] and colours["second"] == colours["meta"], colours
                     assert colours["chipBg"] == colours["errorBg"], colours
+                    assert (colours["mark"], colours["markInk"]) == ("dot/failed", colours["red"]), colours
+                    assert colours["stop"] == "btn btn-xs btn-default", colours
                     assert colours["overflow"] <= 0, colours
                     page.close()
 

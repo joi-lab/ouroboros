@@ -90,8 +90,9 @@ export function createMainWaiting({ page, messagesDiv, toolbar = page?.querySele
         bubble.append(sender, root);
         const reference = row.project_id ? projectReference({ id: row.project_id, name: row.project_name }, { taskId: id }) : null;
         if (reference) controls.append(reference);
+        // The message stands only while the census says the task needs the owner, so its chip is the owner's move.
         record = { groupId: id, bubble, root, phaseEl, title, reason, controls, timelineEl, reference,
-            phaseSecondaryEl: null, row, available: true, finished: false };
+            phaseSecondaryEl: null, row, available: true, finished: false, ownerMove: true };
         records.set(id, record);
         // The time it is first seen: a blocker is a current fact, so it stands at the live edge.
         stampNodeTimestamp(bubble, new Date().toISOString());
@@ -121,7 +122,9 @@ export function createMainWaiting({ page, messagesDiv, toolbar = page?.querySele
             button.addEventListener('click', () => {
                 if (!connected || !record.available || record.row.cancelable !== true) return;
                 openTaskControlMenu(button, { budgetPaused: record.row.phase === 'budget_paused',
-                    resumeVisible: canResume(record), onAction: async action => {
+                    // Resume rides the menu where the server allows it and no Resume button of its own stands
+                    // beside it (an interrupted owner Resume of a member).
+                    resume: record.row.can_resume === true && !canResume(record), onAction: async action => {
                         if (!connected || !record.available || record.row.cancelable !== true) return;
                         try {
                             if (action === ACTION_RESUME) await resumeTaskAction(record.groupId);

@@ -1089,6 +1089,137 @@ def test_boot_check_writes_the_letter_before_the_readiness_broadcast(monkeypatch
     server._boot_managed_update_tasks()
 
     assert calls == [("letter", "b" * 40), ("update_status_ready", "")]
-    # And at boot the local model server is started BEFORE the check that may need it.
-    source = pathlib.Path(server.__file__).read_text(encoding="utf-8")
+    # And at boot the local model server is started BEFORE the check that may need it (the boot
+    # coordinator's background-services step starts both).
+    from ouroboros import server_boot
+
+    source = pathlib.Path(server_boot.__file__).read_text(encoding="utf-8")
     assert source.index('name="local-model-autostart"') < source.index('name="boot-managed-update"')
+
+
+# ---------------------------------------------------------------------------
+# one absolute ceiling through the shared client (#572, update-letter caller only)
+# ---------------------------------------------------------------------------
+
+def test_write_letter_hands_its_one_absolute_ceiling_to_every_call(letter_env, monkeypatch):
+    # The initial send and the one Low retry carry the SAME calendar instant the slot
+    # wait used; the relative timeout stays the per-send remainder (never a second clock).
+    class Overflow(RuntimeError):
+        ledger_attempt_ids = ["att-max"]
+
+    clock = [1000.0]
+    monkeypatch.setattr(ul.time, "time", lambda: clock[0])
+    monkeypatch.setattr(ul, "_letter_timeout_sec", lambda: 10.0)
+    monkeypatch.setattr(ul, "_fit_plan", lambda env, memory, task: _Plan("max", False, True))
+    real_classify = ul._classify
+    monkeypatch.setattr(ul, "_classify", lambda exc: ("context_overflow", "o") if isinstance(exc, Overflow) else real_classify(exc))
+    sent = []
+
+    def fake_chat(client, *, drive_root, **kwargs):
+        sent.append(kwargs)
+        clock[0] += 4.0
+        if len(sent) == 1:
+            raise Overflow("prompt is too long")
+        return {"content": "A Low paragraph."}, {"ledger_attempt_ids": ["att-low"]}
+
+    monkeypatch.setattr(ul, "_chat", fake_chat)
+    record = ul.write_letter(_status(), _material(), drive_root=letter_env["drive"])
+    assert record["state"] == "ready"
+    assert [(call["caller_deadline_ts"], call["timeout"]) for call in sent] == [(1010.0, 10.0), (1010.0, 6.0)]
+    # A wall-clock instant never enters the monotonic execution slot.
+    assert all("caller_execution_deadline" not in call for call in sent)
+
+
+class _ClockSdk:
+    """An in-memory chat.completions endpoint on one controlled calendar clock."""
+
+    def __init__(self, clock, *, reject_first=False, expire_in_first=False):
+        self.clock, self.reject_first, self.expire_in_first = clock, reject_first, expire_in_first
+        self.calls = []
+        self.chat = type("Chat", (), {"completions": type("C", (), {"create": staticmethod(self.create)})()})()
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.expire_in_first and len(self.calls) == 1:
+            self.clock[0] += 30.0  # the ceiling ends while this send is in flight
+        if self.reject_first and len(self.calls) == 1:
+            error = RuntimeError("Unsupported parameter: 'reasoning_effort' is not supported with this model.")
+            error.status_code = 400
+            error.body = {"error": {"type": "invalid_request_error", "code": "unsupported_parameter",
+                                    "param": "reasoning_effort", "message": str(error)}}
+            raise error
+        return type("R", (), {"model_dump": lambda self: {
+            "id": "gen", "object": "chat.completion", "model": "vendor/light",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "A paragraph."}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.0}}})()
+
+
+def _real_client(monkeypatch, tmp_path, sdk, clock, *, expire_on_resolve=False):
+    from datetime import datetime, timezone
+    from ouroboros import deadline_utils
+    from ouroboros.llm import LLMClient
+    import ouroboros.pricing as pricing
+    import ouroboros.request_wire_contract as wire
+    import ouroboros.usage_accounting as ua
+
+    monkeypatch.setattr(ul.time, "time", lambda: clock[0])
+    monkeypatch.setattr(deadline_utils, "utc_now", lambda: datetime.fromtimestamp(clock[0], timezone.utc))
+    monkeypatch.setattr(ul, "_letter_timeout_sec", lambda: 10.0)
+    monkeypatch.setattr(wire, "canonical_wire_evidence_root", lambda: tmp_path)
+    monkeypatch.setattr(pricing, "estimate_cost_optional", lambda *a, **k: None)
+    monkeypatch.setattr(ua, "_reservation_cost", lambda request: 0.01)
+    monkeypatch.setattr(LLMClient, "_get_supported_parameters", lambda *a, **k: None)
+    monkeypatch.setenv("TOTAL_BUDGET", "100")
+    client = LLMClient()
+
+    def resolve(model):
+        if expire_on_resolve:
+            clock[0] += 30.0  # spent after the slot, before the first send
+        return {"provider": "openai", "resolved_model": "vendor/light", "usage_model": "vendor/light",
+                "base_url": "https://provider.invalid/v1", "supports_openrouter_extensions": False,
+                "supports_generation_cost": False, "api_key": "fixture"}
+
+    monkeypatch.setattr(client, "_resolve_remote_target", resolve)
+    for name in ("_get_remote_client", "_get_async_remote_client"):
+        monkeypatch.setattr(client, name, lambda target: sdk)
+    closer = type("Closer", (), {"close": lambda self: None})()
+    monkeypatch.setattr(client, "_make_no_proxy_client", lambda target, timeout: (sdk, closer))
+    return client
+
+
+def test_a_recovery_send_after_the_ceiling_is_refused_and_recorded_as_timeout(letter_env, monkeypatch, tmp_path):
+    from tests._usage_store_testing import ledger_rows
+
+    clock = [2000.0]
+    sdk = _ClockSdk(clock, reject_first=True, expire_in_first=True)
+    client = _real_client(monkeypatch, tmp_path, sdk, clock)
+    record = ul.write_letter(_status(), _material(), drive_root=letter_env["drive"], llm_client=client)
+    # The client's own repair would have sent again; the shared ceiling refuses that send.
+    assert len(sdk.calls) == 1, "the recovery ladder sent past the update-letter ceiling"
+    assert record["state"] == "failed" and record["error_kind"] == "timeout"
+    rows = ledger_rows(letter_env["drive"])
+    sent = [row["attempt_id"] for row in rows if row["state"] not in {"reserved", "released"}]
+    assert sent and set(sent) <= set(record["attempt_ids"]), "the paid first send stays on the record"
+    assert record["error_text"].startswith("the update-letter ceiling ended before a further send")
+
+
+def test_a_ceiling_spent_before_the_first_send_sends_nothing(letter_env, monkeypatch, tmp_path):
+    clock = [3000.0]
+    sdk = _ClockSdk(clock)
+    client = _real_client(monkeypatch, tmp_path, sdk, clock, expire_on_resolve=True)
+    record = ul.write_letter(_status(), _material(), drive_root=letter_env["drive"], llm_client=client)
+    assert sdk.calls == [] and record["error_kind"] == "timeout"
+
+
+@pytest.mark.parametrize("reason,kind", [("deadline", "timeout"), ("cancelled", "provider_unavailable"),
+                                         ("owner_pause", "provider_unavailable")])
+@pytest.mark.parametrize("wait", [False, True])
+def test_only_the_deadline_interruption_is_a_letter_timeout(letter_env, monkeypatch, reason, kind, wait):
+    from ouroboros.llm_attempt import PhysicalDispatchInterrupted
+    from ouroboros.model_wait import ModelWaitInterrupted
+
+    error = ModelWaitInterrupted(reason) if wait else PhysicalDispatchInterrupted(reason)
+    error.ledger_attempt_ids = ["att-paid"]
+    monkeypatch.setattr(ul, "_chat", lambda *a, **k: (_ for _ in ()).throw(error))
+    record = ul.write_letter(_status(), _material(), drive_root=letter_env["drive"])
+    assert record["error_kind"] == kind and record["attempt_ids"] == ["att-paid"]

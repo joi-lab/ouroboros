@@ -1,4 +1,4 @@
-// When a Project room has READ a visible revision (DESIGN "Project unread dot").
+// When a Project room has READ a visible revision (DESIGN "Unread").
 //
 // A revision is read only when a history read covering it has crossed a real
 // browser paint while the room stayed shown AND the reader is at the newest
@@ -66,7 +66,7 @@ export function createProjectReadReceipt({ read, isShown, isReadingLatest, onRea
             : latest === null && !carried() && searched(recentRead.window);
     };
     // The unread opening lands once on the newest message, wherever it lies (DESIGN
-    // "Project unread dot"). While it is still to reach, the room's older pages are
+    // "Unread"). While it is still to reach, the room's older pages are
     // read for that opening alone, one at a time, re-reading what the newest recent
     // read and the pages name after each. The reader's own move, a question, the
     // room hidden or closed, a failed page or the chat's start ends it; a page
@@ -207,7 +207,7 @@ function shownBy(node) {
 
 /**
  * How far the feed moves to show the newest message when an unread room is opened
- * (DESIGN "Project unread dot"): it lands at the top of the read band, so what came
+ * (DESIGN "Unread"): it lands at the top of the read band, so what came
  * after it shows below. 0 when it is already on screen or no node of this page can
  * show it: absent (the bottom decides), unknown, or not loaded (the pager reaches it).
  *

@@ -1136,3 +1136,51 @@ def test_the_public_handler_still_refuses_a_call_without_a_commit_message_at_bin
     with pytest.raises(TypeError):
         inspect.signature(handler).bind(object())
     inspect.signature(handler).bind(object(), commit_message="m", skip_tests=True)
+
+
+def _pending_panel_record(tmp_path):
+    """A written change record left pending: s1 (retrieving, both parts) answered PASS, the packet seats
+    s2 and s3 still in flight."""
+    raws = [_raw("s1", "openai/gpt-5", parts=BOTH, raw_text="two-part answer"),
+            _raw("s2", "anthropic/claude-x", "pending", operation_state="in_flight", late_result_pending=True),
+            _raw("s3", "google/gemini", "pending", operation_state="in_flight", late_result_pending=True)]
+    record = rl.build_wave_record(_facts(raws, pending=True), surface="change", drive_root=tmp_path)
+    rl.write_record(tmp_path, record)
+    return record.to_dict()
+
+
+def test_a_pending_record_settles_from_its_collected_seats_without_a_reissue(tmp_path):
+    """The seats an author stopped waiting for settle the record themselves (owner 17.10, Q3-2): the answers
+    land on the seats that were open, the verdict is reduced over the assigned seats, the provenance and the
+    already answered seat stay, and the revision rises once."""
+    prior = _pending_panel_record(tmp_path)
+    assert prior["state"] == "pending" and prior["verdict"]["aggregate"] == "NOT_PERFORMED"
+    failing = _raw("s3", "google/gemini", answers={"change": _answer("change", "FAIL", findings=[CRITICAL])})
+    settled = rl.settle_from_collected(tmp_path, prior["record_id"], [_raw("s2", "anthropic/claude-x"), failing])
+    assert settled["state"] == "settled" and settled["revision"] == prior["revision"] + 1
+    assert settled["verdict"]["aggregate"] == "FAIL" and settled["verdict"]["reason"] == "critical_findings"
+    assert [f["seat_id"] for f in settled["verdict"]["critical_findings"]] == ["s3"]
+    assert settled["brief"] == prior["brief"] and settled["fingerprints"] == prior["fingerprints"]
+    assert {row["seat_id"]: row["status"] for row in settled["rows"]} == {"s1": "responded", "s2": "responded",
+                                                                        "s3": "responded"}
+    assert all("raw_text" not in row for row in settled["rows"]), "an answer is a retained source, never inline"
+    assert rl.settle_from_collected(tmp_path, prior["record_id"], [_raw("s2", "x", "error")]) == settled, \
+        "a settled record is never re-settled"
+
+
+def test_a_seat_still_running_keeps_the_record_pending_and_a_lost_one_does_not(tmp_path):
+    """Two-sided: a seat whose answer may still come keeps the record pending; a seat whose custody is lost
+    (outcome unknown, never re-sent) is a failed seat of a settled record."""
+    prior = _pending_panel_record(tmp_path)
+    partial = rl.settle_from_collected(tmp_path, prior["record_id"], [_raw("s2", "anthropic/claude-x")])
+    assert partial["state"] == "pending" and partial["verdict"]["aggregate"] == "NOT_PERFORMED"
+    lost = _raw("s3", "google/gemini", "error", answers=None, raw_text="", operation_state="custody_lost",
+                late_result_pending=True, failure_code="review_custody_lost")
+    settled = rl.settle_from_collected(tmp_path, prior["record_id"], [lost])
+    assert settled["state"] == "settled" and settled["verdict"]["aggregate"] == "PASS", "2 of 3 answered: quorum met"
+    seat = {row["seat_id"]: row for row in settled["rows"]}["s3"]
+    assert seat["operation_state"] == "custody_lost" and seat["failure_code"] == "review_custody_lost"
+    assert not rl.seat_open(seat) and rl.seat_open({"operation_state": "in_flight"})
+    # The settled record names its lost seat as never reached; the pending one awaited it, unlisted.
+    assert partial["panel"].get("not_reached", []) == []
+    assert settled["panel"]["not_reached"] == [{"seat_id": "s3", "cause": "review_custody_lost"}]

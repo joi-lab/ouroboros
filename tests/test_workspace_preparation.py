@@ -15,7 +15,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from ouroboros import store
 from ouroboros import subagent_worktrees as trees
+from ouroboros._usage_wait import ACQUISITION_SLICE_SEC
 from ouroboros.task_results import STATUS_REQUESTED, STATUS_SCHEDULED, load_task_result, write_task_result
 from supervisor import queue, task_lifecycle
 from supervisor import workspace_preparation as prep
@@ -200,6 +202,7 @@ def test_blocked_copy_keeps_event_dispatch_responsive_then_admits_once(env, monk
         env.wait_phase("act1", "copying")  # the FIFO thread is inside the copy, blocked on the lock
         # Unrelated work and owner controls progress through the real handler meanwhile.
         assert env.dispatch_returns(env.readonly("ro1"))
+        env.wait_phase("ro1", "admitted")  # the admission lane never waits behind the held copy
         assert env.row("ro1")["status"] == STATUS_SCHEDULED and "ro1" in env.pending_ids()
         assert env.dispatch_returns({"type": "budget_root_fence", "task_id": "other-task",
                                      "resource_limit": {"scope": "root", "root_task_id": "root-c"}})
@@ -302,7 +305,7 @@ def test_queued_preparation_never_starts_once_its_generation_closes(env, monkeyp
         assert env.dispatch_returns(env.request("first", root="r1"))
         env.wait_phase("first", "copying")
         assert env.dispatch_returns(env.request("second", root="r2"))
-        assert env.phase("second") == "queued"
+        assert env.phase("second") is None and "second" in queue.ADMISSION_RESERVATIONS  # claimed, not started
         prep.close_generation(env.gen)
     assert env.gen.wait_idle(_WAIT_SEC)
     assert calls == ["first"]  # the queued claim never started a copy
@@ -321,7 +324,8 @@ def test_preparation_captures_the_current_tree_when_it_runs_not_when_requested(e
     (src / "crlf.txt").write_bytes(b"one\r\ntwo\r\n")
     (src / "tool.sh").write_bytes(b"#!/bin/sh\necho hi\n")
     os.chmod(src / "tool.sh", 0o755)
-    git(src, "add", "crlf.txt", "tool.sh")
+    git(src, "add", "crlf.txt")
+    git(src, "add", "--chmod=+x", "tool.sh")  # Windows has no exec bit to read: the mode is git's
     git(src, "commit", "-qm", "modes and line endings")
     (src / "a.txt").write_bytes(b"base\nedited before the request\n")
     (src / "notes.txt").write_bytes(b"untracked eligible input\n")
@@ -330,7 +334,7 @@ def test_preparation_captures_the_current_tree_when_it_runs_not_when_requested(e
         assert env.dispatch_returns(env.request("blocker", root="rb"))
         env.wait_phase("blocker", "copying")
         assert env.dispatch_returns(env.request("timed", root="rt", base_sha=head))
-        assert env.phase("timed") == "queued"
+        assert env.phase("timed") is None and "timed" in queue.ADMISSION_RESERVATIONS  # claimed, not started
         (src / "a.txt").write_bytes(b"base\nedited while the request was queued\n")  # same HEAD, new dirty bytes
     assert env.gen.wait_idle(_WAIT_SEC)
     row = env.row("timed")
@@ -338,7 +342,8 @@ def test_preparation_captures_the_current_tree_when_it_runs_not_when_requested(e
     copy = pathlib.Path(row["workspace_root"])
     assert (copy / "a.txt").read_bytes() == b"base\nedited while the request was queued\n"
     assert (copy / "crlf.txt").read_bytes() == b"one\r\ntwo\r\n"
-    assert (copy / "tool.sh").stat().st_mode & 0o111
+    assert git(copy, "ls-files", "-s", "tool.sh").startswith(b"100755 ")
+    assert os.name == "nt" or (copy / "tool.sh").stat().st_mode & 0o111  # Windows reports 0o100666
     assert (copy / "notes.txt").read_bytes() == b"untracked eligible input\n"
     binding = row["workspace_copy"]
     assert binding["target_head"] == head and binding["baseline_sha"] != head  # synthetic dirty baseline
@@ -642,7 +647,8 @@ def test_restart_without_preparation_markers_changes_nothing(env):
     ids = ("legacy-requested", "scheduled1", "running1", "paused1", "refused-old")
     before = {tid: result_signature(env.data, tid) for tid in ids}
     report = prep.recover_interrupted_preparations(env.data)
-    assert not any(report.values()), report
+    assert report["live"] == ["legacy-requested"]  # held: nothing proves its request cannot arrive
+    assert not any(value for key, value in report.items() if key != "live"), report
     assert {tid: result_signature(env.data, tid) for tid in ids} == before
     assert obligations.members(env.data, "unknowns") == {}
 
@@ -690,23 +696,36 @@ def test_entry_claim_and_marker_never_wait_for_storage_on_the_event_loop(env, mo
         seen.append(("claim", threading.current_thread().name, active()))
         return real_claim(*args, **kwargs)
 
-    def transition(drive_root, task_id, token, marker, *, expected):
+    def transition(drive_root, task_id, token, marker, *, expected, **kwargs):
         seen.append((marker["phase"], threading.current_thread().name, active()))
-        return real_transition(drive_root, task_id, token, marker, expected=expected)
+        return real_transition(drive_root, task_id, token, marker, expected=expected, **kwargs)
 
     monkeypatch.setattr(task_admission, "claim_requested_child", claim)
     monkeypatch.setattr(prep, "_transition", transition)
+    opened = []
+    real_connection = store.connection
+
+    @contextlib.contextmanager
+    def connection(*args, **kwargs):
+        opened.append(threading.current_thread().name)
+        with real_connection(*args, **kwargs) as conn:
+            yield conn
+
+    monkeypatch.setattr(store, "connection", connection)
     assert env.dispatch_returns(env.request("budget1"))
     assert env.gen.wait_idle(_WAIT_SEC)
     entry = [row for row in seen if row[1] == "test-supervisor-loop"]
-    assert [row[0] for row in entry] == ["claim", "queued"] and all(row[2] == [0] for row in entry)
-    off_loop = [row for row in seen if row[1] == "workspace-preparation"]
-    assert [row[0] for row in off_loop] == ["copying", "ready", "admitting"]
-    assert all(row[2] == [] for row in off_loop)  # the preparation thread keeps ordinary acquisition
+    assert [row[0] for row in entry] == ["claim"] and "test-supervisor-loop" not in opened  # memory only
+    off_loop = [row for row in seen if row[1] != "test-supervisor-loop"]
+    assert [(row[0], row[1]) for row in off_loop] == [("queued", "workspace-preparation"), ("copying", "workspace-preparation"),
+                                                      ("ready", "workspace-preparation"),
+                                                      ("admitting", "workspace-preparation-validation"),
+                                                      ("admitted", "workspace-preparation-validation")]
+    assert all(row[2] == [ACQUISITION_SLICE_SEC] for row in off_loop)  # one slice per attempt, off Q
     assert env.row("budget1")["status"] == STATUS_SCHEDULED
 
 
-@pytest.mark.parametrize("busy", ["claim_read", "marker", "marker_and_refusal"])
+@pytest.mark.parametrize("busy", ["marker", "marker_and_refusal"])
 def test_busy_store_at_entry_is_typed_and_starts_no_preparation(env, monkeypatch, busy):
     from ouroboros import headless
     from ouroboros.store import StoreBusy
@@ -723,12 +742,9 @@ def test_busy_store_at_entry_is_typed_and_starts_no_preparation(env, monkeypatch
     def store_busy(*_args, **_kwargs):
         raise StoreBusy("current store busy: database is locked")
 
-    if busy == "claim_read":
-        monkeypatch.setattr(task_admission, "claim_requested_child", store_busy)
-    else:
-        monkeypatch.setattr(prep, "write_task_result", store_busy)
-        if busy == "marker_and_refusal":
-            monkeypatch.setattr(task_admission, "persist_never_admitted_refusal", store_busy)
+    monkeypatch.setattr(prep, "write_task_result", store_busy)
+    if busy == "marker_and_refusal":
+        monkeypatch.setattr(task_admission, "persist_never_admitted_refusal", store_busy)
     assert env.dispatch_returns(event)
     assert env.gen.wait_idle(_WAIT_SEC)
     assert calls == [] and env.pending_ids() == [] and queue.ADMISSION_RESERVATIONS == {}

@@ -10,10 +10,11 @@ from pathlib import Path
 
 import pytest
 
+from ouroboros import dialogue_store
 from ouroboros.artifacts import read_actor_source_bytes
 from ouroboros.tools.plan_dialogue import plan_chat_reader
 from ouroboros.tools.plan_packet import PLAN_REPLY_CONTRACT
-from ouroboros.utils import append_jsonl
+from tests import _dialogue as dialogue_test
 from tests._review_substrate_shared import user_text
 from tests.test_plan_task_tool import CLEAN, _write
 from tests.test_plan_task_tool import harness as _plan_task_harness
@@ -33,17 +34,16 @@ def test_inline_view_is_the_numbered_conversation(harness):
 
     ctx = harness.make_ctx()
     ctx.current_chat_id = 1
-    chat = harness.drive / "logs" / "chat.jsonl"
-    append_jsonl(chat, {"direction": "in", "chat_id": 1, "ts": "2026-09-01T10:00:00Z", "text": "Use the agreed outline",
+    dialogue_store.append(harness.drive, "chat", {"direction": "in", "chat_id": 1, "ts": "2026-09-01T10:00:00Z", "text": "Use the agreed outline",
                         "attachment_manifest": [{"label": "outline.pdf", "name": "outline.pdf"}]})
-    append_jsonl(chat, {"direction": "out", "chat_id": 1, "ts": "2026-09-01T10:01:00Z", "text": "Option A is faster\nOption B keeps choices"})
-    append_jsonl(chat, {"direction": "out", "chat_id": 1, "ts": "2026-09-01T10:02:00Z", "type": "quiz", "text": "Five or six slides?",
+    dialogue_store.append(harness.drive, "chat", {"direction": "out", "chat_id": 1, "ts": "2026-09-01T10:01:00Z", "text": "Option A is faster\nOption B keeps choices"})
+    dialogue_store.append(harness.drive, "chat", {"direction": "out", "chat_id": 1, "ts": "2026-09-01T10:02:00Z", "type": "quiz", "text": "Five or six slides?",
                         "quiz": {"quiz_id": "q1", "question": "Five or six slides?", "options": ["five", "six"], "recommended_index": 0}})
-    append_jsonl(chat, {"direction": "in", "chat_id": 1, "ts": "2026-09-01T10:03:00Z", "type": "quiz_answer", "text": "five",
+    dialogue_store.append(harness.drive, "chat", {"direction": "in", "chat_id": 1, "ts": "2026-09-01T10:03:00Z", "type": "quiz_answer", "text": "five",
                         "quiz": {"quiz_id": "q1", "options": ["five", "six"], "answered_index": 0, "comment": "The board asked for five."}})
-    append_jsonl(chat, {"direction": "system", "chat_id": 1, "ts": "2026-09-01T10:04:00Z", "type": "task_summary", "text": "HOST SUMMARY ROW"})
+    dialogue_store.append(harness.drive, "chat", {"direction": "system", "chat_id": 1, "ts": "2026-09-01T10:04:00Z", "type": "task_summary", "text": "HOST SUMMARY ROW"})
     for step in ("Reading notes", "Drafting slide 1", "Drafting slide 2"):
-        append_jsonl(harness.drive / "logs" / "progress.jsonl", {"chat_id": 1, "ts": "2026-09-01T10:05:00Z", "content": f"PROGRESS {step}"})
+        dialogue_store.append(harness.drive, "progress", {"chat_id": 1, "ts": "2026-09-01T10:05:00Z", "content": f"PROGRESS {step}"})
     manifest = attach_own_dialogue(ctx, harness.drive, {}, _ASK, persist=True)
     own = manifest["own_dialogue"]
     view, facts = dialogue_view(own)
@@ -82,11 +82,11 @@ def test_mixed_delivery_keeps_full_file_and_exact_overflow_range(harness, monkey
 
     ctx = harness.make_ctx()
     ctx.current_chat_id = 1
-    append_jsonl(harness.drive / "logs" / "chat.jsonl", {"direction": "out", "chat_id": 1,
+    dialogue_store.append(harness.drive, "chat", {"direction": "out", "chat_id": 1,
                  "text": "OLDER " + "discussion " * 22000})
-    append_jsonl(harness.drive / "logs" / "chat.jsonl", {"direction": "in", "chat_id": 1,
+    dialogue_store.append(harness.drive, "chat", {"direction": "in", "chat_id": 1,
                  "text": "LATEST CHOICE"})
-    append_jsonl(harness.drive / "logs" / "progress.jsonl", {"chat_id": 1, "content": "PROGRESS ROW " * 50})
+    dialogue_store.append(harness.drive, "progress", {"chat_id": 1, "content": "PROGRESS ROW " * 50})
     manifest = attach_own_dialogue(ctx, harness.drive, {}, _ASK, persist=True)
     own = manifest["own_dialogue"]
     packet = render_dialogue(manifest)
@@ -156,8 +156,8 @@ def test_a_session_with_an_asserted_window_is_fitted_and_without_one_is_whole(ha
 
     ctx = harness.make_ctx()
     ctx.current_chat_id = 1
-    append_jsonl(harness.drive / "logs" / "chat.jsonl", {"direction": "out", "chat_id": 1, "text": "OLDER " + "discussion " * 22000})
-    append_jsonl(harness.drive / "logs" / "chat.jsonl", {"direction": "in", "chat_id": 1, "text": "LATEST CHOICE"})
+    dialogue_store.append(harness.drive, "chat", {"direction": "out", "chat_id": 1, "text": "OLDER " + "discussion " * 22000})
+    dialogue_store.append(harness.drive, "chat", {"direction": "in", "chat_id": 1, "text": "LATEST CHOICE"})
     manifest = attach_own_dialogue(ctx, harness.drive, {}, _ASK, persist=True)
     packet = render_dialogue(manifest)
     session = SimpleNamespace(slot_id="delegated", model="cursor=grok", role_hint="plan reviewer", use_local=False,
@@ -211,7 +211,7 @@ def test_plan_record_sources_survive_real_child_promotion_and_cleanup(harness):
     ctx.drive_root = child
     ctx.current_chat_id = 1
     harness.install({})
-    append_jsonl(child / "logs" / "chat.jsonl", {"direction": "in", "chat_id": 1, "text": "Must survive cleanup"})
+    dialogue_store.append(child, "chat", {"direction": "in", "chat_id": 1, "text": "Must survive cleanup"})
     _write(ctx, ask="council")
     record = plan_record.load_plan_record(child, "source")
     seats = record["asks"][0]["participants"]
@@ -256,7 +256,7 @@ def test_budget_prices_the_actual_window_fitted_inputs(harness, monkeypatch):
 
     ctx = harness.make_ctx()
     ctx.current_chat_id = 1
-    append_jsonl(harness.drive / 'logs/chat.jsonl', {'ts': '2026-09-01T00:00:00Z',
+    dialogue_store.append(harness.drive, "chat", {'ts': '2026-09-01T00:00:00Z',
         'direction': 'out', 'chat_id': 1, 'text': 'Prior substantive discussion. ' * 20000})
     monkeypatch.setattr(review_synthesis, 'per_slot_input_token_limits',
                         lambda models, **kw: {slot.slot_id: 10000 for slot in kw['slots']})
@@ -293,16 +293,16 @@ def test_snapshot_qualified_room_keeps_original_gap_disclosure(harness):
 
     ctx = harness.make_ctx()
     ctx.current_chat_id = 1
-    chat = harness.drive / "logs/chat.jsonl"
-    append_jsonl(chat, {"chat_id": 1, "text": "Retained explanation"})
-    with chat.open("a") as stream:
-        stream.write("{unreadable history row\n")
+    # The unreadable row is a torn line of the older install's chain, imported as the upgrade does.
+    dialogue_test.seed(harness.drive, live={"chat": [{"chat_id": 1, "text": "Retained explanation"},
+                                                     "{unreadable history row\n"]})
+    dialogue_test.import_all(harness.drive)
     ref = attach_own_dialogue(ctx, harness.drive, {}, _ASK, persist=True)["own_dialogue"]["source_ref"]
     recorded = wave(dialogue_source_ref=ref, dialogue_chat_id=1)
     seed_plan_review_state(harness.drive, ctx.task_id, v2_state(recorded))
     assert _compact_plan_review_wave(recorded)["dialogue_source_ref"] == ref  # an old compacted wave still names it
     original = read_actor_source_bytes(harness.drive, ctx.task_id, ref)
-    append_jsonl(chat, {"chat_id": 1, "text": "Later room growth"})
+    dialogue_store.append(harness.drive, "chat", {"chat_id": 1, "text": "Later room growth"})
     reader = plan_chat_reader(harness.drive, ctx.task_id)
     exact = reader(f"1@{ref['sha256']}")
     assert exact["text"].encode() == original and "Later room growth" not in exact["text"]

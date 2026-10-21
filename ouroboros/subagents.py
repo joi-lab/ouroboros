@@ -1379,8 +1379,6 @@ def envelope_from_task(
 # v7next F2 (D07): moved spans live in their owner leaves; re-exported here
 # so this facade stays the single import surface for callers and tests.
 from ouroboros.subagent_route_health import (  # noqa: E402, F401 -- intentional public re-exports
-    _cooldown_active,
     _exhausted_window,
-    _model_scope_matches,
     route_health,
 )

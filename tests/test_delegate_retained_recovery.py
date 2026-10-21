@@ -15,6 +15,8 @@ from tests.test_delegate_body_collection import money, started, terminal  # noqa
 
 
 class AbsentGateway:
+    store_identity = "store-a"
+
     def __init__(self, *, handshake_error=False):
         self.reads = 0
         self.closed = False
@@ -117,7 +119,8 @@ def test_unchanged_local_debt_emits_no_reconciliation_storm(tmp_path, monkeypatc
 
 @pytest.mark.parametrize("review", [False, True])
 def test_unsettled_absence_keeps_existing_recovery_semantics(tmp_path, review):
-    entry = started(tmp_path, **({"source": "review_substrate:slot"} if review else {}))
+    entry = started(tmp_path, daemon_store_id="store-a",
+                    **({"source": "review_substrate:slot"} if review else {}))
     assert entry.review_owned == review
     gateway = AbsentGateway()
     result = recover(tmp_path, entry, lambda: gateway, "orphan")

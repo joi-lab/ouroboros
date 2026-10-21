@@ -8,6 +8,7 @@ from ouroboros.owner_quiz import (
     reconcile_terminal, record_answered, record_asked, record_closed, record_publication,
 )
 from tests.test_quiz_answer import _decision_app, _post, _tool_ctx
+from tests import _dialogue as dialogue_test
 
 
 def ask(root, qid="q", task="t"):
@@ -173,7 +174,8 @@ def test_publication_address_precedes_exposure_and_wins_over_stale_retries(tmp_p
     def observe(frame):
         block = quiz_states(tmp_path, "t")["q"]
         assert block["publication_chat_id"] == frame["chat_id"] == 77
-        assert (tmp_path / "logs/chat.jsonl").exists()
+        row = dialogue_test.chat_rows(tmp_path)[-1]
+        assert row["chat_id"] == 77 and row["quiz"]["quiz_id"] == "q"
         observed.append(frame)
     bridge._broadcast_fn = observe
     for requested in (77, 1):

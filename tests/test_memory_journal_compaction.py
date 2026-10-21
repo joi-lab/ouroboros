@@ -74,14 +74,9 @@ def test_startup_event_publishes_normal_journal_sizes(tmp_path, monkeypatch):
     journal.write_bytes(b"full historical text\n")
     rows = []
     monkeypatch.setattr(maintenance, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(maintenance, "_STARTUP_PRUNES_OWED", [True])
-    monkeypatch.setattr(maintenance, "_STARTUP_TREES_OWED", [False])
-    monkeypatch.setattr(maintenance, "_STARTUP_SOURCE_PRUNES_OWED", [False])
-    monkeypatch.setattr(maintenance, "_startup_worktree_prune", lambda: None)
-    monkeypatch.setattr(maintenance, "_prune_delegated_snapshots", lambda: None)
     monkeypatch.setattr(state, "append_jsonl", lambda _path, row: rows.append(row))
 
-    maintenance._run_deferred_startup_prunes()
+    maintenance._startup_prune_sweeps()
 
     [observation] = [row for row in rows if row["type"] == "memory_journal_observation"]
     assert observation["report"]["journal_bytes"]["memory/knowledge_history.jsonl"] == len(b"full historical text\n")

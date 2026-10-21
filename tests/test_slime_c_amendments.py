@@ -8,6 +8,8 @@ died with it — while the post-task reflection, written from the error trace,
 declared the delivered 52-page PDF missing.
 """
 
+from tests import _dialogue as dialogue_test
+
 import json
 import pathlib
 import queue
@@ -369,7 +371,7 @@ class TestSealedFinalPackage:
             logs,
         )
 
-        [row] = [json.loads(line) for line in (logs / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+        [row] = dialogue_test.log_rows(logs / "chat.jsonl")
         assert row["summary_kind"] == "host_task_facts" and row["text"] == ""
         assert row["tool_calls"] == 1 and row["rounds"] == 3
         assert "Delivered" not in json.dumps(row) and "make a pdf" not in json.dumps(row)

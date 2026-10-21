@@ -19,10 +19,10 @@ import {
 
 test('header starts loading and fails closed when ledger money is unavailable', () => {
     assert.deepEqual(headerBudgetPresentation(), {
-        state: 'loading', label: 'Loading…', fillPct: 0,
+        state: 'loading', label: 'Loading…', fillPct: 0, attention: false,
     });
     assert.deepEqual(headerBudgetPresentation({ accounting: { available: false } }), {
-        state: 'unavailable', label: 'Unavailable', fillPct: 0,
+        state: 'unavailable', label: 'Unavailable', fillPct: 0, attention: false,
     });
     assert.equal(
         headerBudgetPresentation({ accounting: { available: true }, spent_usd: null, budget_limit: 10 }).state,
@@ -32,8 +32,36 @@ test('header starts loading and fails closed when ledger money is unavailable', 
 
 test('header accepts the legacy numeric state shape without fabricating null as zero', () => {
     assert.deepEqual(headerBudgetPresentation({ spent_usd: 0, budget_limit: 10 }), {
-        state: 'available', label: '$0 / $10', fillPct: 0,
+        state: 'available', label: '$0 / $10', fillPct: 0, attention: false,
     });
+});
+
+// The budget is a neutral fact; it is the owner's move only while a task the spending limit stopped waits for the owner
+// (gateway/main_decisions.py: a Main attention row whose reason is the budget), even at the limit itself.
+test('the budget pill asks for the owner only while a spending-limit stop waits for the owner', () => {
+    const atLimit = { spent_usd: 10, budget_limit: 10 };
+    assert.deepEqual([headerBudgetPresentation(atLimit).fillPct, headerBudgetPresentation(atLimit).attention], [100, false]);
+    const resume = { task_id: 'r', attention_reason: 'restart' };
+    const access = { task_id: 'a', attention_reason: 'model_access' };
+    assert.equal(headerBudgetPresentation({ ...atLimit, main_attention: [resume, access] }).attention, false);
+    const stopped = { task_id: 's', phase: 'budget_paused', can_resume: true, attention_reason: 'budget' };
+    assert.equal(headerBudgetPresentation({ ...atLimit, main_attention: [resume, stopped] }).attention, true);
+    // The fact rides beside the money, whatever the ledger read says.
+    assert.equal(headerBudgetPresentation({ accounting: { available: false }, main_attention: [stopped] }).attention, true);
+    assert.equal(headerBudgetPresentation({ ...atLimit, main_attention: null }).attention, false);
+    // chat.js writes it on the pill and the stylesheet keeps amber for it alone; Panic stays danger.
+    const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
+    assert.match(chat, /budgetPill\.dataset\.attention = budget\.attention \? '1' : '0'/);
+    const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+    const rules = (selector) => [...css.matchAll(/([^{}]+)\{([^}]*)\}/g)]
+        .filter(([, head]) => head.includes(selector)).map(([, head, body]) => `${head.trim()} { ${body.trim()} }`);
+    const amber = /--amber|--status-warn|--tone-amber|245,\s*158,\s*11/;
+    const budget = rules('chat-budget');
+    assert.ok(budget.length >= 6, 'the budget rules are read');
+    assert.deepEqual(budget.filter((rule) => amber.test(rule) && !rule.includes('[data-attention="1"]')), [],
+        'nothing paints the budget amber without the owner\'s move');
+    assert.ok(budget.some((rule) => amber.test(rule) && rule.includes('[data-attention="1"]')));
+    assert.ok(rules('.chat-header-btn.danger.ui-chrome-control').some((rule) => /--tone-red|--status-error/.test(rule)));
 });
 
 test('task cards distinguish unavailable, pending zero, and final zero', () => {

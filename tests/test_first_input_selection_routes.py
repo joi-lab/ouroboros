@@ -124,13 +124,13 @@ def test_authored_compaction_retains_selected_core_and_exact_tool_source(declare
         reclaim_goal_tokens=1, working_note="Actor's retained evidence and unresolved question.",
         expected_view_revision=revision, keep_unit_ids=(),
     )
-    rebuilt, receipt, usage = cc.compact_tool_history_llm(
+    rebuilt, receipt = cc.compact_tool_history_llm(
         messages, request=request, observed_messages=copy.deepcopy(messages),
         observed_tool_schemas=[], tool_schemas=[],
         fit_candidate=lambda *_: {"accepted": True},
         drive_root=env.drive_root, task_id=task["id"],
     )
-    assert receipt.status == "applied" and usage is None
+    assert receipt.status == "applied"
     assert rebuilt[:2] == messages[:2]
     _assert_declared(rebuilt)
     retained = json.loads(read_actor_source_bytes(env.drive_root, task["id"], receipt.checkpoint_ref))

@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Union
 
 from ouroboros.gateway.widgets import ExtensionLiveSnapshot
+from ouroboros.gateway.contributions import UiContributionsResponse
 
 try:  # Python 3.11+
     from typing import Literal, NotRequired, Required, TypedDict  # type: ignore[attr-defined]
@@ -36,6 +37,7 @@ class InstalledSkill(TypedDict, total=False):
     content_hash: Required[str]  # the revision every expected_content_hash names
     payload_root: Required[str]  # skills/<bucket>/<dir>, or ""
     installed_at: Required[str]
+    removal: str  # uninstall | delete | "": the server's available removal action
     review_status: str  # clean | warnings | blockers | pending
     review_stale: bool
     review_gate: Dict[str, Any]
@@ -43,7 +45,6 @@ class InstalledSkill(TypedDict, total=False):
     reviewed_content_hash: str
     executable_review: bool
     review_profile: str
-    official_hub_verified: Optional[bool]  # null: no fresh hub catalog view yet
     owner_attestable: Optional[bool]
     submit_hub: Dict[str, Any]
     conflict: Optional[Dict[str, Any]]  # {code: "skill_conflict", skills, omitted}
@@ -64,9 +65,18 @@ class InstalledSkill(TypedDict, total=False):
     presence_runtime: Dict[str, Any]  # a reviewed presence profile's runtime choice
     provenance: Dict[str, Any]  # a ClawHub install record
     identity_collision: bool
+    # The install record joined with the cached catalog of its source (skill_source_catalog.install_listing):
+    # source {id, name, kind, part}, official (exact endorsed bytes), release, basis, base_known, modified (null: base unknown),
+    # update_available {version, digest} | null, withdrawn ({reason, version} for a withdrawn release), left_source, turn_on_when_ready, installed_by,
+    # installed_at, and reason and task_id when the record has them (an install Ouroboros made says why and in
+    # which task); check {by, notes, at}, pending_update {version, digest}, and
+    # update_rejected {version, digest, reason: review_blockers|review_unfinished|preflight_failed, at}.
+    # null: not installed from a source (made here, a local folder, a built-in seed).
+    install: Optional[Dict[str, Any]]
+    category: List[str]  # the source's category ids for this skill, [] when it has none
 
 
-class ExtensionsIndexResponse(TypedDict):
+class ExtensionsIndexResponse(UiContributionsResponse):
     """``GET /api/extensions``: every installed skill and what the extension loader has live.
     A passive read: no network, no repair."""
 
@@ -90,7 +100,6 @@ class ExtensionManifestResponse(TypedDict, total=False):
     reviewed_content_hash: str
     executable_review: bool
     review_profile: str
-    official_hub_verified: Optional[bool]
     owner_attestable: Optional[bool]
     submit_hub: Dict[str, Any]
 
@@ -125,6 +134,7 @@ class SkillGrantRequest(TypedDict, total=False):
     keys: List[Any]
     granted_keys: List[Any]
     expected_content_hash: str
+    enable_after_grant: bool  # explicit Enable intent stays in this same lifecycle job
 
 
 class SkillDeleteRequest(TypedDict, total=False):
@@ -137,10 +147,17 @@ class SkillDeleteRequest(TypedDict, total=False):
 
 class SkillToggleResponse(TypedDict, total=False):
     """``POST /api/skills/{skill}/toggle`` success. A refusal answers ``SkillActionRefusal``; a
-    toggle with an ``extension_action`` also broadcasts ``extension_lifecycle``."""
+    toggle with an ``extension_action`` also broadcasts ``extension_lifecycle`` when its job ends.
+    Enabling installs missing packages; when that outlasts the answer bound the body is
+    ``{skill, ok, pending: true, job_id, message}`` with no ``enabled`` yet: follow the job on
+    ``GET /api/skills/lifecycle-queue``."""
 
     skill: Required[str]
-    enabled: Required[bool]
+    ok: bool
+    pending: bool
+    job_id: str
+    message: str
+    enabled: bool
     review_status: str
     review_stale: bool
     review_gate: Dict[str, Any]
@@ -162,6 +179,8 @@ class SkillActionRefusal(TypedDict, total=False):
     error: Required[str]
     status_code: int
     skill: str
+    code: str
+    detail: str
     source: str
     content_hash: str
     review_status: str
@@ -237,6 +256,8 @@ class SkillReviewResponse(TypedDict, total=False):
     error: str
     ok: bool  # attest only
     status_code: int  # attest refusal only
+    pending: bool  # attest only: the job outlasted the answer bound; job_id and message name it
+    message: str  # attest only, with pending
     reviewer_models: List[str]
     review_profile: str
     findings: List[Dict[str, Any]]
@@ -357,36 +378,28 @@ class ClawHubPreviewResponse(TypedDict):
 
 
 class MarketplaceInstallRequest(TypedDict):
-    """``POST /api/marketplace/{clawhub|ouroboroshub}/install``. Installing reviews the skill unless
-    ``auto_review`` is false; an existing skill is replaced only with ``overwrite``. OuroborosHub
-    ``adopt`` turns a local copy into the hub skill and needs the ``expected_content_hash`` shown
-    (64 lowercase hex), with ``auto_review`` and without ``overwrite``."""
+    """``POST /api/marketplace/clawhub/install``. Installing reviews the skill unless ``auto_review``
+    is false; an existing skill is replaced only with ``overwrite``."""
 
     slug: str
-    version: NotRequired[str]  # ClawHub only
+    version: NotRequired[str]
     auto_review: NotRequired[bool]  # default true
     overwrite: NotRequired[bool]  # default false
-    adopt: NotRequired[bool]  # OuroborosHub only
-    expected_content_hash: NotRequired[str]
 
 
 class MarketplaceUpdateRequest(TypedDict, total=False):
-    """``POST /api/marketplace/clawhub/update/{name}``; OuroborosHub's update reads no body."""
+    """``POST /api/marketplace/clawhub/update/{name}``."""
 
     version: str
 
 
 class MarketplaceInstallResponse(TypedDict, total=False):
-    """Install, update or adopt result. An install keeps ``ok`` true when review finds blockers (the
-    skill is installed but cannot run; a repair task may be queued); a dependency failure gives
-    ``ok: false`` and rolls back. An OuroborosHub update whose review cannot run, or whose
-    dependencies or reload fail, gives ``ok: false`` and restores the previous version. ``code``
-    types an OuroborosHub refusal (catalog_identity_conflict, adopt_cas_mismatch, ...)."""
+    """ClawHub install or update result. An install keeps ``ok`` true when review finds blockers (the
+    skill is installed but cannot run); a dependency failure gives ``ok: false`` and rolls back."""
 
     ok: Required[bool]
     sanitized_name: str
     error: Optional[str]
-    code: str
     target_dir: str
     summary: Optional[MarketplaceSkillSummary]
     archive: Dict[str, Any]  # {sha256, size_bytes, version}
@@ -398,15 +411,6 @@ class MarketplaceInstallResponse(TypedDict, total=False):
     deps_error: str
     deps_fingerprint: str
     provenance: Dict[str, Any]
-    adopted: bool
-    pre_adopt_retained: Any
-    retention_error: str
-    live_content_hash: str
-    reason: str
-    extension_action: Optional[str]
-    extension_reason: Optional[str]
-    rolled_back: bool
-    rollback_errors: List[str]
 
 
 class MarketplaceUninstallResponse(TypedDict):
@@ -437,25 +441,10 @@ class MarketplaceSearchResponse(TypedDict, total=False):
 
 
 class MarketplaceInstalledResponse(TypedDict):
-    """``GET /api/marketplace/{clawhub|ouroboroshub}/installed``."""
+    """``GET /api/marketplace/{clawhub|ouroboroshub}/installed`` (the hub route remains frozen)."""
 
     count: int
     skills: List[MarketplaceInstalledSkill]
-
-
-class HubCatalogResponse(TypedDict):
-    """``GET /api/marketplace/ouroboroshub/catalog`` (``q`` filters slug, name or description)."""
-
-    query: str
-    count: int
-    results: List[MarketplaceSkillSummary]
-
-
-class HubPreviewResponse(TypedDict):
-    """``GET /api/marketplace/ouroboroshub/preview/{slug}``; any failure is 404."""
-
-    summary: MarketplaceSkillSummary
-    files: List[Dict[str, Any]]
 
 
 class HubPublicationClearRequest(TypedDict):
@@ -973,7 +962,7 @@ __all__ = [
     "MarketplaceSkillSummary", "MarketplaceInstalledSkill", "ClawHubPreviewResponse",
     "MarketplaceInstallRequest", "MarketplaceUpdateRequest", "MarketplaceInstallResponse",
     "MarketplaceUninstallResponse", "MarketplaceSearchResponse", "MarketplaceInstalledResponse",
-    "HubCatalogResponse", "HubPreviewResponse", "HubPublicationClearRequest", "HubPublicationClearResponse",
+    "HubPublicationClearRequest", "HubPublicationClearResponse",
     "ClaudexorProblem", "ClaudexorMaintenanceProblem", "ClaudexorAccountTarget",
     "ClaudexorMaintenanceRequest", "ClaudexorMaintenanceOperation", "ClaudexorMaintenanceInventory",
     "ClaudexorQuotaRefreshRequest", "ClaudexorAccountResources", "ClaudexorAccountResetRequest",

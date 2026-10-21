@@ -12,8 +12,10 @@ from threading import Thread
 
 import pytest
 
+from tests._shared import producer_evidence_dir
 from tests._budget_pause_exact_helpers import _install_queue
 from tests.test_owner_continue import _interrupted
+from tests.ui_console_errors import PageErrors
 
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 WEB = Path(__file__).resolve().parents[1] / 'web'
@@ -95,8 +97,7 @@ def test_failed_admission_reload_retry_and_tree_pause_consumers(tmp_path, monkey
     server = ThreadingHTTPServer(('127.0.0.1', 0), partial(Handler, directory=str(WEB)))
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    evidence = tmp_path / 'screenshots'
-    evidence.mkdir()
+    evidence = producer_evidence_dir(tmp_path / 'screenshots', "batch4-repair-controls")
     persist = q.persist_queue_snapshot
     try:
         with sync_playwright() as pw:
@@ -192,8 +193,8 @@ def test_hard_bound_continue_reason_on_real_collapsed_chat_cards(tmp_path, monke
     from ouroboros.gateway.tasks import api_task_get
     from ouroboros.gateway.task_continue import api_task_continue
     from ouroboros.gateway.history import make_chat_history_endpoint
+    from ouroboros import dialogue_store
     from ouroboros.task_results import load_task_result, write_task_result
-    from ouroboros.utils import append_jsonl
 
     q, _, workers = _install_queue(tmp_path, monkeypatch)
     monkeypatch.setattr('ouroboros.llm.LLMClient.chat', lambda *_a, **_k: pytest.fail('paid explanation'))
@@ -204,7 +205,7 @@ def test_hard_bound_continue_reason_on_real_collapsed_chat_cards(tmp_path, monke
             _interrupted(tmp_path, tid, reason_code=reason)
             write_task_result(tmp_path, tid, 'failed', chat_id=room,
                               deadline_at='2000-01-01T00:00:00Z' if kind == 'expired' else '2099-01-01T00:00:00Z')
-            append_jsonl(tmp_path / 'logs' / 'chat.jsonl', {
+            dialogue_store.append(tmp_path, 'chat', {
                 'task_id': tid, 'chat_id': room, 'direction': 'out', 'role': 'system',
                 'system_type': 'task_summary', 'task_terminal_status': 'failed', 'is_progress': True,
                 'text': 'Report preparation ended.', 'ts': '2026-09-26T12:00:00Z'})
@@ -253,8 +254,7 @@ def test_hard_bound_continue_reason_on_real_collapsed_chat_cards(tmp_path, monke
             browser = getattr(pw, engine).launch(headless=True)
             try:
                 page = browser.new_page(viewport={'width': width, 'height': 900}, has_touch=width < 980)
-                errors = []
-                page.on('pageerror', lambda error: errors.append(str(error)))
+                errors = PageErrors(page, engine)
                 page.route('**/api/**', respond)
                 for room in (1, 7):
                     page.goto(f'http://127.0.0.1:{server.server_port}/fixture?room={room}')
@@ -264,7 +264,7 @@ def test_hard_bound_continue_reason_on_real_collapsed_chat_cards(tmp_path, monke
                     for card in cards.values():
                         expect(card).to_have_count(1)
                         if card.get_attribute('data-expanded') == '1':
-                            card.locator('[data-live-summary-button]').click()
+                            card.locator('[data-live-disclosure]').click()
                     page.screenshot(path=str(evidence / f'continue-{engine}-{width}-room{room}.png'))
                     for kind in ('budget', 'expired'):
                         cards[kind].screenshot(path=str(evidence / f'continue-{engine}-{width}-room{room}-{kind}.png'))
@@ -302,7 +302,7 @@ def test_hard_bound_continue_reason_on_real_collapsed_chat_cards(tmp_path, monke
                     successor = load_task_result(tmp_path, f'ready-{room}')['continued_by']['successor_task_id']
                     assert sum(task['id'] == successor for task in workers.PENDING) == 1
                     page.screenshot(path=str(evidence / f'continue-{engine}-{width}-room{room}-continued.png'))
-                assert not errors
+                assert not errors.unexpected(), errors
             finally:
                 browser.close()
     finally:

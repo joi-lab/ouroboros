@@ -957,7 +957,6 @@ def test_one_shot_checkpoint_is_reasoned_and_consumed(monkeypatch, tmp_path):
     assert coordination_context["root_task_id"] == "child1"
     assert coordination_context["parent_intent"]["state"] == "absent"
     assert coordination_context["time"]["state"] == "not_set"
-    assert coordination_context["review_capacity"]["state"] == "available"
     assert out.pop("sleep")["slept_sec"] == 2.0 and out.pop("leaf_live_input") == "unknown"
     assert out == {
         "status": "inspection_checkpoint", "run_id": "run-1",

@@ -3,20 +3,19 @@
  *
  * Every place that says "this belongs to that Project — take me there" gets its
  * control here, and only this module raises `ouro:open-project`. Callers choose a
- * LAYOUT and, where the surface needs it, a STATE; they never write a label, a
- * glyph or a class name, because that freedom is how one intent came to be drawn
- * several ways while each call still "reused the shared chip".
+ * LAYOUT, one of two forms; they never write a label, a glyph or a class name,
+ * because that freedom is how one intent came to be drawn several ways while each
+ * call still "reused the shared chip".
  *
- *   inline  the pill under a message or a System row, and in a quiz card's head
- *   bar     the whole converted task card
- *   footer  the strip that closes a task card bound to a Project
+ *   inline  the capsule wherever content points at a Project: under a message or a
+ *           System row, at the end of a routing receipt, in a mirrored question's head
+ *   footer  the strip that closes a work portal (a task card bound to a Project)
  */
 import { PAGE_ICONS } from './page_icons.js';
 import { tr } from './i18n.js';
 
-const LAYOUT_CLASS = { inline: 'chat-quiz-project', bar: '', footer: 'chat-live-bound-pointer' };
-// The arrow alone says "opens"; words appear only when the surface is itself the news.
-const STATE_WORDS = { '': '', background: 'running in background' };
+// Two forms only: anything else a caller names is the inline capsule. The arrow alone says "opens".
+const LAYOUT_CLASS = { inline: 'chat-quiz-project', footer: 'chat-live-bound-pointer' };
 
 // What a press opens, per mounted reference: a name that arrives later reaches the payload too.
 const targets = new WeakMap();
@@ -36,21 +35,18 @@ export function nameProjectReference(node, project) {
     if (target && project?.name) target.name = project.name;
     const label = node.querySelector('.chat-live-project-name');
     if (label && label.textContent !== name) label.textContent = name;
-    const words = STATE_WORDS[node.dataset.state || ''] || '';
-    const base = node.dataset.opensQuestion ? `Open this question in ${name}` : `Open project ${name}`;
-    const spoken = words ? `${base}, ${words}` : base;
+    const spoken = node.dataset.opensQuestion ? `Open this question in ${name}` : `Open project ${name}`;
     node.title = spoken;
     node.setAttribute('aria-label', spoken);
     return node;
 }
 
-export function projectReference(project, { layout = 'inline', state = '', taskId = '', quizId = '' } = {}) {
+export function projectReference(project, { layout = 'inline', taskId = '', quizId = '' } = {}) {
     const target = { ...(project || {}) };
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = ['chat-live-project-card-btn', LAYOUT_CLASS[layout] || ''].filter(Boolean).join(' ');
+    btn.className = `chat-live-project-card-btn ${LAYOUT_CLASS[layout] || LAYOUT_CLASS.inline}`;
     btn.dataset.intent = 'open-project';
-    if (STATE_WORDS[state]) btn.dataset.state = state;
     if (quizId) btn.dataset.opensQuestion = '1';
     const icon = document.createElement('span');
     icon.className = 'chat-live-project-icon';
@@ -61,7 +57,7 @@ export function projectReference(project, { layout = 'inline', state = '', taskI
     const statusEl = document.createElement('span');
     statusEl.className = 'chat-live-project-status';
     statusEl.setAttribute('aria-hidden', 'true');
-    statusEl.textContent = [STATE_WORDS[state] || '', '↗'].filter(Boolean).join(' ');
+    statusEl.textContent = '↗';
     btn.append(icon, nameEl, statusEl);
     targets.set(btn, target);
     nameProjectReference(btn, target);

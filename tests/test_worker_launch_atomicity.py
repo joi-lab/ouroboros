@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +19,7 @@ import pytest
 from ouroboros import store
 from ouroboros.task_results import load_task_result, write_task_result
 from supervisor import queue, queue_schedules as schedules, task_admission, worker_assignment
+from tests._store_journal_shared import exclusive_hold
 from tests.test_g1_followup_policy import _assignment_world, register, row, world as _world
 
 pytestmark = pytest.mark.serial
@@ -29,8 +29,7 @@ world = _world  # requested by name: re-bound so the CI ruff gate sees no F811
 @contextlib.contextmanager
 def held_store(root):
     assert store.store_path(root).exists()
-    holder = sqlite3.connect(store.store_path(root), isolation_level=None, check_same_thread=False)
-    holder.execute("BEGIN EXCLUSIVE")
+    holder = exclusive_hold(store.store_path(root))  # its reads busy too, under WAL as well
     try:
         yield
     finally:

@@ -30,6 +30,7 @@ export class NodeStub {
     set textContent(value) { this._text = String(value ?? ''); }
     get textContent() { return this._text; }
     append(...nodes) { nodes.forEach((node) => { node.parentNode = this; this.children.push(node); }); }
+    appendChild(node) { this.append(node); return node; }
     // A parentless node stands in for a mounted root until it is removed.
     get isConnected() { return this.parentNode ? this.parentNode.isConnected : !this.detached; }
     remove() {

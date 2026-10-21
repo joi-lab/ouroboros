@@ -75,11 +75,12 @@ def installation_root(drive_root: Any) -> pathlib.Path:
     root), an own child drive maps to its parent by the host layout of
     ``task_custody.own_child_drives``; any other drive is its own root."""
     from ouroboros.config import resolve_data_dir
+    from ouroboros.install_identity import require_owned_root
 
-    drive = pathlib.Path(drive_root).resolve(strict=False)
-    data = resolve_data_dir().resolve(strict=False)
+    drive, data = pathlib.Path(drive_root).resolve(strict=False), resolve_data_dir().resolve(strict=False)
     if drive == data or data in drive.parents:
-        return data
+        return data  # this install's own set: no identity read, so shutdown doors stay fail-soft
+    drive = require_owned_root(drive)
     while True:
         parents = drive.parents
         if (len(parents) > 3 and drive.name == "data" and parents[1].name == "headless_tasks"
@@ -151,9 +152,28 @@ def owned_records(drive_root: Any, *, strict: bool = False) -> List[Dict[str, An
     return [dict(entry) for entry in _read_document(installation_root(drive_root), strict=strict)["records"].values()]
 
 
+def _require_owned_entry(root: Any, entry: Dict[str, Any]) -> None:
+    from ouroboros.install_identity import require_owned_root
+
+    require_owned_root(entry.get("drive_root") or root)
+    if entry.get("record_path"):
+        require_owned_root(pathlib.Path(entry["record_path"]).resolve(strict=False).parent)
+
+
 def executor_record_paths(drive_root: Any, kind: str) -> List[pathlib.Path]:
-    return [pathlib.Path(entry["record_path"]) for entry in owned_records(drive_root)
-            if entry.get("kind") == kind and entry.get("record_path")]
+    from ouroboros.install_identity import StoreForeign
+
+    paths = []
+    for entry in owned_records(drive_root):
+        if entry.get("kind") != kind or not entry.get("record_path"):
+            continue
+        try:
+            _require_owned_entry(drive_root, entry)
+        except StoreForeign as exc:
+            log.warning("Owned-process record retained (%s): %s", exc.reason, exc)
+            continue
+        paths.append(pathlib.Path(entry["record_path"]))
+    return paths
 
 
 def _update(root: Any, change: Callable[[Dict[str, Any]], bool], *, timeout_sec: float = 2.0) -> bool:
@@ -204,13 +224,15 @@ def _put(document: Dict[str, Any], entry: Dict[str, Any]) -> bool:
     return True
 
 
-def _forget(root: Any, record_ids: Iterable[str], *, drive_root: str = "") -> bool:
+def _forget(root: Any, record_ids: Iterable[str], *, drive_root: str = "",
+            expected_ledger: Optional[dict] = None) -> bool:
     ids = set(record_ids)
 
     def change(document: Dict[str, Any]) -> bool:
         records = document.get("records", {})
         gone = [rid for rid in ids if rid in records
-                and (not drive_root or records[rid].get("drive_root") == drive_root)]
+                and (not drive_root or records[rid].get("drive_root") == drive_root)
+                and (expected_ledger is None or records[rid].get("ledger_entry") == expected_ledger)]
         for rid in gone:
             records.pop(rid)
         return bool(gone)
@@ -366,6 +388,17 @@ def _stop_executor_record(root: Any, entry: Dict[str, Any], deadline: float) -> 
         pid = _int(record.get("host_pid"))
         if not _exit_proven(pid):
             if not executor._host_pid_matches_record(record):
+                expected = str(record.get("host_command_sha256") or "")
+                measured = executor._process_command_sha256(pid)
+                if expected and measured and expected != measured:
+                    from ouroboros.process_custody import record_not_ours
+
+                    if record_not_ours(root, {"pid": pid, "record_id": entry["record_id"]}, {
+                        "recorded": {"cmd_sha256": expected}, "measured": {"cmd_sha256": measured},
+                        "mismatches": ["cmd_sha256"],
+                    }, lock_timeout_sec=max(0.0, min(2.0, deadline - time.monotonic()))):
+                        executor._forget_process(path)
+                        return not path.exists()
                 return False  # alive under an identity the record cannot prove: no right to signal
             executor._kill_host_pid(pid)
             while not _exit_proven(pid):
@@ -380,13 +413,28 @@ def _stop_executor_record(root: Any, entry: Dict[str, Any], deadline: float) -> 
 
 def _stop_ledgered(root: Any, entry: Dict[str, Any], deadline: float, retained: set) -> bool:
     from ouroboros.platform_layer import kill_pid_tree, kill_process_group_id, pid_is_alive
-    from ouroboros.process_custody import _fingerprint_matches, _service_group_survives_leader
+    from ouroboros.process_custody import (
+        _fingerprint_matches, _service_group_survives_leader, measured_identity_mismatch, record_not_ours,
+    )
 
     row = entry.get("ledger_entry") if isinstance(entry.get("ledger_entry"), dict) else {}
 
     def alive() -> bool:
         return _fingerprint_matches(row) or _service_group_survives_leader(row)
 
+    def retire_mismatch() -> Optional[bool]:
+        evidence = measured_identity_mismatch(row)
+        # A reused non-leader PID does not refute surviving group members.
+        if not evidence or _service_group_survives_leader(row):
+            return None
+        if not record_not_ours(root, {**row, "record_id": entry["record_id"]}, evidence,
+                               lock_timeout_sec=max(0.0, min(2.0, deadline - time.monotonic()))):
+            return False
+        return _forget(root, [entry["record_id"]], expected_ledger=row)
+
+    retired = retire_mismatch()
+    if retired is not None:
+        return retired
     if alive():
         # Liveness may tolerate an unmeasurable start time (retention); a signal needs the
         # explicit stop's measured identity, or a recorded group that still has members.
@@ -405,13 +453,18 @@ def _stop_ledgered(root: Any, entry: Dict[str, Any], deadline: float, retained: 
             if time.monotonic() >= deadline:
                 return False
             time.sleep(_POLL_SEC)
-    _forget(root, [entry["record_id"]])
-    return True
+    retired = retire_mismatch()
+    if retired is not None:
+        return retired
+    if not _exit_proven(_int(row.get("pid"))):
+        return False  # a failed identity read is neither a mismatch nor an exit
+    return _forget(root, [entry["record_id"]], expected_ledger=row)
 
 
 def _stop_entry(root: Any, entry: Dict[str, Any], deadline: float, retained: set,
                 skip_paths: frozenset = frozenset()) -> bool:
     """One record's bounded stop: True once its exit is confirmed and it left the set."""
+    _require_owned_entry(root, entry)
     if entry.get("kind") in _EXECUTOR_KINDS:
         if entry.get("record_path") in skip_paths:
             return False  # its in-memory owner holds the Popen/backend handle and settles it
@@ -503,17 +556,17 @@ def _run_stop(root: pathlib.Path, deadline: float) -> Dict[str, Any]:
 def begin_owned_stop(drive_root: Any = None) -> None:
     """A shutdown door was entered: start the generation's one grace deadline (if no door did
     yet) and persist ``stop_requested_at`` on every target before any other owner waits."""
+    if drive_root is None:
+        from ouroboros.config import resolve_data_dir
+        drive_root = resolve_data_dir()
+    root = installation_root(drive_root)
     stop = _GENERATION_STOP
     with stop.lock:
         if stop.deadline is None:
             stop.deadline = time.monotonic() + _stop_budget_sec()
         deadline = stop.deadline
     try:
-        if drive_root is None:
-            from ouroboros.config import resolve_data_dir
-
-            drive_root = resolve_data_dir()
-        _stamp(installation_root(drive_root), "stop_requested_at", _is_stop_target,
+        _stamp(root, "stop_requested_at", _is_stop_target,
                timeout_sec=max(0.0, min(2.0, deadline - time.monotonic())))
     except Exception:
         log.warning("Owned-work stop requests not stamped at shutdown entry; the stop stamps them",
@@ -569,9 +622,25 @@ def import_inherited_records(drive_root: Any) -> Optional[int]:
     boot's background thread only, never on exit: one walk of ``data/state`` and
     ``data/task_drives`` that matches named directory symlinks without descending through them."""
     from ouroboros import workspace_executor as executor
+    from ouroboros.install_identity import canonical_root, initialize_install, StoreForeign
 
     root = installation_root(drive_root)
     if _read_document(root).get("inherited_import"):
+        return None
+    previous = initialize_install().get("copied_from") if root == canonical_root() else None
+    if previous:
+        # Legacy executor JSON has no install provenance. Its PID/backend may
+        # still name the original install's live process; a copy cannot adopt it.
+        error = StoreForeign(previous[-1], previous[-1])
+
+        def refuse(document: Dict[str, Any]) -> bool:
+            document["inherited_import"] = {"at": utc_now_iso(), "records": 0,
+                                             "reason_code": error.reason, "reason_detail": str(error)}
+            return True
+
+        if _update(root, refuse):
+            log.warning("Inherited process records retained (%s): %s", error.reason, error)
+            return 0
         return None
     entries: Dict[str, Dict[str, Any]] = {}
     for base in (root / "state", root / "task_drives"):

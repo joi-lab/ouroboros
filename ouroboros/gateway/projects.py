@@ -205,6 +205,7 @@ _SKILL_LIFECYCLE_KINDS = {
     "disable": "Disable skill",
     "remove": "Remove skill",
     "update": "Update skill",
+    "deps": "Skill dependencies",
     "dependency": "Skill dependencies",
     "dependencies": "Skill dependencies",
 }
@@ -481,7 +482,7 @@ async def api_projects_create(request: Request) -> JSONResponse:
 
 
 async def api_project_update(request: Request) -> JSONResponse:
-    """POST /api/projects/{project_id}/update — rename (the only mutable UI field)."""
+    """POST /api/projects/{project_id}/update — partial name/pin metadata update."""
     try:
         from ouroboros.projects_registry import PROJECT_NAME_MAX, get_project, update_project
 
@@ -492,15 +493,21 @@ async def api_project_update(request: Request) -> JSONResponse:
         drive_root = request_drive_root(request)
         if get_project(drive_root, project_id, strict=True) is None:
             return JSONResponse({"error": f"unknown project: {project_id}"}, status_code=404)
-        name = str(body.get("name") or "").strip()
-        if not name:
-            return JSONResponse({"error": "name is required"}, status_code=400)
-        if len(name) > PROJECT_NAME_MAX:
-            return JSONResponse(
-                {"error": f"name must be <= {PROJECT_NAME_MAX} characters"},
-                status_code=400,
-            )
-        entry = update_project(drive_root, project_id, name=name)
+        updates = {}
+        if "name" in body:
+            name = str(body.get("name") or "").strip()
+            if not name or len(name) > PROJECT_NAME_MAX:
+                return JSONResponse({"error": f"name must be 1 to {PROJECT_NAME_MAX} characters"}, status_code=400)
+            updates["name"] = name
+        if "pinned" in body:
+            if type(body["pinned"]) is not bool:
+                return JSONResponse({"error": "pinned must be a boolean"}, status_code=400)
+            updates["pinned"] = body["pinned"]
+        if not updates:
+            return JSONResponse({"error": "name or pinned is required"}, status_code=400)
+        entry = update_project(drive_root, project_id, **updates)
+        if entry is None:
+            return JSONResponse({"error": "project is no longer active"}, status_code=409)
         _broadcast_projects_changed(str((entry or {}).get("id") or project_id), (entry or {}).get("chat_id"))
         return JSONResponse({"project": entry})
     except Exception as exc:

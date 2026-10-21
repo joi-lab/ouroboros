@@ -1,6 +1,6 @@
 // Pure chat-activity helpers shared by chat.js and dependency-free node tests:
 // live-card presentation projections (moved verbatim from chat.js) plus the
-// in-flight direct/ephemeral turn status reducer and snapshot hydration.
+// census snapshot hydration. The room's status word is the server's (work_status.js).
 import { META_PART_SEPARATOR, executorIdentityMarkup } from './harness_presentation.js';
 import { effortChipMarkup } from './effort_chip.js';
 import { resultFilesItemHtml } from './result_files.js';
@@ -9,9 +9,11 @@ import { compactModel, formatLogDuration, modelExecutionLabel } from './log_even
 import { fitText, fullText } from './text_fit.js';
 import { delegatedActivityBodyHtml, delegatedHeadline, delegatedLineView } from './delegated_activity.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
-import { activityWaitPhase, pausePhaseLabel, modelActivityPresentation, paintLiveDetail, taskActivityPresentation } from './task_phase_chip.js';
-import { currentLanguage, fmt, isEnglish, tr, tx } from './i18n.js';
+import { paintLiveDetail } from './task_phase_chip.js';
+import { fmt, tr, tx } from './i18n.js';
+import { formatMsgTime } from './utils.js';
 import { hostRowDisplayText } from './host_notice_text.js';
+export { bootPhase, startingStatus, supervisorReady } from './host_starting_status.js';
 import {
     joinMarkdownHeadings, MARKDOWN_FENCED_CODE, accountedUpperBound,
     accountedUpperBoundWithChildren,
@@ -395,6 +397,8 @@ export async function confirmAndSendPanic(deps) {
     });
     if (shouldFirePanic(decision)) {
         deps.ws.send({ type: 'command', cmd: '/panic' });
+        // Only after the stop is on its way: the page's own work (skills' page modules) stops with it.
+        globalThis.dispatchEvent?.(new CustomEvent('ouro:panic'));
         return true;
     }
     return false;
@@ -619,20 +623,24 @@ function optionalFiniteNumber(value) {
     return Number.isFinite(number) ? number : null;
 }
 
-/** Pure presentation projection used by the header and dependency-free tests. */
+/** Pure presentation projection used by the header and dependency-free tests. `attention` is the owner's move: a
+ *  task the spending limit stopped waits for the owner (a Main attention row, main_decisions.py), else the pill is
+ *  a neutral fact. */
 export function headerBudgetPresentation(data) {
+    const attention = Array.isArray(data?.main_attention)
+        && data.main_attention.some((row) => row?.attention_reason === 'budget');
     if (!data || data.accounting_loading === true) {
-        return { state: 'loading', label: 'Loading…', fillPct: 0 };
+        return { state: 'loading', label: 'Loading…', fillPct: 0, attention };
     }
     if (data?.accounting?.available === false) {
-        return { state: 'unavailable', label: 'Unavailable', fillPct: 0 };
+        return { state: 'unavailable', label: 'Unavailable', fillPct: 0, attention };
     }
     // Older state shapes did not carry accounting.available.  Keep accepting
     // them when they contain a real numeric projection, but never coerce null
     // (ledger failure in the new shape) into a convincing $0.
     const spent = optionalFiniteNumber(data.spent_usd);
     if (spent === null) {
-        return { state: 'unavailable', label: 'Unavailable', fillPct: 0 };
+        return { state: 'unavailable', label: 'Unavailable', fillPct: 0, attention };
     }
     const rawLimit = optionalFiniteNumber(data.budget_limit);
     const limit = rawLimit !== null && rawLimit > 0 ? rawLimit : 0;
@@ -643,6 +651,7 @@ export function headerBudgetPresentation(data) {
         state: 'available',
         label,
         fillPct: limit > 0 ? Math.min(100, Math.max(0, (spent / limit) * 100)) : 0,
+        attention,
     };
 }
 
@@ -817,7 +826,7 @@ export function clearStickyCardState(record) {
     // A recycled slot must not inherit the previous cycle's finalizing hold —
     // nor the outcome observed under it (#1110), which would otherwise paint the
     // new cycle's chip with the old cycle's Failed.
-    Object.assign(record, { finalizingHold: false, censusPhase: '', observedOutcome: '' });
+    Object.assign(record, { finalizingHold: false, censusPhase: '', observedOutcome: '', workView: null });
     // The activity clock is cycle state too: a recycled slot ('active') would
     // otherwise open showing the previous cycle's "updated" time.
     record.latestActivityTs = '';
@@ -922,12 +931,12 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
  * into ONE follow-up read that starts when the in-flight read settles — the
  * first forced caller receives that request, the others resolve to null once
  * the follow-up has applied or failed. Gated requests settle via `apply`/`fail` even if a callback throws.
- * Only `fail` (a read failed, in any window) fans out `onUnavailable`; socket open/close `retire()` older bodies.
+ * Only `fail` fans out `onUnavailable`; socket changes and confirmed mutations `retire()` older bodies.
  */
 export function createStateSnapshotSequencer(onApply, now = () => Date.now(), onUnavailable = () => {}) {
     let requestedGeneration = 0;
     let appliedGeneration = 0;
-    // Newest applied body until an unavailable read retires it (late-mount seed).
+    // Newest applied body until a failed read or retire() clears it (late-mount seed).
     let latest = null;
     let inflight = null;
     let settled = null;
@@ -977,12 +986,6 @@ export function createStateSnapshotSequencer(onApply, now = () => Date.now(), on
         },
         latest: () => latest,
     };
-}
-
-// В9: one /api/state body's `supervisor_ready`, null when it states nothing. Only
-// true ends Starting…; a `supervisor_error` is not readiness and is not read here.
-export function supervisorReady(data) {
-    return typeof data?.supervisor_ready === 'boolean' ? data.supervisor_ready : null;
 }
 
 /**
@@ -1074,92 +1077,6 @@ export function unkeyedFrameEndsTurn(row) {
 }
 
 /**
- * One header producer: the word, its tone (live, queued, wait for the owner's own question, held, unknown, starting,
- * offline, online) and its dots together; a call's operation, never its word, picks the tone. Precedence: offline >
- * active managed work > pausing > direct turns > pending submissions > finalizing wrap-up (ended work in its post-task
- * work) > access wait > queued > answer wait > unknown > paused > Project hold > idle, which says Starting until the
- * supervisor confirms readiness: neither admission nor a connected socket proves execution. Tasks are counted
- * independently, so one paused task never hides another working; `showDots` is the transcript's typing row.
- */
-export function computeDerivedChatStatus({
-    isConnected = true,
-    hasActiveLiveCard = false,
-    activeDirectCount = 0, activeManagedCount = 0,
-    queuedManagedCount = 0, pausingManagedCount = 0,
-    pausedManagedCount = 0, finalizingCount = 0, hasFinalizingLiveCard = false,
-    pausedCause = '',
-    waitingOwnerCount = 0, unknownActivityCount = 0,
-    waitingModelCount = 0,
-    projectWaitLabel = '',
-    pendingSubmissionsCount = 0,
-    supervisorStarting = false,
-    modelActivity = null,
-} = {}) {
-    const view = (kind, text, tone, showDots = false) => ({ kind, text, tone, showDots, dots: tone === 'live' ? 'moving' : tone === 'queued' ? 'still' : 'one' });
-    if (!isConnected) return view('offline', 'Reconnecting…', 'offline');
-    const observed = modelActivity && view(modelActivity.waiting ? 'online' : 'thinking', modelActivity.text, ['unknown', 'queued'].includes(modelActivity.operation) ? modelActivity.operation : modelActivity.waiting ? 'held' : 'live', modelActivity.motion);
-    if (hasActiveLiveCard || activeManagedCount > 0) return (activeManagedCount > 0 && observed) || view('thinking', taskActivityPresentation({ phase: 'working' }).text, 'live', !hasActiveLiveCard);
-    if (pausingManagedCount > 0) return view('thinking', pausePhaseLabel('budget_pausing'), 'held', true); // settling under the owner's Pause
-    if (activeDirectCount > 0) return observed || view('thinking', taskActivityPresentation({ phase: 'working' }).text, 'live', true);
-    if (pendingSubmissionsCount > 0) return view('thinking', tr('task.chip.sending', 'Sending'), 'live', true);
-    if (finalizingCount > 0 || hasFinalizingLiveCard) return view('thinking', taskActivityPresentation({ phase: 'finalizing' }).text, 'live', true);
-    if (waitingModelCount > 0) return view('online', tr('task.chip.waiting_for_access', 'Waiting for access'), 'held');
-    if (queuedManagedCount > 0) return view('thinking', taskActivityPresentation({ phase: 'queued' }).text, 'queued', true);
-    if (waitingOwnerCount > 0) return view('online', tr('task.chip.waiting_for_answer', 'Waiting for your answer'), 'wait');
-    if (unknownActivityCount > 0) return view('online', tr('task.chip.activity_unconfirmed', 'Activity unconfirmed'), 'unknown');
-    if (pausedManagedCount > 0) return view('online', pausePhaseLabel('budget_paused', pausedCause), 'held'); // never claims Running
-    if (projectWaitLabel) return view('online', projectWaitLabel, 'held');
-    if (supervisorStarting) return view('starting', 'Starting…', 'starting');
-    return view('online', 'Online', 'online');
-}
-
-// Count census activity and unfinished cards; parked/waiting rows retain their own state.
-export function chatStatusCounts(activities, records, isWaiting = () => false) {
-    const counts = { activeDirectCount: 0, activeManagedCount: 0, queuedManagedCount: 0, pausingManagedCount: 0,
-        pausedManagedCount: 0, unknownActivityCount: 0, hasActiveLiveCard: false, waitingModelCount: 0, finalizingCount: 0, hasFinalizingLiveCard: false,
-        projectWaitLabel: '', waitingOwnerCount: 0, pausedCause: '' };
-    const pauseCauses = new Set(), calls = new Map();
-    for (const [id, entry] of activities) {
-        // A Project verification hold is a static wait: never queued or working,
-        // while its pause/pausing/unknown census phase still counts as itself.
-        const projectHold = entry?.project_admission_hold?.label;
-        if (projectHold) counts.projectWaitLabel = projectHold;
-        else if (isWaiting(id)) continue;
-        const waitPhase = activityWaitPhase(entry);
-        if (entry?._activityUnconfirmed || entry?.phase === 'unknown') counts.unknownActivityCount += 1;
-        else if (entry?.phase === 'budget_pausing') counts.pausingManagedCount += 1;
-        else if (entry?.phase === 'budget_paused') { counts.pausedManagedCount += 1; pauseCauses.add(entry.pause_cause || ''); }
-        else if (waitPhase === 'unknown') counts.unknownActivityCount += 1;
-        else if (waitPhase === 'owner_wait') counts.waitingOwnerCount += 1;
-        else if (projectHold) continue;
-        else if (String(entry?.kind || '') !== 'managed_task' && entry?.phase !== 'finalizing') counts.activeDirectCount += 1;
-        else if (String(entry?.phase || '') === 'queued') counts.queuedManagedCount += 1;
-        else counts[String(entry?.phase || '') === 'finalizing' ? 'finalizingCount' : 'activeManagedCount'] += 1;
-        if (!entry?._activityUnconfirmed && ['preparing', 'thinking', 'working'].includes(entry?.phase)
-            && !waitPhase && !projectHold) calls.set(id, modelActivityPresentation(
-                entry.phase === 'preparing' ? { phase: 'preparing' } : entry.model_activity)
-                || (entry.kind !== 'managed_task' ? taskActivityPresentation({ phase: entry.phase }) : null));
-    }
-    if (pauseCauses.size === 1) counts.pausedCause = [...pauseCauses][0];
-    for (const record of records) {
-        if (!isForegroundLiveCard(record)) continue;
-        if (record.projectHold) {
-            counts.projectWaitLabel ||= record.projectHold;
-            continue;
-        }
-        if (activities.get(record.groupId)?.project_admission_hold) continue;
-        if (record.cancelPendingPolicy && calls.has(record.groupId)) calls.set(record.groupId,
-            taskActivityPresentation({ phase: 'working', stopPolicy: record.cancelPendingPolicy }));
-        if (record.modelWaiting) counts.waitingModelCount += 1;
-        else if ((record.finalizingHold || !record.direct) && !record.parkedPhase) counts[record.finalizingHold ? 'hasFinalizingLiveCard' : 'hasActiveLiveCard'] = true;
-    }
-    const views = [...calls.values()];
-    if (views.length && views.length === counts.activeDirectCount + counts.activeManagedCount
-        && views.every(view => view && view.text === views[0]?.text)) counts.modelActivity = views[0];
-    return counts;
-}
-
-/**
  * Local-echo continuity: split the bounded journal of locally-sent owner rows
  * against ONE fetched history response. Entries whose client_message_id
  * appears in the response are CONFIRMED durable (server history is the
@@ -1219,37 +1136,8 @@ export function reconnectBannerText(reason = '') {
     return '';
 }
 
-/** {short, full} presentation of a message timestamp, or null when unreadable. */
-export function formatMsgTime(isoStr) {
-    if (!isoStr) return null;
-    try {
-        const d = new Date(isoStr);
-        if (isNaN(d)) return null;
-        const now = new Date();
-        const pad = n => String(n).padStart(2, '0');
-        const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-        // English keeps this hand format byte for byte; an install language takes its month
-        // names from Intl and its two words from the catalog (web/modules/i18n.js).
-        const monthName = (date) => {
-            if (!isEnglish()) {
-                try { return new Intl.DateTimeFormat(currentLanguage(), { month: 'short' }).format(date); } catch { /* hand list below */ }
-            }
-            return months[date.getMonth()];
-        };
-        const todayStr = now.toDateString();
-        const yesterday = new Date(now);
-        yesterday.setDate(now.getDate() - 1);
-        let short;
-        if (d.toDateString() === todayStr) short = hhmm;
-        else if (d.toDateString() === yesterday.toDateString()) short = `${tr('time.yesterday', 'Yesterday')}, ${hhmm}`;
-        else short = `${monthName(d)} ${d.getDate()}, ${hhmm}`;
-        const full = `${monthName(d)} ${d.getDate()}, ${d.getFullYear()} ${tr('time.at', 'at')} ${hhmm}`;
-        return { short, full };
-    } catch {
-        return null;
-    }
-}
+// The message clock is the chat's one compact time format, shared with the terminal time line (utils.js).
+export { formatMsgTime };
 
 /**
  * Project one /api/state activity census onto the client's active-activity map.
@@ -1351,13 +1239,13 @@ export function reconcileHydratedDirectActivities(
 }
 
 /**
- * Card-set durable-truth reconcile (stuck "Working..." pill class). The header
- * reducer reads hasActiveLiveCard — a pure DOM scan of mounted unfinished
- * foreground cards — so a card minted by a replayed frame whose own terminal
- * row never reached this client (lost task_done, lineage-only subagent final
- * re-minting a finished parent) kept the pill on "Working..." forever: every
- * existing terminal path keys on the card's OWN id reaching a snapshot or
- * frame first. This selector closes the gap from the card side: given the
+ * Card-set durable-truth reconcile (stuck "Working..." card class). A card
+ * minted by a replayed frame whose own terminal row never reached this client
+ * (lost task_done, lineage-only subagent final re-minting a finished parent)
+ * kept its chip on "Working..." forever: every existing terminal path keys on
+ * the card's OWN id reaching a snapshot or frame first, and such a card never
+ * sets the room's status (the server's work projection does). This selector
+ * closes the gap from the card side: given the
  * compact card projection `{id, finished, isSubagent, connected}` and the set
  * of ids the GLOBAL /api/state snapshot confirms live, it returns the mounted
  * unfinished foreground card ids the snapshot does NOT vouch for. Each one is
@@ -1384,15 +1272,15 @@ export function unconfirmedForegroundCardIds(cards, activeIds) {
 }
 
 // В9: the host stamps a typed `ingress_accepted: true` on an owner echo only after the durable chat write, so that
-// client_message_id's bubble says `Input saved` — never that work began; `ingress_undispatched` (proven never dispatched) says
-// `Saved, not delivered.` and `ingress_pending` (the running host has not said yet) `Input saved`, each until the next fact.
+// client_message_id's bubble says `Input saved` — never that work began. `ingress_pending` keeps that note
+// provisional until dispatch is confirmed or the ended host's delivery becomes unknown.
 export function markIngressSaved(root, row) {
-    const cmid = String(row?.client_message_id || ''), state = row?.ingress_undispatched === true ? 'undispatched' : row?.ingress_pending === true ? 'pending' : '';
+    const cmid = String(row?.client_message_id || ''), state = row?.ingress_pending === true ? 'pending' : '';
     if (row?.role !== 'user' || row.ingress_accepted !== true || !cmid) return false;
     const bubble = [...root.querySelectorAll('.chat-bubble.user[data-client-message-id]')]
         .find((node) => node.dataset.clientMessageId === cmid), prior = bubble?.querySelector('[data-ingress-saved]');
-    if (!bubble || (prior && (!['undispatched', 'pending'].includes(prior.dataset.ingressSaved) || prior.dataset.ingressSaved === state))) return false;  // `Input saved` and a kept send's delivery doubt are final
-    const note = Object.assign(document.createElement('div'), { className: 'msg-pending', textContent: state === 'undispatched' ? tr('chat.saved_undispatched', 'Saved, not delivered.') : 'Input saved' });
+    if (!bubble || (prior && (prior.dataset.ingressSaved !== 'pending' || prior.dataset.ingressSaved === state))) return false;  // `Input saved` and a kept send's delivery doubt are final
+    const note = Object.assign(document.createElement('div'), { className: 'msg-pending', textContent: 'Input saved' });
     note.dataset.ingressSaved = state;
     for (const doubt of [prior, bubble.querySelector('[data-ingress-unconfirmed]')]) doubt?.remove();  // the saved row settles a "Send again" doubt
     bubble.insertBefore(note, bubble.querySelector('.msg-time'));

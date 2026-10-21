@@ -8,6 +8,8 @@ never folds the System row into the owner's bubble, and nothing here is a read o
 delivery receipt.
 """
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import json
 import types
@@ -36,7 +38,7 @@ def test_live_frame_names_the_submission_and_the_durable_row_does_not(tmp_path, 
 
     (frame,) = [row for row in frames if row.get("type") == "chat"]
     assert frame["role"] == "system" and frame["client_message_id"] == "cm-owner"
-    stored = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text().splitlines()]
+    stored = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     assert [row["client_message_id"] for row in stored] == ["cm-owner", ""]
     response = asyncio.run(make_chat_history_endpoint(tmp_path)(
         types.SimpleNamespace(query_params={"chat_id": "1"})))

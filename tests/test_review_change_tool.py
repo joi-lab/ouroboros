@@ -302,12 +302,13 @@ def test_the_schema_is_the_planned_call() -> None:
     params = entry.schema["parameters"]
     assert entry.name == "review_change" and params["required"] == ["subject"]
     assert list(params["properties"]) == [
-        "root", "workspace_root", "subject", "base", "head", "surface", "goal", "scope", "author_questions",
+        "root", "workspace_root", "subject", "base", "head", "surface", "answer", "goal", "scope", "author_questions",
         "reviewers", "reason", "coupling_only", "reviewer_effort", "review_rebuttal", "treat_as_body"]
     props = params["properties"]
     assert props["root"]["enum"] == ["active_workspace", "system_repo"] and props["root"]["default"] == "active_workspace"
-    assert props["subject"]["enum"] == ["index", "worktree", "base..head", "system"]
-    assert props["surface"]["enum"] == ["change", "preflight", "system"] and props["surface"]["default"] == "change"
+    assert props["subject"]["enum"] == ["index", "worktree", "base..head", "system", "result"]
+    assert props["surface"]["enum"] == ["change", "preflight", "system", "result"] and props["surface"]["default"] == "change"
+    assert "subject=result only" in props["answer"]["description"]
     assert props["reviewer_effort"]["enum"] == list(EFFORT_SCALE)
     assert (props["treat_as_body"]["type"], props["treat_as_body"]["default"]) == ("boolean", False)
     # The schema states the predicate's rule (review_body_fact.body_fact): the flag raises
@@ -344,7 +345,7 @@ def test_the_system_index_is_the_gate_path_on_one_frozen_subject(h: Harness, tmp
     assert result["aggregate"] == rl.VERDICT_PASS and result["record_id"] == call.record_id
     assert result["checklist"] == {"layer": "body", "body_fact": "true", "how": "dir", "treat_as_body": False}
     assert record["surface"] == "change" and record["brief"]["checklist"]["rules_source"]["sha"] == "body-rules"
-    assert result["panel"]["composition"] == "full_pool" and result["panel"]["chosen_by"] == "owner"
+    assert result["panel"]["composition"] == "full_pool" and result["panel"]["chosen_by"] == "ouroboros"
 
 
 def test_a_foreign_base_head_is_core_untested_and_locks_nothing(h: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -395,7 +396,7 @@ def test_treat_as_body_raises_only_an_unknown_root_to_the_body_layer(
     # owner's panel outside Cyber Pro, enforcement binding; ``how`` keeps the fact's value.
     local = _repo(tmp_path / "work" / "local", "local")
     _stage(local, "b.py", "b = 2\n")
-    raised = h.run(subject="index", workspace_root=str(local), treat_as_body=True, reviewers=[pool[0]])
+    raised = h.run(subject="index", workspace_root=str(local), treat_as_body=True, reviewers=[pool[0]], reason="own-body check")
     call = h.wave.calls[-1]
     assert call.subject.spec.layer == "body" and (call.triad, call.coupling) == (pool, [])
     assert raised["checklist"] == {"layer": "body", "body_fact": "true", "how": "unknown", "treat_as_body": True}
@@ -431,21 +432,29 @@ def test_one_named_seat_is_the_whole_panel_of_a_foreign_root(h: Harness) -> None
     [call] = h.wave.calls
     assert (call.triad, call.coupling) == ([pool[1]], [])
     assert [row["seat_id"] for row in result["rows"]] == [pool[1]]
-    assert (result["panel"]["composition"], result["panel"]["chosen_by"]) == ("composed", "author")
+    assert (result["panel"]["composition"], result["panel"]["chosen_by"]) == ("composed", "ouroboros")
     assert (result["panel"]["reason"], result["panel"]["reason_missing"]) == ("one cheap check", False)
     # A retrieving seat alone is asked both parts: the one seat IS the wave's quorum.
     assert result["rows"][0]["parts"] == ["change", "coupling"] and result["per_question"]["coupling"] == rl.VERDICT_PASS
     assert result["aggregate"] == rl.VERDICT_PASS and result["quorum"]["required"] == 1
 
 
-def test_a_narrowed_panel_without_a_reason_is_recorded_not_refused(h: Harness) -> None:
+@pytest.mark.parametrize("body", [False, True])
+def test_advisory_reason_refusal_applies_only_to_own_code(h: Harness, body: bool) -> None:
     pool = _pool()
-    _stage(h.project, "a.py", "a = 1\n")
-    narrowed = h.run(subject="index", reviewers=[pool[0]])
-    assert narrowed["panel"]["reason_missing"] is True and len(h.wave.calls) == 1
+    root = "system_repo" if body else "active_workspace"
+    repo = h.system if body else h.project
+    _stage(repo, "a.py", "a = 1\n")
+    if body:
+        with pytest.raises(rc.ReviewChangeArgumentError, match="REVIEW_PANEL_REASON_REQUIRED"):
+            h.run(root=root, subject="index", reviewers=[pool[0]])
+        assert not h.wave.calls
+    else:
+        narrowed = h.run(root=root, subject="index", reviewers=[pool[0]])
+        assert narrowed["panel"]["assigned"] == [pool[0]] and narrowed["panel"]["reason_missing"]
 
-    _stage(h.project, "b.py", "b = 2\n")
-    everyone = h.run(subject="index", reviewers=pool)
+    _stage(repo, "b.py", "b = 2\n")
+    everyone = h.run(root=root, subject="index", reviewers=pool)
     assert everyone["panel"]["composition"] == "composed" and everyone["panel"]["reason_missing"] is False
 
 
@@ -461,10 +470,12 @@ def test_no_list_seats_every_configured_seat(h: Harness) -> None:
     assert result["panel"]["composition"] == "full_pool" and result["panel"]["reason_missing"] is False
 
 
-def test_a_body_subset_outside_cyber_pro_is_ignored_and_recorded(h: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_body_subset_is_widened_only_under_blocking_and_recorded(h: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
     pool = _pool()
     _stage(h.system, "body.py", "x = 1\n")
+    monkeypatch.setattr(rc, "get_review_enforcement", lambda: "blocking")
     ignored = h.run(root="system_repo", subject="index", reviewers=[pool[0]])
+    assert ignored["panel"]["widened_from"] == [pool[0]]
     assert (h.wave.calls[-1].triad, h.wave.calls[-1].coupling) == (pool, [])
     assert (ignored["panel"]["composition"], ignored["panel"]["reviewers_subset_ignored"]) == ("full_pool", True)
 
@@ -476,7 +487,7 @@ def test_a_body_subset_outside_cyber_pro_is_ignored_and_recorded(h: Harness, mon
     _stage(h.system, "extra.py", "e = 3\n")
     added = h.run(root="system_repo", subject="index", reviewers=["scout"])
     assert (h.wave.calls[-1].triad, h.wave.calls[-1].coupling) == (pool, ["scout"])
-    assert added["panel"]["additional"] == ["scout"] and added["panel"]["reviewers_subset_ignored"] is False
+    assert added["panel"]["additional"] == ["scout"] and added["panel"]["reviewers_subset_ignored"] is True
     assert {row["seat_id"]: row["additional"] for row in added["rows"]} == {**{seat: False for seat in pool}, "scout": True}
 
     monkeypatch.setattr(rc, "get_runtime_mode", lambda: "cyber_pro")
@@ -531,7 +542,8 @@ def test_an_added_critic_is_any_enabled_catalog_row_and_a_switched_off_row_is_re
     assert _pool() == pool, "unmarked rows do not change the pool"
 
     _stage(h.system, "body.py", "x = 1\n")
-    below = h.run(root="system_repo", subject="index", reviewers=["session-critic"], coupling_only=["scout"])
+    monkeypatch.setattr(rc, "get_review_enforcement", lambda: "blocking")
+    below = h.run(root="system_repo", subject="index", reviewers=["session-critic"], coupling_only=["scout"], reason="session checks coupling")
     call = h.wave.calls[-1]
     assert (call.triad, call.coupling) == (pool, ["session-critic", "scout"])
     assert rl.PART_CHANGE in call.parts["session-critic"] and call.parts["scout"] == (rl.PART_COUPLING,)
@@ -793,3 +805,29 @@ def test_the_dispatcher_binds_the_root_and_answers_with_the_record(h: Harness, m
     assert {project["record_id"], system["record_id"]} == set(h.written)
     refused = registry.execute("review_change", {"subject": "base..head", "base": "HEAD"})
     assert "TOOL_ARG_ERROR" in refused and len(h.wave.calls) == 2
+
+
+def test_a_seat_whose_custody_is_lost_never_keeps_a_wave_open():
+    """Two-sided: a seat still in flight keeps the wave pending; a seat whose custody is lost ("outcome
+    unknown, never re-sent") cannot change, so it never makes a record wait for a re-issue."""
+    from ouroboros.tools.review_change import _open_seats, _seats_open
+
+    lost = {"slot_id": "t2", "operation_state": "custody_lost", "late_result_pending": True}
+    running = {"slot_id": "t3", "operation_state": "in_flight", "late_result_pending": True}
+    done = {"slot_id": "t1", "operation_state": "settled", "late_result_pending": False}
+    assert _open_seats({"triad_raw": [done, lost], "custody_lost": True}) == []
+    assert not _seats_open({"triad_raw": [done, lost], "custody_lost": True})
+    assert _open_seats({"triad_raw": [done, lost, running]}) == ["t3"]
+    assert _seats_open({"triad_raw": [done, running]})
+
+
+def test_a_review_change_records_lost_seat_is_not_reached_while_a_gate_record_awaits_it():
+    """Both directions of the record's own facts: a review_change wave (lost_seat_terminal) settles over a lost seat
+    and names it not reached with its cause; the commit gate's reading keeps the same seat open and unlisted."""
+    from ouroboros import review_ledger as ledger
+
+    lost = {"slot_id": "t2", "seat_id": "t2", "status": "error", "operation_state": "custody_lost",
+            "late_result_pending": True}
+    assert ledger.counted_pending([lost], lost_is_terminal=True) is False
+    assert ledger.panel_not_reached([lost], lost_is_terminal=True) == [{"seat_id": "t2", "cause": "custody_lost"}]
+    assert ledger.counted_pending([lost]) is True and ledger.panel_not_reached([lost]) == []

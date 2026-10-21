@@ -185,7 +185,6 @@ def test_pause_revalidates_physical_authority_inside_the_logical_launch_lock(
 @pytest.mark.parametrize("actor", ["retry", "retry_chain"])
 def test_physical_retry_resume_survives_fence_publication_contention(
         host, monkeypatch, clock, reaper, actor):  # noqa: F811
-    from ouroboros import acceptance_late
     from ouroboros.store import StoreBusy
 
     running = _running_actor(host, monkeypatch, clock, reaper, actor)
@@ -195,13 +194,8 @@ def test_physical_retry_resume_survives_fence_publication_contention(
     _park(host, running, plan)
     assert queue.resume_budget_paused_task(running["id"])["ok"]
     [again] = _assign(host, monkeypatch)
-    prepare = acceptance_late.resume_paused_acceptance_preparations
     release, finish = owner_pause.release_fence, owner_pause._finish_resume_publication
-    calls, publications, failures = [], [], []
-
-    def prepared(*args):
-        calls.append(prepare(*args))
-        return calls[-1]
+    publications, failures = [], []
 
     def contended(*args, **kwargs):
         publications.append(True)
@@ -219,12 +213,11 @@ def test_physical_retry_resume_survives_fence_publication_contention(
             failures.append(str(exc))
             raise
 
-    monkeypatch.setattr(acceptance_late, "resume_paused_acceptance_preparations", prepared)
     monkeypatch.setattr(owner_pause, "release_fence", contended)
     monkeypatch.setattr(owner_pause, "_finish_resume_publication", observed_finish)
     seen = _loop_once(host, monkeypatch, again, plan=plan)
     assert not failures, failures
-    assert seen["kind"] == "pause" and calls == [0] and len(publications) == 2
+    assert seen["kind"] == "pause" and len(publications) == 2
     assert owner_pause.read_fence(host.root, "held")["state"] == "released"
     assert budget_pause.budget_pause_row(host.root, running["id"])["grant"]["consumed_at"]
     with owner_pause.launch_admission(seen["ctx"]):

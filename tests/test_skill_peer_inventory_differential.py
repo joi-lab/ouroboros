@@ -107,6 +107,12 @@ def differential_root(tmp_path):
            _manifest("display-unreadable", conflicts=("loose_pkg",)))
     save_enabled(drive, "unreadable_payload", True)
 
+    # A launcher seed for another platform: discovery hides it, so it is no peer.
+    _write(skills / "native" / "elsewhere_seed",
+           _manifest("elsewhere", conflicts=("in_clawhub",), extra="os: [plan9]\n"))
+    (skills / "native" / "elsewhere_seed" / ".seed-origin").write_text("seeded_from=skills\n", encoding="utf-8")
+    save_enabled(drive, "elsewhere_seed", True)
+
     # Identity collision: the same sanitised basename in two canonical roots.
     _write(skills / "clawhub" / "twin_pkg", _manifest("twin-one", conflicts=("loose_pkg",)))
     _write(checkout / "twin_pkg", _manifest("twin-two"))
@@ -146,6 +152,7 @@ def test_peer_projection_matches_full_discovery_over_every_shape(differential_ro
             assert by_name["unreadable_payload"].conflicts == ("loose_pkg",)
         assert {peer.name for peer in peers if peer.identity_collision} == {"twin_pkg"}
         assert "missing_manifest" not in {peer.name for peer in peers}
+        assert "elsewhere_seed" not in {peer.name for peer in peers}
 
         # Every subject's conflict verdict must be identical under either peer list.
         for subject in full:

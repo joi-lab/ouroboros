@@ -279,8 +279,10 @@ def _compose_subagent_text(
             # schedule time, when the executor is unknown — it states WHERE
             # changes land, never that the child executes them natively itself
             # (the dispatch-time executor note owns execution framing).
-            "All changes land inside the write root only. Do NOT commit, run review / "
+            "All changes land inside the write root only. Do NOT commit, run review gates / "
             "runtime / skills lifecycle, enable tools, or write identity or scratchpad. "
+            "You may optionally ask independent reviewers about work in your write root with "
+            "review_change; it never approves, commits or integrates that work. "
             + _CHILD_MEMORY_SENTENCE + " Your "
             "Git changes are recorded as a workspace.patch; ordinary-folder outputs use their "
             "registered file artifacts. Isolated self_worktree changes are applied; shared "

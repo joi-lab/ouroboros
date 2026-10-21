@@ -125,9 +125,11 @@ def test_shell_catalog_schema_bytes_and_handler_owners_are_stable():
     # start_service with keep_alive=true is the path that outlives the task. Rolled again
     # (whole review, 2026-10-13): that task-end promise names its limit, local POSIX runs
     # only (Windows has no census; a Docker backend's children live in its container),
-    # paid for inside the same description.
+    # paid for inside the same description. Rolled for #1797 (owner decisions 18 Oct): both
+    # outputs descriptions say a refused declaration stops the call before it starts and that
+    # only outputs accept a relative '../', judged by resolved location.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "57e457cc5c8689b9fe1bbda510db45cc6e2721d135b32a2f7b3cedc2304d085a"
+        "eeda91b2c89b3e51045360fc9029105101a215813a8828bda17fd5d54c4a1c74"
     )
     original = json.loads(schema_bytes)
     for schema in original:

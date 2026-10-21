@@ -108,18 +108,3 @@ def test_deadline_pacing_aliases_are_gone_from_the_contract_shape():
     assert gone["improvement_policy"] == "fixed"
     assert "stall_rounds_threshold" not in gone
     assert "stall_rounds_threshold" not in normalize_budget_profile(None)
-
-
-def test_deadline_no_longer_lifts_the_improvement_count_axis(monkeypatch):
-    """Deadlines do not change an explicit author cap. The paid panel limit
-    no longer derives a separate author count, and has_deadline stays retired."""
-    import inspect
-
-    from ouroboros.task_pacing import effective_max_improvement_passes
-
-    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "2")
-    profile = {"improvement_policy": "fixed", "max_improvement_passes": None}
-    assert effective_max_improvement_passes(profile) is None
-    assert effective_max_improvement_passes({**profile, "max_improvement_passes": 1}) == 1
-    params = inspect.signature(effective_max_improvement_passes).parameters
-    assert "has_deadline" not in params

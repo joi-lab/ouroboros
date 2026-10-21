@@ -13,7 +13,6 @@ import contextvars
 import json
 import os
 from dataclasses import dataclass, replace as dataclass_replace
-from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Mapping, Optional
 
 from ouroboros.configured_subagents import (
@@ -192,9 +191,15 @@ _REVIEW_RULES = {
 
 
 _REVIEW_SURFACES = {
-    "commit_gate": "every pool row outside Cyber Pro; composed from the pool in Cyber Pro (reason recorded)",
-    "plan_review": "ask='council' = every pool row; ask=[ids] = those rows",
-    "task_acceptance": {"root": "every pool row", "child": "≤1 from the pool; with several, name one as reviewer"},
+    "commit_gate": {"blocking": "every ticked reviewer; a subset is widened and recorded",
+                    "advisory": "choose ticked reviewers; narrowing requires a reason; omitted means the whole pool; outcome returns before Git for an author disposition",
+                    "cyber_pro": "compose or skip, recording the departure; never holds"},
+    "review_change": "own code follows commit composition; other repositories compose freely in every mode, record a missing reason and never bind",
+    "skill_review": {"blocking": "whole pool", "advisory": "choose ticked reviewers, with a reason when narrowed; omitted and owner-started mean whole pool; review-each blockers keep the skill off until clean review or owner Skip",
+                     "cyber_pro": "panel, self-check or no review; the skill may run"},
+    "plan_review": "opening is optional; first own-code ask: Blocking adds missing ticked reviewers, Advisory requires a ticked reviewer and a reason when narrowed, Cyber Pro is free; later asks name rows; only a counted participant's objection holds, only under Blocking",
+    "advisers": "enabled unticked rows may be named in every mode: heard, not counted, never holding",
+    "result": "review_change(subject=result): named ticked rows in every mode, a narrowed panel records a missing reason; omitted means the whole pool",
     "preflight": "one enabled catalog row you name: commit_reviewed(preflight_reviewer=…); none → recorded as not performed",
     "system_review": "/review: one enabled catalog row, default Main",
 }
@@ -204,30 +209,24 @@ SESSION_SEAT_COST_HINT = "uses a session seat and time"
 COST_UNKNOWN_HINT = "cost unknown"
 
 
-def review_call_cost_text(usd: Optional[float], *, reading: bool) -> str:
-    """An api row's price in words: one full call (``review_helpers.review_row_call_usd``).
-    Settings → Agents prints the same words (``subagents_settings.js`` ``reviewCostText``),
-    the dollars rounded as JavaScript's ``toFixed`` does."""
-    if usd is None:
-        return COST_UNKNOWN_HINT
-    if not usd:
-        return "no API cost per review"
-    places = Decimal("0.0001") if usd < 0.01 else Decimal("0.01")
-    text = f"≈${Decimal(usd).quantize(places, rounding=ROUND_HALF_UP)} per full call (route tariff)"
-    return text + ("; a reading reviewer makes several" if reading else "")
+LOCAL_ROUTE_COST_HINT = "no API cost per review"
 
 
 def _api_review_cost_hint(slot: Any) -> str:
-    """One api seat's price (:func:`review_call_cost_text`), from the tariff and the window
-    already held in this process — context assembly never waits on a provider catalog. A
-    model call through a subscription uses a seat, as Settings → Agents says."""
-    from ouroboros.provider_models import provider_for_model
-    from ouroboros.tools.review_helpers import review_row_call_usd
+    """One api seat's price: what one review by its row actually cost (``review_price``, read from
+    this process's table, so context assembly never waits on the ledger). A model call through a
+    subscription uses a seat and a local route costs no API money, as Settings → Agents says."""
+    from ouroboros.config import resolve_data_dir
+    from ouroboros.provider_models import provider_for_model, review_model_uses_local
+    from ouroboros.review_price import review_price, review_price_text
 
-    if provider_for_model(str(getattr(slot, "model", "") or "")) == "claudexor":
+    model = str(getattr(slot, "model", "") or "")
+    if provider_for_model(model) == "claudexor":
         return SESSION_SEAT_COST_HINT
-    return review_call_cost_text(review_row_call_usd(slot, allow_live_fetch=False),
-                                 reading=bool(getattr(slot, "native_retrieval", False)))
+    if review_model_uses_local(model):
+        return LOCAL_ROUTE_COST_HINT
+    row_id = str(getattr(slot, "subagent_id", "") or getattr(slot, "slot_id", "") or "")
+    return review_price_text(review_price(resolve_data_dir(), row_id, model))
 
 
 # The wizard's summary prints the same sentence (``subagents_settings.js`` ``PACKET_ONLY_POOL_WARNING``).
@@ -301,9 +300,8 @@ def review_facts_block(snapshot: Optional[TaskSettingsSnapshot] = None) -> str:
     marked as reviewers, read through the same builder every review surface runs (``review_pool_slots``), never
     live settings or the last execution; ``None`` reads the bound task scope. Each seat is named by its catalog
     handle (the same handle ``## Available subagents`` shows and ``review_change(reviewers=[…])`` accepts); its
-    ``seat_id`` is the stored row id the records carry. Above four seats the rows shrink to ``{seat_id, model}``
-    and ``omitted`` counts them; ``coupling_unanswerable: true`` (:func:`coupling_unanswerable`) is a block fact,
-    so the shrink keeps it. ``source`` is ``structured`` (a non-empty pool), ``empty`` (a readable catalog
+    ``seat_id`` is the stored row id the records carry. Every row retains delivery, measured recent cost
+    and its last-review status; these facts never rank seats or change routing. ``source`` is ``structured`` (a non-empty pool), ``empty`` (a readable catalog
     with no marked row — a loud, configured fact whose one seat is the Main model reviewing alone,
     ``main_self_review: true``) or ``error`` (a malformed catalog or a refused migration). A seat without a
     catalog row (the Main seat) is named by its ``seat_id``. Stable for the task (cache-marked prefix); the
@@ -323,6 +321,7 @@ def review_facts_block(snapshot: Optional[TaskSettingsSnapshot] = None) -> str:
         pool: list[dict[str, Any]] = []
         slots: list[Any] = []
         without_credentials: list[str] = []
+        recent = rs.reviewer_slot_last_executions()
         if source != "error":
             try:
                 raw = settings.get(SUBAGENTS_SETTING)
@@ -333,12 +332,16 @@ def review_facts_block(snapshot: Optional[TaskSettingsSnapshot] = None) -> str:
                 source, error, slots = "error", str(exc), []
             for slot in slots:
                 session = slot.route is ReviewRouteKind.AGENT_SESSION
+                last = recent.get(slot.slot_id) or {}
                 pool.append({
                     "seat_id": slot.slot_id,
                     "subagent_id": handles.get(slot.subagent_id, slot.subagent_id) or slot.slot_id,
                     "model": slot.model, "effort": slot.effort,
                     "delivery": "session" if session else ("native" if slot.native_retrieval else "packet"),
                     "cost_hint": SESSION_SEAT_COST_HINT if session else _api_review_cost_hint(slot),
+                    **rs.review_cost_facts(last.get("cost_usd"), route=str(slot.route.value), model=slot.model),
+                    "last_review": {key: last[key] for key in ("ts", "status", "failure_code", "cost_kind", "cost_usd") if key in last}
+                                   if last else "unknown",
                 })
                 # A session seat logs in itself; an api seat answers only with its provider's key.
                 if not session and not model_has_credentials_in_settings(slot.model, dict(settings)):
@@ -352,8 +355,6 @@ def review_facts_block(snapshot: Optional[TaskSettingsSnapshot] = None) -> str:
         enforcement, mode = get_review_enforcement(), get_runtime_mode()
         blocks = review_enforcement_blocks(enforcement)
     seats = len(pool)
-    if seats > 4:
-        pool = [{"seat_id": row["seat_id"], "model": row["model"]} for row in pool]
     facts: dict[str, Any] = {
         "source": source, "error": error,
         "enforcement": enforcement, "enforcement_blocks": blocks, "mode": mode,
@@ -371,7 +372,7 @@ def review_facts_block(snapshot: Optional[TaskSettingsSnapshot] = None) -> str:
         **({"pool_without_credentials": without_credentials} if without_credentials else {}),
         **({"no_pool_row_has_credentials": True} if without_credentials and len(without_credentials) == seats else {}),
         "surfaces": _REVIEW_SURFACES,
-        "omitted": {"rows": seats if seats > 4 else 0},
+        "omitted": {"rows": 0},
         "full_source": {"pool": "GET /api/review-pool", "records": "## Review records"},
     }
     if migration.get("snapshot"):

@@ -1,10 +1,13 @@
 // Producer census: loop_model_call/round_limits/nudges/budget, task_pacing,
 // transcript_prefix, loop_forced_finalization, owner_pause and agent budget-pause events.
 export const CHECKPOINT_LABELS = {
-    context_fit_low_retry: 'Context rebuilt in Low mode',
+    context_fit_low_retry: 'Books shown as chapter navigation after a size refusal',
     context_fit_route_rebound: 'Context fit rebound the route',
     context_fit_physical_mode: 'Context starts in a smaller mode (window too small)',
     context_view: 'Context inspected',
+    context_reclaim_emergency: 'Context shrunk after a size refusal (no model)',
+    context_memory_coarsened: 'Memory shown coarser after a size refusal',
+    context_view_renewed: 'Working view renewed: same task, fresh window',
     context_reclaim_manual: 'Context reclaimed on request',
     context_reclaim_automatic: 'Context reclaimed automatically',
     prompt_prefix_break: 'Prompt prefix rebuilt',
@@ -68,6 +71,10 @@ export function taskCheckpointLabel(evt = {}) {
     if (Object.hasOwn(WAIT_LABELS, kind)) return WAIT_LABELS[kind][evt.phase === 'ended' ? 1 : 0];
     if (!kind && Number(evt.checkpoint_number) > 0) {
         return `Checkpoint ${evt.checkpoint_number} — periodic self-check`;
+    }
+    const folded = Number(evt.reclaimed_tokens);
+    if (kind === 'context_view' && evt.status === 'applied' && folded > 0) {
+        return `Ouroboros folded its context (−${folded.toLocaleString('en-US')} tokens)`;
     }
     return budgetCrossingLabel(kind, evt) || (Object.hasOwn(CHECKPOINT_LABELS, kind) ? CHECKPOINT_LABELS[kind]
         : kind ? `Checkpoint · ${kind}` : 'Task checkpoint');

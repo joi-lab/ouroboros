@@ -864,8 +864,8 @@ def test_a_collection_while_a_released_slot_runs_keeps_the_settled_roster(tmp_pa
     slots are still running re-registers the released wave. The outcomes already recorded
     for that wave must survive the re-registration: otherwise the roster shrinks to the
     still-pending slots and the settled wave the last settlement hands the plan ask's hook
-    under-counts. One frame is still written for the ask, once every roster slot has an
-    outcome."""
+    under-counts. Each reply now carries its partial snapshot; one frame is still written
+    for the ask once every counted roster slot has an outcome."""
     import threading
     import time
     from types import SimpleNamespace
@@ -930,7 +930,10 @@ def test_a_collection_while_a_released_slot_runs_keeps_the_settled_roster(tmp_pa
     frames = _mailbox_entries(tmp_path, request.task_id)
     assert len(frames) == 1, [frame["text"] for frame in frames]
     assert frames[0]["text"].startswith("Plan ask a1: every participant settled — 3 answered")
-    assert settled_waves == [({"s1": "ok", "s2": "ok", "s3": "ok"}, 3)]
+    assert all(set(wave) == {"s1", "s2", "s3"} and size == 3 for wave, size in settled_waves)
+    assert sorted(sum(status == "ok" for status in wave.values()) for wave, _ in settled_waves) == [1, 2, 3]
+    assert [(wave, size) for wave, size in settled_waves if all(wave.values())] == [
+        ({"s1": "ok", "s2": "ok", "s3": "ok"}, 3)]
     assert not custody._RELEASED_WAVES
 
 

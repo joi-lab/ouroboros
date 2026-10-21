@@ -537,13 +537,13 @@ function initializeMermaid(api) {
         theme: 'base',
         themeVariables: {
             fontFamily: diagramToken('--diagram-font', 'Inter, system-ui, sans-serif'),
-            background: diagramToken('--diagram-bg', '#151318'),
-            primaryColor: diagramToken('--diagram-primary', '#25222c'),
-            primaryTextColor: diagramToken('--diagram-primary-text', '#f4eef7'),
-            primaryBorderColor: diagramToken('--diagram-border', '#6f6678'),
-            lineColor: diagramToken('--diagram-line', '#9b90a6'),
-            secondaryColor: diagramToken('--diagram-secondary', '#302b39'),
-            tertiaryColor: diagramToken('--diagram-tertiary', '#19171d'),
+            background: diagramToken('--diagram-bg', '#131415'),
+            primaryColor: diagramToken('--diagram-primary', '#212223'),
+            primaryTextColor: diagramToken('--diagram-primary-text', '#efeff2'),
+            primaryBorderColor: diagramToken('--diagram-border', '#717171'),
+            lineColor: diagramToken('--diagram-line', '#989898'),
+            secondaryColor: diagramToken('--diagram-secondary', '#28292a'),
+            tertiaryColor: diagramToken('--diagram-tertiary', '#151617'),
         },
     });
     mermaidInitialized = theme;

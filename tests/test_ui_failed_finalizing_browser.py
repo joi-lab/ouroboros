@@ -18,6 +18,7 @@ import pytest
 from devtools.benchmarks.common.server_runner import _api
 from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID
 from ouroboros.memory import Memory
+from tests._shared import producer_evidence_dir
 from tests.test_owner_wait_integration import wait_clone as clone_fixture
 from tests.system_e2e.harness import (
     ArtifactOracle, KeylessIsolatedServer, ModelGate, ScriptedStubModel, body_text,
@@ -41,8 +42,10 @@ STATE_JS = """tid => {
     const chip = card.querySelector('[data-live-phase]');
     const second = card.querySelector('[data-live-phase-secondary]');
     const style = el => el ? getComputedStyle(el) : null;
+    const mark = chip.querySelector(':scope > .status-mark');
     return {count: cards.length, finished: card.dataset.finished, phase: chip.dataset.phase,
             chip: chip.textContent, chipHidden: chip.hidden, label: chip.getAttribute('aria-label'),
+            mark: mark ? `${mark.dataset.shape}/${mark.dataset.hue}` : '', tone: chip.dataset.chipTone,
             secondary: second.textContent, secondaryHidden: second.hidden,
             title: card.querySelector('[data-live-title]')?.textContent || '',
             theme: document.documentElement.dataset.theme || '',
@@ -149,6 +152,8 @@ def _holding(page, task_id, stage):
     # Outcome owns the chip; the running finalization is only the secondary fact.
     assert state["count"] == 1 and state["finished"] == "0", (stage, state)
     assert state["chip"] == "Failed" and not state["chipHidden"], (stage, state)
+    # The outcome keeps its failed dot in its red body; the running finalization moves nothing beside it.
+    assert (state["mark"], state["tone"]) == ("dot/failed", "failed"), (stage, state)
     assert state["label"] == "Task status: Failed, Finalizing…", (stage, state)
     # The name stays the task's own; the outcome is never smuggled into it.
     assert state["title"] == TITLE, (stage, state)
@@ -170,10 +175,8 @@ def test_failed_root_reads_failed_then_finalizing(wait_clone, tmp_path, monkeypa
     monkeypatch.setattr(KeylessIsolatedServer, "_env", lambda server: {
         **original_env(server), "HOME": str(fake_home), "USERPROFILE": str(fake_home),
         "XDG_CONFIG_HOME": str(fake_home / ".config")})
-    # Evidence stays inside the test's own temp root; an explicit out-dir is opt-in
-    # only and must itself be a temp-root path, so the test never writes elsewhere.
-    shots = tmp_path / "screenshots"
-    shots.mkdir(parents=True, exist_ok=True)
+    # Only diagnostics leave the managed scratch; the fake HOME and server inputs do not.
+    shots = producer_evidence_dir(tmp_path / "screenshots", "failed-finalizing")
     # A scratchpad past its compression threshold: the root's late phase buys that one call.
     for index in range(4):
         Memory(root).append_scratchpad_block(f"{MARKER} working note {index}: " + "w" * 9_000, source=f"fixture-{index}")

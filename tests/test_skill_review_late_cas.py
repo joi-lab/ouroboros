@@ -116,6 +116,29 @@ def test_current_contract_change_does_not_replace_a_recoverable_api_wave(late_sk
     assert len(h.calls) == 2
 
 
+@pytest.mark.parametrize("pool_change", ["disabled_reviewer", "malformed_pool"])
+def test_pool_changes_cannot_rewrite_or_revoke_the_paid_panel(late_skill, monkeypatch, pool_change):
+    from ouroboros.reviewer_slot_config import reviewer_slot_config_error
+    from tests.review_pool_rosters import pool_roster, pool_seat, set_review_pool
+    h = late_skill
+    set_review_pool(monkeypatch, pool_roster(pool_seat("seat-a", "fake/one"), pool_seat("seat-b", "fake/two")))
+    _handle_review_skill(h.ctx(), skill="late", reviewers=["seat-a"])
+    old = json.loads(h.history.read_bytes().splitlines()[-1])
+    h.release.set()
+    assert h.settled.wait(10)
+    if pool_change == "malformed_pool":
+        monkeypatch.setenv("OUROBOROS_SUBAGENTS", "{broken")
+        monkeypatch.setattr(skill_review, "reviewer_slot_config_error", reviewer_slot_config_error)
+    else:
+        set_review_pool(monkeypatch, pool_roster(pool_seat("seat-a", "fake/one", enabled=False), pool_seat("seat-b", "fake/two")))
+    second = _handle_review_skill(h.ctx(), skill="late", reviewers=["seat-a"])
+    new = json.loads(h.history.read_bytes().splitlines()[-1])
+    assert load_review_state(h.root, "late").status == "clean", second
+    assert new["review_resume_of"] == old["wave_id"] and len(h.calls) == 2
+    assert new["panel"]["pool"] == old["panel"]["pool"]
+    assert new["panel"]["assigned"] == old["panel"]["assigned"] == ["seat-a", "seat-b"]
+
+
 @pytest.mark.parametrize("defect", ["missing", "partial", "tampered", "operation"])
 def test_incomplete_skill_cas_never_authorizes_pass_or_another_send(late_skill, defect):
     from ouroboros.observability import call_manifest_path
@@ -205,7 +228,7 @@ def test_timeout_history_is_immutable_and_current_lifecycle_keeps_postconditions
     h.release.set()
     assert h.settled.wait(10)
     assert h.history.read_bytes() == original
-    monkeypatch.setattr(runner, "_reconcile_deps_after_pass_review",
+    monkeypatch.setattr("ouroboros.skill_dependencies.ensure_skill_dependencies",
                         lambda *a, **kw: postconditions.append("deps") or ("not_required", ""))
     _handle_review_skill(h.ctx(), skill="late")
     assert load_review_state(h.root, "late").status == "clean"

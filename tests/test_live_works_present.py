@@ -121,3 +121,39 @@ def test_new_head_discloses_prepared_and_uncertain_intents_without_replaying(tmp
         stored = load_task_result(tmp_path, event["task_id"])
         assert not stored.get("execution_owner") and not stored.get("admitted_dispatch")
         assert stored["promotion_intent"] == event
+
+
+def test_roster_keeps_available_facts_when_project_store_is_busy(tmp_path, monkeypatch):
+    from ouroboros import projects_registry
+    from ouroboros.peer_roster import independent_roots
+    from ouroboros.store import StoreBusy
+
+    project, focus = _fixture(tmp_path)
+    def busy(*_args, **_kwargs):
+        raise StoreBusy("dialogue busy")
+    monkeypatch.setattr(projects_registry, "get_project", busy)
+    roster = independent_roots(tmp_path)
+    assert roster["incomplete"] is True
+    moved = next(row for row in roster["roots"] if row["task_id"] == "moved")
+    assert moved["unavailable"] == {"project": "StoreBusy"}
+    assert moved["project_id"] == project["id"] and moved["focus"] == focus
+    assert moved["open_questions"][0]["quiz_id"] == "q1"
+    present = live_works_present(tmp_path)
+    assert present["incomplete"] is True
+    assert next(row for row in present["works"] if row["task_id"] == "moved")["unavailable"] == moved["unavailable"]
+
+
+def test_roster_discloses_both_unreadable_task_and_project_enrichment(tmp_path, monkeypatch):
+    from ouroboros import projects_registry, task_results
+    from ouroboros.peer_roster import independent_roots
+    from ouroboros.store import StoreBusy
+
+    _fixture(tmp_path)
+    def busy(*_args, **_kwargs):
+        raise StoreBusy("busy")
+    monkeypatch.setattr(projects_registry, "project_binding_for_task", busy)
+    monkeypatch.setattr(task_results, "load_task_result", busy)
+    roster = independent_roots(tmp_path)
+    assert roster["incomplete"] is True
+    assert all(row["unavailable"] == {"task_result": "StoreBusy", "project": "StoreBusy"}
+               for row in roster["roots"])

@@ -16,7 +16,7 @@ import pytest
 
 from ouroboros import context_fit as cf
 from ouroboros.review_history_view import REVIEW_HISTORY_MESSAGE_KEY, REVIEW_CONTEXT_INDEX_KEY, capture_review_history_messages
-from tests.test_review_history_view import fixture, source
+from tests.test_review_history_view import fixture, same_decisions, source
 
 
 def authority(*, operative=True):
@@ -65,10 +65,16 @@ def test_capture_splits_before_serialization_with_exact_operatives_and_attachmen
     assert original == saved
     assert resident["plan_review_authority"]["dispute_history"]["representation"] == "resident_review_index"
     history = index(messages)
+    dispute = original["plan_review_authority"]["dispute_history"]
     assert history["operative_subject"] == original["plan_review_authority"]["operative_subject"]
-    assert history["decision_rows"] == original["plan_review_authority"]["dispute_history"]["decision_rows"]
-    assert history["gaps"] == original["plan_review_authority"]["dispute_history"]["gaps"]
-    assert history["rounds"][0]["evidence"] == original["plan_review_authority"]["dispute_history"]["rounds"][0]["evidence"]
+    assert same_decisions(history, dispute) and history["gaps"] == dispute["gaps"]
+    # The attachment stays whole; the wave's manifest, receipts and unknown fields are behind its one address.
+    (attachment,) = history["attachments"]
+    assert attachment["item"] == dispute["rounds"][0]["evidence"]["attached"][0] and attachment["wave"] == 1
+    wave = history["addresses"][attachment["source"]]
+    assert wave["source_ref"] == dispute["rounds"][0]["source"]["source_ref"] and "rounds" not in history
+    assert wave["read"] == {"tool": "read_file", "arguments": {"root": "artifact_store", "path": wave["source_ref"]["path"]}}
+    assert "unknown_future_field" not in json.dumps(history) and "seat" in wave["what"]
     fields = {m[REVIEW_HISTORY_MESSAGE_KEY]["binding"]["field"] for m in bodies(messages)}
     assert fields == {"findings", "dispositions", "spec", "plan_prose", "reviewer_outputs[0].text"}
     assert all(m["role"] == "user" and m[REVIEW_HISTORY_MESSAGE_KEY]["task_id"] == "task" for m in bodies(messages))
@@ -89,7 +95,9 @@ def test_captured_current_author_subject_is_used_instead_of_guessing_latest_wave
     # No exact current reference: retain every old spec/prose rather than pick by cycle.
     original["plan_review_authority"]["current_wave"]["wave_artifact"] = source("unknown", {})
     resident, messages = capture_review_history_messages(original, task_id="task")
-    assert "spec" in index(messages)["rounds"][0]
+    wave = original["plan_review_authority"]["dispute_history"]["rounds"][0]
+    assert index(messages).get("operative_subject") is None
+    assert index(messages)["subjects"] == [{"wave": 1, "source": "a1", "spec": wave["spec"], "plan_prose": wave["plan_prose"]}]
     assert not any(m[REVIEW_HISTORY_MESSAGE_KEY]["binding"]["field"] in {"spec", "plan_prose"} for m in bodies(messages))
 
 

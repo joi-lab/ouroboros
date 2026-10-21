@@ -189,7 +189,6 @@ def test_bootstrap_repo_reports_a_failed_dependency_install(tmp_path, monkeypatc
         save_settings=lambda s: None, log=_log_stub(sink),
     )
     monkeypatch.setattr(bootstrap_module, "ensure_managed_repo", lambda c: "updated")
-    monkeypatch.setattr(bootstrap_module, "bootstrap_native_skills", lambda c: None)
     monkeypatch.setattr(bootstrap_module, "install_deps", lambda c: False)
     assert bootstrap_module.bootstrap_repo(context) is False
     # WARNING, not ERROR, for the same reason as `install_deps` itself: bootstrap

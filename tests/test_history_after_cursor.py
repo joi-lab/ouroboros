@@ -11,6 +11,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+from ouroboros import dialogue_import, dialogue_store as ds
 from ouroboros.gateway import history_paging
 from ouroboros.gateway.history import make_chat_history_endpoint
 
@@ -18,10 +19,8 @@ TS = "2026-10-16T10:00:{:02d}Z"
 
 
 def _append(root, name, rows):
-    path = root / "logs" / f"{name}.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write("".join(json.dumps(row) + "\n" for row in rows))
+    for row in rows:
+        ds.append(root, name, row)
 
 
 def _say(root, *texts, start=0):
@@ -58,18 +57,20 @@ def test_the_newest_page_names_the_start_of_new_arrivals_and_a_delta_returns_onl
     assert "after_cursor" not in _read(tmp_path, page["page_cursor"])[1]
 
 
-def test_new_arrivals_are_found_across_a_rotation(tmp_path):
-    _say(tmp_path, "before rotation")
+def test_new_arrivals_an_older_body_appended_are_found_after_the_next_cutover(tmp_path):
+    """Rows a store-unaware body wrote to ``logs/chat.jsonl`` (a downgrade ran) join the store at
+    the next boot's cutover, at their chain place: the window's delta finds them like any arrival."""
+    _say(tmp_path, "before the downgrade")
     _, page = _read(tmp_path)
     live = tmp_path / "logs" / "chat.jsonl"
-    archive = tmp_path / "archive"
-    archive.mkdir()
-    _say(tmp_path, "written before the rotation", start=1)
-    live.rename(archive / "chat_20261016T100001.jsonl")
-    _say(tmp_path, "after rotation", start=2)
+    live.parent.mkdir(parents=True, exist_ok=True)
+    with live.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"ts": TS.format(1), "direction": "in", "chat_id": 1, "text": "written by the older body"}) + "\n")
+    dialogue_import.cutover(tmp_path)
+    _say(tmp_path, "after the upgrade", start=2)
     status, delta = _read(tmp_path, page["after_cursor"])
     assert status == 200
-    assert [row["text"] for row in delta["messages"]] == ["written before the rotation", "after rotation"]
+    assert [row["text"] for row in delta["messages"]] == ["written by the older body", "after the upgrade"]
 
 
 def test_a_changed_room_view_or_a_long_absence_takes_the_newest_page_again(tmp_path, monkeypatch):

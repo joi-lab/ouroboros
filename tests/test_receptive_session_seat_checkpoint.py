@@ -21,7 +21,7 @@ from ouroboros.review_state import load_state
 from tests._review_session_route_shared import FakeGateway, _owned_gateway_uses_each_test_transport  # noqa: F401
 from tests._review_session_route_shared import _terminal_detail, fake_route as _fake_route
 from tests.review_pool_rosters import pool_roster, pool_seat, set_review_pool
-from tests.test_receptive_commit_review import TASK, _git, _notices, _parent, _read_mail, until
+from tests.test_receptive_commit_review import TASK, _git, _join, _notices, _parent, _produce, _read_mail, until
 from tests.test_receptive_commit_review import author as _author
 
 author, fake_route = _author, _fake_route
@@ -70,7 +70,7 @@ def session_wave(author, fake_route, monkeypatch):
 
     def held(*args, **kwargs):
         a.preparing.set()
-        assert a.release.wait(20), "the delegated seat was never released"
+        assert a.release.wait(60), "the delegated seat was never released"
         return real(*args, **kwargs)
     monkeypatch.setattr(delegate_custody, "record_start_requested", held)
     _git(a.repo, "add", "change.py")
@@ -85,9 +85,7 @@ def _review_change(a, outcome):
         with _parent(a):
             outcome["result"] = _handle_review_change(a.ctx, root="system_repo", subject="index",
                                                       goal="Raise the value.", scope="change.py only")
-    thread = threading.Thread(target=run)
-    thread.start()
-    return thread
+    return _produce(a, run)
 
 
 def _session_row(a):
@@ -111,21 +109,21 @@ def test_a_delegated_seat_left_before_its_launch_still_checkpoints_and_answers(s
     the mail the wave settles with that answer, as before."""
     a, outcome = session_wave, {}
     thread = _review_change(a, outcome)
-    assert a.reviewer.sent["m1"].wait(15) and a.preparing.wait(15)
+    assert a.reviewer.sent["m1"].wait(60) and a.preparing.wait(60)
     if left_on_mail:
         write_owner_message(a.data, "Is the review done?", TASK)
-        thread.join(15)
+        _join(thread)
         assert outcome["result"].startswith("An addressed message reached you while the reviewers ran"), outcome
         assert _session_row(a)["operation_state"] == "pending_dispatch"  # left before its first launch
     a.release.set()
     a.reviewer.release()
     if left_on_mail:
-        until(lambda: _notices(a, "change"), timeout=30)
+        until(lambda: _notices(a, "change"), timeout=60)
         _read_mail(a)
         outcome = {}
-        _review_change(a, outcome).join(30)  # the same unchanged call collects the settled wave
+        _join(_review_change(a, outcome))  # the same unchanged call collects the settled wave
     else:
-        thread.join(30)
+        _join(thread)
     collected = _payload(outcome["result"])
     assert collected["state"] == "settled", outcome["result"]
     assert len(_posts()) == 1, "the delegated seat started exactly once and was never sent again"

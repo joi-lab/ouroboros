@@ -1,21 +1,39 @@
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { bindScrollFade } from './scroll_fade.js';
+import { SHELL_ICONS } from './page_icons.js';
+import { pageLabel } from './pages.js';
+import { statusMarkHtml } from './status_mark.js';
+import { currentLayout, onLayoutChange } from './layout.js';
 
 function classAttr(parts) {
     return parts.filter(Boolean).join(' ');
 }
 
-export function renderMobileNavToggle() {
+// The shell's ☰: one of the shell's icon controls (style.css .shell-icon-control), shown in the stack layout. A
+// page's header carries it in its leading slot, where the drawer's × then sits; a room (Main, a Project) carries it
+// as the composer row's first control instead, under the thumb (owner 19.10, 1A), as tall as the capsules beside it
+// with the touch minimum as its finger target (tests/test_shell_drawer_static.py). Its status dot says what waits
+// behind it, in the drawer the ☰ opens (app.js paints it and the name's words).
+export function renderMobileNavToggle({ inComposer = false } = {}) {
+    const classes = inComposer ? 'shell-icon-control mobile-nav-toggle composer-menu ui-hit-area' : 'shell-icon-control mobile-nav-toggle';
     return `
-        <button class="mobile-nav-toggle" type="button" data-mobile-nav-toggle aria-label="Open navigation" aria-controls="primary-sidebar" aria-expanded="false">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h16"/></svg>
-        </button>
+        <button class="${classes}" type="button" data-mobile-nav-toggle aria-label="Open navigation" aria-controls="primary-sidebar" aria-expanded="false">${SHELL_ICONS.menu}${statusMarkHtml()}</button>
     `;
 }
 
+/**
+ * The one header of every page AND the Project panel (docs/DESIGN.md "Shell", plan P5): one row, one height,
+ * one title style, one close control. `☰ · title · status … actions · ×`: the leading slot holds ☰ (the stack
+ * layout shows it), the title row takes the room's status after the title (room_work.js), the toolbar and the
+ * trailing slot end the row. A page has no caption line: the sidebar's row and its tabs name it. A tab strip is
+ * its own strip under the row, so the row stays one row. `named` says the sidebar's chosen row already names this place: on a desk such a header shows no
+ * title (the h2 stays for readers) and, with no actions, no bar at all; a Project keeps its name. No icon anywhere:
+ * the place is named by words, never a glyph (owner 5A).
+ */
 export function renderPageHeader({
+    page = '',   // a registry id: the title is its label unless `title` says otherwise
     title,
-    icon = '',
-    description = '',
+    titleId = '',
     leadingHtml,
     toolbarHtml = '',
     trailingHtml = '',
@@ -25,15 +43,13 @@ export function renderPageHeader({
     className = '',
     toolbarClass = '',
     showMobileNav = true,
+    named = true,
 } = {}) {
     const variantClass = variant ? `app-page-header-${escapeHtml(variant)}` : '';
-    const iconHtml = icon ? `<span class="app-page-icon" aria-hidden="true">${icon}</span>` : '';
+    const words = title ?? pageLabel(page);
     const leading = leadingHtml !== undefined
         ? leadingHtml
         : (showMobileNav ? renderMobileNavToggle() : '');
-    const descriptionHtml = description
-        ? `<p class="app-page-description">${escapeHtml(description)}</p>`
-        : '';
     const toolbar = (toolbarHtml || actionsHtml)
         ? `<div class="${classAttr(['app-page-toolbar', 'app-page-actions', escapeHtml(toolbarClass)])}">${toolbarHtml || actionsHtml}</div>`
         : '';
@@ -43,21 +59,64 @@ export function renderPageHeader({
     const tabs = tabsHtml
         ? `<div class="app-page-tabs">${tabsHtml}</div>`
         : '';
+    const facts = [
+        named ? ' data-sidebar-names' : '',
+        named && !toolbar && !trailing ? ' data-empty' : '',
+    ].join('');
+    const id = titleId ? ` id="${escapeHtml(titleId)}"` : '';
     return `
-        <div class="${classAttr(['page-header', 'app-page-header', variantClass, className])}">
+        <div class="${classAttr(['page-header', 'app-page-header', variantClass, className])}"${facts}>
             <div class="app-page-leading">${leading}</div>
             <div class="app-page-title-block">
                 <div class="app-page-title-row">
-                    ${iconHtml}
-                    <h2 class="app-page-title">${escapeHtml(title)}</h2>
+                    <h2 class="app-page-title"${id}>${escapeHtml(words)}</h2>
                 </div>
-                ${descriptionHtml}
             </div>
             ${toolbar}
             ${trailing}
-            ${tabs}
         </div>
+        ${tabs}
     `;
+}
+
+/** A bar narrower than this (px) cannot hold Restart, Panic, More and the budget on one row with the status. */
+export const HEADER_FULL_ROW_MIN_WIDTH = 640;
+
+/**
+ * Main's header controls by the room the bar has (owner Q4=A): a bar wide enough keeps Restart in the row and the
+ * budget after the actions; the stack layout, and a docked content column narrower than
+ * HEADER_FULL_ROW_MIN_WIDTH, move the same two nodes into the ⋯ menu (the budget first, Restart last), so the bar
+ * stays one row and each control keeps its one handler and its one id. The bar's width is measured (a
+ * ResizeObserver), never a viewport breakpoint. Returns the disposer.
+ */
+export function bindHeaderControlPlacement({ headerActions, budgetPill = null, bar = headerActions?.closest?.('.app-page-header') } = {}) {
+    const restart = headerActions?.querySelector?.('[data-chat-command="restart"]');
+    const panic = headerActions?.querySelector?.('[data-chat-command="panic"]');
+    const menu = headerActions?.querySelector?.('.chat-header-menu');
+    const toolbar = budgetPill?.parentElement || null;
+    if (!restart || !menu) return () => {};
+    let placed = '';
+    const compact = (layout) => layout === 'stack'
+        || (Number(bar?.clientWidth) > 0 && bar.clientWidth < HEADER_FULL_ROW_MIN_WIDTH);
+    // Called with the layout name by the layout switch, with entries by the observer, with nothing at bind.
+    const place = (arg) => {
+        const next = compact(typeof arg === 'string' ? arg : currentLayout()) ? 'menu' : 'row';
+        if (next === placed) return;
+        placed = next;
+        if (next === 'menu') {
+            if (budgetPill) menu.prepend(budgetPill);
+            menu.append(restart);
+        } else {
+            headerActions.insertBefore(restart, panic);
+            if (budgetPill && toolbar) toolbar.insertBefore(budgetPill, headerActions.nextSibling);
+        }
+    };
+    place();
+    const offLayout = onLayoutChange(place);
+    const Observer = bar?.ownerDocument?.defaultView?.ResizeObserver;
+    const observer = Observer && bar ? new Observer(place) : null;
+    observer?.observe(bar);
+    return () => { offLayout(); observer?.disconnect(); };
 }
 
 // SSOT for a segmented single-select control (the settings effort/mode toggles):
@@ -146,6 +205,7 @@ export function renderTabStrip({
 export function bindTabStrip(strip, { dataAttr, activeClass = 'active', onChange } = {}) {
     if (!dataAttr) throw new Error('bindTabStrip requires dataAttr');
     let disposed = false;
+    const disposeFade = bindScrollFade(strip, { axis: 'x' });
     const tabs = () => Array.from(strip.querySelectorAll(`[role="tab"][${dataAttr}]`))
         .filter((tab) => tab.closest('[role="tablist"]') === strip);
     const enabled = (tab) => !tab.disabled && tab.getAttribute('aria-disabled') !== 'true'
@@ -157,8 +217,11 @@ export function bindTabStrip(strip, { dataAttr, activeClass = 'active', onChange
         if (!tab) return;
         const bounds = strip.getBoundingClientRect();
         const rect = tab.getBoundingClientRect();
-        const left = bounds.left + strip.clientLeft;
-        const right = left + strip.clientWidth;
+        const style = strip.ownerDocument.defaultView.getComputedStyle(strip);
+        const inset = parseFloat(style.scrollPaddingInlineStart) || 0;
+        const endInset = parseFloat(style.scrollPaddingInlineEnd) || 0;
+        const left = bounds.left + strip.clientLeft + inset;
+        const right = bounds.left + strip.clientLeft + strip.clientWidth - endInset;
         // Scroll only this strip. scrollIntoView can also move the page or its
         // scroll panel when restoring an inactive page's saved selection.
         if (rect.left < left) strip.scrollLeft += rect.left - left;
@@ -221,6 +284,7 @@ export function bindTabStrip(strip, { dataAttr, activeClass = 'active', onChange
         select,
         destroy() {
             disposed = true;
+            disposeFade();
             strip.removeEventListener('click', onClick);
             strip.removeEventListener('keydown', onKey);
             observer?.disconnect();

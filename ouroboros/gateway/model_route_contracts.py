@@ -26,6 +26,8 @@ class WebSearchLeg(TypedDict):
     backend: str
     model: str  # the wire model; empty for ddgs
     model_source: Literal["selection", "provider_default"]
+    # Only on an ``unavailable`` leg: the locally known cause, never a provider probe.
+    unavailable_reason: NotRequired[Literal["no_credentials", "package_missing", "legacy_openai_base_url"]]
 
 
 class WebSearchRoute(TypedDict):
@@ -35,7 +37,7 @@ class WebSearchRoute(TypedDict):
     source: str  # auto, or one strict source
     model: str  # the selection as saved or drafted; empty means provider defaults
     legs: List[WebSearchLeg]  # eligible, in order
-    unavailable: List[WebSearchLeg]  # credential or package missing
+    unavailable: List[WebSearchLeg]  # each names its unavailable_reason
     note: str
     error: NotRequired[str]  # the selection has no built-in transport
     ignored_legacy_model: NotRequired[str]  # a saved bare model the Anthropic source does not apply

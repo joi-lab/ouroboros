@@ -48,18 +48,10 @@ def _options(account):
     return {"source_id": "test-source", "credential_profile_id": account, "account_fingerprint": f"identity-{account}"}
 
 
-def test_same_model_slots_keep_their_actual_distinct_capacity_and_acceptance_cap(accounts):
-    from ouroboros.review_dispatch import acceptance_slot_fit
-    from ouroboros.review_evidence_sections import acceptance_packet_budget_chars
-
+def test_same_model_slots_keep_their_actual_distinct_capacity(accounts):
     slots = _slots()
     caps = per_slot_input_token_limits([MODEL, MODEL], slots=slots, output_reserve=16_000, tokenizer_margin=50_000)
     assert caps == {"review-a": 159_000, "review-b": 734_000}
-    packet = acceptance_packet_budget_chars(slots)
-    assert packet.slot_input_caps == caps
-    executor = SimpleNamespace(prompt_chars=lambda: 100_000)
-    assert acceptance_slot_fit(slots[0], executor, slot_input_caps=caps)[0] == 159_000
-    assert acceptance_slot_fit(slots[1], executor, slot_input_caps=caps)[0] == 734_000
     assert {account for _source, account in accounts["calls"]} == {"account-a", "account-b"}
 
 
@@ -103,14 +95,6 @@ def test_triad_fit_uses_the_already_frozen_rows(tmp_path, accounts, monkeypatch)
     assert prompt == "tiny prompt" and not refused
     assert captured[0]["review-a"] < captured[0]["review-b"]
     assert {account for _source, account in accounts["calls"]} == {"account-a", "account-b"}
-
-
-def test_bound_cap_map_with_missing_slot_is_never_an_unlimited_dispatch():
-    from ouroboros.review_dispatch import acceptance_slot_fit
-
-    with pytest.raises(ValueError, match="frozen reviewer slot"):
-        acceptance_slot_fit(_slots()[0], SimpleNamespace(prompt_chars=lambda: 100_000),
-                            slot_input_caps={"different-slot": 800_000})
 
 
 @pytest.mark.parametrize("mode", ["pin", "auto"])

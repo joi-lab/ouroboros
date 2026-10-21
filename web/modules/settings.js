@@ -63,7 +63,7 @@ const VALUE_FIELDS = [
     // Effort is not a Settings draft: the range is edited in the chat composer alone, and Settings has no effort section.
     ['s-consciousness-autonomy', 'OUROBOROS_CONSCIOUSNESS_AUTONOMY', 'act'],
     ['s-review-enforcement', 'OUROBOROS_REVIEW_ENFORCEMENT', 'advisory'], ['s-task-review-mode', 'OUROBOROS_TASK_REVIEW_MODE', 'auto'], ['s-runtime-mode', 'OUROBOROS_RUNTIME_MODE', 'advanced'],
-    // Shared paid-review-cycle cap (plan review / task acceptance / commit gate);
+    // Shared paid-review-cycle cap (result review / commit gate / skill review; plan asks stand outside it);
     // the ∞ segment saves the string "unlimited" (SSOT: ouroboros/review_cycles.py).
     ['s-review-max-cycles', 'OUROBOROS_REVIEW_MAX_CYCLES', '2'],
     ['s-update-channel', 'OUROBOROS_UPDATE_CHANNEL', 'stable'],
@@ -196,9 +196,14 @@ function customSecretRow(key = '', value = '') {
         row.querySelector(`label[for="${id}"]`).textContent = `Value for ${event.target.value.trim() || `custom key ${ordinal}`}`;
     });
     row.querySelector('[data-custom-secret-remove]')?.addEventListener('click', () => {
+        // The caret moves to the key now in this place, else to Add (DESIGN "List editors").
+        const shown = [...row.parentElement.querySelectorAll('[data-custom-secret-row]:not([hidden])')];
+        const next = shown[shown.indexOf(row) + 1] || shown[shown.indexOf(row) - 1];
         resetSecretReveals(row);
         if (row.dataset.originalKey) { row.dataset.removeCustomSecret = '1'; row.hidden = true; }
         else row.remove();
+        if (next) revealNewRow(next, next.querySelector('[data-custom-secret-key]'));
+        else document.getElementById('btn-add-custom-secret')?.focus();
         markSettingsDirty();
     });
     return row;
@@ -1199,7 +1204,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             // The help text already says skills, MCP and browser tools stay independent.
             const legacy = data.ignored_legacy_model ? ` Anthropic does not apply the saved model ${data.ignored_legacy_model}; edit Source or Model to change it.`
                 : data.unapplied_model ? ` No built-in search serves the saved model ${data.unapplied_model}; Auto uses provider defaults.` : '';
-            target.textContent = data.error || `Eligible routes: ${(data.legs || []).map((leg) => `${leg.source}${leg.model ? ` · ${leg.model}` : ''}`).join(' → ') || 'none'}. Uses saved account credentials.${legacy}`;
+            const causes = { no_credentials: 'no API key', package_missing: 'package not installed', legacy_openai_base_url: 'OPENAI_BASE_URL is set' };
+            const unavailable = (data.unavailable || []).map((leg) => `${leg.source} (${causes[leg.unavailable_reason] || 'not ready'})`).join(', ');
+            target.textContent = data.error || `Eligible routes: ${(data.legs || []).map((leg) => `${leg.source}${leg.model ? ` · ${leg.model}` : ''}`).join(' → ') || 'none'}.${unavailable ? ` Unavailable: ${unavailable}.` : ''} Uses saved account credentials.${legacy}`;
         } catch (_) { if (sequence === searchPreviewSequence && target.isConnected) target.textContent = 'Search routes could not be checked. Your choices are kept.'; }
     }
     const onSearchSelectionEdited = () => { searchSelectionEdited = true; void refreshSearchPreview(); };

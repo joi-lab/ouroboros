@@ -11,6 +11,9 @@ from urllib.parse import urlparse
 
 import pytest
 
+from tests._shared import producer_evidence_dir
+from tests._work_projection_shared import with_work_fields
+
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 WEB = Path(__file__).resolve().parents[1] / "web"
 BOOT = """<script type="module">
@@ -94,7 +97,8 @@ def project_chat(request):
 
     def respond(route):
         path = urlparse(route.request.url).path
-        data = history if path == "/api/chat/history" else state if path == "/api/state" else {}
+        # The census rows and, as the server sends them, their work projection.
+        data = history if path == "/api/chat/history" else with_work_fields(state) if path == "/api/state" else {}
         if path == "/api/projects/from-task":
             payload = route.request.post_data_json
             requests.append(payload)
@@ -123,7 +127,7 @@ def project_chat(request):
                 page.goto(f"http://127.0.0.1:{server.server_port}/")
                 if chat_id == 1:
                     page.wait_for_function("() => window.chat && document.querySelector('#chat-messages .chat-bubble')")
-                    page.evaluate("s=>chat.hydrateStateSnapshot(s)", state)
+                    page.evaluate("s=>chat.hydrateStateSnapshot(s)", with_work_fields(state))
                 yield {"page": page, "expect": playwright.expect, "rows": rows, "state": state, "conversions": conversions,
                        "details": details, "requests": requests, "continues": continues, "history": history,
                        "engine": engine, "theme": theme, "width": width}
@@ -137,9 +141,9 @@ def project_chat(request):
 
 
 def _evidence_dir(tmp_path):
-    path = Path(os.environ.get("OUROBOROS_BROWSER_EVIDENCE_OUT") or tmp_path)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    # An exported destination stays exactly where the operator put it; otherwise the shared
+    # channel keeps the shell screenshots and the geometry/keyboard JSON past scratch release.
+    return producer_evidence_dir(tmp_path, "project-work-card", env="OUROBOROS_BROWSER_EVIDENCE_OUT")
 
 
 def _evidence(tmp_path, chat, name):
@@ -159,16 +163,18 @@ def test_project_rows_bind_the_works_own_cards_never_an_entry(project_chat, tmp_
         expect(footer).to_have_attribute("aria-label", f"Open project {name}")
         assert card.evaluate("c => c.lastElementChild.classList.contains('chat-live-bound-pointer')"), "the footer closes the card"
     assert page.locator('.project-handoff, [data-system-type="project_started"], [data-system-type="project_handoff"]').count() == 0
-    # The room's present: chip, the latest line, tool calls and time; [Reply] [Stop…] while it runs.
+    # The room's present: chip, the latest line, tool calls and time; [Stop…] while it runs (Reply is the row menu's).
     expect(creation.locator('.chat-live-phase').first).to_have_text("Working")
     expect(creation.locator('[data-live-activity]')).to_contain_text("Comparing the reviewer verdicts")
     expect(creation.locator('[data-live-meta]')).to_contain_text("41 tool calls")
-    expect(creation.locator('.chat-live-actions > button')).to_have_text(["Reply", "Stop…"])
-    # A paused work: Resume is the one primary, beside Reply and Stop….
-    expect(transfer.locator('.chat-live-actions > button')).to_have_text(["Reply", "Resume", "Stop…"])
+    expect(creation.locator('.chat-live-actions > button')).to_have_text(["Stop…"])
+    assert creation.locator('[data-card-reply], .chat-live-actions > button', has_text="Reply").count() == 0
+    # A paused work: Resume is the one primary, beside Stop….
+    expect(transfer.locator('.chat-live-actions > button')).to_have_text(["Resume", "Stop…"])
     assert transfer.locator('.chat-live-actions > .btn-primary').all_text_contents() == ["Resume"]
     # The summary is reading content in a portal: no disclosure, no stop.
     assert creation.locator(':scope > [data-live-summary-button]').evaluate("e=>['role','tabindex','aria-expanded'].map(n=>e.getAttribute(n))") == [None, None, None]
+    expect(creation.locator('[data-live-disclosure]')).to_be_hidden()
     geometry = creation.evaluate("""card => { const c = card.getBoundingClientRect();
         const box = (sel) => { const r = card.querySelector(sel).getBoundingClientRect(); return {l: r.left - c.left, r: c.right - r.right, h: r.height}; };
         return {overflow: card.scrollWidth > card.clientWidth + 1, footer: box(':scope > .chat-live-bound-pointer'),
@@ -193,7 +199,7 @@ def test_turn_into_project_keeps_the_card_as_its_portal(project_chat):
     state = project_chat["state"]
     state["active_chat_activities"].append({"activity_id": "local", "chat_id": 1, "kind": "direct_chat", "phase": "working",
                                             "cancelable": True})
-    page.evaluate("s=>chat.hydrateStateSnapshot(s)", state)
+    page.evaluate("s=>chat.hydrateStateSnapshot(s)", with_work_fields(state))
     expect(card.locator('[data-turn-into-project]')).to_have_count(1)
     node = card.element_handle()
     project_chat["conversions"]["local"] = {"project": {"id": "gamma", "name": "Project Gamma", "chat_id": 9},
@@ -265,14 +271,25 @@ def test_a_reply_sends_only_the_quoted_rows_address(project_chat, tmp_path):
     expect(strip).to_have_count(0)
     echo = page.locator(f'.chat-bubble.user[data-client-message-id="{frame["client_message_id"]}"]')
     expect(echo.locator('.chat-quote .chat-quote-author')).to_have_text("Ouroboros")
-    # The work card's own Reply quotes the work by its task address.
-    _card(page, "creation").locator('[data-card-reply]').click()
+    # A work card's Reply is its row menu's (owner 17.10, Q9 B); it quotes the work by its task address.
+    _card(page, "creation").locator('[data-live-title]').click(button="right")
+    page.locator('.chat-row-menu [data-row-action="reply"]').click()
     page.fill('#chat-input', "Stop after the third run")
     page.locator('#chat-send').click()
     assert page.evaluate("() => sentFrames.at(-1).reply_to") == "task:creation"
 
 
 SUCCESSOR = "creation-cnext"
+WORK = "Review runner › integration"  # the work's first name: the ended episode's own
+# DESIGN "Work portal": each episode has its own name, time and past outcome on one meta line (task_episodes.js
+# renderEpisodes, #1979). Whether that line names the work is the owner's open call (#1999): this is the one place.
+EPISODES_NAME_THEIR_WORK = True
+
+
+def _episode(number, span, outcome="", name=""):
+    """An episode's meta line as the rule above writes it; an episode the fixture never named has no name part."""
+    return " · ".join(part for part in (f"Episode {number}", name if EPISODES_NAME_THEIR_WORK else "", span, outcome)
+                      if part)
 
 
 def _interrupted(**extra):
@@ -323,14 +340,14 @@ def test_main_portal_follows_a_continue_made_in_the_project_room(project_chat, j
             continuation_offer={"eligible": True, "cause": "model_provider_failed"})
         state = project_chat["state"]
         state["active_chat_activities"] = [row for row in state["active_chat_activities"] if row["activity_id"] != "creation"]
-        page.evaluate("s => chat.hydrateStateSnapshot(s)", state)
+        page.evaluate("s => chat.hydrateStateSnapshot(s)", with_work_fields(state))
         expect(creation.locator('.chat-live-phase').first).to_have_text("Failed", timeout=15000)
         expect(creation.locator('[data-continue-task]')).to_have_text("Continue")
     state = _room_continue(project_chat)
     if journey == "reload":
         page.reload()
         page.wait_for_function("() => window.chat && document.querySelector('#chat-messages .chat-bubble')")
-    page.evaluate("s => chat.hydrateStateSnapshot(s)", state)
+    page.evaluate("s => chat.hydrateStateSnapshot(s)", with_work_fields(state))
     card = _card(page, SUCCESSOR)
     expect(card).to_be_visible(timeout=15000)
     expect(_card(page, "creation")).to_be_hidden()
@@ -340,14 +357,14 @@ def test_main_portal_follows_a_continue_made_in_the_project_room(project_chat, j
     expect(card.locator('.chat-live-phase').first).to_have_text("Working")
     expect(card.locator('[data-live-activity]')).to_have_text("Continuing the audit")
     expect(card.locator('[data-live-meta]')).to_contain_text("3 tool calls")
-    expect(card.locator('.chat-live-actions > button')).to_have_text(["Reply", "Stop…"])
+    expect(card.locator('.chat-live-actions > button')).to_have_text(["Stop…"])
     footer = card.locator(':scope > .chat-live-bound-pointer')
     expect(footer).to_have_attribute("aria-label", "Open project Project Alpha")
     assert card.evaluate("c => c.lastElementChild.classList.contains('chat-live-bound-pointer')"), "the footer closes the card"
     episodes = card.locator('.chat-live-episode')
     expect(episodes).to_have_count(2)
-    expect(episodes.nth(0)).to_contain_text("Episode 1 · 13:57–14:09 · Failed")
-    expect(episodes.nth(1)).to_have_text("Episode 2 · since 14:00")
+    expect(episodes.nth(0)).to_contain_text(_episode(1, "13:57–14:09", "Failed", name=WORK))
+    expect(episodes.nth(1)).to_have_text(_episode(2, "since 14:00"))
     expect(episodes.nth(1)).to_have_attribute("data-current", "1")
     assert page.locator('#chat-messages [data-continue-task]:visible').count() == 0, "no Continued stands as its action"
     assert page.locator('.project-handoff, [data-system-type="project_started"], [data-system-type="project_handoff"]').count() == 0
@@ -380,14 +397,14 @@ def test_room_card_follows_a_continue_pressed_in_the_room(project_chat, chat_id,
     page.reload()
     creation = _card(page, "creation")
     expect(creation).to_be_visible(timeout=15000)
-    page.evaluate("s => chat.hydrateStateSnapshot(s)", state)
+    page.evaluate("s => chat.hydrateStateSnapshot(s)", with_work_fields(state))
     # The work fails in its room: the room reads its record and offers Continue on the same card.
     project_chat["details"]["creation"] = _interrupted(continuation_offer={"eligible": True, "cause": "model_provider_failed"})
     page.evaluate("""() => emit('chat', {chat_id: 7, role: 'system', system_type: 'task_summary', task_id: 'creation',
         status: 'failed', reason_code: 'model_provider_failed', outcome_axes: {lifecycle: {status: 'failed'}},
         content: 'The model provider failed.', ts: '2026-10-08T14:09:00Z'})""")
     state["active_chat_activities"] = [row for row in state["active_chat_activities"] if row["activity_id"] != "creation"]
-    page.evaluate("s => chat.hydrateStateSnapshot(s)", state)
+    page.evaluate("s => chat.hydrateStateSnapshot(s)", with_work_fields(state))
     expect(creation.locator('.chat-live-phase').first).to_have_text("Failed", timeout=15000)
     expect(creation.locator('[data-continue-task]')).to_have_text("Continue")
     # The owner presses Continue in the room; the host admits the successor and its first line reaches the room.
@@ -400,7 +417,7 @@ def test_room_card_follows_a_continue_pressed_in_the_room(project_chat, chat_id,
     state["active_chat_activities"].append({"activity_id": SUCCESSOR, "chat_id": 7, "project_id": "alpha",
                                             "kind": "managed_task", "phase": "working", "started_at": 1791468720,
                                             "cancelable": True})
-    page.evaluate("s => chat.hydrateStateSnapshot(s)", state)
+    page.evaluate("s => chat.hydrateStateSnapshot(s)", with_work_fields(state))
 
     def assert_one_card(label):
         card = _card(page, SUCCESSOR)
@@ -413,11 +430,11 @@ def test_room_card_follows_a_continue_pressed_in_the_room(project_chat, chat_id,
         expect(card.locator('[data-live-title]')).to_have_text("Review runner › integration")
         expect(card.locator('.chat-live-phase').first).to_have_text("Working")
         expect(card.locator('[data-live-activity]')).to_have_text("Continuing the audit")
-        expect(card.locator('.chat-live-actions > button')).to_have_text(["Reply", "Stop…"])
+        expect(card.locator('.chat-live-actions > button')).to_have_text(["Stop…"])
         episodes = card.locator('.chat-live-episode')
         expect(episodes).to_have_count(2)
-        expect(episodes.nth(0)).to_contain_text("Episode 1 · 13:57–14:09 · Failed")
-        expect(episodes.nth(1)).to_have_text("Episode 2 · since 14:12")
+        expect(episodes.nth(0)).to_contain_text(_episode(1, "13:57–14:09", "Failed", name=WORK))
+        expect(episodes.nth(1)).to_have_text(_episode(2, "since 14:12"))
         expect(episodes.nth(1)).to_have_attribute("data-current", "1")
         assert page.locator('#chat-messages [data-continue-task]:visible').count() == 0, "no Continued stands as its action"
         card.screenshot(path=_evidence(tmp_path, project_chat, f"room-continue-{label}"), animations="disabled")
@@ -435,11 +452,11 @@ def test_room_card_follows_a_continue_pressed_in_the_room(project_chat, chat_id,
                                  _room_line(SUCCESSOR, "Continuing the audit", "2026-10-08T14:12:00Z", cancelable=True)])
     page.reload()
     expect(_card(page, SUCCESSOR)).to_be_attached(timeout=15000)
-    page.evaluate("s => chat.hydrateStateSnapshot(s)", state)
+    page.evaluate("s => chat.hydrateStateSnapshot(s)", with_work_fields(state))
     assert_one_card("reload")
 
 
-# The glyph tile as painted: its fill, its ink and both against what lies beneath them.
+# The reference as painted: its one fill, the glyph's own fill (none), and the glyph's and the name's ink against it.
 _MARK_MATERIAL = """buttons => {
     const rgba = value => { const [r, g, b, a = 1] = String(value).match(/[\\d.]+/g).map(Number); return {r, g, b, a}; };
     const over = (top, base) => Object.fromEntries(['r', 'g', 'b'].map(k => [k, top[k] * top.a + base[k] * (1 - top.a)]));
@@ -459,23 +476,26 @@ _MARK_MATERIAL = """buttons => {
     const contrast = (a, b) => (Math.max(lum(a), lum(b)) + 0.05) / (Math.min(lum(a), lum(b)) + 0.05);
     return buttons.map(button => {
         const icon = button.querySelector('.chat-live-project-icon'), name = button.querySelector('.chat-live-project-name');
-        const tile = painted(icon), beneath = painted(icon.parentElement);
+        const fill = painted(button), beneath = painted(button.parentElement);
         return {host: button.classList.contains('chat-live-bound-pointer') ? 'footer'
                 : button.closest('.msg-routing-annotation') ? 'receipt' : 'capsule', ink,
-            fill: rgba(getComputedStyle(icon).backgroundColor).a,
+            tile: rgba(getComputedStyle(icon).backgroundColor).a,
+            fill: rgba(getComputedStyle(button).backgroundColor).a,
             glyph: getComputedStyle(icon).color, name: getComputedStyle(name).color,
-            glyph_on_tile: contrast(rgba(getComputedStyle(icon).color), tile),
-            tile_on_beneath: contrast(tile, beneath),
-            name_on_beneath: contrast(rgba(getComputedStyle(name).color), beneath)};
+            glyph_on_fill: contrast(rgba(getComputedStyle(icon).color), fill),
+            fill_on_beneath: contrast(fill, beneath),
+            name_on_fill: contrast(rgba(getComputedStyle(name).color), fill)};
     });
 }"""
 
 
-def test_project_glyph_is_a_tinted_mark_never_a_solid_tile(project_chat):
-    """DESIGN "Design bible" (principle 3): hue says identity, fill strength importance. The glyph only identifies the
-    Project, so in each theme it is project ink on a tint, readable, and lighter than the name it marks: never a second
-    button in the row. Its hosts after one bubble per request: a moved work's portal footer, the capsule of a mirrored
-    answer and of a System lifecycle row, and the owner's routing receipt line (the retired Project entries are gone)."""
+def test_project_reference_is_one_tinted_fill_with_no_tile_behind_its_glyph(project_chat):
+    """DESIGN "Design bible" (principles 3, 4): hue says identity, fill strength importance, and a control has one
+    fill. The Project reference (owner 17.10, Q2 C: one chip in two forms) is the Project's tint with the glyph, the
+    name and the arrow in project ink on it, readable in each theme; the glyph stands on that fill with no tile of its
+    own (a second fill read as a second button), and the tint stays far quieter than the name. Its hosts after one
+    bubble per request: a moved work's portal footer, the capsule of a mirrored answer and of a System lifecycle row,
+    and the owner's routing receipt line (the retired Project entries are gone)."""
     page, expect = project_chat["page"], project_chat["expect"]
     for answer in ("The review runner reports every reviewer in words.", None):
         row = {"role": "system", "system_type": "project_completion_summary", "chat_id": 1,
@@ -498,10 +518,11 @@ def test_project_glyph_is_a_tinted_mark_never_a_solid_tile(project_chat):
     marks = page.locator('[data-intent="open-project"]').evaluate_all(_MARK_MATERIAL)
     assert sorted(mark["host"] for mark in marks) == ["capsule", "capsule", "footer", "footer", "receipt"]
     for mark in marks:
+        assert mark["tile"] == 0, mark
         assert 0 < mark["fill"] < 1, mark
         assert mark["glyph"] == mark["name"] == mark["ink"], mark
-        assert mark["glyph_on_tile"] >= 3, mark
-        assert mark["tile_on_beneath"] * 2 < mark["name_on_beneath"], mark
+        assert mark["glyph_on_fill"] >= 3, mark
+        assert mark["fill_on_beneath"] * 2 < mark["name_on_fill"], mark
 
 
 @pytest.mark.parametrize("journey", ["live", "reload"])
@@ -524,7 +545,7 @@ def test_main_portal_follows_a_successor_that_already_finished(project_chat, jou
     state = project_chat["state"]
     state["task_bindings"][quick] = binding
     state["active_chat_activities"] = [row for row in state["active_chat_activities"] if row["activity_id"] != "creation"]
-    page.evaluate("s => chat.hydrateStateSnapshot(s)", state)
+    page.evaluate("s => chat.hydrateStateSnapshot(s)", with_work_fields(state))
     # Its final reaches Main as the author's own row; that row stays a row, the card settles from the record.
     page.evaluate("""id => emit('chat', {chat_id: 1, task_id: id, role: 'assistant', content: 'The audit is complete.',
         project_id: 'alpha', project_name: 'Project Alpha', system_type: 'project_completion_summary',
@@ -532,7 +553,7 @@ def test_main_portal_follows_a_successor_that_already_finished(project_chat, jou
     if journey == "reload":
         page.reload()
         page.wait_for_function("() => window.chat && document.querySelector('#chat-messages .chat-bubble')")
-        page.evaluate("s => chat.hydrateStateSnapshot(s)", state)
+        page.evaluate("s => chat.hydrateStateSnapshot(s)", with_work_fields(state))
     card = _card(page, quick)
     expect(card).to_be_visible(timeout=15000)
     expect(_card(page, "creation")).to_be_hidden()
@@ -540,13 +561,13 @@ def test_main_portal_follows_a_successor_that_already_finished(project_chat, jou
     expect(card).to_have_attribute("data-portal", "1")
     expect(card.locator('[data-live-title]')).to_have_text("Review runner › integration")
     expect(card.locator('.chat-live-phase').first).to_have_text("Done")
-    expect(card.locator('.chat-live-actions > button')).to_have_text(["Reply"])
+    expect(card.locator('.chat-live-actions > button')).to_have_count(0)
     footer = card.locator(':scope > .chat-live-bound-pointer')
     expect(footer).to_have_attribute("aria-label", "Open project Project Alpha")
     episodes = card.locator('.chat-live-episode')
     expect(episodes).to_have_count(2)
-    expect(episodes.nth(0)).to_contain_text("Episode 1 · 13:57–14:09 · Failed")
-    expect(episodes.nth(1)).to_have_text("Episode 2 · 14:10–14:12")
+    expect(episodes.nth(0)).to_contain_text(_episode(1, "13:57–14:09", "Failed", name=WORK))
+    expect(episodes.nth(1)).to_have_text(_episode(2, "14:10–14:12"))
     expect(episodes.nth(1)).to_have_attribute("data-current", "1")
     assert page.locator('#chat-messages [data-continue-task]:visible').count() == 0, "no Continued stands as its action"
     card.screenshot(path=_evidence(tmp_path, project_chat, f"finished-successor-{journey}"), animations="disabled")
@@ -563,7 +584,7 @@ def test_an_already_failed_portal_follows_a_later_fast_continue(project_chat, jo
     expect(old).to_be_visible()
     project_chat["details"]["creation"] = _interrupted(continuation_offer={"eligible": True, "cause": "model_provider_failed"})
     state["active_chat_activities"] = [row for row in state["active_chat_activities"] if row["activity_id"] != "creation"]
-    page.evaluate("s => chat.hydrateStateSnapshot(s)", state)
+    page.evaluate("s => chat.hydrateStateSnapshot(s)", with_work_fields(state))
     expect(old.locator('.chat-live-phase').first).to_have_text("Failed", timeout=15000)
     expect(old.locator('[data-continue-task]')).to_have_text("Continue")
     later = "creation-clater"
@@ -580,22 +601,22 @@ def test_an_already_failed_portal_follows_a_later_fast_continue(project_chat, jo
         project_id: 'alpha', project_name: 'Project Alpha', system_type: 'project_completion_summary',
         ts: '2026-10-08T14:12:00Z'})""", later)
     for _ in range(3):
-        page.evaluate("s => chat.hydrateStateSnapshot(s)", state)
+        page.evaluate("s => chat.hydrateStateSnapshot(s)", with_work_fields(state))
     if journey == "reload":
         page.reload()
         page.wait_for_function("() => window.chat && document.querySelector('#chat-messages .chat-bubble')")
-        page.evaluate("s => chat.hydrateStateSnapshot(s)", state)
+        page.evaluate("s => chat.hydrateStateSnapshot(s)", with_work_fields(state))
     card = _card(page, later)
     expect(card).to_be_visible(timeout=15000)
     expect(_card(page, "creation")).to_be_hidden()
     assert _visible_cards(page) == [later, "transfer"], "one card for the work, at its first place"
     expect(card.locator('[data-live-title]')).to_have_text("Review runner › integration")
     expect(card.locator('.chat-live-phase').first).to_have_text("Done")
-    expect(card.locator('.chat-live-actions > button')).to_have_text(["Reply"])
+    expect(card.locator('.chat-live-actions > button')).to_have_count(0)
     expect(card.locator(':scope > .chat-live-bound-pointer')).to_have_attribute("aria-label", "Open project Project Alpha")
     episodes = card.locator('.chat-live-episode')
     expect(episodes).to_have_count(2)
-    expect(episodes.nth(0)).to_contain_text("Episode 1 · 13:57–14:09 · Failed")
-    expect(episodes.nth(1)).to_have_text("Episode 2 · 14:10–14:12")
+    expect(episodes.nth(0)).to_contain_text(_episode(1, "13:57–14:09", "Failed", name=WORK))
+    expect(episodes.nth(1)).to_have_text(_episode(2, "14:10–14:12"))
     assert page.locator('#chat-messages [data-continue-task]:visible').count() == 0, "no Continue stands as its action"
     card.screenshot(path=_evidence(tmp_path, project_chat, f"later-continue-{journey}"), animations="disabled")

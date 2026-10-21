@@ -9,10 +9,58 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import pathlib
 import re
 from contextlib import contextmanager
 from unittest.mock import MagicMock
+
+
+def producer_evidence_dir(fallback, name, *, env=()):
+    """Where one test producer's own diagnostics go: one destination per invocation.
+
+    A destination the operator exported explicitly for this family wins unchanged. Otherwise
+    the shared channel decides: ``diagnostic_directory`` redirects to the launcher's
+    ``OUROBOROS_TEST_EVIDENCE_ROOT`` (scripts/safe_test.py and the native preflight both
+    publish it) and falls back to ``fallback`` for a bare pytest, where nothing vouches for a
+    directory outside the disposable scratch. A variable private to one test used to fall
+    back straight into ``tmp_path``, so a released scratch took its screenshots, DOM and JSON
+    with it while the migrated destinations survived.
+    """
+    from ouroboros.test_evidence import diagnostic_directory
+
+    for key in ((env,) if isinstance(env, str) else tuple(env)):
+        explicit = os.environ.get(key, "").strip()
+        if explicit:
+            path = pathlib.Path(explicit)
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+    return diagnostic_directory(fallback, name)
+
+
+def retire_synthetic_retention(directory, *reasons) -> bool:
+    """Remove the retention marker THIS test manufactured, only when it says exactly ``reasons``.
+
+    A fixture that fakes an unproven hold or an export fault proves no surviving
+    process, yet its marker would keep the whole enclosing run. Any other line may
+    describe a real one, so it keeps the marker. True when no marker remains.
+    """
+    from ouroboros.test_environment import RETENTION_MARKER
+
+    marker = pathlib.Path(directory) / RETENTION_MARKER
+    if marker.is_symlink():
+        return False
+    try:
+        lines = marker.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return True
+    except (OSError, UnicodeError):
+        return False
+    known = {line for reason in reasons for line in reason.rstrip().splitlines()}
+    if not lines or not known.issuperset(lines):
+        return False
+    marker.unlink()
+    return True
 
 
 def reap_test_process_group(proc, *, timeout_sec: float = 5.0) -> None:

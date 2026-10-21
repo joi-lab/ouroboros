@@ -398,7 +398,7 @@ def test_repeated_folder_reviews_leave_only_evidence(tmp_path, monkeypatch):
     assert not (checkouts / "views").exists()
     assert sum(path.stat().st_size for path in checkouts.rglob("*") if path.is_file()) < 1024 * 1024
 
-def test_startup_and_periodic_passes_run_the_prune_and_owe_views_until_done(monkeypatch, tmp_path):
+def test_the_custody_pass_runs_the_prune_and_owes_views_until_done(monkeypatch, tmp_path):
     calls, answers = [], [{"skipped": "views_busy"}, {"views_done": True}, {}]
     monkeypatch.setattr(sm, "DATA_DIR", tmp_path)
     monkeypatch.setattr(sm, "_REVIEW_VIEWS_OWED", [True])
@@ -408,7 +408,6 @@ def test_startup_and_periodic_passes_run_the_prune_and_owe_views_until_done(monk
     for _pass in range(3):
         sm._prune_review_checkouts()
     assert calls == [(tmp_path, {"task-live"}, sm._PROCESS_STARTED)] * 2 + [(tmp_path, {"task-live"}, None)]
-    assert "_prune_review_checkouts()" in inspect.getsource(sm._run_deferred_startup_prunes)
     assert "_prune_review_checkouts(stop_event=stop_event)" in inspect.getsource(sm._run_periodic_custody_sweep)
 
 

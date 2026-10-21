@@ -1,15 +1,18 @@
 // Replies of one chat instance (docs/DESIGN.md "Replies"): the Reply control beside Copy in a bubble's
-// control row, the quote above the replying bubble's text, the strip above the composer while the owner
-// is replying, the jump from a quote to the message it quotes, and the owner's words a relay carries into a
-// work's room (one Ouroboros bubble: his words in a quote panel above the note). A reply is a reference the
-// host resolves: this module sends only the quoted row's address and never decides who reads the words.
+// control row (the registered message actions stand between them, message_actions.js), the quote above the
+// replying bubble's text, the strip above the composer while the owner is replying, the jump from a quote to the
+// message it quotes, and the owner's words a relay carries into a work's room (one Ouroboros bubble: his words in
+// a quote panel above the note). A reply is a reference the host resolves: this module sends only the quoted
+// row's address and never decides who reads the words.
 import { tr } from './i18n.js';
 import { showToast } from './toast.js';
-import { ensureLiveActionsEl } from './chat_activity.js';
+import { isStoreMigrating } from './api_client.js';
 import { authorOf, createRelayQuote, createReplyQuote, normalizeReplyRef, replySnippet } from './chat_reply_quote.js';
 import { fullText } from './text_fit.js';
+import { bindBubbleActions } from './message_actions.js';
+import { revealTimelineNode } from './chat_render_batch.js';
 
-const REPLY_ICON = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor"'
+export const REPLY_ICON = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor"'
     + ' stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
     + '<path d="M6 11.5 2.5 8 6 4.5"></path><path d="M13.5 12v-1A3 3 0 0 0 10.5 8h-8"></path></svg>';
 const TARGET_MS = 1600;
@@ -25,12 +28,32 @@ function rowAbove(node) {
     return row;
 }
 
+/** Why a quote did not land, as `[code, words]` from the answer or the host's typed reason. Answers and a moved
+ * work card (its task names no room) stay so; an unreadable source may stay so too. Only a read that may answer
+ * differently asks to try again. */
+function failureText({ state, task_id: taskId, error }) {
+    if (state === 'absent') return ['absent', 'The quoted message was not found in saved history.'];
+    if (state === 'ambiguous') return ['ambiguous', 'This reference matches more than one saved message.'];
+    if (state === 'unavailable') return ['unavailable', 'The quoted message cannot be shown in an available room.'];
+    if (state === 'moved' && taskId) return ['moved', 'This work is in another room.'];
+    if (isStoreMigrating(error)) return ['migrating', 'Saved history is being upgraded. Try again shortly.'];
+    if (error?.body?.reason_code === 'history_source_unavailable') {
+        return ['source_unavailable', 'Saved history that may hold the quoted message could not be read.'];
+    }
+    return ['unknown', 'Could not load the quoted message. Try again.'];
+}
+
 /**
  * `feed` holds the bubbles (each stamped `data-row-address`), `input` is the composer field (the strip goes before its
  * row), `key` names the sessionStorage slot of a staged reply. `reading()` is the room's reading-position owner,
- * resolved when a quote is pressed; `onDomWrite` is the instance's stable-viewport seam for a clamp's toggle.
+ * resolved when a quote is pressed; `onDomWrite` is the instance's stable-viewport seam for a clamp's toggle and the
+ * control rows' redraws; `actions` is the message-action registry (the page's own when omitted).
+ * `history()` supplies exact-node revelation through this room's pager; `navigate(address, chatId, current)`
+ * lets app switch to the host's destination only while this claim remains current. It returns a state or null
+ * for cancellation. Neither the quote's stored chat label nor its task chooses the destination.
  */
-export function createChatReplies({ chatId, feed, input, key = '', reading, onDomWrite = (write) => write() }) {
+export function createChatReplies({ chatId, feed, input, key = '', reading, history = () => null,
+    navigate = null, present = () => true, onDomWrite = (write) => write(), actions = undefined }) {
     // The strip stands right before the field's row (below the pills); a bare field (a test fixture) takes it itself.
     const textRow = input.closest('.chat-text-row') || input;
     let storage = null;
@@ -39,6 +62,10 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, onDo
     let staged = null;
     let strip = null;
     let targetTimer = 0;
+    const bubbleActions = bindBubbleActions({ feed, registry: actions, onDomWrite });
+    let destroyed = false;
+    // `held`: the reader's own live-edge intent while a reveal is pending (a reveal sets stick false itself).
+    let revealGeneration = 0, revealing = 0, held = null;
 
     const remember = () => {
         if (!storage || !storageKey) return;
@@ -61,20 +88,58 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, onDo
         targetTimer = setTimeout(() => target.classList.remove('is-quote-target'), TARGET_MS);
     }
 
-    /** Scrolls to the quoted message when this room has it loaded; says so when it does not. */
-    function jump(ref) {
-        const target = rowOf(ref.address);
-        if (!target) {
-            showToast(tr('chat.reply.not_loaded', 'That message is not loaded here'), 'info');
-            return false;
-        }
+    /** One claim covers the loaded fastpath, bounded read and app-owned room switch. Never sends a message.
+     * A reveal that moved nothing (an answer, a failed read, a room it could not open) gives a reader who followed
+     * the live edge that edge back, with what arrived meanwhile, while the claim is still theirs: a gesture, a
+     * newer reveal or leaving the room decided instead. A landing or a page drawn around it (`left`) keeps its view. */
+    async function reveal(address, isCurrent = () => true, prepared = null) {
         const position = reading();
-        position.cancel();
-        feed.scrollTop += target.getBoundingClientRect().top - feed.getBoundingClientRect().top - HEADER_CLEARANCE;
+        const following = held?.claimed() ? held.following : position.stick;
+        const claimed = position.claim ? position.claim() : (position.cancel(), () => true);
+        const wanted = () => !destroyed && present() && claimed() && isCurrent();
+        const generation = revealing = ++revealGeneration;
+        const own = held = { following, claimed };
         position.stick = false;
+        const result = await seek(address, position, wanted, prepared)
+            .catch(error => (wanted() ? { state: 'unknown', error } : null));
+        if (generation === revealing) revealing = 0;
+        if (held === own) held = null;
+        if (following && generation === revealGeneration && wanted() && result?.state !== 'found' && !result?.left) {
+            position.stick = true;
+            position.followAfterLayout?.();
+        }
+        return result;
+    }
+
+    async function seek(address, position, wanted, prepared) {
+        let target = !prepared && (history()?.exact(address) || (!history() && rowOf(address)));
+        if (!target) {
+            const result = await history()?.reference(address, wanted, prepared);
+            if (!wanted() || !result) return null;
+            if (result.state === 'moved' && Number.isInteger(result.chat_id) && navigate) {
+                return navigate(address, result.chat_id, wanted);
+            }
+            if (!result.target) return result;
+            target = result.target;
+        }
+        if (!wanted()) return null;
+        const header = feed.closest('.page, .chat-instance-panel')?.querySelector('.chat-page-header, .chat-panel-statusbar');
+        const clearance = Math.max(HEADER_CLEARANCE,
+            (header?.getBoundingClientRect().bottom || 0) - feed.getBoundingClientRect().top + 12);
+        revealTimelineNode(target, feed, clearance);
         position.scroll();
+        // This explicit placement measured the current column. An ordinary scroll
+        // keeps the old-width anchor until reflow; a newly opened room must replace it.
+        position.remember(true);
         markTarget(target);
-        return true;
+        return { state: 'found' };
+    }
+
+    async function jump(ref) {
+        const result = await reveal(ref.address);
+        if (!result || result.state === 'found') return;
+        const [code, words] = failureText(result);
+        showToast(tr(`chat.reply.${code}`, words), 'info');
     }
 
     function paint() {
@@ -136,7 +201,7 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, onDo
         if (!address) return null;
         const role = ROLE_NAMES.find((name) => bubble.classList.contains(name)) || '';
         const words = bubble.querySelector(':scope > .message')?.textContent
-            || bubble.querySelector('.chat-quiz-question')?.textContent || '';
+            || bubble.querySelector('.chat-quiz-question')?.textContent || bubble.dataset.rowWords || '';
         return { address, chat_id: chatId, role, author_label: bubble.querySelector(':scope > .sender')?.textContent || '',
             kind: bubble.querySelector('.chat-quiz-card') ? 'question' : 'message', snippet: replySnippet(words),
             ts: bubble.dataset.ts ? new Date(Number(bubble.dataset.ts)).toISOString() : '', task_id: bubble.dataset.taskId || '' };
@@ -147,7 +212,7 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, onDo
         if (!bubbleRef(bubble)) return null;
         const button = document.createElement('button');
         button.type = 'button';
-        button.className = 'chat-message-reply';
+        button.className = 'chat-message-reply ui-hit-area';
         button.innerHTML = REPLY_ICON;
         button.title = tr('chat.reply.reply', 'Reply');
         button.setAttribute('aria-label', tr('chat.reply.reply', 'Reply'));
@@ -160,6 +225,7 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, onDo
         row.append(button);
         if (copy) row.append(copy);
         bubble.classList.add('has-reply');
+        bubbleActions.sync(bubble);
         return button;
     }
 
@@ -169,10 +235,12 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, onDo
     } catch { staged = null; }
 
     /**
-     * What a reply to a work card quotes: the work itself (its task id is its durable address; for a Continue
-     * card, the current episode's), named by its title, with its latest line or, settled, its chip's words.
+     * What a reply to a work card quotes, or null while the card offers none: the work itself (its task id is its
+     * durable address; for a Continue card, the current episode's), named by its title, with its latest line or,
+     * settled, its chip's words.
      */
     function cardRef(record) {
+        if (!record?.replyable) return null;
         const line = fullText(record.activityEl).trim();
         const chip = record.phaseEl?.textContent?.trim() || '';
         return {
@@ -183,33 +251,15 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, onDo
     }
 
     /**
-     * The card's own Reply (docs/DESIGN.md "Replies"): neutral, never the primary, first in the card's action row,
-     * on running and settled work alike. `wanted` is false for anything that is not a root work card.
-     * The card becomes a quote's jump target by the same address.
+     * A root work card is answered from its row menu (docs/DESIGN.md "Replies"; owner 17.10, Q9 B): its action row
+     * holds only commands over the work, so it draws no Reply of its own. `wanted` is false for anything that is not
+     * a root work card. The card becomes a quote's jump target by the same address.
      */
     function syncCard(record, wanted) {
-        const existing = record?.cardReplyEl;
-        if (!wanted) {
-            if (existing) { existing.remove(); record.cardReplyEl = null; return true; }
-            return false;
-        }
+        if (!record?.root) return;
+        record.replyable = Boolean(wanted);
         const address = `task:${record.groupId}`;
-        if (record.root.dataset.rowAddress !== address) record.root.dataset.rowAddress = address;
-        const actions = ensureLiveActionsEl(record);
-        if (!actions) return false;
-        let button = existing;
-        if (!button) {
-            button = document.createElement('button');
-            button.type = 'button';
-            button.className = 'btn btn-sm btn-default';
-            button.dataset.cardReply = '1';
-            button.textContent = tr('chat.reply.reply', 'Reply');
-            button.setAttribute('aria-label', tr('chat.reply.reply_to_work', 'Reply to this work'));
-            button.addEventListener('click', () => start(cardRef(record)));
-            record.cardReplyEl = button;
-        }
-        if (actions.firstElementChild !== button) { actions.prepend(button); return true; }
-        return !existing;
+        if (wanted && record.root.dataset.rowAddress !== address) record.root.dataset.rowAddress = address;
     }
 
     /**
@@ -278,9 +328,13 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, onDo
         },
         /** What the row menu's Reply on this bubble quotes, or null. */
         bubbleRef,
+        /** What the row menu's Reply on this root work card quotes, or null. */
+        cardRef,
         start,
         syncCard,
         syncDerivedQuotes,
+        reveal,
+        get revealing() { return revealing !== 0; },
         /**
          * "Send as a new message" under a delivery doubt: the owner's words join this composer's draft (sent, they are
          * a new message with a fresh id); nothing is sent here.
@@ -297,7 +351,9 @@ export function createChatReplies({ chatId, feed, input, key = '', reading, onDo
         echoRow: () => (staged ? { reply_to: staged } : null),
         clear,
         destroy() {
+            destroyed = true;
             clearTimeout(targetTimer);
+            bubbleActions.destroy();
             keyHost?.removeEventListener('keydown', onKeydown);
             strip?.remove();
             strip = null;

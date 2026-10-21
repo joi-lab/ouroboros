@@ -177,7 +177,7 @@ def test_api_conversion_binding_overrides_old_result_scope_on_restore(host, tmp_
     assert [row["id"] for row in sent] == ["converted"]
     for key in ("project_id", "drive_root", "text"):
         assert sent[0].get(key) == prepared.get(key)
-    assert sent[0]["workspace_root"] == ""  # The destination room has no execution folder.
+    assert sent[0]["workspace_root"] == str(folder)  # Placement keeps the explicit API folder, not the room's none.
     assert sent[0]["_project_admission"] == registry.project_admission_basis("chosen", answer["project"], frozen=True)
     assert load_task_result(host.root, "converted")["status"] == "running"
     assert not host.attempts

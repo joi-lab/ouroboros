@@ -1,6 +1,6 @@
 # 7. Configuration (ouroboros/config.py)
 
-This chapter owns the settings surface: where the document lives, who may write it, how an older release's document is translated before defaults merge, per-surface output budgets and the shipped-defaults registry. One key, one home, one default: the table below is a test-mirrored projection of `config.SETTINGS_DEFAULTS`, never a second authority.
+Settings have one home and default; the table projects `config.SETTINGS_DEFAULTS`, never a second authority.
 
 `ouroboros/config.py` is the import surface: the path constants (`APP_ROOT`, `REPO_DIR`, `DATA_DIR`, `SETTINGS_PATH`, `PID_FILE`, `PORT_FILE`), `RESTART_EXIT_CODE`, `AGENT_SERVER_PORT`, `load_settings()`/`save_settings()`, `apply_settings_to_env()`, `normalize_runtime_mode()` (one clamp for save, read coercion and onboarding), `get_runtime_mode()`, `get_skills_repo_path()`, the PID lock. The vocabularies live in the leaves it re-exports (§10 invariant 3), so a new key and its default belong to a leaf, never the facade. `settings_scales.IMMEDIATE_SETTINGS` and `RESTART_REQUIRED_SETTINGS` name keys that bite the running process at once or await a restart; a key in neither applies to the next task. `update_channels.py` owns the update channel and update-network defaults.
 
@@ -12,7 +12,7 @@ Each path constant takes its `OUROBOROS_*` override, else derives from `APP_ROOT
 
 Each task keeps its entry settings (`settings_integrity.TaskSettingsSnapshot`): models, keys and review settings stay private; absent/empty differ and explicit route overrides win. Room Context/Effort overlays never enter process env. `RoomResolver` follows conversion/lineage for new participants; Resume restores the actor's choice before dispatch/context assembly. `composer_cognition.py` copies Main once on project creation/recovery and freezes old rows before Main changes. Primary effort is independent of ordered helper bounds; old documents retain their effective range; internal `_effort_range_format=1` marks independent Main triples. Immediate keys, writers and granted skill keys read current disk, including cleared keys (`skill_settings`: credential-free children reread it; payloads carry operator variables). Access stays boot-pinned; reload failure discloses prior-env fallback and unavailable document-only values.
 
-`normalize_settings_raw()` is the only translation before every reader merges defaults (`load_settings()`, `_owner_read_settings_raw()`, `build_colab_settings()`); a dropped spelling is never promoted. Review-lane keys (`REVIEW_POOL_MIGRATED_SETTING_KEYS`) migrate, not drop: `review_pool_migration.apply_at_read_seam` maps every effectively run lane seat to an `OUROBOROS_SUBAGENTS` reviewer row (Review pool); refused values stay untouched in the document. Retired comma-lists and keys (`settings_defaults.RETIRED_SETTING_KEYS`/`RETIRED_COMMA_LIST_SETTING_KEYS`) drop with an owner notice; comma-list-only and lane-free installs get factory rows; no path reads review keys from the process environment; the boot says so once (`server_maintenance._startup_environment_review_notice`). The pure, idempotent function keeps reads read-only; every in-process reader uses `settings_integrity.read_settings_json_verified` and refuses a changed pinned snapshot. The loader proposes unauthored slots (§2); `server_runtime.apply_runtime_provider_defaults` only respells, unpersisted. `apply_settings_to_env` echoes projected slot/catalog values in internal `OUROBOROS_PROJECTED_PROPOSALS` (no setting or lever), inherited by children and distinguished from operator variables on read.
+`normalize_settings_raw()` is the only translation before every reader merges defaults (`load_settings()`, `_owner_read_settings_raw()`, `build_colab_settings()`); a dropped spelling is never promoted. Review-lane keys (`REVIEW_POOL_MIGRATED_SETTING_KEYS`) migrate, not drop: `review_pool_migration.apply_at_read_seam` maps every effectively run lane seat to an `OUROBOROS_SUBAGENTS` reviewer row (Review pool), refused values staying untouched in the document; retired comma-lists and keys (`settings_defaults.RETIRED_SETTING_KEYS`/`RETIRED_COMMA_LIST_SETTING_KEYS`) drop with an owner notice, comma-list-only and lane-free installs get factory rows, and no path reads review keys from the process environment (the boot says so once: `server_maintenance._startup_environment_review_notice`). The pure, idempotent function keeps reads read-only; every in-process reader uses `settings_integrity.read_settings_json_verified` and refuses a changed pinned snapshot. The loader proposes unauthored slots (§2); `server_runtime.apply_runtime_provider_defaults` only respells, unpersisted. `apply_settings_to_env` echoes projected slot/catalog values in internal `OUROBOROS_PROJECTED_PROPOSALS` (no setting or lever), inherited by children and distinguished from operator variables on read.
 
 Optional bounds. `OUROBOROS_MAX_ROUNDS` and `OUROBOROS_TASK_ABS_CEILING_SEC` take a positive integer or `unlimited` (`settings_scales.parse_positive_or_unlimited`, also the review-cycle cap's vocabulary) and ship `unlimited`: a fresh install is bounded by money, deadlines, Stop/Panic and the idle rail, not by age or round count. A document an earlier release saved without the key keeps the finite value it ran under (`settings_scales.OPTIONAL_BOUND_LEGACY`: 200 rounds / 21600 s), and a blank, zero, negative or malformed value takes that value too, with a log line, never "no bound"; `upgrade_notices.py` tells the owner once which finite limit applies. Readers (`runtime_limits.get_max_rounds`, `get_task_abs_ceiling_sec`) return `None` for no bound. An operation inheriting the task lifetime takes `operation_window_sec()`, so it is never unbounded and never a transport bound.
 
@@ -29,7 +29,6 @@ Providers name the output budget differently: OpenRouter and Anthropic-compatibl
 | `LLMClient.chat()` / `chat_async()` defaults | 65,536 |
 | Main task loop (`loop_llm_call.MAIN_LOOP_MAX_TOKENS`) | 65,536 |
 | `LLMClient.vision_query()` and VLM tools (`analyze_screenshot`, `vlm_query`) | 32,768 |
-| Context compaction round summaries | 32,768 |
 | Review synthesis dedup | 16,384 |
 | Scratchpad consolidation, Light memory drafts (`consolidator.LIGHT_ANSWER_CEILING_TOKENS`) | 16,384 |
 | Post-task evolution promotion decision (`post_task_evolution`) | 8,192 |
@@ -40,7 +39,7 @@ Providers name the output budget differently: OpenRouter and Anthropic-compatibl
 
 ### Default settings
 
-A registry of `config.SETTINGS_DEFAULTS` (defaults canonical in `settings_defaults.py`), one row per key. Env-only rows are operator environment levers with no settings.json carrier; the alias and `(migrated)` rows name retired keys the read seam converts.
+One row per key (`settings_defaults.py`). Env-only rows have no settings.json carrier; alias and `(migrated)` rows name retired keys converted at read.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -89,7 +88,7 @@ A registry of `config.SETTINGS_DEFAULTS` (defaults canonical in `settings_defaul
 | OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC | 180 | Concurrency-slot wait bound |
 | OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC | 60 | Project-naming call ceiling |
 | OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC | 8 | Inline naming bound when a card becomes a project (`gateway/projects.py`) |
-| OUROBOROS_UPDATE_LETTER_TIMEOUT_SEC | 120 | Update-letter one-shot ceiling, slot wait and call together (`update_letter.py`) |
+| OUROBOROS_UPDATE_LETTER_TIMEOUT_SEC | 120 | Update-letter calendar ceiling over slot wait and every send (`update_letter.py`) |
 | OUROBOROS_UI_TRANSLATION_TIMEOUT_SEC | 120 | One translation batch, slot wait and call together (`ui_translation.py`) |
 | OUROBOROS_UI_LANGUAGE | "" | Owner interface language (BCP-47 tag; `""` = not chosen); written only by `POST /api/ui/i18n/language` (`ENDPOINT_WRITTEN_SETTINGS`), read live (§3 Settings and onboarding) |
 | OUROBOROS_FALLBACK_COOLDOWN_ENABLED | true | 429-aware per-process model cooldown |
@@ -137,7 +136,7 @@ A registry of `config.SETTINGS_DEFAULTS` (defaults canonical in `settings_defaul
 | OUROBOROS_SUBSCRIPTION_PRESET_VERSION | "" | One-shot install-preset marker; endpoint-authored, disk-only (`ENDPOINT_AUTHORED_SETTINGS`); absence authorizes nothing (§2) |
 | OUROBOROS_SUBAGENT_PRESET_RECEIPT | "" | Install-preset receipt; endpoint-authored, disk-only |
 | OUROBOROS_ONBOARDING_COMPLETED_AT | "" | Onboarding completion fact; endpoint-authored, disk-only |
-| OUROBOROS_TASK_REVIEW_MODE | auto | Task acceptance-review mode (§6 Task acceptance) |
+| OUROBOROS_TASK_REVIEW_MODE | auto | Result review mode: `auto` forces nothing, `required` runs the host's result review at a root delivery with produced material, `off` refuses `review_change(subject="result")` (§6 Result review) |
 | OUROBOROS_SAFETY_MODE | full | Safety supervision mode; a fresh desktop wizard may author `light`; lowering is owner-guarded (§6 Safety and runtime mode) |
 | OUROBOROS_SAFETY_MAX_TOKENS | 2000 | Safety-check output budget |
 | OUROBOROS_SAFETY_CALL_TIMEOUT_SEC | 60 | Safety-check call ceiling |
@@ -147,27 +146,28 @@ A registry of `config.SETTINGS_DEFAULTS` (defaults canonical in `settings_defaul
 | OUROBOROS_SETTINGS_DOCUMENT_LOCK_TIMEOUT_SEC | 30 | In-process document-lock bound for owner writes; lock contention refuses before the transform runs (`owner_settings.py`) |
 | OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC | 2700 | LLM transport read timeout |
 | OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC | 300 | `plan_task` deadline floor |
-| OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC | 200 | Spendable seconds above the finalization reserve needed to start a critic panel, else `review_skipped_deadline_reserve` (§6 Task lifecycle) |
-| OUROBOROS_REVIEW_MAX_CYCLES | "2" | Shared paid review-cycle cap over the acceptance/commit/skill gates (plan asks stand outside it); `unlimited` = no local count cap (`review_cycles.py`; §6 Review stack) |
+| OUROBOROS_REVIEW_MAX_CYCLES | "2" | Shared paid review-cycle cap over the result-review/commit/skill gates (plan asks stand outside it); `unlimited` = no local count cap (`review_cycles.py`; §6 Review stack) |
 | OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES | (none) | Alias only: a stored value is MIGRATED into `OUROBOROS_REVIEW_MAX_CYCLES` (passes + 1) at load; an environment value is inert |
-| OUROBOROS_ACCEPTANCE_RESERVE_PCT | 5 | Acceptance budget reserve percentage |
 | OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC | unset | Env-only: logical review timeout (absent = route-owned; late results stay in custody) |
 | OUROBOROS_REVIEW_MAX_TOKENS | 65536 | Env-only: reviewer output budget, clamped to the 8192 floor |
 | OUROBOROS_REVIEW_ENFORCEMENT | advisory | Review enforcement advisory/blocking; anything else coerces to the default (§6 Review stack) |
 | OUROBOROS_PREFLIGHT_TIMEOUT_SEC | 1800 | Env-only: total wall-clock budget of the hermetic test preflight (`preflight_runner.py`); the Android entry defaults to 3600 |
 | OUROBOROS_PREFLIGHT_SERIAL | unset | Env-only: `1` selects one serial pytest pass; scrubbed from the candidate environment |
 | OUROBOROS_PREFLIGHT_TEST_WORKERS | unset | Env-only: xdist workers for the parallel pass (floor 2, else `os.cpu_count()`); scrubbed from the candidate |
-| OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS | true | Auto-grant manifest-declared permissions to cleanly reviewed skills (hash-bound; blocking findings never grant) |
-| OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS | true | Launcher seed/resync writes hash-pinned `native_seed` verdicts; no runtime grant endpoint |
+| OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS | true | Auto-grant manifest requests to accepted bytes (clean review or trusted install; hash-bound) |
+| OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS | true | Derived Built in trust (`false`: review); once a source list is saved its Built in row decides |
 | OUROBOROS_CONTEXT_MODE | max | Main's `nano`/`low`/`max` and initial project copy; owner-selected outside Cyber. Review remains independent (§6 Context fitting) |
 | OUROBOROS_CONTEXT_MODE_AUTO_LOW | false | Provenance tombstone, not a toggle: normalization writes `false`; a persisted `low` is honoured only beside it (`context_mode_compat.py`) |
 | OUROBOROS_RUNTIME_MODE | advanced | Effective Access light/advanced/pro/cyber_pro, persisted as the next-boot value (§6 Safety and runtime mode) |
-| OUROBOROS_SKILLS_REPO_PATH | "" | Extra skills checkout path (expanded at read time, never cloned or pulled) |
+| OUROBOROS_SKILLS_REPO_PATH | "" | Skills Repo Path: read in place as My folder (`my-folder`), even with a saved source list; removing that row clears this path. Other folders stay connected. |
 | MCP_ENABLED | false | MCP client toggle (§6 MCP and browser-facing external tools) |
 | MCP_SERVERS | [] | MCP server list; persisted in settings, never env-exported |
 | MCP_TOOL_TIMEOUT_SEC | 60 | Per-MCP-tool timeout |
-| OUROBOROS_HUB_CATALOG_URL | `https://raw.githubusercontent.com/razzant/OuroborosHub/main/catalog.json` | OuroborosHub catalog URL (automatic fetch limited to catalog JSON; installs verify SHA-256) |
+| OUROBOROS_HUB_CATALOG_URL | `https://raw.githubusercontent.com/razzant/OuroborosHub/main/catalog.json` | Derives the two hub rows; a non-GitHub raw URL needs `OUROBOROS_SKILL_SOURCES` with the git address |
 | OUROBOROS_CLAWHUB_REGISTRY_URL | `https://clawhub.ai/api/v1` | ClawHub registry URL |
+| OUROBOROS_SKILL_SOURCES | "" | Skill source list (§13); empty = derived from the keys above, unwritten |
+| OUROBOROS_STARTER_SKILLS | "" | Starter catalog ids from any source; absent/"" = recommended, `[]` or "[]" = none; built-ins install before git reads |
+| OUROBOROS_STARTER_SKILLS_TURN_ON | true | Turn starter installs on when ready; an owner's Off persists |
 | OUROBOROS_PROMPT_CACHE_TTL | 1h | Prompt-cache tier default/5m/1h for Anthropic-family cache markers, applied at the send boundary and recorded in usage |
 | OUROBOROS_EFFORT_MIN | low | Main helper floor; project composers save their own copy (`settings_scales.effort_range`) |
 | OUROBOROS_EFFORT_TASK | medium | Main primary; project copy sets its roots' primary; Auto helpers clamp it into their bounds |
@@ -215,9 +215,9 @@ A registry of `config.SETTINGS_DEFAULTS` (defaults canonical in `settings_defaul
 
 #### Review pool
 
-The review pool is the enabled rows of `OUROBOROS_SUBAGENTS` marked `review_eligible: true` (Settings → Agents, the Reviewer mark; `reviewer_slot_config.review_pool_slots`, read in the task's settings scope): one list for helpers and reviewers, no lane of its own. Outside Cyber Pro every pool row sits on the commit panel. Effort and delivery are row properties: `effort` is the owner's pin, empty = Auto (`reviewer_slot_config.row_effort`: model name, else pin, else a wave's order clamped into the range, else its top; read once per pool build); an API row's `delivery` is `native` (the default: the two-part brief with inspection tools) or `packet`, for a model positively known not to support tools (quota, timeout, unknown capability or an automatic fallback never imply that); a session row always retrieves. Only sessions and managed-model API routes may pin `route.credential_profile_id` (empty = rotation). A marked row switched off leaves the pool silently; a row a call names (`review_change(reviewers=[…])`, `preflight_reviewer`, `/review`) that is off or unknown is refused (`catalog_review_row`), never rerouted. A pool with no reading row asks no seat the coupling question: under Blocking outside Cyber Pro every body commit ends `NOT_PERFORMED` until a reading row is marked or review is Advisory; Save only warns (`subagent_runtime.review_pool_save_warning`).
+The review pool is the enabled rows of `OUROBOROS_SUBAGENTS` marked `review_eligible: true` (Settings → Agents, the Reviewer mark; `reviewer_slot_config.review_pool_slots`, in the task's settings scope): one list for helpers and reviewers. Blocking seats every pool row on the commit panel, Advisory the named rows (with a reason); unmarked additions advise, never count. Effort and delivery are row properties: `effort` is the owner's pin, empty = Auto (`reviewer_slot_config.row_effort`: model name, else pin, else a wave's order clamped into the range, else its top); an API row's `delivery` is `native` (the default, the two-part brief with inspection tools) or `packet`, for a model positively known not to support tools (quota, timeouts, unknown capability or fallbacks never imply it); a session row always retrieves. Only sessions and managed-model API routes may pin `route.credential_profile_id` (empty = rotation). A marked row switched off leaves the pool silently; a row a call names (`review_change(reviewers=[…])`, `preflight_reviewer`, `/review`) that is off or unknown is refused (`catalog_review_row`), never rerouted. A pool with no reading row asks no seat the coupling question: under Blocking outside Cyber Pro every body commit ends `NOT_PERFORMED` until a reading row is marked or review is Advisory; Save only warns (`subagent_runtime.review_pool_save_warning`).
 
-Save, the wizard and the migration share one judge (`reviewer_slot_config.review_pool_save_error`): a malformed catalog refuses Save and every review surface; a catalog with rows but no mark saves only with the owner's explicit `allow_empty_review_pool`; an empty pool reviews on Main alone. A never-configured install (no catalog or lanes key: Docker or Colab without the wizard) mints its factory catalog over the environment-merged read, anew at each read until saved, so it follows a changed factory default. Reviewers (`subscription_install_presets.factory_review_rows`) follow the reachable Main: an OpenRouter Main (or no access yet) gets the three `OPENROUTER_REVIEW_DEFAULTS`, a MiniMax Main its Main, Light, Light (Direct-provider routes), any other Main one row in its whole route (label, pin, processing; quorum 1 of 1); a Main the access cannot run mints nothing (lane keys wait), naming `OUROBOROS_MODEL`. The wizard's Auto helpers (`factory_actor_rows`) join only this cell. An operator's environment catalog (never our echo) wins over minted rows (`review_pool_migration.environment_overridable_keys`); a saved catalog, or rows minted from the owner's lanes, shadow it like any disk-authored key. A changed delivery changes the review-contract identity (a later review may be paid anew) but launches nothing.
+Save, the wizard and the migration share one judge (`reviewer_slot_config.review_pool_save_error`): a malformed catalog refuses Save and every review surface; a catalog with rows but no mark saves only with the owner's explicit `allow_empty_review_pool`; an empty pool reviews on Main alone. A never-configured install (no catalog or lanes key: Docker or Colab without the wizard) mints its factory catalog over the environment-merged read at each read until saved, following a changed factory default. Reviewers (`subscription_install_presets.factory_review_rows`) follow the reachable Main: an OpenRouter Main (or no access yet) gets the three `OPENROUTER_REVIEW_DEFAULTS`, a MiniMax Main its Main, Light, Light (Direct-provider routes), any other Main one row in its whole route (quorum 1 of 1); a Main the access cannot run mints nothing, naming `OUROBOROS_MODEL`. The wizard's Auto helpers (`factory_actor_rows`) join only this cell. An operator's environment catalog (never our echo) wins over minted rows (`review_pool_migration.environment_overridable_keys`); a saved catalog, or rows minted from the owner's lanes, shadow it like any disk-authored key. A changed delivery changes the review-contract identity (a later review may be paid anew) but launches nothing.
 
 #### Direct-provider routes
 

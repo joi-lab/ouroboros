@@ -125,7 +125,10 @@ def test_real_body_cold_terminal_wakes_before_money_and_saved_carrier_is_not_orp
         _until(lambda: current.run(tmp_path, "run-one").output_complete)
         fresh = current.run(tmp_path, "run-one")
         assert not fresh.settled and not fresh.ledger_recorded and not fresh.output_consumed
-        result = wake_ready_sleepers(env.q)
+        # A readiness read never waits on the store: one that meets the live collector's write is
+        # left to the next assignment tick (sleep_wake._readiness), so tick until a pass decides.
+        result = []
+        _until(lambda: result.extend(wake_ready_sleepers(env.q)) or result)
         assert result[0]["ok"] and result[0]["ready"]["reason"] == "run:run-one", json.dumps(result)
         assert task["_budget_pause_resume"]["pause"]["checkpoint"]["task_attempt"] == row["task_attempt"]
     finally:

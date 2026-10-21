@@ -36,12 +36,13 @@ An explicit calendar ``deadline_at`` never moves.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import logging
 import pathlib
 import time
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List
 
 log = logging.getLogger(__name__)
 
@@ -248,7 +249,7 @@ def acknowledge_question_delivery(ctx: Any, text: str) -> None:
 def wake_reason(ctx: Any, chosen: Dict[str, Any]) -> str:
     """Why the sleep is ready now (``""`` = not yet). Owner input is never filtered."""
     from ouroboros.deadline_utils import parse_deadline_ts, utc_now
-    from ouroboros.owner_mailbox import KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_QUIZ_CLOSED, KIND_TASK_MESSAGE
+    from ouroboros.owner_mailbox import KIND_CARD_INPUT, KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_QUIZ_CLOSED, KIND_TASK_MESSAGE
     from ouroboros.owner_wait import _wait_entries
     from ouroboros.task_status import SETTLED_STATUSES
 
@@ -268,7 +269,7 @@ def wake_reason(ctx: Any, chosen: Dict[str, Any]) -> str:
 
     for entry in read_source(_wait_entries, ctx) or ():
         kind = str(entry.get("kind") or KIND_OWNER_TEXT)
-        if kind in {KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_QUIZ_CLOSED}:
+        if kind in {KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_QUIZ_CLOSED, KIND_CARD_INPUT}:
             return "owner_text"
         if kind != KIND_TASK_MESSAGE:
             return f"control:{kind}"  # finalize_now, hurry, owner_pause, ... always wake
@@ -277,13 +278,13 @@ def wake_reason(ctx: Any, chosen: Dict[str, Any]) -> str:
                 or source in chosen.get("senders", [])):
             return f"mail:{source or 'unknown'}"
     if chosen.get("tasks"):
-        from ouroboros.task_results import load_task_result
+        from ouroboros.task_store import task_versions
 
-        root = _canonical_root(ctx)
+        versions = read_source(task_versions, _canonical_root(ctx), chosen["tasks"]) or {}
         for task_id in chosen["tasks"]:
-            row = read_source(load_task_result, root, task_id, strict=False) or {}
-            if str(row.get("status") or "") in SETTLED_STATUSES:
-                return f"task:{task_id}:{row.get('status')}"
+            status = versions.get(task_id, (0, "", False))[1]
+            if status in SETTLED_STATUSES:
+                return f"task:{task_id}:{status}"
     from ouroboros.delegate_custody import TERMINAL_STATES
     from ouroboros.sleep_custody import seen_interactions
 
@@ -484,6 +485,81 @@ def end(ctx: Any) -> float:
         waiter.sleep_started_monotonic = None
         waiter.budget_paused_sec = float(waiter.budget_paused_sec or 0.0) + slept
     return slept
+
+
+IN_SLOT_WAIT_KIND = "in_slot_wait"
+
+
+def announce_resumed(ctx: Any, outcome: Any = "") -> None:
+    """The task's own stack runs again after a wait: re-announce it as its start does.
+
+    A warm resume continues the same attempt, so no new start tells a chat
+    transport that preparation goes on (DESIGN §9, Telegram typing). A stopping
+    control resumes nothing; the owner's Resume of a warm Pause does. Best effort:
+    a lost frame costs one missed cue, never the wait.
+    """
+    from ouroboros.utils import utc_now_iso
+
+    reason, queue = str(outcome or ""), getattr(ctx, "event_queue", None)
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    if queue is None or not task_id or (reason.startswith("control:") and reason != "control:owner_resume"):
+        return
+    try:
+        queue.put({"type": "typing_start", "task_id": task_id, "chat_id": getattr(ctx, "current_chat_id", None),
+                   "phase": "thinking", "ts": utc_now_iso()})
+    except Exception:
+        log.debug("resume announce failed for %s", task_id, exc_info=True)
+
+
+def declare_in_slot_wait(ctx: Any, key: str, until_ts: float) -> None:
+    """A tool holds this task's slot until ``until_ts`` waiting on what ``key`` names:
+    ``mail:``, ``tasks:``, a delegated run (``delegate:<run_id>``) or a review panel
+    (``review:<owner_id>:``). Re-declaring the same key renews it.
+
+    Holding the slot is not preparing a reply; only what the key names may be
+    (``gateway/reply_preparation.py``). The mark lives on the live context (a direct
+    turn's only owner) and rides a typed ``in_slot_wait`` operation lease to the
+    RUNNING row (a pooled task); both expire with the window, so a lost end outlives nothing.
+    """
+    from ouroboros.utils import emit_cognitive_operation_event
+
+    waits = getattr(ctx, "_in_slot_waits", None)
+    if not isinstance(waits, dict):
+        waits = {}
+        try:
+            ctx._in_slot_waits = waits
+        except Exception:  # a context that cannot carry the mark still waits; only the cue misses it
+            log.debug("in-slot wait mark unavailable for %s", getattr(ctx, "task_id", ""), exc_info=True)
+    waits[key] = float(until_ts)
+    emit_cognitive_operation_event(
+        getattr(ctx, "event_queue", None), task_id=str(getattr(ctx, "task_id", "") or ""),
+        operation_id=f"{IN_SLOT_WAIT_KIND}:{key}", phase="started", kind=IN_SLOT_WAIT_KIND,
+        task_attempt=getattr(ctx, "task_attempt", None), lease_until=float(until_ts))
+
+
+def end_in_slot_wait(ctx: Any, key: str) -> None:
+    """The slot wait ``key`` returned: retract its mark and lease, and re-announce the task."""
+    from ouroboros.utils import emit_cognitive_operation_event
+
+    waits = getattr(ctx, "_in_slot_waits", None)
+    if isinstance(waits, dict):
+        waits.pop(key, None)
+    emit_cognitive_operation_event(
+        getattr(ctx, "event_queue", None), task_id=str(getattr(ctx, "task_id", "") or ""),
+        operation_id=f"{IN_SLOT_WAIT_KIND}:{key}", phase="finished", kind=IN_SLOT_WAIT_KIND,
+        task_attempt=getattr(ctx, "task_attempt", None))
+    announce_resumed(ctx)
+
+
+@contextlib.contextmanager
+def in_slot_wait(ctx: Any, window_sec: float, target: str = "mail") -> Iterator[None]:
+    """``declare_in_slot_wait`` for one bounded window (plus a short teardown margin)."""
+    key = f"{target}:{uuid.uuid4().hex}"
+    declare_in_slot_wait(ctx, key, time.time() + max(0.0, float(window_sec)) + 5.0)
+    try:
+        yield
+    finally:
+        end_in_slot_wait(ctx, key)
 
 
 def wake_notice(chosen: Dict[str, Any], outcome: str, slept: float | None) -> Dict[str, Any]:

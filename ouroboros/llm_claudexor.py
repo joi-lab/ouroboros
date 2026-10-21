@@ -15,13 +15,14 @@ import time
 from typing import Any
 
 from ouroboros import _usage_wait, config, context_fit
-from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY
+from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY, HOST_TEXT_SHA_KEY
 from ouroboros._usage_response import model_operation_usage as _usage
 from ouroboros.anthropic_native_custody import scrub_native_custody
 from ouroboros.claudexor_daemon import ensure_owned_gateway, owned_engine_version, read_owned_gateway
 from ouroboros.deadline_utils import llm_transport_timeout_sec
 from ouroboros.gateways.claudexor import (ClaudexorUnavailable, engine_at_least, model_failure_evidence_supported,
                                           operation_query_supported, _READ_TIMEOUT_SEC)
+from ouroboros.gateways.claudexor_metadata import model_gateway
 from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch, effort_request_facts
 from ouroboros.llm_capability_policy import model_catalog as model_catalog, catalog_admits_model as catalog_admits_model
 from ouroboros.send_clock import stamp_clock_note
@@ -261,7 +262,8 @@ def _request(target: dict, messages: list, tools: list | None, parameters: dict)
     for message in prepared:
         for name in ("_context_capsule", "acceptance_observation", "_acceptance_observation", "review_feedback",
                      "reasoning", "reasoning_details", "reasoning_content", "response_id", "stop_reason", "_stable_prefix_blocks",
-                     HOST_CONTEXT_KIND_KEY, TOOL_RESULT_RECORD_KEY, REVIEW_HISTORY_MESSAGE_KEY, REVIEW_CONTEXT_INDEX_KEY):
+                     HOST_CONTEXT_KIND_KEY, HOST_TEXT_SHA_KEY, TOOL_RESULT_RECORD_KEY, REVIEW_HISTORY_MESSAGE_KEY,
+                     REVIEW_CONTEXT_INDEX_KEY):
             message.pop(name, None)
         # A direct provider's refusal is assistant content, not routing metadata.
         # Preserve both text parts verbatim when a response carries both fields;
@@ -404,11 +406,33 @@ class _ModelInvocation:
         scope = current_usage_scope()
         self.task_id = scope.task_id if scope else ""
         self.check_control()
+        deadline = time.monotonic() + self.timeout
+        last_error = None
         try:
-            self.gateway = ensure_owned_gateway()
-            # Freeze once before create. A lost create reply or replaced gateway
-            # must reuse this same operation's diagnostic/idempotency contract.
-            operations = self.gateway.operations()
+            while True:
+                self.check_control()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise last_error or ClaudexorUnavailable("daemon_not_answering", "Call deadline elapsed before model creation")
+                try:
+                    self.gateway = model_gateway(lambda: ensure_owned_gateway(
+                        admission_wait_sec=remaining, startup_wait_sec=remaining))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ClaudexorUnavailable("daemon_not_answering", "Call deadline elapsed before model creation")
+                    operations = self.gateway.operations(timeout_sec=remaining)
+                    break
+                except ClaudexorUnavailable as error:
+                    # No model create has been attempted. Wait on this call's
+                    # own transport deadline; received refusals remain refusals.
+                    unanswered = not error.status_code and (error.observation_timeout or error.code in {
+                        "daemon_unreachable", "daemon_not_answering", "daemon_starting", "daemon_descriptor_changed"})
+                    if not unanswered or time.monotonic() >= deadline:
+                        raise
+                    last_error = error
+                    self.close()
+                    time.sleep(min(config.CLAUDEXOR_MODEL_POLL_INTERVAL_SEC, max(0, deadline - time.monotonic())))
+            # Freeze capabilities before the one create attempt.
             self.capture_failure_evidence = model_failure_evidence_supported(operations)
             self.capture_effort_evidence = operation_query_supported(operations, method="POST",
                 path="/v2/model-operations", name="captureEffortEvidence", value="true")
@@ -420,7 +444,7 @@ class _ModelInvocation:
                                    "capture_failure_evidence": self.capture_failure_evidence,
                                    "capture_effort_evidence": self.capture_effort_evidence})["manifest_ref"]
         except ClaudexorUnavailable as error:
-            raise ClaudexorModelError({"code": error.code, "message": str(error)}, model_role=self.role) from None
+            raise ClaudexorModelNotDispatched({"code": error.code, "message": str(error)}, model_role=self.role) from None
 
     def observe_operation(self, *, accepted: bool = False, phase: str = "") -> None:
         """Publish changed custody/activity facts, never account or provider content.

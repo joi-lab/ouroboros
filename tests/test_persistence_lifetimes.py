@@ -25,7 +25,6 @@ _LIFETIME_RE = re.compile(r"^\[(record|bounded|disposable: ([\w.]+))\]")
 DISPOSABLE_WITHOUT_RETIRER = frozenset({
     "state/evolution_metrics_cache.json",
     "state/presence_turn_gate/last-<sha256>.json",
-    "state/cx/",
     "state/betterleaks/",
     "state/pycache/",
     "state/skills/<name>/jobs/<job>/",

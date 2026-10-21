@@ -14,7 +14,7 @@ import pytest
 from tests.ci_evidence import output_dir
 from tests.test_ui_smoke_playwright import direct_server_with_data as _server
 from tests.ui_chat_viewport_smoke import (
-    _CAPTURE_TEST_SOCKET, _OBSERVE_STATE_READS, _emit_ws_frame, _wait_socket_open_quiescent,
+    _CAPTURE_TEST_SOCKET, _OBSERVE_STATE_READS, _emit_ws_frame, _wait_socket_open_quiescent, wait_drawer_closed,
 )
 
 direct_server_with_data = _server
@@ -129,7 +129,7 @@ def _screenshots(page, evidence, feed):
         for width in (1280, 390):
             page.set_viewport_size({"width": width, "height": 900 if width > 400 else 844})
             if width < 980:
-                page.wait_for_function("document.querySelector('#primary-sidebar').getBoundingClientRect().right <= 1")
+                wait_drawer_closed(page)
             page.evaluate("""() => Promise.all(document.getAnimations()
                 .filter(a => typeof CSSTransition === 'function' && a instanceof CSSTransition)
                 .map(a => a.finished.catch(() => null)))""")

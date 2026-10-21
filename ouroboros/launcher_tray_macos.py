@@ -84,7 +84,7 @@ class MacStatusItem(Indicator):
             app.requestUserAttention_(AppKit.NSInformationalRequest)
 
         _on_main(cue)
-        return False  # not a banner: the caller plays the system sound
+        return False  # Visual Dock cue only; not a delivered system banner.
 
     def set_status(self, text):
         self._status = text

@@ -5,8 +5,8 @@ The pure half of phase P4, and the file the review rounds kept landing in. A rec
 reconciled by ONE typed identity key; the outstanding sets count identities rather than
 rows; every reviewer-facing projection of a receipt discloses what it bounded and names
 the authority that actually decided. Each section below is the round that forced it,
-kept because the defect is easier to re-introduce than to re-find. The loop/acceptance
-wiring that consumes these flags lives in `test_v678_acceptance_state.py`.
+kept because the defect is easier to re-introduce than to re-find. The red-receipt nudge
+and the other consumers of these identities live in `test_v678_acceptance_state.py`.
 
 Offline and layout-free: plain dicts through the real helpers, no ambient checkout state.
 """
@@ -241,35 +241,6 @@ def test_every_bounded_list_on_a_changed_review_surface_discloses_its_omissions(
     summary = _accept_verification_summary([receipt])
     assert len(summary["check_exit_masking_reasons"]) == 10
     assert summary["check_exit_masking_reasons_omitted"] == 4
-
-
-@pytest.mark.parametrize("length", [40, 520, 4000])
-def test_agent_supplied_review_prose_is_disclosed_truncated_not_sliced(length):
-    """Same P1 rule on the acceptance-decision surface this phase rewrote: an agent
-    rationale / obligation-disposition reason that ends mid-argument must say so."""
-    from ouroboros import loop_tool_execution as LTE
-
-    rationale, reason = "r" * length, "o" * length
-    payload = {"status": "deferred_to_host_acceptance", "authoritative": False,
-               "agent_decision": {"disposition": "partial", "rationale": rationale,
-                                  "obligation_dispositions": [
-                                      {"id": "ob1", "disposition": "rejected", "reason": reason}]}}
-    raw = json.dumps(payload)
-    trace = {"tool_calls": [], "acceptance_obligations": [{"id": "ob1", "status": "open"}]}
-    assert LTE.process_tool_results(
-        [{"fn_name": "task_acceptance_review", "tool_call_id": "review-1",
-          "is_error": False, "result": raw, "args_for_log": {}}], [], trace, lambda _: None,
-    ) == 0
-    projected = (trace["acceptance_decision"]["agent_rationale"],
-                 trace["acceptance_obligations"][0]["disposition_reason"])
-    for full, preview in zip((rationale, reason), projected):
-        if length <= 520:  # A cut smaller than its omission marker must stay whole.
-            assert preview == full
-        else:
-            assert preview == full[:500] + f"\n⚠️ OMISSION NOTE: truncated at 500 chars; original length {length}"
-    assert trace["acceptance_obligations"][0]["status"] == "agent_disposed"
-    assert trace["acceptance_evidence_calls"] == [payload]  # Full source survives.
-    assert trace["tool_calls"][0]["result"] == raw
 
 
 # --------------------------------------------------------------------------------------
@@ -548,45 +519,6 @@ def test_canonical_identity_is_the_only_derivation_in_the_receipt_module():
     # The check identity comes from the SHARED shell seam, not a private copy.
     assert "canonical_command_text" in src
     assert R.receipt_canonical_identity({"check": "go   test"}).check == "go test"
-
-
-def test_claim_support_refs_disclose_their_bounds_and_dedup_before_rendering():
-    """Round-4 call-site audit: `_accept_claim_support_refs` is the ELEVENTH surface —
-    it bounded three lists with hand-rolled `[:5]`/`[-5:]` and rendered its path set
-    before deduplicating it, the same two defects the identity projection just lost."""
-    from ouroboros.review_evidence import _accept_claim_support_refs
-
-    stem = "build/" + "e" * 400
-    first, second = stem + "/alpha.bin", stem + "/omega.bin"
-    contract = {"acceptance_claims": [{"id": "c1", "claim": "it builds", "support": "the log"}]}
-    receipts = [
-        {"status": "pass", "criterion_id": "c1", "check": f"make {i}"} for i in range(8)
-    ]
-    receipts[-1] = {
-        "status": "pass", "criterion_id": "c1", "check": "make 7",
-        "artifacts_missing_after": [first, second, "out/x.bin", "out/x.bin"],
-        "artifact_lifecycle": [{"path": f"out/{i}.bin", "exists_after": False} for i in range(9)],
-    }
-
-    row = _accept_claim_support_refs(contract, receipts)[0]
-    # The receipt window is bounded — and now says by how much.
-    assert len(row["support_refs"]) == 5 and row["support_refs_omitted"] == 3
-    ref = row["support_refs"][-1]
-    # The lifecycle list is bounded through the shared helper, with its own count.
-    assert len(ref["artifact_lifecycle"]) == 5 and ref["artifact_lifecycle_omitted"] == 4
-    # The path set is canonicalized on the RAW values first: the duplicate and the
-    # whitespace variant collapse honestly, the two prefix-colliding paths do not vanish.
-    carried = ref["artifacts_missing_after"]
-    assert len(carried) + ref["artifacts_missing_after_omitted"] == 3
-    assert "out/x.bin" in carried
-    # Redaction still reaches both lists.
-    secret = "sk-ant-" + "b" * 40
-    redacted = _accept_claim_support_refs(contract, [{
-        "status": "pass", "criterion_id": "c1",
-        "artifacts_missing_after": [f"out/{secret}.bin"],
-        "artifact_lifecycle": [{"path": f"out/{secret}.bin", "exists_after": False}],
-    }])
-    assert secret not in json.dumps(redacted)
 
 
 def test_receipt_check_text_round_trips_so_two_argvs_are_two_verifications(tmp_path, monkeypatch):

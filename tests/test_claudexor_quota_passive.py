@@ -23,7 +23,7 @@ from ouroboros.gateways import claudexor as wire
 
 
 QUOTA_URL = "/api/claudexor/status?view=quota"
-QUOTA_VIEW = {"view": "constraint_freshness"}
+QUOTA_VIEW = {"view": "resources_freshness", "requestKind": "text"}
 # The engine contract's recorded opt-in response: each constraint carries its own
 # read-time freshness beside the conservative aggregate. Without that field it is
 # exactly the legacy response of an engine that ignores the selector.
@@ -382,9 +382,9 @@ def test_quota_consumer_returns_while_full_status_catalog_is_still_blocked(passi
         original = full_status.result(timeout=5)
     assert original.status_code == 200 and "view" not in original.json()
     assert original.json()["reads"] == dict.fromkeys(("catalog", "accounts", "quota"), "ok")
-    # Only the passive reader opts in; the Accounts status keeps the legacy quota read.
+    # Full Accounts and passive consumers share one opt-in observation contract.
     quota_params = [params for _, path, params in engine.calls if path == "/v2/quota"]
-    assert sorted(quota_params, key=len) == [{}, QUOTA_VIEW]
+    assert quota_params == [QUOTA_VIEW, QUOTA_VIEW]
     assert len(engine.clients) == 2 and all(client.is_closed for client in engine.clients)
 
 
@@ -401,7 +401,7 @@ def test_gateway_quota_selector_is_opt_in(passive_engine):
     engine.provision()
     with wire.ClaudexorGateway(wire.discover_daemon_at(engine.config_dir)) as gateway:
         assert gateway.quota_state() == engine.state["responses"]["/v2/quota"]
-        assert gateway.quota_state(view="constraint_freshness") == engine.state["responses"]["/v2/quota"]
+        assert gateway.quota_state(view="resources_freshness", request_kind="text") == engine.state["responses"]["/v2/quota"]
     assert engine.calls == [("GET", "/v2/quota", {}), ("GET", "/v2/quota", QUOTA_VIEW)]
 
 
@@ -435,7 +435,7 @@ def test_quota_view_selector_ignored_by_an_older_engine_keeps_the_legacy_envelop
     ]
 
 
-def test_quota_view_repeated_refusal_stops_after_one_legacy_read(passive_engine):
+def test_quota_view_repeated_refusal_stops_after_supported_view_ladder(passive_engine):
     engine = passive_engine
     engine.state["errors"]["/v2/quota"] = (400, {"code": "invalid_query", "message": "view"})
     engine.provision()
@@ -443,7 +443,9 @@ def test_quota_view_repeated_refusal_stops_after_one_legacy_read(passive_engine)
         payload = _read(client)
     assert payload["reads"] == {"catalog": "not_read", "accounts": "ok", "quota": "failed"}
     assert payload["read_errors"] == {"quota": {"code": "read_refused", "status_code": 400}}
-    assert [params for _, path, params in engine.calls if path == "/v2/quota"] == [QUOTA_VIEW, {}]
+    assert [params for _, path, params in engine.calls if path == "/v2/quota"] == [
+        QUOTA_VIEW, {"view": "constraint_freshness"}, {},
+    ]
 
 
 def test_quota_view_325_selector_refusal_uses_one_passive_legacy_response(passive_engine, monkeypatch):
@@ -463,6 +465,7 @@ def test_quota_view_325_selector_refusal_uses_one_passive_legacy_response(passiv
         if dict(request.url.params) == QUOTA_VIEW:
             selector_recorded.set()
             assert roster_recorded.wait(5), "roster read did not overlap the selector request"
+        if request.url.params.get("view"):
             engine.state["errors"]["/v2/quota"] = (400, {"code": "invalid_request", "message": "view must be resources"})
         else:
             engine.state["errors"].pop("/v2/quota", None)
@@ -479,9 +482,12 @@ def test_quota_view_325_selector_refusal_uses_one_passive_legacy_response(passiv
     assert payload["quota"][0]["freshness"] == "stale"
     assert all("freshness" not in c for c in payload["quota"][0]["constraints"])
     assert engine.calls == [
-        ("GET", "/v2/quota", QUOTA_VIEW), ("GET", "/v2/credential-profiles", {}), ("GET", "/v2/quota", {}),
+        ("GET", "/v2/quota", QUOTA_VIEW), ("GET", "/v2/credential-profiles", {}),
+        ("GET", "/v2/quota", {"view": "constraint_freshness"}), ("GET", "/v2/quota", {}),
     ]
-    assert [params for _, path, params in engine.calls if path == "/v2/quota"] == [QUOTA_VIEW, {}]
+    assert [params for _, path, params in engine.calls if path == "/v2/quota"] == [
+        QUOTA_VIEW, {"view": "constraint_freshness"}, {},
+    ]
     assert all(method == "GET" for method, _, _ in engine.calls)
 
 
@@ -523,3 +529,24 @@ def test_quota_view_dispatch_is_exact_and_does_not_change_default_status(monkeyp
             response = client.get("/api/claudexor/status" + query)
             assert response.status_code == 200 and response.json() == {"existing_full_status": True}
     assert calls == [False, True, False, False, False]
+
+
+def test_actor_inspection_real_wire_sends_exact_scope_not_account(passive_engine):
+    from ouroboros.settings_integrity import task_settings_scope
+    from ouroboros.subagent_inspection import inspect_subagent
+    from tests.test_subagent_inspection import _resource, _snapshot
+
+    passive_engine.provision()
+    passive_engine.state["responses"]["/v2/quota"] = {
+        "snapshots": [], "absences": [], "resources": [_resource(), _resource("healthy-sibling")],
+        "availability_scope": {"model": "auto", "requestKind": "image", "basis": "quota_block"},
+    }
+    with task_settings_scope(_snapshot("cursor=auto")):
+        result = inspect_subagent("builder", request_kind="image")
+    assert result["configured"]["access"] == "readonly"
+    assert result["availability"]["state"] == "unknown" and result["availability"]["scope"] == "quota_only"
+    assert result["engine"]["resources"] == [_resource()]
+    assert sorted(passive_engine.calls) == [
+        ("GET", "/v2/credential-profiles", {}),
+        ("GET", "/v2/quota", {"view": "resources_freshness", "model": "auto", "requestKind": "image"}),
+    ]

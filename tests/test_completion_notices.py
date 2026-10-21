@@ -1,4 +1,7 @@
-"""Completion causes reach the real summary/notifier, without Telegram network I/O."""
+"""Completion causes reach the real summary/notifier, without Telegram network I/O.
+
+The records are the ones older tasks stored (an acceptance decision on the review axis,
+written before the result review replaced task acceptance); the renderers still read them."""
 import asyncio
 import copy
 
@@ -20,7 +23,22 @@ def _reviewed_trace():
     }
 
 
+def _stored_review_axes(trace):
+    """The review and objective axes an older task stored for this trace.
+
+    Its host acceptance decision applied the earlier revision's PASS panel by name
+    (``previous_revision_accepted``). That selection left with task acceptance, so the
+    current producer reads the superseded run as a gap; old task cards and notices still
+    render the stored record, so the applied panel is restored here."""
+    applied = copy.deepcopy(trace)
+    for run in applied["review_runs"]:
+        run.pop("superseded_by_revision", None)
+    review = outcomes._review_axis(applied)
+    return review, outcomes._objective_axis(review)
+
+
 def _record(case):
+    """An older task's stored record: the real producer over its trace, with the review axes it stored."""
     trace = _reviewed_trace()
     if case == "delivery_control":
         trace["delivery_candidate"].update(degraded=True, degraded_reason="invalid_delivery_control_after_repair")
@@ -29,6 +47,9 @@ def _record(case):
     elif case == "partial":
         trace["review_runs"][0]["actors"][0]["parsed"]["outcome_tier"] = "best_effort"
     outcome = outcomes.derive_loop_outcome("The answer is retained.", {}, trace)
+    review, objective = _stored_review_axes(trace)
+    outcome["outcome_axes"].update(review=review, objective=objective)
+    outcome.update(review_eligibility=review["eligibility"], review_trigger=review["trigger"])
     record = {**outcome, "task_id": case, "status": "completed", "chat_id": 1}
     if case in {"receipt", "mixed", "unknown_warning"}:
         objective = record["outcome_axes"]["objective"]

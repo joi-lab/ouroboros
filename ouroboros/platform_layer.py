@@ -168,7 +168,7 @@ def bootstrap_process_path() -> list[str]:
 def request_native_attention(
     show_window: Optional[Callable[[], None]] = None, *, sound: bool = True,
 ) -> dict[str, object]:
-    """Request one best-effort window/sound cue without claiming a banner."""
+    """Legacy attention bridge. macOS has no separate sound: notifications own it."""
     window_attention = ""
     if show_window is not None:
         try:
@@ -176,21 +176,13 @@ def request_native_attention(
             window_attention = "launcher"
         except Exception as exc:
             log.debug("Native window attention failed: %s", exc)
-    if not sound:
+    if not sound or IS_MACOS:
         if window_attention:
             return {"ok": True, "status": "window_only", "sound_played": False,
                     "window_attention": window_attention}
         return {"ok": False, "status": "unsupported", "reason": "no_window_attention"}
     try:
-        if IS_MACOS:
-            path = "/System/Library/Sounds/Glass.aiff"
-            if not pathlib.Path(path).is_file():
-                raise FileNotFoundError(path)
-            proc = subprocess.run(["/usr/bin/afplay", path], check=False,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-            if proc.returncode:
-                raise RuntimeError(f"sound_exit_{proc.returncode}")
-        elif IS_WINDOWS:
+        if IS_WINDOWS:
             import winsound
             winsound.MessageBeep(winsound.MB_ICONASTERISK)
         elif IS_LINUX and (command := shutil.which("canberra-gtk-play")):
@@ -261,13 +253,13 @@ _KERNEL_LOCK_TIER: dict = {}  # lock directory -> (kernel locks enforced there, 
 _KERNEL_LOCK_TIER_LOCK = threading.Lock()  # one probe per directory, one verdict for every thread
 
 
-def kernel_file_locks_enforced(lock_path: pathlib.Path) -> bool:
-    """Probe and cache kernel-lock capability per directory, never on a live refusal.
-
-    Unprobeable directories stay enforced and retry later; unsupported/ENOLCK
-    select the recorded name-only tier. See ARCHITECTURE §1 "Platform substrate"."""
+def kernel_file_locks_enforced(lock_path: pathlib.Path, *, known: Optional[tuple] = None) -> bool:
+    """Probe/cache per directory; restore ``known=(tier, errno)`` after mount validation,
+    or ``(None, None)`` to recheck. Unprobeable paths retry; unsupported/ENOLCK use name locking."""
     directory = os.path.realpath(str(pathlib.Path(lock_path).parent))
     with _KERNEL_LOCK_TIER_LOCK:
+        if known is not None:
+            _KERNEL_LOCK_TIER[directory] = known
         tier, refused = _KERNEL_LOCK_TIER.get(directory, (None, None))
         if tier is None:
             probe = os.path.join(directory, f".kernel-lock-probe.{os.getpid()}.{time.time_ns()}")
@@ -289,7 +281,7 @@ def kernel_file_locks_enforced(lock_path: pathlib.Path) -> bool:
                 except OSError:
                     log.debug("Kernel-lock probe %s left behind", probe, exc_info=True)
             if not tier:
-                log.warning("No kernel file locks under %s (errno %s): locks there use the name protocol only", directory, refused)
+                log.warning("Name-only locks under %s (errno %s)", directory, refused)
             _KERNEL_LOCK_TIER[directory] = (tier, refused)
     return tier
 

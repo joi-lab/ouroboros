@@ -358,6 +358,13 @@ def _target_lacks_store(sha: str) -> bool:
 
 def checkout_and_reset(branch: str, reason: str = "unspecified",
                        unsynced_policy: str = "ignore") -> Tuple[bool, str]:
+    receipt = _bootstrap_receipt()
+    if reason == "bootstrap" and receipt and receipt.get("branch") == branch:
+        if receipt == _bootstrap_snapshot():
+            _record_checkout_facts({"current_branch": branch, "current_sha": receipt["head"]},
+                                   invalidate_bootstrap=False)
+            return True, "unchanged bootstrap"
+    _forget_bootstrap_receipt()
     before_head = _go().git_capture(["git", "rev-parse", "HEAD"])[1].strip()
     managed_meta = _go()._read_managed_repo_meta()
     fetch_remote = ""
@@ -622,6 +629,10 @@ def import_test() -> Dict[str, Any]:
         log.info("Skipping import_test in frozen (PyInstaller) mode — modules are bundled.")
         return {"ok": True, "skipped": "frozen"}
 
+    before = _bootstrap_snapshot()
+    if before and before == _bootstrap_receipt():
+        return {"ok": True, "skipped": "unchanged_bootstrap"}
+    _forget_bootstrap_receipt()
     r = subprocess.run(
         [sys.executable, "-c", "import ouroboros, ouroboros.agent; print('import_ok')"],
         cwd=str(_go().REPO_DIR),
@@ -629,6 +640,12 @@ def import_test() -> Dict[str, Any]:
     )
     if r.returncode != 0:
         _forget_dependency_fingerprint()  # a broken environment is re-synced next time, never skipped
+    elif before and before == _bootstrap_snapshot():
+        from ouroboros.utils import atomic_write_json
+        try:
+            atomic_write_json(_bootstrap_receipt_path(), before)
+        except OSError:
+            log.warning("Bootstrap receipt not recorded; the next boot verifies again", exc_info=True)
     return {"ok": (r.returncode == 0), "stdout": r.stdout, "stderr": r.stderr,
             "returncode": r.returncode}
 
@@ -750,10 +767,14 @@ def safe_restart(
     return False, "Both branches failed import (dev and stable)"
 
 
-def _record_checkout_facts(facts: dict) -> None:
+def _record_checkout_facts(facts: dict, *, invalidate_bootstrap: bool = True) -> None:
     """Field-update the checkout projection (#1307): never a stale whole-state write."""
     from supervisor.state import StateUnavailable
 
+    if invalidate_bootstrap:
+        # Restore and managed rollback also reach this seam, including a reset
+        # back to the same HEAD. They must never inherit an earlier smoke receipt.
+        _forget_bootstrap_receipt()
     try:
         _go().update_state(lambda live: live.update(facts))
     except StateUnavailable:
@@ -780,3 +801,68 @@ def _dependency_fingerprint(req_path, cmd):
              "environment": {key: os.environ.get(key, "") for key in
                              ("PYTHONUSERBASE", "PIP_TARGET", "PIP_PREFIX", "PIP_USER", "PIP_CONFIG_FILE", "VIRTUAL_ENV")}}
     return hashlib.sha256(json.dumps(facts, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _bootstrap_receipt_path() -> pathlib.Path:
+    return _go().DRIVE_ROOT / "state" / "git_bootstrap.json"
+
+
+def _bootstrap_receipt() -> dict:
+    from ouroboros.utils import read_json_dict
+    return read_json_dict(_bootstrap_receipt_path()) or {}
+
+
+def _forget_bootstrap_receipt() -> None:
+    # Invalidation must finish before a tree mutation can reuse the same HEAD.
+    _bootstrap_receipt_path().unlink(missing_ok=True)
+
+
+def _bootstrap_snapshot() -> Optional[dict]:
+    """Current clean checkout and dependency identity; unknown/active work is no proof.
+
+    Transaction markers (including corrupt ones) force the ordinary bootstrap.
+    Reads are addressed; no history or remote fetch participates in the proof.
+    The receipt this snapshot is compared with is written only by a successful
+    import smoke; a failed or interrupted smoke certifies no later boot.
+    """
+    import json
+    from supervisor.update_merge import UPDATE_TX_MARKER_NAME
+    from ouroboros.body_adoption import holds_checkout
+
+    try:
+        repo, drive = _go().REPO_DIR, _go().DRIVE_ROOT
+        if (_go()._bootstrap_pin_marker_path().exists() or _go()._update_intent_marker_path().exists()
+                or holds_checkout(drive, repo)):
+            return None
+        git_dir = _go()._git_dir()
+        if git_dir.is_file():
+            rc, path, _ = _go().git_capture(["git", "rev-parse", "--absolute-git-dir"])
+            if rc or not path:
+                return None
+            git_dir = pathlib.Path(path.strip())
+        if any((git_dir / name).exists() for name in
+               (_go().BOOTSTRAP_PIN_MARKER_NAME, _go().UPDATE_INTENT_MARKER_NAME,
+                UPDATE_TX_MARKER_NAME, "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
+                "rebase-apply", "rebase-merge", "sequencer")):
+            return None
+        campaign_path = drive / "state" / "evolution_campaign.json"
+        if campaign_path.exists():
+            campaign = json.loads(campaign_path.read_text(encoding="utf-8"))
+            tx = campaign.get("active_transaction")
+            if campaign.get("status") in {"active", "paused"} and isinstance(tx, dict) and not tx.get("commit_sha"):
+                return None
+        rc, dirty, _ = _go().git_capture(["git", "status", "--porcelain"])
+        if rc or dirty:
+            return None
+        rc, head, _ = _go().git_capture(["git", "rev-parse", "HEAD"])
+        if rc or not head:
+            return None
+        rc, branch, _ = _go().git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        if rc or not branch:
+            return None
+        cmd, _, requirements = _dependency_install_plan(repo)
+        return {"schema_version": 1, "repo": str(repo.resolve()), "head": head.strip(),
+                "branch": branch.strip(), "dependencies": _dependency_fingerprint(requirements, cmd)}
+    except Exception:
+        log.debug("Bootstrap identity unavailable; running the ordinary checks", exc_info=True)
+        return None

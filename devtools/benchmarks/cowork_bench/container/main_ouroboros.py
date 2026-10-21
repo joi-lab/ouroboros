@@ -206,7 +206,7 @@ def classify_outcome(result: Mapping[str, Any], truncation_codes: list[str]) -> 
 
     ``completed`` means the agent ended its work voluntarily, which is exactly the reference
     engines' ``success`` ("the model ended its turn"); the benchmark's evaluator, not the
-    acceptance panel, then judges the side effects. A runtime rail (round cap, budget, local
+    result review, then judges the side effects. A runtime rail (round cap, budget, local
     deadline) is the benchmark's ``max_turns_reached``. Provider/transport death is ``failed``
     AND flagged ``infra_failed`` so the launcher may re-run it without touching genuine misses.
     """
@@ -407,7 +407,8 @@ def collect_audit_artifacts(task_root: pathlib.Path, task_id: str, secrets: list
                   "print(json.dumps(read_document(sys.argv[1], sys.argv[2])))")
         try:
             dumped = subprocess.run([OUROBOROS_PYTHON, "-c", reader, OUROBOROS_DATA, task_id], cwd=OUROBOROS_SRC,
-                                    capture_output=True, text=True, timeout=60)
+                                    capture_output=True, text=True, timeout=60,
+                                    env={**os.environ, "OUROBOROS_DATA_DIR": OUROBOROS_DATA})  # read as that install
         except (OSError, subprocess.SubprocessError):
             dumped = None
         if dumped is not None and dumped.returncode == 0 and dumped.stdout.strip() not in ("", "null"):

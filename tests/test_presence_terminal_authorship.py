@@ -35,14 +35,16 @@ def _run_loop(root, monkeypatch, responses, *, held=False, presence=None):
         calls.append(1)
         return next(responses), 0.0
 
-    def review(**_kw):
+    def review(*_a, **_kw):
+        # The host's delivery step (``review_result.result_review_at_delivery``); ``held`` holds the
+        # model's candidate there while a new owner constraint arrives.
         if held:
             held_origins.append(registry._ctx._accumulated_usage.get("terminal_origin"))
             registry._ctx._owner_directives = [{"content": "A new material constraint"}]
         return held
 
     monkeypatch.setattr(loop, "call_llm_with_retry", respond)
-    monkeypatch.setattr(loop, "_run_task_acceptance_review_once", review)
+    monkeypatch.setattr("ouroboros.tools.review_result.result_review_at_delivery", review)
     text, usage, trace = loop.run_llm_loop(
         [{"role": "user", "content": "Please help"}], registry,
         SimpleNamespace(default_model=lambda: "test-model"), root / "logs",

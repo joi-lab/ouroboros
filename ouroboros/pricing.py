@@ -80,7 +80,8 @@ def get_pricing(
     provider = str(provider or "").strip().lower()
     if provider not in {"openrouter", "cloudru"} or (model and provider != "openrouter"):
         return {}
-    model = normalize_model_identity(model) if model else ""
+    exact = str(model or "").strip()  # the slug the endpoints API names; the cache keys its identity
+    model = normalize_model_identity(exact) if exact else ""
     key = (provider, model) if model else provider
     with _pricing_lock:
         cached = dict(_cached_pricing.get(key, {}))
@@ -92,7 +93,7 @@ def get_pricing(
             return {} if model and not fresh else cached
         _pricing_fetch_in_progress.add(key)
     try:
-        rows = _fetch_live_rows(provider, model) if model else _fetch_live_rows(provider)
+        rows = _fetch_live_rows(provider, exact) if model else _fetch_live_rows(provider)
     except Exception as exc:
         log.warning("Failed to fetch %s pricing catalog: %s", provider, exc)
         rows = {}
@@ -152,7 +153,7 @@ def estimate_cost_optional(model: str, prompt_tokens: int, completion_tokens: in
         mode = {"standard": "default", "fast": "priority"}.get(processing_mode, processing_mode)
         if route != "openrouter" or mode not in {"default", "priority", "flex"}:
             return None
-        endpoints = get_pricing(provider=route, model=normalized, allow_live_fetch=allow_live_fetch)
+        endpoints = get_pricing(provider=route, model=raw_model, allow_live_fetch=allow_live_fetch)
         # A bound over all published tier-eligible routes, not a quote from an
         # endpoint we did not select. Retain unhealthy rows: health can change
         # during dispatch without invalidating the tariff we must reserve for.

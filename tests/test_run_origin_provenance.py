@@ -11,7 +11,6 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from tests._store_shared import seed_result
 
 
 def _presence_metadata(**event_extra):
@@ -251,7 +250,7 @@ def test_transcript_fallback_only_without_a_collector_and_never_as_owner(tmp_pat
     assert projected.startswith("[image ref sha256:") and "owner" not in projected
 
 
-# --- the door's stamps ride a promoted root; the reviewers read the same record ------
+# --- the door's stamps ride a promoted root; its persisted record reads the same origin
 
 @pytest.mark.parametrize("stamp", ["logged-ref", "suppressed-log", "none"])
 def test_the_promote_handler_carries_either_door_stamp_onto_the_root(tmp_path, tmp_path_factory, monkeypatch, stamp):
@@ -298,55 +297,21 @@ def test_the_promote_handler_carries_either_door_stamp_onto_the_root(tmp_path, t
         "logged-ref": (ref, None), "suppressed-log": (None, True), "none": (None, None),
     }[stamp]
 
-    # The running-record writer persists the producer's `source`, so the acceptance
-    # packet (persisted record under live metadata) and the synthesis (the live task)
-    # project one and the same origin. A writer that drops `source` fails here.
+    # The running-record writer persists the producer's `source`, so a reader of the persisted
+    # record under the live metadata (the owner card's host facts, ``core_artifacts._quiz_host_facts``)
+    # and the synthesis (the live task) project one and the same origin. A writer that drops
+    # `source` fails here.
     from ouroboros.agent import OuroborosAgent
-    from ouroboros.review_evidence import build_task_acceptance_evidence
+    from ouroboros.task_results import load_task_result
 
     OuroborosAgent._persist_running_record(SimpleNamespace(env=SimpleNamespace(drive_root=tmp_path)), task)
     live_metadata = {**task["metadata"], **({"origin_message_ref": ref} if stamp == "logged-ref" else {})}
-    ctx = SimpleNamespace(task_contract={}, task_metadata=live_metadata, current_task_type="task",
-                          drive_root=str(tmp_path), task_id=task["id"], repo_dir=str(tmp_path))
-    packet = build_task_acceptance_evidence(ctx, llm_trace={"tool_calls": []}, drive_root=tmp_path, task_id=task["id"])
-    assert packet["run_origin"] == run_origin({**task, "metadata": live_metadata})
-    assert packet["run_origin"]["source"] == "promote_chat_to_task"
-
-
-def test_the_acceptance_packet_reads_the_origin_from_the_persisted_record(tmp_path):
-    """The acceptance reviewer and the post-task synthesis read one origin: the
-    packet folds the persisted task record (``source``, ``delegation_role``, the
-    parent) under the live metadata, and a missing record still leaves the
-    metadata-derived facts in the packet."""
-    from ouroboros.review_evidence import build_task_acceptance_evidence
-
-    results = tmp_path / "task_results"
-    results.mkdir()
-    seed_result(tmp_path, "acc", {
-        "_schema_version": 1, "task_id": "acc", "status": "running", "type": "task",
-        "source": "promote_chat_to_task", "delegation_role": "root", "parent_task_id": "",
-    })
-    ctx = SimpleNamespace(task_contract={}, task_metadata={"origin_message_ref": dict(OWNER_REF)},
-                          drive_root=str(tmp_path), task_id="acc", repo_dir=str(tmp_path))
-
-    ev = build_task_acceptance_evidence(ctx, llm_trace={"tool_calls": []}, drive_root=tmp_path, task_id="acc")
-    assert ev["__provenance__"]["run_origin"] == "host_attested"
-    assert (ev["run_origin"]["owner_ingress"], ev["run_origin"]["source"], ev["run_origin"]["delegation_role"]) == (
-        True, "promote_chat_to_task", "root")
-
-    ctx.task_id = "absent"
-    ev = build_task_acceptance_evidence(ctx, llm_trace={"tool_calls": []}, drive_root=tmp_path, task_id="absent")
-    assert ev["run_origin"]["owner_ingress"] is True and "source" not in ev["run_origin"]
-
-    # A context without live metadata still reads the record's own metadata.
-    seed_result(tmp_path, "stored", {
-        "_schema_version": 1, "task_id": "stored", "status": "running", "type": "task",
-        "source": "presence_promote", "metadata": {"initiator": "presence", "origin_suppressed": True},
-    })
-    bare = SimpleNamespace(task_contract={}, task_metadata={}, drive_root=str(tmp_path), task_id="stored", repo_dir=str(tmp_path))
-    ev = build_task_acceptance_evidence(bare, llm_trace={"tool_calls": []}, drive_root=tmp_path, task_id="stored")
-    assert (ev["run_origin"]["owner_ingress"], ev["run_origin"]["initiator"], ev["run_origin"]["source"]) == (
-        True, "presence", "presence_promote")
+    stored = load_task_result(tmp_path, task["id"])
+    persisted = run_origin({**stored, "metadata": {**(stored.get("metadata") or {}), **live_metadata}})
+    live = run_origin({**task, "metadata": live_metadata})
+    # The record carries no task type (its readers take the live one); every other fact is the same.
+    assert persisted == {key: value for key, value in live.items() if key != "task_type"}
+    assert persisted["source"] == "promote_chat_to_task"
 
 
 @pytest.mark.parametrize("label", ["initial_user", "initial_text"])

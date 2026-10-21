@@ -137,12 +137,25 @@ export function mergeAccountResources(snapshot, envelope, target = null, { prefe
                 .every(name => merged[name] === held[name]) ? held : merged];
         } else if (!incoming && held && preferPreviousOnTie) resources = [held];
     }
-    return {
+    const quota = merge(snapshot.quota, keepQuota ? snapshot.quota : envelope.snapshots, quotaTarget);
+    const absences = merge(snapshot.quota_absences, keepQuota ? snapshot.quota_absences : envelope.absences, quotaTarget);
+    const heldScope = snapshot.availability_scope, incomingScope = envelope.availability_scope;
+    const sameScope = heldScope && incomingScope && ['model', 'requestKind', 'basis'].every(key =>
+        Object.hasOwn(heldScope, key) && Object.hasOwn(incomingScope, key) && heldScope[key] === incomingScope[key]);
+    const retainedQuota = target && quota === snapshot.quota && absences === snapshot.quota_absences;
+    const mixedQuota = target && [...quota, ...absences].some(row => !sameTarget(quotaTarget(row), target));
+    // Scope binds the quota value, never the refresh operation. A new echo
+    // cannot certify retained siblings from another (or unproven) scope.
+    const scope = retainedQuota ? heldScope : (!mixedQuota || sameScope ? incomingScope : undefined);
+    const result = {
         ...snapshot,
-        quota: merge(snapshot.quota, keepQuota ? snapshot.quota : envelope.snapshots, quotaTarget),
-        quota_absences: merge(snapshot.quota_absences, keepQuota ? snapshot.quota_absences : envelope.absences, quotaTarget),
+        quota,
+        quota_absences: absences,
         ...(Array.isArray(resources) ? { resources: merge(snapshot.resources, resources, row => row.target) } : {}),
     };
+    if (scope === undefined) delete result.availability_scope;
+    else result.availability_scope = scope;
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +628,7 @@ export function createClaudexorStatusStore({
             const facets = payload.facets && { ...payload.facets, [FACET_QUOTA]: { ...payload.facets[FACET_QUOTA],
                 observed_at: held.facets?.[FACET_QUOTA]?.observed_at ?? null, stale: true } };
             payload = { ...payload, quota: held.quota, quota_absences: held.quota_absences, resources: held.resources,
+                availability_scope: held.availability_scope,
                 ...(facets ? { facets } : {}) };
         }
         // Agent discovery (reads.catalog) is independent of the operations catalog.

@@ -112,10 +112,10 @@ def list_candidates(data_dir: Optional[Any] = None) -> List[Dict[str, Any]]:
     return _rows(data_dir)
 
 
-def find(owner: str, data_dir: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+def find(owner: str, data_dir: Optional[Any] = None, *, strict: bool = False) -> Optional[Dict[str, Any]]:
     owner = str(owner or "").strip()
-    for row in _rows(data_dir) if owner else []:
-        if row.get("task_id") == owner:
+    for row in _rows(data_dir, strict=strict) if owner else []:
+        if row.get("task_id") == owner and not row.get("retiring"):
             return row
     return None
 
@@ -125,8 +125,10 @@ def context_fact(owner: str = "", data_dir: Optional[Any] = None, *, limit: int 
 
     The mind sees what exists and who owns it, so continuing one is a deliberate
     ``prepare_self_change(resume=...)`` and never an inference from a room or a date.
+    A candidate the GC is retiring is left out: no resume would accept it.
     """
-    rows = sorted(list_candidates(data_dir), key=lambda row: float(row.get("created_at") or 0), reverse=True)
+    rows = sorted((row for row in list_candidates(data_dir) if not row.get("retiring")),
+                  key=lambda row: float(row.get("created_at") or 0), reverse=True)
     shown: List[Dict[str, Any]] = [{
         "id": row.get("candidate_id"), "owner_task": row.get("task_id"), "branch": row.get("branch"),
         "path": row.get("path"), "base": str(row.get("base_sha") or "")[:12],
@@ -141,7 +143,8 @@ def context_fact(owner: str = "", data_dir: Optional[Any] = None, *, limit: int 
 def _select(selector: str, data_dir: Optional[Any] = None) -> Optional[Dict[str, Any]]:
     selector = str(selector or "").strip()
     for row in _rows(data_dir) if selector else []:
-        if selector in (row.get("candidate_id"), row.get("task_id"), row.get("path"), row.get("branch")):
+        if not row.get("retiring") and selector in (
+                row.get("candidate_id"), row.get("task_id"), row.get("path"), row.get("branch")):
             return row
     return None
 
@@ -223,6 +226,8 @@ def _update_row(row: Dict[str, Any], change, data_dir: Optional[Any] = None) -> 
         entries = _wt._load_registry(data_dir, strict=True, op="update_body_candidate")
         for entry in entries:
             if entry.get("kind") == KIND and entry.get("path") == row.get("path"):
+                if entry.get("retiring"):
+                    raise CandidateRefused("CANDIDATE_MISSING", "the candidate is being retired; nothing was changed.")
                 change(entry)
                 _wt._save_registry(entries, data_dir)
                 return dict(entry)
@@ -315,10 +320,13 @@ def live_lineage_processes(results_root: Any, task_id: str) -> List[int]:
         return [-1]
 
 
-def _continuation_predecessor(ctx: Any) -> str:
-    contract = getattr(ctx, "task_contract", None)
+def continuation_predecessor(carrier: Any) -> str:
+    """The host-validated predecessor whose candidate ``prepare`` inherits: the contract's
+    source, or a queued row's admitted pointer before its worker projects it there."""
+    row = carrier if isinstance(carrier, dict) else {}
+    contract = row.get("task_contract") if row else getattr(carrier, "task_contract", None)
     authority = contract.get("predecessor_authority") if isinstance(contract, dict) else None
-    source = authority.get("source") if isinstance(authority, dict) else None
+    source = authority.get("source") if isinstance(authority, dict) else row.get("predecessor_authority_source")
     return str(source.get("task_id") or "").strip() if isinstance(source, dict) else ""
 
 
@@ -326,7 +334,7 @@ def _transfer(ctx: Any, row: Dict[str, Any], owner: str, *, via: str) -> Dict[st
     """Hand a retained candidate to this lineage once its previous owner has ended."""
     previous = str(row.get("task_id") or "")
     if previous == owner:
-        return row
+        return _update_row(row, lambda entry: None)  # recheck retirement even for an explicit self-resume
     if not _owner_is_terminal(ctx, previous):
         raise CandidateRefused(
             "CANDIDATE_OWNER_LIVE",
@@ -492,10 +500,15 @@ def _prepare_locked(ctx: Any, resume: str) -> Dict[str, Any]:
         row = _transfer(ctx, row, owner, via="explicit_resume")
     else:
         row = find(owner)
-        predecessor = _continuation_predecessor(ctx)
+        predecessor = continuation_predecessor(ctx)
         if row is None and predecessor and (inherited := find(predecessor)) is not None \
                 and pathlib.Path(str(inherited.get("path") or "")).is_dir():
-            row = _transfer(ctx, inherited, owner, via="continuation")
+            try:
+                row = _transfer(ctx, inherited, owner, via="continuation")
+            except CandidateRefused as exc:
+                if exc.code != "CANDIDATE_MISSING":
+                    raise
+                # GC won the decision lock after find: continue in a fresh checkout.
         lost_branch = ""
         if row is not None and not pathlib.Path(str(row.get("path") or "")).is_dir():
             # Nothing on disk to lose: start again; the old branch keeps its commits.
@@ -592,9 +605,19 @@ def process_environment(ctx: Any, work_dir: Any, *, source=None) -> Optional[Dic
         return None
     try:
         from ouroboros.settings_integrity import runtime_environ
-        from ouroboros.test_environment import isolated_environment
+        from ouroboros.test_environment import SCRATCH_MARKER, declare_scratch, isolated_environment
 
-        return isolated_environment(candidate.with_name(candidate.name + ".env"), candidate,
+        env_root = candidate.with_name(candidate.name + ".env")
+        try:
+            env_root.mkdir(parents=True)
+        except FileExistsError:
+            # A new process invalidates a prior quiescent observation. An older,
+            # undeclared environment keeps its unknown provenance.
+            if (env_root / SCRATCH_MARKER).is_file() and not (env_root / SCRATCH_MARKER).is_symlink():
+                (env_root / SCRATCH_MARKER).touch()
+        else:
+            declare_scratch(env_root, "body-process")
+        return isolated_environment(env_root, candidate,
                                     source=runtime_environ() if source is None else source)
     except Exception as exc:
         log.warning("candidate process environment unavailable", exc_info=True)
@@ -836,13 +859,13 @@ def retention_verdict(row: Dict[str, Any], *, expired: bool, data_dir: Optional[
         return {"remove": True, "keep_branch": True, "reason": "checkout_missing", "pin": ""}
     if not expired:
         return {"remove": False, "keep_branch": True, "reason": "within_retention", "pin": ""}
-    if _retained_scratch(row):
-        return {"remove": False, "keep_branch": True, "reason": "retained_process_environment", "pin": ""}
     if not _recorded_terminal(str(row.get("task_id") or ""), data_dir):
         # Its owner may still be working, or its record is unreadable: unknown is not ended.
         return {"remove": False, "keep_branch": True, "reason": "owner_not_terminal", "pin": ""}
     if live_lineage_processes(data_dir, str(row.get("task_id") or "")):
         return {"remove": False, "keep_branch": True, "reason": "owner_processes_live", "pin": ""}
+    if _retained_scratch(row, classify=True, data_dir=data_dir):
+        return {"remove": False, "keep_branch": True, "reason": "retained_process_environment", "pin": ""}
     work = unique_work(row)
     if not has_unique_work(work):
         return {"remove": True, "keep_branch": False, "reason": "no_unique_work", "pin": "", "work": work,
@@ -893,18 +916,36 @@ def verdict_holds(row: Dict[str, Any], verdict: Dict[str, Any], *, data_dir: Opt
     return True
 
 
-def _retained_scratch(row: Dict[str, Any]) -> bool:
-    """Unconfirmed nested preflight readers retain both their env and source checkout."""
-    from ouroboros.test_environment import retention_markers
+def _retained_scratch(row: Dict[str, Any], *, classify: bool = False, data_dir=None) -> bool:
+    """Keep a candidate's one quiescent scratch observation on its existing row."""
+    from ouroboros.test_environment import scratch_retention
 
     path = pathlib.Path(str(row.get("path") or ""))
     env_root = path.with_name(path.name + ".env")
-    return env_root.exists() and bool(retention_markers(env_root))
+    previous = row.get("scratch_retention")
+    previous = previous if isinstance(previous, dict) else {}
+    owner = _owner_stamp(row)
+    observed = scratch_retention(env_root, previous=previous.get("observation")
+                                 if previous.get("owner") == owner else None, classify=classify)
+    record = {"owner": owner, "observation": observed}
+    if classify and row.get("kind") == KIND and record != previous:
+        # The walk is outside the lock. Publish only against its exact preview,
+        # including retirement/ownership; update that preview for GC's same-row check.
+        with _wt._ops_lock(_wt._resolve_root(), op="record_scratch_retention"):
+            entries = _wt._load_registry(data_dir, strict=True, op="record_scratch_retention")
+            entry = next((entry for entry in entries if entry == row), None)
+            if entry is None:
+                return True
+            entry["scratch_retention"] = record
+            _wt._save_registry(entries, data_dir)
+            row["scratch_retention"] = record
+    return observed["retained"]
 
 
 def discard_scratch(row: Dict[str, Any]) -> None:
     """Delete reproducible scratch only when no nested teardown retained it."""
     path = pathlib.Path(str(row.get("path") or ""))
     env_root = path.with_name(path.name + ".env")
-    if path.name and _wt._deletable(env_root, _wt._resolve_root()) and env_root.exists() and not _retained_scratch(row):
+    if path.name and _wt._deletable(env_root, _wt._resolve_root()) and env_root.exists() and not _retained_scratch(
+            row, classify=row.get("kind") != KIND):
         _wt._force_rmtree(env_root)

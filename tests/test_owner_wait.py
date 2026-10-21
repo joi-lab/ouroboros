@@ -161,7 +161,7 @@ def test_the_granted_resume_row_records_the_bound_expiry(tmp_path, monkeypatch):
     write_task_result(tmp_path, "root-1", "running")
     wait = {"wait_id": "w1", "task_attempt": 1, "quiz_id": "q1", "source_ref": "ref"}
     set_owner_wait(tmp_path, "root-1", {**wait, "state": "waiting"})
-    worker = SimpleNamespace(in_q=queue.Queue(), busy_task_id="root-1",
+    worker = SimpleNamespace(wid=0, in_q=queue.Queue(), busy_task_id="root-1",
                              proc=SimpleNamespace(pid=7), reaping=False, active_capacity=False)
     meta = {"worker_id": 0, "attempt": 1, "owner_wait": {**wait, "state": "waiting"},
             "task": {"id": "root-1", "chat_id": 1}, "started_at": time.time()}
@@ -174,7 +174,8 @@ def test_the_granted_resume_row_records_the_bound_expiry(tmp_path, monkeypatch):
     assert meta["owner_wait_resume_requested"] is True
     assert meta["owner_wait"]["resume_reason"] == "timeout"
     monkeypatch.setattr(supervisor_wait, "_pool", lambda: pool, raising=False)
-    monkeypatch.setattr(supervisor_wait, "_resume_allowed", lambda *_: True)
+    monkeypatch.setattr(supervisor_wait, "_resume_memory_allowed", lambda *_: True)
+    monkeypatch.setattr(supervisor_wait, "_resume_authority_allowed", lambda *_: True)
     monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda **_kw: True)
     pool.time = SimpleNamespace(time=time.time)
     assert supervisor_wait._grant_resume("root-1", meta, worker) is True

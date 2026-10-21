@@ -186,11 +186,13 @@ def _prompt_settlement(result: Dict[str, Any]) -> bool:
             and str(result.get("delegation_role") or "") == "subagent")
 
 
-def _drive_retention_rows(parent: pathlib.Path, names: List[str], stop: Any) -> Iterable[Tuple[str, Any]]:
+def _drive_retention_rows(parent: pathlib.Path, names: List[str], stop: Any, *,
+                          record: bool = True) -> Iterable[Tuple[str, Any]]:
     """Select only this layout's names in bounded transactions; never hold one across a yield.
 
     A selector/upgrade failure does not become absence: the existing strict reader
     handles each name, preserving missing/quarantined/unreadable-result outcomes.
+    ``record=False`` reads without filling the retention projection (the preview).
     """
     from ouroboros import store
     from ouroboros.task_store import DRIVE_RETENTION_BATCH, drive_retention_facts
@@ -198,22 +200,52 @@ def _drive_retention_rows(parent: pathlib.Path, names: List[str], stop: Any) -> 
     for start in range(0, len(names), DRIVE_RETENTION_BATCH):
         batch = names[start:start + DRIVE_RETENTION_BATCH]
         try:
-            facts = drive_retention_facts(parent, batch, stop=stop)
+            facts = drive_retention_facts(parent, batch, stop=stop, record=record)
         except (store.StoreError, ValueError, TypeError):
             facts = {}
         for task_id in batch:
             yield task_id, facts.get(task_id)
 
 
+def drive_candidates(base: pathlib.Path, parent: pathlib.Path, cutoff: float, stop: Any = None,
+                     *, after: str = "", record: bool = True) -> Iterable[Tuple[str, str, Optional[float], bool, Dict[str, Any]]]:
+    """The selection half the prune and the free-space preview share: every drive folder under
+    BASE in name order (wrapping after AFTER), each with the cheap canonical facts of its task row
+    as ``(task_id, status, drive_retention_at, inside_wait, fact)``. ``inside_wait`` says the
+    row is terminal but its retention instant is after CUTOFF; a missing row yields ``""`` as
+    status and None as the instant (the strict reader decides later). A hint never authorizes
+    removal: the prune re-reads the strict row before any settlement. ``record=False`` (the
+    preview) classifies a legacy row in memory only; the prune fills the projection."""
+    names = sorted(entry.name for entry in base.iterdir() if entry.is_dir())
+    names = [name for name in names if name > after] + [name for name in names if name <= after]
+    for task_id, fact in _drive_retention_rows(parent, names, stop, record=record):
+        status, retention_at, inside = "", None, False
+        usable = fact is not None and fact["body_present"] and fact["drive_retention_at"] is not None
+        if usable:
+            status = str(fact.get("status") or "").lower()
+            raw = fact["drive_retention_at"]
+            retention_at = float(raw) if raw else None
+            if status in _FINAL_STATUSES and not _prompt_settlement(fact):
+                try:
+                    inside = (retention_at if retention_at is not None else (base / task_id).stat().st_mtime) > cutoff
+                except OSError:
+                    inside = False
+        yield task_id, status, retention_at, inside, fact if usable else {}
+
+
 def _prune_drives(base: pathlib.Path, parent: pathlib.Path, *, drive_of: Any, not_terminal: str,
                   retention_days: Optional[int], now: Optional[float], live: Any, guard: Any, stop: Any,
-                  budget: Optional[int], after: str, extra_checks: Any) -> Dict[str, Any]:
+                  budget: Optional[int], after: str, extra_checks: Any, rested: Optional[Dict] = None,
+                  only: Optional[Any] = None, progress: Any = None) -> Dict[str, Any]:
     """The prune both layouts share: cheap per-name facts select possible work;
     fresh strict canonical status/date and existing checks still decide eligibility.
     Settlement through ``task_custody.settle_child_drive`` runs in name order after ``after`` (wrapping), at
-    most ``budget`` attempts per call; ``cursor`` is the last attempted drive, ``deferred`` the unreached rest."""
+    most ``budget`` attempts per call; ``cursor`` is the last attempted drive, ``deferred`` the unreached rest;
+    ``rested`` the caller's durable verdicts (``task_custody.rested_verdict``), updated in place. ``only``
+    restricts the pass to those task ids (the free action's previewed folders; every other drive is untouched);
+    ``progress`` is called with the report after each settlement attempt."""
     from ouroboros.retention import age_cutoff
-    from ouroboros.task_custody import settle_child_drive
+    from ouroboros.task_custody import forget_departed, record_rest, rested_verdict, settle_child_drive
 
     days = _resolve_retention_days(retention_days)
     cutoff = age_cutoff(days, now)
@@ -221,27 +253,28 @@ def _prune_drives(base: pathlib.Path, parent: pathlib.Path, *, drive_of: Any, no
                               "deferred": [], "cursor": after}
     if not base.is_dir():
         return report
-    names = sorted(entry.name for entry in base.iterdir() if entry.is_dir())
-    names = [name for name in names if name > after] + [name for name in names if name <= after]
+    chosen = None if only is None else {str(task_id) for task_id in only}
+    forget_departed(rested, base.name, [entry.name for entry in base.iterdir() if entry.is_dir()])
     attempts = 0
-    for task_id, fact in _drive_retention_rows(parent, names, stop):
+    for task_id, status, _retention_at, inside_wait, fact in drive_candidates(base, parent, cutoff, stop, after=after):
+        if chosen is not None and task_id not in chosen:
+            continue
         task_dir = base / task_id
         report["scanned"] += 1
         try:
             validate_task_id(task_id)
-            if fact is not None and fact["body_present"] and fact["drive_retention_at"] is not None:
-                status = str(fact.get("status") or "").lower()
+            if fact:
                 if status not in _FINAL_STATUSES:
                     report["skipped"].append({"task_id": task_id, "reason": not_terminal, "status": status})
                     continue
-                if not _prompt_settlement(fact):
-                    raw = fact["drive_retention_at"]
-                    timestamp = float(raw) if raw else task_dir.stat().st_mtime
-                    if timestamp > cutoff:
-                        report["skipped"].append({"task_id": task_id, "reason": "younger_than_retention"})
-                        continue
+                if inside_wait:
+                    report["skipped"].append({"task_id": task_id, "reason": "younger_than_retention"})
+                    continue
             if stop is not None and stop():
                 report["deferred"].append(task_id)
+                continue
+            if verdict := rested_verdict(rested, parent, task_id, task_dir, drive_of(task_dir)):
+                report["skipped"].append({"task_id": task_id, "reason": "custody_unchanged", "retained": verdict.get("reason")})
                 continue
             # A hint never authorizes removal. In particular a date changed after
             # selection must be checked here; settlement rechecks custody, not age.
@@ -262,9 +295,12 @@ def _prune_drives(base: pathlib.Path, parent: pathlib.Path, *, drive_of: Any, no
                 continue
             attempts += 1
             report["cursor"] = task_id
-            if settle_child_drive(parent, task_id, drive_of(task_dir), live=live, guard=guard, stop=stop,
-                                  report=report)["status"] == "removed":
+            if (outcome := settle_child_drive(parent, task_id, drive_of(task_dir), live=live, guard=guard, stop=stop,
+                                              report=report))["status"] == "removed":
                 report["pruned"].append({"task_id": task_id, "path": str(task_dir)})
+            record_rest(rested, base.name, parent, task_id, task_dir, drive_of(task_dir), outcome)
+            if progress is not None:
+                progress(report)
         except Exception as exc:
             report["errors"].append({"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"})
     return report
@@ -280,10 +316,15 @@ def prune_headless_task_drives(
     stop: Any = None,
     budget: Optional[int] = None,
     after: str = "",
+    rested: Optional[Dict[str, Any]] = None,
+    only: Optional[Any] = None,
+    progress: Any = None,
 ) -> Dict[str, Any]:
     """Prune terminal child drives past retention (a cancelled subagent's at once). Removal is
     ``task_custody.settle_child_drive``'s decision alone: ``live`` is the supervisor's probe (without it nothing
-    is removed), ``guard`` its interlock, ``stop`` the generation's close, ``budget``/``after`` the pass bound/cursor."""
+    is removed), ``guard`` its interlock, ``stop`` the generation's close, ``budget``/``after`` the pass bound/cursor,
+    ``rested`` the durable verdicts of retained drives, ``only``/``progress`` the free action's selection and
+    progress callback (``_prune_drives``)."""
     parent = pathlib.Path(parent_drive_root)
 
     def checks(task_dir: pathlib.Path, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -298,7 +339,8 @@ def prune_headless_task_drives(
 
     return _prune_drives(parent / HEADLESS_TASKS_DIR, parent, drive_of=lambda task_dir: task_dir / "data",
                          not_terminal="parent_not_terminal", retention_days=retention_days, now=now, live=live,
-                         guard=guard, stop=stop, budget=budget, after=after, extra_checks=checks)
+                         guard=guard, stop=stop, budget=budget, after=after, extra_checks=checks, rested=rested,
+                         only=only, progress=progress)
 
 
 def prune_task_drives(
@@ -311,13 +353,17 @@ def prune_task_drives(
     stop: Any = None,
     budget: Optional[int] = None,
     after: str = "",
+    rested: Optional[Dict[str, Any]] = None,
+    only: Optional[Any] = None,
+    progress: Any = None,
 ) -> Dict[str, Any]:
     """Prune direct-task scratch drives past retention (``settle_child_drive`` decides;
     same knobs as ``prune_headless_task_drives``)."""
     parent = pathlib.Path(parent_drive_root)
     return _prune_drives(parent / TASK_DRIVES_DIR, parent, drive_of=lambda task_dir: task_dir,
                          not_terminal="task_not_terminal", retention_days=retention_days, now=now, live=live,
-                         guard=guard, stop=stop, budget=budget, after=after, extra_checks=lambda *_a: None)
+                         guard=guard, stop=stop, budget=budget, after=after, extra_checks=lambda *_a: None,
+                         rested=rested, only=only, progress=progress)
 
 
 def prune_task_trees(
@@ -567,11 +613,14 @@ def prepare_terminal_task_files(canonical_root: pathlib.Path, task: Dict[str, An
     task_id = str(task.get("id") or task.get("task_id") or "")
     report: Dict[str, Any] = {"task_id": task_id, "result": None, "error": "", "terminal_source_present": None}
     from ouroboros.task_custody import CustodyBusy
+    from ouroboros.install_identity import StoreForeign, require_owned_root
 
     try:
-        root = pathlib.Path(canonical_root)
-        current = load_task_result(root, task_id, strict=True) or {}
+        root = require_owned_root(canonical_root)
         child = _child_drive_from_task(task)
+        if child is not None:
+            require_owned_root(child)
+        current = load_task_result(root, task_id, strict=True) or {}
         cancelled = cancellation_blocks_child_result(current)
         adopted = not cancelled and child is not None and _child_result_adopted(child, current)
         source = current
@@ -592,6 +641,9 @@ def prepare_terminal_task_files(canonical_root: pathlib.Path, task: Dict[str, An
         # Derived inventories need not outlive terminal file adoption.
         if child is not None and child.resolve(strict=False) != root.resolve(strict=False):
             shutil.rmtree(child / "state" / "code_intel", ignore_errors=True)
+    except StoreForeign as exc:
+        report.update(error=str(exc), reason_code=exc.reason, reason_detail=str(exc))
+        log.warning("Terminal file preparation for %s refused: %s", task_id, exc)
     except CustodyBusy as exc:
         # Another publisher (a settlement or copy-back) holds the store: the next attempt
         # completes the same work; nothing failed and no failure is stamped.
@@ -723,8 +775,10 @@ def _build_deliverable_manifest(
     Read/change gaps are disclosed, not delivery failures; actual copies stay strict.
     """
     from ouroboros.artifacts import stream_artifact_file
+    from ouroboros.store import is_wal_index
 
     contents: List[Dict[str, Any]] = []
+    excluded: List[Dict[str, Any]] = []  # a WAL index: shared memory never read, rebuilt from the log
     def failed(exc: OSError) -> None:
         path = pathlib.Path(exc.filename) if exc.filename else workspace_root
         contents.append({"rel": path.relative_to(workspace_root).as_posix(), "type": "directory",
@@ -734,6 +788,9 @@ def _build_deliverable_manifest(
         for fname in sorted(files):
             fpath = pathlib.Path(root) / fname
             entry = {"rel": fpath.relative_to(workspace_root).as_posix()}
+            if is_wal_index(fpath):
+                excluded.append({**entry, "reason": "SQLite WAL index"})
+                continue
             try:
                 if fpath.is_symlink():
                     entry.update(symlink=True, sha256="")
@@ -748,14 +805,15 @@ def _build_deliverable_manifest(
         "project_root": str(workspace_root), "created_at": utc_now_iso(),
         "file_count": sum(item.get("type") != "directory" for item in contents),
         "complete": gap_count == 0, "gap_count": gap_count,
-        "truncated": False, "contents": contents,
+        "truncated": False, "contents": contents, **({"excluded": excluded} if excluded else {}),
     }
 
 
 def _file_artifact(kind: str, path: pathlib.Path, **facts: Any) -> Dict[str, Any]:
-    """One row shape for an artifact written straight into the task artifact dir."""
-    return {"kind": kind, "name": path.name, "path": str(path),
-            "size": path.stat().st_size if path.exists() else 0, **facts}
+    """One row shape for an artifact written straight into the task artifact dir, measured by the one
+    owner as published: retaining the same bytes changes no identity (#1969); producer facts stay."""
+    from ouroboros.artifacts import stream_artifact_file
+    return {"kind": kind, "name": path.name, "path": str(path), **stream_artifact_file(path), **facts}
 
 
 def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any],
@@ -816,8 +874,14 @@ def _finalize_task_artifacts_locked(parent_drive_root: pathlib.Path, task: Dict[
                 manifest,
                 trailing_newline=True,
             )
-            artifacts.append(_file_artifact("workspace_patch_manifest", manifest_path,
-                                            workspace_root=str(workspace_root)))
+            try:
+                row = _file_artifact("workspace_patch_manifest", manifest_path, workspace_root=str(workspace_root))
+            except OSError as unmeasured:  # a read-back fault never replaces the capture failure it records
+                note = f"failure manifest unmeasured: {type(unmeasured).__name__}: {unmeasured}"
+                artifact_error = f"{artifact_error}; {note}"
+                row = {"kind": "workspace_patch_manifest", "name": manifest_path.name, "path": str(manifest_path),
+                       "workspace_root": str(workspace_root), "measured": False, "errors": [note]}
+            artifacts.append(row)
 
     child_drive = _child_drive_from_task(task)
     if child_drive is not None:
@@ -1012,6 +1076,7 @@ __all__ = [
     "finalize_task_artifacts",
     "task_is_readonly_subagent",
     "prepare_task_drive",
+    "drive_candidates",
     "prune_headless_task_drives",
     "prune_task_drives",
     "task_artifacts_dir",

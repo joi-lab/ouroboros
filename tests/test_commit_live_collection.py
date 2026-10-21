@@ -1,4 +1,4 @@
-"""Recorded commit collection joins a live worker; acceptance stays a pure read."""
+"""Recorded commit collection joins a live worker."""
 from __future__ import annotations
 
 import copy
@@ -269,26 +269,6 @@ def test_live_rejoin_uses_remaining_original_window_and_does_not_refresh_it(live
     assert f.entry.logical_deadline == deadline
     assert not f.entry.event.is_set()
     assert len(f.calls) == 1
-
-
-def test_pure_acceptance_collection_does_not_wait_for_live_worker(live, monkeypatch):
-    f = live
-    request = replace(f.request, surface="task_acceptance")
-    key = custody._attempt_key(request, f.slot)
-    monkeypatch.setitem(custody._ACTIVE, key, f.entry)
-    run = dict(request=asdict(request), slot_roster=[asdict(f.slot)], actors=[copy.deepcopy(f.row)])
-
-    def no_runner(*_a, **_kw):
-        pytest.fail("pure acceptance collection entered the waiting runner")
-
-    monkeypatch.setattr("ouroboros.review_substrate.run_review_request", no_runner)
-    try:
-        result = operation.collect_recorded_acceptance_run(run, drive_root=f.ctx.drive_root, usage_ctx=f.ctx)
-        assert result.collection["facts"] == {f.slot.slot_id: "deferred"}
-        assert result.actors[0]["operation_id"] == f.entry.operation_id
-        assert not f.entry.event.is_set()
-    finally:
-        custody._ACTIVE.pop(key)
 
 
 @pytest.mark.parametrize("stop", ["cancel", "panic"])

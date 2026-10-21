@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros import context_compaction, loop, usage_accounting as ua
+from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY, OWNER_WORDS_KIND
 from ouroboros.artifacts import read_actor_source_bytes
 from ouroboros.tools.registry import ToolRegistry
 from tests.test_context_fit_integration import _plan
@@ -28,8 +29,6 @@ def main_loop(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_MAX_ROUNDS", "12")
     monkeypatch.setenv("MCP_ENABLED", "false")
     monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_args: False)
-    monkeypatch.setattr(context_compaction, "_call_summarizer",
-                        lambda *a, **kw: pytest.fail("Authored views must not call a helper model"))
     registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
     registry._ctx.repo_dir.mkdir()
     registry._ctx.context_fit_plan = _plan(preferred="max", window=900_000)
@@ -129,7 +128,9 @@ def test_retelling_instructions_and_authored_account_reach_next_send(main_loop, 
 
     def compact(kwargs):
         inspected = json.loads(next(m["content"] for m in kwargs["messages"] if m.get("tool_call_id") == "inspect"))
-        restored.update(next(unit["restore_ref"] for unit in inspected["units"] if unit["kind"] == "tool"))
+        unit = next(unit for unit in inspected["units"] if unit["kind"] == "tool")
+        restored.update({"checkpoint_ref": inspected["restore_checkpoint"], "unit_id": unit["unit_id"],
+                         "raw_sha256": unit["raw_sha256"]})
         return call("compact_context", {"working_note": note, "keep_unit_ids": []}, "compact")
 
     def restore(kwargs):
@@ -298,25 +299,28 @@ def test_main_fit_reports_known_pressure_without_rejecting_useful_shrink(tmp_pat
 
     monkeypatch.setattr(capability_evidence, "resolve_main_token_density", lambda *a, **kw: (1.0, "cold_estimate"))
     plan = _plan(preferred="max", window=100)
-    observed = [*plan.messages_for("max"), {"role": "user", "content": "Full owner requirement. " * 200},
+    observed = [*plan.messages_for("max"), {"role": "user", HOST_CONTEXT_KIND_KEY: OWNER_WORDS_KIND,
+                                            "content": "Full owner requirement. " * 200},
                 call("read_file", {}, "read"), {"role": "tool", "tool_call_id": "read", "content": "raw " * 2000}]
     request = ContextReclaimRequest("route", "round", context_compaction.context_reclaim_transcript_sha256(observed),
         "cold_estimate", 1.0, 0, working_note="I understood the source.",
         expected_view_revision=context_compaction.context_reclaim_transcript_sha256(observed), keep_unit_ids=())
     fit = lambda messages, tools: _measure_main_context_view(plan, messages, tools, "max", "high", "1")
-    owner_words = ("Full owner requirement. " * 200,)  # what the loop passes from the typed owner corpus
-    candidate, receipt, usage = context_compaction.compact_tool_history_llm(
+    candidate, receipt = context_compaction.compact_tool_history_llm(  # the owner's row is typed at delivery
         observed, request=request, observed_messages=observed, tool_schemas=[], fit_candidate=fit,
-        drive_root=tmp_path, task_id="large-main", protected_texts=owner_words)
-    assert receipt.status == "applied" and receipt.reclaimed_tokens > 0 and usage is None
+        drive_root=tmp_path, task_id="large-main")
+    assert receipt.status == "applied" and receipt.reclaimed_tokens > 0
     assert receipt.fit["accepted"] and receipt.fit["predicted_capacity_miss"]
     assert receipt.fit["strict_bound_proven"] is False
     assert candidate[:3] == observed[:3]  # the owner's words stay whole under keep_unit_ids=()
-    untyped, untyped_receipt, _ = context_compaction.compact_tool_history_llm(
-        observed, request=request, observed_messages=observed, tool_schemas=[], fit_candidate=fit,
+    legacy = [*observed[:2], {"role": "user", "content": observed[2]["content"]}, *observed[3:]]  # delivered untyped
+    legacy_request = replace(request, transcript_sha256=context_compaction.context_reclaim_transcript_sha256(legacy),
+                             expected_view_revision=context_compaction.context_reclaim_transcript_sha256(legacy))
+    untyped, untyped_receipt = context_compaction.compact_tool_history_llm(
+        legacy, request=legacy_request, observed_messages=legacy, tool_schemas=[], fit_candidate=fit,
         drive_root=tmp_path, task_id="large-main")
-    assert untyped_receipt.status == "applied" and untyped[:2] == observed[:2]
-    assert untyped[2] != observed[2]  # an untyped host prose row is an addressable dialogue unit (3A)
+    assert untyped_receipt.status == "applied" and untyped[:2] == legacy[:2]
+    assert untyped[2] != legacy[2]  # an untyped row is an addressable dialogue unit the mind may fold (3A)
     unknown = _measure_main_context_view(replace(plan, status="unknown"), candidate, [], "max", "high", "1")
     assert unknown["accepted"] and unknown["capacity_total_tokens"] is None
     unbound = _measure_main_context_view(None, candidate, [], "max", "high", "1")

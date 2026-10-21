@@ -653,6 +653,10 @@ def test_external_restart_reexecs_current_source_after_sync_in_same_process(tmp_
     monkeypatch.setattr(launcher, '_external_seed_bundle', tmp_path / 'seed')
     monkeypatch.setattr(launcher, 'REPO_DIR', tmp_path / 'repo')
     monkeypatch.setattr(launcher, '_launch_argv', ['--no-ui', '--seed-bundle', str(tmp_path / 'seed')])
+    if not packaged:
+        # Source-seed hosts carry the immutable seed's version too.
+        (tmp_path / 'seed').mkdir()
+        (tmp_path / 'seed' / 'VERSION').write_text('4.50.0-rc.2\n', encoding='utf-8')
     if packaged:
         seed = tmp_path / 'seed'
         _write_bundle(_make_bundle_source(tmp_path), seed)
@@ -670,6 +674,9 @@ def test_external_restart_reexecs_current_source_after_sync_in_same_process(tmp_
         (repo / 'ouroboros' / 'launcher_server_reaper.py').write_text('GEN = 1\n')
         _run(['git', 'add', '-A'], cwd=repo)
         _run(['git', 'commit', '-m', 'loaded helper'], cwd=repo)
+        # This fixture's synthetic frozen helper is from this commit, newer than
+        # the seed it originally cloned. Record that actual loaded generation.
+        monkeypatch.setattr(bootstrap_module, '_LOADED_CHECKOUT_SHA', _git_output(repo, 'rev-parse', 'HEAD'))
 
     def start_agent(port):
         calls.append('core')

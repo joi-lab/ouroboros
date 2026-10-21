@@ -8,6 +8,7 @@ import types
 import pytest
 
 from ouroboros.preflight_runner import LANE_EXCLUSION_EXPR, PARALLEL_PASS_FLAGS
+from ouroboros.safe_test_supervisor import _GRACE_SEC as SAFE_TEST_INT_WINDOW_SEC
 from tests import conftest
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -73,7 +74,7 @@ def test_default_mode_is_one_run_over_both_lanes(run_tests, monkeypatch, standal
     assert all(flag in command for flag in untouched)
 
 
-def test_the_worker_override_steers_xdist_like_the_gate(run_tests, monkeypatch, standalone_budget):
+def test_the_worker_override_steers_xdist_like_the_gate(run_tests, monkeypatch, standalone_budget, capsys):
     from ouroboros import process_containment
 
     seen = {}
@@ -95,7 +96,9 @@ def test_the_worker_override_steers_xdist_like_the_gate(run_tests, monkeypatch, 
             seen["closed"] = True
 
     monkeypatch.setattr(process_containment, "ProcessContainer", Owner)
-    assert run_tests._run("x", [run_tests.sys.executable, "-m", "pytest"], run_tests.REPO) == 0
+    assert run_tests._run("x", [run_tests.sys.executable, "-m", "pytest", "-n", "8"], run_tests.REPO) == 0
+    assert seen["argv"][-2:] == ["-n", "3"]
+    assert "=== x: pytest -n 3\n" in capsys.readouterr().out
     assert seen["env"]["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "3"
     assert seen["env"]["OURO_TEST_WORKER_BUDGET"] == "3"
     assert seen["options"] == {"lifeline": True, "overload": True}
@@ -120,10 +123,18 @@ def test_runner_never_greens_an_overload_or_interrupt(
         def spawn(self, *args, **kwargs):
             return self
 
-        def wait(self, **kwargs):
-            if interrupted and not kwargs:
+        def wait(self, timeout=None):
+            if interrupted and timeout is None:
                 raise KeyboardInterrupt
+            events.extend([f"wait {timeout}"] if timeout is not None else [])
             return 0
+
+        def interrupt_root(self):
+            events.append("interrupted")
+            return True
+
+        def terminate_tree(self, grace):
+            events.append(f"terminate {grace}")
 
         def reap(self):
             events.append("reaped")
@@ -134,7 +145,10 @@ def test_runner_never_greens_an_overload_or_interrupt(
 
     monkeypatch.setattr(process_containment, "ProcessContainer", Owner)
     assert run_tests._run("x", [run_tests.sys.executable, "-c", "pass"], REPO) == expected
-    assert events == ["reaped", "closed"]
+    # The export wait and TERM grace are allotted inside safe_test's window; its deadline bounds the reap.
+    assert run_tests._INTERRUPT_EXPORT_SEC + run_tests._INTERRUPT_TERM_SEC < SAFE_TEST_INT_WINDOW_SEC
+    stop = ["interrupted", "wait 7", "terminate 2"] if interrupted else []
+    assert events == [*stop, "reaped", "wait 5", "closed"]
     if diagnostic:
         assert diagnostic in capsys.readouterr().err
 
@@ -213,6 +227,7 @@ def test_sequential_with_pytest_arguments_is_refused(run_tests, monkeypatch):
 
 
 def test_a_bare_call_never_means_a_subset(run_tests, monkeypatch):
+    monkeypatch.delenv("OUROBOROS_TEST_EVIDENCE_ROOT", raising=False)
     calls = []
     monkeypatch.setattr(run_tests, "_node_lane", lambda: 0)
     monkeypatch.setattr(run_tests, "_run", lambda label, argv, cwd: calls.append((label, argv)) or 0)

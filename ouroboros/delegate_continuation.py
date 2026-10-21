@@ -1,4 +1,4 @@
-"""Continuation of a settled delegated run: ``delegate_start``'s ``continue_from=<run_id>``.
+"""Continuation of a finished delegated run: ``delegate_start``'s ``continue_from=<run_id>``.
 
 A delegated run stops for many reasons — its wall-clock cap, a vendor
 subscription limit, a crash of the harness or of this host, a cancel, a
@@ -18,14 +18,14 @@ definite no-run):
    root the owner's Continue created from the run's tree root (the recorded
    ``continued_by`` binding, ``owner_continue.recorded_continuation``); room or
    folder equality grants nothing, and a review panel's run is never a task's;
-2. settled — the run has a settled terminal and no successor already continues
-   it (one writer at a time);
+2. terminal — the run's terminal is observed (its money may still settle) and no
+   successor already continues it (one writer at a time);
 3. no pending-ambiguous apply — an apply intent without a disposition means
    the tree MAY already carry its patch;
 4. authority does not widen — native access is not wider than the run's
    recorded access, and a writing run writes for the target the old run held.
 
-Everything else is a FACT, never a refusal: the cause (any settled cause), an
+Everything else is a FACT, never a refusal: the cause (any terminal cause), an
 unread result, the patch disposition, another actor, route or configuration, a
 changed or partially verified work order. The facts reach the parent in the
 started payload and the continuing child in its PROMPT
@@ -157,7 +157,7 @@ def still_continuable(drive: Any, entry: Any, live_task_ids=None) -> bool:
     root = entry.root_task_id or entry.task_id
     pending, seen = [entry.task_id, root], set()
     try:
-        local_queue = queue.INITIALIZED and Path(queue.DRIVE_ROOT).resolve() == Path(drive).resolve()
+        local_queue = queue.owns_live_queue(drive)
         if local_queue:
             with queue._queue_lock:
                 live.update(str(row.get('id') or '') for row in queue.PENDING)
@@ -229,9 +229,9 @@ def bind_continuation(ctx: Any, drive: Any, run_id: str, *, actor: Dict[str, Any
             + (" (a review panel's run)" if entry.review_owned else "")
             + ", and this task is neither its owner, its confirmed retry successor, nor a root the "
             "owner's Continue created from its task tree.")
-    if not entry.settled or not entry.terminal_state:
+    if entry.terminal_state not in custody.TERMINAL_STATES:  # execution ended; money may still be pending (#1969)
         return {}, REFUSAL_SOURCE_NOT_TERMINAL, (
-            f"Run {rid} has no settled terminal on its custody rows (state {entry.terminal_state or 'unsettled'!r}): "
+            f"Run {rid} has no observed terminal on its custody rows (state {entry.terminal_state or 'not observed'!r}): "
             "it may still be live. Wait on it with delegate_wait or cancel it and verify the receipt; "
             "never start a second writer over a run that may still be running.")
     if entry.superseded_by:
@@ -256,7 +256,7 @@ def bind_continuation(ctx: Any, drive: Any, run_id: str, *, actor: Dict[str, Any
     needs_disposition = bool(entry.snapshot_id or (
         ref.get("workspace_kind") == "directory" and ref.get("strategy") == "copy"))
     advice: List[str] = []
-    if custody.settled_output_unread(entry):
+    if custody.output_unread(entry):  # read facts, not money
         advice.append("result_unread")
     if (not entry.selected_subagent_id or entry.selected_subagent_id != str(actor.get("selected_subagent_id") or "")
             or entry.route_id != str(getattr(route, "route_id", "") or "")
@@ -423,8 +423,8 @@ def _handover_refusal(drive: Any, row: Dict[str, Any]) -> Dict[str, Any]:
 
     rid, invocation = str(row.get("continuation_of") or ""), str(row.get("invocation_id") or "")
     prior = run(drive, rid)
-    if prior is None or not prior.settled:
-        return {"reason": REFUSAL_SOURCE_NOT_TERMINAL, "detail": f"Run {rid} is no longer a settled run."}
+    if prior is None or prior.terminal_state not in custody.TERMINAL_STATES:
+        return {"reason": REFUSAL_SOURCE_NOT_TERMINAL, "detail": f"Run {rid} has no observed terminal."}
     if prior.superseded_by:
         return {"reason": REFUSAL_SUPERSEDED, "head": prior.superseded_by,
                 "detail": f"Run {rid} was continued by run {prior.superseded_by} meanwhile; continue from it."}

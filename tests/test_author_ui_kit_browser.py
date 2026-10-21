@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from tests import test_widget_stream_download_ui as widget_fixture
+from tests._shared import producer_evidence_dir
 from tests.test_author_ui_kit import EXAMPLE, _copy_installed_runtime
 
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
@@ -339,7 +340,8 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
             failed = _frame(page, "unavailable")
             failed.get_by_text("Controls unavailable: HTTP 503", exact=True).wait_for()
             assert route.get_by_role("button", name="Preview", exact=True).is_visible()
-            evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_OUT", str(tmp_path / "evidence")))
+            evidence = producer_evidence_dir(tmp_path / "evidence", "author-ui-kit",
+                                             env="OUROBOROS_UI_EVIDENCE_OUT")
             evidence.mkdir(parents=True, exist_ok=True)
             page.evaluate("() => window.ouroTheme.set('light')")
             module.locator('html[data-theme="light"]').wait_for(state="attached")

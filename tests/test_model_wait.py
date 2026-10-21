@@ -11,12 +11,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from ouroboros import owner_mailbox as mailbox
-from ouroboros import model_wait
+from ouroboros import dialogue_store, model_wait
 from ouroboros.gateways.claudexor import ClaudexorUnavailable
 from ouroboros.task_results import load_task_result, write_task_result
 from tests.test_llm_claudexor import MODEL, result, ledger, setup as gateway_fixture
 from ouroboros.store import StoreError
 from tests._store_shared import result_signature, seed_result, unreadable_result
+from tests import _dialogue as dialogue_test
 
 setup = gateway_fixture
 
@@ -475,7 +476,7 @@ def test_permanent_switch_to_the_shown_default_authors_the_slot(live_wait, monke
     monkeypatch.setattr(config, "SETTINGS_PATH", path)
     for name in (*config.SETTINGS_DEFAULTS, "OUROBOROS_MODEL_FALLBACK"):
         monkeypatch.delenv(name, raising=False)
-    path.write_text(json.dumps({"OPENROUTER_API_KEY": "sk-or-present-key"}))
+    path.write_text(json.dumps({"OPENROUTER_API_KEY": "-".join(("sk", "or", "present", "key"))}))
     _owner_update_settings(fields_on_saved_document({"OUROBOROS_TOOL_TIMEOUT_SEC": 77}))
     assert key not in json.loads(path.read_text())
     chosen = config.SETTINGS_DEFAULTS[key]
@@ -489,7 +490,7 @@ def test_permanent_switch_to_the_shown_default_authors_the_slot(live_wait, monke
     document = json.loads(path.read_text())
     assert document[key] == chosen
     del document["OPENROUTER_API_KEY"]
-    path.write_text(json.dumps({**document, "ANTHROPIC_API_KEY": "sk-ant-present-key"}))
+    path.write_text(json.dumps({**document, "ANTHROPIC_API_KEY": "-".join(("sk", "ant", "present", "key"))}))
     started = apply_task_start_settings().settings
     assert started[key] == chosen
     other = "OUROBOROS_MODEL_LIGHT" if key == "OUROBOROS_MODEL" else "OUROBOROS_MODEL"
@@ -605,9 +606,8 @@ def test_supervisor_reordering_keeps_latest_union_clock_and_never_marks_progress
     from supervisor import queue as task_queue
 
     root, _transport, _client, _controller, _events, _decide = live_wait
-    pushed, persisted = [], []
+    pushed = []
     ctx = SimpleNamespace(RUNNING=task_queue.RUNNING, DRIVE_ROOT=root,
-                          append_jsonl=lambda _path, row: persisted.append(row),
                           bridge=SimpleNamespace(push_log=pushed.append))
     first = {"type": "task_model_wait", "task_id": "task-one", "wait_id": "wait-a", "revision": 1,
              "task_attempt": 1, "state": "waiting", "is_progress": False,
@@ -624,16 +624,16 @@ def test_supervisor_reordering_keeps_latest_union_clock_and_never_marks_progress
     assert meta["task"]["model_waits"]["wait-a"]["requires_owner_action"] is False
     assert meta["task"]["model_waits"]["wait-b"]["requires_owner_action"] is True
     assert projection.quota_waited_seconds(meta, 200.0) == 20.0
+    persisted = dialogue_test.progress_rows(root)
     assert "last_progress_at" not in meta and len(pushed) == len(persisted) == 2
 
 
 def test_history_preserves_typed_wait_map_without_counting_progress_or_human_rows(tmp_path):
     from ouroboros.gateway.history import _assemble_history_response
-    from ouroboros.utils import append_jsonl
 
     stamp = datetime.now(timezone.utc)
     for seconds, wait_id, revision, state in ((0, "wait-a", 1, "waiting"), (1, "wait-b", 2, "waiting"), (2, "wait-a", 3, "resolved")):
-        append_jsonl(tmp_path / "logs/progress.jsonl", {
+        dialogue_store.append(tmp_path, "progress", {
             "type": "task_model_wait", "task_id": "task-one", "chat_id": 1,
             "wait_id": wait_id, "revision": revision, "task_attempt": 1, "state": state,
             "ts": (stamp + timedelta(seconds=seconds)).isoformat(), "is_progress": False,

@@ -702,7 +702,7 @@ def _attempt_key(request: Any, slot: Any) -> str:
     }
     if getattr(slot, "default_temperature", None) is not None:
         slot_data["default_temperature"] = slot.default_temperature
-    if getattr(slot, "processing_preference", ""):
+    if getattr(slot, "processing_preference", None) is not None:
         slot_data["processing_preference"] = slot.processing_preference
     if str(getattr(slot, "session_access", "") or "readonly") != "readonly":
         slot_data["session_access"] = slot.session_access  # writable rights are identity
@@ -808,6 +808,8 @@ def _emit_operation(
             # operation is the stable round identity for both terminal events.
             "round_id": str(getattr(request, "round_id", "") or entry.operation_id),
             "slot_id": str(getattr(slot, "slot_id", "") or ""),
+            # The panel this seat serves, as its wait rows name it (``review_pause.panel_activity``).
+            "model_wait_owner_id": str(getattr(getattr(entry, "operation", None), "owner_id", "") or ""),
             **extra,
         }
         if event_queue is not None:
@@ -816,6 +818,15 @@ def _emit_operation(
             from ouroboros.tools.review_helpers import emit_review_event
 
             emit_review_event(usage_ctx, {"type": "cognitive_operation", **values})
+        if phase == "started":
+            # The cue may have gone idle before this panel acquired its first seat.
+            # Both frames share the control FIFO: publish the seat before waking its reader.
+            from ouroboros.model_sleep import announce_resumed
+
+            wait = getattr(getattr(entry, "operation", None), "wait", None)
+            if wait is not None:
+                announce_resumed(SimpleNamespace(event_queue=wait.event_queue, task_id=task_id,
+                                                  current_chat_id=wait.task.get("chat_id")))
     except Exception:
         log.debug("review operation event failed", exc_info=True)
     try:
@@ -1030,8 +1041,7 @@ def _settle_review_attempt(
             or (explicit_retry and (entry.released_early or entry.pause_before_launch)
                 and str(getattr(actor, "operation_state", "") or "") == "not_dispatched")
         )
-        released_wave: Dict[str, Any] = {}
-        quorum_wave: Dict[str, Any] = {}
+        plan_wave: Dict[str, Any] = {}
         if entry.released_early and entry.wave_key in _RELEASED_WAVES:
             roster = _RELEASED_WAVES[entry.wave_key]
             slot_id = str(getattr(slot, "slot_id", "") or "")
@@ -1045,13 +1055,10 @@ def _settle_review_attempt(
             # store failure) at $0 instead of reporting them as still owed. The live registry cannot
             # serve it — a settled entry leaves it as soon as its worker's publication ends.
             roster.setdefault("actors", {})[slot_id] = {"actor": copy.deepcopy(actor), "slot": slot}
-            if getattr(request, "surface", "") == "task_acceptance" and not unresolved:
-                roster.setdefault("verdicts", {})[slot_id] = _settled_slot_verdict(actor)
+            if getattr(request, "surface", "") == "plan_review":
+                plan_wave = copy.deepcopy(roster)  # counted completion may precede physical adviser completion
             if all(roster["slots"].values()):
-                released_wave = _RELEASED_WAVES.pop(entry.wave_key)
-            elif _released_quorum_reached(request, roster):
-                roster["quorum_announced"] = True
-                quorum_wave = copy.deepcopy(roster)
+                _RELEASED_WAVES.pop(entry.wave_key)  # every seat settled: the wave's roster is done
         if replayable and usage_ctx is not None and (late or explicit_retry):
             settled = getattr(usage_ctx, "_review_settled_attempts", None)
             if not isinstance(settled, dict):
@@ -1067,16 +1074,12 @@ def _settle_review_attempt(
             phase="failed" if actor.status == "error" else "finished",
             actor=actor,
         )
-    if entry.released_early:  # plan review's event route: the reply settles into the plan record; the last one wakes the mailbox
+    if entry.released_early:  # each reply lands; the recorded counted council decides its completion
         from ouroboros.tools.plan_ask import settle_released_reply
 
         settle_released_reply(usage_ctx, request=request, task_id=task_id, actor=actor, slot=slot,
-                              settled_wave=dict(released_wave.get("slots") or {}), roster_size=int(released_wave.get("total") or 0),
-                              settled_actors=released_wave.get("actors") or {})
-        if getattr(request, "surface", "") == "task_acceptance" and (released_wave or quorum_wave):
-            from ouroboros.acceptance_settlement import announce_acceptance_settlement
-
-            announce_acceptance_settlement(usage_ctx, request, released_wave or quorum_wave)
+                              settled_wave=dict(plan_wave.get("slots") or {}), roster_size=int(plan_wave.get("total") or 0),
+                              settled_actors=plan_wave.get("actors") or {})
     if late and not pending_invocation and not custody_lost and usage_ctx is not None:
         try:
             from ouroboros.tools.review_helpers import emit_review_event
@@ -1115,56 +1118,9 @@ def _wave_key(request: Any) -> str:
     return "|".join(str(getattr(request, key, "") or "") for key in ("surface", "task_id", "retry_key"))
 
 
-def _released_quorum_reached(request: Any, roster: Dict[str, Any]) -> bool:
-    """Whether this wave has enough answered slots to be worth waking Main for.
-
-    The panel's own ``min_successful_slots`` is the quorum; slots that ANSWERED
-    before the release (the drain collected an ok/empty actor, not a refusal or
-    an expiry) are counted from the roster's registration. A wave
-    announced at its quorum is never announced for that reason twice; the last
-    straggler still announces through the completed-roster arm.
-    """
-    if roster.get("quorum_announced"):
-        return False
-    policy = getattr(request, "policy", None) or {}
-    try:
-        quorum = max(1, int(policy.get("min_successful_slots") or 1))
-    except (TypeError, ValueError):
-        quorum = 1
-    slots = roster.get("slots") or {}
-    answered = sum(1 for status in slots.values() if status in {"ok", "empty"})
-    early = set(roster.get("answered_before_release_ids") or ()) - set(slots)
-    return len(early) + answered >= quorum
-
-
-def _settled_slot_verdict(actor: Any) -> Dict[str, str]:
-    """This ONE reviewer's own verdict, parsed where it settled.
-
-    Quorum, tier, contract demotion and dissent stay with the collecting call's
-    reducer (``review_actor_aggregation``): a settlement thread that re-derived
-    them would be a second aggregation authority. Only the reviewer's own words
-    travel, so the wake can BE the advice instead of a pointer to it.
-    """
-    from ouroboros.triad_review import parse_review_findings
-
-    try:
-        parsed, findings, signal = parse_review_findings(str(getattr(actor, "raw_text", "") or ""))
-    except Exception:
-        log.debug("released acceptance verdict could not be parsed", exc_info=True)
-        parsed, findings, signal = {}, [], ""
-    from ouroboros.utils import truncate_review_artifact
-
-    note = str((parsed or {}).get("summary") or "") if isinstance(parsed, dict) else ""
-    note = note or next((str(row.get("recommendation") or row.get("item") or "")
-                         for row in (findings or []) if isinstance(row, dict)), "")
-    note = note or str(getattr(actor, "error", "") or getattr(actor, "parse_reason", "") or "")
-    return {"verdict": str(signal or "").upper(), "note": truncate_review_artifact(" ".join(note.split()), limit=400)}
-
-
 def _register_released_roster(
     request: Any, slots: List[Any], slot_entries: Dict[str, Any], returned_ids: set,
     slot_deadlines: Dict[str, float], monotonic_now: Callable[[str], float],
-    *, answered_before_release: Any = (),
 ) -> set:
     """Register the WHOLE released roster under ONE lock hold before any released row is
     minted: a slot settling at once then finds the complete roster and cannot split the
@@ -1182,10 +1138,6 @@ def _register_released_roster(
         if released_ids:
             # A collection re-releases the wave: merging keeps the recorded outcomes.
             roster = _RELEASED_WAVES.setdefault(_wave_key(request), {"slots": {}, "total": len(slots)})
-            # Slot IDS, not a count: a re-released wave replays an already-settled
-            # slot through the drain, and an id in the roster is never counted twice.
-            roster["answered_before_release_ids"] = sorted(
-                set(roster.get("answered_before_release_ids") or ()) | set(answered_before_release))
             for slot_id in released_ids:
                 roster["slots"].setdefault(slot_id, "")
     return released_ids
@@ -1542,8 +1494,6 @@ def _run_custodied_review_slots(
     returned_ids = {str(getattr(actor, "slot_id", "") or "") for actor in actors}
     released_ids = _register_released_roster(
         request, slots, slot_entries, returned_ids, slot_deadlines, monotonic_now,
-        answered_before_release={str(getattr(actor, "slot_id", "") or "") for actor in actors
-                                 if str(getattr(actor, "status", "") or "") in {"ok", "empty"}},
     ) if drain_deadline is not None else set()
     for slot in slots:
         slot_id = str(getattr(slot, "slot_id", "") or "")

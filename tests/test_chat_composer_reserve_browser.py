@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from ouroboros import dialogue_store
 from tests.test_ui_smoke_playwright import direct_server_with_data as direct_server_with_data
 from tests.test_subscription_setup_browser import subscription_ui as subscription_ui
 from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET, _emit_ws_frame, _SETTLE_RESTORE_FRAMES
@@ -34,11 +35,11 @@ def test_main_and_project_composer_clearance(direct_server_with_data, engine):
 
     data = direct_server_with_data["data_dir"]
     project = create_project(data, "composer-room", name="Composer room")
-    (data / "logs" / "chat.jsonl").write_text(json.dumps({
+    dialogue_store.append(data, "chat", {
         "ts": "2026-09-17T10:00:00Z", "direction": "out", "chat_id": project["chat_id"],
         "text": "Saved Project answer.\n" + "\n".join(f"History line {i}" for i in range(12)),
         "format": "markdown",
-    }) + "\n", encoding="utf-8")
+    })
     evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", data.parent))
     evidence.mkdir(parents=True, exist_ok=True)
     observations = []

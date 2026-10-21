@@ -37,15 +37,20 @@ for (const example of fixture.cases) {
             assert.equal(summary.tone, 'muted');
         }
         const verdict = sessionRouteVerdict(row, state, nowMs);
-        assert.equal(verdict.label, example.exhausted ? 'Limit reached' : example.unknown ? 'Not checked' : 'Available');
+        assert.equal(verdict.label, 'Not checked'); // ratios are useful display, not an exact engine verdict
     });
 }
 
 test('model scope, account pin and stale evidence remain independent', () => {
     const spent = { used_ratio: 1, resets_at: '2030-01-01T02:00:00Z', applies_to_models: ['other-model'] };
     const state = stateFor([spent]);
+    state.snapshot.availability_scope = { model: 'fable', requestKind: 'text', basis: 'quota_block' };
+    state.snapshot.quota[0].availability = { state: 'available' };
     assert.equal(sessionRouteVerdict(row, state, nowMs).label, 'Available');
+    // No fuzzy matcher: raw aliases/ratios cannot overturn the engine's verdict.
     state.snapshot.quota[0].constraints[0].applies_to_models = ['fable'];
+    assert.equal(sessionRouteVerdict(row, state, nowMs).label, 'Available');
+    state.snapshot.quota[0].availability = { state: 'exhausted', resets_at: spent.resets_at };
     assert.equal(sessionRouteVerdict(row, state, nowMs).label, 'Limit reached');
     state.snapshot.quota[0].subject.subject_id = 'sibling';
     assert.equal(sessionRouteVerdict(row, state, nowMs).label, 'Not checked');
@@ -56,9 +61,41 @@ test('model scope, account pin and stale evidence remain independent', () => {
 
 test('one incomplete profile cannot certify or refuse the whole rotation pool', () => {
     const state = stateFor([{ used_ratio: 1 }]);
+    state.snapshot.availability_scope = { model: 'fable', requestKind: 'text', basis: 'quota_block' };
     state.snapshot.quota.push({ subject: { harness: 'claude', subject_id: 'sibling' },
-        freshness: 'fresh', constraints: [{ used_ratio: 1, resets_at: '2030-01-01T02:00:00Z' }] });
+        freshness: 'fresh', availability: { state: 'exhausted' },
+        constraints: [{ used_ratio: 1, resets_at: '2030-01-01T02:00:00Z' }] });
     const unpinned = { route: { ...row.route, credential_profile_id: '' } };
     assert.equal(sessionRouteVerdict(unpinned, state, nowMs).label, 'Not checked');
     assert.equal(sessionRouteVerdict(row, state, nowMs).label, 'Not checked');
+});
+
+
+test('only an honored exact text scope may turn cached quota into an actor verdict', () => {
+    const state = stateFor([{ used_ratio: 1, applies_to_models: ['fable'], freshness: 'fresh' }]);
+    state.snapshot.quota[0].availability = { state: 'available' }; // engine, not host ratio/matcher
+    for (const scope of [undefined, {}, { model: null, requestKind: 'text', basis: 'quota_block' },
+        { model: 'fable-extra', requestKind: 'text', basis: 'quota_block' },
+        { model: 'fable', requestKind: 'image', basis: 'quota_block' }]) {
+        state.snapshot.availability_scope = scope;
+        assert.equal(sessionRouteVerdict(row, state, nowMs).label, 'Not checked');
+    }
+    state.snapshot.availability_scope = { model: 'fable', requestKind: 'text', basis: 'quota_block' };
+    assert.equal(sessionRouteVerdict(row, state, nowMs).label, 'Available');
+});
+
+test('native-default subject aliases need the same positive roster as Python inspection', () => {
+    const state = stateFor([]);
+    const defaultRow = { route: { ...row.route, credential_profile_id: 'claude-default' } };
+    state.snapshot.profiles.profiles[0].profile.profile_id = 'claude-default';
+    state.snapshot.availability_scope = { model: 'fable', requestKind: 'text', basis: 'quota_block' };
+    state.snapshot.quota[0].availability = { state: 'available' };
+    state.snapshot.quota[0].subject.subject_id = null;
+    assert.equal(sessionRouteVerdict(defaultRow, state, nowMs).label, 'Not checked');
+    state.snapshot.profiles.accountPools = [];
+    assert.equal(sessionRouteVerdict(defaultRow, state, nowMs).label, 'Available');
+    state.snapshot.quota[0].subject.subject_id = '';
+    assert.equal(sessionRouteVerdict(defaultRow, state, nowMs).label, 'Available');
+    state.snapshot.quota[0].subject.subject_id = 'healthy-sibling';
+    assert.equal(sessionRouteVerdict(defaultRow, state, nowMs).label, 'Not checked');
 });

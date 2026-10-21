@@ -151,8 +151,9 @@ def verdict(w, decider, child):
 
 
 def dispositions(w, decider):
-    from ouroboros.delegate_evidence import acceptance_patch_dispositions
-    return acceptance_patch_dispositions(w.data, decider).get("rows", [])
+    """The decider's attested patch verdicts: its ``subagent_patch_verdict`` custody rows."""
+    from ouroboros.delegate_custody_current import marks
+    return marks(w.data, decider).get("patch_verdicts", [])
 
 
 def test_successor_applies_a_finished_copy_after_its_execution_root_is_gone(world):
@@ -176,7 +177,7 @@ def test_successor_applies_a_finished_copy_after_its_execution_root_is_gone(worl
     assert receipt["child_result_sha256"] == consumed and receipt["patch_sha256"] == manifest["sha256"]
     assert Path(receipt["target_root"]) == world.project.resolve() and receipt["reason"] == "finished helper work"
     row = dispositions(world, successor)[-1]
-    assert (row["child"], row["disposition"], row["applied"], row["original_parent_task_id"]) == (
+    assert (row["child_task_id"], row["disposition"], row["applied"], row["original_parent_task_id"]) == (
         "child", "applied", True, "pred")
     # The author's record, evaluation and product, and the predecessor, stay exactly as recorded.
     assert (result_signature(world.data, "child"), result_signature(world.data, "pred")) == signatures

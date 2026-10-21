@@ -1358,7 +1358,7 @@ def _root_resume_grants(state: Dict[str, Any]) -> tuple:
                     'generation': int(hold['root_resume_generation']), 'pause_id': ''}, {}
         return {}, {}
     if any(current.get(key) for key in (
-            '_budget_pause', '_budget_pause_consumed', '_continuation_prepared')):
+            '_budget_pause', '_continuation_prepared')):
         return {}, {}
 
     exact_basis = grant.get('root_resume_basis') or {}

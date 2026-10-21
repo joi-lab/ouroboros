@@ -294,15 +294,25 @@ async def _dispatch_extension_message(
     return True
 
 
-def _initialization_notice(client_message_id: str = "", chat_id: int = 1) -> str:
-    """The refusal of this socket's frame; it names that frame so only its Sending settles."""
+def _initialization_notice(client_message_id: str = "", chat_id: int = 1, *, reason: str = "") -> str:
+    """The refusal of this socket's frame; it names that frame so only its Sending settles.
+    ``reason`` says in plain words why the message was not saved (no bridge yet: the store is
+    still migrating, or the start failed); a refused acceptance keeps the generic sentence."""
     return json.dumps({
         "type": "chat", "chat_id": chat_id,
         "role": "system", "system_type": "initialization_notice",
-        "content": "⚠️ System is still initializing. Please wait a moment and try again.",
+        "content": reason or "⚠️ System is still initializing. Please wait a moment and try again.",
         "ts": utc_now_iso(),
         **({"client_message_id": client_message_id} if client_message_id else {}),
     })
+
+
+def _no_bridge_notice(websocket: WebSocket, client_message_id: str, chat_id: int) -> str:
+    """The notice for a chat frame that arrived before the dialogue opened."""
+    from ouroboros.server_liveness import boot_notice
+
+    return _initialization_notice(client_message_id, chat_id,
+                                  reason=boot_notice(getattr(websocket.app, "state", None)))
 
 
 async def _accept_chat_after(websocket: WebSocket, previous: asyncio.Task | None, accept,
@@ -320,9 +330,13 @@ async def _accept_chat_after(websocket: WebSocket, previous: asyncio.Task | None
         await asyncio.wait((previous,))  # its failure was its own notice
     try:
         await run_sync_to_completion(accept)
-    except Exception:
+    except Exception as exc:
+        from ouroboros.store import StoreBusy
+
+        busy = isinstance(exc, StoreBusy) or isinstance(exc.__cause__, StoreBusy)
+        reason = "⚠️ Your message was not saved: the dialogue store is busy. Please send it again." if busy else ""
         try:
-            await websocket.send_text(_initialization_notice(client_message_id, chat_id))
+            await websocket.send_text(_initialization_notice(client_message_id, chat_id, reason=reason))
         except Exception:
             log.debug("WebSocket closed before its chat failure notice", exc_info=True)
 
@@ -433,8 +447,10 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                             controls.add(control)
                             control.add_done_callback(controls.discard)
                             continue
-                    if bridge is None:
-                        raise AssertionError("message bus is not initialized")
+                    if bridge is None:  # the store is still migrating (or the start failed): say so
+                        await websocket.send_text(_no_bridge_notice(
+                            websocket, str(msg.get("client_message_id") or ""), thread_id))
+                        continue
                     if msg_type == "chat":
                         accept = (functools.partial(_accept_with_attachments, bridge, payload, send_kwargs,
                                                     msg["attachments"]) if msg.get("attachments")

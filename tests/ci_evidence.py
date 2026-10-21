@@ -532,6 +532,34 @@ if __name__ == "__main__":
 # pytest is intentionally below the stdlib-only CLI entrypoint and loaded only
 # through conftest's post-isolation plugin registration.
 import pytest
+
+
+def _machine() -> dict:
+    """What ran the session. Hosted runners come in faster and slower hardware classes, and
+    the same commit runs about 1.5x apart on them, so durations compare within one class:
+    the processor, a fixed pure-Python workload's time, and the SQLite the stores ran."""
+    import sqlite3
+    import subprocess
+
+    model = ""
+    try:
+        if sys.platform.startswith("linux"):
+            for line in Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.lower().startswith("model name"):
+                    model = line.split(":", 1)[1].strip()
+                    break
+        elif sys.platform == "darwin":
+            model = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True,
+                                   text=True, timeout=5, check=False).stdout.strip()
+        else:
+            model = os.environ.get("PROCESSOR_IDENTIFIER", "") or platform.processor()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    started, total = monotonic(), 0
+    for value in range(2_000_000):
+        total += value * value
+    return {"cpu": model, "cpus": os.cpu_count(), "calibration_sec": round(monotonic() - started, 3),
+            "sqlite": sqlite3.sqlite_version}
 try:
     from _pytest.subtests import SubtestReport
 except ModuleNotFoundError as error:
@@ -585,6 +613,8 @@ class _Results:
         except Exception as close_error:
             error = error or close_error
         if error is not None:  # One line, then silence: the session outcome is untouched.
+            from ouroboros.test_evidence import diagnostics_incomplete
+            diagnostics_incomplete(type(error).__name__)
             print(f"CI_DIAGNOSTICS_INCOMPLETE: incremental journal disabled ({type(error).__name__})")
 
     def _event(self, event, nodeid, **facts):
@@ -656,7 +686,7 @@ class _Results:
                 "tests_collected": session.testscollected, "reports": self.reports,
                 "collection_failures": self.collection_failures,
                 "environment": {"python": platform.python_version(), "platform": platform.system(),
-                                "pytest": pytest.__version__},
+                                "pytest": pytest.__version__, "machine": _machine()},
                 "raw_exception_text": "omitted",
                 "raw_junit": "private_not_copied",
                 "github": {name: os.environ.get("GITHUB_" + name.upper(), "")
@@ -675,6 +705,8 @@ class _Results:
             write_json(output_dir(self.config) / "results.json", _redact(facts, self.secrets))
         except Exception as error:
             # Diagnostics alone never alter session.exitstatus or expose a body.
+            from ouroboros.test_evidence import diagnostics_incomplete
+            diagnostics_incomplete(type(error).__name__)
             print(f"CI_DIAGNOSTICS_INCOMPLETE: safe result export failed ({type(error).__name__})")
         finally:
             self._journal_off()

@@ -704,9 +704,10 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "", stop_action_i
     # no-op as ``already_settled`` over it. Worker-side, the queue snapshot is
     # the ownership projection (the live maps belong to the supervisor).
     live_ownership = False
+    live_helpers = False
     try:
-        from ouroboros.cancel_intents import _validated_single_cancel_target
-        from ouroboros.task_status import task_has_live_queue_ownership
+        from ouroboros.cancel_intents import _validated_single_cancel_target, settled_status
+        from ouroboros.task_status import task_has_live_queue_ownership, task_subtree_has_live_queue_rows
 
         live_ownership = task_has_live_queue_ownership(status_drive_root, tid)
         # This pre-read is only a fail-open liveness hint. request_cancel
@@ -716,6 +717,14 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "", stop_action_i
             live_ownership = live_ownership or task_has_live_queue_ownership(
                 status_drive_root, retry_hint,
             )
+        elif settled_status(status_drive_root, tid):
+            # A settled root whose helpers or delegated runs still work is still
+            # owned: the owner's Stop cascades over that tree, and so does this one.
+            from ouroboros.delegate_custody_reconcile import tree_open_runs
+
+            live_helpers = (task_subtree_has_live_queue_rows(status_drive_root, tid)
+                            or bool(tree_open_runs(status_drive_root, tid)))
+            live_ownership = live_ownership or live_helpers
     except Exception:
         live_ownership = True
         log.debug("cancel_task live-ownership read failed for %s", tid, exc_info=True)
@@ -769,6 +778,21 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "", stop_action_i
             f"Nothing to cancel: {tid} had already finished ({intent.get('status')}). "
             "Its result is preserved — use discard_child_result if you want to drop it." + observed_note
         )
+    helpers_note = ""
+    if live_helpers and str(intent.get("task_id") or tid) == tid:
+        # The tool's request names no scope, so an exact retry replays it whatever the
+        # helpers did since; the host records the shape it runs, as a cascade records
+        # its own (widen-only), and custody's cascade stops the live members.
+        from ouroboros.cancel_intents import SCOPE_CASCADE, mark_intent_scope
+
+        try:
+            widened = mark_intent_scope(status_drive_root, tid, SCOPE_CASCADE) or intent.get("scope") == SCOPE_CASCADE
+        except Exception:
+            widened = False
+            log.warning("cancel_task could not extend %s to its live helpers", tid, exc_info=True)
+        helpers_note = (" It had already finished: its result stays and its still-running helpers and external runs"
+                        " stop with it." if widened else " Its still-running helpers and external runs could not be"
+                        " added to this Stop; they may keep running.")
     if own:
         _record_child_decision_beacon(
             ctx, tid,
@@ -790,7 +814,7 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "", stop_action_i
     already = (" (same Stop action replayed)" if intent.get("stop_action_replayed") else
                " (existing cancellation custody retained)" if intent.get("already_requested") else "")
     return (
-        f"Cancel requested: {tid}{(' — ' + reason_preview) if reason_preview else ''}{note}{already}. "
+        f"Cancel requested: {tid}{(' — ' + reason_preview) if reason_preview else ''}{note}{already}.{helpers_note} "
         "cancel_state=pending until the supervisor confirms teardown; a child that "
         "already finished keeps its completed result (use discard_child_result to drop it)." + observed_note
     )

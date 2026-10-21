@@ -598,7 +598,7 @@ def _finish_task_done_dispatch(
                 # A member that finished while its tree was pausing may be the
                 # last one the owner's Pause was waiting for — or the last writer
                 # an owner's Continue of that tree was held behind. The root's own
-                # terminal counts too: its late phase parked or ended (D10).
+                # terminal counts too: its late phase ended, or the Pause ended it.
                 refresh_owner_pause_tree(tree_root)
                 from supervisor.continuation_admission import release_settled_continuations
 
@@ -606,15 +606,6 @@ def _finish_task_done_dispatch(
             except Exception:
                 log.warning("Owner pause/continue settlement check failed for %s", tree_root, exc_info=True)
     ctx.persist_queue_snapshot(reason="task_done")
-    # The early answer may already be receipted when split-drive copyback
-    # finishes. Normal and recovered publication converge here after releasing
-    # author custody; the existing ReviewOperation owns preparation and payment.
-    debt = final_task_result.get("acceptance_debt") or {}
-    delivery_id = (debt.get("delivery") or {}).get("delivery_id")
-    if task_id and delivery_id:
-        from supervisor.events_chat_delivery import _handoff_delivered_review
-
-        _handoff_delivered_review(ctx, str(task_id), str(delivery_id))
     try:
         ctx.bridge.push_log(task_done_event)
     except Exception:

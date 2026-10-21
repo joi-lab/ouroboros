@@ -9,6 +9,8 @@ serving it). Nothing here reads the frame's text to decide what is speech.
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import json
 import queue
@@ -543,7 +545,7 @@ def test_wait_streams_exact_ranges_drains_the_terminal_tail_and_replays_the_same
                                append_jsonl=lambda *_: pytest.fail("delivery raised"))
     for frame in frames:
         events_chat_delivery._handle_send_message(frame, delivery)
-    stored = [json.loads(line) for line in (tmp_path / "logs" / "progress.jsonl").read_text().splitlines()]
+    stored = dialogue_test.log_rows(tmp_path / "logs" / "progress.jsonl")
     response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"limit": "10"})))
     replay = [row for row in json.loads(response.body)["messages"] if row.get("is_progress")]
     for rows in (live, outbound, stored, replay):

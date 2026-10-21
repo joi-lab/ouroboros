@@ -229,6 +229,7 @@ def test_discard_is_engine_disposition_not_fake_apply(tmp_path, monkeypatch):
 def test_lost_apply_leaves_existing_intent_pending(tmp_path, monkeypatch):
     ctx, target = context(tmp_path, monkeypatch)
     engine, held = DirectoryEngine(target, lost_apply=True), entry(ctx, target, "copy")
+    capture_directory_result(ctx.drive_root, held, engine)  # the body's capture, before the decision (#1969)
     with pytest.raises(OSError, match="response lost"):
         integrate_directory_result(ctx, held, "apply", "accepted", engine)
     assert held.patch_apply_pending and not held.patch_disposed
@@ -243,6 +244,7 @@ def test_lost_apply_leaves_existing_intent_pending(tmp_path, monkeypatch):
 def test_selected_apply_keeps_remaining_results_undisposed(tmp_path, monkeypatch):
     ctx, target = context(tmp_path, monkeypatch)
     engine, held = DirectoryEngine(target), entry(ctx, target, "copy")
+    capture_directory_result(ctx.drive_root, held, engine)  # the body's capture, before the decision (#1969)
     get_run = engine.get_run
 
     def partially_delivered(run_id):

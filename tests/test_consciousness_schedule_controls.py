@@ -360,7 +360,7 @@ def test_schedule_lock_key_uses_platform_case_normalization(monkeypatch):
 def test_the_transaction_itself_takes_the_queue_lock_before_the_table_lock(tmp_path, monkeypatch):
     """One owner of the ORDER, so no caller can compose the pair the other way.
 
-    ``schedule_followup`` wraps its cap-read and its write in one transaction; if
+    ``schedule_followup`` wraps its pending read and its write in one transaction; if
     the queue lock were taken inside that hold (by ``upsert_scheduled_task``, as
     it used to be) it would run table-then-queue against the tick's
     queue-then-table. The order lives in the transaction so there is nothing per
@@ -407,7 +407,7 @@ def test_the_transaction_itself_takes_the_queue_lock_before_the_table_lock(tmp_p
 def test_a_transaction_wrapped_write_and_a_queue_lock_holder_do_not_deadlock(tmp_path, monkeypatch):
     """The two real orders, run against each other, with every row surviving.
 
-    Thread A is the follow-up tool: one transaction around its cap-read and its
+    Thread A is the follow-up tool: one transaction around its pending read and its
     write. Thread B is a supervisor pass: the queue lock, then the table. While
     the transaction left the queue lock to its callers these two could wedge, and
     this test would HANG rather than fail — so the join has a hard timeout.

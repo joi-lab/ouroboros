@@ -223,7 +223,7 @@ def test_main_input_reserve_and_account_capacity_remain_distinct(tmp_path, monke
     plan = replace(_plan(), model=MODEL, provider="claudexor", route_fp=evidence.route_fp,
                    window_tokens=evidence.window_tokens, status=evidence.status,
                    model_route=_binding(evidence))
-    measured = measure_main_fit(plan, plan.messages_for("max"), [], drive_root=tmp_path,
+    measured = measure_main_fit(plan, plan.messages_for("max"), [],
                                 profile="owner_max", rendered_mode="max", round_id="r1").measurement
     assert measured.capacity_total_tokens == 872_000
     assert measured.response_reserve_tokens == 65_536

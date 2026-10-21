@@ -48,6 +48,14 @@ from ouroboros.headless import (
     ARTIFACT_STATUS_READY_WITH_CHANGES,
 )
 
+# Git's own retargeting variables: they would make a Git command read a FOREIGN repository
+# (or turn a plain folder into one), so the reverse patch check strips them and lets the
+# selected root alone decide.
+_GIT_RETARGET_ENV = frozenset({
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
+})
+
 log = logging.getLogger(__name__)
 
 # The capture statuses a disposition may proceed over (C1-R3): a usable patch
@@ -284,7 +292,6 @@ def _verify_shared_external_workspace(
         return False, [], str(exc)
     if not patch_path.is_file() or not patch_path.stat().st_size:
         return (True, [], "") if file_rows else (False, [], "workspace patch and file outputs are absent")
-    from ouroboros.repo_diff_capture import _GIT_RETARGET_ENV
     # Capture diffed B under the ambient Git configuration (CRLF conversion, filters);
     # the read-only reverse check must convert the same way, so it strips only the
     # variables that would redirect Git to another repository or index.
@@ -1205,7 +1212,10 @@ def get_tools() -> List[ToolEntry]:
                     "results stay retained. Direct ordinary-folder work has already changed the "
                     "source: apply acknowledges those effects, reject cannot undo them, and no full "
                     "rollback is promised. Unapplied copies can be explicitly rejected; conflicts "
-                    "retain their snapshot and results. Read the captured result before deciding. "
+                    "retain their snapshot and results. Read the captured result before deciding. A finished "
+                    "run's capture still owed when you call is prepared by this call and returned for "
+                    "inspection, never applied in the same call; one already ready is applied as before, "
+                    "with no proof that you read it. "
                     "Undisposed snapshots or directory-copy results remain custody debt; direct runs "
                     "do not create that debt."
                 ),

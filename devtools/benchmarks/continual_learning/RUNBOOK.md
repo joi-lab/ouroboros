@@ -9,10 +9,12 @@ Field-tested configuration and operational hazards from the 2026-07-20 full 1-se
 - Model `openrouter/anthropic/claude-sonnet-4.6`, **effort low pinned uniformly** across every
   engine task type (engine defaults drift between releases — v6.71 flipped review effort to
   high; pin them all).
-- Review gate `OUROBOROS_TASK_REVIEW_MODE=required` + `OUROBOROS_REVIEW_ENFORCEMENT=blocking`
-  with **`max_improvement_passes` pinned to 1** (adapter does this automatically; see the
-  review-mode ablation in METHODOLOGY — unbounded convergence is 2.6× the cost for no measured
-  gain on the toolchain-oracle domain, and burns the full per-issue step budget on doomed issues).
+- Review gate `OUROBOROS_TASK_REVIEW_MODE=required` + `OUROBOROS_REVIEW_ENFORCEMENT=blocking`:
+  the host's result review runs at delivery and a FAIL holds the answer. The adapter still pins
+  **`max_improvement_passes` to 1**, which the result review ignores; the paid bound is
+  `OUROBOROS_REVIEW_MAX_CYCLES` (see the review-mode ablation in METHODOLOGY — unbounded
+  convergence is 2.6× the cost for no measured gain on the toolchain-oracle domain, and burns
+  the full per-issue step budget on doomed issues).
 - **`max_workers: 3` in system-params — mandatory at scale.** Worker pool size drives engine
   container RSS: 10 workers ≈ 0.8GB/container, 3 workers ≈ 0.35GB. Capacity formula:
   `concurrent_containers × per-container-RSS ≤ 0.8 × Docker-VM memory limit`

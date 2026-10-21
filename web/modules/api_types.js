@@ -29,6 +29,7 @@
  * @property {?number} spent_calls
  * @property {boolean} supervisor_ready
  * @property {?string} supervisor_error
+ * @property {BootDocument=} boot  // the boot phases (same object as /api/health.boot); the Starting… header paints them
  * @property {string} runtime_mode
  * @property {string} context_mode
  * @property {boolean} context_mode_auto_low  // frozen compatibility field; always false
@@ -39,6 +40,7 @@
  * @property {Object} accounting  // physical-attempt ledger projection
  * @property {Array<ProjectEntry>} projects  // active/deleting sidebar projection
  * @property {Array<number>} project_chat_ids  // complete (uncapped) project chat_ids — WS fan-out isolation SSOT (v6.32.0)
+ * @property {?number=} main_visible_revision  // Main's room revision (its standalone messages, as a Project's visible_revision counts); null while unreadable
  * @property {Object<string, {project_id: string, chat_id: number, origin_bound?: boolean}>} task_bindings  // bound task -> its project: suppress the stray "turn into project" button (v6.33.0 P2) + render a pointer that opens the project panel (v6.33.0 F4). origin_bound marks a task the host included because its OWNER MESSAGE already has a project (#902), so one message cannot keep a second convertible card
  * @property {ActiveDirectTurn[]=} active_direct_turns  // active direct/ephemeral chat turns snapshot
  * @property {boolean=} active_chat_activities_complete
@@ -49,7 +51,23 @@
  * @property {Array<Object>=} main_attention Live human recovery owners, including children; the activity census stays root-only.
  * @property {boolean=} main_attention_complete False retains previously observed actions.
  * @property {Array<Object>=} main_attention_gaps Typed gaps in current action evidence.
+ * @property {import('./work_types.js').Work[]} works  // one row per work: a request with its Continue episodes and live members
+ * @property {Object<string, import('./work_types.js').RoomStatus>} rooms  // one status per room (chat_id), from its works
+ * @property {import('./work_types.js').WorkSummary} work_summary  // the tray's one line
+ * @property {boolean} works_complete  // false: a source was unreadable; keep what was seen, never read it as empty
+ * @property {Array<Object>} works_gaps  // typed gaps of the work projection
  * @property {import('./client_contract_types.js').ServedUiState=} served_ui  // this generation's main interface; absent on older cores
+ */
+/**
+ * @typedef {Object} BootDocument  // GET /api/health.boot and GET /api/state.boot: the serving generation's phases
+ * @property {'starting'|'serving'|'ready'|'failed'} phase
+ * @property {string} since
+ * @property {boolean} dialogue_ready  // an owner message is accepted durably
+ * @property {boolean} tasks_ready  // pooled task starts are admitted
+ * @property {Array<{name: string, state: 'running'|'done'|'failed', started_at: string, ended_at: ?string, error: ?string}>} steps
+ * @property {Object<string, {state: ?string, done: ?number, total: ?number}>} jobs  // the store's named background jobs
+ * @property {?string} error
+ * @property {?{ts: string, max_event_lag_sec: ?number}=} supervisor_load  // latest supervisor_load row's headline; null before the first
  */
 /**
  * Background Consciousness alarm clock (server._describe_bg_consciousness_state over consciousness.status_snapshot). A wake-up is an ordinary Main turn; the direct-activity census owns its liveness.
@@ -89,6 +107,7 @@
  * @property {string} runtime_version
  * @property {string} app_version
  * @property {string=} abi_version  // gateway ABI carrier; absent on cores older than GET /api/contract
+ * @property {BootDocument=} boot  // the serving generation's phases; answered while the boot runs
  */
 /**
  * @typedef {Object} OpenAICompatibleModelsResponse
@@ -156,6 +175,8 @@
  * @property {boolean=} skipSubscriptionPresets
  * @property {Object=} OUROBOROS_SUBAGENTS
  * @property {boolean=} allow_empty_review_pool  // confirms saving agents that leave no review row
+ * @property {string[]=} starter_skills  // catalog ids installed once after completion; absent: the default list
+ * @property {Object<string, string>=} skill_source_trust  // {hub row id: trusted|review}; marks them confirmed
  */
 /**
  * POST /api/onboarding/subagents/preview accepts the same open provider/local draft and subscription
@@ -262,7 +283,6 @@
  * @property {boolean=} ingress_accepted Canonical inbound row saved; not proof of task start or model delivery.
  * @property {boolean=} ingress_dispatched This live host process accepted the row and entered its dispatch; absent after a host restart (unknown).
  * @property {boolean=} ingress_pending This live host process accepted the row and has entered or refused neither yet: a later echo or history read says which.
- * @property {boolean=} ingress_undispatched History only: this live host process proved the row's write raised before dispatch; one Send again hands it over.
  * @property {Array<NonNullable<UploadResponse['view']>>=} attachments The owner message's ChatAttachmentView list: the same views history replays.
  * @property {boolean=} text_placeholder The owner row's text is the host's placeholder (no words were sent): no caption is shown.
  * @property {boolean=} markdown
@@ -718,6 +738,7 @@
  * @typedef {Object} ProjectEntry
  * @property {string} id
  * @property {string=} name
+ * @property {boolean=} pinned  // absent on legacy rows means unpinned
  * @property {number=} chat_id
  * @property {string=} working_dir
  * @property {string=} provenance   // attached | cloned | genesis | none (historical fact)
@@ -904,23 +925,12 @@
  * @property {number} span
  * @property {number} grid_span
  * @property {string} revision
+ * @property {boolean=} pinned_card  // a kept living card (skill "_cards"); presses use the card: decision family
  */
 
 /**
  * @typedef {Object} WidgetsResponse
  * @property {WidgetTab[]} ui_tabs
- */
-
-/**
- * One `/api/marketplace/ouroboroshub/catalog` result row (additive hubflow fields).
- * `POST /api/marketplace/ouroboroshub/install` additionally accepts the adopt
- * body fields `{adopt: true, expected_content_hash: string}` (64 lowercase hex;
- * adopt forces auto_review and conflicts with overwrite).
- * @typedef {Object} HubCatalogRow
- * @property {string} slug
- * @property {string} sanitized_name
- * @property {string} latest_version
- * @property {boolean} identity_conflict
  */
 
 /**
@@ -964,6 +974,8 @@
  * @property {string=} error
  * @property {boolean=} ok  // attest only
  * @property {number=} status_code  // attest refusal only
+ * @property {boolean=} pending  // attest only: the job outlasted the answer bound; job_id and message name it
+ * @property {string=} message  // attest only, with pending
  * @property {string[]=} reviewer_models
  * @property {string=} review_profile
  * @property {Object[]=} findings
@@ -1003,13 +1015,19 @@
  */
 
 /**
- * `POST /api/skills/{skill}/grants`; a refusal answers `SkillActionRefusal`.
+ * `POST /api/skills/{skill}/grants`; refusals use `SkillActionRefusal`, slow setup {ok, pending: true, job_id, message}.
  * @typedef {Object} SkillGrantResponse
  * @property {boolean} ok
- * @property {string} skill
+ * @property {boolean=} pending
+ * @property {string=} job_id
+ * @property {string=} message
+ * @property {string=} skill
+ * @property {boolean=} enabled
  * @property {string=} content_hash
  * @property {string[]=} granted_keys
  * @property {string[]=} granted_permissions
+ * @property {string=} turn_on_when_ready
+ * @property {string=} setup_error
  * @property {string=} extension_action
  * @property {string=} extension_reason
  * @property {string=} load_error
@@ -1260,6 +1278,7 @@
  * @property {Array<Object>=} quota
  * @property {Array<Object>=} quota_absences
  * @property {Array<Object>=} resources Engine resource facets retain decimal strings, units and independent observation times.
+ * @property {Object=} availability_scope Engine binding: model (string|null), requestKind (text|image), basis quota_block.
  * @property {Object<string, boolean>=} resource_capabilities Catalog-negotiated read, refresh, reset and inspect_reset operations.
  * @property {ClaudexorReadState=} resource_capabilities_read Operations-catalog evidence, independent of reads.catalog (agent capabilities).
  * @property {ClaudexorStatusReads=} reads
@@ -1279,6 +1298,9 @@
  * @property {Object} profiles
  * @property {Array<Object>} quota
  * @property {Array<Object>} quota_absences
+ * @property {Array<Object>=} resources
+ * @property {Object=} availability_scope
+ * Engine echo: model (string|null), requestKind (text|image), basis quota_block.
  * @property {boolean} unified_accounts
  * @property {ClaudexorStatusReads} reads
  * @property {Object<'discovery'|'accounts'|'quota', ClaudexorPassiveReadError>} read_errors
@@ -1350,10 +1372,7 @@
  * @typedef {Object} ScheduleDeleteResponse
  * @property {boolean} ok
  */
-/**
- * @typedef {Object} TaskPauseRequest
- * @property {string} request_id
- */
+/** @typedef {import('./task_activity_types.js').TaskPauseRequest} TaskPauseRequest */
 /** @typedef {import('./task_activity_types.js').TaskPauseResponse} TaskPauseResponse */
 /**
  * @typedef {Object} TaskContinueRequest
@@ -1428,6 +1447,9 @@
  * `POST /api/skills/{skill}/delete`; a refusal carries only ok, error and status_code.
  * @typedef {Object} SkillDeleteResponse
  * @property {boolean} ok
+ * @property {boolean=} pending  // queued behind a long job past the answer bound: {ok, pending, job_id, message}
+ * @property {string=} job_id
+ * @property {string=} message
  * @property {string=} skill
  * @property {string=} source
  * @property {string=} content_hash
@@ -1439,6 +1461,8 @@
  */
 /**
  * @typedef {Object} UiPreferencesResponse
+ * @property {{stt:string,tts:string,tts_voice:string}} voice
+ * @property {{hidden:string[],order:string[]}} contributions
  * @property {string[]} widget_order
  * @property {Object.<string,'auto'|'manual'|'retain'>} widget_start_mode  // owner per-card launch-policy override, keyed "<skill>:<tab_id>"
  * @property {Object.<string,{w:number,h:number}>} widget_size  // owner Widgets card width: w masonry columns the card spans (12 = full width), h 0 (reserved)
@@ -1446,6 +1470,7 @@
  * @property {number} sidebar_width  // px; 0 = CSS default (v6.33.0)
  * @property {number} project_panel_width  // px; 0 = CSS default
  * @property {Object.<string,number>} project_seen_revision  // monotonic paint ACK
+ * @property {?number} main_seen_revision  // Main's monotonic paint ACK; null until a client first reads Main
  * @property {{mode:'default'|'hidden'|'custom',text:string}} welcome  // install-wide empty-Main UI copy, not chat history
  * @property {boolean=} ok
  */
@@ -1564,6 +1589,9 @@ export const MAX_QUIZ_OPTIONS = 6;
 // Mirror task_decision._COMMENT_MAX: ingress refuses longer comments, never
 // truncates; cards must offer only comments the ingress can deliver verbatim.
 export const MAX_DECISION_COMMENT = 2000;
-export const GATEWAY_CONTRACT_VERSION = '7.7.0';
+export const GATEWAY_CONTRACT_VERSION = '7.7.1';
 /** @typedef {import('./client_contract_types.js').ChatHistoryPosition} ChatHistoryPosition */
 /** @typedef {import('./client_contract_types.js').ChatHistoryResponse} ChatHistoryResponse */
+
+/** @typedef {import('./management_contract_types.js').UiContribution} UiContribution */
+/** @typedef {import('./management_contract_types.js').UiContributionsResponse} UiContributionsResponse */

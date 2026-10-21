@@ -174,9 +174,10 @@ def _write_payload_patch_artifacts(
     reported as ``blocked_reserved_paths`` and refused whole at apply, with the
     candidate always preserved for the parent's decision.
     """
-    import hashlib
     import subprocess
 
+    from ouroboros.artifact_storage import compress_in_place
+    from ouroboros.artifacts import stream_artifact_file
     from ouroboros.headless import (
         ARTIFACT_STATUS_FAILED,
         ARTIFACT_STATUS_READY_NO_CHANGES,
@@ -346,7 +347,9 @@ def _write_payload_patch_artifacts(
             detail = (diff.stderr or diff.stdout or b"").decode("utf-8", errors="replace")
             return _manifest(ARTIFACT_STATUS_FAILED, note=f"patch emit failed: {detail.strip()[:300]}")
         patch_bytes = diff.stdout or b""
-        (cap_dir / "workspace.patch").write_bytes(patch_bytes)
+        patch_path = cap_dir / "workspace.patch"
+        patch_path.write_bytes(patch_bytes)
+        compress_in_place(patch_path)
         baseline_hash = str((entry.resource_ref or {}).get("payload_hash") or "")
         if baseline_hash and result_hash == baseline_hash:
             # Non-empty patch, result hash EQUAL to baseline: the change is
@@ -362,10 +365,11 @@ def _write_payload_patch_artifacts(
                      "e.g. symlink topology or file metadata). The snapshot and "
                      "the candidate patch are preserved for inspection.")
         stat = _git("diff", *diff_isolation, "--cached", "--shortstat", baseline)
+        measured = stream_artifact_file(patch_path)
         return _manifest(
             ARTIFACT_STATUS_READY_WITH_CHANGES,
-            sha256=hashlib.sha256(patch_bytes).hexdigest(),
-            patch_size=len(patch_bytes),
+            sha256=measured["sha256"],
+            patch_size=measured["size"],
             diffstat=(stat.stdout or b"").decode("utf-8", errors="replace").strip(),
             tracked_changed=changed,
             untracked_included=[],

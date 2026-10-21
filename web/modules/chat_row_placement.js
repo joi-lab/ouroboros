@@ -1,5 +1,5 @@
 // Where a task-keyed chat row belongs, read from its declared facts the same way live
-// and on replay (DESIGN "Project unread dot"). A row's task_id names a task; by itself
+// and on replay (DESIGN "Unread"). A row's task_id names a task; by itself
 // it says neither who speaks, nor whether the row stands alone, nor whether it ends that task.
 import { isNonTerminalMediaHistoryRow, positiveTaskTerminalFact } from './chat_activity.js';
 

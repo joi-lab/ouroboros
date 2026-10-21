@@ -148,12 +148,12 @@ def governing_words_for_schedule(ctx: Any) -> Dict[str, Any]:
 
 
 def _inbound_rows(drive_root: Any, client_ids: Mapping[str, str]) -> List[Dict[str, Any]]:
-    """Owner rows of the chat chain with these client message ids, in chain order."""
-    from ouroboros.chat_chain import chat_chain_paths
-    from ouroboros.utils import iter_jsonl_objects
+    """Owner rows addressed by client message id, in canonical order."""
+    from ouroboros import dialogue_store as ds
 
-    return [row for path in chat_chain_paths(drive_root) for row in iter_jsonl_objects(path)
-            if str(row.get("client_message_id") or "") in client_ids and _owner_row(row)]
+    ds.require_imported(drive_root, "chat")
+    return [entry.row for entry in ds.iter_probes(drive_root, "chat", [("client_message_id", key) for key in client_ids])
+            if _owner_row(entry.row)]
 
 
 def _owner_row(row: Mapping[str, Any] | None) -> bool:

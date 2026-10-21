@@ -236,11 +236,36 @@ def observed_store(root, data):
     return out
 
 
-def refresh_policy(root, data, record):
+def scan_policy(root, snapshot):
+    """Off-Q observations of rows that can act or still bind an admitted task.
+
+    Pre-occurrence one-shots can retain an unstarted last_task_id: that live
+    binding still owes Stop/Restore convergence even though the row is disabled.
+    Settled historical ids need only their typed status, never their origins.
+    """
+    from ouroboros.store import StoreError, acquisition_budget
+    from ouroboros.task_store import task_versions
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    rows = [row for row in snapshot.get("tasks") or [] if isinstance(row, dict)]
+    try:
+        with acquisition_budget(0):  # optional legacy inventory must not stall the active rows
+            versions = task_versions(root, [row["last_task_id"] for row in rows
+                                           if row.get("last_task_id") and not row.get("enabled", True)
+                                           and not isinstance(row.get("occurrence"), dict)])
+    except StoreError:
+        versions = {}  # unknown legacy bindings wait for the next scan
+    live = {tid for tid, (_seq, status, _owes) in versions.items() if status not in SETTLED_STATUSES}
+    return {str(row.get("id") or ""): (row, policy_view(root, snapshot, row)) for row in rows
+            if row.get("enabled", True) or isinstance(row.get("occurrence"), dict)
+            or row.get("delete_requested_at") or row.get("last_task_id") in live}
+
+
+def refresh_policy(root, data, record, *, observed=None):
     """Persist restrictions only through the table producer's audited write seam."""
     from supervisor import queue_schedules as store
 
-    view = policy_view(root, data, record)
+    view = policy_view(root, data, record) if observed is None else observed
     hold = view.get("hold") or record.get("followup_hold")
     if view.get("busy") or record.get("followup_hold") == hold and record.get("followup_wait", "") == view["wait"]:
         return view  # contention is not a restriction to persist: no write, no audit flap

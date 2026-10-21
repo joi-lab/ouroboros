@@ -402,9 +402,11 @@ def test_gate_import_and_call_site_are_wired():
     from ouroboros import preflight_runner as pr
 
     assert pr.run_node_tests is pn.run_node_tests
-    source = inspect.getsource(pr.run_hermetic_pytest)
+    source = inspect.getsource(pr._run_hermetic_pytest)
     assert "run_node_tests(worktree, temp_root, timeout, max_output)" in source
-    assert source.index("_copy_untracked(repo, worktree)") < source.index("run_node_tests(") < source.index("for spec in passes:")
+    assert source.index("_assemble_live_source(") < source.index("run_node_tests(") < source.index("for spec in passes:")
+    assembly = inspect.getsource(pr._assemble_live_source)
+    assert assembly.index("_copy_untracked(repo, worktree)") < assembly.index("source_evidence(")
 
 
 # ── CI parity ─────────────────────────────────────────────────────────

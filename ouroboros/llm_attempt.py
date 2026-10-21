@@ -23,7 +23,7 @@ from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Set
 
 from ouroboros.anthropic_native_custody import is_replayed_native_content
-from ouroboros.context_budget import CONTEXT_OVERFLOW_CODES, HOST_CONTEXT_KIND_KEY
+from ouroboros.context_budget import CONTEXT_OVERFLOW_CODES, HOST_CONTEXT_KIND_KEY, HOST_TEXT_SHA_KEY
 from ouroboros.request_wire_contract import physical_candidate_bytes as _canonical_candidate_bytes
 from ouroboros.request_wire_recovery import prepare_wire_payload_for_send
 from ouroboros.transport_custody import ProviderNotDispatched, is_loopback_base_url
@@ -505,6 +505,7 @@ def _physical_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
     for message in candidate.get("messages") or []:
         if isinstance(message, dict):
             message.pop(HOST_CONTEXT_KIND_KEY, None)
+            message.pop(HOST_TEXT_SHA_KEY, None)
             message.pop(TOOL_RESULT_RECORD_KEY, None)
             message.pop(REVIEW_HISTORY_MESSAGE_KEY, None)
             message.pop(REVIEW_CONTEXT_INDEX_KEY, None)

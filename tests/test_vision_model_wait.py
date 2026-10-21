@@ -36,7 +36,7 @@ def _install_child_fixture(mode, events_path):
         polls = 0
         lost = False
 
-        def operations(self):
+        def operations(self, **_kwargs):
             return []  # Legacy model-operation catalog.
 
         def upload_model_request(self, payload, *, idempotency_key):
@@ -95,7 +95,7 @@ def _install_child_fixture(mode, events_path):
             event("close")
 
     gateway = Gateway()
-    transport.ensure_owned_gateway = lambda: gateway
+    transport.ensure_owned_gateway = lambda **_kw: gateway
     transport.config.CLAUDEXOR_MODEL_POLL_INTERVAL_SEC = 0.01
     pricing._fetch_live_rows = lambda *_: pytest.fail("VLM fixture must never fetch live pricing")
     original_write = vision_process._private_json
@@ -406,3 +406,59 @@ def test_real_parent_quota_controller_polls_metadata_then_rejoins_image_call(chi
     persisted = read_result(root, "image-task")
     wait, = persisted["model_waits"].values()
     assert wait["state"] == "resolved" and wait["resolution"] == "resource_available"
+
+
+def _vlm_ctx():
+    from ouroboros.tools.registry import BrowserState
+
+    state = BrowserState()
+    state.last_screenshot_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    from ouroboros.tools.tool_result import _TOOL_RESULT_ATTR
+
+    # The attribute the registry's result sidecar uses, so the typed result is observable.
+    return SimpleNamespace(browser_state=state, event_queue=None, task_id="image-task", task_attempt=None,
+                           _accumulated_usage={}, pending_events=[], **{_TOOL_RESULT_ATTR: None})
+
+
+@pytest.mark.parametrize("tool,label", [("vlm_query", "VLM_QUERY_FAILED"), ("analyze_screenshot", "VLM_ANALYSIS_FAILED")])
+def test_tool_result_carries_the_reconstructed_typed_provider_projection(child_fixture, monkeypatch, tool, label):
+    """#763: the provider field the child's receipt carries reaches the tool's returned text."""
+    from ouroboros.tools.tool_result import _published_tool_result
+
+    state, _, _ = child_fixture
+    state["mode"] = "field"
+    monkeypatch.setattr(vision, "_get_llm_client", lambda: None)
+    monkeypatch.setattr(vision, "_resolve_vlm_model", lambda *a, **k: MODEL)
+    ctx = _vlm_ctx()
+    text = (vision._vlm_query(ctx, prompt="Describe only this image", image_url="data:image/png;base64,AAAA")
+            if tool == "vlm_query" else vision._analyze_screenshot(ctx, prompt="Describe only this image"))
+    first = text.splitlines()[0]
+    assert first.startswith(f"⚠️ {label}: ") and "provider_code=string_above_max_length" in first
+    assert "parameter=instructions" in first and "invalid_request: controlled refusal" in first
+    assert "private provider body" not in text  # the raw provider body never joins the projection
+    published = _published_tool_result(ctx, None)
+    assert published.text == text and published.code == "VLM_ERROR"
+    # Machine metadata is unchanged; only the returned text gained the typed projection.
+    assert dict(published.meta) == {"model": MODEL, "provider_status_code": 400}
+
+
+@pytest.mark.parametrize("error,shown", [
+    (RuntimeError("HTTP 400 image input is not supported"), "HTTP 400 image input is not supported"),
+    (ClaudexorModelError({"code": "invalid_request", "message": "plain refusal"}), "invalid_request: plain refusal"),
+])
+def test_an_error_without_typed_fields_keeps_its_own_text(monkeypatch, error, shown):
+    monkeypatch.setattr(vision, "_get_llm_client", lambda: None)
+    monkeypatch.setattr(vision, "_resolve_vlm_model", lambda *a, **k: MODEL)
+    monkeypatch.setattr(vision, "_vision_query_with_timeout", lambda *a, **k: (_ for _ in ()).throw(error))
+    assert vision._vlm_query(_vlm_ctx(), prompt="p", image_url="data:image/png;base64,AAAA") == f"⚠️ VLM_QUERY_FAILED: {shown}"
+
+
+def test_an_unknown_outcome_is_still_raised_not_turned_into_a_result(monkeypatch):
+    unknown = ClaudexorModelError({"code": "provider_failed", "message": "lost",
+                                   "context": {"vendorCode": "should_not_show"}}, unknown=True)
+    monkeypatch.setattr(vision, "_get_llm_client", lambda: None)
+    monkeypatch.setattr(vision, "_resolve_vlm_model", lambda *a, **k: MODEL)
+    monkeypatch.setattr(vision, "_vision_query_with_timeout", lambda *a, **k: (_ for _ in ()).throw(unknown))
+    with pytest.raises(ClaudexorModelError) as caught:
+        vision._vlm_query(_vlm_ctx(), prompt="p", image_url="data:image/png;base64,AAAA")
+    assert caught.value is unknown and "should_not_show" not in unknown.display_message

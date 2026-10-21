@@ -21,6 +21,8 @@ echo first, and a retry rejoins the one delivery.
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import base64
 import json
@@ -58,10 +60,8 @@ def _chat_frame(client_message_id: str, text: str = "hello") -> str:
 
 def _row_ids(drive) -> list[str]:
     path = drive / "logs" / "chat.jsonl"
-    if not path.exists():
-        return []
     return [json.loads(line)["client_message_id"]
-            for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            for line in dialogue_test.log_text(path).splitlines() if line.strip()]
 
 
 def _witness_echoes(bridge):

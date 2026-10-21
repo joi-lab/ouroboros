@@ -594,6 +594,20 @@ def collect_and_deliver_terminal(ctx, rid, detail, authority, entry, gateway):
                 full_ok=retained.get("complete") is True, full_note=full.get("primary_output_full"))
             payload["collection"] = {"status": "pending", "reason": "output_publication_unconfirmed"}
             return payload
+        if collection.get("status") == "unavailable":
+            # An unavailable collector is not a contending one.
+            from ouroboros.delegate_shared import _fail, delegate_payload
+            note = (
+                "This run belongs to a review panel. Rejoin the original review operation to collect "
+                "its result; delegate_wait does not collect or settle panel-owned reviews."
+                if entry.review_owned else
+                "The terminal result cannot be collected through this wait. Inspect the recorded "
+                "custody and owning operation before choosing another action."
+            )
+            return delegate_payload(_fail(
+                "delegate_wait", str(collection.get("reason") or "collection_unavailable"), note,
+                run_id=rid, state=str(custody.summary_of(detail).get("state") or ""),
+                collection=collection, answered=True, last_seq=int(detail.get("lastSeq") or 0)))
         return {"status": "observation_pending", "reason": "collection_in_progress", "run_id": rid,
                 "state": str(custody.summary_of(detail).get("state") or ""), "collection": collection,
                 "answered": True, "last_seq": int(detail.get("lastSeq") or 0)}

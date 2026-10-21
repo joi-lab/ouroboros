@@ -94,6 +94,7 @@ _REVIEW_SUBSTRATE_PATHS = frozenset({
     "ouroboros/llm.py", "ouroboros/openrouter_attribution.py", "ouroboros/outcomes.py",
     "ouroboros/platform_layer.py", "ouroboros/pricing.py", "ouroboros/provider_models.py",
     "ouroboros/preflight_runner.py", "ouroboros/review_actor_aggregation.py", "ouroboros/review_dispatch.py",
+    "ouroboros/test_evidence.py", "ouroboros/safe_test_supervisor.py",
     "ouroboros/review_execution.py", "ouroboros/review_execution_projection.py", "ouroboros/review_native_episode.py",
     "ouroboros/review_slot_cancel.py", "ouroboros/review_verdict_extraction.py", "ouroboros/reviewer_slot_config.py",
     "ouroboros/reviewer_window.py", "ouroboros/review_substrate.py", "ouroboros/review_records.py",
@@ -610,6 +611,17 @@ def _pending_checkout_custody(ctx) -> dict:
     return facts
 
 
+def _review_checkout_ctx(checkout, review_drive_root: pathlib.Path):
+    """A context over a temporary review checkout. Both lanes remove the checkout's parent
+    on return, unlike an ordinary taskless CLI: raw test sources/logs stay with the
+    persistent review drive."""
+    from ouroboros.tools.registry import ToolContext
+
+    ctx = ToolContext(repo_dir=pathlib.Path(checkout), drive_root=review_drive_root)
+    ctx._preflight_evidence_parent = review_drive_root / "test-evidence"
+    return ctx
+
+
 def _contributor_tests_preflight(host_ctx, proposal: dict, *, review_drive_root: pathlib.Path) -> tuple[dict, dict]:
     """The proposal's own hermetic test suite, run by the commit gate's runner in an
     isolated checkout of the same ``base..head`` subject the review operation freezes,
@@ -619,14 +631,13 @@ def _contributor_tests_preflight(host_ctx, proposal: dict, *, review_drive_root:
     from ouroboros.commit_admission import run_tests_preflight_with_proof
     from ouroboros.preflight_receipts import execution_exhibit
     from ouroboros.tools.commit_gate import _review_tests_facts
-    from ouroboros.tools.registry import ToolContext
     from ouroboros.tools.review_helpers import _run_review_preflight_tests
     from ouroboros.tools.review_subject import ReviewSubjectSpec, isolated_checkout
 
     spec = ReviewSubjectSpec(root_kind="system_repo", root=str(REPO), kind="base..head",
                              base=proposal["base_sha"], head=proposal["head_sha"], surface="change")
     with isolated_checkout(host_ctx, spec) as frozen:
-        test_ctx = ToolContext(repo_dir=pathlib.Path(frozen.checkout), drive_root=review_drive_root)
+        test_ctx = _review_checkout_ctx(frozen.checkout, review_drive_root)
         test_err = run_tests_preflight_with_proof(
             test_ctx, runner=lambda c, **kw: _run_review_preflight_tests(c, **kw))
         if test_err:
@@ -1374,7 +1385,6 @@ def _operator_lane(args, host_ctx, commit_message: str, *, goal: str, scope: str
     open after the cycle."""
     from ouroboros.tools.commit_gate import preflight_reviewer_error
     from ouroboros.tools.git import _run_non_committing_review_cycle
-    from ouroboros.tools.registry import ToolContext
     from ouroboros.tools.review_subject import ReviewSubjectSpec, isolated_checkout
 
     refusal = preflight_reviewer_error(args.preflight_reviewer.strip()) if args.preflight_reviewer.strip() else ""
@@ -1398,7 +1408,7 @@ def _operator_lane(args, host_ctx, commit_message: str, *, goal: str, scope: str
                     "exit_code": 3, "outcome": {"status": "blocked", "block_reason": "isolated_checkout_failed"}})
                 return 3
             checkout = pathlib.Path(frozen.checkout)
-            ctx = ToolContext(repo_dir=checkout, drive_root=review_drive_root)
+            ctx = _review_checkout_ctx(checkout, review_drive_root)
             print(f"Isolated review checkout: {checkout}", file=sys.stderr)
         # The shared cycle owns preparation, admission and the named preflight.
         try:

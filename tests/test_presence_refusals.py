@@ -1,4 +1,6 @@
 """Recovery disposition is a producer fact, not a guess from an HTTP status."""
+
+from tests import _dialogue as dialogue_test
 import asyncio
 import json
 import queue
@@ -100,6 +102,15 @@ def test_receipt_write_retry_and_conflict_do_not_share_disposition(tmp_path, mon
     assert json.loads(unavailable.body)["disposition"] == "retry"
     assert json.loads(unavailable.body)["code"] == "presence_receipt_unwritable"
 
+    def importing(*args):
+        from ouroboros.store import StoreMigrating
+        raise StoreMigrating("Dialogue history is still importing")
+
+    monkeypatch.setattr(ctx.presence_deliveries, "record", importing)
+    waiting = asyncio.run(host_service._api_presence_delivery(_request(app, payload)))
+    assert waiting.status_code == 503 and json.loads(waiting.body)["disposition"] == "retry"
+    assert json.loads(waiting.body)["code"] == "presence_history_importing", "an import is not a failed write"
+
 
 def test_missing_work_is_rejected_without_losing_original_error(tmp_path):
     app, binding, _ctx = _presence_app(tmp_path, _answer)
@@ -154,7 +165,7 @@ def test_retained_turn_records_facts_without_forced_owner_or_correspondent_speec
     _notify_unresolved_turn(tmp_path, task_id)
     _notify_unresolved_turn(tmp_path, task_id)
     assert load_task_result(tmp_path, task_id)["status"] == "running"
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = dialogue_test.chat_rows(tmp_path)
     facts = [row for row in rows if row.get("summary_id") == f"presence-retained:{task_id}"]
     assert len(facts) == 1 and facts[0]["summary_kind"] == "host_task_facts"
     assert facts[0]["text"] == "" and facts[0]["presence_recovery"]["turn_ref"] == task_id
@@ -431,7 +442,7 @@ def test_host_retries_only_attested_no_effect_after_reset_with_new_physical_iden
     assert asyncio.run(_turn(app, binding, "event")).body == recovered.body
     assert json.loads(pointer.read_text(encoding="utf-8"))["task_id"] == second_id
     assert invoked == [first_id, second_id] and ctx.presence_turns.live() == []
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = dialogue_test.chat_rows(tmp_path)
     assert len([row for row in rows if row.get("direction") == "in" and
                 row.get("client_message_id") == "event"]) == 1
 
@@ -462,7 +473,7 @@ def test_required_jsonl_boundary_read_error_refuses_append(tmp_path, monkeypatch
     from pathlib import Path
     from ouroboros.utils import append_jsonl
 
-    path = tmp_path / "logs" / "chat.jsonl"
+    path = tmp_path / "logs" / "events.jsonl"
     path.parent.mkdir()
     original_bytes = b'{"torn": 1}'
     path.write_bytes(original_bytes)
@@ -634,8 +645,7 @@ def test_inline_turn_recovers_lost_response_without_replaying_event(tmp_path, mo
                         lambda _root, task_id: notices.append(task_id))
 
     def spoken():
-        path = tmp_path / "logs" / "chat.jsonl"
-        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()] if path.exists() else []
+        rows = dialogue_test.chat_rows(tmp_path)
         return [row["text"] for row in rows if row.get("direction") == "out"]
 
     class ObservedLLM(_LedgerLLM):

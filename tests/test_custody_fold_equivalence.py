@@ -7,6 +7,7 @@ import sqlite3
 
 from ouroboros import delegate_custody as custody
 from ouroboros import delegate_custody_current as current
+from ouroboros import delegate_invocation as inv
 from ouroboros import store, store_import
 
 
@@ -66,6 +67,8 @@ def _reduced(rows):
                      conn.execute("SELECT run_id, facts, state FROM custody_runs")},
             "open": txn.set_rows("custody_open"), "refused": txn.set_rows("custody_refused"),
             "marks": txn.set_rows("custody_marks"),
+            "invocations": txn.set_rows(inv.INVOCATIONS), "operations": txn.set_rows(inv.OPERATIONS),
+            "event_ordinals": txn.set_rows(inv.EVENTS), "ordinal": txn.meta(inv.ORDINAL),
         }), _normalise(txn.set_rows("delegated_runs"))
 
 
@@ -91,15 +94,12 @@ def test_required_chain_matches_at_every_prefix_and_at_import(tmp_path):
     assert _normalise(receipts["delegated_runs"]) == _reduced(rows)[1]
 
 
-def test_start_after_repeated_refused_request_prevents_equivalence():
-    """A CUT1 blocker: the fold retains answered requests; the live reducer binds open ones."""
+def test_start_after_repeated_refused_request_preserves_equivalence():
+    """A late start keeps the original request and billing group through refusal/retry."""
     rows = [row for row in _chain() if row.get("invocation_id") == "inv-b"]
     rows.append({"type": custody.STARTED, "event_id": "late-start", "run_id": "b",
                  "invocation_id": "inv-b", "task_id": "t2", "root_task_id": "t1"})
     live, imported = _reduced(rows)[0], _normalise(current.fold(rows))
-    live_run, imported_run = live["runs"]["b"][0], imported["runs"]["b"][0]
-    assert live_run.pop("request_event") == {}
-    assert imported_run.pop("request_event") == rows[0]
-    assert live_run.pop("billing_group") == {}
-    assert imported_run.pop("billing_group") == rows[0]["billing_group"]
-    assert live == imported, "the request and billing group are the only differences"
+    assert live["runs"]["b"][0]["request_event"] == rows[0]
+    assert live["runs"]["b"][0]["billing_group"] == rows[0]["billing_group"]
+    assert live == imported

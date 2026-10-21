@@ -101,51 +101,6 @@ def calibrated_input_token_limit(
     )
 
 
-def review_row_call_usd(row: Any, *, allow_live_fetch: bool = True) -> Optional[float]:
-    """The price of ONE full call of a review row: the number Settings → Agents shows for a
-    catalog row and ``## Review`` for its pool seat. ``row`` is a pool slot, or a mapping with
-    its ``slot_id``, ``model``, ``profile_id`` and ``processing_preference``.
-
-    A full call is the row's calibrated input cap inside its reviewer window (the fit ladder's
-    bound, at most ``REVIEW_PROMPT_TOKEN_BUDGET``) plus the review output reservation within the
-    route's known maximum response, priced by the reservation math a review wave is admitted with.
-    A packet reviewer makes one such call per review; a reading reviewer makes several, each
-    reserved as it is sent, so this never bounds a whole review. ``None`` is unknown, never zero;
-    a local route is the known zero (``pricing.estimate_cost_optional`` prices route ``local`` at ``0.0``).
-
-    ``allow_live_fetch=False`` keeps the whole measurement in this process: the tariff AND
-    the reviewer window are read as already held (an unevidenced window prices at the full
-    window), so a context-assembly reader never waits on a provider catalog."""
-    get = row.get if isinstance(row, dict) else lambda key, default=None: getattr(row, key, default)
-    model = str(get("model", "") or "")
-    if not model:
-        return None
-    try:
-        from ouroboros.provider_models import review_model_uses_local
-
-        use_local = get("use_local", None)
-        if review_model_uses_local(model) if use_local is None else use_local:
-            return 0.0
-        from ouroboros.reviewer_window import reviewer_context_window, reviewer_window_binding, window_scaled_reserves
-        from ouroboros.tools.review_multi_model import review_output_allowance
-        from ouroboros.usage_admission import review_wave_admission
-
-        window = reviewer_context_window(model, allow_fetch=allow_live_fetch, **(binding := reviewer_window_binding(row)))
-        output = review_output_allowance(model, window, **binding)
-        reserve, margin = window_scaled_reserves(window, output_reserve=output, tokenizer_margin=50_000)
-        prompt = max(0, calibrated_input_token_limit(
-            model, context_window=window, output_reserve=reserve, tokenizer_margin=margin))
-        bounds = review_wave_admission(
-            root_task_id="review-row-price", models=[model], prompt_chars=prompt * 4, max_completion_tokens=output,
-            remaining_usd_override=0.0, processing_preferences=str(get("processing_preference", "") or ""),
-            allow_live_fetch=allow_live_fetch,
-        ).get("slot_bounds") or [None]
-    except Exception:
-        logger.debug("review row price estimate failed open", exc_info=True)
-        return None
-    return bounds[0]
-
-
 SKILL_HOST_CONTEXT_FILES = (
     ("docs/CREATING_SKILLS.md", "markdown"),
     ("ouroboros/contracts/plugin_api.py", "python"),

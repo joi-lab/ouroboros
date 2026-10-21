@@ -340,7 +340,7 @@ def test_the_pool_grant_announces_every_non_control_wake(tmp_path, monkeypatch, 
                  chat_id=1, wait_for_answer=True)
     frames = _bridge(monkeypatch)
     set_owner_wait(tmp_path, "root-1", {**wait, "state": "waiting"})
-    worker = SimpleNamespace(in_q=queue.Queue(), busy_task_id="root-1",
+    worker = SimpleNamespace(wid=0, in_q=queue.Queue(), busy_task_id="root-1",
                              proc=SimpleNamespace(pid=7), reaping=False, active_capacity=False)
     meta = {"worker_id": 0, "attempt": 1, "owner_wait": {**wait, "state": "waiting"},
             "task": {"id": "root-1", "chat_id": 1}, "started_at": time.time()}
@@ -352,7 +352,8 @@ def test_the_pool_grant_announces_every_non_control_wake(tmp_path, monkeypatch, 
         pool,
     )
     monkeypatch.setattr(supervisor_wait, "_pool", lambda: pool, raising=False)
-    monkeypatch.setattr(supervisor_wait, "_resume_allowed", lambda *_: True)
+    monkeypatch.setattr(supervisor_wait, "_resume_memory_allowed", lambda *_: True)
+    monkeypatch.setattr(supervisor_wait, "_resume_authority_allowed", lambda *_: True)
     monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda **_kw: True)
     assert supervisor_wait._grant_resume("root-1", meta, worker) is True
     row = load_task_result(tmp_path, "root-1")["owner_wait"]

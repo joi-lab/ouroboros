@@ -5,14 +5,13 @@ feed (a census-only one is mounted at its own date by the waiting pill) and a ta
 owner is one System message there, with the task's own controls.
 """
 import json
-import os
 import re
 import socket
-from pathlib import Path
 
 import pytest
 
 from tests.test_ui_smoke_playwright import direct_server_with_data as direct_server_with_data
+from tests._shared import producer_evidence_dir
 from tests.ui_chat_viewport_smoke import (
     _CAPTURE_TEST_SOCKET, _OBSERVE_STATE_READS, _emit_ws_frame, _wait_socket_open_quiescent,
     _wait_state_reads_quiescent,
@@ -42,7 +41,8 @@ def test_shared_app_read_failure_reaches_main_without_overwriting_newer_question
     from playwright.sync_api import expect, sync_playwright
 
     server = direct_server_with_data
-    evidence = Path(os.environ.get("OUROBOROS_BROWSER_EVIDENCE_OUT") or server["data_dir"].parent) / engine
+    evidence = producer_evidence_dir(server["data_dir"].parent, "main-shared-state",
+                                     env="OUROBOROS_BROWSER_EVIDENCE_OUT") / engine
     evidence.mkdir(parents=True, exist_ok=True)
     question = {"task_id": "question-task", "quiz_id": "cached", "quiz_state": "open",
                 "project_id": "build", "project_name": "Build", "project_chat_id": 12,
@@ -190,7 +190,8 @@ def test_project_panel_read_failure_reaches_main_without_overwriting_newer_quest
     from ouroboros import projects_registry as registry
 
     server = direct_server_with_data
-    evidence = Path(os.environ.get("OUROBOROS_BROWSER_EVIDENCE_OUT") or server["data_dir"].parent) / f"panel-{engine}"
+    evidence = producer_evidence_dir(server["data_dir"].parent, "main-shared-state",
+                                     env="OUROBOROS_BROWSER_EVIDENCE_OUT") / f"panel-{engine}"
     evidence.mkdir(parents=True, exist_ok=True)
     project = registry.create_project(server["data_dir"], "build", name="Build")
     question = {"task_id": "question-task", "quiz_id": "cached", "quiz_state": "open", "project_id": "build",
@@ -337,7 +338,8 @@ def test_genuine_socket_close_withdraws_main_authority_until_a_fresh_census(dire
     with socket.socket() as probe:  # a loopback port nothing listens on once closed
         probe.bind(("127.0.0.1", 0))
         refused_url = f"ws://127.0.0.1:{probe.getsockname()[1]}/ws"
-    evidence = Path(os.environ.get("OUROBOROS_BROWSER_EVIDENCE_OUT") or server["data_dir"].parent) / f"close-{engine}"
+    evidence = producer_evidence_dir(server["data_dir"].parent, "main-shared-state",
+                                     env="OUROBOROS_BROWSER_EVIDENCE_OUT") / f"close-{engine}"
     evidence.mkdir(parents=True, exist_ok=True)
     settled_text = "Settled result: the quarterly report is ready."
     log_chat("out", 1, 1, settled_text, task_id="settled-task", drive_root=server["data_dir"], require_write=True)

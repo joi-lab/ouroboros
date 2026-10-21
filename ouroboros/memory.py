@@ -5,12 +5,12 @@ import json
 import logging
 import os
 import pathlib
-from collections import Counter, deque
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
-from ouroboros.utils import append_jsonl, iter_jsonl_objects, read_json_dict, read_text, short, utc_now_iso, write_text
+from ouroboros.utils import append_jsonl, read_json_dict, read_text, short, utc_now_iso, write_text
 from ouroboros.platform_layer import (
     file_lock_exclusive as _lock_ex,
     file_lock_shared as _lock_sh,
@@ -469,9 +469,9 @@ class Memory:
         self, count: int = 100, offset: int = 0, search: str = "",
         snapshot: str = "", **filters: str,
     ) -> str:
-        chat_path = self.logs_path("chat.jsonl")
-        archive_dir = self.drive_root / "archive"
-        if not chat_path.exists() and not any(archive_dir.glob("chat_*.jsonl")):
+        from ouroboros import dialogue_store as ds
+
+        if ds.stream_end(self.drive_root, "chat") == 0 and ds.range_coverage(self.drive_root, "chat")["imported"]:
             meta = self.load_dialogue_meta()
             signature = meta.get("chat_log_signature") if isinstance(meta, dict) else {}
             if not (isinstance(signature, dict) and signature.get("first_line_sha256")):
@@ -556,189 +556,59 @@ class Memory:
         except Exception as e:
             return f"(error reading history: {e})"
 
-    def _ordered_chat_generation_paths(self) -> List[pathlib.Path]:
-        """Existing canonical chat generations, oldest archive through live.
-
-        This is deliberately a chat-specific Memory primitive, not a generic
-        history framework.  Consolidation owns cursor semantics; this reader
-        gives ordinary cognition and ``chat_history`` the same physical
-        generation horizon instead of silently treating the mutable live file
-        as the whole biography.
-        """
-        from ouroboros.chat_chain import _ordered_chat_generation_paths
-
-        live = self.logs_path("chat.jsonl")
-        return _ordered_chat_generation_paths(live)
-
     def read_chat_generations(
-        self,
-        *,
-        exclude_a2a: bool = False,
+        self, *, exclude_a2a: bool = False,
         predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        room_id: Optional[int] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """Read the archive/live chat chain with truthful coverage facts.
+        """A frozen SQL horizon with honest import/invalid-interval coverage.
 
-        Filtering happens while traversing the complete existing chain and
-        therefore before any caller applies a recent-window bound.  A rotation
-        racing the capture is retried; a persistently moving chain is returned
-        as a known-partial snapshot with an explicit gap rather than certified
-        complete.
+        Explicit recall requests the whole biography. Room consumers supply their
+        room address so filtering never reads another room's history first.
         """
-        from ouroboros.utils import jsonl_generation_signature
+        from ouroboros import chat_chain, dialogue_store as ds, dialogue_positions as dp
 
-        last_entries: List[Dict[str, Any]] = []
-        last_coverage: Dict[str, Any] = {}
-        for attempt in range(3):
-            paths = self._ordered_chat_generation_paths()
-            before = [jsonl_generation_signature(path) for path in paths]
-            entries: List[Dict[str, Any]] = []
-            gaps: List[Dict[str, Any]] = []
-            generations: List[Dict[str, Any]] = []
-            for path, signature in zip(paths, before):
-                if not path.exists():
-                    # A live file can be absent before the first append or in the
-                    # short interval after rotation.  A genuinely missing cursor
-                    # generation is detected by the consolidator-owned resolver.
-                    continue
-                generation_rows, parse_gaps = self._read_chat_generation(path)
-                gaps.extend(parse_gaps)
-                generations.append({
-                    "path": str(path),
-                    "first_line_sha256": str(signature.get("first_line_sha256") or ""),
-                    "size": int(signature.get("size") or 0),
-                    "rows": len(generation_rows),
-                })
-                for entry in generation_rows:
-                    if exclude_a2a and is_a2a_chat_id(entry.get("chat_id")):
-                        continue
-                    if predicate is not None and not predicate(entry):
-                        continue
-                    entries.append(entry)
-
-            after_paths = self._ordered_chat_generation_paths()
-            after = [jsonl_generation_signature(path) for path in after_paths]
-            stable_paths = [str(path) for path in paths] == [str(path) for path in after_paths]
-            stable_generations = stable_paths and all(
-                str(left.get("first_line_sha256") or "")
-                == str(right.get("first_line_sha256") or "")
-                and int(right.get("size") or 0) == int(left.get("size") or 0)
-                for left, right in zip(before, after)
-            )
-            coverage = {
-                "generations": generations,
-                "matched_rows": len(entries),
-                "gaps": gaps,
-                "capture_attempts": attempt + 1,
-                "snapshot_changed_during_read": bool(
-                    not stable_generations
-                ),
-                "snapshot_stable": stable_generations,
-                "reader": "chat_history(count, offset, search)",
-            }
-            try:
-                from ouroboros.chat_chain import _resolve_generation_segments
-
-                _segments, _offset, cursor_gap = _resolve_generation_segments(
-                    self.load_dialogue_meta(), self.logs_path("chat.jsonl"),
-                )
-                if cursor_gap:
-                    coverage["gaps"].append({
-                        "kind": "consolidation_cursor_generation_missing",
-                        "detail": "The consolidation cursor names a generation that is no longer readable.",
-                    })
-            except Exception as exc:
-                coverage["gaps"].append({
-                    "kind": "consolidation_cursor_state_unreadable",
-                    "error": type(exc).__name__,
-                })
-            durable_gaps, durable_gap_ids = self._durable_dialogue_gaps()
-            coverage["gaps"].extend(durable_gaps)
-            coverage["durable_gap_ids"] = durable_gap_ids
-            last_entries, last_coverage = entries, coverage
-            if stable_generations:
-                return entries, coverage
-        last_coverage = dict(last_coverage)
-        last_coverage["snapshot_stable"] = False
-        last_coverage.setdefault("gaps", []).append({
-            "kind": "generation_chain_changed_during_capture",
-            "detail": "archive/live generation ordering did not stabilize after 3 attempts",
-        })
-        return last_entries, last_coverage
-
-    @staticmethod
-    def _read_chat_generation(
-        path: pathlib.Path, *, tail_bytes: Optional[int] = None, max_rows: Optional[int] = None,
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Read one physical generation without hiding malformed durable rows."""
-        rows: List[Dict[str, Any]] = []
-        gaps: List[Dict[str, Any]] = []
-        try:
-            with path.open("rb") as handle:
-                if tail_bytes is not None:
-                    size = path.stat().st_size
-                    if size > tail_bytes:
-                        handle.seek(size - tail_bytes - 1)
-                        if handle.read(1) != b"\n":
-                            handle.readline()
-                        gaps.append({
-                            "kind": "generation_prefix_unscanned", "path": str(path),
-                            "omitted_bytes_at_least": size - tail_bytes,
-                        })
-                if max_rows is not None:
-                    buffered = deque(maxlen=max_rows)
-                    seen = 0
-                    for raw in handle:
-                        seen += 1
-                        buffered.append((seen, raw))
-                    if seen > max_rows:
-                        gaps.append({
-                            "kind": "generation_tail_rows_unscanned", "path": str(path),
-                            "omitted_rows": seen - max_rows,
-                        })
-                    source = buffered
-                else:
-                    source = enumerate(handle, start=1)
-                for line_number, raw in source:
-                    if not raw.strip():
-                        continue
-                    try:
-                        decoded = raw.decode("utf-8")
-                        value = json.loads(decoded)
-                    except UnicodeDecodeError:
-                        gaps.append({"kind": "jsonl_decode_error", "path": str(path), "line": line_number})
-                        continue
-                    except (json.JSONDecodeError, ValueError):
-                        gaps.append({"kind": "jsonl_malformed", "path": str(path), "line": line_number})
-                        continue
-                    if not isinstance(value, dict):
-                        gaps.append({"kind": "jsonl_non_object", "path": str(path), "line": line_number})
-                        continue
-                    rows.append(value)
-        except OSError as exc:
-            gaps.append({"kind": "generation_unreadable", "path": str(path), "error": type(exc).__name__})
-        return rows, gaps
-
-    def _read_jsonl_entries(
-        self,
-        log_name: str,
-        exclude_a2a: bool = False,
-    ) -> List[Dict[str, Any]]:
-        path = self.logs_path(log_name)
-        try:
-            return [e for e in iter_jsonl_objects(path)
-                    if not (exclude_a2a and is_a2a_chat_id(e.get("chat_id")))]
-        except Exception:
-            log.warning("Failed to read JSONL entries from %s", log_name, exc_info=True)
-            return []
+        upper = ds.stream_end(self.drive_root, "chat")
+        imported = ds.range_coverage(self.drive_root, "chat", upper=upper)
+        source = (ds.iter_rows(self.drive_root, "chat", upper=upper) if room_id is None else
+                  chat_chain.room_rows(self.drive_root, room_id, upper=upper))
+        entries = [entry.row for entry in source
+                   if not (exclude_a2a and is_a2a_chat_id(entry.row.get("chat_id")))
+                   and (predicate is None or predicate(entry.row))]
+        gaps = [{"kind": "jsonl_malformed" if gap.kind == "invalid" else "jsonl_non_object",
+                 "path": str(ds.path(self.drive_root)), "offset": gap.seq, "length": gap.length}
+                for gap in dp.skipped_between(self.drive_root, "chat", upper=upper)]
+        if imported["pending"]:
+            gaps.append({"kind": "history_importing", "detail": "Dialogue history is still importing"})
+        if imported["mismatch"]:
+            gaps.append({"kind": "history_import_failed", "detail": "A segment could not be imported"})
+        coverage = {
+            "generations": ([{"path": str(ds.path(self.drive_root)), "first_line_sha256": "dialogue:chat",
+                              "size": upper, "rows": len(entries)}] if upper else []),
+            "matched_rows": len(entries), "gaps": gaps, "capture_attempts": 1,
+            "snapshot_changed_during_read": False, "snapshot_stable": bool(imported["imported"]),
+            "reader": "chat_history(count, offset, search)",
+        }
+        if imported["imported"]:
+            _position, missing = chat_chain.generation_cursor(self.drive_root, self.load_dialogue_meta())
+            if missing:
+                gaps.append({"kind": "consolidation_cursor_generation_missing",
+                             "detail": "The consolidation cursor names a generation that is no longer readable."})
+        durable_gaps, durable_gap_ids = self._durable_dialogue_gaps()
+        gaps.extend(durable_gaps)
+        coverage["durable_gap_ids"] = durable_gap_ids
+        return entries, coverage
 
     def read_task_recent(
         self, log_name: str, task_id: str, want: int, *, iter_objects=None, list_archives=None, stat=None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """The newest ``want`` rows of ONE task (or of the log when ``task_id`` is
-        empty) through the bounded rotation-aware reader (razzant/ouroboros#131);
+        empty) through an addressed SQL query for chat/progress;
         for ``tools.jsonl`` the rows of the newest ``want`` logical calls (#1316).
 
-        The window is a doubling byte tail of the live file plus at most the
+        SQL coverage records the queried coordinates, older matching rows and
+        incomplete or invalid import ranges. Other logs use a doubling byte tail
+        of the live file plus at most the
         three newest archives, so a busy neighbour cannot push this task's own
         rows out of a shared global suffix, and the whole file is never parsed
         for its tail. ``coverage`` states what the window was and whether the
@@ -747,6 +617,29 @@ class Memory:
         ``iter_objects``, ``list_archives`` and ``stat`` are the reader's parser,
         archive-listing and metadata seams, passed through unchanged.
         """
+        if log_name in {"chat.jsonl", "progress.jsonl"}:
+            from ouroboros import dialogue_store as ds
+
+            stream, wanted, limit = log_name[:-6], str(task_id or "").strip(), max(1, int(want))
+            upper = ds.stream_end(self.drive_root, stream)
+            records = (ds.probe_rows(self.drive_root, stream, [("task_id", wanted)], before=upper, limit=limit + 1)
+                       if wanted else list(reversed(ds.newest(self.drive_root, stream, limit=limit + 1, before=upper))))
+            bounded = len(records) > limit
+            records = records[:limit]
+            lower = records[-1].seq if bounded else 0
+            imported = ds.range_coverage(self.drive_root, stream, lower=lower, upper=upper)
+            gaps = (["history is still importing"] if imported["pending"] else [])
+            if imported["mismatch"]:
+                gaps.append("a segment could not be imported")
+            if imported["gaps"]:
+                gaps.append("recorded invalid intervals")
+            coverage = {"task_id": wanted, "source": f"state/dialog.sqlite ({stream})", "dialogue": True,
+                        "lower": lower, "upper": upper, "shown": len(records), "matched": len(records),
+                        "quota_met": len(records) >= limit, "older_available": bounded, "gaps": gaps,
+                        "archives_bounded": False, "archives": 0, "archives_available": 0,
+                        "live_size": upper, "live_window": upper - lower}
+            return [entry.row for entry in reversed(records)], coverage
+
         from ouroboros.jsonl_tail import read_rotated_jsonl_entries
         from ouroboros.tool_call_log import counts_as_call, logical_calls
 
@@ -789,37 +682,6 @@ class Memory:
                              "archives_bounded": bool(coverage.get("archives_bounded")) and len(calls) < int(want)})
         coverage["quota_met"] = int(coverage.get("matched") or 0) >= int(want)
         return shown, coverage
-
-    def read_jsonl_tail_after_offset(
-        self,
-        log_name: str,
-        offset: int,
-        max_entries: int = 100,
-    ) -> List[Dict[str, Any]]:
-        # Full project awareness (v6.32.0): the one identity's dialogue stream is
-        # its WHOLE conversation — main + project threads alike — because Ouroboros
-        # is one awareness across direct chat, project rooms, and background
-        # consciousness (BIBLE P1). Only A2A virtual-transport ids are excluded
-        # (machine-to-machine traffic, not the human dialogue). A project task's
-        # OWN focused recent-chat view is built separately in build_recent_sections.
-        entries = self._read_jsonl_entries(log_name, exclude_a2a=True)
-        if offset <= 0:
-            return entries[-max_entries:] if max_entries < len(entries) else entries
-        if offset > len(entries):
-            log.warning(
-                "Dialogue consolidation offset %s exceeds %s filtered entry count %s; using plain tail",
-                offset,
-                log_name,
-                len(entries),
-            )
-            return entries[-max_entries:] if max_entries < len(entries) else entries
-        suffix = entries[offset:]
-        return suffix[-max_entries:] if max_entries < len(suffix) else suffix
-
-    def jsonl_generation_signature(self, log_name: str) -> Dict[str, Any]:
-        from ouroboros.utils import jsonl_generation_signature
-
-        return jsonl_generation_signature(self.logs_path(log_name))
 
     @staticmethod
     def _format_chat_line(
@@ -891,7 +753,7 @@ class Memory:
             source = own_drive if own_drive is not None and log_name != "progress.jsonl" else self
             entries, coverage = source.read_task_recent(log_name, task_id, want if task_id else 200)
             if own_drive is not None:  # a child's header says which drive each window came from
-                coverage["source"] = "canonical logs/progress.jsonl" if source is self else (
+                coverage["source"] = "canonical state/dialog.sqlite (progress)" if source is self else (
                     f"task drive logs/{log_name}" + (
                         " (worker rows; host-side rows such as waits stay in the canonical log)"
                         if log_name == "events.jsonl" else ""))

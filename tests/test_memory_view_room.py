@@ -234,7 +234,7 @@ def _rows(rooms):
         m(_ts(25), "Task root6 was cancelled. Below is the last persisted model message: UNREVIEWED DRAFT",
           direction="system", type="cancel_receipt", task_id="root6"),
         m(_ts(26), "custody text", direction="system", type="custody_notice", task_id="root6"),
-        m(_ts(27), "Project X › root6 · Cancelled", direction="system", type="project_completion_summary",
+        m(_ts(27), "Project X › root6 · Stopped", direction="system", type="project_completion_summary",
           task_id="root6", status="cancelled"),
     ]
 
@@ -259,6 +259,7 @@ def _install(root):
         encoding="utf-8")
     (memory / "dialogue_meta.json").write_text(json.dumps({
         "chat_log_signature": jsonl_generation_signature(archive), "last_consolidated_offset": 2}), encoding="utf-8")
+    shared.import_all(root)  # the legacy chain is imported before the chronicle activates, as the upgrade does
     assert ChronicleStore(root).ensure_activated()["kind"] == "activation"
     return rooms, rows
 
@@ -328,7 +329,7 @@ def test_lane_two_is_one_host_line_per_root_task_with_typed_facts_by_address(tmp
     assert by_task["root5"].startswith(f"[{_ts(22)}; host; task root5] running or unreported; last row task_summary "
                                        f"by Light (legacy retelling), 15 chars, {_addr(rows[21])}; children 1;")
     assert "outgoing, author not recorded" in by_task["pre1"]  # before the epoch: not mine
-    assert by_task["root6"] == (f"[{_ts(25)}; host; task root6] Project X › root6 · Cancelled; rows 3; "
+    assert by_task["root6"] == (f"[{_ts(25)}; host; task root6] Project X › root6 · Stopped; rows 3; "
                                 f"get_task_result(task_id='root6'); {_addr(rows[23])}..{_addr(rows[25])}; "
                                 f"cancel receipt: {_addr(rows[23])}; custody notice: {_addr(rows[24])}")
     joined = "\n".join(lane2)
@@ -347,7 +348,7 @@ def test_an_old_task_summary_without_a_kind_is_model_prose_and_never_a_status(tm
     assert root7.startswith(f"[{_ts(28)}; host; task root7] running or unreported; last row task_summary by ")
     assert "OLD MODEL PROSE" not in text
     root6 = next(line for line in lane2 if "; host; task root6]" in line)
-    assert root6.startswith(f"[{_ts(25)}; host; task root6] Project X › root6 · Cancelled; ")
+    assert root6.startswith(f"[{_ts(25)}; host; task root6] Project X › root6 · Stopped; ")
 
 def test_a_page_seals_rows_only_in_its_room_and_a_row_in_two_rooms_stays_open_in_the_other(tmp_path):
     from ouroboros.tools.chronicle import page_covers
@@ -571,10 +572,11 @@ def test_each_role_sees_its_parts_of_the_live_view(tmp_path):
     assert "the words that started that work" in alpha_child
 
 
-def test_a_helpers_owner_words_are_indented_and_survive_local_compaction(tmp_path):
-    """A line of the owner's own that starts with '## ' stays inside the words; the local model's compaction
-    keeps the section, as it keeps this room and the marks (the owner's words never degrade)."""
-    from ouroboros.llm_local import _compact_local_text, _split_markdown_sections
+def test_a_helpers_owner_words_are_indented_so_their_lines_never_become_headings(tmp_path):
+    """A line of the owner's own that starts with '## ' stays inside the words: indented, it is no
+    section heading of the view (the owner's words never degrade)."""
+    import re
+
     from ouroboros.owner_words import render_owner_words
 
     _install(tmp_path)
@@ -583,12 +585,9 @@ def test_a_helpers_owner_words_are_indented_and_survive_local_compaction(tmp_pat
         "governing_owner_words": [{"text": said, "source": "initial_user", "task_id": "root1"}]}}
     _child, child_text = _view(tmp_path, child_task)
     assert "\n  Find the cause\n  ## not a heading of the request" in child_text
-    titles = [title for title, _body in _split_markdown_sections(child_text)[1]]
+    titles = re.findall(r"^## (.+)$", child_text, flags=re.M)
     assert "not a heading of the request" not in titles
     assert titles[0] == "Words of my human that caused this work (verbatim)"
-    compacted = _compact_local_text(child_text, "dynamic")
-    assert "## not a heading of the request" in compacted and "Compacted for local-model context" not in \
-        compacted.split("## Marks I keep in view")[0]
     # The indent is the view's: every other audience prints the words as recorded.
     rows = [{"text": said, "source": "initial_user", "task_id": "root1"}]
     assert "\nFind the cause\n## not a heading" in render_owner_words(rows, audience="reviewer")

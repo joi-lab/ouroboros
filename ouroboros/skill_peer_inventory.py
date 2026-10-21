@@ -11,7 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ouroboros.contracts.skill_manifest import SkillManifestError, parse_skill_manifest_text
-from ouroboros.skill_loader import _ManifestUnreadable, _manifest_text_for_dir, _skill_location_inventory, load_enabled
+from ouroboros.skill_loader import (
+    _ManifestUnreadable, _classify_skill_source, _manifest_text_for_dir, _native_platform_visible,
+    _skill_location_inventory, load_enabled,
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,9 @@ def discover_skill_peers(drive_root: Path, *, repo_path: str | None = None) -> t
         except (_ManifestUnreadable, SkillManifestError) as exc:
             peers.append(SkillPeer(**identity, manifest_error=type(exc).__name__))
             continue
+        if candidate.location == "native" and not _native_platform_visible(candidate.skill_dir, manifest) and _classify_skill_source(
+                candidate.skill_dir, location=candidate.location, drive_root=drive_root) == "native":
+            continue  # discovery hides a launcher seed for another platform
         peers.append(SkillPeer(**identity, enabled=load_enabled(drive_root, candidate.name),
                                conflicts=tuple(manifest.conflicts or ())))
     return tuple(peers)

@@ -13,14 +13,15 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | Method | Path | Note |
 |---|---|---|
 | GET | `/` | |
-| GET | `/api/health` | |
+| GET | `/api/health` | 200 during boot too; the `boot` document: §2 Boot order |
 | GET | `/api/contract` | |
 | GET | `/api/state` | |
-| GET | `/api/extensions` | installed-skill projection; never fetches the hub catalog |
+| GET | `/api/extensions` | installed-skill projection; never fetches |
 | POST | `/api/skills/{skill}/publish-preflight` | |
 | GET | `/api/extensions/{skill}/manifest` | |
 | GET | `/api/extensions/{skill}/module/{entry:path}` | reviewed `.js`/`.mjs` from captured texts; `Access-Control-Allow-Origin: *` |
-| GET | `/api/widgets` | passive projection of live UI tabs; `Cache-Control: no-store` |
+| GET | `/api/extensions/{skill}/ui/{revision}/{path:path}` | captured page-module files of the live revision |
+| GET | `/api/widgets` | passive projection of live UI tabs and pinned cards; `Cache-Control: no-store` |
 | GET | `/api/extensions/{skill}/settings_section` | |
 | ANY | `/api/extensions/{skill}/{rest:path}` | extension dispatch (§13) |
 | GET | `/api/skills/daemons` | |
@@ -34,18 +35,27 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | POST | `/api/skills/{skill}/reconcile` | |
 | GET | `/api/marketplace/clawhub/search` | |
 | GET | `/api/marketplace/clawhub/installed` | |
+| GET | `/api/marketplace/ouroboroshub/installed` | frozen hub listing |
 | GET | `/api/marketplace/clawhub/info/{slug:path}` | |
 | GET | `/api/marketplace/clawhub/preview/{slug:path}` | |
 | POST | `/api/marketplace/clawhub/install` | |
 | POST | `/api/marketplace/clawhub/update/{name}` | |
 | POST | `/api/marketplace/clawhub/uninstall/{name}` | |
-| GET | `/api/marketplace/ouroboroshub/catalog` | |
-| GET | `/api/marketplace/ouroboroshub/installed` | |
-| GET | `/api/marketplace/ouroboroshub/preview/{slug:path}` | |
-| POST | `/api/marketplace/ouroboroshub/install` | also the adopt transport |
-| POST | `/api/marketplace/ouroboroshub/update/{name}` | |
-| POST | `/api/marketplace/ouroboroshub/uninstall/{name}` | |
-| POST | `/api/marketplace/ouroboroshub/publication/{name}/clear` | forgets only the local publication receipt |
+| POST | `/api/skills/{skill}/publication/clear` | |
+| GET | `/api/skill-sources` | |
+| POST | `/api/skill-sources` | |
+| POST | `/api/skill-sources/my-skills` | |
+| POST | `/api/skill-sources/probe` | |
+| POST | `/api/skill-sources/{source_id}` | |
+| POST | `/api/skill-sources/{source_id}/remove` | |
+| POST | `/api/skill-sources/{source_id}/refresh` | |
+| GET | `/api/skill-catalog` | |
+| GET | `/api/skill-catalog/search` | |
+| GET | `/api/skill-catalog/item/{source_id}/{name}` | |
+| POST | `/api/skill-catalog/install` | |
+| POST | `/api/skills/{skill}/update` | |
+| POST | `/api/skills/{skill}/uninstall` | |
+| GET | `/api/onboarding/starter-skills` | |
 | GET | `/api/files/list` | |
 | GET | `/api/files/read` | |
 | GET | `/api/files/content` | |
@@ -87,6 +97,7 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | POST | `/api/owner/safety-mode` | |
 | POST | `/api/owner/skills/{skill}/presence-runtime` | |
 | POST | `/api/owner/capability-ack` | |
+| GET | `/api/ui/contributions` | live skill controls, speech providers, offers |
 | GET | `/api/ui/preferences` | |
 | POST | `/api/ui/preferences` | |
 | GET | `/api/ui/i18n` | interface language and translation memory; a read never starts generation |
@@ -114,6 +125,10 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | POST | `/api/tasks/{task_id}/continue` | (§6 Owner Continue after a technical interruption) |
 | POST | `/api/tasks/{task_id}/resume` | |
 | POST | `/api/decisions` | |
+| GET | `/api/cards/{card_id}` | a living card's current body and presses |
+| GET | `/api/cards/{card_id}/app` | app HTML as `text/plain`, `nosniff`, `no-store` |
+| POST | `/api/cards/{card_id}/pin` | keep a component card on Widgets |
+| DELETE | `/api/cards/{card_id}/pin` | |
 | GET | `/api/schedules` | |
 | POST | `/api/schedules` | |
 | POST | `/api/schedules/{schedule_id}/action` | explicit action and reason (§5 Schedules and follow-ups) |
@@ -128,8 +143,12 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 | POST | `/api/update/preflight` | |
 | POST | `/api/update/apply` | |
 | GET | `/api/cost-breakdown` | |
-| GET | `/api/storage` | passive |
-| POST | `/api/storage/measure` | starts or joins the walk |
+| GET | `/api/storage` | passive; `?count=` omits a held count |
+| POST | `/api/storage/measure` | start/join child count |
+| POST | `/api/storage/measure/cancel` | stop child; saved count stays |
+| POST | `/api/storage/free/preview` | pure preview; 202, start/join |
+| POST | `/api/storage/free` | `StorageFreeRequest`; exact plan ids; 202, `started`/`reason` |
+| POST | `/api/storage/free/cancel` | stop preview/run; freed stays freed |
 | GET | `/api/evolution-data` | |
 | GET | `/api/projects` | optional `chat_id`: that active room from the full registry, beyond sidebar limits (missing → empty `projects`; unreadable → error) |
 | POST | `/api/projects` | |
@@ -172,7 +191,7 @@ Every path-addressed `/api/files/*` operation resolves its requested `path` and 
 
 Update-status, log-tail and schedule-list reads run off the event loop.
 
-`/api/state` adds `current_questions`/`main_attention`, each with completeness and typed gaps (§3); `active_chat_activities` stays root-only. GET neither scans chat nor writes; actions reuse `/api/decisions` and task endpoints.
+`/api/state` adds `current_questions`/`main_attention` and the work projection (`works`, `rooms`), each with completeness and typed gaps (§3); `active_chat_activities` stays root-only. GET neither scans chat nor writes; actions reuse `/api/decisions` and task endpoints.
 
 ### WebSocket protocol
 
@@ -184,7 +203,7 @@ The browser opens one socket for the whole SPA. Feature modules subscribe, and t
 
 A browser `chat` frame carries owner text and/or uploaded attachment references, optionally with `sender_session_id`, `client_message_id`, `force_plan`, `chat_id`, `project_id` and `client_surface`: raw sending-surface facts measured at send (the pywebview bridge appears asynchronously after load). The gateway normalizes them (`client_surface.normalize_client_surface`), stamps host `received_at` at receipt, and every transport passes one common enqueue (`LocalChatBridge.enqueue_local_message`). The surface fact is per-message provenance, distinct from the chat-scoped `transport` reply route, assembled at its producer, never inferred at render, carried from the originating owner turn by promotion or steering (`client_surface.py`).
 
-Acceptance is idempotent on `client_message_id`: a successful browser `send()` means only that the current socket took the frame, not task admission. A same-id frame rejoins the accepted row if words and ordered attachment content match, else is refused; the `ingress_accepted` echo and history carry what this process knows of dispatch (`ingress_pending`, `ingress_dispatched`, `ingress_undispatched`), facts a restart loses; nothing then replays, while row and uploads are kept (`supervisor/message_ingress.py`). Unreadable chat history is unknown: the frame is refused with the `initialization_notice` before anything is claimed or written.
+Acceptance is idempotent on `client_message_id`: a successful browser `send()` means only that the current socket took the frame, not task admission. A same-id frame rejoins the accepted row if words and ordered attachment content match, else is refused; the `ingress_accepted` echo and history carry the row's durable dispatch fact (`ingress_pending`: owed, performed once by a retry or the next bus init; `ingress_dispatched`: entered here); row and uploads are kept (`supervisor/message_ingress.py`). Unreadable chat history is unknown: the frame is refused with the `initialization_notice` before anything is claimed or written.
 
 Frames sent while disconnected wait in a bounded process-local queue (oldest dropped), flushed after reconnect and lost on reload: no second durable outbox. Attachment messages set `queue:false` (uploads happen just before the send; a retained frame would leave unowned temporaries); on socket loss Chat refuses the message, cleans those and keeps the staged files for an explicit retry. Once the socket took a frame — every owner message, a bare slash command excepted; a queued one once written — `chat_attachments.createUnconfirmedSends` keeps it (with its `reply_to`) by id in tab sessionStorage across reloads until that id's echo or history row settles it; an unsettled frame offers "Send again" (same frame and id, never automatic) and "Discard".
 
@@ -206,4 +225,4 @@ Server broadcasts snapshot the client list and send to all clients concurrently,
 
 The browser reconnects with bounded exponential delay behind the reconnect overlay; a watchdog closes a silent seemingly-open connection: heartbeats prove stream liveness, not task progress. One served-page decision (`ws.js decideServedPage`) governs the post-open state read and the socket-down probe, so a transient drop cannot destroy in-page state. The core attests only pages it serves: without `served_ui` (an older core), or for its marked page while it serves builtin, `decide()` reloads on a changed or unprovable SHA (a restarted server must not keep old JS/CSS alive in PyWebView), and an unchanged one keeps the page and its queued frames (an unversioned `/api/state` with no remembered SHA keeps it too, accepting possibly stale assets); the marked page reloads once after a restart applied a directory or `none`, and an unmarked page owns its refresh and only reconnects. A failed/non-OK state read never reloads (a seconds-old server can answer 500); `web/modules/ws.js` owns the probe discipline and its one forced reload per disconnect episode.
 
-Each Chat instance handles `open` by resynchronizing archive-aware durable history and `close` by withdrawing online and accounting presentation; reconnect deduplication covers the overlap between live frames and REST replay, and large history parsing runs off the server event loop. Delivery is live plus replay, not a promise that every transient frame is persisted: durable chat rows, task results, queue snapshots, Project revisions, review ledgers, cost ledgers and lifecycle state remain the recovery authorities.
+Each Chat instance handles `open` by resynchronizing durable history and `close` by withdrawing online and accounting presentation; reconnect deduplication covers the overlap between live frames and REST replay, and large history parsing runs off the server event loop. Delivery is live plus replay, not a promise that every transient frame is persisted: durable chat rows, task results, queue snapshots, Project revisions, review ledgers, cost ledgers and lifecycle state remain the recovery authorities.

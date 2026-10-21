@@ -403,8 +403,13 @@ export function createModelRolesEditor({ hostId, store = claudexorStatus,
                 });
             }
             node.querySelector('[data-model-remove]')?.addEventListener('click', () => {
+                const siblings = rows.filter((entry) => entry.slot === row.slot);
+                const next = siblings[siblings.indexOf(row) + 1] || siblings[siblings.indexOf(row) - 1];
                 rows = rows.filter((entry) => entry !== row); changed(); render();
-                host()?.querySelector('[data-model-add]')?.focus();
+                // The caret moves to the fallback now in this place, else to Add (DESIGN "List editors").
+                const shown = next && host()?.querySelector(`[data-model-role="${next.id}"]`);
+                if (shown) revealNewRow(shown, shown.querySelector('[data-model-role-model]'));
+                else host()?.querySelector('[data-model-add]')?.focus();
             });
         }
         element.querySelectorAll('[data-model-role-group]').forEach((group) => {

@@ -56,10 +56,10 @@ export const VALUE_LADDER = [
 export const LADDER_FOOTNOTE =
     'Riding a plan is not free — it moves that work onto a subscription you already '
     + 'pay for instead of adding per-call API charges. What moves is exactly what you '
-    + 'route: commit, plan, skill review and task acceptance all run on the review pool '
-    + '(the rows marked Reviewer), so an all-subscription pool also puts each substantive task\'s '
-    + 'acceptance panel on the subscription: on the API it measured about 12 s and '
-    + '$0.07 per model row per task; a session spends minutes of your window per task instead.';
+    + 'route: commit, plan, skill and result reviews all take their reviewers from the review pool '
+    + '(the rows marked Reviewer), so an all-subscription pool puts each review on the subscription; '
+    + 'Settings → Agents shows what one review by each API row actually cost (a wave costs the reviewers '
+    + 'it asks), and a session spends minutes of your window per review instead.';
 
 // ---------------------------------------------------------------------------
 // Pure helpers.
@@ -304,7 +304,7 @@ export function agentsOutcomeText(connected = [], {
     if (reviewerHarnesses.length) {
         const reviewerLabels = familyLabels(reviewerHarnesses, snapshot, { catalogKnown });
         clauses.push(`${joinLabels(reviewerLabels)} can `
-            + 'also move commit, scope, advisory, plan, skill review, and task acceptance.');
+            + 'also move commit, scope, advisory, plan, skill and result review.');
     }
     if (taskOnlyHarnesses.length) {
         const taskOnlyLabels = familyLabels(taskOnlyHarnesses, snapshot, { catalogKnown });

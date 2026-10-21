@@ -576,8 +576,7 @@ def test_delegated_audit_failure_is_typed_unknown_never_clean(qenv, monkeypatch)
     )
     assert "DELEGATED RUN STATE UNKNOWN" in event["text"]
 
-    # The pending-invocation audit failure surfaces the same way (the shared snapshot
-    # read failed first, so each projection reads for itself).
+    # A failed addressed snapshot stays unknown without falling back to global readers.
     from ouroboros import delegate_terminal
 
     monkeypatch.setattr(dc, "open_runs", lambda *a, **kw: [])
@@ -589,7 +588,7 @@ def test_delegated_audit_failure_is_typed_unknown_never_clean(qenv, monkeypatch)
 
     monkeypatch.setattr(dc, "pending_invocations", _boom2)
     still2 = qenv.tl._reconcile_delegated_runs_on_kill(qenv.q, "au2")
-    assert still2 == [f"{RUN_STATE_UNKNOWN_PREFIX}:pending_invocation_audit_failed"]
+    assert still2 == [f"{RUN_STATE_UNKNOWN_PREFIX}:snapshot_unavailable"]
 
 
 # --------------------------------------------------------------------------

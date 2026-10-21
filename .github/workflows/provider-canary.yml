@@ -51,6 +51,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-python-env
+        with:
+          interpreter: shipped  # the SQLite and journal mode fresh installs run
       - name: Run integration tests
         id: provider_tests
         env:

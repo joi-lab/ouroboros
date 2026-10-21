@@ -7,7 +7,7 @@
 * ASK: ``ask="council"`` or ``ask=[participant ids]`` is the ONLY paid act; it sends
   the current revision (the one this call wrote, or the latest) to exactly the named
   participants (``plan_ask``). Answers settle into the record and wake the mailbox;
-  a body plan's first ask includes every owner-marked reviewer.
+  under Blocking, a body plan's first ask includes every owner-marked reviewer.
 * READ: no arguments → the free state: the current revision, every participant's open
   objections (``not_adjudicated`` flagged), who last saw which revision, the latest
   contributions and the pending asks; pending seats whose producer finished while
@@ -44,7 +44,7 @@ from ouroboros.utils import utc_now_iso
 log = logging.getLogger(__name__)
 
 WRITE_FIELDS = ("goal", "done_when", "affected_paths", "plan")
-ASK_FIELDS = ("ask", "message", "attach", "reviewer_effort")
+ASK_FIELDS = ("ask", "message", "attach", "reviewer_effort", "reason")
 # The retired engine's arguments: a typed $0 refusal names the new form (no shim).
 RETIRED_FIELDS = frozenset({"spec", "review_disposition", "author_action", "author_disposition", "confirm_fresh_panel",
                             "review_fingerprint", "items", "acceptance_claims", "evidence", "in_scope", "non_goals",
@@ -86,8 +86,8 @@ _SCHEMA = {
         "first revision ([] = the work changes no files; a path under Ouroboros's own body makes it a body plan, whose "
         "participants receive the constitutional pack). ASK (the only paid act): ask='council' sends the current revision "
         "to the review pool (Main alone when no reviewer is marked), ask=[ids] to exactly those participants — pool seats "
-        "or any enabled catalog row (its objections are answered but never hold); a body plan's first ask includes every "
-        "owner-marked reviewer. Participants answer in parallel the first time and see each other's answers on later "
+        "or any enabled catalog row (unticked advisers never hold); Blocking adds all ticked reviewers to a body plan's "
+        "first ask; Advisory requires a ticked reviewer and a reason when narrowed; Cyber Pro is free. Later asks use the named rows. Participants answer in parallel the first time and see each other's answers on later "
         "asks; each receives the plan or its delta, the council so far, its own open objections, your message and your "
         "attachments. Answers arrive in your mailbox; READ (no arguments, free) shows the current revision, every open "
         "objection with who raised it, who saw which revision, the latest contributions and the pending asks. An "
@@ -114,6 +114,7 @@ _SCHEMA = {
                 "description": ("Whom to ask now: 'council' = the review pool; or participant ids (pool seat ids, catalog row ids/handles). "
                                 "Named recipients only — nothing is sent unless you ask."),
             },
+            "reason": {"type": "string", "description": "Why these reviewers: required when an Advisory first ask about your own code names fewer than all ticked reviewers. Blocking adds missing ticked reviewers; later asks name any enabled rows. Advisers are heard, not counted."},
             "message": {"type": "string", "description": "What you want from the asked participants now (what changed, what you decided and why, what to look at)."},
             "attach": {"type": "array", "items": {"type": "string"},
                        "description": "Evidence locators for the asked participants (paths with optional ::lines=A-B, task:<id>, chat:<id>); attached bounded, every absence named."},
@@ -184,7 +185,7 @@ def _retired_form_refusal(ctx: ToolContext, keys: List[str]) -> str:
 
 
 def _validate_write(params: Mapping[str, Any]) -> Optional[str]:
-    for key in ("goal", "plan", "message"):
+    for key in ("goal", "plan", "message", "reason"):
         if params.get(key) is not None and not isinstance(params[key], str):
             return f"{key} must be text."
     for key in ("affected_paths", "attach"):
@@ -225,8 +226,8 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
         return _arg_error(ctx, error)
     writes = any(key in given for key in WRITE_FIELDS)
     asks = given.get("ask") is not None
-    if not writes and not asks and any(key in given for key in ("message", "attach", "reviewer_effort")):
-        return _arg_error(ctx, "message, attach and reviewer_effort travel with an ask (ask='council' or ask=[ids]).")
+    if not writes and not asks and any(key in given for key in ("message", "attach", "reviewer_effort", "reason")):
+        return _arg_error(ctx, "message, attach, reviewer_effort and reason travel with an ask (ask='council' or ask=[ids]).")
     try:
         state_root, task_id = plan_ask.state_location(ctx)
     except ValueError as exc:
@@ -266,6 +267,7 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
             prepared = plan_ask.prepare_ask(
                 ctx, record=record, revision=candidate, ask=given["ask"], message=str(given.get("message") or ""),
                 attach=list(given.get("attach") or []), reviewer_effort=str(given.get("reviewer_effort") or ""),
+                reason=str(given.get("reason") or ""),
                 state_root=state_root, task_id=task_id, legacy=legacy)
         except plan_ask.PlanAskRefused as exc:
             if exc.attempt is None:

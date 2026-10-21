@@ -267,6 +267,8 @@ def capture_directory_result(drive, entry, gateway):
 
 
 def directory_capture_block(drive, entry, manifest):
+    from ouroboros.delegate_registration_policy import INVESTIGATION_NOTE, evidence_only
+
     cap_dir = custody.delegated_capture_dir(drive, entry.task_id, entry.run_id)
     return {"status": manifest["status"], "capture_kind": "engine_directory",
             "execution_root": manifest["workspace_root"], "authority_target_root": entry.target_root,
@@ -274,13 +276,15 @@ def directory_capture_block(drive, entry, manifest):
             "manifest_read": {"root": "artifact_store", "path": f"delegated_runs/{cap_dir.name}/workspace_patch.json"},
             "file_outputs": manifest["file_outputs"], "patch_artifact": None,
             "complete": manifest["complete"], "scope_paths": manifest["scope_paths"],
-            "strategy": manifest["strategy"], "note": manifest["note"]}
+            "strategy": manifest["strategy"],
+            "note": INVESTIGATION_NOTE if evidence_only(entry) else manifest["note"]}
 
 
 def integrate_directory_result(ctx, entry, decision, reason, gateway, *, acknowledge_ambiguous=False,
-                               paths=None, orphan=False, admission_check=None):
+                               paths=None, orphan=False, admission_check=None, prepared=None):
     """Use engine CAS/disposition, retaining unknown effects under the same host intent."""
     drive = custody.custody_root(ctx)
+    prepared = not entry.patch_captured if prepared is None else prepared
     manifest = capture_directory_result(drive, entry, gateway)
     from ouroboros.delegate_shared import orphan_apply_target_ok
     active, target = Path(ctx.active_repo_dir()).resolve(), Path(entry.target_root).resolve()
@@ -290,6 +294,14 @@ def integrate_directory_result(ctx, entry, decision, reason, gateway, *, acknowl
         return "⚠️ TOOL_ARG_ERROR (integrate_delegated_patch): paths must be a nonempty list of captured file paths."
     if admission_check and (refusal := admission_check()):
         return refusal
+    from ouroboros.tools.subagent_integration_delegated import prepared_capture_inspection
+    from ouroboros.delegate_collection import capture_projection
+
+    copies = not manifest.get("no_changes") and manifest.get("work_product") != "absent" and manifest["strategy"] != "direct"
+    if inspection := prepared_capture_inspection(entry.run_id, decision, copies,
+                                                 lambda: capture_projection(drive, entry, reader_task_id=ctx.task_id),
+                                                 prepared=prepared):
+        return inspection
     receipt: dict = {}
     absent = manifest.get("work_product") == "absent" and not manifest.get("no_changes")
     if absent and decision == "apply":

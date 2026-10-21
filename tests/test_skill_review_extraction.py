@@ -74,30 +74,32 @@ def test_skill_review_leaves_are_non_catalog_owners_without_backedges():
 
 def test_skill_review_keeps_the_lifecycle_driver_and_its_patchable_seams():
     """The trust gate's own decisions stay with ``skill_review``: the outcome
-    record, the deterministic preflight floor, the official-hub payload profile
-    the owner-attestation path consults through this module, the quorum-failure
-    outcome, and ``review_skill`` itself. The preflight and the hub predicate are
-    patched at ``skill_review.<name>`` by the attestation tests, and their only
-    readers live here, so those seams do not move."""
+    record, the deterministic preflight floor, the quorum-failure outcome, and
+    ``review_skill`` itself. The preflight is patched at ``skill_review.<name>``
+    by the attestation tests, and its only readers live here, so that seam does
+    not move. A source's trust is an install basis (skill_acceptance), never a
+    review profile, so no hub predicate lives here any more."""
     for name in (
         "SkillReviewOutcome",
         "_truncate_raw_result",
         "_apply_auto_grant_outcome",
         "_is_module_widget_skill",
         "_run_deterministic_preflight",
-        "_official_hub_review_profile",
-        "is_official_hub_payload_verified",
         "_skill_cycles_gate",
         "_skill_quorum_failure_outcome",
         "_stamp_paid_facts",
         "_persist_reviewed_outcome",
         "review_skill",
+        "run_acceptance_preflight",
     ):
         assert getattr(skill_review, name).__module__ == "ouroboros.skill_review", name
+    for retired in ("_official_hub_review_profile", "is_official_hub_payload_verified", "hub_payload_matches"):
+        assert not hasattr(skill_review, retired), retired
     assert skill_review.__all__ == [
         "SkillReviewOutcome",
         "render_skill_review_block",
         "review_skill",
+        "run_acceptance_preflight",
     ]
 
 

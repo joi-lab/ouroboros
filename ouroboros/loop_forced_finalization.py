@@ -1,5 +1,5 @@
 """Forced finalization of a task that ran out of road: orphan notes, child claims
-and the absorption gate, forced children acceptance, swarm-action enforcement,
+and the absorption gate, swarm-action enforcement,
 forced services and owner-directive drain, the one forced model call, stale and
 fallback candidates and the forced final answer.
 
@@ -8,10 +8,8 @@ executes no tool and buys no repair call: a reply that still asks for a tool is
 a preamble and falls back to the retained or host text. A second call happens
 only to answer owner directives that arrived during the first.
 
-Every rail records through ``_record_forced_finalization``, whose acceptance
-write is a ledger entry, never a gate: a task eligible for a panel that did not
-run gets an eligible bypass record with trigger ``bypassed_<reason_code>``; a
-panel that already ran, or a host decision already recorded, is not overwritten.
+Every rail records through ``_record_forced_finalization``; a rail runs no result
+review (its outcome says what ended the task).
 Extracted from loop.py (v7 L-B split); loop.py re-exports every name."""
 
 from __future__ import annotations
@@ -28,7 +26,7 @@ from ouroboros.finalization_timing import finalization_child_scope
 from ouroboros._usage_wait import receiver_abandonable
 from ouroboros.loop_llm_call import forced_response_is_incomplete, forced_response_parts
 from ouroboros.model_wait import ModelWaitInterrupted
-from ouroboros.outcomes import ACCEPTANCE_FINALIZED_UNACCEPTED, REASON_DELIVERY_CONTROL_DEGRADED
+from ouroboros.outcomes import REASON_DELIVERY_CONTROL_DEGRADED
 from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_NOTICE, TERMINAL_ORIGIN_HOST_SALVAGE, TERMINAL_ORIGIN_MODEL_FINAL, set_terminal_host_notice
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.usage_accounting import BillingAuthorityUnavailable, BudgetExceeded, ControlAuthorityUnavailable, PhysicalAttemptPreconditionFailed
@@ -123,7 +121,7 @@ def _project_child_result_dispositions(
     ctx: _RoundLimitContext,
     llm_trace: Dict[str, Any],
 ) -> None:
-    """Expose a compact exact-hash projection for acceptance/outcome reducers."""
+    """Expose a compact exact-hash projection for the outcome reducers."""
 
     try:
         from ouroboros.tools.join_ledger import _child_result_sha256
@@ -163,7 +161,6 @@ def _record_forced_finalization(
     # Common terminal recorder = the ONE seam over the LLM-seam forced
     # answer (`_forced_final_answer`) and the no-spend host-fallback fence
     # path (`_handle_budget_exceeded` -> `_forced_fallback_result`).
-    _loop()._record_forced_acceptance_bypass(ctx, llm_trace, reason_code)
     ctx.accumulated_usage.setdefault("terminal_origin", TERMINAL_ORIGIN_HOST_NOTICE)
     # Every rail returns this candidate's bytes. A wake's quiet selection stays
     # internal here too (the pipeline publishes only the host's outcome notice);
@@ -195,8 +192,6 @@ def _record_forced_finalization(
             and bool(current_fingerprint) and not binding.get("stale_evidence")
             and candidate.evidence_fingerprint == current_fingerprint
         ),
-        "acceptance_status": str(binding.get("acceptance_status") or "unaccepted"),
-        "acceptance_authoritative": bool(binding.get("authoritative", False)),
     }
 
 
@@ -554,7 +549,7 @@ def _prepare_forced_prompt(
     _loop()._drain_forced_owner_directives(ctx, llm_trace)
     _loop()._finalize_forced_services(ctx, llm_trace)
     tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
-    # The typed facts sit BEFORE the acceptance observation so that one-shot block
+    # The typed facts sit BEFORE the owner-source observation so that one-shot block
     # stays the tail of the message (the prompt-cache prefix rule).
     return (
         prompt
@@ -658,7 +653,7 @@ def _read_presence_declaration(tools_ctx: Any, extracted: str) -> None:
 
 def _forced_subject_prompt(ctx: _RoundLimitContext, llm_trace: Dict[str, Any]) -> str:
     """Capture the source before pricing/sending, never after a reply arrives."""
-    from ouroboros.loop_acceptance import capture_acceptance_observation, acceptance_observation_prompt
+    from ouroboros.loop_messages import capture_acceptance_observation, acceptance_observation_prompt
 
     tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     if tools_ctx is None:
@@ -777,19 +772,8 @@ def _drain_forced_owner_directives(
     after = len(directives) if isinstance(directives, list) else 0
     if after <= before:
         return False
-    candidate = _loop()._live_delivery_candidate(ctx)
-    binding = (
-        candidate.acceptance_binding
-        if isinstance(candidate, _loop().DeliveryCandidate)
-        and isinstance(candidate.acceptance_binding, dict)
-        else {}
-    )
-    if (
-        binding.get("authoritative") is True
-        or bool(getattr(tools._ctx, "_task_acceptance_reviewed", False))
-        or bool(getattr(tools._ctx, "_task_acceptance_sealed_fence_token", None))
-    ):
-        _loop()._supersede_task_acceptance_for_owner_followup(tools._ctx, llm_trace)
+    if getattr(tools._ctx, "_task_acceptance_sealed_fence_token", None):
+        _loop()._release_for_owner_followup(tools._ctx, llm_trace)
     _loop()._delivery_evidence_state(tools, ctx, llm_trace)
     return True
 
@@ -815,17 +799,20 @@ def _forced_physical_context(ctx: _RoundLimitContext, messages: List[Dict[str, A
     plan = getattr(tools_ctx, "context_fit_plan", None)
     if plan is None or str(ctx.active_model or "") != str(getattr(plan, "model", "") or ""):
         return None
+    from ouroboros.context_anchor import main_input_anchor
     from ouroboros.context_fit import measure_main_fit
     from ouroboros.loop_model_call import _main_context_profile, _physical_context_for_fit, _remember_main_fit
     from ouroboros.observability import new_execution_id
+    from ouroboros.transcript_prefix import rewrite_epoch
 
     mode = str(getattr(tools_ctx, "active_context_mode", "") or "")
     mode = mode if mode in {"max", "low", "nano"} else "max"
     round_id = f"{ctx.accumulated_usage.setdefault('execution_id', new_execution_id())}:round:{ctx.round_idx}"
+    anchor, accepted = main_input_anchor(ctx.accumulated_usage, plan, rewrite_epoch=rewrite_epoch(tools_ctx))
     disposition = measure_main_fit(
         plan, messages, getattr(ctx, "tool_schemas", None), profile=_main_context_profile(plan, mode),
         rendered_mode=mode, round_id=round_id, reasoning_effort=ctx.active_effort,
-        automatic_pass_used=(str(plan.route_fp or ""), round_id) in _loop()._context_reclaim_materializations(tools_ctx))
+        anchor=anchor, accepted_input_tokens=accepted)
     _remember_main_fit(ctx, disposition)
     return _physical_context_for_fit(disposition)
 
@@ -1176,11 +1163,6 @@ def _resolve_forced_delivery_control(
                     candidate.acceptance_binding = _loop()._forced_unaccepted_binding(
                         ctx.tools, candidate, REASON_DELIVERY_CONTROL_DEGRADED,
                     )
-                    tools_ctx._task_acceptance_reviewed = False
-                    _loop()._set_acceptance_decision(llm_trace, {
-                        "status": ACCEPTANCE_FINALIZED_UNACCEPTED, "reason": REASON_DELIVERY_CONTROL_DEGRADED,
-                        "source": "forced_acceptance_subject", "rationale": error,
-                    })
     if consumed and not degraded and llm_trace is not None:
         parsed, _, _ = _parse_delivery_control_body(extracted)
         if isinstance(parsed, dict) and parsed.get("action") == "stop":

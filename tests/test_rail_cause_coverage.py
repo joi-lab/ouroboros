@@ -52,7 +52,8 @@ def _imported_reason_codes() -> set:
         named
         | set(outcomes.BEST_EFFORT_REASON_CODES)
         | set(outcomes.ACCEPTANCE_BYPASS_REASON_BY_RAIL)
-        | set(outcomes.ACCEPTANCE_BYPASS_REASONS)
+        # Old task records still carry these bypass reasons; nothing writes them now.
+        | set(outcomes.ACCEPTANCE_BYPASS_REASON_BY_RAIL.values())
         | set(TIMEOUT_TERMINAL_REASONS)
     ) - SILENT_BY_DESIGN
 
@@ -95,7 +96,7 @@ def test_the_timeout_rails_are_one_typed_tuple_in_priority_order():
 
 
 def test_c1_adds_no_status_word():
-    assert list(OUTCOME_PHASE_HEADLINE.values()) == ["Working", "Done", "Done with warnings", "Failed", "Cancelled"]
+    assert list(OUTCOME_PHASE_HEADLINE.values()) == ["Working", "Done", "Done with warnings", "Failed", "Stopped"]
 
 
 # ---------------------------------------------------------------- the card line

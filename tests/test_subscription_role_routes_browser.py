@@ -165,7 +165,7 @@ def test_a_reviewer_row_names_its_delivery_cost_and_last_run(role_ui):
             "effective": {"route": "api_model", "model": "gpt-test", "credential_profile_id": "personal"},
             "review_record_id": "rev_42"}}],
         "excluded": [], "last_executions": {}, "config_error": "", "migration": None,
-        "row_costs": {"direct": {"usd_per_review": 0.42, "basis": "route_tariff"}},
+        "row_costs": {"direct": {"usd_per_review": 0.42, "basis": "observed_reviews", "reviews": 2, "low": 0.4, "high": 0.44}},
     }
     page = open_agents(ui)
     rows = page.locator("[data-subagent-row]")
@@ -176,8 +176,8 @@ def test_a_reviewer_row_names_its_delivery_cost_and_last_run(role_ui):
     assert native.locator("[data-subagent-last-review] dd").text_content() == (
         "API model · gpt-test · account personal · record rev_42")
     facts = direct.locator("[data-subagent-review-facts]").text_content()
-    assert facts == direct.locator("[data-subagent-delivery-cost]").inner_text() == "≈$0.42 per full call (route tariff)"
-    assert "reading reviewer" not in facts, "the several-calls clause belongs to a reading row"
+    assert facts == direct.locator("[data-subagent-delivery-cost]").inner_text() == (
+        "≈$0.42 per review (median of 2 measured, $0.40–$0.44)")
     assert agent.locator("[data-subagent-field=\"delivery\"]").count() == 0, "delivery is for API reviewers"
     delivery = direct.locator('[data-subagent-field="delivery"]')
     assert delivery.input_value() == "packet"

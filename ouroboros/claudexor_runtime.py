@@ -9,9 +9,10 @@ There is no mutable ``current`` pointer.  The code's exact pin is the next-spawn
 selection.  Installing a newer pin while an older daemon is alive therefore
 stages the immutable directory without hot-swapping the process; the next
 daemon start selects it, and a planned restart whose landed checkout changed the
-pin ends the old daemon so that start follows (``server_restart``).  Rolling
-Ouroboros back selects the older executable, not older engine data; a migrated
-home may refuse it. Forward-only recovery is documented in docs/PERSISTENCE.md.
+pin ends the old daemon so that start follows (``server_restart``), except that
+a lower release pin keeps a newer serving engine (status ``newer_serving``).
+Rolling Ouroboros back selects the older executable, not older engine data; a
+migrated home may refuse it. Forward-only recovery is documented in docs/PERSISTENCE.md.
 """
 
 from __future__ import annotations
@@ -281,6 +282,18 @@ def load_runtime_pin(path: "str | pathlib.Path | None" = None, *,
     return ClaudexorRuntimePin.from_mapping(release)
 
 
+def release_below(version: str, other: str) -> bool:
+    """Is plain release ``version`` strictly below plain release ``other``?
+
+    The engine's data floor orders only ASCII ``x.y.z`` releases. Any other
+    spelling (``v`` prefix, prerelease, empty) is unordered here: False, so
+    callers keep their existing behavior. A build SHA never orders.
+    """
+    from ouroboros.gateways.claudexor import engine_at_least
+
+    plain = all(isinstance(value, str) and value.isascii() and _SEMVER.fullmatch(value)
+                for value in (version, other))
+    return plain and not engine_at_least(version, other)
 
 
 def verify_runtime_archive(path: "str | pathlib.Path", pin: ClaudexorRuntimePin) -> pathlib.Path:
@@ -565,7 +578,9 @@ class ClaudexorRuntimeManager:
     def status(
         self, *, running: bool = False, engine_version: str = "", engine_build_sha: str = ""
     ) -> dict[str, Any]:
-        """Read-only browser/diagnostic projection; never downloads or extracts."""
+        """Read-only browser/diagnostic projection; never downloads or extracts.
+
+        ``newer_serving``: a newer engine serves than the lower pin, installed or not; nothing activates."""
         explicit, override_error = _explicit_binary()
         target_meta = self._managed_metadata()
         installed_meta = target_meta or self._other_installed_metadata(
@@ -590,6 +605,7 @@ class ClaudexorRuntimeManager:
         )
         staged_version = ""
         last_error = self._last_error or self._pin_error or override_error
+        newer_serving = running and release_below(target_version, engine_version)
         if self._install_in_progress() and not target_meta:
             state = "installing"
         elif explicit or external:
@@ -600,7 +616,9 @@ class ClaudexorRuntimeManager:
                 and engine_version == str(target_meta.get("version") or "")
                 and engine_build_sha == str(target_meta.get("build_sha") or "")
             )
-            if running and not target_is_running:
+            if newer_serving:
+                state = "newer_serving"
+            elif running and not target_is_running:
                 state = "update_staged"
                 staged_version = str(target_meta.get("version") or "")
             else:
@@ -613,6 +631,8 @@ class ClaudexorRuntimeManager:
             last_error = last_error or "managed runtime files are incomplete or fail identity checks"
         elif last_error and (pin is not None or self._pin_error or override_error):
             state = "error"
+        elif newer_serving:  # not installed yet is no update either: ensure installs the lower tree and attaches
+            state = "newer_serving"
         elif pin is not None and (
             installed_meta
             or (

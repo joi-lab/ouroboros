@@ -33,7 +33,10 @@ export function bindSecretReveal(input, button, { savedSelector, savedLabel = ()
     status.className = 'settings-secret-status settings-inline-status';
     status.dataset.secretRevealStatus = '1';
     status.setAttribute('role', 'status');
-    row.append(source, preview, status);
+    // The shown value takes the masked input's own place in its row; the input
+    // steps aside untouched, so the draft and its value never change.
+    input.after(preview);
+    row.append(source, status);
     button.setAttribute('aria-controls', preview.id);
     input.dataset.secretReveal = '1';
     let generation = 0;
@@ -44,6 +47,7 @@ export function bindSecretReveal(input, button, { savedSelector, savedLabel = ()
         open = false;
         preview.textContent = '';
         preview.hidden = true;
+        input.hidden = false;
         source.textContent = '';
         source.hidden = true;
         preview.removeAttribute('aria-describedby');
@@ -87,6 +91,7 @@ export function bindSecretReveal(input, button, { savedSelector, savedLabel = ()
             if (!current()) return;
             preview.textContent = disclosed;
             preview.hidden = false;
+            input.hidden = true;
             status.textContent = '';
             status.hidden = true;
             button.setAttribute('aria-expanded', 'true');

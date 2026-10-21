@@ -9,6 +9,8 @@ import types
 
 import pytest
 
+from ouroboros import dialogue_store
+from tests import _dialogue as dialogue_test
 from tests.test_swarm_host_admission import host as _swarm_host
 
 swarm_host = _swarm_host
@@ -1142,13 +1144,9 @@ def test_chat_history_tool_spans_all_threads_full_awareness(tmp_path):
     threads), only A2A virtual transport excluded. Project-task FOCUS lives in the
     passive default context (the memory view's room), NOT in this recall tool, so
     the one identity can recall anything it chooses (BIBLE P1)."""
-    import json
-
     from ouroboros.memory import Memory
     from ouroboros.projects_registry import create_project
 
-    logs = tmp_path / "logs"
-    logs.mkdir(parents=True)
     a = create_project(tmp_path, "alpha")
     b = create_project(tmp_path, "beta")
     ca, cb = int(a["chat_id"]), int(b["chat_id"])
@@ -1158,8 +1156,8 @@ def test_chat_history_tool_spans_all_threads_full_awareness(tmp_path):
         {"direction": "in", "text": "beta-msg", "chat_id": cb},
         {"direction": "in", "text": "a2a-noise", "chat_id": -1001},
     ]
-    (logs / "chat.jsonl").write_text(
-        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    for row in rows:
+        dialogue_store.append(tmp_path, "chat", row)
     mem = Memory(drive_root=tmp_path)
 
     view = mem.chat_history(count=50)
@@ -1168,24 +1166,21 @@ def test_chat_history_tool_spans_all_threads_full_awareness(tmp_path):
 
 
 def test_chat_history_tool_uses_canonical_budget_root_and_archive_pagination(tmp_path):
-    import json
     from types import SimpleNamespace
 
     from ouroboros.tools.control import _chat_history
 
     canonical = tmp_path / "canonical"
     child = tmp_path / "child"
-    (canonical / "logs").mkdir(parents=True)
-    (canonical / "archive").mkdir()
     child.mkdir()
-    (canonical / "archive" / "chat_20260820T010000.jsonl").write_text(
-        "\n".join(json.dumps({"direction": "in", "text": f"old-{i}"}) for i in range(3)) + "\n",
-        encoding="utf-8",
+    dialogue_test.seed(
+        canonical,
+        archives={"chat_20260820T010000.jsonl": [
+            {"direction": "in", "text": f"old-{i}"} for i in range(3)
+        ]},
+        live={"chat": [{"direction": "in", "text": "new-live"}]},
     )
-    (canonical / "logs" / "chat.jsonl").write_text(
-        json.dumps({"direction": "in", "text": "new-live"}) + "\n",
-        encoding="utf-8",
-    )
+    dialogue_test.import_all(canonical)
     ctx = SimpleNamespace(
         drive_root=child,
         budget_drive_root=str(canonical),
@@ -1205,8 +1200,6 @@ def test_memory_view_main_names_the_bound_room_and_the_project_task_sees_its_row
     that room's. Main keeps its own words verbatim and names the Project in one line of
     ``## Live rooms`` (its rows one memory_read away); the Project task reads them in its own
     room, and Main's words stay out of its view."""
-    import json
-
     from ouroboros.projects_registry import bind_task_to_project, create_project
     from tests._memory_view_context import blocks, section
     from tests.test_cache_optimization import _make_env_and_memory
@@ -1221,7 +1214,8 @@ def test_memory_view_main_names_the_bound_room_and_the_project_task_sees_its_row
         {"direction": "out", "text": "bound-task-row", "chat_id": 1, "task_id": "task-7",
          "ts": "2026-09-01T00:01:00+00:00"},
     ]
-    (root / "logs" / "chat.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    for row in rows:
+        dialogue_store.append(root, "chat", row)
 
     _a, _b, main_ctx, _cap = blocks(env, mem, {"id": "main-turn", "chat_id": 1})
     assert "] plain-main" in section(main_ctx, "## This room (Main)")
@@ -1743,13 +1737,19 @@ def test_bound_project_history_backfills_task_progress(tmp_path):
     project = create_project(tmp_path, "bound-progress", name="Bound progress")
     project_chat = int(project["chat_id"])
     bind_task_to_project(tmp_path, "task-1", "bound-progress", project_chat, origin={"absent": "system"})
-    logs = tmp_path / "logs"
-    logs.mkdir(parents=True)
-    with open(logs / "chat.jsonl", "w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"ts": "2026-01-01T00:00:00Z", "direction": "out", "text": "final answer", "chat_id": 1, "task_id": "task-1"}) + "\n")
-        fh.write(json.dumps({"ts": "2026-01-01T00:00:01Z", "direction": "in", "text": "raw project chat", "chat_id": project_chat}) + "\n")
-    with open(logs / "progress.jsonl", "w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"ts": "2026-01-01T00:00:02Z", "type": "send_message", "content": "working", "text": "working", "is_progress": True, "chat_id": 1, "task_id": "task-1", "format": "markdown", "cancelable": True}) + "\n")
+    dialogue_store.append(tmp_path, "chat", {
+        "ts": "2026-01-01T00:00:00Z", "direction": "out", "text": "final answer",
+        "chat_id": 1, "task_id": "task-1",
+    })
+    dialogue_store.append(tmp_path, "chat", {
+        "ts": "2026-01-01T00:00:01Z", "direction": "in", "text": "raw project chat",
+        "chat_id": project_chat,
+    })
+    dialogue_store.append(tmp_path, "progress", {
+        "ts": "2026-01-01T00:00:02Z", "type": "send_message", "content": "working",
+        "text": "working", "is_progress": True, "chat_id": 1, "task_id": "task-1",
+        "format": "markdown", "cancelable": True,
+    })
 
     api = make_chat_history_endpoint(tmp_path)
 
@@ -1866,8 +1866,6 @@ def test_chat_history_filters_by_thread(tmp_path):
     project_chat = int(proj["chat_id"])
     transport_chat = 555000111
 
-    logs = tmp_path / "logs"
-    logs.mkdir(parents=True)
     rows = [
         {"ts": "2026-06-13T00:00:01Z", "direction": "in", "text": "main hello", "chat_id": 1},
         {"ts": "2026-06-13T00:00:02Z", "direction": "out", "text": "main reply", "chat_id": 1},
@@ -1877,9 +1875,8 @@ def test_chat_history_filters_by_thread(tmp_path):
         {"ts": "2026-06-13T00:00:04Z", "direction": "out", "text": "a2a noise", "chat_id": -1001},
         {"ts": "2026-06-13T00:00:05Z", "direction": "out", "text": "legacy row (no chat_id)"},
     ]
-    with open(logs / "chat.jsonl", "w", encoding="utf-8") as fh:
-        for row in rows:
-            fh.write(json.dumps(row) + "\n")
+    for row in rows:
+        dialogue_store.append(tmp_path, "chat", row)
 
     api = make_chat_history_endpoint(tmp_path)
 

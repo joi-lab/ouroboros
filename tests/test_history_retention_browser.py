@@ -78,13 +78,14 @@ def test_retention_details_and_problem_only_card(engine, width):
                 }""")
                 card = page.locator('.chat-live-card[data-task-id="history-task"]')
                 card.wait_for()
-                toggle = card.locator('[data-live-summary-button]')
+                summary = card.locator(':scope > [data-live-summary-button]')
+                toggle = summary.locator('[data-live-disclosure]')
                 meta = card.locator(':scope > .chat-live-foot > [data-live-meta]')
                 if card.get_attribute('data-expanded') == '1':
                     toggle.click()
                 page.evaluate("""() => emit('log',{chat_id:1,data:{type:'history_retention',task_id:'history-task',
                     status:'deferred',pending_count:1,problem_count:0}})""")
-                assert 'history' not in toggle.inner_text().lower()
+                assert 'history' not in summary.inner_text().lower()
 
                 def capture(name):
                     root = os.environ.get("OUROBOROS_UI_EVIDENCE_DIR")
@@ -96,7 +97,7 @@ def test_retention_details_and_problem_only_card(engine, width):
                 toggle.click()
                 history = card.locator('[data-live-line-key="history-retention-history-task"]')
                 playwright.expect(history).to_contain_text('Saving task history')
-                assert 'history' not in toggle.inner_text().lower()
+                assert 'history' not in summary.inner_text().lower()
                 capture("details-pending")
                 toggle.click()
                 for status in ("problem", "complete"):

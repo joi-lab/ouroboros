@@ -68,7 +68,7 @@ def test_an_import_not_completed_leaves_a_view_with_its_reason_and_reads_no_chai
         raise AssertionError("the chain is not read before the import has completed")
 
     monkeypatch.setattr(chat_chain, "iter_rows", no_chain)
-    monkeypatch.setattr(chat_chain, "generation_signatures", no_chain)
+    monkeypatch.setattr(chat_chain, "iter_room_rows", no_chain)
     snapshot = mv.capture_memory_view(tmp_path, MAIN_TASK, spec)
     assert not snapshot.active
     assert snapshot.store_status == {"state": receipt["kind"], "reason": receipt["reason"]}

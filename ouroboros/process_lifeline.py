@@ -24,25 +24,36 @@ _HANDSHAKE_SEC = 10.0
 _GUARDIAN_EXIT_SEC = 30.0
 
 
-def kill_attributed_tree(token: str, root: int = 0, birth: str = "") -> None:
+def kill_attributed_tree(token: str, root: int = 0, birth: str = "", *, graceful: bool = False) -> None:
     """End the measured root's tree, then token-bearing detached descendants.
 
     Neither a stale pid/pgid nor a command-name match grants signal authority.
     POSIX still has the unavoidable exit/reuse race between validation and kill;
     the existing container's survivor scan reports unconfirmed cleanup.
+    ``graceful`` sends SIGTERM to the same targets instead: a request, never an
+    exit, so the caller still forces and verifies (Windows: no-op).
     """
     from ouroboros.process_containment import (
         ENV_ASSIGNMENT_PRESENT, pid_environment_assignment_state, pids_with_env_marker,
     )
 
     if root > 0 and birth and pl.process_start_time(root) == birth:
-        pl.kill_process_tree(SimpleNamespace(pid=root))
+        if not graceful:
+            pl.kill_process_tree(SimpleNamespace(pid=root))
+        else:
+            if pl.process_group_id(root) == root:  # spawn made it a session leader
+                pl.terminate_process_group_id(root)
+            for pid in (*pl.collect_descendant_pids(root), root):
+                pl.deliver_signal(pid, graceful=True)
     members = pids_with_env_marker(token)
     if members is None:
         raise RuntimeError("lifeline could not enumerate the contained process tree")
     for pid in members:
         if pid != os.getpid() and pid_environment_assignment_state(pid, token, "1") == ENV_ASSIGNMENT_PRESENT:
-            pl.force_kill_pid(pid)
+            if graceful:
+                pl.deliver_signal(pid, graceful=True)
+            else:
+                pl.force_kill_pid(pid)
 
 
 class ProcessLifeline:

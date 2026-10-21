@@ -474,3 +474,23 @@ def test_direct_current_reads_stop_within_half_the_writers_wait(ctx):
     assert refused["status"] == "error" and "snapshot=true" in refused["message"]
     assert call(ctx, op="sql", query="SELECT 1", timeout_sec=sql.CURRENT_HOLD_SEC)["status"] == "ok"
     assert call(ctx, op="sql", query="SELECT 1", timeout_sec=sql.CURRENT_HOLD_SEC + 1, snapshot=True)["status"] == "ok"
+
+
+def test_storage_kind_reads_the_saved_count_from_the_installation_root_and_refuses_a_child(ctx, monkeypatch):
+    """``kind="storage"`` is installation-wide: the saved count comes from the canonical root
+    through the existing admission; a child selector is refused before any read."""
+    from ouroboros import storage
+
+    (ctx.drive_root / "observability").mkdir()
+    (ctx.drive_root / "observability" / "a.bin").write_bytes(b"x" * 4096)
+    table = [{"id": "model_calls", "group": "records", "roots": [(str(ctx.drive_root), ("observability",))]}]
+    record = storage.measure(ctx.drive_root, places=table, sleep=lambda _s: None)
+    storage.save_count(ctx.drive_root, record)
+    result = call(ctx, op="json", kind="storage")
+    assert result["status"] == "ok" and result["source"]["kind"] == "storage"
+    assert result["data"]["latest"]["finished_at"] == record["finished_at"] and result["data"]["previous"] is None
+    assert call(ctx, op="json", kind="storage", select="latest.places[*].id")["data"] == ["model_calls"]
+    monkeypatch.setattr("ouroboros.tools.query_data._child_root", lambda *_a: pytest.fail("storage must not resolve a child"))
+    refused = call(ctx, op="json", kind="storage", child_task_id="second")
+    assert refused["status"] == "error" and "installation-wide" in refused["message"]
+    assert call(ctx, op="json", kind="storage", ids=["x"])["status"] == "error"

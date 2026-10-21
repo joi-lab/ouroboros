@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs';
 
 import { createChatInstance } from '../modules/chat.js';
 import { applyPayload, flushMisses, setMissTransport } from '../modules/i18n.js';
-import { installDom as installHistoryDom } from './chat_dom_fixture.js';
+import { TextStub, installDom as installHistoryDom } from './chat_dom_fixture.js';
 
 // Source pins below match across line breaks; normalize CRLF so a Windows
 // checkout (core.autocrlf) reads the same bytes the regexes were written for.
@@ -66,7 +66,7 @@ class ElementStub {
         this._innerHTML = this._textContent
             .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
     }
-    get textContent() { return this._textContent; }
+    get textContent() { return this._textContent + this.children.filter((child) => child.nodeType === 3).map((child) => child.data).join(''); }
     set innerHTML(value) {
         this._innerHTML = String(value || '');
         if (!this.ownerDocument) return;
@@ -137,6 +137,9 @@ class ElementStub {
         node.parentElement = null;
     }
     remove() { this.parentNode?.removeChild?.(this); this.isConnected = false; }
+    get firstElementChild() { return this.children.find((child) => child.nodeType !== 3) || null; }
+    get firstChild() { return this.children[0] || null; }
+    get lastChild() { return this.children.at(-1) || null; }
     replaceChildren(...nodes) { this.children = []; nodes.forEach((node) => this.appendChild(node)); }
     contains(node) {
         if (node === this) return true;
@@ -191,6 +194,7 @@ function installDom(fetchImpl = async () => ({ ok: true, json: async () => ({ ac
     const document = {
         byId: new Map(), hidden: false, activeElement: null,
         createElement(tag) { return new ElementStub(tag, document); },
+        createTextNode(data) { return new TextStub(data); },
         createDocumentFragment() {
             const fragment = new ElementStub('#document-fragment', document);
             fragment.isDocumentFragment = true;
@@ -264,7 +268,7 @@ const PLAIN_ROW = {
     role: 'system',
     system_type: 'project_completion_summary',
     markdown: false,
-    content: 'Launch › Ship · Completed\nOpen the Project for details.',
+    content: 'Launch › Ship · Done with warnings\nThe reviewers did not reach a verdict on this answer.',
     project_id: 'launch',
     project_name: 'Launch',
     ts: '2026-08-31T00:00:00Z',
@@ -319,7 +323,7 @@ test('plain project row renders escaped text with the Project reference and no m
         // Escaped plain text: the raw newline survives (pre-wrap), so the row
         // did NOT pass through the markdown renderer (whose no-parser fallback
         // rewrites \n to <br>) and produced no heading elements.
-        assert.match(bubble.innerHTML, /Launch › Ship · Completed\nOpen the Project for details\./);
+        assert.match(bubble.innerHTML, /Launch › Ship · Done with warnings\nThe reviewers did not reach a verdict on this answer\./);
         assert.doesNotMatch(bubble.innerHTML, /<br>|<h1|<h2|md-h1|md-h2/);
         // Bug report #9: no enhancement pass — Mermaid/Chart/KaTeX/code-copy
         // only ever activate behind enhanceChatMarkdown's enhanced stamp.
@@ -328,7 +332,8 @@ test('plain project row renders escaped text with the Project reference and no m
         const message = bubble.querySelector('.message');
         const actions = bubble.children.find((node) => node.classList.contains('system-message-actions'));
         assert.equal(message.contains(actions), false);
-        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 2);
+        // Right after the prose: the row's one time line is its own time, not a note between (owner 17.10, Q7 A).
+        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 1);
         assert.ok(actions, 'system-message-actions container present');
         // The row points at its Project with the one reference, never a button of its own.
         assert.deepEqual(referenceShape(actions.children[0]), LAUNCH_REFERENCE);
@@ -390,10 +395,10 @@ test('a completion row carrying the answer renders as an ordinary Ouroboros mess
         assert.match(bubble.innerHTML, /<div class="sender">Ouroboros<\/div>/);
         // His words, through the markdown path — and none of the host's pointer text.
         assert.match(bubble.innerHTML, /Done: PR #7 merged\./);
-        assert.doesNotMatch(bubble.innerHTML, /Open the Project for details|Completed/);
+        assert.doesNotMatch(bubble.innerHTML, /Done with warnings|did not reach a verdict/);
         const message = bubble.querySelector('.message');
         const actions = bubble.children.find((node) => node.classList.contains('system-message-actions'));
-        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 2);
+        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 1);
         // The SAME reference the System row carries: the voice of a row never chooses how the
         // UI points at its Project. The mirror has no second route into the result.
         assert.equal(actions.children.length, 1);
@@ -845,7 +850,7 @@ test('the legacy-memory notice reads in the install language; other plain system
             restoreDom(prior);
         }
         // Not every System row: a plain Project row stays as the host wrote it.
-        assert.match(render(PLAIN_ROW), /Launch › Ship · Completed/);
+        assert.match(render(PLAIN_ROW), /Launch › Ship · Done with warnings/);
         assert.doesNotMatch(render(PLAIN_ROW), /Запуск/);
         applyPayload({ language: 'ru', english: false, entries: {} });
         assert.match(render(notice), /Memory: what Ouroboros remembered before this update/);

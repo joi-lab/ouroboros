@@ -17,7 +17,13 @@ async function safe(fn) {
     }
 }
 
-export function updatePillText(status = {}) {
+// The capsule says one thing (owner Q6=A): the versions and commit hashes stay in Dashboard → Updates and in
+// the capsule's title, where updatePillDetail puts them.
+export function updatePillText() {
+    return 'Update available';
+}
+
+export function updatePillDetail(status = {}) {
     const currentVersion = String(status.current_version || '');
     const latestVersion = String(status.latest_version || '');
     const currentSha = String(status.current_short_sha || status.current_sha || '').slice(0, 8);
@@ -78,6 +84,7 @@ export function initUpdateStatus({ showPage, openDashboardTab, ws } = {}) {
             return;
         }
         pill.textContent = updatePillText(status);
+        pill.title = updatePillDetail(status);
         // Content or uncommitted work of the checkout's own, not a count of commits ahead.
         pill.classList.toggle('has-local', Boolean(status.dirty || status.local_changes !== 'absent'));
         pill.hidden = false;

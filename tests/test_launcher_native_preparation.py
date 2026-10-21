@@ -30,7 +30,7 @@ def lifecycle(monkeypatch, tmp_path):
     shutdown.set()
 
 
-def test_preparation_finishes_before_any_http_readiness_budget(lifecycle, monkeypatch):
+def test_preparation_finishes_before_any_http_readiness_probe(lifecycle, monkeypatch):
     launcher, shutdown = lifecycle
     entered, release, spawned = threading.Event(), threading.Event(), threading.Event()
     calls, result = [], []
@@ -47,8 +47,8 @@ def test_preparation_finishes_before_any_http_readiness_budget(lifecycle, monkey
         spawned.set()
         return process
 
-    def health(port, timeout, abort_event=None, proc=None):
-        assert spawned.is_set(), 'HTTP clock was consumed by native preparation'
+    def health(port, timeout=None, abort_event=None, proc=None):
+        assert spawned.is_set(), 'HTTP readiness probing started before native preparation ended'
         calls.append(('http', timeout))
         return True
 
@@ -68,7 +68,7 @@ def test_preparation_finishes_before_any_http_readiness_budget(lifecycle, monkey
         release.set()
         waiter.join(3)
         assert result == [(True, 8765)]
-        assert calls[0] == 'spawn' and ('http', 45) in calls
+        assert calls[0] == 'spawn' and ('http', None) in calls, 'the launcher probes its own child without a clock'
     finally:
         release.set(); shutdown.set()
         if waiter.ident is not None:

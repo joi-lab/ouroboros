@@ -56,32 +56,21 @@ def _origin_message(drive_root: pathlib.Path, client_message_id: str) -> Dict[st
 
     The picker transports the owner's exact ingress bytes to the chosen
     destination (the same rule the steer tool follows: a paraphrase must
-    never replace the owner's text). Bounded reverse scan over the live
-    chat log plus its rotation archives."""
-    from ouroboros.gateway._helpers import read_rotated_jsonl_entries
+    never replace the owner's text). Only rows carrying this id are read."""
+    from ouroboros import dialogue_store as ds
 
     target = str(client_message_id or "")
-
-    def _is_origin(entry: Dict[str, Any]) -> bool:
-        return (
-            str(entry.get("direction") or "") == "in"
-            and str(entry.get("client_message_id") or "") == target
-        )
-
-    try:
-        entries = read_rotated_jsonl_entries(
-            drive_root / "logs" / "chat.jsonl",
-            drive_root / "archive",
-            "chat",
-            want=1,
-            counts_toward_quota=_is_origin,
-        )
-    except Exception:
-        log.debug("origin-message scan failed for %s", client_message_id, exc_info=True)
+    if not target:
         return {}
-    for entry in reversed(list(entries or [])):
-        if isinstance(entry, dict) and _is_origin(entry):
-            return entry
+    try:
+        for entry in ds.iter_probes(drive_root, "chat", [("client_message_id", target)], newest_first=True):
+            if entry.row.get("direction") == "in":
+                return entry.row
+        ds.require_imported(drive_root, "chat")
+    except ds.StoreError:
+        raise
+    except Exception:
+        log.debug("origin-message lookup failed for %s", client_message_id, exc_info=True)
     return {}
 
 
@@ -157,7 +146,16 @@ def handle_routing_decision(
         return 400, {"ok": False, "error": "option_not_dispatchable",
                      "decision_id": decision_id, "action": action}
 
-    origin = _origin_message(drive_root, client_message_id)
+    from ouroboros.store import StoreError, StoreMigrating
+
+    try:
+        origin = _origin_message(drive_root, client_message_id)
+    except StoreMigrating as exc:
+        return 503, {"ok": False, "error": "history_importing", "decision_id": decision_id,
+                     "state": "open", "reason": str(exc)}
+    except StoreError as exc:
+        return 503, {"ok": False, "error": "history_unavailable", "decision_id": decision_id,
+                     "state": "open", "reason": str(exc)}
     # VERBATIM contract: the dispatched message is the owner's exact ingress
     # bytes; strip() is only the emptiness CHECK, never a rewrite.
     raw_origin_text = str(origin.get("text") or "")

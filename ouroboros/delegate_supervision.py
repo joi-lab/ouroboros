@@ -26,6 +26,11 @@ _MAX_COORDINATION_SEEN = 256
 # The gateway's typed code for a read that delivered no daemon answer at all
 # (``gateways.claudexor._request``): a quiet renewal here, never a model wake.
 _DAEMON_UNREACHABLE = "daemon_unreachable"
+# The hold's in-slot mark outlives one slow observation read (60 s), then renews; an
+# observation older than a few ticks says nothing current about the run's work.
+_HOLD_MARK_SEC = 120.0
+_OBSERVATION_CURRENT_SEC = 4 * _TICK_SEC
+_OBSERVED: dict = {}  # state path -> ((mtime_ns, size), parsed observation fields)
 
 
 def _owner_line(ctx: Any, text: str, key: str, tone: str) -> None:
@@ -171,8 +176,8 @@ def _time_fact(ctx: Any) -> dict[str, Any]:
 
     Disclosed consequence: a metadata-poor task (no ``created_at``/
     ``started_at`` and no anchor latched yet) reports ``state: "not_set"``
-    until a path that OWNS a mutation — the acceptance launch — latches the
-    anchor. A poll answering the same question twice never changes its own
+    until a path that OWNS a mutation — the loop's time-budget notice — latches
+    the anchor. A poll answering the same question twice never changes its own
     next answer."""
     try:
         from ouroboros.task_pacing import observe_budget_profile, observe_budget_snapshot
@@ -320,17 +325,6 @@ def coordination_live_context(ctx: Any) -> dict[str, Any]:
     """
 
     root_task_id = _coordination_root_id(ctx)
-    try:
-        from ouroboros.task_pacing import project_task_acceptance_review_capacity
-
-        review_capacity = project_task_acceptance_review_capacity(ctx)
-    except Exception as exc:
-        review_capacity = {
-            "state": "unknown", "reason": type(exc).__name__,
-            "root_task_id": root_task_id, "cap_cycles": None,
-            "claimed_cycles": None, "remaining_cycles": None,
-            "binding_seen": False, "dedupe": "task_acceptance_binding_sha256",
-        }
     return {
         "observed_at": utc_now_iso(),
         "root_task_id": root_task_id,
@@ -338,7 +332,6 @@ def coordination_live_context(ctx: Any) -> dict[str, Any]:
         "time": _time_fact(ctx),
         "settled_spend": _settled_spend_fact(ctx, root_task_id),
         "active_descendants": _active_descendants_fact(ctx),
-        "review_capacity": review_capacity,
     }
 
 
@@ -909,19 +902,65 @@ def _open_sleep_entry(state: dict[str, Any], run_id: str) -> None:
     state["sleep_entry"] = entry
 
 
-def _record_observation(state: dict[str, Any], payload: dict[str, Any], answered: bool) -> None:
+def _record_observation(state: dict[str, Any], payload: dict[str, Any], answered: bool,
+                        attempt: str = "") -> None:
     """Dated observation facts (run-scoped): the supervisor's own ``status`` and the
     file's ``updated_at`` move on every quiet renewal, failed reads included, so
-    freshness is the last ANSWERED observation plus the current failure, never mtime."""
+    freshness is the last ANSWERED observation plus the current failure, never mtime.
+    ``waiting_on_user`` and the task attempt let a reader judge the run's current
+    work (``observed_run_activity``) without the window payload."""
     at = utc_now_iso()
     state["observation"] = {
         "at": at, "answered": bool(answered), "status": str(payload.get("status") or ""),
         "run_state": str(payload.get("state") or ""), "reason": str(payload.get("reason") or ""),
+        "waiting_on_user": bool(payload.get("waiting_on_user")), "at_unix": time.time(), "attempt": str(attempt),
     }
     if answered:
         state["last_answered_observation_at"] = at
     state["observation_failure"] = "" if answered else str(
         payload.get("reason") or payload.get("status") or "unknown")
+
+
+def run_activity(observation: Any) -> Optional[bool]:
+    """What one dated observation of a run says of its work (this supervision record's, or the
+    body observer's, ``delegate_collection.current_activity``): True running, False waiting
+    (queued for capacity, paused on its question, terminal), None unanswered or unknown.
+    A running run counts as working: an engine-internal provider wait carries no typed fact."""
+    if not isinstance(observation, dict) or observation.get("answered") is not True:
+        return None
+    run_state = str(observation.get("run_state") or "")
+    if run_state == "running":
+        return not observation.get("waiting_on_user")
+    return False if run_state == "queued" or run_state in custody.TERMINAL_STATES else None
+
+
+def observed_run_activity(drive_root: Any, task_id: str, run_id: str, attempt: Any) -> Optional[bool]:
+    """The work of the run ``task_id`` holds now, from its supervision record: the same
+    run and task attempt, observed within a few ticks; anything else is None (unknown).
+    For ``gateway/reply_preparation.py``; one small file, reread only when it changed."""
+    path = pathlib.Path(drive_root) / "state" / "delegate_supervision" / f"{task_id}.json"
+    try:
+        stat = path.stat()
+        stamp, memo = (stat.st_mtime_ns, stat.st_size), _OBSERVED.get(str(path))
+        if memo is None or memo[0] != stamp:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            observation = data.get("observation") if isinstance(data, dict) else None
+            memo = (stamp, {"run_id": str(data.get("run_id") or ""), "observation": dict(observation)}
+                    if isinstance(observation, dict) else {})
+            if len(_OBSERVED) >= 256:
+                _OBSERVED.clear()
+            _OBSERVED[str(path)] = memo
+    except (OSError, ValueError, AttributeError):
+        return None
+    observation = memo[1].get("observation") or {}
+    try:
+        current = time.time() - float(observation.get("at_unix") or 0) <= _OBSERVATION_CURRENT_SEC
+    except (TypeError, ValueError):
+        current = False
+    if (memo[1].get("run_id") != str(run_id) or not current
+            or str(observation.get("attempt") or "") != str(attempt or 1)):
+        return None
+    return run_activity(observation)
 
 
 def _leaf_live_input(ctx: Any, run_id: str, gateway: Any) -> str:
@@ -1111,8 +1150,16 @@ def supervised_wait(
     retained = retained_terminal_result(ctx, run_id) if owns_transport else None
     gateway = _loop_gateway() if owns_transport and retained is None else None
     live_input = _leaf_live_input(ctx, run_id, gateway) if retained is None else "unknown"
+    from ouroboros import model_sleep
+
+    # Holding the run is a wait, never this task's own work; what the run does is its
+    # recorded observation (``observed_run_activity``, DESIGN §9 Telegram typing).
+    hold_key, hold_until, activity = f"delegate:{run_id}", 0.0, None
     try:
         while True:
+            if hold_until - time.time() < _HOLD_MARK_SEC / 2:
+                hold_until = time.time() + _HOLD_MARK_SEC
+                model_sleep.declare_in_slot_wait(ctx, hold_key, hold_until)
             # A control already present does not wait behind another HTTP read.
             observed = not _control_wakes(ctx)
             if not observed:
@@ -1130,8 +1177,11 @@ def supervised_wait(
             # transport: rebuilding it would re-handshake into the same refusal and wake the
             # model, and it is no outage either. Only a read nothing answered is a dead socket.
             reached = answered or payload.get("answered") is True
+            resumed = False
             if observed:
-                _record_observation(state, payload, answered)
+                _record_observation(state, payload, answered, _attempt_key(ctx))
+                previous, activity = activity, run_activity(state["observation"])
+                resumed = activity is True and previous is not True
             if not reached:
                 gateway = _drop_gateway(gateway)
             unreachable = (
@@ -1250,7 +1300,11 @@ def supervised_wait(
                     "event_only": True,
                 })
             _save_state(ctx, state)
+            if resumed:
+                model_sleep.announce_resumed(ctx)  # the held run works again, as recorded: no new start says so
     finally:
+        if hold_until:
+            model_sleep.end_in_slot_wait(ctx, hold_key)
         _drop_gateway(gateway)
 
 

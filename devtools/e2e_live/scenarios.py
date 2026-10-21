@@ -31,7 +31,7 @@ SM1_CSS_PATH = "web/ui.css"
 # or a page-local override; the browser checks both documents after the reviewed restart.
 SM1_CSS_PATHS = (SM1_CSS_PATH,)
 SM1_REQUIRED_PALETTE = frozenset({"--accent", "--accent-light", "--accent-dim",
-                                "--accent-04", "--accent-65", "--focus-accent-border", "--focus-accent-ring"})
+                                "--accent-04", "--accent-55", "--focus-accent-border", "--focus-accent-ring"})
 # The stub's README Version History row (the release preflight requires one per VERSION).
 SM1_HISTORY_ROW = "Live E2E stand SM1 rehearsal: the shared brand accent changed for the app and setup wizard."
 _ACCENT_RE = re.compile(r"^(\s*--accent:\s*)([^;]+);", re.MULTILINE)

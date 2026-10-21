@@ -175,11 +175,66 @@ def test_skills_and_widgets_use_inner_scroll_regions():
     assert ".widgets-scroll" in css and "overflow-y: auto" in css
 
 
-def test_sidebar_projects_list_is_a_bounded_scroll_region():
-    """The sidebar's one variable-length collection owns a bounded window with
-    its own scroll, so the navigation column cannot grow with the project count."""
-    rule = _read("web/style.css").split(".nav-projects-list {", 1)[1].split("}", 1)[0]
-    assert "max-height: var(--nav-projects-list-max-height)" in rule and "overflow-y: auto" in rule, rule
+def test_sidebar_is_three_zones_with_the_projects_list_as_the_one_scroller():
+    """The sidebar is a pinned head (Main Chat), the Projects list as the ONE scroller (no inner cap, no outer
+    scroll wrapper) and the tools right after it: the Projects zone is as tall as its rows and shrinks to scroll
+    them, so free room stays under the last row, never between the zones (docs/DESIGN.md "Shell").
+    A too-short window falls back to the whole column scrolling with the head sticky."""
+    css = _read("web/style.css")
+    html = _read("web/index.html")
+    zone = css.split("\n.nav-projects {", 1)[1].split("}", 1)[0]
+    assert "flex: 0 1 auto" in zone and "min-height: 0" in zone, zone
+    assert "flex: 1 1 auto" not in zone, "a zone that takes the free height leaves a hole when the list is short"
+    rule = css.split("\n.nav-projects-list {", 1)[1].split("}", 1)[0]  # the base rule, not the short-window fallback
+    assert "flex: 1 1 auto" in rule and "min-height: 0" in rule and "overflow-y: auto" in rule, rule
+    assert "overscroll-behavior: contain" in rule and "max-height" not in rule, rule
+    # Too short for the zones: the column is the one scroller and the list flows (no second scroller).
+    # A finger's 44px rows run out of room sooner, so a touch column falls back at a taller window.
+    fallback = css.split("@media (max-height: 540px), (pointer: coarse) and (max-height: 600px) {", 1)[1].split("}\n}", 1)[0]
+    assert "#primary-sidebar .nav-projects-list { flex: 0 0 auto; overflow-y: visible;" in fallback
+    assert "--nav-projects-list-max-height" not in css and "--nav-projects-list-max-height" not in _read("web/ui.css")
+    # A fresh document has no outer wrapper. An older desktop page can keep its pre-three-zone .sidebar-scroll; the
+    # one rule naming it takes its box away, so that page's list scrolls again (test_ui_shell_legacy_browser.py).
+    assert "sidebar-scroll" not in html
+    rules = re.sub(r"/\*.*?\*/", "", css, flags=re.S).splitlines()
+    legacy = [line.strip() for line in rules if "sidebar-scroll" in line]
+    assert legacy == ["#primary-sidebar > .sidebar-scroll { display: contents; }"], legacy
+    head = css.split(".sidebar-head {", 1)[1].split("}", 1)[0]
+    assert "position: sticky" in head and "top: 0" in head
+    assert html.index('class="sidebar-head"') < html.index('id="nav-projects"') < html.index('class="sidebar-foot"')
+    # The zones are filled from the page registry: Main into the head, the tools into the foot (pages.js).
+    pages_js = _read("web/modules/pages.js")
+    assert "id: 'chat', label: 'Main Chat', icon: 'chat', zone: 'head'" in pages_js
+    for page in ("files", "skills", "widgets", "dashboard", "settings"):
+        assert f"id: '{page}'," in pages_js and "zone: 'foot'" in pages_js.split(f"id: '{page}',", 1)[1].split("}", 1)[0]
+    assert "Utilities" not in html and "nav-section-label" not in html
+    # A finger gets 44px rows and +; the version reads at the meta size.
+    assert "#primary-sidebar { --nav-item-h: 44px; --nav-control-h: 44px; }" in css
+    version = css.split("#nav-version {", 1)[1].split("}", 1)[0]
+    assert "font-size: var(--type-meta)" in version and "opacity" not in version
+    # A row's one status mark is the shared one (ui.css "Status marks"), in the row's own ink: no unread dot of its
+    # own, no second painter, and no name ink that changes with unread (new messages are the mark's hue).
+    for retired in (".nav-unread-dot", ".nav-activity-marker", ".nav-project-row.has-unread", ".nav-projects-show-all"):
+        assert retired not in css, retired
+    row = css.split("\n.nav-project-row {\n    min-height", 1)[1].split("}", 1)[0]
+    assert "grid-template-columns: minmax(0, 1fr) 18px;" in row, row
+    assert ".nav-project-row > .nav-mark { grid-column: 2; }" in css
+    # Main's mark lands in the Project rows' column by construction: Main's row ends where theirs does.
+    assert "--nav-kebab-w: var(--nav-control-h);" in css
+    assert "grid-template-columns: minmax(0, 1fr) var(--nav-kebab-w);" in css.split("\n.nav-project-item {", 1)[1].split("}", 1)[0]
+    assert "padding-right: calc(var(--nav-kebab-w) + var(--space-1));" in css.split("\n.nav-row-main {", 1)[1].split("}", 1)[0]
+    # On touch a long press opens a row's menu: the ⋯ keeps no column and no finger, and stays the keyboard's door.
+    touch = css.split("/* Touch: a long press opens the row's menu", 1)[1].split("\n}\n", 1)[0]
+    assert "#primary-sidebar { --nav-kebab-w: 0px; }" in touch
+    assert ".nav-project-item .nav-project-kebab:not(:focus, [aria-expanded=\"true\"]) {" in touch
+    assert "pointer-events: none" in touch
+    assert ".nav-project-item:has(> .nav-project-kebab:is(:focus, [aria-expanded=\"true\"])) {" in touch
+    assert "-webkit-touch-callout: none" in touch and "user-select: none" in touch
+    # The row's ⋯ is the shell's one More glyph.
+    app_js = _read("web/app.js")
+    assert "kebab.innerHTML = SHELL_ICONS.more;" in app_js and "kebab.textContent = '⋯'" not in app_js
+    assert "navProjectsToggle?.classList.toggle('active'" not in _read("web/app.js")
+    assert "openProjectPanel(item.project, { openOnly: true })" in _read("web/app.js")
 
 
 # ---------------------------------------------------------------------------
@@ -221,28 +276,31 @@ def test_server_navigation_and_chat_static_contracts():
     assert "evo-runtime-detail" in evo_source
     assert "data?.evolution_state?.detail" in chat_source
     assert "data?.bg_consciousness_state?.detail" in chat_source
-    assert re.search(r'<input[^>]+id="chat-file-input"[^>]+multiple', chat_source)
+    # The composer's markup and send path live in composer.js, mounted by chat.js.
+    composer_source = _read("web/modules/composer.js")
+    assert "${composerMarkup()}" in chat_source
+    assert re.search(r'<input[^>]+id="chat-file-input"[^>]+multiple', composer_source)
     # The composer's staged files live in chat_attachments.js (DESIGN "Chat attachments");
-    # chat.js uploads through it on Send and names the uploads for the model.
+    # composer.js uploads through it on Send and names the uploads for the model.
     attachments_source = _read("web/modules/chat_attachments.js")
-    assert "createComposerAttachments({" in chat_source
-    assert "composerText(text, uploadedAttachments.map(" in chat_source
+    assert "createComposerAttachments({" in composer_source
+    assert "composerText(text, uploadedAttachments.map(" in composer_source
     assert "attachmentTail(names);" in attachments_source  # every message but the exact /restart command
     assert "list.slice(0, ATTACHMENT_PREVIEW_COUNT)" in attachments_source
     assert "for (const item of [...pending])" in attachments_source
     assert "attachBtn.classList.toggle('uploading', flag)" in attachments_source
     assert "input.readOnly = flag;" in attachments_source
-    assert "cleanupUploadedAttachments" in chat_source
-    assert "await cleanupUploadedAttachments(e.uploaded || []);" in chat_source
-    assert "await cleanupUploadedAttachments(uploadedAttachments);" in chat_source
-    assert "ws.send({" in chat_source and "{ queue: false }" in chat_source
-    assert "result?.status !== 'sent'" in chat_source
+    assert "cleanupUploadedAttachments" in composer_source
+    assert "await cleanupUploadedAttachments(e.uploaded || []);" in composer_source
+    assert "await cleanupUploadedAttachments(uploadedAttachments);" in composer_source
+    assert "ws.send(frame, hasAttachments ? { queue: false } : undefined)" in composer_source
+    assert "result?.status !== 'sent'" in composer_source
     assert "data-attachment-remove" in attachments_source
     media_source = _read("web/modules/chat_media.js")
     assert "export async function cleanupUploadedAttachments" in media_source
     assert "method: 'DELETE'" in media_source
     assert "Promise.allSettled" in media_source
-    assert '>Loading…</span>' in chat_source
+    assert '>Loading…</span>' in _read("web/modules/chat_header.js")
     assert "syncHeaderControlState({ accounting: { available: false } });" in chat_source
     assert "budget_text: 'Connecting...'" not in chat_source
     assert "send(msg, options = {})" in _read("web/modules/ws.js")

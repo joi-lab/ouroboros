@@ -5,7 +5,20 @@ from __future__ import annotations
 import pytest
 
 
-def test_keyed_terminal_api_error_is_replayed_while_sibling_is_late(tmp_path):
+def _freeze_slot_clock(monkeypatch, *slot_ids):
+    """Classification is the contract where this is used; the late cases pin expiry. Worker start
+    and custody-write latency is not a classification change, so the named slots (default all)
+    never reach their window (#1889)."""
+    import time
+
+    from ouroboros import review_custody
+
+    start, real = time.monotonic(), review_custody.monotonic_now
+    monkeypatch.setattr(review_custody, "monotonic_now",
+                        lambda slot: start if not slot_ids or slot in slot_ids else real(slot))
+
+
+def test_keyed_terminal_api_error_is_replayed_while_sibling_is_late(tmp_path, monkeypatch):
     """A settled API slot must not be bought twice while its cycle sibling settles."""
     import threading
     from types import SimpleNamespace
@@ -20,6 +33,7 @@ def test_keyed_terminal_api_error_is_replayed_while_sibling_is_late(tmp_path):
     late_finished = threading.Event()
     release_late = threading.Event()
     ctx = SimpleNamespace()
+    _freeze_slot_clock(monkeypatch, "fast")
     request = ReviewRequest(
         surface="plan_review", goal="review", task_id="mixed-cycle",
         retry_key="plan_review:mixed-cycle:1",
@@ -35,7 +49,7 @@ def test_keyed_terminal_api_error_is_replayed_while_sibling_is_late(tmp_path):
         calls.append(slot.slot_id)
         if slot.slot_id == "late":
             late_started.set()
-            release_late.wait(1.0)
+            assert release_late.wait(60), "late sibling was never released"
             late_finished.set()
         return ReviewActorRecord(
             slot_id=slot.slot_id, model=slot.model, status="error",
@@ -58,25 +72,26 @@ def test_keyed_terminal_api_error_is_replayed_while_sibling_is_late(tmp_path):
         usage_meta={}, review_usage_scope=UsageScope(drive_root=tmp_path, task_id=request.task_id),
         run_slot=run_slot, error_actor=error_actor,
     )
-    first = run_custodied_review_slots(**args)
-    assert {actor.slot_id: actor.operation_state for actor in first} == {
-        "fast": "settled", "late": "in_flight",
-    }
-    assert late_started.wait(1.0)
-    assert getattr(ctx, "_review_settled_attempts", {})
-    second = run_custodied_review_slots(**args)
-    # Both slots run on independent workers; custody guarantees one call each,
-    # not which worker the scheduler enters first.
-    assert sorted(calls) == ["fast", "late"]
-    assert {actor.slot_id: actor.operation_state for actor in second} == {
-        "fast": "settled", "late": "in_flight",
-    }
+    try:
+        first = run_custodied_review_slots(**args)
+        assert {actor.slot_id: actor.operation_state for actor in first} == {
+            "fast": "settled", "late": "in_flight",
+        }
+        assert late_started.wait(60), "late sibling never started"
+        assert getattr(ctx, "_review_settled_attempts", {})
+        second = run_custodied_review_slots(**args)
+        # Both slots run on independent workers; custody guarantees one call each,
+        # not which worker the scheduler enters first.
+        assert sorted(calls) == ["fast", "late"]
+        assert {actor.slot_id: actor.operation_state for actor in second} == {
+            "fast": "settled", "late": "in_flight",
+        }
+    finally:
+        release_late.set()
+        assert late_finished.wait(60), "late sibling did not finish"
 
-    release_late.set()
-    assert late_finished.wait(1.0)
 
-
-def test_unresolved_terminal_http_capture_is_replayed_without_second_dispatch(tmp_path):
+def test_unresolved_terminal_http_capture_is_replayed_without_second_dispatch(tmp_path, monkeypatch):
     """A typed provider response makes an unresolved ledger row known-terminal."""
     from types import SimpleNamespace
 
@@ -87,6 +102,7 @@ def test_unresolved_terminal_http_capture_is_replayed_without_second_dispatch(tm
 
     calls = []
     ctx = SimpleNamespace()
+    _freeze_slot_clock(monkeypatch)
     request = ReviewRequest(
         surface="plan_review", goal="review", task_id="terminal-capture",
         retry_key="plan_review:terminal-capture:1",
@@ -126,7 +142,7 @@ def test_unresolved_terminal_http_capture_is_replayed_without_second_dispatch(tm
     assert second[0].http_status == 503
 
 
-def test_unresolved_capture_without_terminal_status_is_no_resend_without_typed_code(tmp_path):
+def test_unresolved_capture_without_terminal_status_is_no_resend_without_typed_code(tmp_path, monkeypatch):
     """A legacy actor cannot turn an unknown physical outcome into a resend."""
     from types import SimpleNamespace
 
@@ -137,6 +153,7 @@ def test_unresolved_capture_without_terminal_status_is_no_resend_without_typed_c
 
     calls = []
     ctx = SimpleNamespace()
+    _freeze_slot_clock(monkeypatch)
     request = ReviewRequest(
         surface="plan_review", goal="review", task_id="unknown-capture",
         retry_key="plan_review:unknown-capture:1",
@@ -175,7 +192,7 @@ def test_unresolved_capture_without_terminal_status_is_no_resend_without_typed_c
     assert second[0].late_result_pending is True
 
 
-def test_unknown_physical_capture_state_is_no_resend_even_with_terminal_status(tmp_path):
+def test_unknown_physical_capture_state_is_no_resend_even_with_terminal_status(tmp_path, monkeypatch):
     """Malformed physical provenance must win over an otherwise typed status."""
     from types import SimpleNamespace
 
@@ -188,6 +205,7 @@ def test_unknown_physical_capture_state_is_no_resend_even_with_terminal_status(t
 
     calls = []
     ctx = SimpleNamespace()
+    _freeze_slot_clock(monkeypatch)
     request = ReviewRequest(
         surface="plan_review", goal="review", task_id="unknown-physical-state",
         retry_key="plan_review:unknown-physical-state:1",
@@ -430,7 +448,7 @@ def test_budget_exceeded_review_failure_remains_retryable(tmp_path, monkeypatch)
     assert not getattr(ctx, "_review_settled_attempts", {})
 
 
-def test_not_dispatched_error_remains_retryable_for_same_cycle(tmp_path):
+def test_not_dispatched_error_remains_retryable_for_same_cycle(tmp_path, monkeypatch):
     """A $0 admission refusal must not become a sticky replay actor."""
     from types import SimpleNamespace
 
@@ -441,6 +459,7 @@ def test_not_dispatched_error_remains_retryable_for_same_cycle(tmp_path):
 
     calls = []
     ctx = SimpleNamespace()
+    _freeze_slot_clock(monkeypatch)
     request = ReviewRequest(
         surface="plan_review", goal="review", task_id="retryable-refusal",
         retry_key="plan_review:retryable-refusal:1",
@@ -495,10 +514,7 @@ def test_pre_dispatch_capture_state_remains_retryable_for_same_cycle(
 
     calls = []
     ctx = SimpleNamespace()
-    # Classification and retry are this case's contract; the late cases pin
-    # expiry. Worker start/publication latency is not a classification change.
-    clock_start = time.monotonic()
-    monkeypatch.setattr("ouroboros.review_custody.monotonic_now", lambda _slot: clock_start)
+    _freeze_slot_clock(monkeypatch)
     request = ReviewRequest(
         surface="plan_review", goal="review", task_id=f"retryable-{physical_state}",
         retry_key=f"plan_review:retryable-{physical_state}:1",

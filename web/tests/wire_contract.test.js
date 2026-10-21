@@ -230,35 +230,31 @@ test('the UNIFIED wire shape feeds the same readers: all rows named, pools carry
 
 test('delivered photo, video, and document rows keep their replay wire fields', () => {
     const history = repoFile('ouroboros/gateway/history.py');
+    const deliveries = repoFile('ouroboros/gateway/history_deliveries.py');
     const chat = moduleFile('chat.js');
 
-    const documentBranch = history.slice(
-        history.indexOf('if entry.get("type") == "document":'),
-        history.indexOf('elif entry.get("type") in {"photo", "video"}',
-            history.indexOf('if entry.get("type") == "document":')),
-    );
+    // history.py hands every stored delivery row to the one projection in history_deliveries.py.
+    assert.match(history, /if delivery := delivery_fields\(entry\):\n\s+rec\.update\(delivery\)/);
+    const branch = (start, end) => deliveries.slice(deliveries.indexOf(start), deliveries.indexOf(end));
+    const documentBranch = branch('if kind == "document":', 'if kind in {"photo", "video"}');
     for (const field of ['msg_type', 'filename', 'mime', 'download_url', 'caption', 'size_bytes']) {
-        assert.match(documentBranch, new RegExp(`rec\\["${field}"\\]`),
-            `document replay no longer emits ${field}`);
+        assert.ok(documentBranch.includes(`"${field}"`), `document replay no longer emits ${field}`);
     }
-
-    const mediaBranchStart = history.indexOf('elif entry.get("type") in {"photo", "video"}');
-    const mediaBranch = history.slice(mediaBranchStart, history.indexOf('\n            if ', mediaBranchStart));
-    // Same keyword-argument idiom as the links branch below.
-    for (const field of ['msg_type=', 'mime=', 'download_url=', 'download_url_compat=', 'caption=']) {
-        assert.ok(mediaBranch.includes(field), `photo/video replay no longer emits ${field}`);
+    const mediaBranch = branch('if kind in {"photo", "video"}', 'if kind == "links"');
+    for (const field of ['msg_type', 'mime', 'download_url', 'download_url_compat', 'caption']) {
+        assert.ok(mediaBranch.includes(`"${field}"`), `photo/video replay no longer emits ${field}`);
     }
-
-    const linksBranchStart = history.indexOf('elif entry.get("type") == "links"');
-    const linksBranch = history.slice(linksBranchStart, history.indexOf('\n            if ', linksBranchStart));
-    for (const field of ['msg_type="links"', 'actions=', 'title=']) {
+    const linksBranch = branch('if kind == "links"', 'if kind == "card"');
+    for (const field of ['"msg_type": "links"', '"actions"', '"title"']) {
         assert.ok(linksBranch.includes(field), `links replay no longer emits ${field}`);
     }
+    assert.ok(branch('if kind == "card"', 'return {}').includes('"msg_type": "card"'), 'card replay lost its msg_type');
 
-    assert.match(chat, /\['document', 'photo', 'video', 'links', 'quiz'\]\.includes\(msg\.msg_type\)/);
-    assert.match(chat, /if \(msg\.msg_type === 'document'\) appendDocumentBubble\(msg\);/);
-    assert.match(chat, /else if \(msg\.msg_type === 'links'\) appendLinksMessage\(msg\);/);
-    assert.match(chat, /else appendMediaBubble\(msg\);/);
+    // Replay draws every delivery row through the one table in chat_media.js, before final handling.
+    const media = moduleFile('chat_media.js');
+    assert.match(media, /const replayed = \{ document: appendDocumentBubble, links: appendLinksMessage, quiz: appendQuizMessage,\s+card: appendCardMessage, photo: appendMediaBubble, video: appendMediaBubble \};/);
+    const replay = chat.indexOf('if (appendDelivery(msg)) continue;');
+    assert.ok(replay > 0 && replay < chat.indexOf('if (taskId && replayConcludesTask(msg))'), 'deliveries replay before final handling');
 });
 
 test('live structured delivery frames keep additive grouping and size fields', () => {
@@ -275,10 +271,11 @@ test('live structured delivery frames keep additive grouping and size fields', (
     assert.match(bus, /"type": "document",[\s\S]*?"size_bytes": size_bytes,[\s\S]*?"task_id": str\(task_id or ""\)/);
     assert.match(bus, /"type": "links",[\s\S]*?"actions": validated,[\s\S]*?"task_id": str\(task_id or ""\)/);
     assert.match(bus, /"type": "quiz",[\s\S]*?"quiz_id": qid,[\s\S]*?"task_id": str\(task_id or ""\)/);
-    // Replay: the quiz row joins the non-terminal delivery family in chat.js
-    // BEFORE the finishLiveCard/plainUntypedFinal block.
+    // Replay: the quiz row joins the non-terminal delivery family (chat_media.js's table, drawn by chat.js
+    // BEFORE the finishLiveCard/plainUntypedFinal block).
     const chat = moduleFile('chat.js');
-    assert.match(chat, /msg\.msg_type === 'quiz'\) appendQuizMessage\(msg\)/);
+    assert.match(moduleFile('chat_media.js'), /quiz: appendQuizMessage,/);
+    assert.ok(chat.indexOf('if (appendDelivery(msg)) continue;') < chat.indexOf('if (taskId && replayConcludesTask(msg))'));
     // The card gets the SAME sanitizing markdown pipeline as assistant bubbles.
     assert.match(chat, /mountMarkdown: mountChatMarkdown/);
     assert.match(chat, /enhanceMarkdown: enhanceMountedMarkdown/);

@@ -183,36 +183,6 @@ def test_no_delegated_session_starts_under_an_unreadable_bucket(data_root):
     assert tree_billing_group(data_root, "S")["billing_group_id"] == "P"  # the bucket its receipt will use
 
 
-@pytest.mark.parametrize("fault", ["read_error", "amendment_error"])
-def test_delegated_start_rereads_the_continuation_original_group_before_start(data_root, monkeypatch, fault):
-    from ouroboros import delegate_custody as custody
-    from ouroboros.delegate_custody_current import task_snapshot, tree_billing_group
-    from ouroboros.task_results import write_task_result
-    from ouroboros.task_store import patch_document
-
-    write_task_result(data_root, "P", "completed", billing_group=BINDING)
-    write_task_result(data_root, "S", "running", root_task_id="S", billing_group=BINDING,
-                      metadata={"continuation": {"billing_group_id": "P"}})
-    payload = dict(task_id="S", root_task_id="S", invocation_id="original-group",
-                   request={"prompt": "continue the same work"}, idempotency_key="original-group")
-    sends = []
-    with monkeypatch.context() as broken:
-        if fault == "read_error":
-            unreadable_result(broken, "P")
-        else:
-            patch_document(data_root, "P", lambda row: {**row, "acceptance_root_cap_amendments": ["broken"]})
-        with ua.usage_scope(_task_scope(data_root, "S", "S")), pytest.raises(ua.BillingAuthorityUnavailable):
-            ua.execute_physical_attempt(_request(), lambda: sends.append(True))
-        with pytest.raises(ua.BillingAuthorityUnavailable) as refused:
-            custody.record_start_requested(data_root, **payload)
-        assert refused.value.kind == "unreadable" and refused.value.root_task_id == "P"
-        assert task_snapshot(data_root, "S")["pending"] == [] and sends == []
-    patch_document(data_root, "P", lambda row: {**row, "acceptance_root_cap_amendments": []})
-    assert custody.record_start_requested(data_root, **payload)
-    assert len(task_snapshot(data_root, "S")["pending"]) == 1
-    assert tree_billing_group(data_root, "S")["billing_group_id"] == "P"
-
-
 # ------------------------------------------------------------- the real loop and its pause
 
 def _loop_driver(root, monkeypatch, task_id, *, exact_owner=True):

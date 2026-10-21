@@ -182,51 +182,6 @@ def test_a_continue_successor_sees_its_whole_work_group_headroom(tmp_path, monke
     assert note.checkpoint["budget_axis"] == "whole_work_allowance"
 
 
-@pytest.mark.parametrize("anchor", ["start", "wait", "legacy"])
-@pytest.mark.parametrize("compaction", [
-    {"cost": 0.75}, {"cost": 0.75, "cost_estimated": True}, {"cost_final": False},
-], ids=["priced", "estimated", "unpriced"])
-def test_compaction_usage_reaches_the_next_nanny_fact_without_another_response(
-    tmp_path, monkeypatch, anchor, compaction,
-):
-    """Deferred/overflow compaction folds money before the next facts row, not a response.
-
-    Exercise that production fold and the real facts consumer. No provider call,
-    new round or delegation request is needed to make already-recorded cost visible.
-    """
-    from ouroboros import loop_round_limits
-    from ouroboros.nanny_pacing import note_nanny_delegate_activity
-
-    monkeypatch.setattr(task_pacing, "shared_wallet_observation", lambda: {"status": "no_global_limit"})
-    monkeypatch.setattr(loop, "_loop_tree_accounting", lambda **_kw: None)
-    monkeypatch.setattr(loop_round_limits, "estimate_cost_optional", lambda *_a, **_k: None)
-    context = _facts_ctx(tmp_path, monkeypatch, _nanny_route_dispatched=True)
-    usage = context.accumulated_usage
-    usage["cost"] = 1.5
-    tool_ctx = context.tools._ctx
-    tool_ctx._accumulated_usage = usage
-    verb = "delegate_start" if anchor == "start" else "delegate_wait"
-    note_nanny_delegate_activity(tool_ctx, 2, usage, [{"function": {"name": verb}}])
-    if anchor == "legacy":
-        tool_ctx._nanny_delegate_baseline = {}
-    before = dict(tool_ctx._nanny_delegate_baseline)
-    progress = dict(tool_ctx._nanny_metered_progress)
-    loop_round_limits._account_compaction_usage(usage, compaction, None, "task")
-    assert append_context_facts(context)
-    line = context.messages[-1]["content"]
-    total = 1.5 + compaction.get("cost", 0)
-    assert f"own recorded cost ${total:.2f}" in line
-    if anchor == "legacy":
-        assert "historical cost anchor unavailable" in line
-    else:
-        delta = total - (1.5 if anchor == "start" else 0)
-        assert f"own recorded cost ${delta:.2f}" in line.split("nanny:", 1)[1]
-        if compaction.get("cost_estimated") or compaction.get("cost_final") is False:
-            assert "subtotal, not final" in line.split("nanny:", 1)[1]
-    assert tool_ctx._nanny_delegate_baseline == before
-    assert tool_ctx._nanny_metered_progress == progress
-
-
 @pytest.mark.parametrize("later_calls", [0, 1, 2])
 def test_answer_fact_distinguishes_a_saved_line_from_its_current_currency(later_calls):
     from ouroboros.loop_messages import _final_answer_fact

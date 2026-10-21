@@ -158,6 +158,37 @@ def test_the_pause_carrier_tells_sleep_owner_pause_and_money_apart(tmp_path):
     assert f"unknown wait (reason=maintenance, state=paused, rail=maintenance_window, since={_PAUSED_ISO})" in note
 
 
+def test_a_parked_pause_keeps_the_author_its_tree_fence_declared(tmp_path):
+    """The exact pause a member parks as names no author; its tree's fence does, read as the owner's card reads it
+    (``control_actor.pause_author``): the owner's press, Ouroboros with its own sentence (a fence written before
+    the declaration existed keeps its mind record), and a press that declared nobody names nobody."""
+    fences = {
+        "pressed": {"by": {"actor": "owner", "text": "", "at": _PAUSED_ISO}},
+        "mind": {"by": {"actor": "ouroboros", "text": "pausing for the update", "at": _PAUSED_ISO}},
+        "legacy-mind": {"actor": "mind", "reason": "before the restart"},
+        "anonymous": {},  # requested_by=owner alone is the door, not a declaration
+    }
+    for task_id, declared in fences.items():
+        write_task_result(tmp_path, task_id, "scheduled", reason_code="budget_paused", budget_pause={
+            "pause_id": f"p-{task_id}", "state": "paused", "task_attempt": 1, "paused_at": _PAUSED_AT,
+            "reason": "owner", "rail": "owner_pause"}, owner_pause={
+            "state": "paused", "fence_id": f"f-{task_id}", "requested_by": "owner", "requested_at": _PAUSED_ISO,
+            **declared})
+    _snapshot(tmp_path, pending=list(fences))
+
+    waits = _waits(tmp_path)
+    assert waits["pressed"] == [{"kind": "owner_pause", "state": "paused", "by": "owner", "since": _PAUSED_ISO}]
+    assert waits["mind"][0]["by"] == "Ouroboros: pausing for the update"
+    assert waits["legacy-mind"][0]["by"] == "Ouroboros: before the restart"
+    assert waits["anonymous"] == [{"kind": "owner_pause", "state": "paused", "since": _PAUSED_ISO}]
+    note = _note(tmp_path)
+    assert f"owner Pause (by=owner, state=paused, since={_PAUSED_ISO})" in note
+    assert f"owner Pause (by=Ouroboros: pausing for the update, state=paused, since={_PAUSED_ISO})" in note
+    assert f"owner Pause (state=paused, since={_PAUSED_ISO})" in note
+    from ouroboros.peer_roster import live_root_catalogue
+    assert {row["task_id"]: row["waiting"] for row in live_root_catalogue(tmp_path, limit=10)["roots"]} == waits
+
+
 def test_a_restart_retained_warm_sleep_keeps_its_warm_mode_and_says_it_was_retained(tmp_path):
     """The real retention moves a warm sleep into the exact pause: the roster reads
     the saved mode (warm, never inferred cold from the carrier), marks it retained

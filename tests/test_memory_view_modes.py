@@ -241,7 +241,6 @@ def _needs(core, plan):
 
 
 def test_a_built_max_keeps_books_before_refusal_while_memory_still_fits(tmp_path, monkeypatch):
-    from ouroboros import capability_evidence
     from ouroboros.context_fit import measure_main_fit
 
     core, plan = _built(tmp_path, monkeypatch)
@@ -260,8 +259,7 @@ def test_a_built_max_keeps_books_before_refusal_while_memory_still_fits(tmp_path
             assert built.projection(mode).memory_facts["floor"]["mode_switch"] is None
     tiny = plan(1)
     assert tiny.projection("max").memory_facts["floor"]["steps"]
-    monkeypatch.setattr(capability_evidence, "resolve_main_token_density", lambda *_a, **_kw: (1.0, "cold_estimate"))
-    measured = measure_main_fit(tiny, tiny.messages_for("max"), [], drive_root=tmp_path,
+    measured = measure_main_fit(tiny, tiny.messages_for("max"), [],
                                profile="owner_max", rendered_mode="max", round_id="e:round:1")
     assert measured.predicted_capacity_miss and measured.measurement.capacity_deficit_tokens > 0
     unknown = plan(1, status="failed")
@@ -332,7 +330,7 @@ def test_the_loop_does_not_report_predicted_max_as_a_lowered_start(tmp_path, mon
             return "test-model"
 
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_kw: ({"role": "assistant", "content": "done"}, 0.0))
-    monkeypatch.setattr(loop, "_run_task_acceptance_review_once", lambda **_kw: False)
+    monkeypatch.setattr("ouroboros.tools.review_result.result_review_at_delivery", lambda *_a, **_kw: False)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     core, plan = _built(tmp_path / "w", monkeypatch)
     for name, window in (("tight", 1), ("roomy", 10_000_000)):
@@ -428,26 +426,24 @@ def test_a_nano_the_window_chose_is_measured_against_the_window_alone(monkeypatc
     """The task trace's measurement of a Nano the window chose has Nano's reserve and no owner target."""
     from types import SimpleNamespace
 
-    from ouroboros import capability_evidence
     from ouroboros.context_fit import measure_main_fit
     from ouroboros.loop_model_call import _main_context_profile
 
     assert _main_context_profile(SimpleNamespace(preferred_mode="nano"), "nano") == "owner_nano"
     assert _main_context_profile(SimpleNamespace(preferred_mode="max"), "nano") == "task_local_nano"
     assert _main_context_profile(SimpleNamespace(preferred_mode="low"), "nano") == "task_local_nano"
-    monkeypatch.setattr(capability_evidence, "resolve_main_token_density", lambda *_a, **_kw: (1.0, "cold_estimate"))
     core, plan = _built(tmp_path, monkeypatch)
     built = plan(200_000)
     messages = built.messages_for("nano") + [{"role": "user", "content": "x" * 400_000}]  # ≈100k: over 85k, under 200k
 
     def measure(profile):
-        return measure_main_fit(built, messages, [], drive_root=tmp_path, profile=profile, rendered_mode="nano",
+        return measure_main_fit(built, messages, [], profile=profile, rendered_mode="nano",
                                 round_id="e:round:1")
 
     window, owner = measure("task_local_nano"), measure("owner_nano")
     assert window.measurement.response_reserve_tokens == owner.measurement.response_reserve_tokens == cb.NANO_MIN_HEADROOM_TOKENS
     assert window.measurement.target_total_tokens is None and window.action == "send"
-    assert owner.measurement.target_total_tokens == cb.OWNER_NANO_TARGET_TOKENS and owner.action == "reclaim_once"
+    assert owner.measurement.target_total_tokens == cb.OWNER_NANO_TARGET_TOKENS and owner.action == "send_target_miss"
 
 
 def test_a_route_switch_keeps_the_owners_mode_and_starts_from_the_tasks_own(tmp_path, monkeypatch):
@@ -533,7 +529,7 @@ def test_explicit_post_refusal_low_projection_remains_available(tmp_path, monkey
     tool_ctx = SimpleNamespace(memory_view_facts=shown, _execution_trace={VIEW_TRACE_KEY: dict(shown)})
     ctx = SimpleNamespace(active_context_mode="max", context_fit_plan=built, messages=messages, tool_schemas=[],
                           tools=SimpleNamespace(_ctx=tool_ctx), task_id="t", round_idx=1,
-                          event_queue=None, drive_logs=tmp_path)
+                          event_queue=None, drive_logs=tmp_path, accumulated_usage={})
     events = []
     monkeypatch.setattr(loop, "_emit_checkpoint_event", lambda *_a, **_kw: events.append(_a[-1]))
     # This helper is entered by the typed-refusal caller, not by a prediction.

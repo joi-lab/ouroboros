@@ -353,29 +353,6 @@ def test_add_usage_keeps_billing_sums_and_reports_known_only_while_every_call_re
     assert [event_token_counts(total)[key] for key in COUNTERS] == expected
 
 
-@pytest.mark.parametrize("raws,expected", [
-    ((FULL, ZERO), [172, 6, 40, 25]), ((ZERO, ZERO), [14, 0, 0, 0]), ((FULL, PARTIAL), [None, 9, None, None]),
-    ((FULL, MALFORMED), [None, None, None, 25]),
-])
-def test_compaction_total_reaches_its_llm_usage_row_truthfully(tmp_path, monkeypatch, offline, raws, expected):
-    """The summarizer's recorder (``context_compaction._record_usage``) and the loop's compaction
-    account (``loop_round_limits._account_compaction_usage``) are the actual producer pair."""
-    from ouroboros.context_compaction import _record_usage
-    from ouroboros.loop_round_limits import _account_compaction_usage
-
-    usages = [_adapter_usage(monkeypatch, raw) for raw in raws]
-    compaction_total, task_total, events = {}, {"_task_attempt": 1}, queue.Queue()
-    for usage in usages:
-        _record_usage(compaction_total, usage)
-    _account_compaction_usage(task_total, compaction_total, events, "compaction-task")
-    event = events.get_nowait()
-    assert events.empty() and event["type"] == "llm_usage" and [event[key] for key in COUNTERS] == expected
-    assert _persisted_usage(event, tmp_path / "supervisor") == expected
-    reference = _billing_reference({}, *usages)
-    assert {key: compaction_total.get(key) for key in reference} == reference
-    assert {key: task_total.get(key) for key in BILLING} == {key: reference[key] for key in BILLING}
-
-
 @pytest.mark.parametrize("raws,expected", [((FULL, ZERO), [172, 6, 40, 25]), ((FULL, PARTIAL), [None, 9, None, None])])
 def test_native_review_episode_total_reaches_its_llm_usage_row_truthfully(tmp_path, monkeypatch, offline, raws, expected):
     """A native multi-round review episode folds its rounds with ``add_usage``; deep_self_review

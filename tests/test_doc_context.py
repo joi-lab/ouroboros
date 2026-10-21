@@ -180,7 +180,7 @@ def test_forked_context_uses_canonical_global_cognition_not_child_noise(monkeypa
     assert f"{len('CANONICAL_DEEP_REVIEW')} chars" in rendered
     assert "CANONICAL_DEEP_REVIEW" not in rendered and "CHILD_DEEP_NOISE" not in rendered
     call = {"root": "runtime_data", "path": str((canonical / "memory" / "deep_review.md").resolve())}
-    pointer = f"Read: read_file(root='runtime_data', path='{call['path']}')"
+    pointer = f"Read: read_file(root='runtime_data', path={call['path']!r})"  # as the product spells it (repr)
     assert json.dumps(pointer, ensure_ascii=False)[1:-1] in rendered
     registry = ToolRegistry(repo_dir=env.repo_dir, drive_root=child)
     registry.set_context(ctx)
@@ -340,32 +340,23 @@ def test_unreadable_current_plan_review_source_returns_typed_startup_refusal(mon
 
 
 def test_named_owner_source_resolves_beyond_automatic_recent_generations():
-    import json
-
     from ouroboros.agent_startup_checks import validate_task_authority_sources
     from ouroboros.project_dialogue import build_owner_message_ref
 
+    from tests import _dialogue as dialogue_test
+
     tmpdir = pathlib.Path(tempfile.mkdtemp())
     env, _memory = _make_env_and_memory(tmpdir)
-    archive = env.drive_root / "archive"
-    logs = env.drive_root / "logs"
-    archive.mkdir(parents=True)
-    logs.mkdir(parents=True, exist_ok=True)
     text = "old but exact owner authority"
     ref = build_owner_message_ref(
         chat_id=1, client_message_id="old-owner", ts="2026-08-01T00:00:00Z", text=text,
     )
-    (archive / "chat_0001.jsonl").write_text(
-        json.dumps({**ref, "direction": "in", "text": text}) + "\n", encoding="utf-8",
-    )
-    for index in range(2, 6):
-        (archive / f"chat_000{index}.jsonl").write_text(
-            json.dumps({"direction": "in", "text": f"newer-{index}"}) + "\n",
-            encoding="utf-8",
-        )
-    (logs / "chat.jsonl").write_text(
-        json.dumps({"direction": "in", "text": "live"}) + "\n", encoding="utf-8",
-    )
+    # The owner's row is in the oldest of five archived generations of the legacy chain, imported as the upgrade does.
+    dialogue_test.seed(env.drive_root, archives={
+        "chat_0001.jsonl": [{**ref, "direction": "in", "text": text}],
+        **{f"chat_000{index}.jsonl": [{"direction": "in", "text": f"newer-{index}"}] for index in range(2, 6)}},
+        live={"chat": [{"direction": "in", "text": "live"}]})
+    dialogue_test.import_all(env.drive_root)
     task = {"id": "legacy-source", "origin_message_ref": ref}
 
     assert validate_task_authority_sources(env, task) == {}

@@ -2,8 +2,8 @@
    launch policy (and whether it keeps the card running while Widgets is
    hidden), the card's ONE primary control (Start / Stop) and the facade a
    stopped card shows in place of its frame; for every card the card menu —
-   the launch policy of a framed card and the owner's width steps (column
-   spans: web/modules/widget_size.js).
+   the launch policy of a framed card, the owner's width steps (column
+   spans: web/modules/widget_size.js) and Remove on a card kept from the chat.
    widgets.js owns the registry and decides WHEN a card mounts or stops; this
    module only renders and reads the controls. Declarative cards are host-drawn
    and get only the menu's width steps. */
@@ -84,12 +84,14 @@ export function renderWidgetCardControls(tab) {
     const sizes = group('Size', `<p class="widgets-menu-note" data-widget-size-note hidden>Widths apply when the list is wide.</p>${
         WIDGET_WIDTH_STEPS.map(({ w, label }) => item(`data-widget-size="${w}" aria-checked="false"`, label)).join('')
     }${item('data-widget-size="reset"', 'Reset size', 'menuitem')}`);
+    // A card kept from the chat (`pinned_card`) is the owner's data: Remove takes it off the board.
+    const remove = tab?.pinned_card ? `<div role="group" aria-label="Card">${item('data-widget-unpin', 'Remove', 'menuitem')}</div>` : '';
     const power = framed ? `<span class="ui-status" data-tone="neutral" data-widget-status hidden>Stopped</span>
         <button type="button" class="btn btn-primary btn-sm" data-widget-power>Start</button>` : '';
     return `${power}
         <div class="skills-card-menu">
             <button type="button" class="skills-card-menu-trigger" aria-label="Widget options" aria-haspopup="menu" aria-expanded="false" data-widget-menu-trigger>⋮</button>
-            <dialog class="skills-card-menu-dialog ui-popup" role="menu" aria-label="Widget options">${policy}${sizes}</dialog>
+            <dialog class="skills-card-menu-dialog ui-popup" role="menu" aria-label="Widget options">${policy}${sizes}${remove}</dialog>
         </div>`;
 }
 
@@ -166,11 +168,11 @@ export function renderWidgetFacade(mount, tab) {
 /**
  * Card-menu domain adapter over the shared keyboard/viewport menu: a launch
  * policy goes to `onSelectMode(key, mode)`, a width step (or Reset, `null`) to
- * `widths.setWidth(key, w)`; the menu opens with the card's current width
+ * `widths.setWidth(key, w)`, a kept card's Remove to `onRemove(key)`; the menu opens with the card's current width
  * (`widths.widthOf(key)`) checked, and on the stacked column it says that
  * widths apply to the wide board only.
  */
-export function bindWidgetCardMenus(list, onSelectMode, widths = null) {
+export function bindWidgetCardMenus(list, onSelectMode, widths = null, onRemove = () => {}) {
     if (!list) return { close() {}, destroy() {} };
     let active = null;
     const close = () => active?.binding.close();
@@ -195,11 +197,12 @@ export function bindWidgetCardMenus(list, onSelectMode, widths = null) {
         popover.show();
         trigger.setAttribute('aria-expanded', 'true');
         const onSelect = (selection) => {
-            const item = selection.target.closest('[data-widget-start-mode], [data-widget-size]');
+            const item = selection.target.closest('[data-widget-start-mode], [data-widget-size], [data-widget-unpin]');
             if (!item) return;
             active?.binding.close({ restoreFocus: true });
             const size = item.dataset.widgetSize;
-            if (!size) onSelectMode(key, item.dataset.widgetStartMode || '');
+            if (item.hasAttribute('data-widget-unpin')) onRemove(key);
+            else if (!size) onSelectMode(key, item.dataset.widgetStartMode || '');
             else widths?.setWidth(key, size === 'reset' ? null : Number(size));
         };
         popover.addEventListener('click', onSelect);

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import copy
 import json
@@ -682,8 +684,8 @@ def test_provider_test_attempts_are_physically_accounted_without_chat_side_effec
     events = [json.loads(line) for line in events_path.read_text().splitlines()]
     assert not any(row.get("type") in {"llm_round", "llm_usage", "chat", "progress"} for row in events)
     assert not (tmp_path / "task_results").exists()
-    assert not (tmp_path / "logs" / "chat.jsonl").exists()
-    assert not (tmp_path / "logs" / "progress.jsonl").exists()
+    assert not dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
+    assert not dialogue_test.log_rows(tmp_path / "logs" / "progress.jsonl")
 
 
 def test_response_log_and_accounting_expose_only_controlled_error(
@@ -737,7 +739,7 @@ def test_provider_test_and_active_model_enumeration_never_select_legacy_heavy():
     assert LEGACY_MODEL_SETTING_KEYS == ("OUROBOROS_MODEL_HEAVY",)
     assert provider_api._provider_test_model("anthropic", {
         "OUROBOROS_MODEL_HEAVY": "anthropic::owner-legacy-heavy",
-    }) == "anthropic::claude-opus-5"
+    }) == "anthropic::claude-opus-5-5"
 
 
 @pytest.mark.parametrize("retired_key", [

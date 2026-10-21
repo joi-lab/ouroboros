@@ -170,6 +170,7 @@ _MAC_ALLOW = 2 | 4  # UNAuthorizationOptionSound | Alert: no badge (DESIGN §9)
 _MAC_PRESENT = 2 | 4 | 8 | 16  # presentation Sound | Alert | List | Banner: in front too (2A)
 _MAC_DEFAULT_ACTION = "com.apple.UNNotificationDefaultActionIdentifier"
 _MAC_STATUS = {0: NOT_DETERMINED, 1: DENIED, 2: AUTHORIZED, 3: AUTHORIZED, 4: AUTHORIZED}
+_MAC_SOUND_SETTING = {2: "enabled", 1: "disabled"}  # UNNotificationSetting; 0 is notSupported
 _MAC_CLASSES = ("UNUserNotificationCenter", "UNMutableNotificationContent", "UNNotificationRequest",
                 "UNNotificationSound")
 _mac_shared: dict = {}  # an Objective-C class is process-wide: the delegate is defined once
@@ -265,11 +266,32 @@ class MacNotifier(NativeNotifier):
             raise Unavailable(self._broken)
         return self._center
 
-    def _status(self) -> str:
+    def status(self) -> dict:
+        try:
+            return self._settings_answer()
+        except Exception as exc:
+            return {**capability(self.platform, UNAVAILABLE, _reason(exc)), "sound_setting": "unknown"}
+
+    def ask(self) -> dict:
+        answer = super().ask()
+        # Authorization alone does not mean sound is enabled in System Settings.
+        if answer["status"] in (AUTHORIZED, DENIED):
+            return self.status()
+        return {**answer, "sound_setting": "unknown"}
+
+    def _settings_answer(self) -> dict:
         center = self._ready()
         (settings,) = _await(lambda done: center.getNotificationSettingsWithCompletionHandler_(
             lambda value: done(value)), _REPLY_WAIT)
-        return _MAC_STATUS.get(int(settings.authorizationStatus()), UNAVAILABLE)
+        status = _MAC_STATUS.get(int(settings.authorizationStatus()), UNAVAILABLE)
+        try:
+            sound = _MAC_SOUND_SETTING.get(int(settings.soundSetting()), "unknown")
+        except Exception:
+            sound = "unknown"
+        return {**capability(self.platform, status), "sound_setting": sound}
+
+    def _status(self) -> str:
+        return self._settings_answer()["status"]
 
     def _request(self) -> str:
         status = self._status()
@@ -287,11 +309,10 @@ class MacNotifier(NativeNotifier):
         return AUTHORIZED if granted else DENIED
 
     def _deliver(self, title, body, sound, token):
-        # Only the owner's gesture asks (``ask``); an alert that finds the question unasked falls back.
-        status = self._status()
-        if status != AUTHORIZED:
-            # Still unasked after the system's question failed: its error stays the reason.
-            return refused(self.platform, status, self._ask_error if status == NOT_DETERMINED else "")
+        # The page checks snapshot and current preferences immediately before
+        # calling us. Do not insert a blocking permission wait after that
+        # last cancellable boundary. The OS enforces permission at submission.
+        center = self._ready()
         content = self._classes["UNMutableNotificationContent"].alloc().init()
         content.setTitle_(title)
         if body:
@@ -300,13 +321,27 @@ class MacNotifier(NativeNotifier):
             content.setSound_(self._classes["UNNotificationSound"].defaultSound())
         request = self._classes["UNNotificationRequest"].requestWithIdentifier_content_trigger_(token, content, None)
         try:
-            (error,) = _await(lambda done: self._center.addNotificationRequest_withCompletionHandler_(
+            (error,) = _await(lambda done: center.addNotificationRequest_withCompletionHandler_(
                 request, lambda value: done(value)), _REPLY_WAIT)
         except TimeoutError:
             # Added, unanswered: the center may still show it, and its click still carries the token.
             return unconfirmed(self.platform, "no_completion")
         if error is not None:
-            return refused(self.platform, FAILED, str(error.localizedDescription()))
+            try:
+                denied = str(error.domain()) == "UNErrorDomain" and int(error.code()) == 1
+            except Exception:
+                denied = False
+            if not denied:
+                return refused(self.platform, FAILED, _ns_error(error))
+            # "Not allowed" is also the answer while the question is unasked. Only after this definite
+            # refusal, one bounded read tells them apart; an unreadable answer stays a denial.
+            try:
+                unasked = self._status() == NOT_DETERMINED
+            except Exception:
+                unasked = False
+            if unasked:
+                return refused(self.platform, NOT_DETERMINED, self._ask_error)
+            return refused(self.platform, DENIED, _ns_error(error))
         return submitted(self.platform, "os" if sound else "off")
 
 

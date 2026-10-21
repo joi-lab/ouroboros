@@ -10,15 +10,14 @@ at that module's band ceiling: the grant lifecycle is one owner with its own
 reason to change (owner Q7/Q9/Q10 semantics), and ``queue_transitions`` keeps
 the general resume seam (``resume_budget_paused_task``) that calls into it.
 Every call here runs with the queue lock held by that seam or by restore,
-except the answered root's late-phase Resume (D10, ``resume_late_phase``):
-it observes tree custody off-lock and takes the queue lock briefly itself.
+except the Resume of an answered root's Pause (``resume_late_phase``): it
+observes tree custody off-lock and takes the queue lock briefly itself.
 """
 
 from __future__ import annotations
 
 import logging
 import pathlib
-import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -305,13 +304,13 @@ def _global_money_refusal(q: Any, budget_remaining: Any) -> Optional[Dict[str, A
 
 def _root_money_refusal(result_root: Any, task: Dict[str, Any], root_task_id: str) -> Optional[Dict[str, Any]]:
     from ouroboros.usage_accounting import refresh_root_accounting
-    from ouroboros.usage_admission import effective_billing_fields, task_accounting_key, task_billing_fields
+    from ouroboros.usage_admission import task_accounting_key, task_billing_fields
     from ouroboros.usage_ledger import BillingAuthorityUnavailable
 
     # The original group's authority is reread strictly first: unreadable or refused is
     # named as such, never as accounting room or as an exhausted cap.
     try:
-        effective_billing_fields(result_root, root_task_id, task_billing_fields(task, root_task_id, None, result_root))
+        task_billing_fields(task, root_task_id, None, result_root)
     except BillingAuthorityUnavailable as exc:
         return {"ok": False, "error": "billing_authority_unavailable", "billing_authority": exc.kind, "cause": exc.cause,
                 "action": "fix_billing_authority_then_resume" if exc.kind == "unreadable" else "cancel_or_new_run"}
@@ -643,6 +642,73 @@ def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected
             **({"released_hold": str(released_hold.get("reason") or "")} if released_hold else {})}
 
 
+def newer_continuation_basis(task: Dict[str, Any], drive_root: Any) -> bool:
+    """Custody after a spent Resume, never permission to dispatch that custody.
+
+    Each carrier's existing admission validates its source/transaction. An
+    unreadable authority raises: neither a continuation nor absence is proven.
+    """
+    from ouroboros.budget_pause import LIVE_PAUSE_STATES, budget_pause_row
+    from ouroboros.delegate_recovery import _read, planned_handoff_matches
+
+    if any(isinstance(task.get(key), dict) for key in ("_owner_wait_resume", "_working_recovery")):
+        return True
+    root = pathlib.Path(task.get("budget_drive_root") or drive_root)
+    pause = task.get("_budget_pause") or {}
+    if pause.get("exact_continuation"):
+        row = budget_pause_row(root, str(task.get("id") or ""))
+        if (row.get("state") in LIVE_PAUSE_STATES and row.get("source_ref")
+                and row.get("pause_id") == (pause.get("checkpoint") or {}).get("pause_id")):
+            return True
+    return int(task.get("_attempt") or 1) > 1 and planned_handoff_matches(
+        _read(root, str(task.get("id") or ""), strict=True), task)
+
+
+def resume_hold_requires_fence(task: Dict[str, Any], drive_root: Any) -> bool:
+    """Re-decide spent, marker-less custody using its durable hold after restore."""
+    from supervisor.events_budget import BUDGET_HOLD_KEY, HOLD_GRANT_CONSUMED_STALE_ROW, HOLD_STALE_GRANT_SUPERSEDED
+
+    task.pop("_budget_pause_consumed", None)  # legacy in-memory copy; the hold owns these identities
+    hold = task.get(BUDGET_HOLD_KEY) or {}
+    if hold.get("reason") not in {HOLD_GRANT_CONSUMED_STALE_ROW, HOLD_STALE_GRANT_SUPERSEDED}:
+        return False
+    if hold.get("reason") == HOLD_STALE_GRANT_SUPERSEDED and isinstance(task.get("_budget_pause"), dict):
+        return False  # retained exact-pause admission owns this hold
+    if not newer_continuation_basis(task, drive_root):
+        return True
+    task.pop(BUDGET_HOLD_KEY, None)
+    return False
+
+
+def revalidate_consumed_resume_holds() -> None:
+    """Call first in ``supervisor.task_admission.revalidate_project_holds()`` under Q,
+    before its empty-project-holds early return and before normal admission.
+
+    Safe every tick: without consumed or marker-less superseded holds, the queue
+    scan is in-memory only, with no store reads/writes or snapshot publication;
+    with them its store reads are zero-wait, contention retrying next tick.
+    """
+    from supervisor import queue as q
+    from supervisor.events_budget import BUDGET_HOLD_KEY
+    from supervisor.queue_snapshot import _fence_snapshot_running_rows
+
+    from ouroboros.store import StoreError, admission_acquisition
+
+    changed = False
+    for task in q.PENDING:
+        before = task.get(BUDGET_HOLD_KEY)
+        try:
+            with admission_acquisition():  # under Q nothing waits: a busy read keeps the hold for the next tick
+                # A live attempt of the same id owns the task: its stale row waits, never fences it.
+                if resume_hold_requires_fence(task, q.DRIVE_ROOT) and task.get("id") not in q.RUNNING:
+                    _fence_snapshot_running_rows([{"id": task["id"]}], restored_ids=set())
+            changed |= before != task.get(BUDGET_HOLD_KEY)
+        except (StoreError, OSError, ValueError, TypeError, RuntimeError):
+            log.warning("Continuation basis unreadable for %s; hold retained", task.get("id"), exc_info=True)
+    if changed:
+        q.persist_queue_snapshot(reason="consumed_resume_hold_revalidated")
+
+
 def revoke_exact_budget_resume(task: Dict[str, Any], reason: str) -> bool:
     """Return a granted-but-undispatched task to its exact pause (queue lock held).
 
@@ -710,32 +776,24 @@ def revoke_exact_budget_resume(task: Dict[str, Any], reason: str) -> bool:
     same_grant = str(grant.get("grant_id") or "") == handoff_grant_id
     consumed = bool(grant.get("consumed_at")) or row_state == STATE_RESUMED
     if same_pause and same_grant and consumed:
-        # NEVER re-armed: the loop consumed this grant, so the task ran (or
-        # ran and ended). This queue row is a stale carrier; it is held typed,
-        # off the dispatch path, with no pause marker — and a restore fences it
-        # as the running work it names.
-        if isinstance(task.get("_owner_wait_resume"), dict):
+        try:
+            continuing = newer_continuation_basis(task, result_root)
+        except (OSError, ValueError, TypeError, RuntimeError):
+            continuing = False  # retained hold; restore/tick re-reads before deciding absence
+        if continuing:
             from supervisor.events_budget import continue_consumed_resume_selection
 
             continue_consumed_resume_selection(task, row)
             task.pop("_budget_pause_resume", None)
-            # The task ran ON past this grant and LATER parked in an owner wait:
-            # the spent carrier is simply retired and the newer planned-restart
-            # handoff decides the row (its own restore gate re-validates it).
-            # Fencing the row here would drop that valid continuation (#1196, F3).
             q.append_jsonl(q.DRIVE_ROOT / "logs" / "events.jsonl",
                            {"ts": utc_now_iso(), "type": "budget_resume_carrier_retired",
                             "task_id": task_id, "reason": str(reason or ""),
                             "grant_id": str(grant.get("grant_id") or ""),
                             "pause_id": current_pause_id,
                             "consumed_at": grant.get("consumed_at"),
-                            "retained": "owner_wait_resume"})
+                            "retained": "newer_continuation_basis"})
             return False
         task.pop("_budget_pause_resume", None)
-        task["_budget_pause_consumed"] = {
-            "pause_id": current_pause_id, "grant_id": str(grant.get("grant_id") or ""),
-            "consumed_at": grant.get("consumed_at"), "reason": str(reason or ""),
-        }
         hold_budget_row(task, reason=HOLD_GRANT_CONSUMED_STALE_ROW, detail=str(reason or ""),
                          extra={"pause_id": current_pause_id, "grant_id": str(grant.get("grant_id") or "")},
                          result_root=None)  # the task's own status is not ours to rewrite
@@ -824,14 +882,9 @@ def revoke_exact_budget_resume(task: Dict[str, Any], reason: str) -> bool:
     return True
 
 
-_LATE_RESUMING: set = set()
-_LATE_RESUMING_LOCK = threading.Lock()
-
-
 def _late_phase_refusal(q: Any, root: pathlib.Path, task_id: str, row: Dict[str, Any],
-                        record: Dict[str, Any], fence: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """The exact Resume's own refusals for a saved late phase; nothing is consumed or degraded."""
-    from ouroboros.artifacts import read_actor_source_bytes
+                        fence: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The exact Resume's own refusals for an answered root's late work; nothing is consumed."""
     from ouroboros.cancel_intents import has_active_intent
     from ouroboros.deadline_utils import parse_deadline_ts, utc_now
     from supervisor.continuation_admission import action_writers
@@ -847,7 +900,7 @@ def _late_phase_refusal(q: Any, root: pathlib.Path, task_id: str, row: Dict[str,
     except Exception:
         return {"ok": False, "error": "cancellation_authority_unavailable"}
     with q._queue_lock:
-        # A Continue of this answered root that may already write would overlap the remainder.
+        # A Continue of this answered root that may already write would overlap the late work.
         successors = [str(t.get("id") or "") for t in [*q.PENDING, *(m.get("task") or {} for m in q.RUNNING.values())]
                       if isinstance(t, dict) and ((t.get("metadata") or {}).get("continuation") or {}).get(
                           "predecessor_task_id") == task_id and (t.get("id") in q.RUNNING or not budget_hold_fact(t))]
@@ -862,34 +915,40 @@ def _late_phase_refusal(q: Any, root: pathlib.Path, task_id: str, row: Dict[str,
                                  or (row.get("metadata") or {}).get("deadline_at"))
     if deadline is not None and deadline <= utc_now():
         return {"ok": False, "error": "deadline_passed"}
-    refusal = _global_money_refusal(q, budget_remaining) or _root_money_refusal(
+    return _global_money_refusal(q, budget_remaining) or _root_money_refusal(
         root, {**row, "id": task_id}, str(row.get("root_task_id") or task_id))
-    if refusal:
-        return refusal
-    if record:
-        try:
-            read_actor_source_bytes(root, task_id, record["payload_ref"])
-        except Exception:
-            return {"ok": False, "error": "pause_source_unreadable", "action": "cancel_or_new_run"}
-    return None
 
 
-def _release_late_fence(q: Any, root: pathlib.Path, task_id: str, row: dict, fence: Dict[str, Any]) -> Dict[str, Any]:
-    """Resume of an answered root's Pause with no saved post-task remainder (D10).
+def resume_late_phase(task_id: str) -> Optional[Dict[str, Any]]:
+    """The owner's Resume of an answered root's Pause; None when not one.
 
-    Nothing left at all: the tree census already releases it. Only deferred,
-    unsent late work left (a late review still preparing): this explicit
-    Resume reopens the fence once nothing sent remains in flight.
+    The Pause already ended that root's post-answer upkeep, so nothing of it is
+    resumed. Nothing left at all: the tree census already releases the fence.
+    Only deferred, unsent late work left (a review operation not yet sent): this
+    explicit Resume reopens the fence once nothing sent remains in flight. The
+    exact Resume's refusals apply unchanged (Restart/Panic hold, a live Stop,
+    unsettled tree custody, the calendar deadline, global money and the root
+    tree's own cap): a refusal leaves the fence as it was.
     """
-    from ouroboros.owner_pause import FENCE_RELEASED, launch_lock, set_fence_state
+    from ouroboros.owner_pause import FENCE_RELEASED, fence_closed, launch_lock, read_fence, set_fence_state
     from ouroboros.post_task_checkpoint import post_task_synthesis_in_flight
     from ouroboros.review_operation import task_has_live_review_operation
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
     from supervisor.continuation_admission import conflicting_writers, release_settled_continuations
     from supervisor.owner_pause_control import refresh_owner_pause_tree
+    from supervisor import queue as q
 
+    root = pathlib.Path(q.DRIVE_ROOT)
+    try:
+        row = load_task_result(root, task_id, strict=True) or {}
+        fence = read_fence(root, task_id) if row else {}
+    except Exception:
+        return {"ok": False, "error": "pause_record_unreadable"}
+    if row.get("status") not in _TRULY_TERMINAL_STATUSES or not fence_closed(fence):
+        return None
     remainder = refresh_owner_pause_tree(task_id) != FENCE_RELEASED
     if remainder:
-        refusal = _late_phase_refusal(q, root, task_id, row, {}, fence)
+        refusal = _late_phase_refusal(q, root, task_id, row, fence)
         if refusal:
             return refusal
         try:
@@ -903,11 +962,8 @@ def _release_late_fence(q: Any, root: pathlib.Path, task_id: str, row: dict, fen
             return {"ok": False, "error": "owner_pause_effects_unsettled", "action": "wait_for_effect_settlement"}
         try:
             with launch_lock(root, task_id):
-                from ouroboros.owner_pause import read_fence
-                from ouroboros.acceptance_late import resume_paused_acceptance_preparations
                 if read_fence(root, task_id) != fence:
                     return {"ok": False, "error": "selection_authority_changed"}
-                resume_paused_acceptance_preparations(root, task_id, fence)
                 set_fence_state(root, task_id, fence_id=str(fence.get("fence_id") or ""), state=FENCE_RELEASED,
                                 expected_state=str(fence.get("state") or ""), release_reason="owner_resume_late")
         except Exception as exc:
@@ -919,82 +975,3 @@ def _release_late_fence(q: Any, root: pathlib.Path, task_id: str, row: dict, fen
     release_settled_continuations(task_id)
     return {"ok": True, "task_id": task_id, "root_task_id": task_id, "late_phase": "resumed" if remainder else "settled",
             "owner_pause_released": True}
-
-
-def resume_late_phase(task_id: str) -> Optional[Dict[str, Any]]:
-    """The owner's Resume of an answered root's paused remainder (D10); None when not one.
-
-    The exact Resume's refusals apply unchanged (Restart/Panic hold, a live
-    Stop, unsettled tree custody, the calendar deadline, global money and the
-    root tree's own cap): a refusal consumes nothing and leaves the saved phase
-    and its fence as they were. Otherwise ONE single-use grant is recorded on
-    the pause and handed to the existing late-phase executor, which consumes it
-    where the work starts. A closed fence whose late work already ended is
-    settled by the tree census (released when nothing remains).
-    """
-    from ouroboros.owner_pause import fence_closed, read_fence
-    from ouroboros.post_task_checkpoint import late_phase_pause_record, update_late_phase_pause
-    from ouroboros.post_task_synthesis import revoke_late_phase_grant
-    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
-    from supervisor import queue as q
-    from supervisor import workers
-
-    root = pathlib.Path(q.DRIVE_ROOT)
-    try:
-        row = load_task_result(root, task_id, strict=True) or {}
-        fence = read_fence(root, task_id) if row else {}
-    except Exception:
-        return {"ok": False, "error": "pause_record_unreadable"}
-    if row.get("status") not in _TRULY_TERMINAL_STATUSES:
-        return None
-    record = late_phase_pause_record(row)
-    if not record:
-        return _release_late_fence(q, root, task_id, row, fence) if fence_closed(fence) else None
-    with _LATE_RESUMING_LOCK:
-        if task_id in _LATE_RESUMING:
-            return {"ok": False, "error": "resume_already_granted"}
-        _LATE_RESUMING.add(task_id)
-    try:
-        live = record.get("grant") if isinstance(record.get("grant"), dict) else {}
-        if live and not live.get("consumed_at") and not live.get("revoked_at"):
-            # No executor holds it in this process: an orphan of a failed start.
-            revoke_late_phase_grant(root, task_id, reason="orphaned_grant_without_executor")
-        refusal = _late_phase_refusal(q, root, task_id, row, record, fence)
-        if refusal:
-            return refusal
-        grant = {**control_actor(), "grant_id": uuid.uuid4().hex, "granted_at": utc_now_iso(), "single_use": True,
-                 "selected_by": "owner", "authority": "explicit_resume",
-                 "fence_id": str(fence.get("fence_id") or "") if fence_closed(fence) else ""}
-
-        def mint(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            prior = current.get("grant") if isinstance(current.get("grant"), dict) else {}
-            if (current.get("pause_id") != record.get("pause_id") or current.get("stopped_at")
-                    or prior and not prior.get("consumed_at") and not prior.get("revoked_at")):
-                return None
-            return {**current, "grant": grant, "resume_generation": int(current.get("resume_generation") or 0) + 1}
-
-        try:
-            if update_late_phase_pause(root, task_id, mint) is None:
-                return {"ok": False, "error": "selection_authority_changed"}
-        except Exception as exc:
-            return {"ok": False, "error": "grant_not_recorded", "detail": str(exc)[:200]}
-        from ouroboros.agent_task_pipeline import recover_pending_root_post_task_synthesis
-
-        if not recover_pending_root_post_task_synthesis(root, getattr(workers, "REPO_DIR", None),
-                                                        resume_task_id=task_id):
-            revoke_late_phase_grant(root, task_id, reason="late_phase_resume_not_started")
-            return {"ok": False, "error": "selection_authority_changed"}
-    finally:
-        with _LATE_RESUMING_LOCK:
-            _LATE_RESUMING.discard(task_id)
-    with q._queue_lock:
-        latch = q.BUDGET_ROOT_FENCES.get(task_id) or {}
-        # A newer Pause minted over this grant keeps its own latch (the remainder parks again).
-        if latch.get("cause") == "owner_pause" and str(latch.get("fence_id") or "") in {"", grant["fence_id"]}:
-            q.BUDGET_ROOT_FENCES.pop(task_id, None)
-        persisted = q.persist_queue_snapshot(reason="owner_pause_late_resumed")
-    q.append_jsonl(q.DRIVE_ROOT / "logs" / "events.jsonl",
-                   {"ts": utc_now_iso(), "type": "owner_pause_resumed", "task_id": task_id, "root_task_id": task_id,
-                    "fence_id": grant["fence_id"], "grant_id": grant["grant_id"], "late_phase": True})
-    return {"ok": True, "task_id": task_id, "root_task_id": task_id, "late_phase": "resumed",
-            "grant_id": grant["grant_id"], "stage": record.get("stage"), "snapshot_persisted": bool(persisted)}

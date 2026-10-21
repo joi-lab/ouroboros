@@ -833,15 +833,16 @@ def test_payload_instructions_variant_is_payload_only(tmp_path, monkeypatch, acc
     from ouroboros.tools.delegate import _HOST_INSTRUCTIONS, _host_instructions
 
     ordinary = _host_instructions(delegated_run_shape(False))
-    assert "do not touch the host's runtime controls, skills, or memory" in ordinary
+    ban = "do not touch the host's runtime controls or memory, or modify its skills"
+    assert ban in ordinary
     assert "PAYLOAD ASSIGNMENT" not in ordinary
     mutating = _host_instructions(delegated_run_shape(True, access))
-    assert "do not touch the host's runtime controls, skills, or memory" in mutating
+    assert ban in mutating
     payload = _host_instructions(delegated_run_shape(True, access), payload_skill="alpha")
-    assert "runtime controls, skills, or memory" not in payload
-    assert "do not touch the host's runtime controls or memory" in payload
+    assert "modify its skills" not in payload
+    assert "do not touch the host's runtime controls or memory." in payload
     assert "PAYLOAD ASSIGNMENT" in payload and "'alpha'" in payload
-    assert "do not touch the host's runtime controls, skills, or memory" in _HOST_INSTRUCTIONS  # source intact
+    assert ban in _HOST_INSTRUCTIONS  # source intact
 
 
 def test_idempotent_already_applied_branch_runs_the_finalizer(tmp_path, monkeypatch):
@@ -1263,6 +1264,32 @@ def test_child_added_gitattributes_and_crlf_file_transport_raw(tmp_path, monkeyp
     assert "✅ Integrated" in out, out
     assert (skill / "table.csv").read_bytes() == b"a,b\r\n1,2\r\n"
     assert payload_content_hash(skill) == manifest["result_content_hash"]
+    custody._CUSTODY.clear()
+
+
+@pytest.mark.parametrize("note,bucket", [(".self_authored.json", "external"),
+                                         (".ouroboroshub.json", "ouroboroshub"), (".clawhub.json", "clawhub")])
+def test_payload_carrying_its_buckets_install_note_integrates(tmp_path, monkeypatch, note, bucket):
+    """The snapshot copy sits outside data/skills/<bucket>/: the CAS hashes the bucket's
+    per-install note there and in the live folder alike, so the edit still integrates."""
+    from ouroboros.tools.delegate import _capture_terminal_patch
+    from ouroboros.tools.delegate_integration import payload_content_hash
+    from ouroboros.tools.subagent_integration import _integrate_delegated_patch
+
+    ctx = _payload_ctx(tmp_path, monkeypatch)
+    skill = _seed_skill(tmp_path / "data", bucket=bucket)
+    (skill / note).write_text('{"origin": "host"}\n', encoding="utf-8")
+    handle = provision_payload_snapshot(target_root=skill, task_id="t-payload", snapshot_id="snapP")
+    custody._CUSTODY.clear()
+    (pathlib.Path(handle.path) / "notes.txt").write_text("DONE\n", encoding="utf-8")
+    entry = _payload_entry(handle, skill)
+    entry.resource_ref["source"] = bucket
+    capture = _capture_terminal_patch(ctx, entry)
+    assert capture["status"] == "ready_with_changes", capture
+    out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
+    assert "✅ Integrated" in out, out
+    assert (skill / "notes.txt").read_text(encoding="utf-8") == "DONE\n"
+    assert payload_content_hash(skill) == _capture_manifest(capture)["result_content_hash"]
     custody._CUSTODY.clear()
 
 

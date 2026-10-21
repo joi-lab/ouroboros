@@ -98,6 +98,7 @@ def test_source_replacement_keeps_previous_destination(tmp_path, monkeypatch, re
         except OSError:
             pytest.skip("symlinks unavailable")
         source = link
+    monkeypatch.setattr(artifacts, "clone_file", lambda *a: False)  # the streamed path is what this proves
     original_stream = artifacts.stream_artifact_file
     replacement_refusals = []
 
@@ -894,7 +895,6 @@ def test_small_document_keeps_inline_delivery_when_capture_is_unavailable(tmp_pa
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(message_bus, "load_state", lambda: {})
     monkeypatch.setattr(message_bus, "log_chat", lambda *args, **kwargs: None)
-    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda *args: None)
     monkeypatch.setattr(message_bus, "publish_event", lambda kind, payload: host_events.append(payload))
     monkeypatch.setattr(events_chat_delivery, "_bound_project_chat_id", lambda *args: None)
     bridge = message_bus.LocalChatBridge()

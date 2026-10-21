@@ -11,6 +11,7 @@ import {
     ACTION_HURRY,
     ACTION_PAUSE,
     ACTION_RESUME,
+    ACTION_STOP_EARLIER,
     ACTION_STOP_NOW,
     TASK_CONTROL_LABELS,
     TASK_CONTROL_TRIGGER_LABEL,
@@ -27,6 +28,7 @@ import { ownerHurryProjection, summarizeChatLiveEvent, taskSoftStopPending } fro
 const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
 const activity = readFileSync(new URL('../modules/activity.js', import.meta.url), 'utf8');
 const menuSrc = readFileSync(new URL('../modules/task_control_menu.js', import.meta.url), 'utf8');
+const workSrc = readFileSync(new URL('../modules/work_status.js', import.meta.url), 'utf8');
 
 // --- the frozen owner dropdown (Q2/HQ1) ---
 
@@ -38,8 +40,11 @@ test('the dropdown offers exactly the owner-decided actions, in order', () => {
     assert.equal(TASK_CONTROL_LABELS[ACTION_HURRY], 'Hurry up');
     assert.equal(TASK_CONTROL_LABELS[ACTION_PAUSE], 'Pause');
     assert.equal(TASK_CONTROL_LABELS[ACTION_STOP_NOW], 'Stop now');
-    // A paused member offers Resume, never a second Pause; a pending Stop wins.
-    assert.deepEqual(taskControlActions({ budgetPaused: true }), [ACTION_RESUME, ACTION_STOP_NOW]);
+    // A held Continue's earlier attempt has its own Stop.
+    assert.equal(TASK_CONTROL_LABELS[ACTION_STOP_EARLIER], 'Stop earlier attempt');
+    // A paused member never offers a second Pause; Resume only where its work's Resume control asks for it.
+    assert.deepEqual(taskControlActions({ budgetPaused: true }), [ACTION_STOP_NOW]);
+    assert.deepEqual(taskControlActions({ budgetPaused: true, resume: true }), [ACTION_RESUME, ACTION_STOP_NOW]);
     assert.equal(stopPolicyFor(ACTION_PAUSE), '', 'Pause is not a stop');
 });
 
@@ -67,6 +72,25 @@ test('Pause retries an unknown answer with the same id, then a new action gets a
     assert.match(toasts.at(-1)[0], /^Pause refused: cancel_pending/);
     // Both surfaces reach it through the shared menu, resolved from the anchor.
     assert.match(menuSrc, /anchor\.dataset\?\.id \|\| anchor\.closest\?\.\('\[data-task-id\]'\)/);
+});
+
+test("the owner's Pause press declares the owner through the shared client, the same on its retry", async () => {
+    const prior = globalThis.fetch;
+    const posts = [];
+    globalThis.fetch = async (url, init) => {
+        posts.push([url, init.method, JSON.parse(init.body)]);
+        const latch = posts.length === 1;
+        return { ok: true, status: latch ? 202 : 200, json: async () => ({ ok: true, state: 'requested', latch_pending: latch }) };
+    };
+    try {
+        assert.equal(await pauseTaskAction('owner-root', { toast: () => {}, wait: async () => {} }), true);
+    } finally { globalThis.fetch = prior; }
+    assert.deepEqual(posts.map(([url, method]) => [url, method]),
+        [['/api/tasks/owner-root/pause', 'POST'], ['/api/tasks/owner-root/pause', 'POST']]);
+    const [[, , body], [, , retry]] = posts;
+    assert.match(body.request_id, /^pause-/);
+    assert.deepEqual(body, { request_id: body.request_id, actor: 'owner' }, 'the owner declares itself, with no text');
+    assert.deepEqual(retry, body, 'completing the same action repeats the same declared press');
 });
 
 test('Resume retires an unconfirmed Pause id, but a refused Resume leaves it retryable', async () => {
@@ -178,9 +202,11 @@ test('the hurry path never creates a chat bubble in either surface', () => {
 // --- both surfaces share the ONE control module (owner parity) ---
 
 test('Chat and Activity both wire the shared dropdown', () => {
-    // Chat and its room header share the record-aware adapter. Activity still
-    // calls the same lower-level dropdown; the adapter owns its effect wiring.
-    assert.match(chat, /openTaskControls\(/);
+    // Chat cards and the room's Shade open it through work_status.js on their work's controls (a card
+    // no work lists keeps the record-aware adapter). Activity still calls the same lower-level dropdown.
+    assert.match(chat, /openCardControls\(/);
+    assert.match(workSrc, /openTaskControlMenu\(/);
+    assert.match(workSrc, /openTaskControls\(/);
     // Exact adapter effects are exercised in test_room_work_review_browser.py;
     // finding its own function names inside the adapter would prove nothing.
     assert.match(activity, /openTaskControlMenu\(/);
@@ -217,19 +243,18 @@ test('the chat card re-offers the escalation during a pending soft stop', () => 
     // pending menu offers only "Stop now"), while an immediate
     // stop keeps the button disabled until the terminal frame.
     assert.match(chat, /record\.cancelPendingPolicy === 'finalize'/);
-    assert.match(chat, /cancelPending: Boolean\(record\.cancelPendingPolicy\)/);
+    assert.match(workSrc, /const cancelPending = Boolean\(record\?\.cancelPendingPolicy\);/);
 });
 
 // --- budget-paused resume offer (#322) ---
 
-test('a budget-paused member offers Resume and the stop escalation only', () => {
-    assert.deepEqual(
-        taskControlActions({ budgetPaused: true }),
-        [ACTION_RESUME, ACTION_STOP_NOW],
-    );
+test('a budget-paused member offers Resume (where its work asks for it) and the stop escalation only', () => {
+    assert.deepEqual(taskControlActions({ budgetPaused: true, resume: true }), [ACTION_RESUME, ACTION_STOP_NOW]);
+    assert.deepEqual(taskControlActions({ budgetPaused: true }), [ACTION_STOP_NOW],
+        'a paused phase alone offers no Resume (a held Continue is never the owner\'s to resume)');
     // A pending cancel outranks the pause: only the hard escalation remains.
     assert.deepEqual(
-        taskControlActions({ budgetPaused: true, cancelPending: true }),
+        taskControlActions({ budgetPaused: true, cancelPending: true, resume: true }),
         [ACTION_STOP_NOW],
     );
     assert.equal(TASK_CONTROL_LABELS[ACTION_RESUME], 'Resume');
@@ -239,7 +264,8 @@ test('a budget-paused member offers Resume and the stop escalation only', () => 
 
 test('a child row never offers the whole-tree Pause; its other actions stay', () => {
     assert.deepEqual(taskControlActions({ wholeTree: false }), [ACTION_FINALIZE, ACTION_HURRY, ACTION_STOP_NOW]);
-    assert.deepEqual(taskControlActions({ wholeTree: false, budgetPaused: true }), [ACTION_RESUME, ACTION_STOP_NOW]);
+    assert.deepEqual(taskControlActions({ wholeTree: false, budgetPaused: true }), [ACTION_STOP_NOW]);
+    assert.deepEqual(taskControlActions({ wholeTree: false, budgetPaused: true, resume: true }), [ACTION_RESUME, ACTION_STOP_NOW]);
     assert.deepEqual(taskControlActions({ wholeTree: false, cancelPending: true }), [ACTION_STOP_NOW]);
     assert.deepEqual(taskControlActions({ wholeTree: true }), [ACTION_FINALIZE, ACTION_HURRY, ACTION_PAUSE, ACTION_STOP_NOW]);
 });

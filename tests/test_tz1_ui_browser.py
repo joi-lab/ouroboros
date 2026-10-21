@@ -107,7 +107,7 @@ def test_recorded_folder_download_from_real_gateway_in_chat(subscription_ui, tmp
     card = page.locator(f'#chat-messages .chat-live-card[data-task-id="{TASK}"]')
     card.wait_for()
     assert card.locator('[data-live-phase]').inner_text() == "Done"
-    card.locator('[data-live-summary-button]').click()
+    card.locator('[data-live-disclosure]').click()
     page.wait_for_selector(f'#chat-messages .chat-live-card[data-task-id="{TASK}"] [data-result-files]')
     folder = card.locator('[data-result-files] a[href*="?archive=reports"]')
     assert folder.count() == 1 and "reports/" in folder.inner_text()

@@ -119,10 +119,10 @@ def test_unreadable_custody_log_skips_the_sweep(tmp_path, monkeypatch):
     assert report["skipped"] == "custody_log_unreadable" and not report["removed"]
 
 
-def test_startup_custody_sweep_runs_the_state_sweep():
+def test_the_reconcile_pass_runs_the_state_sweep():
     import inspect
 
     import ouroboros.server_maintenance as sm
 
-    assert "sweep_settled_delegate_state" in inspect.getsource(sm._run_deferred_startup_prunes)
+    assert "sweep_settled_delegate_state" in inspect.getsource(sm._run_reconcile_prunes)
     assert "sweep_settled_delegate_state" not in inspect.getsource(sm._startup_custody_sweep)

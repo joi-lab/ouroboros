@@ -451,6 +451,19 @@ def _pins_match(plan: dict, base_sha: str, target_sha: str) -> bool:
 
 
 def _quiesce_repo_writers(reason: str) -> list[str]:
+    """Stop the repository writers with admission paused: a launch or Resume already writing its marks
+    hands over to the still-running pool first, and nothing new starts until the pool is stopped
+    (``workspace_preparation.pause_admission``); admission reopens for whatever follows."""
+    from supervisor.workspace_preparation import pause_admission, resume_admission
+
+    pause_admission()
+    try:
+        return _stop_repo_writers(reason)
+    finally:
+        resume_admission()
+
+
+def _stop_repo_writers(reason: str) -> list[str]:
     """Close new writers, drain in-process turns, then prove the pool stopped."""
     from supervisor.git_ops import DRIVE_ROOT
     from supervisor.workers import (

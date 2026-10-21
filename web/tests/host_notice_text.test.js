@@ -233,6 +233,9 @@ test('command, plan and paused-evolution producer variants are covered', () => {
         ['server.py', 'command_reply', '🧠 Background consciousness: ', 'off'],
         ['ouroboros/tools/plan_ask.py', 'host_progress', '📐 Plan: ', 'ask a1 on revision 1 — sending to 2 participants.'],
         ['supervisor/evolution_lifecycle.py', 'evolution_notice', '🧬⚠️ Evolution paused: ', '3 consecutive failures.'],
+        // An OpenAI attempt and the stream's own search event stay two rows, each without its mark.
+        ['ouroboros/tools/search.py', 'host_progress', '🔍 Trying ', 'OpenAI web search: q'],
+        ['ouroboros/tools/search.py', 'host_progress', '🔍 Searching: ', 'q'],
     ];
     for (const [path, type, prefix, suffix] of cases) {
         assert.ok(readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8').includes(prefix));

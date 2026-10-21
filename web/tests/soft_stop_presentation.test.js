@@ -88,12 +88,12 @@ test('logs surface shows the same factual headline and marker instead of the raw
     assert.ok(!view.meta.includes('owner_requested_finalization'));
 });
 
-test('an expiry kill still reads Cancelled — honesty outranks the soft-stop label', () => {
+test('an expiry kill still reads Stopped — honesty outranks the soft-stop label', () => {
     // When the grace ran out and custody hard-killed, lifecycle=cancelled must
     // win over the soft-stop presentation (the summary was NOT delivered).
     const expired = { ...softStop, status: 'cancelled' };
     assert.equal(taskOutcomeSeverity(expired), 'cancelled');
-    assert.equal(summarizeChatLiveEvent(expired).headline, 'Cancelled');
+    assert.equal(summarizeChatLiveEvent(expired).headline, 'Stopped');
 });
 
 test('the chat terminal seam shares one note with the owner marker in its body', () => {

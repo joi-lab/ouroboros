@@ -408,6 +408,12 @@ def _classify(exc: Exception) -> Tuple[str, str]:
         return "budget_exhausted", safe
     if isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.lower():
         return "timeout", safe
+    from ouroboros.llm_attempt import PhysicalDispatchInterrupted
+    from ouroboros.model_wait import ModelWaitInterrupted
+
+    if isinstance(exc, (PhysicalDispatchInterrupted, ModelWaitInterrupted)) and exc.control_reason == "deadline":
+        # Only the refused send is unsent; an earlier one keeps its attempt id on the record.
+        return "timeout", _safe_text(f"the update-letter ceiling ended before a further send ({type(exc).__name__})")
     try:
         from ouroboros.loop_llm_call import classify_llm_exception
 
@@ -510,8 +516,9 @@ def write_letter(
                 record.update(error_kind="timeout",
                               error_text="the update-letter ceiling was spent waiting for a model slot")
                 return record
+            # The same calendar ceiling reaches every physical send, the client's recovery too.
             call = dict(drive_root=data_root, model=model, tools=None, reasoning_effort="low",
-                        model_role="light",
+                        model_role="light", caller_deadline_ts=deadline_ts,
                         max_tokens=UPDATE_LETTER_MAX_TOKENS, use_local=use_local)
             low_retries = 0
 

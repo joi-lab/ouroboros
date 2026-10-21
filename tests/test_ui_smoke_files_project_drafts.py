@@ -507,6 +507,9 @@ def test_project_sources_keep_selected_target(direct_server_with_data, engine): 
             page.evaluate("""() => window.projectModule.openProjectRowMenu({id:'example', name:'Scoped project'}, {
                 anchorEl: document.querySelector('#nav-projects-add'), apiClient: {},
             })""")
+            # The menu opens on its first item, Pin since the sidebar pins (#2006); the keyboard goes on to Rename.
+            expect(page.get_by_role("menuitem", name="Pin", exact=True)).to_be_focused()
+            page.keyboard.press("ArrowDown")
             expect(page.get_by_role("menuitem", name="Rename…", exact=True)).to_be_focused()
             page.keyboard.press("Enter")
             expect(page.locator("[data-confirm-input]")).to_be_focused()

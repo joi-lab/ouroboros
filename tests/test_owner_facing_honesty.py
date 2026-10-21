@@ -1,8 +1,9 @@
 """v6.70.0 honesty & reliability tests: full owner-facing review rationale,
-truncation floor, acceptance format repair, self-locating tool errors,
-scout skill_payload access, secret-redacting logs, stray-process invariant
-(startup + TTL-cached live), project-thread pointers, tool-trace arg width,
-ground-truth probe guidance, and the decision-turn outcome contract."""
+truncation floor, self-locating tool errors, scout skill_payload access,
+secret-redacting logs, stray-process invariant (startup + TTL-cached live),
+project-thread pointers, tool-trace arg width, ground-truth probe guidance,
+and the decision-turn outcome contract. (The acceptance panel's format-repair
+resend and owner cause line left with the acceptance machine.)"""
 
 from __future__ import annotations
 
@@ -88,52 +89,6 @@ def test_task_contract_preserves_complete_authority_fields():
     assert contract["delegation_budget"]["intent_note"] == intent
     assert contract["acceptance_claims"][0]["claim"] == claim
     assert contract["acceptance_claims"][0]["support"] == support
-
-
-# ---------------------------------------------------------------------------
-# 2.6 Acceptance format repair uses the second permitted physical send
-# ---------------------------------------------------------------------------
-
-def test_acceptance_malformed_response_gets_one_repair_resend(tmp_path):
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
-
-    calls = {"n": 0}
-
-    class _FlakyJson:
-        def chat(self, **kwargs):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return {"content": "sorry, here are my thoughts in prose (no JSON)"}, {}
-            return {"content": '{"verdict": "PASS", "findings": [], "summary": "ok"}'}, {}
-
-    result = run_review_request(
-        ReviewRequest(surface="task_acceptance", goal="g", task_id="t",
-                      policy={"min_successful_slots": 1}),
-        slots=[ReviewSlot(slot_id="s1", model="m")],
-        drive_root=tmp_path, llm=_FlakyJson(),
-    )
-    assert calls["n"] == 2  # extraction/format repair used the second send
-    assert result.aggregate_signal == "PASS"
-
-
-def test_acceptance_repair_does_not_third_send(tmp_path):
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
-
-    calls = {"n": 0}
-
-    class _AlwaysProse:
-        def chat(self, **kwargs):
-            calls["n"] += 1
-            return {"content": "still prose"}, {}
-
-    result = run_review_request(
-        ReviewRequest(surface="task_acceptance", goal="g", task_id="t",
-                      policy={"min_successful_slots": 1}),
-        slots=[ReviewSlot(slot_id="s1", model="m")],
-        drive_root=tmp_path, llm=_AlwaysProse(),
-    )
-    assert calls["n"] == 2  # hard two-physical-send rail
-    assert result.aggregate_signal == "DEGRADED"
 
 
 # ---------------------------------------------------------------------------
@@ -358,115 +313,6 @@ def test_response_ref_projection_never_leaks_host_paths(tmp_path):
     assert all("/" not in str(v) for v in projected.values())
 
 
-def test_repair_resend_blocked_by_rail_keeps_first_answer(tmp_path):
-    """When the physical-attempt rail blocks the format-repair resend, the
-    malformed FIRST answer must survive as forensics (not a bare error actor)."""
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
-    from ouroboros.usage_accounting import PhysicalAttemptLimitExceeded
-
-    calls = {"n": 0}
-
-    class _RailBlocked:
-        def chat(self, **kwargs):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return {"content": "prose answer, no JSON — but substantive"}, {}
-            raise PhysicalAttemptLimitExceeded("physical attempt limit reached")
-
-    result = run_review_request(
-        ReviewRequest(surface="task_acceptance", goal="g", task_id="t",
-                      policy={"min_successful_slots": 1}),
-        slots=[ReviewSlot(slot_id="s1", model="m")],
-        drive_root=tmp_path, llm=_RailBlocked(),
-    )
-    actor = result.actors[0]
-    status = actor["status"] if isinstance(actor, dict) else actor.status
-    raw = (actor.get("raw_text") if isinstance(actor, dict) else actor.raw_text) or ""
-    assert status != "error"
-    assert "prose answer" in raw
-
-
-def test_repair_resend_empty_keeps_first_answer(tmp_path):
-    """An EMPTY repair resend keeps the substantive malformed first answer
-    instead of landing an empty actor (forensics symmetry with the
-    exception paths)."""
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
-
-    calls = {"n": 0}
-
-    class _ResendEmpty:
-        def chat(self, **kwargs):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return {"content": "prose answer, no JSON — but substantive"}, {}
-            return {"content": ""}, {}
-
-    result = run_review_request(
-        ReviewRequest(surface="task_acceptance", goal="g", task_id="t",
-                      policy={"min_successful_slots": 1}),
-        slots=[ReviewSlot(slot_id="s1", model="m")],
-        drive_root=tmp_path, llm=_ResendEmpty(),
-    )
-    actor = result.actors[0]
-    status = actor["status"] if isinstance(actor, dict) else actor.status
-    raw = (actor.get("raw_text") if isinstance(actor, dict) else actor.raw_text) or ""
-    assert calls["n"] == 2
-    assert status != "empty"
-    assert "prose answer" in raw
-
-
-def test_repair_first_attempt_is_persisted(tmp_path):
-    """P1 forensics: a SUCCESSFUL repair must not make the malformed first
-    answer unreconstructible — attempt 1 gets its own persisted call record."""
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
-
-    calls = {"n": 0}
-
-    class _FlakyJson:
-        def chat(self, **kwargs):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return {"content": "sorry, prose thoughts (no JSON)"}, {}
-            return {"content": '{"verdict": "PASS", "findings": [], "summary": "ok"}'}, {}
-
-    run_review_request(
-        ReviewRequest(surface="task_acceptance", goal="g", task_id="t",
-                      policy={"min_successful_slots": 1}),
-        slots=[ReviewSlot(slot_id="s1", model="m")],
-        drive_root=tmp_path, llm=_FlakyJson(),
-    )
-    attempt1 = list(tmp_path.rglob("*attempt1_response*"))
-    assert attempt1, "first malformed attempt must be persisted as its own call record"
-
-
-def test_repair_resend_transport_failure_keeps_first_answer(tmp_path):
-    """Symmetric forensics: a TRANSPORT failure on the repair resend also falls
-    back to the preserved first malformed answer, not an error actor."""
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
-
-    calls = {"n": 0}
-
-    class _ResendDies:
-        def chat(self, **kwargs):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return {"content": "prose answer, no JSON — but substantive"}, {}
-            raise RuntimeError("upstream 500")
-
-    result = run_review_request(
-        ReviewRequest(surface="task_acceptance", goal="g", task_id="t",
-                      policy={"min_successful_slots": 1}),
-        slots=[ReviewSlot(slot_id="s1", model="m")],
-        drive_root=tmp_path, llm=_ResendDies(),
-    )
-    actor = result.actors[0]
-    status = actor["status"] if isinstance(actor, dict) else actor.status
-    raw = (actor.get("raw_text") if isinstance(actor, dict) else actor.raw_text) or ""
-    assert calls["n"] == 2
-    assert status != "error"
-    assert "prose answer" in raw
-
-
 def test_tool_trace_arg_width_is_200():
     from ouroboros.agent_task_pipeline import build_trace_summary
 
@@ -502,20 +348,6 @@ def test_start_task_description_carries_ground_truth_probe():
 
     assert "ground-truth its existence with one cheap probe" in _START_TASK_DESCRIPTION
     assert "memory of past work is not evidence" in _START_TASK_DESCRIPTION
-
-
-def test_degraded_owner_line_bounds_each_reason():
-    from types import SimpleNamespace
-
-    from ouroboros.loop_acceptance_review import _slot_cause_clause
-
-    raw = "r" * 500
-    clause = _slot_cause_clause(SimpleNamespace(degraded_reasons=[raw] * 5))
-    assert clause.startswith(" Causes: ")
-    assert raw not in clause
-    assert clause.count("OMISSION NOTE") == 4
-    assert "(+1 more in the task result)" in clause
-    assert _slot_cause_clause(SimpleNamespace(degraded_reasons=[])) == ""
 
 
 def test_redaction_filter_ssot_is_observability():

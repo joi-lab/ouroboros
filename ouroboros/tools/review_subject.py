@@ -658,8 +658,10 @@ SUBJECT_KINDS = (SUBJECT_KIND_INDEX, SUBJECT_KIND_WORKTREE, SUBJECT_KIND_RANGE)
 ROOT_KIND_SYSTEM, ROOT_KIND_WORKSPACE = "system_repo", "active_workspace"
 ROOT_KINDS = (ROOT_KIND_SYSTEM, ROOT_KIND_WORKSPACE)
 # Isolated checkouts live under the install's data root (never a foreign repo,
-# never the process temp dir): ``state/review_checkouts/<token>/repo``.
+# never the process temp dir): ``state/review_checkouts/<token>/repo``, beside it the marker
+# naming the task whose round it serves (``review_checking_prune`` retires what no review reads).
 CHECKOUT_SUBDIR = "review_checkouts"
+CHECKOUT_MARKER = "checkout.json"
 _BINARY_PATCH_FLAGS = ("--binary", "--no-ext-diff", "--no-textconv")
 
 
@@ -909,7 +911,14 @@ def isolated_checkout(ctx: Any, spec: ReviewSubjectSpec, *,
     may still read is kept for reconciliation, and the caller records the fact.
     An unreadable custody answer is disclosed as unknown and keeps the checkout, and
     so does a wave that fails while reading a checkout an earlier wave retained:
-    its custody was never established, so the earlier owner's claim stands."""
+    its custody was never established, so the earlier owner's claim stands. A kept
+    or crash-left checkout carries ``checkout.json`` (its task), by which the custody
+    pass retires it after observing released custody (``review_checking_prune``).
+
+    Reuse and retirement share no per-token lock. A rejoin beginning after the
+    retirement custody check can lose a checkout it just reused; published custody
+    guards and rebuilding after completed retirement do not close this race.
+    """
     from ouroboros.tool_access_paths import canonical_data_root
 
     spec = _normalized_spec(ctx, spec)
@@ -922,7 +931,8 @@ def isolated_checkout(ctx: Any, spec: ReviewSubjectSpec, *,
     try:
         reused = _retained_checkout_at(checkout, frozen.tree_sha)
         if not reused:
-            _materialize_checkout(spec.root, checkout_root, checkout, frozen)
+            _materialize_checkout(spec.root, checkout_root, checkout, frozen,
+                                  task_id=str(getattr(ctx, "task_id", "") or ""))
         yield frozen
     except BaseException:
         failed = True
@@ -976,11 +986,18 @@ def _retained_checkout_at(checkout: pathlib.Path, tree_sha: str) -> bool:
 
 
 def _materialize_checkout(root: str, checkout_root: pathlib.Path, checkout: pathlib.Path,
-                          frozen: FrozenSubject) -> None:
+                          frozen: FrozenSubject, *, task_id: str = "") -> None:
+    from ouroboros.utils import atomic_write_json, utc_now_iso
+
     if checkout_root.exists():  # stale content under the round's name: replaced, never read
         _git_bytes(root, ["worktree", "remove", "--force", str(checkout)])
         shutil.rmtree(checkout_root, ignore_errors=True)
     checkout_root.mkdir(parents=True, exist_ok=True)
+    try:  # first, so a crash below still leaves the owner a later retirement needs; never the review's failure
+        atomic_write_json(checkout_root / CHECKOUT_MARKER,
+                          {"task_id": str(task_id or ""), "created_at": utc_now_iso(), "schema_version": 1})
+    except OSError:
+        log.warning("review checkout marker not written in %s", checkout_root, exc_info=True)
     rc, _raw, err = _git_bytes(root, ["worktree", "add", "--detach", str(checkout), frozen.parent_sha])
     if rc != 0:
         raise StagedDiffUnavailable(f"isolated checkout could not be created: {err or 'no detail'}")

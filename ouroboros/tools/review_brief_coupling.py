@@ -259,8 +259,9 @@ def _store_review_source(
     existing actor-readable artifact store — the store a native episode's
     ``read_file(root="artifact_store", …)`` resolves under its data root. A
     delegated harness has no artifact store, only the project, so its brief
-    additionally materializes the byte-exact copy inside the review's already
-    git-ignored ``.review-drive`` view. A store the host cannot write is not a
+    additionally materializes the byte-exact copy inside the review's
+    git-ignored ``.review-drive`` view (locally excluded in an external project).
+    A store the host cannot write is not a
     refusal: the caller keeps the inline diff or the unavailable-preimage
     diagnostic, with the reason stated in either case.
     """
@@ -283,6 +284,31 @@ def _store_review_source(
 
         view = materialize_commit_review_session_view(
             {"source_ref": ref, "task_id": task_id, "data_root": root}, repo_dir)
+        if view.get("session_source_status") != "ready" and (repo_dir / ".git").exists():
+            # External projects need not carry Ouroboros's .gitignore. Keep the
+            # generated input out of their candidate without editing tracked files.
+            from ouroboros.utils import run_cmd
+
+            try:
+                exclude = repo_dir / run_cmd(["git", "rev-parse", "--git-path", "info/exclude"], cwd=repo_dir).strip()
+                exclude.parent.mkdir(parents=True, exist_ok=True)
+                with exclude.open("a", encoding="utf-8") as stream:
+                    stream.write("\n/.review-drive/\n")
+                view = materialize_commit_review_session_view(
+                    {"source_ref": ref, "task_id": task_id, "data_root": root}, repo_dir)
+            except (OSError, RuntimeError) as exc:
+                return {"error": f"{type(exc).__name__}: {exc}"}
+        if view.get("session_source_status") != "ready" and not (repo_dir / ".git").exists():
+            # Project-scoped review also supports ordinary non-Git workspaces;
+            # no Git ignore check is meaningful there.
+            from ouroboros.utils import write_bytes_atomic
+
+            relative = pathlib.Path(".review-drive") / task_id / (ref["sha256"] + ".txt")
+            try:
+                write_bytes_atomic(repo_dir / relative, raw)
+                view.update(session_source_status="ready", session_relative_path=relative.as_posix())
+            except OSError as exc:
+                return {"error": f"{type(exc).__name__}: {exc}"}
         if view.get("session_source_status") != "ready":
             return {"error": str(view.get("session_source_error") or "session_view_unavailable")}
         source["session_relative_path"] = view["session_relative_path"]
@@ -320,6 +346,18 @@ def _paged_diff_pointer(brief: BriefInputs, body: str, source: Dict[str, Any]) -
         "commit is in it. Read it before you judge the change, and read the touched "
         "files themselves for the context around it."
     )
+
+
+def paged_review_text(text: str, source: dict, *, label: str, delegated: bool) -> str:
+    """Disclose an exact, readable source in place of an oversized inline part."""
+    path = source.get("session_relative_path") if delegated else source["path"]
+    reader = (f"Read project-relative file `{path}` with your file tools" if delegated else
+              f'Read with read_file(root="artifact_store", path="{path}")')
+    return (f"The complete {label} is not inlined because of the initial delivery size. "
+            f"Nothing was truncated: {len(text)} characters, sha256 `{source['sha256']}`.\n"
+            f"{reader}, in ranges (start_line/max_lines or start_char for long lines), "
+            "until you have read the complete source. It contains the review assignment and "
+            "evidence; follow its instructions and output contract before judging.\n")
 
 
 # The managed subject keeps its authority wording on both deliveries: a reviewer
@@ -636,9 +674,26 @@ def build_retrieving_brief(
                 delivery.update(diff_paging="unavailable",
                                 diff_paging_reason=str(source.get("error") or "no_source_root"))
     task_text, part1, part2 = _assemble(diff_slot)
-    if delivery.get("diff_delivery") == "paged":
-        delivery["first_send_chars"] = _first_send_chars(
-            repo_dir, brief, task_text, required_ref if required_rows is not None else None)
+    measured = _first_send_chars(repo_dir, brief, task_text, required_ref if required_rows is not None else None)
+    from ouroboros.review_native_episode import native_landing_at
+
+    ceiling = SESSION_INLINE_DIFF_CEILING_CHARS if brief.delegated else native_landing_at(bound)
+    if measured >= ceiling:
+        # History, manifests and task evidence can exceed the layout even after
+        # the diff was paged. Keep the complete assembled brief as another source.
+        source = _store_review_source(repo_dir, brief, task_text.encode("utf-8"), "review-complete-brief")
+        if source.get("path"):
+            required_rows = [{**row, "coverage_basis": "candidate_blob"}
+                             if row.get("coverage_basis") == "delivered_inline" else row
+                             for row in (required_rows or [])]
+            required_rows = [*(required_rows or []), {**source["required_row"], "disposition": "review_subject"}]
+            required_ref = required_sources_ref(required_rows, staged_tree_sha=tree_sha)
+            task_text = paged_review_text(task_text, source, label="review brief", delegated=brief.delegated) + answer_format
+            delivery.update(brief_delivery="paged", brief_source=source)
+            measured = _first_send_chars(repo_dir, brief, task_text, required_ref)
+        else:
+            delivery.update(brief_paging="unavailable", brief_paging_reason=source.get("error") or "no_source_root")
+    delivery["first_send_chars"] = measured
 
     manifest: Dict[str, Any] = {
         "delivery": AGENTIC_RETRIEVAL_DELIVERY,
@@ -662,7 +717,7 @@ def build_retrieving_brief(
         "governance_tokens_estimate": governance.tokens_estimate,
         "preimage_sources": preimage_sources,
         "native_data_root": (str(brief.source_root or "") if preimage_sources
-                             or delivery.get("diff_delivery") == "paged" else ""),
+                             or delivery.get("diff_delivery") == "paged" or delivery.get("brief_delivery") == "paged" else ""),
         "first_send_bound": bound,
         "brief_chars": len(task_text),
         "sha": {"brief": hashlib.sha256(task_text.encode("utf-8")).hexdigest(),

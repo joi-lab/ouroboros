@@ -326,7 +326,7 @@ def dialogue_text(entry: Mapping[str, Any]) -> str:
     message = _mapping(transport.get("message"))
     if entry.get("type") == "presence_delivery" and message:
         text += "\n[Delivery details: " + json.dumps(dict(message), ensure_ascii=False, sort_keys=True) + "]"
-    evidence = entry.get("late_evidence")
+    evidence = entry.get("late_evidence")  # an old task-acceptance late-settlement row; nothing writes one now
     if entry.get("type") == "acceptance_late_settlement" and isinstance(evidence, Mapping):
         text += "\n[Late review evidence: " + json.dumps(dict(evidence), ensure_ascii=False, sort_keys=True) + "]"
     source = entry.get("context_source_ref")
@@ -498,6 +498,8 @@ def render_row_text(row: Mapping[str, Any]) -> str:
         return _quiz_text(dict(row))
     if row.get("type") == "quiz" and isinstance(quiz, dict):
         return _question_text(row, quiz)
+    if row.get("type") == "card" and isinstance(row.get("card"), Mapping):  # its id lets a later turn replace it
+        return f"[card {_text(row['card'].get('card_id'))}] " + dialogue_text(row)
     if row.get("type") == "task_summary" and not _text(row.get("text")):
         return _host_facts_text(row)
     return dialogue_text(row)

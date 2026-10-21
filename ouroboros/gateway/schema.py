@@ -206,7 +206,7 @@ def validate_ingress(payload: Any, typed_dict: Any) -> List[str]:
 
 # Body words of ``endpoint_index.Shape``: anything else names a contract TypedDict (JSON).
 _BODY_MEDIA = {
-    "json": "application/json", "html": "text/html", "sse": "text/event-stream",
+    "json": "application/json", "html": "text/html", "text": "text/plain", "sse": "text/event-stream",
     "file": "application/octet-stream", "zip": "application/zip", "js": "application/javascript",
     "empty": "", "any": "*/*", "multipart": "multipart/form-data",
     "form": "application/x-www-form-urlencoded",
@@ -215,7 +215,8 @@ CONTRACT_MODULES = (
     "ouroboros.gateway.contracts", "ouroboros.gateway.client_contracts",
     "ouroboros.gateway.management_contracts", "ouroboros.gateway.history_contracts",
     "ouroboros.gateway.ui_i18n_contracts", "ouroboros.gateway.mcp_import_contracts",
-    "ouroboros.gateway.model_route_contracts",
+    "ouroboros.gateway.model_route_contracts", "ouroboros.gateway.card_contracts",
+    "ouroboros.gateway.skill_source_contracts",
 )
 _CONTRACT_CACHE: Dict[str, Any] = {}
 

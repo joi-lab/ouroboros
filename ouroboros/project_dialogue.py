@@ -18,11 +18,11 @@ import pathlib
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from ouroboros.acceptance_preparation import incident_cause_clauses
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 from ouroboros.review_records import recorded_author_stop
 from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_SALVAGE
-from ouroboros.utils import append_jsonl, iter_jsonl_objects, jsonl_append_lock_path, replace_atomic, strip_markdown, utc_now_iso
+from ouroboros import dialogue_store
+from ouroboros.utils import iter_jsonl_objects, jsonl_append_lock_path, replace_atomic, strip_markdown, utc_now_iso
 
 _ANNOTATIONS_NAME = "chat_annotations.jsonl"
 # Receipt id for a routing act that belongs to NO owner message — the agent's
@@ -44,7 +44,6 @@ AGENT_RECEIPT_ID_PREFIX = "agent-steer:"
 # rewrite the whole of it on every append.
 _RETAINED_AGENT_RECEIPTS = 64
 _COMPACT_AT_BYTES = 800_000
-_RETAINED_ARCHIVES = 3
 log = logging.getLogger(__name__)
 
 
@@ -182,28 +181,12 @@ def project_question_pointer(row: Dict[str, Any], block: Any, project: Any,
     return pointer
 
 
-def _chat_paths(drive_root: Any) -> List[pathlib.Path]:
-    root = pathlib.Path(drive_root)
-    archives = sorted(
-        (root / "archive").glob("chat_*.jsonl"),
-        key=lambda path: path.name,
-        reverse=True,
-    )[:_RETAINED_ARCHIVES]
-    return [*reversed(archives), root / "logs" / "chat.jsonl"]
-
-
 def _text_sha256(value: Any) -> str:
     normalized = " ".join(str(value or "").split())
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def build_owner_message_ref(
-    *,
-    chat_id: int,
-    client_message_id: str,
-    ts: str,
-    text: str,
-) -> Dict[str, Any]:
+def build_owner_message_ref(*, chat_id: int, client_message_id: str, ts: str, text: str) -> Dict[str, Any]:
     """The canonical owner-row identity, built AT INGRESS from host-known facts.
 
     Identity is captured where the host writes the canonical row and passed by
@@ -234,12 +217,14 @@ def owner_message_ref_is_valid(ref: Any) -> bool:
     )
 
 
-def source_refs_for_project(drive_root: Any, project_chat_id: int) -> List[Dict[str, Any]]:
+def source_refs_for_project(drive_root: Any, project_chat_id: int, *, bindings=None) -> List[Dict[str, Any]]:
     """Canonical owner-row references held by bindings for one Project lens."""
     from ouroboros.projects_registry import project_task_bindings
 
     refs: List[Dict[str, Any]] = []
-    for row in project_task_bindings(drive_root).values():
+    for row in (project_task_bindings(drive_root) if bindings is None else bindings).values():
+        if not isinstance(row, dict):
+            continue  # raw ``bindings`` keep malformed rows; project_task_bindings drops them too
         try:
             same_chat = int(row.get("project_chat_id") or 0) == int(project_chat_id or 0)
         except (TypeError, ValueError):
@@ -301,8 +286,8 @@ def room_membership(chat_id: int, project_chat_ids: set, source_refs: list,
 
     ``rooms`` is the room rule (``projects_registry.RoomResolver``), the same one
     the live bus addresses by, so a task's rows replay in the room its frames went
-    to. ``gateway.history_segments.room_segment_lens`` mirrors the Project
-    admissions below to skip archives; change both together.
+    to. ``gateway.history_paging.room_lens`` addresses the Project admissions
+    below in the dialogue store (its candidate superset); change both together.
 
     Presentation-only hiding and cross-room question pointers belong to the UI
     caller. A room source retains the actual cognitive result as well.
@@ -381,20 +366,28 @@ def matching_project_origin(entry: dict, refs: list) -> str:
 
 
 def resolve_owner_message_source(drive_root: Any, ref: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Stream the exact named owner source across the durable generation chain."""
-    from ouroboros.chat_chain import _ordered_chat_generation_paths
+    """Resolve the owner source by its stored identity, checking its original text hash."""
+    from ouroboros import dialogue_store as ds
 
-    live = pathlib.Path(drive_root) / "logs" / "chat.jsonl"
     ref_key = _source_ref_identity(ref)
     if ref_key is None:
         return None
-    for path in reversed(_ordered_chat_generation_paths(live)):
-        try:
-            for row in iter_jsonl_objects(path):
-                if ref_key in _entry_source_identities(row):
-                    return dict(row)
-        except OSError:
-            continue
+    chat_id, client_id, ts, _digest = ref_key
+    if client_id:
+        candidates = ds.iter_probes(drive_root, "chat", [("client_message_id", client_id)], newest_first=True)
+    elif ts:
+        candidates = ds.rows_by_identity(drive_root, chat_id, ts)
+        if chat_id == 1:  # the legacy owner-source convention for a missing/invalid chat id
+            candidates += ds.rows_by_identity(drive_root, None, ts)
+        candidates = sorted(candidates, key=lambda entry: entry.seq, reverse=True)
+    else:
+        # Pre-identity bindings named only a chat and a text checksum.
+        keys = [("chat_id", chat_id)] + ([("chat_id", None)] if chat_id == 1 else [])
+        candidates = ds.iter_probes(drive_root, "chat", keys, newest_first=True)
+    for entry in candidates:
+        if ref_key in _entry_source_identities(entry.row):
+            return dict(entry.row)
+    ds.require_imported(drive_root, "chat")
     return None
 
 
@@ -426,9 +419,7 @@ def latest_chat_annotations(drive_root: Any) -> Dict[str, Dict[str, Any]]:
     return _latest_annotations(path)
 
 
-def chat_annotation_receipt(
-    drive_root: Any, client_message_id: str, routing_token: str,
-) -> Dict[str, Any]:
+def chat_annotation_receipt(drive_root: Any, client_message_id: str, routing_token: str) -> Dict[str, Any]:
     """The latest annotation written for one routing attempt, read BY TOKEN.
 
     A later act under the same owner message no longer hides an earlier act's
@@ -444,17 +435,22 @@ def chat_annotation_receipt(
 def _compact_annotations_locked(drive_root: Any, path: pathlib.Path) -> None:
     if not path.is_file() or path.stat().st_size < _COMPACT_AT_BYTES:
         return
-    retained_ids = {
-        str(row.get("client_message_id") or "")
-        for chat_path in _chat_paths(drive_root)
-        for row in iter_jsonl_objects(chat_path)
-        if row.get("client_message_id")
-    }
+    from ouroboros import dialogue_store as ds
+
+    # Incomplete history cannot prove an annotation's source is absent. Leave the
+    # sidecar intact until its retained-message decisions can be made truthfully;
+    # over an unreadable line (a gap) no source is proven absent, but the newest
+    # act per message still replaces the older ones.
+    coverage = ds.range_coverage(drive_root, "chat")
+    if not coverage["imported"]:
+        return
     latest = _latest_annotations(path)
     kept_receipts = set(sorted(
         (message_id for message_id in latest if message_id.startswith(AGENT_RECEIPT_ID_PREFIX)),
         key=lambda message_id: str(latest[message_id].get("ts") or ""),
     )[-_RETAINED_AGENT_RECEIPTS:])
+    retained_ids = {message_id for message_id in latest if not message_id.startswith(AGENT_RECEIPT_ID_PREFIX)
+                    and (coverage["gaps"] or ds.rows_by_client_id(drive_root, message_id, limit=1))}
     # Retained per (message, token): an older act's receipt under a message that
     # is still in the chat survives beside the message's newest act.
     rows = [
@@ -640,7 +636,7 @@ ROUTING_REFUSAL_CAUSES: Dict[str, str] = {
     "skill_repair_payload_unreadable": "the skill's files could not be read",
     "skill_repair_admission_unwritable": "the skill repair request could not be recorded",
     "repair_promotion_failed": "the skill repair request could not be started",
-    "task_acceptance_fence": "the task tree is already being accepted",
+    "task_acceptance_fence": "the task tree is closing after its author stopped it",
     "invalid_task_depth": "the task depth was invalid",
     "promotion_persistence_failed": "the task record could not be saved",
     "routing_receipt_persist_failed": "the receipt could not be saved",
@@ -675,12 +671,11 @@ MAIN_NOTICE_TYPE = "main_notice"
 # send handler and room_membership replay read this one set.
 MAIN_PINNED_ROW_TYPES = frozenset({"project_started", "project_handoff", "project_completion_summary", MAIN_NOTICE_TYPE})
 # Rows whose address is the producer's, never their task's room: Main pins, the
-# origin-addressed refusals, the late-acceptance supplement (its retained chat is
-# the send handler's decision) and the Main question pointer. The bus write seam
+# origin-addressed refusals and the Main question pointer. The bus write seam
 # (``message_bus.send_with_budget``) reads this one set; the readers above keep
 # each component's own reading.
 ROOM_FIXED_ROW_TYPES = MAIN_PINNED_ROW_TYPES | ORIGIN_ADDRESSED_NOTICE_TYPES | frozenset({
-    "acceptance_late_settlement", "project_question_pointer", "relay_reply"})
+    "project_question_pointer", "relay_reply"})
 
 # Statuses of an act that LANDED (or is still in flight): no cause sentence.
 _LANDED_ROUTING_STATUSES = frozenset({"scheduled", "delivered", "read", "pending", "dispatch_pending", "accepted"})
@@ -752,7 +747,7 @@ def routing_option_label(option: Any) -> str:
 
 
 OUTCOME_PHASE_HEADLINE = {"working": "Working", "done": "Done", "warn": "Done with warnings",
-                          "error": "Failed", "cancelled": "Cancelled"}
+                          "error": "Failed", "cancelled": "Stopped"}
 
 # One owner sentence per typed cause, for BOTH lifecycle writers and the card.
 # Keyed on the CODE only — never on (status × reason): the status word already
@@ -761,8 +756,8 @@ OUTCOME_PHASE_HEADLINE = {"working": "Working", "done": "Done", "warn": "Done wi
 # code stays typed on the row. web/modules/log_events.js carries the twin;
 # web/tests/fixtures/outcome_phase_parity.json pins both.
 TASK_CAUSE_PHRASES = {
-    # Acceptance-decision reasons. A clean accepted decision renders no clause (clean_pass and
-    # clean_pass_obligations_closed carry no sentence); an accepted decision with a sentence states its cause.
+    # Reasons of a task-acceptance decision stored before the result review. A clean accepted decision renders no
+    # clause (clean_pass, clean_pass_obligations_closed carry no sentence); one with a sentence states its cause.
     "previous_revision_accepted": "The reviewers approved an earlier version of this answer; the current version was not re-reviewed.",
     "admission_close_unconfirmed": "Reviewers approved this answer; the supervisor did not confirm that task admission was closed.",
     "author_stop": "Ouroboros stopped with unfinished work; no review approval was granted.",
@@ -918,12 +913,22 @@ def completion_status_label(result: Dict[str, Any], event: Dict[str, Any]) -> st
     return OUTCOME_PHASE_HEADLINE[outcome_phase(result, event)]
 
 
-def append_canonical_task_summary(drive_root: Any, row: Dict[str, Any]) -> bool:
-    """Append one task-summary row through the existing concurrent JSONL owner."""
+def append_canonical_task_summary(drive_root: Any, row: Dict[str, Any], *, retained: bool = False) -> bool:
+    """Append one task-summary row (the one chat writer seam). A root's projection row answers False
+    on a busy store and its readiness appends it again (content dedup); a ``retained`` row (a child's
+    terminal row, host task facts) has no such owner, so a busy store keeps it in the retry buffer."""
+    from ouroboros._usage_wait import ACQUISITION_SLICE_SEC
+    from ouroboros.store import StoreError, acquisition_budget
+
     if not str(row.get("summary_id") or "").strip():
         return False
-    path = pathlib.Path(drive_root) / "logs" / "chat.jsonl"
-    return append_jsonl(path, dict(row))
+    if retained:
+        return dialogue_store.append_quietly(pathlib.Path(drive_root), "chat", dict(row)) is not None
+    try:
+        with acquisition_budget(ACQUISITION_SLICE_SEC):
+            return dialogue_store.append(pathlib.Path(drive_root), "chat", dict(row), idempotent=True) is not None
+    except (StoreError, OSError, ValueError):
+        return False
 
 
 def canonical_task_summary_receipt(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -946,10 +951,11 @@ def canonical_task_summary_receipt(result: Dict[str, Any]) -> Dict[str, Any]:
 def canonical_task_summary_reached_chat(result: Dict[str, Any], chat_id: Any) -> bool:
     """Did this task's own terminal row already reach THAT chat?
 
-    Every settled task gets a receipt, so "a receipt exists" answers nothing: it
-    is true of every completed, failed and cancelled child alike. The question a
-    second writer actually has is whether the reader it is about to address has
-    already been told, and only the row's own chat answers that. A receipt
+    A settled task whose row landed inline gets a receipt, so "a receipt exists" answers
+    nothing: it is true of every completed, failed and cancelled child alike. A child's row
+    the retry buffer lands later carries no receipt, so a composer may name that child once
+    more. The question a second writer actually has is whether the reader it is about to
+    address has already been told, and only the row's own chat answers that. A receipt
     written before the chat was recorded says nothing either, so it never
     silences anybody.
     """
@@ -990,83 +996,46 @@ def continuation_narrative_is_valid(value: Any, task_id: str) -> bool:
     )
 
 
-def _bounded_chat_tail_rows(
-    path: pathlib.Path, *, max_bytes: int, max_rows: int,
-) -> List[Dict[str, Any]]:
-    """Read only a bounded tail; never enter the unbounded archive resolver."""
-    if not path.is_file():
-        return []
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as handle:
-            start = max(0, size - max(1, int(max_bytes)))
-            handle.seek(start)
-            if start:
-                handle.readline()  # discard the partial first JSONL row
-            rows: List[Dict[str, Any]] = []
-            for raw in handle:
-                if len(rows) >= max(1, int(max_rows)):
-                    break
-                try:
-                    value = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-                if isinstance(value, dict):
-                    rows.append(value)
-            return rows
-    except OSError:
-        return []
-
-
 def resolve_legacy_continuation_narrative(
     drive_root: Any, task_id: str, result_ref: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    """Find one recent authored row by exact task identity, within fixed bounds."""
-    from ouroboros.context_budget import (
-        CONTINUATION_NARRATIVE_LEGACY_GENERATIONS,
-        CONTINUATION_NARRATIVE_LEGACY_MAX_ROWS,
-        CONTINUATION_NARRATIVE_LEGACY_TAIL_BYTES,
-    )
+    """Find the newest authored row by exact task identity in the dialogue store."""
+    from ouroboros import dialogue_store as ds
 
     tid = str(task_id or "").strip()
     expected_ref = dict(result_ref) if isinstance(result_ref, dict) else {}
     if not tid or not _narrative_result_ref_is_valid(expected_ref, tid):
         return None
-    paths = _chat_paths(drive_root)
-    paths = paths[-max(1, int(CONTINUATION_NARRATIVE_LEGACY_GENERATIONS)):]
-    for path in reversed(paths):
-        rows = _bounded_chat_tail_rows(
-            path,
-            max_bytes=CONTINUATION_NARRATIVE_LEGACY_TAIL_BYTES,
-            max_rows=CONTINUATION_NARRATIVE_LEGACY_MAX_ROWS,
-        )
-        for row in reversed(rows):
-            if (
-                str(row.get("type") or "") != "task_summary"
-                or str(row.get("summary_kind") or "") != "authored_root_summary"
-                or str(row.get("summary_id") or "") != f"task-narrative:{tid}"
-                or str(row.get("task_id") or "") != tid
-                or not _narrative_result_ref_is_valid(row.get("result_ref"), tid)
-                or row.get("result_ref") != expected_ref
-                or not isinstance(row.get("source_coverage"), dict)
-                or row["source_coverage"].get("task_result") != expected_ref
-                or not str(row.get("text") or "").strip()
-            ):
-                continue
-            return {
-                "text": str(row.get("text") or ""),
-                "task_id": tid,
-                "summary_id": f"task-narrative:{tid}",
-                "summary_kind": "authored_root_summary",
-                "result_ref": dict(expected_ref),
-                "source_coverage": dict(row["source_coverage"]),
-                "source": {
-                    "kind": "chat_jsonl",
-                    "path": str(path),
-                    "summary_id": str(row.get("summary_id") or ""),
-                },
-                "written_at": str(row.get("ts") or ""),
-            }
+    for entry in ds.iter_probes(drive_root, "chat", [("task_id", tid)], newest_first=True):
+        row = entry.row
+        if (
+            str(row.get("type") or "") != "task_summary"
+            or str(row.get("summary_kind") or "") != "authored_root_summary"
+            or str(row.get("summary_id") or "") != f"task-narrative:{tid}"
+            or str(row.get("task_id") or "") != tid
+            or not _narrative_result_ref_is_valid(row.get("result_ref"), tid)
+            or row.get("result_ref") != expected_ref
+            or not isinstance(row.get("source_coverage"), dict)
+            or row["source_coverage"].get("task_result") != expected_ref
+            or not str(row.get("text") or "").strip()
+        ):
+            continue
+        return {
+            "text": str(row.get("text") or ""),
+            "task_id": tid,
+            "summary_id": f"task-narrative:{tid}",
+            "summary_kind": "authored_root_summary",
+            "result_ref": dict(expected_ref),
+            "source_coverage": dict(row["source_coverage"]),
+            "source": {
+                "kind": "dialogue_row",
+                "path": str(ds.path(drive_root)),
+                "history_id": entry.history_id,
+                "summary_id": str(row.get("summary_id") or ""),
+            },
+            "written_at": str(row.get("ts") or ""),
+        }
+    ds.require_imported(drive_root, "chat")
     return None
 
 
@@ -1299,7 +1268,9 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any], *, includ
                                       or (review_cause == "author_finish" and author_closed and review.get("status") != "fail")):
         review_cause = ""
     held = phase == "error" and str(objective.get("source") or "").startswith("plan_review_")
-    if raw_reason == REASON_OWNER_REQUESTED_FINALIZATION:
+    if reason == "foreign_install_root" and (result.get("reason_detail") or event.get("reason_detail")):
+        clause = str(result.get("reason_detail") or event["reason_detail"])
+    elif raw_reason == REASON_OWNER_REQUESTED_FINALIZATION:
         clause = review_cause = ""  # an owner-requested stop carries its own marker
     elif phase == "cancelled" and isinstance(origin, dict) and origin:
         # The recorded cause and the relation the record PROVES (#1061).
@@ -1341,10 +1312,21 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any], *, includ
         warning_clauses.append(TASK_CAUSE_PHRASES["partial_result"])
     line = _join_cause_clauses([clause, *warning_clauses, TASK_CAUSE_PHRASES.get(review_cause, review_cause),
                                 _author_stop_rationale(decision, completion),
-                                *incident_cause_clauses(decision, reason, TASK_CAUSE_PHRASES),
+                                *_incident_cause_clauses(decision, reason),
                                 *_terminal_limitations(result, event, reason, held=held),
                                 TASK_CAUSE_PHRASES.get(custody, custody) if custody else ""])
     return line if not line or line.endswith((".", "!", "?", "…", ")")) else line + "."
+
+
+def _incident_cause_clauses(decision: Dict[str, Any], reason: str) -> List[str]:
+    """An old record's unresolved local evidence-assembly failure states both facts: it and the rail."""
+    from ouroboros.outcomes import REASON_FINAL_MESSAGE
+
+    incident = decision.get("acceptance_incident")
+    if not isinstance(incident, dict) or not incident or str(incident.get("status") or "") == "resolved":
+        return []
+    rail = TASK_CAUSE_PHRASES.get(reason, "") if reason not in {"", REASON_FINAL_MESSAGE} else ""
+    return [TASK_CAUSE_PHRASES["acceptance_preparation_failed"], rail]
 
 
 def _author_stop_rationale(decision: Dict[str, Any], completion: Optional[Dict[str, Any]] = None) -> str:
@@ -1492,25 +1474,22 @@ def project_completion_delivery_outcome(
             return MAIN_MIRROR_INELIGIBLE, False
         # Only the salvage excerpt survives in the TEXT: the model's own answer is
         # never cut into it (it rides whole in the typed key below, or not at all),
-        # while salvaged bytes exist nowhere else. The text's only pointer is the
-        # invitation, so a salvage may never displace it — preserved bytes named
-        # with no way to reach them are worse than the plain invitation.
+        # while salvaged bytes exist nowhere else. The row's door is its Project
+        # reference (the UI builds it from `project_id`), so the text invites nothing:
+        # a sentence promising an action only the capsule performs is a second door.
         excerpt = _completion_excerpt(result, chat_id=1, salvage_only=True)
         delivery = source_delivery or {}
         clause = terminal_delivery_clause(delivery.get("state", ""), delivery.get("preserved_path", ""))
         verdict = _join_cause_clauses([_completion_verdict(result, task_done_event),
                                       f"Source Project: {clause}" if clause else ""])
-        lead = f"{verdict} " if verdict else ""
-        if excerpt:
-            excerpt = f"{excerpt} Open the Project for details."
+        detail = " ".join(part for part in (verdict, excerpt) if part)
         from ouroboros.terminal_time import terminal_time_fact
         from ouroboros.terminal_projection import completion_notice
         from ouroboros.project_completion_facts import completion_facts
         event = {
             "type": "send_message", "chat_id": 1, "task_id": tid,
-            "text": (f"{snapshot['target_label']} · "
-                     f"{completion_status_label(result, task_done_event)}\n"
-                     f"{lead}{excerpt or 'Open the Project for details.'}"),
+            "text": (f"{snapshot['target_label']} · {completion_status_label(result, task_done_event)}"
+                     + (f"\n{detail}" if detail else "")),
             "role": "system", "system_type": "project_completion_summary",
             "delivery_id": f"project-completion:{tid}",
             "progress_meta": {
@@ -1537,9 +1516,7 @@ def enqueue_project_completion_summary(
     result: Dict[str, Any], task_done_event: Dict[str, Any],
 ) -> bool:
     """Whether this call queued a live Main copy; the typed pair also reports durability."""
-    return project_completion_delivery_outcome(
-        drive_root, evt, task_id, task, result, task_done_event,
-    )[1]
+    return project_completion_delivery_outcome(drive_root, evt, task_id, task, result, task_done_event)[1]
 
 
 def announce_project_started(

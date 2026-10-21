@@ -16,6 +16,7 @@ from tests.test_chat_addressing_browser import ToolCallOnlyModel, _OBSERVE_CARDS
 from tests.test_chat_history_recovery_browser import _click_project
 from tests.test_owner_wait_integration import wait_clone as clone_fixture
 from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET
+from tests.ui_console_errors import PageErrors
 from tests.ui_failure_evidence import FailureEvidence
 
 wait_clone = clone_fixture
@@ -225,11 +226,11 @@ def _presentation(page, feed, task_id, answer, case, project, *, managed=False):
         if case == "unfinished_stop":
             assert card.locator(":scope > [data-live-summary-button] [data-live-phase]").inner_text() == "Failed"
             if card.get_attribute("data-expanded") != "1":
-                card.locator(":scope > [data-live-summary-button]").click()
+                card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
             assert _STOP_REASON in card.inner_text()
         if case == "invalid_finish":
             if card.get_attribute("data-expanded") != "1":
-                card.locator(":scope > [data-live-summary-button]").click()
+                card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
             fold = card.locator(':scope > [data-live-timeline] > .chat-live-line.expandable').filter(has_text="1 tool call · 1 error")
             fold.wait_for(state="visible", timeout=30000)
             if fold.get_attribute("data-expanded") != "1":
@@ -303,8 +304,7 @@ def test_native_completion_receipt_keeps_work_and_errors_visible(
             with sync_playwright() as pw:
                 browser = getattr(pw, engine).launch()
                 page = browser.new_page(viewport={"width": width, "height": 900}, has_touch=width < 980)
-                errors = []
-                page.on("pageerror", lambda error: errors.append(str(error)))
+                errors = PageErrors(page, engine)
                 page.add_init_script(_OBSERVE)
                 with FailureEvidence(page, browser, evidence, request.node.nodeid, engine) as capture:
                     feed = _open(page, server, project)
@@ -346,7 +346,7 @@ def test_native_completion_receipt_keeps_work_and_errors_visible(
                         feed = _click_project(page, project)
                     views["reloaded"] = _presentation(page, feed, task_id, answer, case, project)
                     page.screenshot(path=str(evidence / "reloaded.png"), full_page=True, animations="disabled")
-                    assert not errors, errors
+                    assert not errors.unexpected(), errors
                     _write_receipt(evidence / "receipt.json", wait_clone, case=case, surface=surface,
                         engine=engine, width=width, task=task, result=result, task_metrics=metrics,
                         observed_model_calls=len(calls), errors=errors, views=views, delivery=delivery, wire_order=order)
@@ -437,7 +437,7 @@ def test_unfinished_project_parent_preserves_running_child_and_full_output(
                         for card in (parent, child_card):
                             card.wait_for(state="attached", timeout=30000)
                             if card.get_attribute("data-expanded") != "1":
-                                card.locator(":scope > [data-live-summary-button]").click()
+                                card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
                         # The authored result precedes its lifecycle notification;
                         # the latter may repeat an explicitly shortened [RESULT].
                         line = child_card.locator(":scope > [data-live-timeline] > .chat-live-line.expandable").filter(has_text="CHILD_OUTPUT_HEAD").first

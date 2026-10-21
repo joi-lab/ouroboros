@@ -47,6 +47,12 @@ _MOVED_OWNERS = {
     # and the loader re-exports the very same objects for its gateway callers.
     "live_module_sources": extension_registry_state,
     "live_widget_projection": extension_registry_state,
+    # The surface snapshot and the route/WS/companion listings are the same kind
+    # of one-lock read over the registries this leaf owns.
+    "list_companion_names": extension_registry_state,
+    "list_routes": extension_registry_state,
+    "list_ws_handlers": extension_registry_state,
+    "snapshot": extension_registry_state,
     "_EXTENSION_NAME_PREFIX": extension_surface_names,
     "_EXTENSION_NAME_RE": extension_surface_names,
     "_EXTENSION_SHORT_MAX": extension_surface_names,
@@ -90,7 +96,7 @@ _MOVED_OWNERS = {
 
 # The loader keeps the lifecycle it is named for: catalog installation for an
 # out-of-process child, companion spawning, reconcile, load, unload, reload and
-# the read-only snapshots the host and the tool registry consume. (Fix-round-4:
+# the stamped ``get_tool`` read the tool registry consumes. (Fix-round-4:
 # ``_stage_out_of_process_surfaces`` moved to the child-catalog leaf it
 # composes; the loader re-exports it.)
 # Merge with upstream ``23ab428f``: ``_finalize_extension_reconcile`` is the one
@@ -101,12 +107,12 @@ _MOVED_OWNERS = {
 # ``fa397986``, ``live_module_sources`` ``afe1fc4f``) are NOT here: they are
 # one-lock reads over ``_ui_tabs``/``_extensions`` and live in the leaf that
 # owns those registries, re-exported by the facade for their gateway callers.
+# ``snapshot`` and the route/WS/companion listings followed them there.
 _STAYED = (
     "__all__", "_finalize_extension_reconcile", "_publish_out_of_process_registration",
     "_run_unload_callback", "_unload_extension_locked",
-    "ensure_companions_running", "get_tool", "list_companion_names", "list_routes",
-    "list_ws_handlers", "load_extension", "log", "reconcile_extension", "reload_all",
-    "snapshot", "unload_extension",
+    "ensure_companions_running", "get_tool", "load_extension", "log",
+    "reconcile_extension", "reload_all", "unload_extension",
 )
 
 
@@ -173,3 +179,14 @@ def test_the_public_loader_surface_is_unchanged():
     ]
     for name in extension_loader.__all__:
         assert hasattr(extension_loader, name), name
+
+
+def test_companion_projection_preserves_order_and_excludes_nonspawnable_markers(monkeypatch):
+    from types import SimpleNamespace
+
+    # The registry belongs to extension_registry_state; the facade re-export serves the projection.
+    monkeypatch.setattr(extension_registry_state, "_extensions", {
+        "first": SimpleNamespace(companion_names=[None, "", "daemon", "task:hidden", "worker-skip:other"]),
+        "second": SimpleNamespace(companion_names=["other", "daemon"]),
+    })
+    assert extension_loader.list_companion_names() == ["daemon", "other", "daemon"]

@@ -48,6 +48,7 @@ from ouroboros.tools.tool_result import ToolResult, _replace_tool_result
 from ouroboros.subagent_work_order import (  # noqa: F401 - compatibility re-export
     assignment_instructions as _assignment_instructions,
     session_design_navigation,
+    session_host_references,
 )
 from ouroboros.delegate_source_coverage import (
     add_terminal_source_verification,  # noqa: F401  (leaf reads it through _delegate() at call time)
@@ -348,7 +349,7 @@ def _start_argument_refusal(ctx: ToolContext, text: str, selector_root: str, ret
     already behind the nanny (``definitely_unrun`` = the producer's own no-run
     verdict, P2), and the continuation selector shapes one call cannot combine: a
     retry replays an old key byte-identically while a continuation is a NEW
-    intention over a settled run, and a skill-payload selector run keeps its own
+    intention over a finished run, and a skill-payload selector run keeps its own
     target semantics."""
     if not text.strip() and not str(continue_from or "").strip() and not str(retry_of or "").strip():
         return "", _fail("delegate_start", "empty_prompt", "prompt is required")
@@ -370,7 +371,7 @@ def _start_argument_refusal(ctx: ToolContext, text: str, selector_root: str, ret
     token = str(continue_from or "").strip()
     if token and str(retry_of or "").strip():
         return token, _fail("delegate_start", "continuation_selector_conflict",
-                            "continue_from starts a NEW run bound to a settled predecessor; retry_of replays a "
+                            "continue_from starts a NEW run bound to a finished predecessor; retry_of replays a "
                             "pending invocation. Supply one of them.", definitely_unrun=True)
     if token and str(selector_root or "").strip():
         return token, _fail("delegate_start", "continuation_resource_conflict",
@@ -571,7 +572,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             if authority.access == "full":
                 gateway.ensure_full_access(scope_root)
             seconds = bound.seconds
-            instructions += session_design_navigation(ctx, target_root=record_auth["target_root"], source_root=root)
+            instructions += session_host_references(ctx, target_root=record_auth["target_root"], source_root=root)
             request_body = _start_request(ctx, route, authority, scope_root, continuation.prompt or text,
                                           seconds, instructions, execution_root, continuation=continuation.request, ephemeral=ephemeral,
                                           **({"directory_options": directory_options} if directory_options else {}))
@@ -832,7 +833,7 @@ def _retire_orphaned_registration(ctx: ToolContext, gateway: Any, project_id: st
             run.snapshot_id == snapshot_id for run in custody.replay(custody.custody_root(ctx)).values()):
         # The C1 execution snapshot THIS attempt provisioned. Only a definite refusal
         # proves no run can be live against it; an unknown outcome keeps it — the
-        # pending invocation names it durably, and the startup GC reconciles it.
+        # pending invocation names it durably; custody GC reconciles it once the owning task is proven over.
         try:
             from ouroboros.subagent_worktrees import remove_execution_snapshot
 
@@ -1342,7 +1343,7 @@ def get_tools() -> List[ToolEntry]:
                 "subagent_id. A configured session's exact leaf is already started before your first round: "
                 "supervise the startup receipt's run, never duplicate it. Replacement with prompt='' requires "
                 "verified cancellation/terminal settlement or a typed refusal proving no run exists. "
-                "Recover an unknown start with retry_of, without a new selector; continue settled work "
+                "Recover an unknown start with retry_of, without a new selector; continue finished work "
                 "with continue_from (see arguments). This call requests no extra Claudexor review panel; "
                 "new ordinary runs on engine 3.9.8+ default to none. The receipt names engine_version; "
                 "older engines or a recovered historical run may retain earlier review behavior. Engine review, execution, "
@@ -1390,16 +1391,16 @@ def get_tools() -> List[ToolEntry]:
                     "(often 3-5+ minutes). An advancing delegate_wait cursor means progress; the run enforces "
                     "its own cap. Do not cancel progressing work just to hurry it."},
                 "continue_from": {"type": "string", "description":
-                    "Continue a settled run after cap, subscription limit, crash/restart, cancel or input_required. "
+                    "Continue a finished run after cap, subscription limit, crash/restart, cancel or input_required. "
                     "Prefer this when work is worth keeping. It must belong to your task line: yours, your confirmed "
                     "retry predecessor's, or the predecessor's task tree in an owner-created Continue root. "
                     "The engine reuses the session where possible, else briefs a new one with retained evidence; "
                     "some work may need repeating. A writer keeps its undisposed private snapshot as one cumulative "
                     "patch, superseding the old capture. prompt carries only new work/answers/corrections and may "
                     "be empty. For resumable pool_exhausted or a limit with resetsAt, use "
-                    "await_messages(wake_at=resetsAt) before continuing. Must be settled, not already continued "
-                    "(otherwise use the head), with no ambiguous apply and no wider access. Select subagent_id "
-                    "as for a start; configured sessions omit it. Never combine with retry_of."},
+                    "await_messages(wake_at=resetsAt) before continuing. Needs an observed terminal (not settled "
+                    "money), not already continued (otherwise use the head), no ambiguous apply, no wider access. "
+                    "Select subagent_id as for a start; configured sessions omit it. Never combine with retry_of."},
                 "continue_carrier": {"type": "string", "enum": ["auto", "packet"], "description":
                     "With continue_from: auto (default) reuses the session where possible; packet starts a new "
                     "session with retained evidence when the old session has gone astray."},
@@ -1422,10 +1423,11 @@ def get_tools() -> List[ToolEntry]:
                 "same quiet renewal (typed reason daemon_unreachable, told to the owner once per "
                 "outage); while such a read hangs, a finalize_now/hurry control is noticed only "
                 "when it returns, up to ~60 s later rather than on the 3 s beat. "
-                "Terminal settlement, a new interaction, "
+                "An observed terminal, a new interaction, "
                 "fault, addressed owner/task message, a direct-child attention/terminal event, "
                 "cancel/deadline control, recovery judgment, or an explicit one-shot checkpoint "
-                "wakes exactly once. Every wake carries `sleep` (measured over this whole call), "
+                "wakes exactly once. Usable terminal output returns before pending host capture/accounting; "
+                "rereading it is immediate, not a wait for that preparation. Every wake carries `sleep` (measured over this whole call), "
                 "`leaf_live_input` (the route's declared live-input capability, 'unknown' when "
                 "unread) and, once the prompt-cache horizon has passed since your last model "
                 "response, one cache_horizon_note. A run that asks its "

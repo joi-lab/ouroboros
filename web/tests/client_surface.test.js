@@ -10,10 +10,10 @@ function mockWindow({ pywebviewApi = undefined, narrow = false, coarse = false }
         pywebview: pywebviewApi === undefined ? undefined : { api: pywebviewApi },
         innerWidth: 1234,
         innerHeight: 777,
-        matchMedia: (query) => ({
-            matches: query.includes('max-width') ? narrow : coarse,
-        }),
+        matchMedia: () => ({ matches: coarse }),
     };
+    // theme.js paints the shell's layout switch on the root; the snapshot reads that, never a query of its own.
+    globalThis.document = { documentElement: { dataset: { layout: narrow ? 'stack' : 'docked' } } };
 }
 
 if (typeof navigator === 'undefined') {
@@ -65,6 +65,7 @@ test('field helper wraps the snapshot and stays honest on breakage', async () =>
     assert.deepEqual(Object.keys(field), ['client_surface']);
     // A broken environment yields an honest null / empty spread, never a guess.
     globalThis.window = undefined;
+    globalThis.document = undefined;
     assert.equal(clientSurfaceSnapshot(), null);
     assert.deepEqual(clientSurfaceField(), {});
 });

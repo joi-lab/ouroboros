@@ -868,6 +868,27 @@ def test_an_ordinary_idle_exit_retires_in_one_reaper_pass_and_is_journaled(assig
         "worker_id": 1, "pid": 43, "process_birth": "test-birth", "token": probe["token"], "replaced": False}
 
 
+@pytest.mark.parametrize("retained", [0, 2])
+def test_a_retired_idle_worker_journals_the_dialogue_rows_it_still_held(assigning, monkeypatch, retained):
+    import json
+    monkeypatch.setattr(workers, "MAX_WORKERS", 3)
+    workers.RUNNING.clear()
+    assigning.original.busy_task_id = None
+    surplus = affirm_ready(workers.Worker(1, _ReapedOnJoin(43), InputQueue()))
+    workers.WORKERS[1] = surplus
+    with queue._queue_lock:
+        lifecycle.request_worker_quiescence(surplus)
+    probe = surplus.in_q.get_nowait()
+    lifecycle.handle_worker_quiescent({**probe, "worker_id": 1, "pid": 43, "process_birth": surplus.process_birth,
+                                       "retained_rows": retained}, workers)
+    assert lifecycle.retire_quiescent_worker(surplus)
+    monkeypatch.setattr(lifecycle, "kill_worker_tree", lambda pid, **kw: setattr(surplus.proc, "killed", True))
+    lifecycle.reap_idle_worker(queue._reap_queue.get_nowait())
+    rows = [json.loads(line) for line in (assigning.root / "logs" / "supervisor.jsonl").read_text().splitlines()]
+    retired, = [row for row in rows if row["type"] == "worker_retired"]
+    assert retired.get("dialogue_rows_lost") == (retained or None)
+
+
 def test_an_unready_child_reaped_on_join_continues_its_bounded_step_in_one_pass(assigning, monkeypatch):
     slot = workers.Worker(1, _ReapedOnJoin(43), InputQueue(), reaping=True)
     workers.WORKERS[1] = slot

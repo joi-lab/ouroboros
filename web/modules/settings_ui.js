@@ -1,5 +1,4 @@
 import { renderPageHeader, renderSegmentedField, renderTabStrip, bindTabStrip } from './page_header.js';
-import { PAGE_ICONS } from './page_icons.js';
 import { renderAgentAccountsSection, renderAgentsServiceBanner } from './harness_accounts.js';
 import { renderSubagentsSection } from './subagents_settings.js';
 import { languageBlockHtml } from './settings_language.js';
@@ -255,12 +254,9 @@ function secretSettingsSection() {
 export function renderSettingsPage() {
     return `
         ${renderPageHeader({
-            title: 'Settings',
-            icon: PAGE_ICONS.settings,
-            description: 'Configure providers, secrets, models, behavior, source control, and runtime controls.',
+            page: 'settings',
             tabsHtml: `
                 <div class="settings-tabs-bar">
-                    <button type="button" class="settings-mobile-back" data-settings-back hidden>Settings</button>
                     ${renderTabStrip({
                         items: SETTINGS_TABS.map((item) => ({ ...item,
                             tabId: `settings-tab-${item.value}`, panelId: `settings-panel-${item.value}` })),
@@ -747,8 +743,11 @@ export function renderSettingsPage() {
                             finished task. Notifications arrive whether or not this window has focus, and
                             clicking one opens its source where the system supports it. The desktop app hands
                             them to the system's own notifications where the system allows it, and that system
-                            decides their sound; otherwise a browser banner or an alert inside the app. Sound off
-                            asks for them silently. Test asks the system for permission when it has not been asked yet.
+                            controls their sound and volume; otherwise a browser banner or an alert inside the app.
+                            A soft app tone plays by itself only when the desktop app could not hand an alert to the
+                            system and then reports that its notifications and their sound are allowed; it may not
+                            follow Focus / Do Not Disturb. Sound off asks for them silently.
+                            Test asks the system for permission when it has not been asked yet.
                             <br><strong>Per device, not per account:</strong> like the theme above, these choices
                             are stored by this client alone and never sent to the server.
                             Where this system exposes no notifications, or permission is denied, alerts fall back
@@ -780,6 +779,16 @@ export function renderSettingsPage() {
                                 <input type="checkbox" class="ui-checkbox" data-notify-pref="sound">
                                 Sound
                             </label>
+                            <!-- The soft fallback tone's level, stored by this client; moving it plays nothing. -->
+                            <div class="notify-tone-volume">
+                                <label for="notify-tone-volume">App tone volume</label>
+                                <input type="range" id="notify-tone-volume" min="0" max="100" step="1" value="40" data-notify-volume>
+                                <output for="notify-tone-volume" data-notify-volume-value data-i18n-skip>40%</output>
+                                <div class="settings-toolbar">
+                                    <button type="button" class="btn btn-default btn-sm" data-notify-preview>Preview tone</button>
+                                </div>
+                                <div class="settings-inline-note">Controls only the soft app tone, not the system notification volume. Unless this client can report that the system allows its notifications and their sound, only Preview tone uses it.</div>
+                            </div>
                             <label class="local-toggle ui-field ui-field-inline">
                                 <input type="checkbox" class="ui-checkbox" data-notify-pref="show_text">
                                 Show the message text (otherwise only the kind of event)
@@ -908,8 +917,8 @@ export function renderSettingsPage() {
                         </div>
                         <div class="settings-toolbar">
                             <button class="btn btn-primary" id="btn-local-start">Start</button>
-                            <button class="btn btn-primary" id="btn-local-stop">Stop</button>
-                            <button class="btn btn-primary" id="btn-local-test">Test Tool Calling</button>
+                            <button class="btn btn-default" id="btn-local-stop">Stop</button>
+                            <button class="btn btn-default" id="btn-local-test">Test Tool Calling</button>
                         </div>
                         <div id="local-model-status" class="settings-inline-status" role="status" aria-live="polite">Status: Offline</div>
                         <div id="local-model-action-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true"></div>

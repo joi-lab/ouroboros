@@ -1,7 +1,7 @@
 """The health invariants ouroboros.context builds, and where they must appear.
 
 This module owns the cache hit-rate invariant, the remote context overflow it reports,
-the hot-store growth it watches, the rest of the invariant coverage, and the rule that
+the rest of the invariant coverage, and the rule that
 the invariants come first in both the dynamic and the background-consciousness context.
 
 The runtime section, the advisory review status, the memory/consolidation sections and
@@ -17,8 +17,10 @@ import json
 
 import pytest
 
+from ouroboros import dialogue_store
 from ouroboros.context import build_health_invariants, build_runtime_section
 
+from tests import _dialogue as dialogue_test
 from tests._context_shared import _make_health_env
 
 
@@ -331,130 +333,6 @@ class TestAdditionalHealthInvariantCoverage:
         assert "2026-04-14-test" in result
 
 
-def _grow_file(path, size: int) -> None:
-    """Create a file whose st_size is exactly `size` without writing `size` bytes."""
-    import os
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.touch()
-    os.truncate(path, size)
-
-
-def _grow_ledger(path, size: int) -> None:
-    """Grow a synthetic usage ledger WITHOUT triggering tail quarantine.
-
-    build_health_invariants reads the ledger (budget-drift check) BEFORE the
-    hot-store stat. A single torn tail row would be QUARANTINED there — the
-    substrate ftruncates the file — shrinking st_size before the check under
-    test runs. Corruption BEFORE the tail instead raises UsageLedgerCorrupt
-    without mutating the file, degrading the budget check to its established
-    "COST ACCOUNTING UNAVAILABLE" path while st_size stays exactly `size`.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    row = b"not json\n"
-    path.write_bytes(row * (size // len(row)) + b"x" * (size % len(row)))
-
-
-class TestHotStoreGrowthInvariant:
-    def test_progress_growth_warns_above_threshold(self, tmp_path):
-        from ouroboros.context_budget import PROGRESS_LOG_WARN_BYTES
-
-        env = _make_health_env(tmp_path)
-        _grow_file(tmp_path / "logs" / "progress.jsonl", PROGRESS_LOG_WARN_BYTES + 1)
-
-        result = build_health_invariants(env)
-        assert "HOT STORE GROWTH" in result
-        assert "logs/progress.jsonl" in result
-        assert "rotation" in result  # remediation pointer
-
-    def test_exactly_at_threshold_stays_silent(self, tmp_path):
-        from ouroboros.context_budget import PROGRESS_LOG_WARN_BYTES
-
-        env = _make_health_env(tmp_path)
-        _grow_file(tmp_path / "logs" / "progress.jsonl", PROGRESS_LOG_WARN_BYTES)
-
-        result = build_health_invariants(env)
-        assert "HOT STORE GROWTH" not in result
-
-    def test_rotated_log_thresholds_are_regression_tripwires(self, tmp_path):
-        """events/tools/supervisor/task_reflections rotate on the supervisor
-        tick (CPL4-C1..C4); their thresholds fire only when rotation is broken."""
-        from ouroboros.context_budget import (
-            EVENTS_LOG_WARN_BYTES,
-            SUPERVISOR_LOG_WARN_BYTES,
-            TASK_REFLECTIONS_LOG_WARN_BYTES,
-            TOOLS_LOG_WARN_BYTES,
-        )
-
-        env = _make_health_env(tmp_path)
-        _grow_file(tmp_path / "logs" / "events.jsonl", EVENTS_LOG_WARN_BYTES + 1)
-        _grow_file(tmp_path / "logs" / "tools.jsonl", TOOLS_LOG_WARN_BYTES + 1)
-        _grow_file(tmp_path / "logs" / "supervisor.jsonl", SUPERVISOR_LOG_WARN_BYTES + 1)
-        _grow_file(
-            tmp_path / "logs" / "task_reflections.jsonl",
-            TASK_REFLECTIONS_LOG_WARN_BYTES + 1,
-        )
-
-        result = build_health_invariants(env)
-        assert result.count("HOT STORE GROWTH") == 4
-        assert "logs/events.jsonl" in result
-        assert "logs/tools.jsonl" in result
-        assert "logs/supervisor.jsonl" in result
-        assert "logs/task_reflections.jsonl" in result
-        assert "rotation is broken or missing" in result
-
-    def test_events_archive_chain_growth_warns(self, tmp_path):
-        """Custody replay walks the whole events chain; the pre-rotation 100MB
-        replay-degradation signal now watches live + archive segments."""
-        from ouroboros.context_budget import EVENTS_ARCHIVE_SCAN_WARN_BYTES
-
-        env = _make_health_env(tmp_path)
-        segment = tmp_path / "archive" / "events_20260101T000000.jsonl"
-        segment.parent.mkdir(parents=True, exist_ok=True)
-        with segment.open("wb") as fh:  # sparse: size matters, bytes do not
-            fh.seek(EVENTS_ARCHIVE_SCAN_WARN_BYTES)
-            fh.write(b"x")
-
-        result = build_health_invariants(env)
-        assert "HOT STORE GROWTH" in result
-        assert "events chain" in result
-        assert "never deleted" in result
-        assert "Legacy segments retain inline delegated request bodies" in result
-        assert "without shrinking existing history" in result
-        assert segment.stat().st_size == EVENTS_ARCHIVE_SCAN_WARN_BYTES + 1
-
-    def test_isolated_benchmark_sentinel_suppresses_warnings(self, tmp_path):
-        from supervisor.state import ISOLATED_BENCHMARK_SENTINEL
-        from ouroboros.context_budget import PROGRESS_LOG_WARN_BYTES
-
-        env = _make_health_env(tmp_path)
-        _grow_file(tmp_path / "logs" / "progress.jsonl", PROGRESS_LOG_WARN_BYTES + 1)
-        (tmp_path / ISOLATED_BENCHMARK_SENTINEL).write_text("isolated\n", encoding="utf-8")
-
-        result = build_health_invariants(env)
-        assert "HOT STORE GROWTH" not in result
-
-    def test_scheduled_tasks_store_growth_warns_with_receipt_remediation(self, tmp_path):
-        """The one-shot follow-up receipts (B2b W=A) made this whole-document
-        store grow with every fired follow-up; the scheduler re-parses and
-        rewrites it on every tick under the queue lock."""
-        from ouroboros.context_budget import SCHEDULED_TASKS_WARN_BYTES
-
-        env = _make_health_env(tmp_path)
-        _grow_file(tmp_path / "state" / "scheduled_tasks.json", SCHEDULED_TASKS_WARN_BYTES + 1)
-
-        result = build_health_invariants(env)
-        assert "HOT STORE GROWTH" in result
-        assert "state/scheduled_tasks.json" in result
-        assert "receipts" in result  # remediation pointer
-
-    def test_absent_stores_stay_silent(self, tmp_path):
-        env = _make_health_env(tmp_path)
-
-        result = build_health_invariants(env)
-        assert "HOT STORE GROWTH" not in result
-
-
 def test_health_invariants_come_first_in_dynamic_context(tmp_path):
     from ouroboros.context import build_llm_messages
     from ouroboros.memory import Memory
@@ -588,14 +466,12 @@ def test_project_room_keeps_an_older_own_directive_beside_sibling_traffic(tmp_pa
     sibling = create_project(root, "sibling", name="Sibling")
     own_chat, sibling_chat = int(own["chat_id"]), int(sibling["chat_id"])
     decisive = "CLAUDEXOR_ONLY_AND_THREE_LEVEL_NESTING"
-    (root / "archive").mkdir(parents=True, exist_ok=True)
-    (root / "archive" / "chat_20260820T010000.jsonl").write_text(
-        json.dumps({"chat_id": own_chat, "direction": "in", "ts": "2026-08-20T01:00:00+00:00", "text": decisive}) + "\n",
-        encoding="utf-8",
-    )
-    (root / "logs" / "chat.jsonl").write_text("".join(
-        json.dumps({"chat_id": sibling_chat, "direction": "in", "ts": "2026-08-21T00:00:00+00:00",
-                    "text": f"noise-{i}"}) + "\n" for i in range(4500)), encoding="utf-8")
+    # The directive is old history (an archived chain segment); the sibling noise is the newer live chain.
+    dialogue_test.seed(root, archives={"chat_20260820T010000.jsonl": [
+        {"chat_id": own_chat, "direction": "in", "ts": "2026-08-20T01:00:00+00:00", "text": decisive}]},
+        live={"chat": [{"chat_id": sibling_chat, "direction": "in", "ts": "2026-08-21T00:00:00+00:00",
+                        "text": f"noise-{i}"} for i in range(4500)]})
+    dialogue_test.import_all(root)
 
     _a, _b, changing, _cap = blocks(env, memory, {"id": "own-task", "chat_id": own_chat})
     room = section(changing, f"## This room (Project Own [chat_id={own_chat}])")
@@ -622,21 +498,22 @@ def test_project_room_keeps_the_retention_proof_cross_room_directive_once(tmp_pa
     bind_task_to_project(root, "cat-root", "cat-tower", project_chat, origin={"ref": ref, "text": directive})
     source_row = {**ref, "direction": "in", "text": directive}
     follow = {"chat_id": project_chat, "direction": "in", "ts": "2026-08-21T00:01:00Z", "text": "continue"}
-    (root / "logs" / "chat.jsonl").write_text(json.dumps(source_row) + "\n" + json.dumps(follow) + "\n",
-                                              encoding="utf-8")
+    # The chain does not hold the owner's row (an older install never stored it): the binding kept the words.
+    dialogue_store.append(root, "chat", follow)
     label = f"## This room (Project Cat tower [chat_id={project_chat}])"
+    _a, _b, absent, _cap = blocks(env, memory, {"id": "cat-root", "chat_id": project_chat})
+    room = section(absent, label)
+    assert room.count("CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3") == 1  # retention-proof: the binding kept it
+    assert "### Words that started this work (retention-proof)" in room
+
+    origin = root / "memory" / "chronicle"
+    assert origin.is_dir()  # the first capture activated the chronicle
+    # Once the owner's row itself is an open row of this room, it is read there, once, and not under the heading.
+    dialogue_store.append(root, "chat", source_row)
     _a, _b, present, _cap = blocks(env, memory, {"id": "cat-root", "chat_id": project_chat})
     room = section(present, label)
     assert room.count("CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3") == 1  # an open row of this room
     assert "### Words that started this work" not in room
-
-    origin = root / "memory" / "chronicle"
-    assert origin.is_dir()  # the first capture activated the chronicle
-    (root / "logs" / "chat.jsonl").write_text(json.dumps(follow) + "\n", encoding="utf-8")
-    _a, _b, later, _cap = blocks(env, memory, {"id": "cat-root", "chat_id": project_chat})
-    room = section(later, label)
-    assert room.count("CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3") == 1  # retention-proof: the binding kept it
-    assert "### Words that started this work (retention-proof)" in room
 
 
 def test_chat_history_surfaces_malformed_gap_even_when_search_matches_nothing(tmp_path):
@@ -658,12 +535,8 @@ def test_chat_history_surfaces_malformed_gap_even_when_search_matches_nothing(tm
 def test_archive_only_chat_chain_is_complete_while_live_file_is_absent(tmp_path):
     from ouroboros.memory import Memory
 
-    archive = tmp_path / "archive"
-    archive.mkdir(parents=True)
-    (archive / "chat_20260820T010000.jsonl").write_text(
-        json.dumps({"direction": "in", "text": "archive-only"}) + "\n",
-        encoding="utf-8",
-    )
+    dialogue_test.seed(tmp_path, archives={"chat_20260820T010000.jsonl": [{"direction": "in", "text": "archive-only"}]})
+    dialogue_test.import_all(tmp_path)
 
     entries, coverage = Memory(drive_root=tmp_path).read_chat_generations()
 

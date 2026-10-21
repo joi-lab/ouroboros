@@ -99,7 +99,7 @@ def test_unstored_narration_and_missing_task_never_create_display_truth(tmp_path
     _delivery(monkeypatch, tmp_path)
     write_task_result(tmp_path, "work", "running")
     before = signature(tmp_path, "work")
-    monkeypatch.setattr(message_bus, "append_jsonl", lambda *a: False)
+    monkeypatch.setattr(message_bus.dialogue_store, "append_quietly", lambda *a, **k: None)
     message_bus.send_with_budget(1, "Unsaved", is_progress=True, task_id="work", narration=True)
     assert signature(tmp_path, "work") == before
     assert "last_line" not in load_task_result(tmp_path, "work")

@@ -1,8 +1,8 @@
 """GET /api/widgets — the Widgets page card list, projected from the live loader.
 
-Built purely from the in-memory extension state: no skill discovery, no
-stale-review reconcile, no schedule sync, no disk hashing, no writes
-(DEVELOPMENT.md "Passive GET"). ``revision`` is the owning skill's live loader
+Built from the in-memory extension state plus the owner's pinned cards (one small
+file, ``gateway/cards.py``): no skill discovery, no stale-review reconcile, no
+schedule sync, no disk hashing, no writes (DEVELOPMENT.md "Passive GET"). ``revision`` is the owning skill's live loader
 ``content_hash`` — a revision FACT for the page's change signature, not an
 ETag and not a cache-busting token.
 
@@ -13,7 +13,12 @@ type-only here and the response class is imported inside the handler).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, List, TypedDict
+from typing import TYPE_CHECKING, Any, Dict, List
+
+try:  # Python 3.11+
+    from typing import NotRequired, TypedDict  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - CI supports Python 3.10.
+    from typing_extensions import NotRequired, TypedDict  # type: ignore[assignment]
 
 if TYPE_CHECKING:  # type-only: keeps ``import ouroboros.contracts.api_v1`` transport-free
     from starlette.requests import Request
@@ -21,7 +26,9 @@ if TYPE_CHECKING:  # type-only: keeps ``import ouroboros.contracts.api_v1`` tran
 
 
 class WidgetTab(TypedDict):
-    """One Widgets card as served by ``GET /api/widgets``."""
+    """One Widgets card as served by ``GET /api/widgets``. ``pinned_card`` marks a living-message
+    card the owner kept (skill ``_cards``, ``gateway/cards.py``); its presses use the ``card:``
+    decision family, never a skill route."""
 
     key: str
     skill: str
@@ -33,6 +40,7 @@ class WidgetTab(TypedDict):
     span: int
     grid_span: int
     revision: str
+    pinned_card: NotRequired[bool]
 
 
 class WidgetsResponse(TypedDict):
@@ -52,6 +60,7 @@ class ExtensionLiveSnapshot(TypedDict):
     ws_handlers: List[str]
     ui_tabs: List[Dict[str, Any]]
     settings_sections: List[Dict[str, Any]]
+    contributions: List[Dict[str, Any]]
 
 
 def widget_tabs() -> List[WidgetTab]:
@@ -69,18 +78,22 @@ def widget_tabs() -> List[WidgetTab]:
         # revision comes straight from the live tab (frame geometry stays in
         # ``render``, which is where the page reads it).
         card: Dict[str, Any] = {
-            name: tab.get(name) for name in WidgetTab.__annotations__ if name != "revision"
+            name: tab.get(name) for name in WidgetTab.__annotations__ if name not in {"revision", "pinned_card"}
         }
         card["revision"] = row["revision"]
         tabs.append(card)  # type: ignore[arg-type]
     return tabs
 
 
-async def api_widgets(_request: Request) -> JSONResponse:
-    """GET /api/widgets — live widget cards from the loader only; uncached like the module read."""
+async def api_widgets(request: Request) -> JSONResponse:
+    """GET /api/widgets — live widget cards from the loader, then the owner's pinned cards; uncached."""
     from starlette.responses import JSONResponse
 
-    return JSONResponse({"ui_tabs": widget_tabs()}, headers={"Cache-Control": "no-store"})
+    from ouroboros.gateway._helpers import request_drive_root
+    from ouroboros.gateway.cards import pinned_widget_tabs
+
+    tabs = [*widget_tabs(), *pinned_widget_tabs(request_drive_root(request))]
+    return JSONResponse({"ui_tabs": tabs}, headers={"Cache-Control": "no-store"})
 
 
 __all__ = [

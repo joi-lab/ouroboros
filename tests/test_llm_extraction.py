@@ -70,10 +70,7 @@ _MODULE_OWNERS = {
         "normalize_reasoning_effort"
     ),
     llm_routing: "_OR_PROVIDER_PRESETS _resolve_or_provider",
-    llm_local: (
-        "LocalContextTooLargeError _LOCAL_COMPACTION_MODES _compact_local_text "
-        "_compact_markdown_sections _estimate_message_chars _split_markdown_sections"
-    ),
+    llm_local: "LocalContextTooLargeError",
     llm_openai_compatible: "_FALSE_LIKE_ENV_VALUES _RESPONSE_METADATA_LABEL_MAX_CHARS _bounded_response_metadata_label",
     llm_pricing: "add_usage fetch_cloudru_pricing fetch_openrouter_pricing",
 }
@@ -169,6 +166,7 @@ def test_llm_facade_reexports_every_moved_module_identity():
 
     assert llm.context_overflow_message is context_budget.context_overflow_message
     assert llm.CONTEXT_OVERFLOW_CODES is context_budget.CONTEXT_OVERFLOW_CODES
+    assert llm._estimate_message_chars is context_budget.estimate_message_chars
 
 
 def test_claudexor_catalog_aliases_keep_the_metadata_owner_identity():

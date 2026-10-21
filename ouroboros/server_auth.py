@@ -236,14 +236,14 @@ def _login_page(next_url: str, error: str = "") -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Ouroboros Login</title>
 </head>
-<body style="margin:0;background:#0d0b0f;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;">
+<body style="margin:0;background:#0f0f11;color:#efeff2;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;">
   <form method="post" action="/auth/login" style="width:min(360px,calc(100% - 32px));padding:24px;border:1px solid rgba(255,255,255,0.08);border-radius:18px;background:rgba(255,255,255,0.04);box-shadow:0 24px 60px rgba(0,0,0,0.35);">
     <h1 style="margin:0 0 8px;font-size:22px;">Ouroboros</h1>
     <p style="margin:0 0 16px;color:rgba(255,255,255,0.65);line-height:1.5;">This server is exposed beyond localhost. Enter the network password to continue.</p>
     <input type="hidden" name="next" value="{safe_next}">
     <label for="password" style="display:block;margin-bottom:8px;font-size:14px;">Password</label>
-    <input id="password" name="password" type="password" autofocus required style="width:100%;box-sizing:border-box;padding:12px 14px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);background:#15121a;color:#e2e8f0;">
-    <button type="submit" style="margin-top:16px;width:100%;padding:12px 14px;border:none;border-radius:12px;background:#c93545;color:white;font-weight:600;cursor:pointer;">Unlock</button>
+    <input id="password" name="password" type="password" autofocus required style="width:100%;box-sizing:border-box;padding:12px 14px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);background:#1a1b1c;color:#efeff2;">
+    <button type="submit" style="margin-top:16px;width:100%;padding:12px 14px;border:none;border-radius:12px;background:#d32d43;color:white;font-weight:600;cursor:pointer;">Unlock</button>
     {error_html}
   </form>
 </body>

@@ -1,13 +1,15 @@
 // One work, one card (work_portal.js) through the real Main chat consumer: a card whose work moved into a Project
 // room stays the same node and becomes its portal — from /api/state task_bindings, from a census row naming the
 // Project, and from a project_started / project_handoff row (no second entry) — reads its present from the
-// all-chat census (CONTRACTS K8: last_line, last_line_at, tool_calls, detached), keeps [Reply] … [Stop…], and
+// all-chat census (CONTRACTS K8: last_line, last_line_at, tool_calls, detached), keeps its commands (… [Stop…]), and
 // settles from the completion row's typed outcome. A census without the new fields leaves today's card.
 import assert from 'node:assert/strict';
 import test, { after } from 'node:test';
 import { createChatInstance } from '../modules/chat.js';
 import { createWorkPortals } from '../modules/work_portal.js';
+import { clock } from '../modules/work_status.js';
 import { ElementStub, installDom, restoreDom, walkCard } from './chat_dom_fixture.js';
+import { projection, room as serverRoom, work } from './work_fixture.js';
 
 const originalQuery = ElementStub.prototype.querySelector;
 after(() => { ElementStub.prototype.querySelector = originalQuery; });
@@ -76,7 +78,7 @@ const room = (extra = {}) => ({ activity_id: 'w-1', chat_id: 7, kind: 'managed_t
     started_at: Date.parse('2026-10-10T12:00:00Z') / 1000, ...extra });
 const controls = (f, id) => (f.card(id)?.querySelector('.chat-live-actions')?.children || []).map((node) => node.textContent);
 
-test('a bound card becomes its work\'s portal in place: footer reference, the room\'s present, Reply and Stop…', async () => {
+test('a bound card becomes its work\'s portal in place: footer reference, the room\'s present, Stop…', async () => {
     const f = fixture();
     try {
         f.narrate('w-1', 'Reading the logs before the audit.');
@@ -95,7 +97,7 @@ test('a bound card becomes its work\'s portal in place: footer reference, the ro
         assert.equal(f.part('w-1', 'live-activity').textContent, 'Checking the third project.', 'the room\'s latest line');
         assert.match(f.part('w-1', 'live-meta').innerHTML, /41 tool calls/);
         assert.match(f.part('w-1', 'live-meta').innerHTML, /updated /);
-        assert.deepEqual(controls(f, 'w-1'), ['Reply', 'Stop…'], 'one action row: Reply first, Stop… while the room runs it');
+        assert.deepEqual(controls(f, 'w-1'), ['Stop…'], 'one action row of commands: Stop… while the room runs it (Reply is the row menu\'s)');
         assert.equal(node.querySelector('[data-turn-into-project]'), null, 'a moved work no longer converts');
         assert.equal(messages(f).filter((child) => child.classList.contains('project-handoff')).length, 0);
     } finally { f.close(); }
@@ -228,10 +230,10 @@ function assertFollowed(f, node) {
     assert.equal(f.part('w-1-c1', 'live-phase').textContent, 'Working', 'the current episode owns the chip');
     assert.equal(f.part('w-1-c1', 'live-activity').textContent, 'Continuing the audit.');
     assert.match(f.part('w-1-c1', 'live-meta').innerHTML, /3 tool calls/);
-    assert.deepEqual(controls(f, 'w-1-c1'), ['Reply', 'Stop…'], 'its own controls: Stop… while the room runs it');
+    assert.deepEqual(controls(f, 'w-1-c1'), ['Stop…'], 'its own controls: Stop… while the room runs it');
     const episodes = f.part('w-1-c1', 'live-episodes');
     assert.equal(episodes.hidden, false);
-    assert.match(episodes.innerHTML, /Episode 1<\/span> · <span class="chat-live-episode-span">[^<]+<\/span> · <span class="chat-live-episode-outcome" data-tone="error">Failed<\/span>/,
+    assert.match(episodes.innerHTML, /Episode 1<\/span> · <span class="chat-live-episode-name">Audit the projects<\/span> · <span class="chat-live-episode-span">[^<]+<\/span> · <span class="chat-live-episode-outcome" data-tone="failed">Failed<\/span>/,
         'the ended episode is one meta line on the same card');
     assert.match(episodes.innerHTML, /data-episode="2" data-current="1"/);
 }
@@ -263,7 +265,7 @@ test('continued later in the room: a new root in its Project makes the settled p
         details['w-1'] = failedDetail({ continuation_offer: { eligible: true, cause: 'model_provider_failed' } });
         f.state({ task_bindings: bindings, active_chat_activities: [] });
         await settle();
-        assert.deepEqual(controls(f, 'w-1'), ['Reply', 'Continue'], 'the interrupted work offers Continue');
+        assert.deepEqual(controls(f, 'w-1'), ['Continue'], 'the interrupted work offers Continue');
         const reads = () => f.reads.filter((id) => id === 'w-1').length;
         const read = reads();
         // Another work starts in the same room: the portal's record names no successor, so nothing changes.
@@ -327,7 +329,7 @@ test('a bound claim stays pending: Retry Continue on the work\'s own card, nothi
         }
         assert.equal(f.card('w-1-c1'), null, 'a bound claim mints no successor card');
         assert.equal(node.hidden, false, 'nor hides or replaces the work\'s card');
-        assert.deepEqual(controls(f, 'w-1'), ['Reply', 'Retry Continue'], 'the claim shows as pending');
+        assert.deepEqual(controls(f, 'w-1'), ['Retry Continue'], 'the claim shows as pending');
         details['w-1'] = failedDetail(continuedBy());
         f.state({ task_bindings: bindings, active_chat_activities: [successorRow()] });
         await settle();
@@ -335,23 +337,38 @@ test('a bound claim stays pending: Retry Continue on the work\'s own card, nothi
     } finally { f.close(); }
 });
 
-test('an admitted successor held in the room carries Resume as its one primary, from its own census row', async () => {
+test('an admitted successor paused in the room carries Resume as its one primary, from its work\'s own control', async () => {
     const details = {};
     const f = fixture({ details });
     try {
         const node = await runningPortal(f);
         details['w-1'] = failedDetail(continuedBy());
-        f.state({ task_bindings: bindings, active_chat_activities: [successorRow({ phase: 'budget_paused', pause_cause: 'owner',
-            can_resume: true, last_line: '' })] });
+        const paused = successorRow({ phase: 'budget_paused', pause_cause: 'owner', can_resume: true, last_line: '' });
+        // The work runs in its Project room (chat 7): the portal's card in Main still reads that work's controls.
+        const pressed = '2026-09-15T10:00:00Z';
+        const pausedWork = (controls) => projection(7, [work(paused, { activity: 'paused', because: [{ code: 'paused_by_owner',
+            text: 'You paused it', since: pressed, by: { actor: 'owner', text: '', at: pressed } }], controls })],
+        serverRoom('paused'));
+        f.state({ task_bindings: bindings, active_chat_activities: [paused],
+            ...pausedWork([{ action: 'stop', target: 'w-1-c1' }]) });
         await settle();
         assert.equal(node.hidden, true);
-        assert.deepEqual(controls(f, 'w-1-c1'), ['Reply', 'Resume', 'Stop…'], 'held: Resume beside Reply and Stop…');
+        assert.deepEqual(controls(f, 'w-1-c1'), ['Stop…'], 'a paused phase alone offers no Resume');
+        f.state({ task_bindings: bindings, active_chat_activities: [paused],
+            ...pausedWork([{ action: 'resume', target: 'w-1-c1' }, { action: 'stop', target: 'w-1-c1' }]) });
+        await settle();
+        assert.deepEqual(controls(f, 'w-1-c1'), ['Resume', 'Stop…'], 'paused: Resume beside Stop…');
+        assert.deepEqual([f.part('w-1-c1', 'live-phase').textContent, f.part('w-1-c1', 'live-phase-secondary').textContent],
+            ['Paused', `You paused it · ${clock(pressed)}`], 'the portal says the work\'s word, its line beside it');
         const primary = f.card('w-1-c1').querySelector('.chat-live-actions').children.filter((b) => b.classList.contains('btn-primary'));
         assert.deepEqual(primary.map((b) => b.textContent), ['Resume']);
-        // Released in the room: the next census says working, and the card's controls follow it.
-        f.state({ task_bindings: bindings, active_chat_activities: [successorRow()] });
+        // Released in the room: the next body says working, and the card's controls follow its work.
+        const working = successorRow();
+        f.state({ task_bindings: bindings, active_chat_activities: [working], ...projection(7, [work(working, {
+            controls: [{ action: 'wrap_up', target: 'w-1-c1' }, { action: 'stop', target: 'w-1-c1' }] })],
+        serverRoom('working')) });
         await settle();
-        assert.deepEqual(controls(f, 'w-1-c1'), ['Reply', 'Stop…']);
+        assert.deepEqual(controls(f, 'w-1-c1'), ['Stop…']);
         assert.equal(f.part('w-1-c1', 'live-activity').textContent, 'Continuing the audit.');
     } finally { f.close(); }
 });
@@ -400,7 +417,7 @@ function assertRoomFollowed(f, node) {
     assert.ok(!controls(f, 'w-1-c1').includes('Continued'));
     const episodes = f.part('w-1-c1', 'live-episodes');
     assert.equal(episodes.hidden, false);
-    assert.match(episodes.innerHTML, /Episode 1<\/span> · <span class="chat-live-episode-span">[^<]+<\/span> · <span class="chat-live-episode-outcome" data-tone="error">Failed<\/span>/,
+    assert.match(episodes.innerHTML, /Episode 1<\/span> · <span class="chat-live-episode-name">Audit the projects<\/span> · <span class="chat-live-episode-span">[^<]+<\/span> · <span class="chat-live-episode-outcome" data-tone="failed">Failed<\/span>/,
         'the ended episode is one meta line on the same card');
     assert.match(episodes.innerHTML, /data-episode="2" data-current="1"/);
 }
@@ -505,8 +522,8 @@ function assertSettledFollow(f, folded, { id = 'w-1-c1', episodes = 2 } = {}) {
     assert.ok(!controls(f, id).includes('Stop…') && !controls(f, id).includes('Continued'), 'a settled work offers no Stop');
     const lines = f.part(id, 'live-episodes').innerHTML;
     assert.equal((lines.match(/data-episode="/g) || []).length, episodes);
-    assert.match(lines, /Episode 1<\/span> · <span class="chat-live-episode-span">[^<]+<\/span> · <span class="chat-live-episode-outcome" data-tone="error">Failed<\/span>/);
-    assert.match(lines, new RegExp(`data-episode="${episodes}" data-current="1"><span class="chat-live-episode-label">Episode ${episodes}</span> · <span class="chat-live-episode-span">[^<]+–[^<]+</span></div>`),
+    assert.match(lines, /Episode 1<\/span> · <span class="chat-live-episode-name">Audit the projects<\/span> · <span class="chat-live-episode-span">[^<]+<\/span> · <span class="chat-live-episode-outcome" data-tone="failed">Failed<\/span>/);
+    assert.match(lines, new RegExp(`data-episode="${episodes}" data-current="1"><span class="chat-live-episode-label">Episode ${episodes}</span> · (?:<span class="chat-live-episode-name">[^<]+</span> · )?<span class="chat-live-episode-span">[^<]+–[^<]+</span></div>`),
         'the finished current episode carries its own span; the chip is its outcome');
 }
 
@@ -581,7 +598,7 @@ async function failedWithContinue(f, details) {
     details['w-1'] = failedDetail({ continuation_offer: { eligible: true, cause: 'model_provider_failed' } });
     f.state({ task_bindings: bindings, active_chat_activities: [] });
     await settle();
-    assert.deepEqual(controls(f, 'w-1'), ['Reply', 'Continue'], 'Main shows the interruption and offers Continue');
+    assert.deepEqual(controls(f, 'w-1'), ['Continue'], 'Main shows the interruption and offers Continue');
     return node;
 }
 const lateFinal = (id = 'w-1-c1') => ({ role: 'system', system_type: 'project_completion_summary', task_id: id, project_id: 'p-1',
@@ -623,7 +640,7 @@ test('W3: an unrelated work in the same Project, or a claim still bound, leaves 
             assert.equal(f.part('w-1', 'live-phase').textContent, 'Failed');
             assert.ok(reads() > read, 'the observation made the settled portal read its own record');
             assert.ok(reads() <= read + 2, 'once per observation, never a poll');
-            assert.deepEqual(controls(f, 'w-1'), ['Reply', claim === 'bound' ? 'Retry Continue' : 'Continue']);
+            assert.deepEqual(controls(f, 'w-1'), [claim === 'bound' ? 'Retry Continue' : 'Continue']);
         } finally { f.close(); }
     }
 });

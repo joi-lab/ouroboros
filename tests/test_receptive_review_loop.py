@@ -102,7 +102,7 @@ def main_loop(author, monkeypatch):  # noqa: F811 -- imported pytest fixture
 
 def _mail_when_both_seats_started(a, text="How is the commit going?"):
     def owner():
-        assert a.reviewer.sent["m1"].wait(15) and a.reviewer.preparing_m2.wait(15)
+        assert a.reviewer.sent["m1"].wait(60) and a.reviewer.preparing_m2.wait(60)
         write_owner_message(a.data, text, TASK)
     threading.Thread(target=owner, daemon=True).start()
 
@@ -322,7 +322,7 @@ def test_a_child_message_is_an_addressed_event_too(main_loop):
 
     def started(messages):
         def child():
-            assert a.reviewer.sent["m1"].wait(15) and a.reviewer.preparing_m2.wait(15)
+            assert a.reviewer.sent["m1"].wait(60) and a.reviewer.preparing_m2.wait(60)
             write_task_message(a.data, "Child result ready.", TASK, source_task_id="child-7",
                                provenance="descendant_task")
         threading.Thread(target=child, daemon=True).start()
@@ -379,7 +379,7 @@ def test_negative_a_deaf_wait_holds_the_owner_message_until_every_reviewer_answe
 
     def started(messages):
         def owner():
-            assert a.reviewer.sent["m1"].wait(15)
+            assert a.reviewer.sent["m1"].wait(60)
             write_owner_message(a.data, "How is the commit going?", TASK)
             time.sleep(0.6)
             assert len(f.inputs) == 1, "the deaf wait never let Main answer"
@@ -486,12 +486,12 @@ def test_a_cold_restored_left_review_wakes_with_its_custody_fact(tmp_path, monke
     kwargs = {**_loop_kwargs(tmp_path, registry, []), "emit_progress": lambda *_a, **_k: None}
     worker = threading.Thread(target=lambda: outcome.update(result=loop.run_llm_loop(**kwargs)))
     worker.start()
-    worker.join(10 if wake else 2)
+    worker.join(60 if wake else 2)  # the positive ends by itself: 60 s is only its hang bound
     stranded = worker.is_alive()
     if stranded:  # release the negative control, including a regressed positive, before asserting
         assert not seen, "the cold park cannot buy an empty model round"
         write_owner_message(tmp_path, "Any news?", "t-wait")
-        worker.join(15)
+        worker.join(60)
     assert stranded is (not wake), "a failed notice write must not strand a restored review wait"
     assert not worker.is_alive() and outcome["result"][0].startswith("The left review ended")
     custody = "[Review custody] The commit review you left"

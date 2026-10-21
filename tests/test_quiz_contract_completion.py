@@ -1,4 +1,6 @@
 """Engineering brief: admitted membership, explicit owner close, immutable publication."""
+
+from tests import _dialogue as dialogue_test
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -111,7 +113,7 @@ def test_owner_close_delivers_typed_noanswer_and_retry_preserves_winner(runtime)
     assert status == 409 and answer["closed_actor"] == "owner"
     assert answer["closed_reason"] == first["closed_reason"]
     assert runtime.bridge._inbox.empty()
-    rows = [json.loads(line) for line in (runtime.root / "logs/chat.jsonl").read_text().splitlines()]
+    rows = dialogue_test.log_rows(runtime.root / "logs/chat.jsonl")
     assert len([row for row in rows if row.get("type") == "quiz_closed"]) == 1
     assert not [row for row in rows if row.get("type") == "quiz_answer"]
 
@@ -230,7 +232,7 @@ def test_closure_has_distinct_dialogue_provenance_and_terminal_mail_custody(runt
 
     prepare(runtime)
     assert close(runtime)[0] == 200
-    row = next(json.loads(line) for line in (runtime.root / "logs/chat.jsonl").read_text().splitlines()
+    row = next(json.loads(line) for line in dialogue_test.log_text(runtime.root / "logs/chat.jsonl").splitlines()
                if json.loads(line).get("type") == "quiz_closed")
     assert row_author(row)["kind"] == "human"
     rendered = render_row_text(row)

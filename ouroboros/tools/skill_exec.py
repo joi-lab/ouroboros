@@ -690,8 +690,7 @@ def _author_finish_existing_skill_review(
         return {"error": _skill_review_refusal(ctx, "TOOL_ARG_ERROR", f"SKILL_REVIEW_ERROR: {exc}")}
     previous_hash = str(review_state.reviewed_content_hash or review_state.content_hash or "")
     preflight_facts = None
-    # Current preflight is independent evidence; Cyber may continue with its
-    # failure, while ordinary Advisory still requires it to pass.
+    # Current preflight is independent evidence; Cyber may continue with its failure, Advisory may not.
     preflight = _run_deterministic_preflight(
         ctx, drive_root, loaded, current_hash, persist=False, binding=binding,
     )
@@ -710,12 +709,13 @@ def _author_finish_existing_skill_review(
     author_record["review_reference"] = basis
     review_state.author_disposition = author_record
     save_review_state(drive_root, skill_name, review_state)
+    from ouroboros.skill_dependencies import ensure_skill_dependencies
     from ouroboros.skill_loader import auto_grant_if_enabled
-    from ouroboros.skill_review_runner import _reconcile_deps_after_pass_review, _reconcile_extension_payload
+    from ouroboros.skill_review_runner import _reconcile_extension_payload
 
     loaded.review = review_state
     auto_grant_if_enabled(drive_root, loaded)
-    deps_status, deps_error = _reconcile_deps_after_pass_review(drive_root, skill_name, binding=binding)
+    deps_status, deps_error = ensure_skill_dependencies(drive_root, loaded)
     extension = (_reconcile_extension_payload(ctx, skill_name, drive_root=drive_root,
                                              repo_path=None, binding=binding)
                  if loaded.manifest.is_extension() else {})
@@ -744,6 +744,7 @@ def _handle_review_skill(
     author_disposition: str = "",
     author_rationale: str = "",
     review_reference: Optional[Dict[str, Any]] = None,
+    reviewers: Optional[List[str]] = None, reason: str = "",
     _resolved_binding: ResolvedResourceBinding | None = None,
     **_kwargs: Any,
 ) -> str:
@@ -770,9 +771,10 @@ def _handle_review_skill(
     if author_value or author_reason:
         if author_value not in {"accepted", "rejected", "partial", "deferred"} or not author_reason:
             return _skill_review_refusal(ctx, "TOOL_ARG_ERROR", "⚠️ SKILL_REVIEW_ERROR: explicit author finish requires a valid disposition and rationale.")
-        finished = _author_finish_existing_skill_review(
-            ctx, binding, skill_name, disposition=author_value, rationale=author_reason, review_reference=review_reference,
-        )
+        from ouroboros.skill_source_install import run_in_lane
+        # Re-load and qualify the binding AFTER waiting for the lane, before any author-state write.
+        finished = run_in_lane(binding.state_drive_root, "review", skill_name, lambda: _author_finish_existing_skill_review(
+            ctx, binding, skill_name, disposition=author_value, rationale=author_reason, review_reference=review_reference))
         if finished is None:
             return _skill_review_refusal(ctx, "LEGACY_UNAVAILABLE", "⚠️ SKILL_REVIEW_ERROR: author finish could not bind the selected skill revision.")
         if finished.get("error"):
@@ -807,7 +809,7 @@ def _handle_review_skill(
     payload = run_skill_review_lifecycle_blocking(
         ctx,
         skill_name,
-        source="tool",
+        source="tool", reviewers=reviewers, reason=reason,
         review_impl=_review_with_optional_rebuttal,
         _resolved_binding=binding,
     )
@@ -843,13 +845,13 @@ def _skill_deps_exec_block(drive_root: pathlib.Path, loaded: Any) -> str:
     return (
         f"⚠️ SKILL_EXEC_BLOCKED: skill {loaded.name!r} isolated "
         f"dependencies are not ready (status={deps_status!r}). "
-        "Reconcile the declared dependencies through skill_review before executing."
+        "toggle_skill enabled=true installs them (no review is needed for packages); then execute."
     )
 
 
 
 def _non_executable_review_message(prefix: str, skill_name: str, status: str, *, stale: bool = False,
-                                   gate: Dict[str, Any] | None = None) -> str:
+                                   gate: Dict[str, Any] | None = None, strict_review: bool = False) -> str:
     gate = gate or skill_review_gate(status, stale=stale)
     normalized_status = normalize_skill_review_status(status)
     if gate["blocking_reason"] == "blocker_findings_under_blocking_enforcement":
@@ -862,7 +864,8 @@ def _non_executable_review_message(prefix: str, skill_name: str, status: str, *,
     stale_note = f", stale={stale}" if stale else ""
     return (
         f"⚠️ {prefix}: skill {skill_name!r} review status is {normalized_status!r}{stale_note}, "
-        f"not executable ({gate['blocking_reason']}). Execution needs {executable_review_requirement(gate)}. "
+        f"not executable ({gate['blocking_reason']}). "
+        f"Execution needs {executable_review_requirement(gate, strict_review=strict_review)}. "
         f"{gate['summary']}"
     )
 
@@ -983,14 +986,15 @@ def _handle_skill_exec(
         )
     stale = loaded.review.is_stale_for(current_hash)
     gate = loaded.review.gate_for(current_hash)
+    strict_review = bool((getattr(loaded.review, "acceptance", None) or {}).get("strict_review"))
     if stale and not gate["executable_review"]:
         return (
             f"⚠️ SKILL_EXEC_BLOCKED: skill {skill_name!r} was edited since "
-            f"the last review. Execution needs {executable_review_requirement(gate)}."
+            f"the last review. Execution needs {executable_review_requirement(gate, strict_review=strict_review)}."
         )
     if not gate["executable_review"]:
         return _non_executable_review_message("SKILL_EXEC_BLOCKED", skill_name, loaded.review.status, stale=stale,
-                                              gate=gate)
+                                              gate=gate, strict_review=strict_review)
     deps_block = _skill_deps_exec_block(drive_root, loaded)
     if deps_block:
         return deps_block
@@ -1312,6 +1316,8 @@ _REVIEW_SCHEMA = {
                 "type": "string",
                 "description": "Skill name (directory name in OUROBOROS_SKILLS_REPO_PATH).",
             },
+            "reviewers": {"type": "array", "items": {"type": "string"}, "description": "Enabled row ids/handles; omitted means the whole pool. Blocking widens to all ticked reviewers; Advisory requires at least one ticked reviewer and a reason when narrowed. Unticked advisers are heard, not counted. Cyber Pro composes freely."},
+            "reason": {"type": "string", "description": "Why these reviewers; required for a narrowed Advisory panel, including a re-review after blockers."},
             "review_rebuttal": {
                 "type": "string",
                 "description": (
@@ -1403,7 +1409,8 @@ _TOGGLE_SCHEMA = {
         "skill's review_gate to permit the current bytes (outside Cyber Pro: "
         "a current executable reviewer verdict or a qualified Advisory author "
         "acceptance of these exact bytes), any requested key or "
-        "host-permission grants, and ready isolated dependencies. "
+        "host-permission grants; enabling installs or refreshes the declared isolated dependencies "
+        "itself (a review is never needed for packages) and repairs an enabled skill whose packages broke. "
         "For selected-skill development, interpret the real owner request: "
         "Repair and run authorizes enabling and leaving the repaired skill running. "
         "The host resolves that task's original owner message when owner_source is omitted; "
@@ -1488,7 +1495,7 @@ def get_tools() -> List[ToolEntry]:
             schema=_TOGGLE_SCHEMA,
             handler=_handle_toggle_skill,
             is_code_tool=False,
-            timeout_sec=15,
+            timeout_sec=_SKILL_REVIEW_TOOL_TIMEOUT_SEC,
         ),
         ToolEntry(
             name="skill_owner_action", schema=_OWNER_ACTION_SCHEMA,

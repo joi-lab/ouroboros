@@ -50,6 +50,22 @@ def test_notification_controls_are_client_local():
         )
 
 
+def test_the_app_tone_level_sits_under_sound_with_the_existing_controls():
+    """The approved row (task a2199222): under Sound, a slider no collector reads, its value, and the
+    shared small capsule button; the level is stored by the notifier like the checkboxes beside it."""
+    panel = _appearance_panel(_read("web/modules/settings_ui.js"))
+    block = panel[panel.index("data-notify-settings"):]
+    sound = block.index('data-notify-pref="sound"')
+    row = block.index('class="notify-tone-volume"')
+    after = block.index('data-notify-pref="show_text"')
+    assert sound < row < after, "the App tone volume row sits directly under Sound"
+    row_html = block[row:after]
+    assert re.search(r'<input type="range"[^>]*\bdata-notify-volume\b', row_html)
+    assert "data-notify-volume-value" in row_html
+    for attribute in ('id="s-', 'name="s-'):
+        assert attribute not in row_html, f"{attribute} would post the client-local level to the server"
+
+
 def test_reminders_and_skill_notices_use_the_important_toggle():
     """Reminders and skill notices have no separate notification preference."""
     assert "systemType === 'reminder' || systemType === 'skill_notice'" in _read("web/modules/notifications.js")

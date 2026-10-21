@@ -8,7 +8,7 @@ import re
 import pytest
 
 from tests.test_chat_history_paging_browser import (
-    _assert_at_newest, _open, _open_project, _step, _idle, _write, _result, _screenshot, _FRAMES,
+    _append, _assert_at_newest, _open, _open_project, _step, _idle, _result, _screenshot, _FRAMES,
 )
 from tests.test_chat_history_recovery_browser import _click_project
 from tests.test_ui_smoke_playwright import direct_server_with_data as direct_server_with_data
@@ -59,7 +59,7 @@ def test_deep_reopen_delay_retry_and_live_arrival(direct_server_with_data, brows
     project = create_project(root, "continuity-room", name="History continuity")
     other = create_project(root, "other-room", name="Other room")
     start = datetime(2026, 9, 1, tzinfo=timezone.utc)
-    _write(root / "logs" / "chat.jsonl", [{
+    _append(root, "chat", [{
         "direction": "in", "chat_id": project["chat_id"],
         "ts": (start + timedelta(minutes=index)).isoformat(),
         "client_message_id": f"continuity-{index}",
@@ -177,13 +177,19 @@ def test_terminal_publication_timing_and_answer_copy(direct_server_with_data, br
                 # One compact limitation beside each non-clean final; the clean one stays unadorned.
                 assert [row.locator('.project-answer-limitation').all_inner_texts() for row in rows.all()] == [
                     [], ['Failed'], ['Failed']]
-                notes = rows.locator('.msg-provenance:not(.project-answer-limitation)').all_inner_texts()
-                assert 'Task ended' in notes[0] and 'Sep 25, 2026' in notes[0]
-                assert 'Sep 24, 2026' in notes[1] and 'Notification added Sep 26, 2026' in notes[1]
-                assert notes[2].startswith('Task end time not recorded')
-                assert 'Notification added Sep 26, 2026' in notes[2]
-                assert rows.nth(1).evaluate("node => !node.querySelector('.message').contains(node.querySelector('.msg-provenance'))")
-                return notes
+                # One compact time line (owner 17.10, Q7 A): the row's own time also says when its task ended, both
+                # facts only when their minutes differ; the full instants are its title and spoken text, no second note.
+                times = rows.locator(':scope > .msg-time').evaluate_all("""ns => ns.map(n => [
+                    n.querySelector('[aria-hidden="true"]').textContent, n.title, n.querySelector('.msg-time-full').textContent])""")
+                assert [shown for shown, _, _ in times] == [
+                    'Sep 25, 15:19', 'Ended Sep 24, 18:18 · added Sep 26, 19:21', 'End time not recorded · added Sep 26, 19:21']
+                assert all(title == spoken for _, title, spoken in times), times
+                # ICU spells the date/time joint differently per engine; the facts are fixed.
+                assert re.search(r'^Task ended Sep 25, 2026\D+03:19 PM · Notification added Sep 25, 2026\D+03:19 PM$', times[0][1])
+                assert re.search(r'^Task ended Sep 24, 2026\D+06:18 PM · Notification added Sep 26, 2026\D+07:21 PM$', times[1][1])
+                assert re.search(r'^Task end time not recorded · Notification added Sep 26, 2026\D+07:21 PM$', times[2][1])
+                assert rows.locator(':scope > .msg-provenance:not(.project-answer-limitation)').count() == 0
+                return times
             before = check()
             _screenshot(page, tmp_path, f'terminal-times-{browser_engine}')
             page.reload(wait_until='domcontentloaded')
@@ -191,7 +197,7 @@ def test_terminal_publication_timing_and_answer_copy(direct_server_with_data, br
             assert check() == before
             page.set_viewport_size({'width':390, 'height':844})
             if page.locator('#nav-drawer-backdrop').is_visible():
-                page.locator('#nav-drawer-backdrop').click(position={'x':380, 'y':400})
+                page.locator('#nav-drawer-backdrop').click()  # the room's quarter, all the scrim covers
             page.evaluate(_FRAMES)
             assert check() == before
             _screenshot(page, tmp_path, f'terminal-times-narrow-{browser_engine}')
@@ -236,7 +242,7 @@ def test_project_room_terminal_lines_separate_end_and_notification(direct_server
                     card = page.locator(f'{feed} .chat-live-card[data-task-id="{task_id}"]')
                     card.wait_for(state='attached')
                     if card.get_attribute('data-expanded') != '1':
-                        card.locator(':scope > [data-live-summary-button]').click()
+                        card.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
                     found[task_id] = card.locator(':scope > [data-live-timeline]').inner_text()
                 return found
 
@@ -272,7 +278,7 @@ def test_latest_supersedes_a_held_question_reveal_and_a_later_reveal_lands(direc
 
     root = direct_server_with_data['data_dir']
     project = create_project(root, 'navigation-room', name='Addressed history')
-    _write(root / 'logs/chat.jsonl', [{
+    _append(root, 'chat', [{
         'direction': 'in', 'chat_id': project['chat_id'],
         'ts': '2026-09-03T10:00:00Z' if index >= 1180 else '2026-09-01T10:00:00Z',
         'client_message_id': f'navigation-{index}', 'text': f'NAVIGATION_MESSAGE_{index:04d}',
@@ -369,8 +375,9 @@ _FIRST_VISIBLE = """root => {
 }"""
 
 
-def _deep_gesture_history(root):
-    """A Review card, a photo and the reading target live on the third saved page."""
+def _deep_gesture_history(root, narration=''):
+    """A Review card, a photo and the reading target live on the third saved page; ``narration``
+    lengthens each line of the Review card's own narration."""
     from ouroboros.artifacts import store_task_artifact_bytes
     from ouroboros.projects_registry import create_project
     from tests.test_chat_history_paging_browser import _result
@@ -387,13 +394,14 @@ def _deep_gesture_history(root):
     rows[425] = {'direction': 'out', 'chat_id': cid, 'ts': at(425), 'type': 'photo', 'task_id': 'gesture-media',
                  'text': 'Held photo', 'caption': 'Held photo', 'mime': 'image/png',
                  'download_url': f'/api/tasks/gesture-media/artifacts/{image_name}'}
-    _write(root / 'logs' / 'chat.jsonl', rows)
+    _append(root, 'chat', rows)
     review = {'panels': [{'panel_id': 'gesture-panel', 'surface': 'task_acceptance', 'aggregate_signal': 'PASS',
                           'transport_status': 'success', 'parse_status': 'valid',
                           'reason': 'DEEP_REVIEW_DETAIL ' + 'Reviewed evidence stays readable. ' * 12, 'actors': []}]}
-    _write(root / 'logs' / 'progress.jsonl', [
+    _append(root, 'progress', [
         *[{'ts': at(420, index), 'chat_id': cid, 'task_id': 'deep-review',
-           'content': f'Deep review narration {index}. ' + 'Inspecting retained history. ' * 6} for index in range(3)],
+           'content': f'Deep review narration {index}. ' + 'Inspecting retained history. ' * 6 + narration}
+          for index in range(3)],
         *[{'ts': at(700 + index // 2, index % 2), 'chat_id': cid, 'task_id': 'later-work',
            'content': f'Later work {index:03d}'} for index in range(200)],
     ])
@@ -428,10 +436,10 @@ def _nested_full_output_history(root, card_after=49):
     def minute(index):
         return f'2026-09-01T{10 + index // 60:02d}:{index % 60:02d}'
     at = minute(card_after)
-    _write(root / 'logs/chat.jsonl', [
+    _append(root, 'chat', [
         {'direction': 'in', 'chat_id': cid, 'ts': f'{minute(index)}:00Z',
          'client_message_id': f'nested-{index}', 'text': f'Nested context {index:03d}'} for index in range(200)])
-    _write(root / 'logs/progress.jsonl', [
+    _append(root, 'progress', [
         {'chat_id': cid, 'ts': f'{at}:30Z', 'task_id': 'nested-parent', 'content': 'Parent narration'},
         {'chat_id': cid, 'ts': f'{at}:31Z', 'task_id': 'nested-child', **lineage,
          'subagent_event': 'completed', 'status': 'completed', 'content': 'Child finished',
@@ -449,7 +457,7 @@ def _open_nested_full_output(page, url, project):
     for card in (parent, child):
         card.wait_for(state='attached')
         if card.get_attribute('data-expanded') != '1':
-            card.locator(':scope > [data-live-summary-button]').click()
+            card.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
     line = child.locator(':scope > [data-live-timeline] > .chat-live-line.expandable')
     line.locator('[data-live-line-toggle]').click()
     body = line.locator(':scope > .chat-live-line-body-full')
@@ -538,7 +546,7 @@ def test_feed_scrollbar_drag_to_the_live_edge_follows_new_replies(direct_server_
     root = direct_server_with_data['data_dir']
     project = create_project(root, 'scrollbar-room', name='Scrollbar drag')
     cid = project['chat_id']
-    _write(root / 'logs/chat.jsonl', [
+    _append(root, 'chat', [
         {'direction': 'in', 'chat_id': cid, 'ts': f'2026-09-01T10:{index:02d}:00Z',
          'client_message_id': f'drag-{index}', 'text': f'Scrollbar context {index:02d}'} for index in range(60)])
     with sync_playwright() as pw:

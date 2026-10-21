@@ -1,8 +1,8 @@
 """The paid act of ``plan_task``: one ask to the council over the plan record.
 
 Composition (DESIGN §3): the default council is the review pool, which already
-falls back to Main for a valid empty pool; a body plan's FIRST ask (outside Cyber
-Pro) includes every owner-marked reviewer and says so when the mind named fewer;
+falls back to Main for a valid empty pool; Blocking widens a body plan's first ask
+to every marked reviewer, while Advisory requires a counted seat and a reason to narrow;
 a mind-named enabled catalog row outside the pool is a participant whose
 objections are answered but never hold; children the mind schedules are not
 catalog rows and cannot be named. Each participant receives its own host-built
@@ -33,7 +33,7 @@ import copy
 import json
 import logging
 import pathlib
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from typing import Any, Dict, List, Mapping, Optional
 
 from ouroboros import plan_record
@@ -148,47 +148,32 @@ def _pool_slots(reviewer_effort: str) -> List[Any]:
                              "Fix the Reviewer rows on the Agents tab in Settings. Nothing was written.") from exc
 
 
-def resolve_participants(ask: Any, *, first_body_ask: bool, reviewer_effort: str = "") -> List[Participant]:
-    """``"council"`` → the pool (Main when it is empty). A list → the named rows: pool rows
-    by seat id or catalog handle (owner-marked), any other enabled catalog row as a
-    mind-added participant (never holds). A body plan's first ask adds the pool rows the
-    mind did not name (``host_added``). An unknown name is a typed refusal."""
-    from ouroboros import reviewer_slot_config as slots_config
-    from ouroboros.settings_integrity import live_effort_range
+def resolve_participants(ask: Any, *, first_body_ask: bool, reviewer_effort: str = "",
+                         reason: str = "") -> tuple[List[Participant], Dict[str, Any]]:
+    """Use the shared composer; only Blocking tops up the first own-body ask."""
+    from ouroboros.reviewer_slot_config import PanelCompositionError, compose_review_panel
 
-    pool = _pool_slots(reviewer_effort)
-    by_id = {str(s.slot_id): s for s in pool}
-    by_id.update({str(getattr(s, "subagent_id", "") or ""): s for s in pool if getattr(s, "subagent_id", "")})
-    if ask == "council":
-        return [Participant(slot, owner_marked=True) for slot in pool]
-    named: Dict[str, Participant] = {}
-    for raw in ask:
-        name = str(raw or "").strip()
-        if name in by_id:
-            slot = by_id[name]
-            named.setdefault(str(slot.slot_id), Participant(slot, owner_marked=True))
-            continue
+    try:
+        panel = compose_review_panel(() if ask == "council" else ask, reason,
+            surface="plan_first" if first_body_ask else "plan", pool=_pool_slots(reviewer_effort),
+            reviewer_effort=reviewer_effort)
+    except PanelCompositionError as exc:
+        detail = str(exc).replace("REVIEWER_UNKNOWN:", "PARTICIPANT_UNKNOWN:", 1)
+        raise PlanAskRefused("TOOL_ARG_ERROR", f"ERROR: PLAN_{detail} Nothing was written.") from exc
+    requested = set(panel.facts["reviewers_requested"])
+    widened = bool(panel.facts["widened_from"])
+    # Resolve handles before deciding which counted participants the host added.
+    from ouroboros.reviewer_slot_config import catalog_review_row
+    for name in tuple(requested):
         try:
-            row = slots_config.catalog_review_row(None, name)
-        except ValueError as exc:
-            raise PlanAskRefused("TOOL_ARG_ERROR",
-                                 f"ERROR: PLAN_PARTICIPANT_UNKNOWN: {name!r} is neither a review-pool seat nor an enabled "
-                                 f"catalog row ({exc}). Participants are catalog rows: the pool seats "
-                                 f"{sorted(str(s.slot_id) for s in pool)} or an enabled row by its id/handle; a helper you "
-                                 "scheduled yourself is never a participant. Nothing was written.") from exc
-        if str(row.subagent_id or "") in by_id:
-            slot = by_id[str(row.subagent_id)]
-            named.setdefault(str(slot.slot_id), Participant(slot, owner_marked=True))
-            continue
-        slot = slots_config._delivery_slot(
-            row, role_hint="plan reviewer", default_effort=str(reviewer_effort or ""), rng=live_effort_range(),
-            timeout_sec=PLAN_REVIEW_SLOT_TIMEOUT_SEC, max_tokens=PLAN_REVIEW_MAX_TOKENS, default_temperature=0.2)
-        named.setdefault(str(slot.slot_id), Participant(slot, owner_marked=False))
-    if first_body_ask:
-        for slot in pool:
-            if str(slot.slot_id) not in named:
-                named[str(slot.slot_id)] = Participant(slot, owner_marked=True, host_added=True)
-    return list(named.values())
+            requested.add(catalog_review_row(None, name).slot_id)
+        except ValueError:
+            pass  # Main and test-provided pool seats already use their stored id.
+    seats = sorted(panel.seats, key=lambda seat: seat.slot.slot_id not in requested) if widened else panel.seats
+    return ([Participant(replace(seat.slot, role_hint="plan reviewer", timeout_sec=PLAN_REVIEW_SLOT_TIMEOUT_SEC,
+                                max_tokens=PLAN_REVIEW_MAX_TOKENS, default_temperature=0.2), owner_marked=not seat.additional,
+                         host_added=widened and not seat.additional and seat.slot.slot_id not in requested)
+             for seat in seats], panel.facts)
 
 
 def first_body_ask(record: Mapping[str, Any], revision: Mapping[str, Any]) -> bool:
@@ -358,22 +343,22 @@ class PreparedAsk:
     enforcement: str
     system_root: pathlib.Path
     active_root: pathlib.Path
+    panel: Dict[str, Any] = field(default_factory=dict)
 
 
 def prepare_ask(ctx: Any, *, record: Mapping[str, Any], revision: Mapping[str, Any], ask: Any, message: str,
                 attach: List[str], reviewer_effort: str, state_root: pathlib.Path, task_id: str,
-                legacy: Optional[Mapping[str, Any]] = None) -> PreparedAsk:
+                legacy: Optional[Mapping[str, Any]] = None, reason: str = "") -> PreparedAsk:
     """Everything that can refuse, before anything is written: participants, the deadline rail, each
     participant's delivery, fit and lane health, the budget admission (``legacy``: the imported v2 state)."""
     from ouroboros.config import get_review_enforcement
     from ouroboros.tools.plan_dialogue import attach_own_dialogue, dialogue_slot_inputs, render_dialogue, session_input_limits
-    from ouroboros.tools.review_helpers import review_enforcement_blocks, review_wave_binding_fence, review_wave_budget_gate
+    from ouroboros.tools.review_helpers import review_wave_binding_fence, review_wave_budget_gate
 
     system_root, active_root = planning_roots(ctx)
     body = bool(revision.get("body"))
-    cyber_pro = not review_enforcement_blocks("blocking")
-    body_first = first_body_ask(record, revision) and not cyber_pro
-    participants = resolve_participants(ask, first_body_ask=body_first, reviewer_effort=reviewer_effort)
+    body_first = first_body_ask(record, revision)
+    participants, panel = resolve_participants(ask, first_body_ask=body_first, reviewer_effort=reviewer_effort, reason=reason)
     if not participants:
         raise PlanAskRefused("CAPABILITY_UNAVAILABLE", "ERROR: PLAN_ASK_EMPTY: no participant could be named. Nothing was written.")
     deadline = plan_deadline_skip(ctx)
@@ -461,7 +446,7 @@ def prepare_ask(ctx: Any, *, record: Mapping[str, Any], revision: Mapping[str, A
         system_prompt=system_prompt, session_prompt=session_prompt, contents=contents, session_tasks=session_tasks,
         delivery=merged, session_threads=session_threads, continued=continued, manifest=manifest, message=message,
         attach=list(attach or []), reviewer_effort=str(reviewer_effort or ""), body=body, body_first_ask=body_first,
-        enforcement=enforcement, system_root=system_root, active_root=active_root)
+        enforcement=enforcement, system_root=system_root, active_root=active_root, panel=panel)
 
 
 # ------------------------------------------------------------------ dispatch
@@ -572,7 +557,8 @@ def dispatch_ask(ctx: Any, prepared: PreparedAsk, *, revision: Mapping[str, Any]
         "ask_id": prepared.ask_id, "ts": utc_now_iso(), "revision": revision.get("n"), "message": prepared.message,
         "attach": list(prepared.attach), "attached": [{k: a.get(k) for k in ("locator", "sha256", "bytes")} for a in prepared.manifest.get("attached") or []],
         "omissions": list(prepared.manifest.get("omissions") or []), "reviewer_effort": prepared.reviewer_effort,
-        "body_first_ask": bool(prepared.body_first_ask), **_dialogue_carrier(prepared.manifest),
+        "body_first_ask": bool(prepared.body_first_ask), "panel": prepared.panel, "reason": prepared.panel.get("reason", ""),
+        **_dialogue_carrier(prepared.manifest),
         "host_added": [p.seat_id for p in prepared.participants if p.host_added],
         "participants": participants, "record_id": record_id, "retry_key": prepared.retry_key,
     })
@@ -715,7 +701,7 @@ def _keep_late_reply_in_view(state_root: pathlib.Path, task_id: str, ask: Mappin
 def settle_released_reply(usage_ctx: Any, *, request: Any, task_id: str, actor: Any, settled_wave: Dict[str, str],
                           roster_size: int = 0, slot: Any = None, settled_actors: Optional[Mapping[str, Any]] = None) -> None:
     """The custody hook for a plan seat released at the dispatch barrier: settle it into
-    the record, and when the whole ask has settled wake the task mailbox. The hook that
+    the record, and when its counted participants finish wake the task mailbox once. The hook that
     composes the frame first absorbs, from custody's own copies (``settled_actors``), every
     seat whose record write has not landed — a sibling's hook still running, or a write lost
     to a store failure — at $0, never a send; what it still cannot record the frame names as
@@ -750,10 +736,9 @@ def settle_released_reply(usage_ctx: Any, *, request: Any, task_id: str, actor: 
             record_reviewer_slot_executions("plan_review", [actor], {seat_id: slot}, keep_on=usage_ctx)
         except Exception:
             log.debug("plan ask %s: last-execution row for %s not recorded", ask_id, seat_id, exc_info=True)
-    if not settled_wave:
-        return
     participants: List[Mapping[str, Any]] = []
     objections: List[Mapping[str, Any]] = []
+    completed = None
     try:
         record = plan_record.load_plan_record(state_root, task_id)
         ask, _ = _ask_and_participant(record, ask_id, "")
@@ -769,18 +754,30 @@ def settle_released_reply(usage_ctx: Any, *, request: Any, task_id: str, actor: 
                     record = settled
             except Exception:
                 log.warning("plan ask %s: custody's copy of %s could not be recorded", ask_id, sid, exc_info=True)
-        ask, _ = _ask_and_participant(record, ask_id, "")
+        completed = plan_record.claim_ask_completion(state_root, task_id, ask_id, settled_wave)
+        if completed is None:
+            return
+        ask, _ = _ask_and_participant(completed, ask_id, "")
         participants = (ask or {}).get("participants") or []
-        objections = plan_record.open_objections(record)
+        objections = plan_record.open_objections(completed)
     except Exception:
         log.warning("plan ask %s: the record could not be read for the settled frame", ask_id, exc_info=True)
+        if not settled_wave or not all(settled_wave.values()):
+            return  # without the recorded standing, only physical completion is known
     from ouroboros.owner_mailbox import write_task_message
 
+    delivered = False
     try:
-        write_task_message(pathlib.Path(str(usage_ctx.drive_root)), plan_packet.settled_frame(ask_id, participants, objections, custody=settled_wave),
-                           task_id, source_task_id=task_id, provenance="system")
+        delivered = write_task_message(pathlib.Path(str(usage_ctx.drive_root)), plan_packet.settled_frame(ask_id, participants, objections, custody=settled_wave),
+                                       task_id, source_task_id=task_id, provenance="system", msg_id=f"plan-complete:{task_id}:{ask_id}")
     except Exception:
         log.warning("plan ask %s settled-wave frame failed for %s", ask_id, task_id, exc_info=True)
+    finally:
+        if not delivered and completed is not None:
+            try:
+                plan_record.release_ask_completion(state_root, task_id, ask_id)
+            except Exception:
+                log.warning("plan ask %s: undelivered completion claim could not be released", ask_id, exc_info=True)
 
 
 def collect_pending(ctx: Any, record: Mapping[str, Any], *, state_root: pathlib.Path, task_id: str) -> Dict[str, Any]:

@@ -198,13 +198,13 @@ def test_workspace_parent_keeps_the_ordinary_top_level_control_surface(tmp_path,
     names = {schema["function"]["name"] for schema in initial_tool_schemas(registry)}
 
     assert "plan_task" in names
-    assert "task_acceptance_review" in names
+    assert "review_change" in names  # a task's result is reviewed as review_change(subject="result")
     assert "commit_reviewed" in names
     assert "request_restart" in names
 
-    registry.override_handler("task_acceptance_review", lambda ctx=None, **_kwargs: "review-ok")
+    registry.override_handler("review_change", lambda ctx=None, **_kwargs: "review-ok")
     registry.override_handler("commit_reviewed", lambda ctx=None, **_kwargs: "commit-ok")
-    assert registry.execute("task_acceptance_review", {}) == "review-ok"
+    assert registry.execute("review_change", {"subject": "result"}) == "review-ok"
     assert registry.execute("commit_reviewed", {"commit_message": "system target"}) == "commit-ok"
 
 

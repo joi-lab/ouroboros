@@ -156,6 +156,9 @@ def skill_review_contract_fingerprint(
         for row, access in zip(rows, delivery.get("session_accesses") or []):
             if str(access or "readonly") != "readonly":
                 row["access"] = str(access)
+        for row, extra in zip(rows, delivery.get("additional") or []):
+            if extra:
+                row["additional"] = True
         identity = {"reviewer_rows": sorted(rows, key=lambda row: row["slot_id"])}
         # Every retrieving seat (a session or a native api row) receives the retrieving
         # assignment and frozen-payload delivery, so its serialization is the contract.
@@ -292,6 +295,7 @@ def find_free_replay_row(
     content_hash: str,
     contract_fingerprint: str,
     rebuttal_sha256: str = "",
+    legacy_hashes: tuple = (),
 ) -> Optional[Dict[str, Any]]:
     """The recorded verdict a free replay may quote, or ``None`` for a paid run.
 
@@ -299,13 +303,16 @@ def find_free_replay_row(
     roster/contract fingerprint)`` and a SUBSTANTIVE terminal verdict; rows
     without a recorded fingerprint (pre-upgrade) never replay, and a rebuttal
     hash new to this snapshot's rows buys exactly one paid rerun (a repeated
-    hash replays free, quoting the previous outcome)."""
+    hash replays free, quoting the previous outcome). ``legacy_hashes`` are the
+    version-1 hashes of the same bytes (skill_identity conversion): history rows
+    recorded before the release digest still name this snapshot."""
     if not content_hash or not contract_fingerprint:
         return None
+    snapshot_hashes = {content_hash, *(str(item) for item in legacy_hashes if item)}
     rows = [
         row
         for row in load_history(drive_root, skill_name, limit=0, group_id=group_id)
-        if str(row.get("content_hash") or "") == content_hash
+        if str(row.get("content_hash") or "") in snapshot_hashes
     ]
     if not rows:
         return None
@@ -373,6 +380,11 @@ def free_replay_outcome(
     content was edited away and reverted), the replay falls through to a
     PAID rerun that re-persists properly — never a live-lock on a stale
     verdict (skill-2)."""
+    review_state = getattr(skill, "review", None)
+    legacy = (
+        tuple(getattr(review_state, "legacy_content_hashes", ()) or ())
+        if str(getattr(review_state, "content_hash", "") or "") == content_hash else ()
+    )
     row = find_free_replay_row(
         drive_root,
         str(getattr(skill, "name", "") or ""),
@@ -380,13 +392,13 @@ def free_replay_outcome(
         content_hash=content_hash,
         contract_fingerprint=contract_fingerprint,
         rebuttal_sha256=rebuttal_sha256,
+        legacy_hashes=legacy,
     )
     if row is None:
         return None
     from ouroboros.skill_review import SkillReviewOutcome
 
     status = normalize_skill_review_status(str(row.get("status") or ""))
-    review_state = getattr(skill, "review", None)
     if (
         review_state is None
         or str(getattr(review_state, "content_hash", "") or "") != content_hash
@@ -406,6 +418,7 @@ def free_replay_outcome(
         rebuttal_sha256=rebuttal_sha256,
         replayed_from_ts=str(row.get("ts") or ""),
         single_reviewer_no_diversity=bool(row.get("single_reviewer_no_diversity")),
+        panel=dict(row.get("panel") or getattr(review_state, "panel", {}) or {}),
         convergence_hint=(
             "FREE REPLAY (Max Review Cycles): this exact skill snapshot "
             f"(content_hash {content_hash[:12]}) already has a recorded "
@@ -475,12 +488,13 @@ def skill_review_cycles_refusal(
         "preflight; Cyber Pro retains its existing exceptions."
         if author_finish_open else ""
     )
+    owner_exit = ("ask the owner to raise Max Review Cycles (3/5/unlimited are one settings "
+                  "change away), " if not author_finish_open else "")
     message = (
         f"⚠️ REVIEW_CYCLES_EXHAUSTED: {lane} already spent {paid} of {cap} paid "
         "skill-review panel cycle(s) (OUROBOROS_REVIEW_MAX_CYCLES). Refusing to buy "
         "another panel; the skill stays honestly pending. Decide the honest exit "
-        "yourself: finalize and disclose the unreviewed skill, ask the owner to raise "
-        f"Max Review Cycles (3/5/unlimited are one settings change away), or {fresh_exit}. "
+        f"yourself: finalize and disclose the unreviewed skill, {owner_exit}or {fresh_exit}. "
         "A rebuttal cannot buy past the ceiling — rebuttal cycles count toward it."
         f"{author_exit}"
     )

@@ -20,7 +20,17 @@ import pytest
 from ouroboros import owner_hurry as oh
 from tests._delivery_candidate_shared import write_child, write_confirmed_disposition_fixture
 from tests.test_delivery_forced_finalization import _forced_test_context
-from tests.test_owner_hurry_s3 import _acceptance_ctx, _plan_record
+from tests.test_owner_hurry_s3 import _plan_record
+
+
+def _acceptance_ctx(tmp_path, *, latched):
+    """A root's delivery context, latched by the owner's hurry when ``latched`` (the helper the deleted
+    acceptance tests of ``test_owner_hurry_s3`` shared)."""
+    ctx = SimpleNamespace(is_direct_chat=False, drive_root=str(tmp_path), budget_drive_root=str(tmp_path),
+                          task_metadata={}, task_contract={}, task_attempt=1, task_id="t-acc")
+    if latched:
+        ctx._owner_hurry_latch = {"msg_id": "hurry:x", "requested_at": "", "reason": oh.REASON_OWNER_HURRY}
+    return ctx
 
 OWNER_NOTICE = (
     "\n\n⚠️ Plan review: 1 open objection remains open — triad_a/o1 (ask a1, revision 1): no; "

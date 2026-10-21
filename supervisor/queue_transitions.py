@@ -248,6 +248,18 @@ def clear_acceptance_fence_for_root(root_task_id: str) -> bool:
         return q.ACCEPTANCE_FENCES.pop(root_task_id, None) is not None
 
 
+def release_turn_acceptance_fence(drive_root: Any, root_task_id: str) -> bool:
+    """An in-process turn that sends no ``task_done`` (Presence) releases its own root's row at its end."""
+    try:
+        if not _queue_module().owns_live_queue(drive_root) or not clear_acceptance_fence_for_root(root_task_id):
+            return False
+        _queue_module().persist_queue_snapshot(reason="acceptance_fence_turn_ended")
+        return True
+    except Exception:
+        log.warning("Turn %s could not release its acceptance fence", root_task_id, exc_info=True)
+        return False
+
+
 def clear_budget_root_fence_for_settled_tree(task: dict) -> bool:
     """Release a root budget fence once its tree has no live members left.
 
@@ -258,8 +270,8 @@ def clear_budget_root_fence_for_settled_tree(task: dict) -> bool:
     or RUNNING members stays: only the last settling member clears it.
     Without this, cancelling a paused tree left the fence latched forever
     (and the snapshot restore would resurrect it after a restart). An owner
-    Pause latch also stays while the answered root's late phase is paused or
-    still running (D10): that remainder is the tree's last member.
+    Pause latch also stays while the answered root's late phase still runs:
+    that upkeep is the tree's last member until the Pause ends it.
     """
     q = _queue_module()
     if not isinstance(task, dict):
@@ -307,8 +319,8 @@ def sweep_orphaned_budget_fences(pending, fences, drive_root) -> list:
             str(t.get("root_task_id") or t.get("id") or "")
             for t in pending if isinstance(t, dict)
         }
-        # An open late phase (D10) is the owner-paused tree's member across Restart:
-        # saved, or still to be settled by recovery (the census then releases it).
+        # A running late phase is the owner-paused tree's member across Restart until
+        # recovery settles it (the census then releases the Pause).
         orphaned = [root for root in list(fences) if root not in live_roots and not (
             (fences.get(root) or {}).get("cause") == "owner_pause" and late_phase_state(drive_root, root))]
         for root in orphaned:
@@ -450,7 +462,7 @@ def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[st
         if warm is not None:
             return warm
     if located is None and not selected_by:
-        # An answered root's paused remainder (D10) resumes through its own grant.
+        # An answered root's Pause: its deferred late review resumes, or nothing is left.
         from supervisor.budget_resume import resume_late_phase
 
         late = resume_late_phase(task_id)
@@ -846,14 +858,14 @@ def evolution_stop_report(outcomes: Dict[str, List[str]]) -> tuple[List[str], bo
     """Compose honest ``/evolve off`` message lines from typed stop outcomes.
 
     ONE composer for both stop ingresses (owner chat and agent tool), so the
-    two surfaces cannot drift: "Cancelled" names only real cancellations,
+    two surfaces cannot drift: "Stopped" names only real cancellations,
     already-settled tasks are reported as what they are, and any task that is
     STILL LIVE (custody failure or a refused intent write) makes the stop
     INCOMPLETE — returned as ``(lines, incomplete)``.
     """
     lines: List[str] = []
     if outcomes.get("cancelled"):
-        lines.append("🛑 Cancelled evolution task(s): " + ", ".join(outcomes["cancelled"]))
+        lines.append("🛑 Stopped evolution task(s): " + ", ".join(outcomes["cancelled"]))
     settled = [*outcomes.get("already_settled", []), *outcomes.get("not_found", [])]
     if settled:
         lines.append("ℹ️ Already settled (nothing left to cancel): " + ", ".join(settled))
@@ -894,21 +906,27 @@ def settled_status_of(row: Any) -> str:
     return status if status in SETTLED_STATUSES else ""
 
 
-def task_subtree_is_live(task_id: str, *, ignore_intents: bool = False) -> bool:
+def task_subtree_is_live(task_id: str, *, ignore_intents: bool = False, count_runs: bool = True) -> bool:
     """Cheap liveness check the HTTP Stop asks only for a settled or row-less cascade target.
 
     True when the task itself is queued/running, when it still has live
     descendants in the queue, when THIS process still runs its paid post-task
-    synthesis (the direct-chat turn's in-flight key), or when it holds an
-    ACTIVE durable cancel intent (or the legacy ``cancel_requested`` status
-    latch of pre-redesign files) — the intent's settle still has honest work
-    to do. Everything else is inactive and must keep today's 404 contract.
+    synthesis (the direct-chat turn's in-flight key), when its live review
+    operation still owns paid work, when a delegated run of its tree is still
+    open in custody (the cascade cancels it: ``stop_tree_runs``), or when it
+    holds an ACTIVE durable cancel intent (or the legacy ``cancel_requested``
+    status latch of pre-redesign files) — the intent's settle still has honest
+    work to do. Everything else is inactive and must keep today's 404 contract.
 
     ``ignore_intents=True`` is the PHYSICAL variant for the cascade
     postcondition (GR2-1e): the root's own cascade intent now survives until
     that postcondition passes, so the postcondition must judge queue/durable
     liveness only — counting the coordination intent itself would make the
     check circular and the cascade unable to ever report success.
+
+    ``count_runs=False`` asks whether anything besides the tree's open delegated
+    runs is live: a cascade whose only remaining work is runs whose cancel is in
+    flight is pending, not a cascade that cancelled nothing.
     """
     q = _queue_module()
     task_id = str(task_id or "").strip()
@@ -945,6 +963,12 @@ def task_subtree_is_live(task_id: str, *, ignore_intents: bool = False) -> bool:
     from ouroboros.review_operation import task_has_live_review_operation
 
     if task_has_live_review_operation(q.DRIVE_ROOT, task_id):
+        return True
+    from ouroboros.delegate_custody_reconcile import tree_open_runs
+
+    # A run open in custody is physical work until custody records it settled, so an unconfirmed
+    # cancel keeps the cascade's postcondition unmet; unreadable custody raises like the review read.
+    if count_runs and tree_open_runs(q.DRIVE_ROOT, task_id):
         return True
     if ignore_intents:
         return False
@@ -1135,7 +1159,7 @@ def _live_retry_target_locked(q: Any, task_id: str, *, results) -> Tuple[str, st
 
 def task_has_live_ownership(task_id: str, *, ignore_review_operation: str = '', ownership=None) -> bool:
     """Whether executable or paused custody remains for this task: a RUNNING row,
-    busy worker, direct turn, still-billing synthesis or saved late remainder.
+    busy worker, direct turn, still-billing synthesis or a retained late review.
 
     The pipeline persists the durable terminal result BEFORE post-task
     cognition ends, so "the status is settled" and "the worker is dead" are
@@ -1155,8 +1179,8 @@ def task_has_live_ownership(task_id: str, *, ignore_review_operation: str = '', 
     if not task_id:
         return False
     from supervisor.task_ownership import TaskOwnershipRead, prepare_retry_chain
-    from ouroboros.review_operation import task_has_live_review_operation, paused_acceptance_preparations
-    from ouroboros.owner_pause import fence_closed, FENCE_REQUESTED, FENCE_PAUSED, FENCE_RELEASED
+    from ouroboros.review_operation import task_has_live_review_operation
+    from ouroboros.owner_pause import FENCE_REQUESTED, FENCE_PAUSED, FENCE_RELEASED
 
     ownership = ownership or TaskOwnershipRead(q.DRIVE_ROOT)
     accessed = set()
@@ -1172,11 +1196,6 @@ def task_has_live_ownership(task_id: str, *, ignore_review_operation: str = '', 
         fence = current.get("owner_pause") or {}
         if not isinstance(fence, dict) or (fence and fence.get("state") not in
                                            {FENCE_REQUESTED, FENCE_PAUSED, FENCE_RELEASED}):
-            return True
-        if fence_closed(fence) and paused_acceptance_preparations(q.DRIVE_ROOT, task_id, fence['fence_id'],
-                                                                 result_loader=read):
-            return True
-        if (current.get("root_phase_checkpoint") or {}).get("post_task_synthesis") == "paused":
             return True
         prepare_retry_chain(q, task_id, read)
     except (OSError, ValueError, TypeError, RuntimeError):

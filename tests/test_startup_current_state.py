@@ -1,4 +1,4 @@
-"""Boot gaps, append ordering, notice receipts and deferred housekeeping."""
+"""Boot gaps, append ordering, notice receipts and the housekeeping that waits on recovery."""
 import inspect
 import json
 from contextlib import contextmanager
@@ -178,43 +178,38 @@ def test_notice_receipts_import_once_and_publication_never_reads_chat(tmp_path, 
     assert not migrations.prepare_startup_state(tmp_path)["imported"]
 
 
-def test_prunes_wait_off_ready_path_and_tree_debt_clears_after_recovery(tmp_path, monkeypatch):
-    from ouroboros import headless
+def test_prunes_wait_off_ready_path_and_trees_wait_for_readable_recovery_links(tmp_path, monkeypatch):
+    """Startup prunes nothing (off the ready path); task trees go on a reconcile pass only once the
+    recovery links read, and on every pass after that, never once per process. The worktree family
+    is the custody pass's, never the reconcile pass's."""
+    from ouroboros import headless, subagent_worktrees
     migrations.prepare_startup_state(tmp_path)
     monkeypatch.setattr(maintenance, "DATA_DIR", tmp_path)
-    for name in ("_STARTUP_PRUNES_OWED", "_STARTUP_SOURCE_PRUNES_OWED", "_STARTUP_TREES_OWED",
-                 "_STARTUP_RECOVERY_GAPS", "_STARTUP_TEMP_SWEEP_OWED"):
-        monkeypatch.setattr(maintenance, name, [False])
+    monkeypatch.setattr(maintenance, "_STARTUP_RECOVERY_GAPS", [False])
     calls = []
     monkeypatch.setattr(headless, "prune_task_trees", lambda *a, **kw: calls.append("trees"))
-    monkeypatch.setattr(maintenance, "_startup_worktree_prune", lambda: calls.append("worktrees"))
-    monkeypatch.setattr(maintenance, "_prune_delegated_snapshots", lambda: None)
+    monkeypatch.setattr(subagent_worktrees, "prune_orphans", lambda **kw: pytest.fail("worktrees on a reconcile pass"))
     o.add(tmp_path, "pending_drives", "task")
     maintenance._startup_prune_sweeps(preserve_task_sources=True, recovery_report={"unresolved": ["task"]})
     assert calls == []
-    maintenance._run_deferred_startup_prunes()
-    assert calls == ["worktrees"] and maintenance._STARTUP_TREES_OWED == [True]
+    maintenance._run_reconcile_prunes()
+    assert calls == [], "a recovery link that cannot be read keeps every tree for this pass"
     o.remove(tmp_path, "pending_drives", "task")
-    maintenance._run_deferred_startup_prunes()
-    assert calls == ["worktrees", "trees"] and maintenance._STARTUP_TREES_OWED == [False]
+    maintenance._run_reconcile_prunes()
+    maintenance._run_reconcile_prunes()
+    assert calls == ["trees", "trees"]
 
 
 @pytest.mark.parametrize("gap", [None, "unreadable", "coarse"])
-def test_deferred_prunes_keep_live_tree_and_retry_recovery_gaps(tmp_path, monkeypatch, gap):
+def test_reconcile_prunes_keep_live_tree_and_wait_out_recovery_gaps(tmp_path, monkeypatch, gap):
     import os
-    from ouroboros import owner_mailbox
     migrations.prepare_startup_state(tmp_path)
     monkeypatch.setattr(maintenance, "DATA_DIR", tmp_path)
-    for name in ("_STARTUP_PRUNES_OWED", "_STARTUP_SOURCE_PRUNES_OWED", "_STARTUP_TREES_OWED",
-                 "_STARTUP_RECOVERY_GAPS", "_STARTUP_TEMP_SWEEP_OWED"):
-        monkeypatch.setattr(maintenance, name, [False])
-    monkeypatch.setattr(maintenance, "_startup_worktree_prune", lambda: None)
-    monkeypatch.setattr(maintenance, "_prune_delegated_snapshots", lambda: None)
+    monkeypatch.setattr(maintenance, "_STARTUP_RECOVERY_GAPS", [False])
     running = results.write_task_result(tmp_path, "running", "running")
     results.write_task_result(tmp_path, "settled", "completed", ts="2000-01-01T00:00:00+00:00")
     for task in ("running", "settled"):
         (tmp_path / "task_trees" / task).mkdir(parents=True)
-        owner_mailbox.write_owner_message(tmp_path, "retained message", task)
     service = tmp_path / "services/settled/service.log"
     service.parent.mkdir(parents=True)
     service.write_text("retained service output", encoding="utf-8")
@@ -222,51 +217,47 @@ def test_deferred_prunes_keep_live_tree_and_retry_recovery_gaps(tmp_path, monkey
     unreadable = unreadable_result(monkeypatch, "running") if gap == "unreadable" else {"on": False}
     maintenance._startup_prune_sweeps(preserve_task_sources=bool(gap),
         recovery_report={"errors": ["ownership unknown"]} if gap == "coarse" else {"unresolved": ["running"]})
-    maintenance._run_deferred_startup_prunes()
+    maintenance._run_reconcile_prunes()
     if gap:
         assert (tmp_path / "task_trees/settled").exists() and service.exists()
-        assert owner_mailbox._mailbox_path(tmp_path, "settled").exists()
-        assert maintenance._STARTUP_TREES_OWED == maintenance._STARTUP_SOURCE_PRUNES_OWED == [True]
-        assert maintenance._STARTUP_PRUNES_OWED == [False]
+        maintenance._run_reconcile_prunes()
+        assert (tmp_path / "task_trees/settled").exists() and service.exists(), "a later pass keeps them too"
         unreadable["on"] = False
         assert results.load_task_result(tmp_path, "running", strict=True) == running
-        maintenance._STARTUP_RECOVERY_GAPS[0] = False
-        maintenance._run_deferred_startup_prunes()
+        maintenance._startup_prune_sweeps()  # the next generation's boot, with recovery complete
+        maintenance._run_reconcile_prunes()
     assert not (tmp_path / "task_trees/settled").exists() and not service.exists()
-    assert not owner_mailbox._mailbox_path(tmp_path, "settled").exists()
     assert (tmp_path / "task_trees/running").exists()
-    assert owner_mailbox._mailbox_path(tmp_path, "running").exists()
-    assert maintenance._STARTUP_TREES_OWED == maintenance._STARTUP_SOURCE_PRUNES_OWED == [False]
 
 
-def test_periodic_sweep_retries_source_only_debt_until_success(tmp_path, monkeypatch):
+def test_a_failed_prune_step_spares_the_others_and_the_next_pass_runs_it_again(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from ouroboros import headless, owner_mailbox, review_operation
     from ouroboros.tools import services
     migrations.prepare_startup_state(tmp_path)
     monkeypatch.setattr(maintenance, "DATA_DIR", tmp_path)
-    for name in ("_STARTUP_PRUNES_OWED", "_STARTUP_TREES_OWED", "_STARTUP_SOURCE_PRUNES_OWED",
-                 "_STARTUP_RECOVERY_GAPS", "_STARTUP_TEMP_SWEEP_OWED"):
-        monkeypatch.setattr(maintenance, name, [name == "_STARTUP_SOURCE_PRUNES_OWED"])
+    monkeypatch.setattr(maintenance, "_STARTUP_RECOVERY_GAPS", [False])
     monkeypatch.setattr(maintenance, "_periodic_zombie_reconcile", lambda **kw: None)
     monkeypatch.setattr(maintenance, "_run_drive_custody_pass", lambda *a: None)
-    monkeypatch.setattr(review_operation, "collect_orphaned_operations_softly", lambda *a, **kw: None)
-    monkeypatch.setattr(headless, "prune_task_trees", lambda *a, **kw: pytest.fail("tree debt already discharged"))
+    monkeypatch.setattr(maintenance, "_tick_maintenance_child", lambda: None)
+    monkeypatch.setattr(review_operation, "retire_dead_review_pointers_softly", lambda *a, **kw: None)
+    monkeypatch.setattr(owner_mailbox, "sweep_settled_owner_mailboxes",
+                        lambda *a, **kw: pytest.fail("the drive-custody pass owns the mailbox sweep"))
     calls = []
-    def unavailable(_root):
-        calls.append("mail-unavailable")
-        raise OSError("mailbox cleanup unavailable")
-    monkeypatch.setattr(owner_mailbox, "sweep_settled_owner_mailboxes", unavailable)
-    monkeypatch.setattr(services, "prune_service_logs", lambda *a: calls.append("services") or {})
+    def unavailable(*_a, **_kw):
+        calls.append("trees-unavailable")
+        raise OSError("task trees unavailable")
+    monkeypatch.setattr(headless, "prune_task_trees", unavailable)
+    monkeypatch.setattr("ouroboros.delegate_state_sweep.sweep_settled_delegate_state",
+                        lambda *a: calls.append("delegate") or {})
     latch = SimpleNamespace(release=lambda: None)
     maintenance._run_periodic_reconcile_sweep([0], latch=latch)
-    assert calls == ["mail-unavailable"] and maintenance._STARTUP_SOURCE_PRUNES_OWED == [True]
-    monkeypatch.setattr(owner_mailbox, "sweep_settled_owner_mailboxes", lambda *a: calls.append("mail") or {})
+    assert calls == ["trees-unavailable", "delegate"]
+    monkeypatch.setattr(headless, "prune_task_trees", lambda *a, **kw: calls.append("trees"))
+    monkeypatch.setattr(services, "prune_service_logs", lambda *a: calls.append("services") or {})
     maintenance._run_periodic_reconcile_sweep([0], latch=latch)
-    assert calls == ["mail-unavailable", "mail", "services"]
-    assert maintenance._STARTUP_SOURCE_PRUNES_OWED == [False]
     maintenance._run_periodic_reconcile_sweep([0], latch=latch)
-    assert calls == ["mail-unavailable", "mail", "services"]
+    assert calls == ["trees-unavailable", "delegate"] + ["trees", "services", "delegate"] * 2
 
 
 def test_tree_exclusions_follow_only_addressed_links_and_own_child_results(tmp_path, monkeypatch):

@@ -531,7 +531,7 @@ def test_delegate_start_recipes_match_the_fresh_start_schema():
             assert re.search(r"\bprompt\s*=", recipe), (relative, recipe)
             if not re.search(r"\bretry_of\s*=", recipe):
                 # continue_from is the schema's third start selector: a NEW run
-                # bound to a settled predecessor.
+                # bound to a finished predecessor.
                 assert "continue_from" in schema["properties"]
                 direct_selector = re.search(
                     r"\b(?:subagent_id|continue_from)\s*=", recipe)

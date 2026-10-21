@@ -239,7 +239,9 @@ def test_browser_wait_controls_apply_once_and_only_to_light(integrated_wait, per
     assert page.locator(".model-wait-row").count() == 1
     assert "Light" in row.inner_text() and "Account: work" in row.inner_text()
     assert row.locator("[data-wait-auto]").is_checked()
-    assert not card.locator("[data-live-typing]").is_visible()
+    # A quota wait that resumes by itself shows no computation: still dots on a neutral chip.
+    assert card.locator("[data-live-phase] > .status-mark").get_attribute("data-shape") == "still"
+    assert card.locator("[data-live-phase]").get_attribute("data-chip-tone") == "neutral"
     assert set(flow.canonical()["model_waits"]) == {flow.wait_id}
 
     # Let real source metadata publish a newer revision without delivering

@@ -41,7 +41,7 @@ def is_task_card_message(meta: Mapping[str, Any] | None) -> bool:
     (``card_row``) and a child task's own lineage (``delegation_role`` — the
     child speaks to its parent, whose card shows it). They hold whether or not a
     page has that card loaded, so neither is a new conversation message for the
-    Project unread revision (DESIGN "Project unread dot").
+    Project unread revision (DESIGN "Unread").
     """
     source = meta if isinstance(meta, Mapping) else {}
     return (source.get("card_row") in CARD_ROW_PLACEMENTS

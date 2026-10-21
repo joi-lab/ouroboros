@@ -58,18 +58,27 @@ TERMINAL_WRITERS = {
     # Selects an already retained actor account; its locked projector preserves
     # CURRENT lifecycle, including terminal state, and compares the prior pointer.
     ('ouroboros/review_history_view.py::publish_review_history_view', '"running"'): 'dynamic',
+    # Names the mind's surviving notes after an applied fold; its locked projector
+    # preserves CURRENT lifecycle, including terminal state, and writes only the pointer.
+    ('ouroboros/main_context_authority.py::publish_working_notes', '"running"'): 'dynamic',
     # Create-only pooled control admission seeds running/scheduled authority;
     # an existing row is returned unchanged, including any terminal status.
     ('supervisor/queue.py::ensure_control_task_result', 'status'): 'dynamic',
     # Continue replay restores the exact stored status, or seeds scheduled;
     # its recovered admission cannot originate a new terminal transition.
     ('supervisor/continuation_admission.py::_replay', 'stored.get("status") or "scheduled"'): 'dynamic',
-    # A source-bound cap amendment preserves CURRENT lifecycle in its locked
-    # projector; it changes money authority only and never revives the task.
-    ('ouroboros/acceptance_history.py::prepare_owner_historical_review', 'accounting["status"]'): 'dynamic',
     ('ouroboros/agent.py::_task_exception_terminal', 'STATUS_FAILED'): 'terminal',
     ('ouroboros/agent_task_pipeline.py::_store_task_result', 'status'): 'dynamic',
     ('ouroboros/delegate_terminal.py::record_terminal_reconciliation', 'str(existing.get("status") or STATUS_RUNNING)'): 'dynamic',
+    # Foreign-root disclosure preserves CURRENT status and pointers under the
+    # projector, then rests the local duty; it never terminalizes a task.
+    ('ouroboros/install_identity.py::rest_foreign_member', 'stored["status"]'): 'dynamic',
+    # A refused foreign-root launch names its reason on this install's own row;
+    # the projector keeps CURRENT status and writes nothing once it is named.
+    ('ouroboros/install_identity.py::disclose_foreign_task', '""'): 'dynamic',
+    # Preparation markers land only on a row still in the named non-terminal
+    # status (requested by default); the projector refuses any other row.
+    ('supervisor/workspace_preparation.py::_transition', 'status'): 'dynamic',
     # F6 upstream sync: the cursor/backfill refresh rewrites a stale stored
     # disclosure without changing the task's terminal status (same preserved
     # read as its record_terminal_reconciliation sibling).
@@ -84,10 +93,9 @@ TERMINAL_WRITERS = {
     # Both retain CURRENT lifecycle status rather than authoring completion.
     ('ouroboros/headless.py::_retry_child_task_refs_locked', 'source["status"]'): 'dynamic',
     ('ouroboros/headless.py::prepare_terminal_task_files', 'existing["status"]'): 'dynamic',
-    # Existing task custody/projection enrichment only: both locked field
-    # projectors preserve CURRENT lifecycle status rather than ending a task.
+    # Existing task custody/projection enrichment only: its locked field
+    # projector preserves CURRENT lifecycle status rather than ending a task.
     ('ouroboros/history_retention.py::call_inventory_custodied', 'current["status"]'): 'dynamic',
-    ('ouroboros/review_operation.py::_remember_legacy_notice', '"running"'): 'dynamic',
     ('ouroboros/headless.py::_finalize_task_artifacts_locked', 'status'): 'dynamic',
     ('ouroboros/headless.py::_finalize_task_artifacts_locked', 'str(existing.get("status") or status or "completed")'): 'terminal',
     ('ouroboros/mutation_attribution.py::advance_mutation_baseline', 'status'): 'dynamic',
@@ -124,9 +132,6 @@ TERMINAL_WRITERS = {
     ('ouroboros/terminal_projection.py::append_terminal_projection', 'status'): 'dynamic',
     ('ouroboros/terminal_projection.py::clear_terminal_projection_obligation', 'str(expected.get("status") or "completed")'): 'terminal',
     ('ouroboros/project_naming.py::spawn_turn_namer._work', 'status'): 'dynamic',
-    # The locked field projector preserves the existing status, including a
-    # terminal one; publishing review evidence never completes the task itself.
-    ('ouroboros/review_projection.py::publish_acceptance_checkpoint', '"running"'): 'dynamic',
     # Rebinds a proven legacy child start before existing orphan materialization;
     # write_task_result still preserves any terminal status under its locked reducer.
     ('ouroboros/startup_task_files.py::recover_terminal_task_files', '"running"'): 'dynamic',
@@ -153,7 +158,7 @@ TERMINAL_WRITERS = {
     # Monetary refresh projects fields under the result lock and preserves its
     # current terminal status; it cannot publish a lifecycle transition.
     ('supervisor/events_task_done.py::_refresh_terminal_task_cost', 'current["status"]'): 'dynamic',
-    ('supervisor/queue_snapshot.py::restore_pending_from_snapshot', 'STATUS_CANCELLED'): 'terminal',
+    ('supervisor/queue_snapshot.py::_restore_pending', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/queue_snapshot.py::_refuse_restore_invalid_fences', 'STATUS_CANCELLED'): 'terminal',
     # Explicit calendar expiry retains pending custody until the result and delivery are durable.
     ('supervisor/queue_timeouts.py::_settle_pending_deadline', '"failed"'): 'terminal',
@@ -195,7 +200,7 @@ NO_DELIVERABLE_LANES = {
         'cancelled before it ever started: no answer exists',
     'supervisor/workers.py::_settle_cancelled_pending_row':
         'dropped before assignment; the salvage receipt belongs to custody',
-    'supervisor/queue_snapshot.py::restore_pending_from_snapshot':
+    'supervisor/queue_snapshot.py::_restore_pending':
         'restore-time reconciliation of a task cancelled while the server was down',
     'supervisor/queue_snapshot.py::_refuse_restore_invalid_fences':
         'the invalid-acceptance-fence refusal moved out of restore_pending_from_snapshot (#1196): '

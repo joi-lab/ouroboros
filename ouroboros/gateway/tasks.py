@@ -1021,6 +1021,26 @@ def _record_cascade_incident(task_id: str, kind: str, detail: str = "") -> None:
         log.debug("Failed to surface cascade cancel incident for %s", task_id, exc_info=True)
 
 
+def _cascade_waits_only_on_runs(task_id: str) -> bool:
+    """Whether a cascade that did not settle left only its tree's open delegated runs live.
+
+    Their cancel is in flight (an engine confirms a cancel asynchronously), refused (a containment fault,
+    critical until a verified terminal) or not sent (the engine is unreachable: pending until it answers).
+    The Stop stays pending and the cancel-intent watchdog settles it once custody records them settled;
+    none of these is a cascade that cancelled nothing. An unreadable answer proves nothing, so the
+    incident stays.
+    """
+    try:
+        from ouroboros.delegate_custody_reconcile import tree_open_runs
+        from supervisor.queue import DRIVE_ROOT, task_subtree_is_live
+
+        return bool(tree_open_runs(DRIVE_ROOT, task_id)) and not task_subtree_is_live(
+            task_id, ignore_intents=True, count_runs=False)
+    except Exception:
+        log.debug("Cascade liveness read failed for %s", task_id, exc_info=True)
+        return False
+
+
 def _run_cascade_cancel(task_id: str) -> bool:
     """Subtree cancel for the Host Service ``/chat/cancel`` path, AWAITED by its caller.
 
@@ -1042,7 +1062,8 @@ def _run_cascade_cancel(task_id: str) -> bool:
             from supervisor.queue import task_subtree_is_live
 
             if task_subtree_is_live(task_id):
-                _record_cascade_incident(task_id, "task_cancel_cascade_noop")
+                if not _cascade_waits_only_on_runs(task_id):
+                    _record_cascade_incident(task_id, "task_cancel_cascade_noop")
                 return False
         return True
     except Exception as exc:
@@ -1138,7 +1159,7 @@ def _drive_stop(task_id: str, intent: Dict[str, Any], *, cascade: bool) -> JSONR
         except Exception:
             pending = intent  # recorded; an unreadable projection proves no settle
         if pending:
-            if cascade and outcome:
+            if cascade and outcome and not _cascade_waits_only_on_runs(target):
                 _record_cascade_incident(target, "task_cancel_cascade_noop")
             return JSONResponse({
                 "ok": True, "task_id": task_id, "cancel_state": "pending",

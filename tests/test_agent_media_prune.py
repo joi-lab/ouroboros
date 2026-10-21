@@ -75,7 +75,7 @@ def test_the_sweep_never_follows_a_symlink_out_of_the_drive(tmp_path):
     assert report == {"removed": 1, "kept": 0, "skipped": 2, "errors": 0}
 
 
-def test_startup_prune_sweeps_run_the_media_prune(tmp_path, monkeypatch):
+def test_every_reconcile_pass_runs_the_media_prune(tmp_path, monkeypatch):
     import ouroboros.server_maintenance as sm
 
     shots = tmp_path / "uploads" / "screenshots"
@@ -88,13 +88,8 @@ def test_startup_prune_sweeps_run_the_media_prune(tmp_path, monkeypatch):
         os.utime(path, (_OLD, _OLD))
 
     monkeypatch.setattr(sm, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(sm, "_STARTUP_PRUNES_OWED", [True])
-    monkeypatch.setattr(sm, "_STARTUP_TREES_OWED", [False])
-    monkeypatch.setattr(sm, "_STARTUP_SOURCE_PRUNES_OWED", [False])
-    monkeypatch.setattr(sm, "_startup_worktree_prune", lambda: None)
-    monkeypatch.setattr(sm, "_prune_delegated_snapshots", lambda: None)
 
-    sm._run_deferred_startup_prunes()
+    sm._run_reconcile_prunes()
 
     assert not old_shot.exists()
     assert owner_upload.read_bytes() == b"owner image"

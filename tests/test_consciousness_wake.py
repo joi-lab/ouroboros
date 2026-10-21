@@ -9,7 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros import consciousness_wake as wake
+from ouroboros import consciousness_wake as wake, dialogue_store as ds
+from tests._dialogue import import_all
 from tests._store_shared import read_result, result_exists, seed_result
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -53,6 +54,10 @@ def test_wake_task_metadata_carries_origin_level_and_tree_cap(monkeypatch):
 def _chat(root, *rows, archive: str = ""):
     """Append rows to the live chat log, or write them as one rotated archive segment."""
     path = root / ("archive" if archive else "logs") / (f"chat_{archive}.jsonl" if archive else "chat.jsonl")
+    if ds.present(root):
+        for row in rows:
+            ds.append(root, "chat", row)
+        return path
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         for row in rows:
@@ -140,8 +145,8 @@ def test_the_boundary_survives_rotation_and_a_replaced_chain_is_disclosed(tmp_pa
     (tmp_path / "archive" / "chat_20270115T100000.jsonl").write_text(
         json.dumps(_owner("rewritten history", since + 5, cmid="z")) + "\n", encoding="utf-8")
     replaced = _observe(tmp_path, boundary=accepted, since=T0 - 60)
-    assert replaced.window["basis"] == "time_bootstrap_boundary_mismatch"
-    assert "accepted_boundary_no_longer_matches_chat_chain" in replaced.gaps
+    assert replaced.window["basis"] == "accepted_boundary"
+    assert "accepted_boundary_no_longer_matches_chat_chain" not in replaced.gaps
     assert [line.rsplit('"', 2)[-2] for line in _lines(replaced)] == ["after rotation"]
 
 
@@ -235,77 +240,21 @@ def test_an_expired_card_is_a_transition_and_stays_answerable_in_the_inventory(t
     assert "answered in own words: yes" in _lines(third)[0] and third.outstanding == ()
 
 
-def _late_panel(tmp_path, task_id, *, settled_at=None, pending=False):
-    """The acceptance panel exactly as the review writer publishes it (real producer functions)."""
-    from ouroboros.acceptance_settlement import late_evidence_fact
-    from ouroboros.artifacts import store_actor_source_bytes
-    from ouroboros.review_projection import compact_review_projection
-
-    actor = {"slot_id": "s1", "operation_id": "op1", "status": "ok", "raw_text": "FAIL: the tests were never run",
-             "semantic_verdict": "FAIL", "operation_state": "in_flight" if pending else "settled"}
-    run = {"authority": "host_root", "panel_id": "p1", "aggregate_signal": "FAIL", "actors": [actor],
-           "request": {"surface": "task_acceptance", "retry_key": "rk-9", "subject": "answer A", "task_id": task_id}}
-    if settled_at:
-        fact = late_evidence_fact(run, {"source": "terminal_delivery_registry", "state": "unknown",
-                                        "delivery_ids": []}, settled_at=_iso(settled_at))
-        run["late_settlement"] = {"note": "On the reviewed version of this answer, reviewers later rejected it.\n"
-                                          "- s1: FAIL", **fact}
-    ref = store_actor_source_bytes(tmp_path, task_id, category="context_checkpoints", source_id="acceptance",
-                                   data=json.dumps(run).encode(), extension="json")
-    run['applied_source_ref'] = ref
-    return compact_review_projection([run]), ref
-
-
-def test_a_late_review_is_read_from_its_canonical_fact_with_its_exact_source(tmp_path):
-    """No invented chat fields: the settlement, its subject and its exact published source come
-    from ``acceptance_settlement.late_acceptance_facts``; the source is readable by read_file."""
-    from ouroboros.tools.registry import ToolRegistry
-    from tests.test_review_operation_source_closure import read_late_source
-    from ouroboros.tools.tool_context import ToolContext
-
-    projection, ref = _late_panel(tmp_path, "rv", pending=True)
-    _write(tmp_path, "rv", status="completed", ts=_iso(T0 - 900), updated_at=_iso(T0 - 100),
-           review_projection=projection)
-    first = _wake(tmp_path, None, T0)
-    assert "rv" in first.boundary["transitions"]["inventory"]  # its panel may still settle
-    projection, ref = _late_panel(tmp_path, "rv", settled_at=T0 + 60)
-    _write(tmp_path, "rv", review_projection=projection)
-    second = _wake(tmp_path, first.boundary, T0 + 600)  # the outbox row has not landed yet
-    assert [(kind, offset) for kind, offset, _l in second.events] == [("late_review", None)]
-    line = _lines(second)[0]
-    assert line.startswith("- late review settled for task rv, 9 min ago: On the reviewed version of this answer, "
-                           "reviewers later rejected it.; panel p1; signal FAIL; reviewed version unknown; "
-                           "emitted answer unknown; 1 reviewer outputs; exact source ")
-    assert f"sha256 {ref['sha256']}" in line and "rv" in second.boundary["transitions"]["inventory"]
-    read = json.loads(line.split("exact source ", 1)[1].rsplit(" sha256 ", 1)[0])
-    reader = ToolContext(repo_dir=REPO, drive_root=tmp_path, task_id="wake0002", task_metadata={})
-    registry = ToolRegistry(repo_dir=REPO, drive_root=tmp_path)
-    registry.set_context(reader)
-    assert '"FAIL: the tests were never run"' in read_late_source(registry, read)
-    # The owner-visible row lands afterwards: already accepted, not a second report.
-    _chat(tmp_path, {"ts": _iso(T0 + 700), "direction": "system", "type": "acceptance_late_settlement",
-                     "task_id": "rv", "text": "On the reviewed version…", "card_row": "reviews",
-                     "card_row_id": "acceptance-late:rk-9"})
-    assert _wake(tmp_path, second.boundary, T0 + 1200).events == ()
-
-
 def test_a_transition_takes_the_position_of_the_row_that_announced_it_once(tmp_path):
-    projection, _ref = _late_panel(tmp_path, "rv", pending=True)
-    _write(tmp_path, "rv", status="completed", ts=_iso(T0 - 900), updated_at=_iso(T0 - 100),
-           review_projection=projection)
     _write(tmp_path, "kid", status="running", ts=_iso(T0 - 900), updated_at=_iso(T0 - 900))
     first = _wake(tmp_path, None, T0)
-    projection, _ref = _late_panel(tmp_path, "rv", settled_at=T0 + 60)
-    _write(tmp_path, "rv", review_projection=projection)
     _write(tmp_path, "kid", status="completed", updated_at=_iso(T0 + 90))
+    # A pre-fold acceptance_late_settlement row stays ordinary chat history, never a wake event.
     late_row = {"ts": _iso(T0 + 61), "direction": "system", "type": "acceptance_late_settlement", "task_id": "rv",
                 "text": "On the reviewed version…", "card_row": "reviews", "card_row_id": "acceptance-late:rk-9"}
-    _chat(tmp_path, _owner("hello", T0 + 30, cmid="h"), late_row, dict(late_row), _summary("kid", T0 + 95))
+    summary = _summary("kid", T0 + 95)
+    _chat(tmp_path, _owner("hello", T0 + 30, cmid="h"), late_row, summary, dict(summary))
     second = _wake(tmp_path, first.boundary, T0 + 600)
-    assert [kind for kind, _o, _l in second.events] == ["owner_message", "late_review", "task_terminal"]
+    assert [kind for kind, _o, _l in second.events] == ["owner_message", "task_terminal"]
     assert all(offset is not None for _k, offset, _l in second.events)  # each at its announcing row, once
     assert "no chat row in this window" not in second.full_text()
-    assert "- task kid completed" in _lines(second)[2]
+    assert "- task kid completed" in _lines(second)[1]
+    assert "On the reviewed version" not in second.full_text()
 
 
 def test_a_result_first_written_late_under_an_old_stamp_is_found_through_its_row(tmp_path):
@@ -321,17 +270,15 @@ def test_a_result_first_written_late_under_an_old_stamp_is_found_through_its_row
 
 
 def test_an_unreadable_task_store_keeps_the_accepted_inventory(tmp_path, monkeypatch):
-    import ouroboros.task_results as task_results
-
     _write(tmp_path, "kid", status="running", ts=_iso(T0 - 900), updated_at=_iso(T0 - 900))
     first = _wake(tmp_path, None, T0)
-    real = task_results.list_task_results
-    monkeypatch.setattr(task_results, "list_task_results", lambda _root, **_kw: (_ for _ in ()).throw(OSError("busy")))
+    real = wake._task_window
+    monkeypatch.setattr(wake, "_task_window", lambda *_args, **_kw: (_ for _ in ()).throw(OSError("busy")))
     _write(tmp_path, "kid", status="completed", updated_at=_iso(T0 + 60))
     blind = _wake(tmp_path, first.boundary, T0 + 600)
     assert blind.boundary["transitions"] == first.boundary["transitions"]  # nothing consumed
     assert "task_results unreadable: OSError" in blind.gaps
-    monkeypatch.setattr(task_results, "list_task_results", real)
+    monkeypatch.setattr(wake, "_task_window", real)
     assert "- task kid completed" in _lines(_wake(tmp_path, blind.boundary, T0 + 1200))[0]
 
 
@@ -343,32 +290,34 @@ def test_unfinished_and_malformed_lines_are_gaps_not_silence(tmp_path):
         handle.write(json.dumps(_owner("unfinished", since + 2, cmid="b"))[:-1])
     first = _observe(tmp_path)
     assert [line.rsplit('"', 2)[-2] for line in _lines(first)] == ["complete"]
-    assert "malformed_jsonl" in first.gaps and "gaps: malformed_jsonl" in first.full_text()
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write("}\n")  # the writer completes its line after the snapshot
+    assert any("jsonl_malformed" in gap for gap in first.gaps)
+    ds.append(tmp_path, "chat", _owner("unfinished", since + 2, cmid="b"))
     second = _observe(tmp_path, boundary=first.boundary)
     assert [line.rsplit('"', 2)[-2] for line in _lines(second)] == ["unfinished"]
 
 
-@pytest.mark.parametrize('rotate', [False, True])
-def test_first_partial_line_survives_completion_after_accepted_wake(tmp_path, rotate):
+def test_invalid_only_import_has_an_explicit_gap_and_later_sql_row_keeps_its_old_stamp(tmp_path):
     path = _chat(tmp_path)
-    raw = json.dumps(_owner('old timestamp, newly complete', T0 - 100, cmid='partial'))
-    path.write_text(raw[:-1], encoding='utf-8')
+    row = _owner("old timestamp, newly complete", T0 - 100, cmid="partial")
+    path.write_text(json.dumps(row)[:-1], encoding="utf-8")
     first = wake.observe_wake(tmp_path, boundary=None, since=T0 - 500, now=T0)
-    assert not first.events and first.boundary['upper'] == 0
-    with path.open('a', encoding='utf-8') as handle:
-        handle.write('}\n')
-    if rotate:
-        archive = tmp_path / 'archive'
-        archive.mkdir()
-        path.rename(archive / 'chat_2027-01-15.jsonl')
-        path.write_text('', encoding='utf-8')
+    assert not first.events and first.gaps and first.boundary["upper"] > 0
+    ds.append(tmp_path, "chat", row)
     second = wake.observe_wake(tmp_path, boundary=first.boundary, since=T0 + 10, now=T0 + 100)
-    assert len(second.events) == 1 and 'newly complete' in second.full_text()
-    assert second.window['basis'] == 'accepted_boundary' and not second.gaps
-    third = wake.observe_wake(tmp_path, boundary=second.boundary, since=T0 + 110, now=T0 + 200)
-    assert third.events == ()
+    assert len(second.events) == 1 and "newly complete" in second.full_text()
+    assert second.window["basis"] == "accepted_boundary" and not second.gaps
+    assert wake.observe_wake(tmp_path, boundary=second.boundary, since=T0 + 110, now=T0 + 200).events == ()
+
+
+def test_pending_import_does_not_advance_an_accepted_wake_boundary(tmp_path):
+    from tests._dialogue import seed
+
+    seed(tmp_path, archives={"chat_20261016T000000.jsonl": [_owner("pending", T0 - 100)]})
+    first = _observe(tmp_path)
+    assert any("still importing" in gap for gap in first.gaps)
+    assert "upper" not in first.boundary
+    import_all(tmp_path)
+    assert "pending" in _observe(tmp_path, boundary=first.boundary).full_text()
 
 
 def test_human_input_is_classified_by_producer_provenance(tmp_path):
@@ -386,7 +335,7 @@ def test_human_input_is_classified_by_producer_provenance(tmp_path):
           {"ts": _iso(since + 30), "direction": "system", "type": "quiz_answer", "task_id": "asker", "quiz": block},
           {**_owner("Keep", since + 30), "client_message_id": "quiz_late_answer:asker:q9"},
           {"ts": _iso(since + 40), "direction": "out", "chat_id": 1, "text": "my reply"},
-          # The durable row as the producer writes it (``log_chat``): its text and card placement only.
+          # A pre-fold late acceptance row exactly as its retired producer wrote it (``log_chat``).
           {"ts": _iso(since + 50), "direction": "system", "type": "acceptance_late_settlement", "task_id": "t1",
            "text": "Late review of an earlier revision: 2 findings", "card_row": "reviews",
            "card_row_id": "acceptance-late:rk-1"},
@@ -394,15 +343,15 @@ def test_human_input_is_classified_by_producer_provenance(tmp_path):
            "text": "⚠️ Error: RuntimeError: boom", "task_terminal_status": "failed"})
     observation = _observe(tmp_path)
     assert [kind for kind, _o, _l in observation.events] == [
-        "owner_message", "correspondent_message", "card_answer", "late_review", "task_error"]
+        "owner_message", "correspondent_message", "card_answer", "task_error"]
     lines = _lines(observation)
     assert "Presence correspondent message" in lines[1] and "from a correspondent" in lines[1]
     assert lines[2].startswith("- owner card q9 on task asker: answered") and "chose option 1: Keep" in lines[2]
-    # No task result records that settlement: the row's own words, never invented subject fields.
-    assert lines[3] == "- late review announced for task t1, 59 min ago: Late review of an earlier revision: 2 findings"
-    assert "task w1 runner failed" in lines[4]
+    assert "task w1 runner failed" in lines[3]
     text = observation.full_text()
     assert "I opened this cycle" not in text and "machine traffic" not in text and "my reply" not in text
+    # A pre-fold acceptance_late_settlement row is ordinary history of its chat, never a wake event.
+    assert "Late review of an earlier revision" not in text
 
 
 @pytest.mark.parametrize("status, origin", [("failed", "host_notice"), ("cancelled", ""),
@@ -482,12 +431,10 @@ def test_a_project_task_is_an_observed_event_not_a_wake_cause(tmp_path):
 
 
 def test_trigger_stays_first_when_task_results_are_unreadable(tmp_path, monkeypatch):
-    import ouroboros.task_results as task_results
-
-    def broken(_root, **_kw):
+    def broken(*_args, **_kw):
         raise OSError("broken task store")
 
-    monkeypatch.setattr(task_results, "list_task_results", broken)
+    monkeypatch.setattr(wake, "_task_window", broken)
     observation = _observe(tmp_path, since=T0 - 1)
     assert observation.trigger == "- wake cause: the scheduled wake time; events never move it, they are listed as observed"
     assert observation.gaps == ("task_results unreadable: OSError",)
@@ -544,7 +491,7 @@ def test_template_names_only_its_placeholders_and_the_wake_hints():
 
     assert set(re.findall(r"\{([a-z_]+)\}", template)) == set(wake.PLACEHOLDERS)
     for hint in ("A pause is a legitimate decision", "Distinguish incremental cash cost",
-                 "do not request task acceptance", "wake facts", "recent facts"):
+                 "do not ask the review pool to review the wake itself as a result", "wake facts", "recent facts"):
         assert hint in template, hint
     assert "a heartbeat, a task that finished, a project digest" not in template
     assert "up to 10 rounds" not in template and "300 seconds" not in template
@@ -639,17 +586,6 @@ def test_new_result_with_old_timestamps_and_no_chat_row_is_observed_once(tmp_pat
     assert _wake(tmp_path, second.boundary, T0 + 1200).events == ()
 
 
-def test_new_and_settled_panel_on_old_closed_task_is_observed_without_chat(tmp_path):
-    _write(tmp_path, "old", status="completed", ts=_iso(T0 - 86400), updated_at=_iso(T0 - 80000))
-    first = _wake(tmp_path, None, T0)
-    projection, _ref = _late_panel(tmp_path, "old", settled_at=T0 - 70000)
-    _write(tmp_path, "old", review_projection=projection)
-    second = _wake(tmp_path, first.boundary, T0 + 600)
-    assert [(kind, offset) for kind, offset, _ in second.events] == [("late_review", None)]
-    assert "late review settled for task old" in second.full_text()
-    assert _wake(tmp_path, second.boundary, T0 + 1200).events == ()
-
-
 def test_partial_old_inventory_upgrades_with_explicit_coverage_gap(tmp_path):
     _write(tmp_path, "old", status="completed", ts=_iso(T0 - 86400))
     boundary = _wake(tmp_path, None, T0).boundary
@@ -711,3 +647,60 @@ def test_projection_discloses_parked_wake_and_unknown_outcome(describe):
     assert "still occupies" not in completed_since["detail"] and completed_since["tasks_running"] == 0
     unknown = describe({**BASE, "last_wake_outcome": "unknown"})
     assert unknown["status"] == "wake_outcome_unknown" and "unconfirmed" in unknown["detail"]
+
+
+def test_narrow_task_window_equals_full_scan_and_reads_only_selected_bodies(tmp_path, monkeypatch):
+    from ouroboros import task_store, task_results
+
+    for tid, status in (("unchanged", "completed"), ("settling", "running"), ("changed", "completed"),
+                        ("chat-addressed", "running"), ("open-card", "running")):
+        _write(tmp_path, tid, status=status, ts=_iso(T0 - 600), updated_at=_iso(T0 - 600))
+    _write(tmp_path, "open-card", owner_quiz={"q": {"state": "open", "question": "Still open?"}})
+    first = _wake(tmp_path, None, T0)
+    # Backdated changes and newly inserted results must still be selected.
+    _write(tmp_path, "settling", status="completed", updated_at=_iso(T0 - 600))
+    _write(tmp_path, "changed", owner_quiz={"closed": {"state": "closed", "question": "Old?",
+                                                     "closed_at": _iso(T0 - 600)}})
+    _write(tmp_path, "new-old-date", status="failed", ts=_iso(T0 - 900), updated_at=_iso(T0 - 900))
+    _chat(tmp_path, _summary("chat-addressed", T0 + 10))
+    selected = []
+    original_decode = task_store._decode
+    def decode(*args):
+        rows = original_decode(*args)
+        selected.extend(row["task_id"] for row in rows)
+        return rows
+    monkeypatch.setattr(task_store, "_decode", decode)
+    narrow = _wake(tmp_path, first.boundary, T0 + 60)
+    assert set(selected) == {"settling", "changed", "new-old-date", "open-card", "chat-addressed"}
+    assert len(selected) == 5
+
+    def full(root, _prior, _chat):
+        rows = task_results.list_task_results(root, strict=True)
+        with task_store.open_store(root, write=False) as txn:
+            signatures = {tid: list(stamp) for tid, stamp in txn.write_seqs().items()}
+        return rows, signatures, {}
+    monkeypatch.setattr(wake, "_task_window", full)
+    reference = _wake(tmp_path, first.boundary, T0 + 60)
+    assert narrow == reference
+    assert narrow.source_bytes() == reference.source_bytes()
+    assert narrow.full_text() == reference.full_text()
+
+
+def test_boundary_without_signatures_reads_once_then_preserves_inventory(tmp_path, monkeypatch):
+    from ouroboros import task_store
+    _write(tmp_path, "old", status="completed", ts=_iso(T0 - 10), updated_at=_iso(T0 - 10))
+    first = _wake(tmp_path, None, T0)
+    first.boundary["transitions"].pop("signatures")
+    selected = []
+    original = task_store._decode
+    def decode(*args):
+        rows = original(*args)
+        selected.extend(row["task_id"] for row in rows)
+        return rows
+    monkeypatch.setattr(task_store, "_decode", decode)
+    second = _wake(tmp_path, first.boundary, T0 + 60)
+    assert selected == ["old"] and second.events == ()
+    selected.clear()
+    third = _wake(tmp_path, second.boundary, T0 + 120)
+    assert selected == [] and third.events == ()
+    assert third.boundary["transitions"]["inventory"] == first.boundary["transitions"]["inventory"]

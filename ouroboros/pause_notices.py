@@ -23,14 +23,47 @@ log = logging.getLogger(__name__)
 _LOCK = threading.Lock()
 
 
-def notice_fields(current: dict, root: Any, task_id: str, episode_id: str, reason: str) -> dict:
-    """Called inside the result writer, only for a newly confirmed pause episode."""
+def notice_fields(current: dict, root: Any, task_id: str, episode_id: str, reason: str, *,
+                  fence: dict | None = None) -> dict:
+    """Called inside the result writer, only for a newly confirmed pause episode.
+
+    ``fence`` is the owner Pause this episode confirms: the author it declared
+    (``control_actor.pause_author``) is kept with the notice, so a later Pause
+    of the same task never rewords it.
+    """
+    from ouroboros.control_actor import pause_author
+
     if not episode_id or reason not in {"budget", "owner", "authority"}:
         return {}
     identity = f"pause:{task_id}:{episode_id}"
     pending = dict(current.get("pause_notices") or {})
-    pending.setdefault(identity, {"reason": reason, "confirmed_at": utc_now_iso()})
+    by = {"by": pause_author(fence)} if fence is not None else {}
+    pending.setdefault(identity, {"reason": reason, "confirmed_at": utc_now_iso(), **by})
     return {"pause_notices": pending}
+
+
+_RETAINED = "Its work is retained; Resume continues it."
+
+
+def notice_text(notice: dict) -> str:
+    """The sentence one owed notice says; an owner Pause names the author its own fence declared."""
+    if notice.get("reason") == "owner":
+        by = notice.get("by") if isinstance(notice.get("by"), dict) else {}  # a notice saved before ``by``: nobody
+        said = " ".join(str(by.get("text") or "").split())
+        if by.get("actor") == "owner":
+            return f"You paused this task. {_RETAINED}"
+        if by.get("actor") == "ouroboros" and said:
+            ended = said if said.endswith((".", "!", "?", "…")) else f"{said}."
+            return f"Ouroboros paused this task: {ended} {_RETAINED}"
+        if by.get("actor") == "ouroboros":
+            return f"Ouroboros paused this task. {_RETAINED}"
+        return f"This task was paused. {_RETAINED}"
+    authority = notice.get("reason") == "authority"
+    cause = ("a technical fault: its billing or control authority could not be read, which says nothing about "
+             "money left") if authority else "its budget limit"
+    resume = "Fix the cause, then use Resume on the task when available" if authority else (
+        "Use Resume on the task when available")
+    return f"The task paused because of {cause}. Its work is retained. {resume}."
 
 
 def _acknowledge(root: pathlib.Path, task_id: str, identity: str, notice: dict) -> None:
@@ -92,15 +125,10 @@ def reconcile_pause_notices(drive_root: Any, *, stop_requested=None) -> None:
                     # Read per notice: a failed send whose row DID land (a live
                     # transport error after the append) is seen on the next pass.
                     if receipt not in obligations.members(root, "pause_notice_receipts"):
-                        cause = {"owner": "the owner's Pause", "authority": (
-                            "a technical fault: its billing or control authority could not be read, which says "
-                            "nothing about money left")}.get(str(notice.get("reason")), "its budget limit")
-                        resume = ("Fix the cause, then use Resume on the task when available"
-                                  if notice.get("reason") == "authority" else "Use Resume on the task when available")
-                        text = f"The task paused because of {cause}. Its work is retained. {resume}."
                         message_bus.send_with_budget(
-                            chat_id, text, task_id=task_id, role="system", system_type="task_pause_notice",
-                            narration=False, require_write=True, ensure_record_boundary=True,
+                            chat_id, notice_text(notice), task_id=task_id, role="system",
+                            system_type="task_pause_notice", narration=False, require_write=True,
+                            ensure_record_boundary=True,
                             progress_meta={**{k: event[k] for k in ("root_task_id", "parent_task_id") if k in event},
                                            "card_row": "timeline", "card_row_id": identity},
                         )

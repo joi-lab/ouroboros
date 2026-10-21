@@ -120,7 +120,8 @@ def render_skill_review_block(
         lines.append("")
         for model_key in matrix_order:
             model_label = str(by_model[model_key][0].get("model") or model_key)
-            lines.append(f"### Reviewer: {model_label}" + (f" [{model_key}]" if model_key != model_label else ""))
+            lines.append(f"### Reviewer: {model_label}" + (f" [{model_key}]" if model_key != model_label else "")
+                         + (" (adviser, not counted)" if by_model[model_key][0].get("additional") else ""))
             for f in by_model[model_key]:
                 item = str(f.get("item") or "?")
                 verdict = str(f.get("verdict") or "").upper()
@@ -149,7 +150,7 @@ def render_skill_review_block(
             model = str(r.get("model_id") or r.get("model") or "reviewer")
             status_raw = str(r.get("status") or "unknown")
             raw_text = str(r.get("raw_text") or "")
-            lines.append(f"### Reviewer: {model} ({status_raw})")
+            lines.append(f"### Reviewer: {model} ({status_raw})" + (" (adviser, not counted)" if r.get("additional") else ""))
             lines.append(format_prompt_code_block(raw_text, "text"))
         lines.append("")
 
@@ -174,13 +175,13 @@ def render_skill_review_block(
         lines.append("")
 
     has_fails = any(
-        isinstance(f, dict) and str(f.get("verdict") or "").upper() == "FAIL"
+        isinstance(f, dict) and not f.get("additional") and str(f.get("verdict") or "").upper() == "FAIL"
         for f in findings
     )
     if has_fails:
         fail_items = []
         for f in findings:
-            if not isinstance(f, dict):
+            if not isinstance(f, dict) or f.get("additional"):
                 continue
             if str(f.get("verdict") or "").upper() != "FAIL":
                 continue
@@ -208,6 +209,21 @@ def render_skill_review_block(
 
 
 # Parsing / aggregation
+
+
+def skill_result_panel(result: Dict[str, Any], delivery: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach the admitted seats' standing and measured cost before any parser reads them."""
+    from ouroboros.reviewer_slot_config import review_cost_facts
+    ids = delivery.get("slot_ids") or []
+    advisers = {sid for sid, extra in zip(ids, delivery.get("additional") or []) if extra}
+    routes = dict(zip(ids, delivery.get("routes") or []))
+    for index, row in enumerate(result.get("results") or []):
+        sid = row.get("slot_id") or (ids[index] if index < len(ids) else "")
+        row["additional"] = sid in advisers
+        route = routes.get(sid, "")
+        row.update(review_cost_facts(row.get("cost_estimate"), route=str(getattr(route, "value", route)),
+                                    model=str(row.get("model") or "")))
+    return result
 
 
 def _extract_actor_findings(

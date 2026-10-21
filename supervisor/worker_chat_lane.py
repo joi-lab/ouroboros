@@ -293,6 +293,7 @@ def _admit_chat_task(
     # The registered execution includes agent construction, attachment staging,
     # the whole native lifecycle and event delivery, not just its LLM rounds.
     from ouroboros.consciousness_authority import is_consciousness_origin
+    from supervisor.active_activity import reply_expected
 
     quiet = is_consciousness_origin(task_metadata)  # a wake: the alarm reports the refusal, not the chat
     with _pool()._repo_writer_gate_lock:
@@ -303,7 +304,7 @@ def _admit_chat_task(
             client_message_id=client_msg_id,
             project_id=str((task_metadata or {}).get("project_id") or ""),
             kind=kind, origin_message_ref=(task_metadata or {}).get("origin_message_ref"),
-            actor=agent,
+            actor=agent, reply_expected=reply_expected({"metadata": task_metadata or {}}),
         )
     admitted: Dict[str, Any] = {
         "task": task, "agent": agent, "activity": activity, "registry": registry,
@@ -560,6 +561,8 @@ def _report_direct_chat_error(admitted: Dict[str, Any], e: BaseException) -> Non
             "traceback": str(traceback.format_exc())[:2000],
         },
     )
+    if admitted.get("activity") is not None:
+        admitted["activity"].reply_handed_off = True  # this failure IS the turn's reply
     try:
         # Key the error final with the turn's activity id so the client
         # concludes exactly this turn (active set, 4A) instead of leaving

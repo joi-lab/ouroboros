@@ -11,15 +11,16 @@
  *   pager: { around: Function, revisit: Function, pageOf: (id: string) => ?string },
  *   reading: { claim: () => () => boolean, stick: boolean, nearBottom: () => boolean },
  *   feed: Element,
- *   records: Map<string, { root?: Element }>,
+ *   records: Map<string, { root?: Element, items?: Array<Object>, parentGroupId?: string }>,
  *   present: () => boolean,  // the room is still shown and alive
+ *   expand?: (record: Object) => void,  // existing card disclosure/materialization owner
  * }} owners
  */
-export function createHistoryReveal({ pager, reading, feed, records, present }) {
+export function createHistoryReveal({ pager, reading, feed, records, present, expand = () => {} }) {
     // One history read for a navigation (the pager lets a window read in flight finish first): null once
     // the reader has moved on.
-    async function read(isCurrent, load) {
-        const claimed = reading.claim();
+    async function read(isCurrent, load, claim = true) {
+        const claimed = claim ? reading.claim() : () => true;
         const wanted = () => present() && isCurrent() && claimed();
         const result = await load(wanted).catch((error) => ({ status: 'error', error }));
         return wanted() ? result : null;
@@ -37,7 +38,48 @@ export function createHistoryReveal({ pager, reading, feed, records, present }) 
             .find((node) => node.dataset.historyId === id || node.dataset.sourceHistoryId === id) || null : null;
     }
 
+    // Exact references may name a line in a collapsed child card. Expand through the same card owner
+    // that handles its disclosure, then require the actual addressed node. A portal, retained context,
+    // or a folded repeat with no original line is not an exact landing.
+    function exact(address, id = '') {
+        const find = () => [...feed.querySelectorAll('[data-row-address], [data-history-id]')].find(node =>
+            (node.dataset.rowAddress === address || id && node.dataset.historyId === id)
+            && node.dataset.originProjected !== '1'
+            && (!address.startsWith('row:') || !node.closest?.('[data-portal="1"]'))) || null;
+        let target = find();
+        if (!target && id) {
+            const record = [...records.values()].find(record => record.items?.some(item => item.historyId === id));
+            const seen = new Set();
+            for (let owner = record; owner && !seen.has(owner); owner = records.get(owner.parentGroupId)) {
+                if (owner.root?.dataset.portal === '1') return null;
+                seen.add(owner); expand(owner);
+                if (owner.episodeDisclosure) owner.episodeDisclosure.open = true;
+            }
+            target = find();
+        }
+        for (let node = target?.parentElement; node && node !== feed; node = node.parentElement) {
+            if (node.matches?.('details')) node.open = true;
+            const record = records.get(node.dataset.taskId);
+            if (node.matches?.('.chat-live-card') && record) expand(record);
+        }
+        return target && !target.closest?.('[hidden]') && target.getClientRects?.().length !== 0 ? target : null;
+    }
+
     return {
+        exact,
+        // Reply's caller claims once before any I/O and carries that intent across destination lookup.
+        // Task references keep their work-card semantics; only row references require an exact node.
+        // A failed read keeps its typed error (the host's reason code); `left`: a page was drawn without it.
+        async reference(address, isCurrent, prepared = null) {
+            const result = await read(isCurrent, wanted => pager.around(address, wanted, prepared), false);
+            if (!result) return null;
+            if (result.status === 'anchor') return result.anchor;
+            if (result.status === 'error') return { state: 'unknown', error: result.error };
+            if (result.status !== 'applied') return { state: 'unknown' };
+            const target = address.startsWith('task:') ? landing(address.slice(5), result.anchor)
+                : result.anchor?.row_address === address ? exact(address, result.anchor.history_id) : null;
+            return target ? { target } : { state: 'unavailable', left: true };
+        },
         // Where a return goes: the passage on screen, the page of the reader's chain that holds it (read again
         // if it was let go meanwhile) and whether the reader was following the present: held to the newest
         // message and still at it (a view moved without a gesture, by focus or find in page, is a passage).

@@ -419,6 +419,7 @@ def log_preflight_test_proof(ctx, proof: PreflightTestProof, *, reused: bool, ph
         "pass_seconds": dict(passes or ()), "budget_sec": proof.workload[1],
         "head": proof.head, "tree": proof.tree, "index_tree": proof.index_tree,
         "workload_fingerprint": fingerprint,
+        "evidence": getattr(ctx, "_preflight_test_evidence", None),
         **scope_record(proof, getattr(ctx, "_preflight_test_inventory", None)),
         **({"receipt": receipt} if receipt is not None else {}),
         **({"empty_lanes": list(empty_lanes)} if isinstance(empty_lanes, list) else {}),
@@ -443,7 +444,7 @@ def preflight_test_workload(
     from ouroboros import preflight_runner as pr
     from ouroboros.preflight_node import candidate_node_tests, resolve_node
     from ouroboros.process_containment import CONTAINMENT_ENV_PREFIX
-    from ouroboros.test_environment import default_temp_parent
+    from ouroboros.test_environment import OUTPUT_LOCATION_KEYS, default_temp_parent
     from ouroboros.preflight_inventory import MODULE, selection_passes
     from ouroboros.test_parallelism import requested_workers
 
@@ -453,9 +454,11 @@ def preflight_test_workload(
     # changes what a proof covers, and naming the workload reads no memory at all.
     env = pr._preflight_env(base, base / "repo", create=False, workers=requested_workers(os.cpu_count() or 1))
     # Containment membership stays in the child env (an outer reap must see the
-    # tree), but its keys are per-launch nonces, not test inputs.
+    # tree), but its keys are per-launch nonces, not test inputs. Evidence and
+    # diagnostic destinations are output locations, never part of what a proof covers.
     environment = hashlib.sha256(json.dumps({key: value for key, value in env.items()
-                                             if not key.startswith(CONTAINMENT_ENV_PREFIX)},
+                                             if not key.startswith(CONTAINMENT_ENV_PREFIX)
+                                             and key not in OUTPUT_LOCATION_KEYS},
                                             sort_keys=True).encode()).hexdigest()
     python = agent_python or os.environ.get("OUROBOROS_AGENT_PYTHON") or sys.executable or "python3"
     specs = passes if passes is not None else (selection_passes(selection) if selection else pr._preflight_pass_specs(pytest_args))

@@ -103,7 +103,9 @@ print(json.dumps({
 
 
 @pytest.mark.serial
-def test_pytest_scrubbed_child_keeps_disposable_state_root(tmp_path):
+def test_pytest_scrubbed_child_keeps_disposable_state_root(tmp_path, monkeypatch):
+    from tests.conftest import _PYTEST_DEFAULTS
+
     repo = pathlib.Path(__file__).resolve().parents[1]
     fake_home = tmp_path / "home"
     fake_live = fake_home / "Ouroboros" / "data" / "state"
@@ -114,14 +116,13 @@ def test_pytest_scrubbed_child_keeps_disposable_state_root(tmp_path):
     }
     for path, content in sentinels.items():
         path.write_bytes(content)
-    disposable_state = pathlib.Path(os.environ["OUROBOROS_DATA_DIR"]) / "state"
-    disposable_paths = tuple(
-        disposable_state / name
-        for name in ("state.json", "state.last_good.json", "evolution_campaign.json")
-    )
-    disposable_before = {
-        path: path.read_bytes() if path.exists() else None for path in disposable_paths
-    }
+    # The scrubbed child receives the session's disposable default root, which every
+    # earlier test of this process shares. A queue snapshot one of them left there is
+    # prior history, and a first state is then refused by design
+    # (prior_history_without_state). A fresh disposable default keeps the invariant
+    # under test, the default and never the fake home, independent of what ran before.
+    disposable = tmp_path / "disposable-data"
+    monkeypatch.setitem(_PYTEST_DEFAULTS, "OUROBOROS_DATA_DIR", str(disposable))
     code = """
 import json
 from supervisor import evolution_lifecycle, state
@@ -139,31 +140,22 @@ print(json.dumps({
     child_env = {"HOME": str(fake_home), "USERPROFILE": str(fake_home)}
     if os.name == "nt" and os.environ.get("SystemRoot"):
         child_env["SystemRoot"] = os.environ["SystemRoot"]
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-c", code],
-            cwd=repo,
-            env=child_env,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=repo,
+        env=child_env,
+        capture_output=True,
+        text=True,
+    )
+    # A bare exit 1 from a CI runner is undiagnosable: name the child's own words.
+    assert proc.returncode == 0, f"scrubbed child exited {proc.returncode}; stderr tail: {proc.stderr[-2000:]!r}"
 
-        payload = json.loads(proc.stdout.strip().splitlines()[-1])
-        assert payload["pytest_loaded"] is False
-        assert pathlib.Path(payload["drive_root"]).resolve(strict=False) == pathlib.Path(
-            os.environ["OUROBOROS_DATA_DIR"]
-        ).resolve(strict=False)
-        assert payload["campaign_id"]
-        for path, content in sentinels.items():
-            assert path.read_bytes() == content
-    finally:
-        for path, content in disposable_before.items():
-            if content is None:
-                path.unlink(missing_ok=True)
-            else:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(content)
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert payload["pytest_loaded"] is False
+    assert pathlib.Path(payload["drive_root"]).resolve(strict=False) == disposable.resolve(strict=False)
+    assert payload["campaign_id"]
+    for path, content in sentinels.items():
+        assert path.read_bytes() == content
 
 
 @pytest.mark.serial

@@ -261,6 +261,7 @@ class FullGateReceipt:
         self.status = "declined" if path is None else "unchecked"
         self.origin: dict = {}
         self.empty_lanes: Optional[list] = None
+        self.evidence = None
 
     @classmethod
     def prepare(cls, ctx: Any, subject: Any, passes, probe_module: str, agent_python: str,
@@ -313,6 +314,7 @@ class FullGateReceipt:
             log.warning("Preflight receipt %s is not usable (%s); running the gate", self.path, problem)
             return False
         self.status, self.origin = "reused", {key: document[key] for key in _PROVENANCE}
+        self.evidence = document.get("evidence")
         # Only a non-empty parallel lane is ever published; the serial lane may have been empty.
         self.empty_lanes = ["serial"] if document["lanes"]["serial"] == "empty" else []
         return True
@@ -345,6 +347,7 @@ class FullGateReceipt:
             if reason:
                 self.status, self.reason = "declined", reason
                 return
+            self.evidence = getattr(ctx, "_preflight_test_evidence", None)
             atomic_write_json(self.path, {
                 "schema": RECEIPT_SCHEMA, "identity": self.identity, "result": "passed",
                 "authenticity": "unsigned",
@@ -352,6 +355,7 @@ class FullGateReceipt:
                           "admitted_workers": admitted, "serial": "empty" if "serial" in empty_passes else "passed"},
                 "pass_seconds": dict(timings), "phase": phase,
                 "task_id": str(getattr(ctx, "task_id", "") or ""), "created_at": utc_now_iso(),
+                "evidence": getattr(ctx, "_preflight_test_evidence", None),
             })
             self.status = "published"
         except Exception as exc:  # durability is an optimization; the verdict is already decided
@@ -361,6 +365,7 @@ class FullGateReceipt:
     def disclosure(self) -> dict:
         """The event-log projection: disclosure, never authority."""
         return {"status": self.status, "key": self.key, **({"reason": self.reason} if self.reason else {}),
+                **({"evidence": self.evidence} if self.evidence else {}),
                 **({"origin": dict(self.origin)} if self.origin else {})}
 
 

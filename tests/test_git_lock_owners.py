@@ -374,11 +374,12 @@ def replacement_history(tmp_path_factory):
     """Build the common four-commit history once; expose immutable bytes, never its root."""
     repo = _init_repo(tmp_path_factory.mktemp("git-lock-history"))
     root = _commit(repo, "root", {"BIBLE.md": "constitution\n", "ouroboros/store.py": "# store\n",
-                                  "ouroboros/usage_store.py": "# usage\n", "seed.txt": "seed\n"})
+                                  "ouroboros/usage_store.py": "# usage\n", "ouroboros/dialogue_store.py": "# dialogue\n",
+                                  "seed.txt": "seed\n"})
     base = _commit(repo, "owner work", {"local.txt": "owner commit\n"})
     _git(repo, "checkout", "-q", "-b", "official", root)
     target = _commit(repo, "official release", {"official.txt": "release\n"})
-    storeless = _commit(repo, "store-less release", delete=("ouroboros/store.py",))
+    storeless = _commit(repo, "store-less release", delete=("ouroboros/store.py", "ouroboros/dialogue_store.py"))
     _git(repo, "checkout", "-q", "ouroboros")
     (repo / ".git" / git_ops.MANAGED_REPO_META_NAME).write_text(
         json.dumps({"managed_local_branch": "ouroboros"}), encoding="utf-8")
@@ -917,7 +918,7 @@ def test_a_store_less_target_the_switch_did_not_reach_is_never_replayed_or_final
     scene = replace_scene
     if history == "older_ancestor":  # a real downgrade: the running checkout descends from the old release
         _git(scene.repo, "checkout", "-q", "-B", "ouroboros", scene.storeless)
-        _commit(scene.repo, "the store arrives", {"ouroboros/store.py": "# store\n"})
+        _commit(scene.repo, "the store arrives", {"ouroboros/store.py": "# store\n", "ouroboros/dialogue_store.py": "# dialogue\n"})
         scene.base = _commit(scene.repo, "owner work", {"local.txt": "owner commit\n"})
     ensure_current_store(scene.data)
     lock = _orphan_lock(scene.repo)
@@ -1078,7 +1079,8 @@ def restore_door(tmp_path, monkeypatch):
     repo = _init_repo(tmp_path)
     storeless = _commit(repo, "before the store", {"BIBLE.md": "constitution\n", "seed.txt": "storeless\n",
                                                    "ouroboros/usage_store.py": "# usage\n"})
-    old = _commit(repo, "the store arrives", {"ouroboros/store.py": "# store\n", "seed.txt": "old\n"})
+    old = _commit(repo, "the store arrives", {"ouroboros/store.py": "# store\n", "ouroboros/dialogue_store.py": "# dialogue\n",
+                                              "seed.txt": "old\n"})
     head = _commit(repo, "owner work", {"seed.txt": "new\n", "new.txt": "new\n"})
     data = tmp_path / "data"
     (data / "logs").mkdir(parents=True)

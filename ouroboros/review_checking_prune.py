@@ -16,6 +16,20 @@ discarded views, and a view that no seat holding a copy needs and whose last use
 process, when a finished seat names it or it is older than the retention period. It does not
 run after a pass that stopped early, found a seat busy or could not read a seat used within
 the retention period.
+
+The same pass retires an isolated checkout (``state/review_checkouts/<token>/``, made by
+``review_subject.isolated_checkout``) that its wave kept for open custody or that a crash left,
+once no review can still read it: its task is terminal and not live, no active review custody
+(``state/advisory_review.json``) names its round, no live review operation runs for the task and
+no seat that still holds a copy checks from it. Its owner is the task its ``checkout.json`` names;
+a checkout made before the marker is owned only through a recorded round of that state, and goes
+only once older than the retention period. Targeted ``git worktree remove`` retires only this
+checkout's registration. A rejoin rebuilds a retired checkout at its frozen tree. An unreadable
+review state or a busy or unreadable seat keeps every such checkout; an unreadable marker or task
+row keeps its own. Isolated-checkout reuse and retirement share no per-token lock:
+a rejoin starting after the custody judgment can reuse the tree and then lose it
+during removal. The pass lock only serializes pruners; the seat/view locks above
+protect other objects. Rebuilding after completed retirement does not close that race.
 """
 from __future__ import annotations
 
@@ -84,6 +98,126 @@ def _copy_runs_over(data_root: Any, task_id: str, area: pathlib.Path, created_at
     return True if any(_started_after(entry.started_ts, created_at) for entry in runs) else None
 
 
+def _checkout_entries(base: pathlib.Path) -> list:
+    """The ``<token>/`` folders ``review_subject.isolated_checkout`` makes (not ``seats/``, ``views/`` or dot names)."""
+    try:
+        return [entry for entry in sorted(base.iterdir()) if entry.name not in {"seats", "views"}
+                and not entry.name.startswith(".") and not entry.is_symlink() and entry.is_dir()]
+    except OSError:
+        return []
+
+
+def _review_rounds(data_root: Any) -> tuple:
+    """``(active, owners)`` from the one review state (``state/advisory_review.json``): the checkout
+    names of rounds whose custody is still active, and every recorded round's task by its checkout
+    name. A state that cannot be read raises: no checkout is judged without it."""
+    from ouroboros.review_state import _load_state_unlocked
+    from ouroboros.tools.review_subject import checkout_token
+
+    state = _load_state_unlocked(pathlib.Path(data_root), strict_attempt_authority=True)
+
+    def name(attempt: Any) -> str:
+        return checkout_token(attempt.review_retry_key, task_id=attempt.task_id)
+
+    return ({name(row) for row in state.get_active_attempts() if row.review_retry_key},
+            {name(row): str(row.task_id) for row in state.attempts if row.review_retry_key and row.task_id})
+
+
+def _checkout_hold(data_root: Any, entry: pathlib.Path, *, rounds: tuple, sources: set,
+                   live: Callable[[], Any], cutoff: float) -> str:
+    """Why the isolated checkout ENTRY stays, or ``""`` when no review can still read it."""
+    from ouroboros.review_operation import task_has_live_review_operation
+    from ouroboros.task_results import load_task_result
+    from ouroboros.task_status import SETTLED_STATUSES
+    from ouroboros.tools.review_subject import CHECKOUT_MARKER
+
+    active, owners = rounds
+    try:
+        marker = json.loads((entry / CHECKOUT_MARKER).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        marker = None  # made before the marker: owned only through a recorded round, and only past the wait
+    if marker is not None and (not isinstance(marker, dict) or marker.get("schema_version") != 1):
+        return "marker_unreadable"
+    task_id = str(marker.get("task_id") or "") if marker is not None else owners.get(entry.name, "")
+    repo = (entry / "repo").resolve(strict=False)
+    if not task_id:
+        return "owner_unknown"
+    if entry.name in active:
+        return "review_custody_active"
+    if any(root == repo or root.is_relative_to(repo) for root in sources):
+        return "seat_checking"
+    if marker is None and _last_use(entry) >= cutoff:
+        return "younger_than_retention"
+    row = load_task_result(data_root, task_id, strict=True) or {}
+    if str(row.get("status") or "") not in SETTLED_STATUSES:
+        return "task_not_terminal"
+    if task_id in live():
+        return "task_live"
+    if task_has_live_review_operation(data_root, task_id, result_loader=lambda tid: row if tid == task_id else (
+            load_task_result(data_root, tid, strict=True) or {})):
+        return "operation_live"
+    return ""
+
+
+def _checkout_registration_gone(repo: pathlib.Path) -> bool:
+    """A deleted subject leaves a Git pointer to an absent registration; unreadable is not absent."""
+    pointer = (repo / ".git").read_text(encoding="utf-8").strip()
+    if not pointer.startswith("gitdir: ") or not pointer[8:]:
+        return False
+    try:
+        (repo / pointer[8:]).stat()
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def _remove_checkout(entry: pathlib.Path) -> str:
+    """Remove this checkout after Git unregisters it or its registration is already gone."""
+    from ouroboros.subagent_worktrees import _force_rmtree
+    from ouroboros.tools.review_subject import _git_bytes
+
+    repo, common = entry / "repo", None
+    if (repo / ".git").is_file():
+        rc, out, err = _git_bytes(repo, ["rev-parse", "--git-common-dir"])
+        text = out.decode("utf-8", "replace").strip()
+        common = (repo / text).resolve(strict=False) if rc == 0 and text else None
+        if common is None or not common.is_dir():
+            if not _checkout_registration_gone(repo):
+                return f"{entry.name}: Git common directory unavailable: {err.strip()}"
+        else:
+            rc, _out, err = _git_bytes(common, ["--git-dir", str(common), "worktree", "remove", "--force", str(repo)])
+            if rc:
+                return f"{entry.name}: Git worktree removal failed: {err.strip()}"
+    _force_rmtree(entry)
+    if entry.exists() or entry.is_symlink():
+        return f"{entry.name}: the checkout survived its removal"
+    return ""
+
+
+def _retire_checkouts(data_root: Any, entries: list, live: Callable[[], Any], cutoff: float, sources: set,
+                      stopped: Callable[[], bool], report: Dict[str, Any]) -> None:
+    """Judge and remove the isolated checkouts ENTRIES; ``sources`` are the roots kept seats check from."""
+    try:
+        rounds = _review_rounds(data_root)
+    except Exception as exc:  # unknown custody: every checkout stays
+        report["errors"].append(f"review state unreadable: {type(exc).__name__}: {exc}")
+        return
+    for entry in entries:
+        if stopped():
+            return
+        try:
+            hold = _checkout_hold(data_root, entry, rounds=rounds, sources=sources, live=live, cutoff=cutoff)
+            error = "" if hold else _remove_checkout(entry)
+        except Exception as exc:  # an unreadable marker, row or tree keeps the checkout
+            hold, error = "", f"{entry.name}: {type(exc).__name__}: {exc}"
+        if error:
+            report["errors"].append(error)
+        elif hold:
+            report["checkouts_kept"] += 1
+        else:
+            report["checkouts_removed"] += 1
+
+
 def prune_review_checkouts(data_root: Any, live_task_ids: Any, *, views_since: Optional[float] = None,
                            retention_days: Optional[int] = None, now: Optional[float] = None,
                            stop: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
@@ -98,8 +232,9 @@ def prune_review_checkouts(data_root: Any, live_task_ids: Any, *, views_since: O
     seats, view_root = base / "seats", base / "views"
     views = views_since is not None
     report: Dict[str, Any] = {"released": 0, "removed": 0, "kept": 0, "busy": 0, "capture_failed": 0,
-                              "errors": []}
-    if not (seats.is_dir() or views and view_root.is_dir()):
+                              "checkouts_removed": 0, "checkouts_kept": 0, "errors": []}
+    checkouts = _checkout_entries(base)
+    if not (seats.is_dir() or checkouts or views and view_root.is_dir()):
         return {**report, "views_done": views}
     if not _PASS_LOCK.acquire(blocking=False):
         return {**report, "skipped": "pass_in_progress"}
@@ -109,7 +244,7 @@ def prune_review_checkouts(data_root: Any, live_task_ids: Any, *, views_since: O
         live = live_task_ids if callable(live_task_ids) else (lambda: live_task_ids)
         stopped = stop or (lambda: False)
         cutoff = age_cutoff(get_gc_retention_days() if retention_days is None else retention_days, now)
-        named, kept_views, unread, busy = set(), set(), [], []
+        named, kept_views, unread, busy, sources = set(), set(), [], [], set()
 
         def remove(path: pathlib.Path) -> None:
             if not _checking_area_present(path):
@@ -194,10 +329,13 @@ def prune_review_checkouts(data_root: Any, live_task_ids: Any, *, views_since: O
                         remove(leftover)
                     if not _checking_area_present(area):
                         return set()
-                    return views_of if retire(home, area) else set()
+                    kept = retire(home, area)
                 except Exception as exc:  # its views are known and stay; the views pass need not wait for it
                     report["errors"].append(f"{home.name}: {type(exc).__name__}: {exc}")
-                    return views_of
+                    kept = True
+                if kept and source.get("root"):  # a copy that stays may still read the checkout it came from
+                    sources.add(pathlib.Path(str(source["root"])).resolve(strict=False))
+                return views_of if kept else set()
 
         for home in sorted(seats.iterdir()) if seats.is_dir() else ():
             if stopped():
@@ -210,6 +348,8 @@ def prune_review_checkouts(data_root: Any, live_task_ids: Any, *, views_since: O
             except Exception as exc:  # a seat whose views are unknown never stops the pass; it keeps every view
                 unread.append(home.name)
                 report["errors"].append(f"{home.name}: {type(exc).__name__}: {exc}")
+        if checkouts and not unread and not busy and not stopped():
+            _retire_checkouts(data_root, checkouts, live, cutoff, sources, stopped, report)
         if views and not unread and not stopped():
             doomed = []
             with _seat_locked(base, wait=False, name=VIEWS_LOCK_NAME) if view_root.is_dir() else contextlib.nullcontext(

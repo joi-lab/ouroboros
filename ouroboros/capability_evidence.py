@@ -74,7 +74,64 @@ _CTX_LIMIT_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"maximum allowed length\s*\(?\s*([0-9][0-9,]*)", re.I),
     re.compile(r"context (?:window|length)\s*(?:of|is)?\s*([0-9][0-9,]*)\s*tokens", re.I),
     re.compile(r"maximum (?:input |prompt )?(?:length|tokens?)\s*(?:is|of)?\s*([0-9][0-9,]*)", re.I),
+    # Anthropic ("prompt is too long: 215000 tokens > 200000 maximum"; "input length and `max_tokens` exceed
+    # context limit: 190000 + 65536 > 200000") and Gemini ("... exceeds the maximum number of tokens allowed
+    # (1048576)") state the limit after the size.
+    re.compile(r"tokens\s*>\s*([0-9][0-9,]*)\s*maximum", re.I),
+    re.compile(r"context limit:\s*[0-9][0-9,]*\s*\+\s*[0-9][0-9,]*\s*>\s*([0-9][0-9,]*)", re.I),
+    re.compile(r"maximum number of tokens allowed\s*\(?\s*([0-9][0-9,]*)", re.I),
 )
+#: The refused request's whole input where the provider states it beside the limit: OpenAI ("your messages
+#: resulted in N tokens"), Anthropic ("prompt is too long: N tokens", "context limit: N + R") and Gemini
+#: ("input token count (N)").
+_CTX_INPUT_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"resulted in\s*([0-9][0-9,]*)\s*tokens", re.I),
+    re.compile(r"prompt is too long:\s*([0-9][0-9,]*)\s*tokens", re.I),
+    re.compile(r"context limit:\s*([0-9][0-9,]*)\s*\+", re.I),
+    re.compile(r"input token count\s*\(?\s*([0-9][0-9,]*)", re.I),
+)
+#: Shares of the input where only the parts are stated: OpenAI's messages and functions (tool definitions),
+#: OpenRouter's "N of <kind> input".
+_CTX_INPUT_PART = re.compile(r"([0-9][0-9,]*)\s*(?:of [a-z]+ input|in the (?:messages|functions))", re.I)
+#: The reply the refused request reserved ("R in the completion" / "in the output", Anthropic's "+ R").
+_CTX_REPLY_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"([0-9][0-9,]*)\s*in the (?:completion|output)", re.I),
+    re.compile(r"context limit:\s*[0-9][0-9,]*\s*\+\s*([0-9][0-9,]*)", re.I),
+)
+#: OpenAI's and OpenRouter's "you requested (about) N tokens" is a total: the input plus that reserved reply.
+_CTX_TOTAL_PATTERN = re.compile(r"you requested (?:about\s*)?([0-9][0-9,]*)\s*tokens", re.I)
+
+
+def gateway_double_counted_cache(prompt_tokens: int, cached_tokens: int) -> bool:
+    """A cache-inclusive total landing on 2 x cached (+-1): a gateway adding the cache read on top.
+
+    Neither a density witness nor a conversation's size anchor (``context_anchor``) learns from it
+    (``observe_token_density`` names the paid run that showed it)."""
+    return bool(cached_tokens) and abs(int(prompt_tokens) - 2 * int(cached_tokens)) <= 1
+
+
+def _parse_ctx_requested(text: str) -> Tuple[int, int, int]:
+    """``(input, reply, total)`` of a refused request as the provider stated them beside its limit; 0 = unstated.
+
+    A total beside its reply share gives the input as the difference, whatever parts it lists (messages,
+    functions, images); else a stated whole input; else the sum of the stated input parts. A bare total stays a
+    total: it already holds the reply that request reserved.
+    """
+    text = str(text or "")
+
+    def first(patterns: Tuple[re.Pattern[str], ...]) -> int:
+        for pat in patterns:
+            m = pat.search(text)
+            if m:
+                return int(m.group(1).replace(",", ""))
+        return 0
+
+    reply = first(_CTX_REPLY_PATTERNS)
+    total = first((_CTX_TOTAL_PATTERN,))
+    if reply and total > reply:
+        return total - reply, reply, total
+    stated = first(_CTX_INPUT_PATTERNS) or sum(int(n.replace(",", "")) for n in _CTX_INPUT_PART.findall(text))
+    return stated, reply, total
 
 
 def _parse_ctx_limit_number(text: str) -> int:
@@ -1417,7 +1474,7 @@ def observe_token_density(request: Any, usage: Optional[Dict[str, Any]], *, driv
         # uncached == cached +-1 is a coincidence whose loss costs nothing
         # (writes are throttled and five pairs retained); uncached ABOVE cached
         # is ordinary and stays measurable.
-        if cached and abs(real - 2 * cached) <= 1:
+        if gateway_double_counted_cache(real, cached):
             return
         # The witness MUST calibrate the basis the fit estimator measures on
         # (MAIN_DENSITY_BASIS: bounded image proxy, system counted) — the

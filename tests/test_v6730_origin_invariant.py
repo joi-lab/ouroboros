@@ -14,6 +14,8 @@ Covers the four legs of the meta-fix:
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import json
 from types import SimpleNamespace
@@ -404,7 +406,7 @@ def test_real_log_chat_honors_explicit_ts(tmp_path, monkeypatch):
         "in", 1, 1, OWNER_TEXT, ts="2026-07-19T21:10:38Z",
         client_message_id="owner-msg-1",
     )
-    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    row = json.loads(dialogue_test.log_text(tmp_path / "logs" / "chat.jsonl").splitlines()[0])
     assert row["ts"] == "2026-07-19T21:10:38Z"
     assert row["client_message_id"] == "owner-msg-1"
     assert entry_matches_ref_row(row)

@@ -13,13 +13,18 @@ def root_present_fields(root, task_id, task, stored, *, settled=False):
     from ouroboros.project_admission import project_hold_fact
     from ouroboros.projects_registry import get_project, project_binding_for_task
 
+    from ouroboros.store import StoreError
+
     fields = {}
     if root is not None:
-        binding = project_binding_for_task(root, task_id) or {}
-        if binding:
-            fields.update(project_id=binding["project_id"], chat_id=binding.get("project_chat_id"))
-        project = get_project(root, fields.get("project_id") or task.get("project_id") or "") or {}
-        fields["project_name"] = str(project.get("name") or "")
+        try:
+            binding = project_binding_for_task(root, task_id) or {}
+            if binding:
+                fields.update(project_id=binding["project_id"], chat_id=binding.get("project_chat_id"))
+            project = get_project(root, fields.get("project_id") or task.get("project_id") or "") or {}
+            fields["project_name"] = str(project.get("name") or "")
+        except StoreError as exc:
+            fields["unavailable"] = {"project": type(exc).__name__}
     if settled:
         fields["recorded_status"] = stored["status"]
         return fields
@@ -33,6 +38,14 @@ def root_present_fields(root, task_id, task, stored, *, settled=False):
     if hold:
         fields["project_admission_hold"] = hold
     return fields
+
+
+# One neutral sentence of understanding, not a rule: what the list holds and that tidying it is ordinary work.
+_HYGIENE_NOTE = ("Every live, waiting, paused or held work in your rooms, with what it waits for, since when and "
+                 "what of it still runs (tails); "
+                 "other_live_work is work whose own root ended while its helpers or external runs go on. Keeping this "
+                 "list free of work nobody needs any more is ordinary hygiene: close it, ask the owner, or leave it, "
+                 "as you judge.")
 
 
 def live_works_present(root, *, exclude=""):
@@ -50,8 +63,14 @@ def live_works_present(root, *, exclude=""):
             "state": row["status"], "started_at": row.get("started_at"),
             "open_questions": row.get("open_questions") or [], "waiting": row.get("waiting") or [],
             "last_line": focus.get("text", ""), "last_line_at": focus.get("authored_at"),
-            **{key: row[key] for key in ("focus", "project_admission_hold", "recorded_status") if key in row}})
-    return {"works": works, "last_line_source": "model_authored_focus", "incomplete": roster["incomplete"],
+            **{key: row[key] for key in ("focus", "project_admission_hold", "recorded_status", "tails", "unavailable")
+               if key in row}})
+    from ouroboros.peer_roster import unlisted_live_work
+
+    other = unlisted_live_work(pathlib.Path(root), {row["task_id"] for row in roster["roots"]})
+    return {"works": works, "last_line_source": "model_authored_focus",
+            "incomplete": roster["incomplete"] or any(row.get("unavailable") for row in other),
+            **({"other_live_work": other} if other else {}), "note": _HYGIENE_NOTE,
             **{key: roster[key] for key in ("queue_snapshot", "direct_roots")}}
 
 

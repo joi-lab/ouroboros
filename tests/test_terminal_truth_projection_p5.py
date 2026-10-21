@@ -236,3 +236,27 @@ def test_the_event_and_the_row_render_one_reason_line_over_the_shared_fixture() 
         record, clause = case["record"], case["acceptance_clause"]
         assert _completion_verdict(record, {}) == clause, case["name"]
         assert _completion_verdict({}, record) == clause, case["name"]
+
+
+@pytest.mark.parametrize("event_only", [False, True])
+@pytest.mark.parametrize("prior", [
+    {"status": "completed"},
+    {"status": "failed"},
+    {"status": "cancelled", "cancel_origin": {"actor": "owner", "reason": "old stop"}},
+    {"status": "failed", "outcome_axes": {"objective": {
+        "status": "fail", "source": "plan_review_gate", "reason": "plan_review_advisory"}}},
+])
+def test_foreign_install_reason_preserves_the_path_and_explicit_move_instruction(prior, event_only):
+    detail = ("/installs/<install_A>/task_drives/t belongs to another Ouroboros install at "
+              "/installs/<install_A>; move it explicitly to work on it here")
+    record = {**prior, "reason_code": "foreign_install_root", "reason_detail": detail}
+    assert _completion_verdict({} if event_only else record, record if event_only else {}) == detail + "."
+
+
+@pytest.mark.parametrize("reason, expected", [
+    ("final_message", ""), ("some_future_code", "some_future_code."),
+])
+def test_other_reason_codes_do_not_render_foreign_install_detail(reason, expected):
+    record = {"status": "completed", "reason_code": reason, "reason_detail": "Not this task's reason."}
+    assert _completion_verdict(record, {}) == expected
+    assert _completion_verdict({"reason_code": "foreign_install_root"}, {}) == "foreign_install_root."

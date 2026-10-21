@@ -12,12 +12,13 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
 import { bindLanguageSettings, languageBlockHtml, saveLanguageChoice } from './settings_language.js';
 import { installAltMenuSuppression, installDesktopShellLinkInterceptor } from './ui_helpers.js';
 import { createModelRolesEditor, modelRolesHost, modelRoleMap, parseModelSource } from './model_roles.js';
-import { ALLOW_EMPTY_REVIEW_POOL, PACKET_ONLY_POOL_WARNING, availableSubagentsEditorHost, packetOnlyReviewPool, reviewPoolRows } from './subagents_settings.js';
+import { ALLOW_EMPTY_REVIEW_POOL, PACKET_ONLY_POOL_WARNING, availableSubagentsEditorHost, packetOnlyReviewPool, reviewPoolRows, reviewerTickCaption } from './subagents_settings.js';
 import { PROCESSING_PREFERENCE_KEY, MODEL_PROCESSING_PREFERENCES_KEY, processingIntentLabel,
     configuredApiProviders, apiProviderLabel } from './route_editor_primitives.js';
 import { MODEL_CATALOG_TIMEOUT_MS, mergeModelCatalog, catalogReadState, summarizeReadErrors } from './settings_catalog.js';
 import { accountRows } from './claudexor_status_store.js';
 import { accountRowFacts } from './harness_accounts.js';
+import { createStarterSkillsRow } from './onboarding_starter_skills.js';
 
 (() => {
         // The served wizard document needs its own menu-key binding.
@@ -106,6 +107,7 @@ import { accountRowFacts } from './harness_accounts.js';
     let catalogGeneration = 0;
     const stepScrollPositions = new Map();
     let suggestedVisionModel = null;
+    const starterSkills = createStarterSkillsRow(); // the Summary's Starter skills row keeps its ticks across renders
     const modelRoles = createModelRolesEditor({ hostId: 'onboarding-model-roles', onChange: (settings, { slot } = {}) => {
         if (slot === 'vision') suggestedVisionModel = null;
         adoptModelSettings(settings);
@@ -870,7 +872,7 @@ import { accountRowFacts } from './harness_accounts.js';
 
     function reviewersNote() {
         const count = reviewPoolRows(catalogDraft()).length;
-        if (count) return `Reviewers: ${count} — the rows marked Reviewer under Models → Available subagents. Outside Cyber Pro each of them reviews every change to Ouroboros itself; in Cyber Pro the agent composes the panel from them.`;
+        if (count) return `Reviewers: ${count} — the rows marked Reviewer under Models → Available subagents. ${reviewerTickCaption(state.reviewEnforcement, state.runtimeMode)}`;
         if (agentsStep?.previewError) return 'Automatic reviewers are unavailable. Mark rows as Reviewer under Models → Available subagents, or use Main on the summary.';
         return (catalogDraft()?.items || []).length ? 'No row is marked Reviewer, so the main model reviews alone. Mark rows under Models → Available subagents for a second opinion.'
             : 'Reviewers will be prepared from your connected access.';
@@ -958,7 +960,7 @@ import { accountRowFacts } from './harness_accounts.js';
     }
 
     function refreshSummary() {
-        const summary = root.querySelector('.summary-card');
+        const summary = root.querySelector('.summary-card-rows');
         if (summary) summary.innerHTML = summaryRowsHtml();
         syncCurrentStepActionState();
     }
@@ -971,7 +973,7 @@ import { accountRowFacts } from './harness_accounts.js';
                     <p class="step-copy">${escapeHtml(STEP_META.summary.copy)}</p>
                 </div>
             </div>
-            <div class="summary-card">${summaryRowsHtml()}</div>
+            <div class="summary-card"><div data-starter-skills></div><div class="summary-card-rows">${summaryRowsHtml()}</div></div>
             ${state.reviewEnforcement === 'blocking' && trim(state.runtimeMode) !== 'cyber_pro' && packetOnlyReviewPool(catalogDraft())
                 ? `<div class="wizard-inline-note" data-tone="warn" data-review-pool-warning>${escapeHtml(PACKET_ONLY_POOL_WARNING)}</div>` : ''}
             ${languageBlockHtml({ onboarding: true })}
@@ -1069,6 +1071,7 @@ import { accountRowFacts } from './harness_accounts.js';
             </div>
         `;
         bindEvents();
+        starterSkills.mount(root.querySelector('[data-starter-skills]'));
         disposeLanguage?.();   // the Language block lives on the summary step only; its binder owns its listeners
         disposeLanguage = state.currentStep === 'summary' && !state.completedRestartMode ? bindLanguageSettings(root, { staged: state.languageChoice, stage: (value) => { state.languageChoice = value; } }) : null;
         renderLocalStatus();
@@ -1294,6 +1297,8 @@ import { accountRowFacts } from './harness_accounts.js';
                 choice.setAttribute('aria-pressed', String(selected));
             });
             markStepEdited();
+            const note = root.querySelector('[data-reviewers-note]');  // what a tick means under the mode just chosen
+            if (note) note.textContent = reviewersNote();
         }));
     }
 
@@ -1500,9 +1505,11 @@ import { accountRowFacts } from './harness_accounts.js';
             // Completion validates this visible draft and never replaces it.
             OUROBOROS_SUBAGENTS: catalogDraft(),
             ...(agentsStep?.allowEmptyReviewPool ? { [ALLOW_EMPTY_REVIEW_POOL]: true } : {}),
+            ...starterSkills.payload(),
         };
         try {
             await saveWizardPayload(payload);
+            starterSkills.destroy();
         } catch (error) {
             // The wizard STAYS OPEN with the real reason. A typed preset refusal
             // wrote nothing, so the offered escape is honest: finish without the
@@ -1566,6 +1573,7 @@ import { accountRowFacts } from './harness_accounts.js';
         catalogGeneration += 1;
         catalogRequest?.controller.abort();
         modelRoles.destroy();
+        starterSkills.destroy();
     });
     render();
 })();

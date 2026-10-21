@@ -447,8 +447,8 @@ def test_a_declared_entry_and_script_under_skipped_folders_stay_in_the_reader_vi
 def test_a_link_to_a_skipped_file_keeps_its_bytes_without_copying_dependencies(tmp_path, monkeypatch, kind):
     body = "module.exports = 1\n"
     skill, _ = _skill(tmp_path, {"node_modules/real.js": body, "node_modules/unused.js": "unused\n"})
-    try:
-        (skill.skill_dir / "shim.js").symlink_to("node_modules/real.js")
+    try:  # the host's separator: Windows reads a "/" inside a relative link target as part of a name
+        (skill.skill_dir / "shim.js").symlink_to(os.path.join("node_modules", "real.js"))
     except (OSError, NotImplementedError) as exc:
         pytest.skip(f"this host cannot create symlinks: {exc}")
     content_hash = compute_content_hash(skill.skill_dir)  # the hash reads shim.js through its link

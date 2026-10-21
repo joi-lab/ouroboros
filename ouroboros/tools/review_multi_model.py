@@ -219,6 +219,7 @@ async def _query_model(
     retry_key: str = "", subagent_id: str = "", use_local: bool | None = None, task_evidence: dict = None,
     native_retrieval: bool = False, resolved_wave_id: str = "",
     session_access: str = "", checking_source: dict = None, preflight_execution: dict = None,
+    processing_preference: str | None = None,
 ):
     async with semaphore:
         slot = None
@@ -285,6 +286,7 @@ async def _query_model(
                 route=slot_route,
                 session_target=session_target if delegated else "",
                 session_profile=session_profile,
+                processing_preference=processing_preference,
                 subagent_id=str(subagent_id or ""),
                 # Explicit both ways for an api row: the slot's own delivery fact.
                 native_retrieval_override=None if delegated else bool(native_retrieval),
@@ -358,6 +360,8 @@ async def _multi_model_review_async(content: str, prompt: str,
     row_ids = _row_vector("slot_ids", lambda idx: _rev().slot_id_for_row(idx + 1))
     row_actors = _row_vector("subagent_ids", lambda idx: "")
     row_local = _row_vector("use_local", lambda idx: None)
+    # None is an unbound historical row; a captured empty preference stays empty.
+    row_processing = _row_vector("processing_preferences", lambda idx: None)
     row_access = _row_vector("session_accesses", lambda idx: "")
     # One brief per seat (PR-3 B): a retrieving row carries ITS OWN two-part
     # brief, answer policy and reading root; an absent entry keeps the shared one.
@@ -418,6 +422,7 @@ async def _multi_model_review_async(content: str, prompt: str,
                      session_root=row_roots[idx] or session_root,
                      effort=row_efforts[idx], session_target=row_targets[idx],
                      session_profile=row_profiles[idx], surface=surface,
+                     processing_preference=row_processing[idx],
                      session_policy=row_policies[idx] or session_policy, usage_attribution=usage_attribution,
                      retry_key=retry_key, subagent_id=row_actors[idx], use_local=row_local[idx], task_evidence=task_evidence,
                      preflight_execution=preflight_execution,

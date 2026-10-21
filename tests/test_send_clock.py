@@ -463,7 +463,9 @@ def test_the_consumed_line_makes_each_request_extend_the_last_byte_for_byte(tran
     first, second = sent[0]["messages"], sent[1]["messages"]
     assert second[:len(first)] == first  # the previous request is an exact prefix of the next
     assert len(_clock_rows(first)) == 1 and len(_clock_rows(second)) == 2
-    assert not _clock_rows(messages[:2]) and _clock_rows(messages) == [first[-1], second[-1]]
+    assert not _clock_rows(messages[:2]) and [row["content"] for row in _clock_rows(messages)] == [
+        first[-1]["content"], second[-1]["content"]]  # the wire shows text only; the canonical row is typed and bound
+    assert all(row["_host_context_kind"] == sc.CLOCK_ROW_NAME and "_host_text_sha256" in row for row in _clock_rows(messages))
 
 
 def test_a_child_or_helper_call_sends_no_clock_line(transport, unstreamed):  # noqa: F811

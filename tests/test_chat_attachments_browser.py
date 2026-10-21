@@ -16,6 +16,8 @@ Playwright, not the native PyWebView shell.
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import base64
 import json
 import os
@@ -200,8 +202,7 @@ def test_owner_attachments_render_once_everywhere(direct_server_with_data, engin
             _capture(page, own, evidence / f"attachments-own-{engine}.png")
 
             # The canonical row: one inbound message, server-measured refs, no paths or bytes.
-            rows = [json.loads(line) for line in (data / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
-                    if line.strip()]
+            rows = dialogue_test.log_rows(data / "logs" / "chat.jsonl")
             inbound = [row for row in rows if row.get("direction") == "in" and row.get("attachments")]
             assert len(inbound) == 1, "one owner message, not one per file"
             refs = inbound[0]["attachments"]
@@ -543,8 +544,7 @@ def test_composer_consumer_path_and_real_media_past_the_text_tail(direct_server_
             _assert_lazy_images_load(page, bubble, f"{engine} own bubble")
             _assert_many(_many_shape(bubble), f"{engine} own bubble")
             assert badges.count() == 0 and page.evaluate(_BLOB_ALIVE, thumbs) == [False] * 28
-            rows = [json.loads(line) for line in (data / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
-                    if line.strip()]
+            rows = dialogue_test.log_rows(data / "logs" / "chat.jsonl")
             (inbound,) = [row for row in rows if row.get("direction") == "in" and row.get("attachments")]
             assert len(inbound["attachments"]) == 30 and inbound["text"].endswith("[5 more attached files]")
             assert {ref["kind"] for ref in inbound["attachments"][:2]} == {"video", "audio"}
@@ -626,7 +626,7 @@ def test_an_attachment_frame_lost_after_send_is_recoverable_exactly_once(direct_
 
     def inbound(cmid: str) -> list[dict]:
         chat = data / "logs" / "chat.jsonl"
-        rows = [json.loads(line) for line in chat.read_text(encoding="utf-8").splitlines() if line.strip()] if chat.exists() else []
+        rows = dialogue_test.log_rows(chat)
         return [row for row in rows if row.get("direction") == "in" and row.get("client_message_id") == cmid]
 
     settled = """cmid => {

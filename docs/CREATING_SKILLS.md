@@ -4,8 +4,8 @@ This is the practical guide for **writing your own skills** that
 Ouroboros can install, review, enable, and execute. It is the
 single place where the manifest schema, the `PluginAPI`, the review
 checklist, the lifecycle (install → review → enable → execute), the
-widget render schemas, and the marketplace publishing flows are
-explained together.
+widget render schemas, skill sources and publishing are explained
+together.
 
 If you are looking for the *runtime* architecture (how the loader
 imports plugins, how the tri-model review pipeline is wired, etc.),
@@ -17,30 +17,39 @@ Review Checklist" section of [`docs/CHECKLISTS.md`](CHECKLISTS.md).
 
 A **skill** is a small package that adds capabilities to Ouroboros:
 new tools the agent can call, HTTP routes the desktop app can fetch,
-WebSocket message handlers, and host-rendered widget UIs. Skills are
-**reviewed** before they can run. Skills dropped in from disk or
-marketplaces go through tri-model review and explicit owner lifecycle
-actions. Skills authored by the current Ouroboros agent session carry
+WebSocket message handlers, and host-rendered widget UIs. Skills need exact-byte
+review or acceptance before they run. Disk copies use the configured review;
+source installs also support trusted-source acceptance and, in Cyber Pro only,
+Ouroboros's recorded self-check (see "Sources and publishing"). Skills authored by the current Ouroboros agent session carry
 both payload-local `.self_authored.json` and owner-state
 `data/state/skills/<name>/self_authored.json` markers for provenance,
 but they still go through the same tri-model skill review before they
 can run.
 
-**Owner attestation (skip review for your own or verified official skill).** For
-an external or self-authored skill, and for a hash-verified official
-OuroborosHub payload, the OWNER may skip the expensive LLM review via the
+**Owner attestation (Skip review / Turn on anyway).** For a skill from any
+origin, the OWNER may skip the expensive LLM review of its exact bytes via the
 **Skip review** action on the skill card (owner-only
 `POST /api/owner/skills/{skill}/attest-review`). The deterministic preflight +
-manifest-validation floor STILL runs (an invalid or unsafe payload is refused),
-and official-hub payloads are freshly rechecked against the live catalog before
-attestation is persisted. Only the tri-model LLM phase is skipped; the verdict
+manifest-validation floor STILL runs (an invalid or unsafe payload is refused).
+Only the LLM phase is skipped; the verdict
 is marked `owner-attested` (distinct from an LLM-clean badge) and does not
 confer publication readiness. Choosing Publish may still start the ordinary
 managed publication task, but attestation alone authorizes no outbound GitHub
 effect. Publication needs fresh critic authority or a later actual independent-review
-outcome acknowledged through qualified Advisory author finish (see Publishing). Native, ClawHub, and unverified
-OuroborosHub payloads are never attestable. The agent cannot self-attest (the
-marker is owner-state).
+outcome acknowledged through qualified Advisory author finish (see Publishing). The
+agent cannot self-attest (the marker is owner-state).
+
+**Accepted without a review.** A skill installed unchanged from a source the owner
+trusts runs on its install record's basis for exactly that
+release; an edit by the selected-skill task the owner's own request started is
+recorded as an owner edit and keeps running as Modified. Any other edit makes the
+skill "Not reviewed yet". For an owner-requested edit in an ordinary task,
+Ouroboros can carry out Skip through `skill_owner_action(action="attest")`, with
+the current `expected_content_hash` and `owner_source` recording the owner's
+words; its deterministic preflight and exact-byte owner
+attestation keep that edited copy running. This is the owner's authority, not
+an agent's claim that its own edit passed review. Blocker findings in a skill from a source that reviews
+each skill keep it off even under Advisory until the owner skips the review.
 
 There are three skill types:
 
@@ -52,22 +61,26 @@ There are three skill types:
 
 The **runtime ownership** of an installed skill is also tagged:
 
-- `native`: bundled with the launcher (e.g. `unix_computer_use`).
+- `native`: a built-in bundled with the app (e.g. `unix_computer_use` on macOS/Linux,
+  `windows_computer_use` on Windows).
 - `self_authored`: created by Ouroboros itself in the current data
   plane; marked by `.self_authored.json` and reviewed through the
   standard tri-model skill-review path.
 - `external`: dropped into `data/skills/external/` by the user.
-- `clawhub`: installed via the ClawHub marketplace.
-- `ouroboroshub`: installed via the official OuroborosHub catalog.
+- `clawhub`: installed from the ClawHub registry.
+- `ouroboroshub`: installed from a hub or another git-hosted source.
 
 User-authored or manually copied skills belong under
 `data/skills/external/<name>/`. The `native` bucket is reserved for
-launcher-seeded skills that carry a `.seed-origin` marker. That marker, not the
+built-in skills that carry a `.seed-origin` marker. That marker, not the
 directory name alone, is the ownership fact: an existing payload under
 `native/` without the marker is treated in place as user-managed `external`
 content. Ordinary top-level tasks can inspect, edit, run commands in, or
-delegate that payload without a migration. A marker-present launcher seed stays
-read/review-only, and new skills are still created under `external/`.
+delegate that payload without a migration. A marker-present built-in stays
+read/review-only, and new skills are still created under `external/`. Windows keeps an
+enabled legacy Unix remote skill across later OFF/ON and updates (eligibility for
+remote machines, not local Windows support or execution authority;
+[startup rules](architecture/02-startup-onboarding-flow.md#packaged-seed-and-managed-checkout)).
 
 ## Manifest schema (`SKILL.md` frontmatter or `skill.json`)
 
@@ -82,6 +95,7 @@ description: Live weather widget    # required, short summary
 version: 0.2.1                      # required, free-form (semver recommended)
 type: extension                     # instruction | script | extension
 runtime: python3                    # script skills: python/python3/bash/node/deno/ruby/go; extension entry modules are Python plugin.py
+os: any                             # or [darwin, linux, win32]; governs new bundled offerings (legacy remote exception above)
 entry: plugin.py                    # type=extension only — relative to skill dir
 scripts:                            # type=script only
   - name: fetch.py                  # name resolves under scripts/ unless slashes/extensions
@@ -171,10 +185,199 @@ the `list_skills` index and the "Installed Skills" context section, whole in
 manifest — so write it for the model, not for the human reviewer. Unknown keys or
 non-string values are refused at parse time.
 
+### Passive context snapshots (extensions only)
+
+A reviewed extension may declare `context_snapshot: {path: context-snapshot.json}`
+and the `context_snapshot` permission/grant. Its existing deterministic task or
+companion writes that relative path under its own skill state, atomically:
+`{"schema_version":1,"observed_at":"…Z","valid_until":"…Z","text":"…"}`.
+Dates must be finite timezone-aware ISO instants, observed ≤ valid and not in the
+future. The complete UTF-8 JSON file is bounded at 32768 bytes; malformed, missing,
+escaping or oversized files yield an explicit unknown, never clipped prose.
+
+Write compact deterministic facts, not instructions or relative-age counters.
+Keep changing poll timestamps out of `text`: the envelope dates date the visible
+claim. Main, project roots and consciousness receive a labelled UNTRUSTED tail
+note after compaction; children and Presence do not. No callback, model, network,
+refresh or scheduler is run by prompt preparation. Current enablement, review,
+grants, dependencies and publication must remain eligible. Revocation/expiry emits
+one withdrawal; it does not resend old facts. A changed material value appends a
+full note; timestamp-only renewal waits until the visible lease expires, then
+references that exact full text's source/text hashes with new dates. No delta
+chain or hidden memo is authority: reclaim keeps the required visible base, and
+an absent base after compaction/cold Resume causes a complete current note. This preserves the
+existing prefix, not a promise of provider cache hits. Source bytes are retained
+through observability; earlier notes remain historical, not current authority.
+
 Manifest refusals teach: every `SkillManifestError` carries the problem plus,
 where the parser knows the repair, a `fix_hint` rendered into the message
 (`... — fix: ...`), so a refused registration tells you how to fix the
 manifest instead of only what was wrong.
+
+## Contributing controls and speech engines
+
+`contributes` is an optional list of up to 32 mappings on instruction or extension
+skills. Each needs a unique `id` matching `[a-z0-9_]{1,40}` and exactly one of
+`placement` or `provides`. Shape errors reject the manifest; semantic errors drop
+only that entry, with a repair warning in preflight and the contribution catalog.
+There is no additional PluginAPI registration call.
+
+| Field | Contract |
+|---|---|
+| `label`, `title` | Required nonblank label ≤40 characters, optional title ≤200; displayed verbatim. |
+| `icon`, `order` | Optional host icon name (the `icons` list of `/api/ui/contributions`), optional integer order (default 0). |
+| `placement` | `composer.plus`, `composer.chips` or `message.action`. |
+| `action` | Required on placements: `draft.insert` with text ≤4000, `notice` with text ≤300, `open.tab`, or `skill.request`. No verb sends as the owner. |
+| `action.route`, `with`, `then` | `skill.request` POSTs to its own relative route; `with: none` (default), `draft` or `message`; `then: keep_draft` (default) or `clear_draft`. The host supplies the absolute URL. |
+| `source` | Required only for chips: `{route, refresh_s}`; relative GET route, refresh integer 15..3600 seconds; reply `{text, tone?: ok|warn|bad|muted, title?}`. |
+| `provides`, `runtime` | Engine kind `stt` or `tts`; required runtime `server` or `client`. Server engines declare a relative POST `route`; clients register from their host module. |
+| `destination` | Required for engines: `device`, `host` or `vendor:<Name>`. Describe the real processing destination. |
+| `languages`, `formats` | Optional lists of up to 64 nonblank strings ≤120 characters. Formats: `audio/webm`, `audio/ogg`, `audio/mp4`, `audio/mpeg`, `audio/wav`. |
+| `install_size` | Optional nonblank text ≤120 characters, shown by install offers. |
+| `max_bytes`, `max_seconds` | Optional STT limits: integers 1..524288 bytes and 1..600 seconds. These do not raise the host route cap. |
+| `render` | Defaults to `{kind: declarative}`. `{kind: host, entry: ui/name.js}` names a trusted same-origin ES module; only relative `.js` entries under `ui/`. |
+
+Routes are plain relative paths without traversal, URL schemes, queries or
+fragments. Host render and client runtime require `type: extension` and declared
+`page_module` permission. A client provider also needs `render.kind: host`; it
+has no server route. Data-only entries need no page permission and remain valid
+on instruction skills. Extension providers and controls appear only while their
+extension is loaded; instruction contributions follow enablement and review.
+
+A template item can be entirely declarative:
+
+```yaml
+contributes:
+  - id: explain_simpler
+    placement: composer.plus
+    label: Explain simpler
+    icon: sparkle
+    action: {verb: draft.insert, text: "Explain your last answer more simply."}
+```
+
+A server speech engine uses its normal registered route:
+
+```yaml
+contributes:
+  - id: dictation
+    provides: stt
+    label: Local dictation
+    runtime: server
+    route: transcribe
+    destination: host
+    languages: [auto, en, ru]
+    formats: [audio/webm, audio/mp4, audio/wav]
+    install_size: "~500 MB"
+    max_bytes: 393216
+    max_seconds: 60
+```
+
+The request body is raw audio (`Content-Type` is the recorded type); a client
+may add `?lang=`, but the builtin one sends none, so detect the language
+yourself. Return `{text}`, `{text:"", status:"no_speech"}` or
+`{error:{code,message}}`. Keep uploads under both declared limits and the existing
+512 KiB route cap. The recorder enforces the declared limits; do not require a
+multipart wrapper or a skill-specific host upload exception.
+
+A capsule-row chip reads a small status route and opens its Widgets tab:
+
+```yaml
+contributes:
+  - id: quota
+    placement: composer.chips
+    label: Usage
+    source: {route: chip, refresh_s: 60}
+    action: {verb: open.tab}
+```
+
+Host modules and their relative imports load from captured revision URLs such as
+`/api/extensions/<skill>/ui/<revision>/ui/name.js`; CSS, JSON and images under
+`ui/` are captured too. Editing disk files does not change a loaded generation;
+unload or a new revision makes its old URLs return 404. Export `mount(ctx)` and
+return `{dispose}`; release resources when disposed. These are trusted page
+modules, distinct from sandboxed widget modules or model-written mini-apps.
+Every skill gets `page_module` through the ordinary grant: the owner's, or the
+auto-grant setting once its release is accepted (a built-in's trusted source counts).
+
+### What placed controls do
+
+A `composer.plus` item appears in the composer's "+" menu, after Attach file,
+in a section under the skill's name, in the owner's arrangement and otherwise
+by `order`. A `composer.chips` chip is one of the capsule row's capsules: its
+`label`, then the `text` its source answers (the first 24 characters; longer
+text and the answer's `title` become the chip's description), with a dot for a
+`tone` of `ok`, `warn` or `bad` (`muted`, or none, shows no dot). The host
+reads the source every `refresh_s` (15 seconds at least) and only while a room
+shows the chip on a visible page; after a failed read it shows "—" with the
+reason and asks again later, doubling the wait up to sixteen refreshes. Chips
+that do not fit beside the host's capsules fold into one "+N" chip whose list
+holds them, so keep the label and the text short. A press does the chip's
+`action`.
+
+A `message.action` appears on Ouroboros's saved replies, never on the owner's
+own rows or on work cards: an icon control between the reply's Reply and Copy
+(its accessible name is `label`, its tooltip `title`) and an item in the row's
+menu, in words. Its `skill.request` with `with: message` POSTs JSON
+`{text, row_id}`: the reply's plain words and its row address. With
+`with: draft` it POSTs `{text}`, the visible room's draft; with `none`, `{}`.
+A 2xx answer may carry `{notice}`, shown as one line (otherwise "<label>:
+done."). A failure shows one line naming the label and keeps the draft;
+`then: clear_draft` clears the draft only after a 2xx and only while it still
+holds the words that were sent. `draft.insert` puts its text into the visible
+room's draft at the caret and never sends; `open.tab` opens the Widgets page at
+the skill's card; `notice` shows its text.
+
+### Page modules
+
+The host imports every live `render.kind: host` entry from its revision URL
+and calls the module's exported `mount(ctx)` once per contribution (several
+contributions may share one file). `mount` may return `{dispose()}`, directly
+or through a promise; the host calls `dispose` when the skill is disabled,
+updated or removed, on this page's Panic and when the page goes away, and
+aborts `ctx.signal` at the same moment. The context is frozen and versioned; a
+capability a later version adds is absent from an older context, never a stub.
+
+| `ctx` field | Meaning |
+|---|---|
+| `api` | `1`, the context version. |
+| `skill`, `key` | The skill's directory name and this contribution's key (`<skill>:<id>`). |
+| `signal` | An `AbortSignal`, aborted when the module is disposed. |
+| `providers.register(kind, impl)` | Registers the client provider this contribution declares (`provides` equal to `kind`, `runtime: client`) and returns its unregister. Any other kind throws. |
+| `notice(text)` | One line in the page, prefixed with the skill's name. |
+| `draft.insert(text)` | Puts words into the visible room's draft at the caret, never sends; answers false when there is no draft. |
+| `theme.dark`, `theme.reducedMotion` | The painted theme and the motion preference, read when asked. |
+| `origin.secure`, `origin.loopback` | The page is a secure context; it is served from this computer. |
+
+A client speech provider is a plain object the host calls; it never draws.
+A `stt` provider is `{label, destination?, available() → {ok, code?},
+start({lang, signal}) → {stop() → Promise<{text} | {no_speech: true}>,
+cancel()}}`: the host calls `start` inside the owner's press (recognizers need
+the gesture), holds the page's one microphone lease for it, and puts the text
+into the draft itself. A `tts` provider is `{label, voices() → [{id, label,
+lang, local}], speak(text, {voice, lang, signal}) → Promise<void>, stop()}`;
+`local` is true only when the platform says the voice runs on the device, and
+`speak` settles when the words end, are stopped, or `signal` aborts. A
+provider's `destination` (`device`, `host` or `vendor:<Name>`) says where
+audio or text goes; the host shows it beside the engine's name. An engine the
+owner chose that cannot run is reported with its reason; the host never picks
+another one in its place.
+
+There is no composer, feed or other page DOM in the context: placements are
+the way into those. A module that cannot be imported, throws or rejects in
+`mount`, does not start within the host's module bound
+(`WIDGET_REQUEST_TIMEOUT_MS`, `web/modules/widget_job.js`) or registers a
+provider it does not declare is off for that page: its providers are
+unregistered and the owner sees one notice naming the skill. It stays off
+until the page reloads or the skill's revision changes; the other modules and
+the page keep working.
+
+Recovery never depends on the modules. While modules start, the host keeps a
+boot marker in the page's storage; a page that finds one (the last start froze
+or crashed, however long ago) starts without page modules and offers Start
+with plugins, which alone clears it. Opening the page with `?plugins=off` does the same
+on purpose; Main's More menu (Restart without plugins) and the macOS app's
+Help menu (Start without plugins) reload it that way. Declarative contributions
+stay available in both cases.
 
 ## Lifecycle: install → review → enable → execute
 
@@ -193,14 +396,19 @@ flowchart LR
 ```
 
 - **Install** lands the payload under the appropriate bucket
-  (`data/skills/<bucket>/<name>/`). Marketplace installs also write
-  a provenance sidecar (`.clawhub.json` / `.ouroboroshub.json`).
+  (`data/skills/<bucket>/<name>/`) and records where it came from in
+  `data/state/skills/<name>/install.json`, outside the payload. ClawHub
+  installs also keep their `.clawhub.json` sidecar; skills installed from the
+  hub by earlier versions keep `.ouroboroshub.json`.
 - **Review** runs three reviewer models in parallel against the
   Skill Review Checklist (see [`docs/CHECKLISTS.md`](CHECKLISTS.md)).
   The review pack hashes every runtime-reachable file in the skill
   directory; any later edit stales that critic verdict. `.self_authored.json`
   is provenance only; self-authored skills use the same tri-model review,
   grant, enable, and extension reload flow as other executable skills.
+  Reviewers also read how the skill was installed (`install.json`: by the
+  owner or by Ouroboros, from which source and trust, why, in which task) as
+  context, never as approval.
 - **Isolated deps** (pip / npm / uv / node) install into
   `data/skills/<bucket>/<name>/.ouroboros_env/`. Status is recorded
   in `data/state/skills/<name>/deps.json`.
@@ -211,7 +419,9 @@ flowchart LR
   through import, handler waits and cleanup. The async form polls
   cooperatively, so it never blocks the ASGI loop; nested scopes and
   unwrapped child work remain unsupported rather than inheriting a lease.
-- **Enable** flips `enabled.json` after current executable-review authority + grants + deps. The
+- **Enable** flips `enabled.json` after current executable-review authority + grants, installing
+  the declared packages itself when they are missing, failed or stale (idempotent: Enable on an
+  enabled skill repairs it; a refusal is typed, `code` + one sentence + `detail`). The
   Skills UI surfaces a toggle; agents can also call `toggle_skill`.
   A self-authored skill's first enablement can follow
   `OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS`; otherwise enabling requires the owner
@@ -263,8 +473,10 @@ install:
 ```
 
 Bare `dependencies` entries are treated as Python packages. `pip`,
-`pipx`, `uv`, `npm`, and `node` specs are installed only after a fresh
-executable review and only under the skill's `.ouroboros_env` directory.
+`pipx`, `uv`, `npm`, and `node` specs are installed once the review gate admits the exact
+bytes (a reviewer verdict, a trusted release, the owner's skip or edit, Cyber Pro) by one owner
+(`skill_dependencies.ensure_skill_dependencies`: at enable, review end, install, author finish
+and startup; no new paid review is required) and only under the skill's `.ouroboros_env` directory.
 Global package-manager specs remain manual setup guidance. Exact resources and
 explicit build actions use the same isolated install owner:
 
@@ -483,7 +695,7 @@ skill_preflight(skill="weather", paths=["plugin.py"])
 
 ## Repair task path scheme and edit tools
 
-**Repair and run** from the Skills or Marketplace UI starts an ordinary managed
+**Repair and run** from the Skills page starts an ordinary managed
 development task. The confirmed request is retained as a real owner message, not
 a presentation-only acknowledgement. Its normal task constraint records the selected skill and physical payload
 root; the task also retains the request source and initial content revision.
@@ -524,7 +736,7 @@ An ordinary top-level task in every runtime mode can target user-managed skill
 payloads with `root=skill_payload`, `bucket` (`external` / `clawhub` /
 `ouroboroshub` / `user_repo`), and `skill_name`. A markerless payload physically
 under `native/` is selected through the logical `external` bucket; a true
-marker-present native seed remains read/review-only. A short relative
+marker-present built-in remains read/review-only. A short relative
 `path` such as `plugin.py` or `lib/utils.py` resolves under
 the selected physical payload root. Supply both args together — passing only
 one returns a clear
@@ -582,9 +794,11 @@ calls and runtime behaviours:
 
 | Permission | What it grants |
 |------------|----------------|
+| `context_snapshot` | Opt-in standing model context from the declared local snapshot, subject to the existing content-hash-bound grant (see Passive context snapshots). No injection or model-start authority. |
 | `net` | The skill may make outbound network calls. |
 | `fs` | The skill may write outside its state dir (review item still enforces confinement). |
 | `subprocess` | The skill may spawn child processes (review items + cwd-confinement still enforce). |
+| `page_module` | With its hash-bound grant, reviewed extension code may run as a trusted same-origin contribution module in the owner’s page. |
 | `widget` | The skill may call `register_ui_tab` and `register_settings_section`. |
 | `ws_handler` | The skill may call `register_ws_handler` and `send_ws_message`. |
 | `route` | The skill may call `register_route`. |
@@ -596,6 +810,12 @@ calls and runtime behaviours:
 | `inject_chat` | With the owner's `inject_chat` grant, `POST /chat/inject` accepts text, an inline image or `attachments` (`[{path, name?, mime?}]`: up to 25 regular files confined to the skill's state root, copied without the former 50 MiB cap to `data/uploads` and staged for the task; file-only messages need no text). Optional `reply_to` carries a host row or `task:<task_id>` address as a reference, never routing. The same grant lets the skill relay the owner's decision-card answer through `POST /chat/decision` (`{request_id, decision_id, option_index?, comment?}`, the `POST /api/decisions` contract). A message that carries a `client_message_id` becomes an addressable operation: the host answers with its `operation_ref` (`<chat_id>:<client_message_id>`) on 202, 200 and 504; a repeated delivery of the same message — the same words AND the same ordered attachment content (inline image and files, compared by bytes and name, not by the host's stored copy) — rejoins it instead of enqueueing again (a different message under a reused id is refused with 409); an inline image and the attachments also appear in the owner's chat bubble from the host's stored copy, while the image still reaches the model as before (inline bytes that are not a proven image are kept as an ordinary file and never sent as an image; base64 over 50 MiB decoded is refused with 413); `GET /chat/operations/{operation_ref}` reports the skill's own accepted message (`pending`, `running` with its task or turn, the durable answer, a terminal task status, or `lost` after a host restart or when the host's own acceptance write failed); and `POST /chat/cancel` (`{operation_ref, reason?}`) runs the existing cancellation owner on work that message started, answering `cancelled`, `already_terminal`, `unresolved` or `cancel_unsupported` — never a cancellation that did not happen. |
 | `presence` | A reviewed transport skill may submit authenticated non-owner conversation events to the Host Service Presence boundary and poll only their correlated late work. Requires an explicit content-hash-bound owner grant. |
 | `notify_owner` | The skill may tell the owner one thing through `POST /notify` after an explicit owner permission grant (see "Telling the owner something" below): one bounded plain sentence the host shows in the owner's chat as a System row signed with the skill's name. It wakes no model; narrower than `inject_chat`. |
+
+`chat.typing` is a start/resume/activity-change wake, not proof of an active
+reply or an exactly-once start. The bundled Telegram bridge reads the internal
+`ouroboros.gateway.reply_preparation` projection; no stable PluginAPI or Host
+Service reader is exposed to third-party skills yet. A live activity may be
+waiting, stopped or doing post-answer work.
 
 A missing permission causes the matching `register_*` call to raise
 `ExtensionRegistrationError`, surfaced as a skill load error in the
@@ -619,8 +839,8 @@ consent. The desktop launcher's owner-grant bridge records these grants.
 
 The Skills UI surfaces missing grants on the skill card. The agent
 can also call `toggle_skill enabled=true` only after grants are
-approved (the tool returns `SKILL_TOGGLE_ERROR: cannot enable until
-requested key and permission grants are approved`). Self-authored markers alone
+approved (the tool returns `SKILL_TOGGLE_ERROR` with `code: "grants"` and the sentence
+`Grant it the keys and permissions it asks for first.`). Self-authored markers alone
 do not authorize grants or enablement. Automatic grants and first enablement
 follow the setting below; an explicitly authorized task toggle remains separate.
 
@@ -635,19 +855,9 @@ mode makes the review executable. Qualified current Advisory author acceptance
 uses the same gate even when the original critic state stays pending. Editing the
 skill still invalidates those grants.
 
-Official OuroborosHub skills have one extra review profile. If the installed
-payload, live catalog file list, and `.ouroboroshub.json` hashes all match
-exactly — including the full local runtime-reachable file set — the
-`official_hub` profile applies. For such hash-verified official payloads it
-downgrades severity-driven hygiene/bug findings (`bug_hunting`,
-`companion_process_safety`, `extension_namespace_discipline`,
-`widget_module_safety`) to warnings, so re-reviewing an already-published skill
-is not blocked by style nits. Hard trust-boundary checklist items still
-aggregate to `blockers`, and deterministic preflight, unreadable/binary
-payloads, sensitive-shaped files, catalog hash mismatches, dependency failures,
-missing grants, disabled state, and stale reviews still block as usual. Editing
-the payload locally, adding an extra runtime-reachable file, or any
-sidecar/catalog hash drift drops back to ordinary local-skill review semantics.
+Every review, grant and acceptance is bound to the skill's release digest: its
+payload files plus its declared dependencies, without per-install notes, so the
+same release has one identity on every install.
 
 Transport and control skills are first-class control surfaces — a legitimate
 full replacement for the local UI, not demos. An owner may have no screen, no
@@ -759,11 +969,17 @@ stack or cancellation return `disposition: retained`, `turn_ref` for the origina
 optional `work_ref` for a real admitted child, and `delivery_reporting_version`.
 Persist the full receipt and source event, release the input FIFO, and observe
 both references independently through `/presence/work`; never resubmit the event
-as new work. An unresolved work view has `status: unresolved`, the retained code
-and references, no authored outcome/text, and any already released continuation
-outputs. Keep observing for canonical late evidence without erasing the retained
-receipt when a child finishes. Deduplicate output by its original source identity.
-Cancelled attempts remain observed without new generation. A live turn's model
+as new work. A work view is `pending` (202) while its attempt can still change.
+Then it is terminal: a recorded `completed` or `failed` answer keeps its recorded
+projection (a selected reply, or `silent`); a cancellation, unknown outcome, resource
+refusal or settled loss is `failed` (`cancelled` when recorded) with `outcome: "silent"`, empty `text`/`output_ref`, the typed `code` and facts
+(`recorded_status` is the status when observed, `uncertainty`,
+`status_reconciled_from`), `work_ref` naming the polled reference, a real child in
+`child_work_ref` and already released continuation outputs. There `silent` means
+nothing further to deliver, never chosen silence or absence of effects. Stop
+observing a reference at its terminal, keep the receipt, observe a child until its
+own terminal, and deduplicate output by its original source identity. An ended
+attempt is never re-run. A live turn's model
 recovery keeps its conversation under existing controls until it finishes or
 returns a retained refusal; input custody is not released merely by a stream loss.
 `retry` preserves temporary failures and quota refusals with a source-bound
@@ -777,8 +993,8 @@ Never project a retained refusal as `completed/silent` or as a successful handof
 
 `GET /identity` advertises `presence_continuation_version: 1` on supporting hosts. Request
 `continuation_version: 1` beside `binding_id` and `event` on `/presence/turn` (negotiation is not
-event identity). An author whose result waits for acceptance review then yields the conversation
-and answers early: `status: "continuing"` with `continuation_ref` (equal to `turn_ref`) and an
+event identity). An author parked on a review it left for an addressed message (a commit, change or result
+review) yields the conversation and answers early: `status: "continuing"` with `continuation_ref` (equal to `turn_ref`) and an
 initial `outcome`/`text`/`output_ref`. `deferred` with empty text means a result may follow; an
 author-selected early output (Advisory `pending_review=finish`) is speech to send once under its
 `output_ref`; `silent`/`tool_delivered` send nothing. A promoted child keeps its own `work_ref`; poll
@@ -788,24 +1004,21 @@ within the request. A retry of the same event returns the identical stored envel
 
 Poll `GET /presence/work/{continuation_ref}?binding_id=...` like other late work. Ordinary pending
 and terminal continuation views carry `work_ref` and `continuation_ref` naming the author, plus
-`child_work_ref` for its promoted independent work (empty if none). An unresolved retained view
-names the author with `turn_ref` and any retained `continuation_ref`; its optional `work_ref`
-names the actual child, and any `child_work_ref` is retained too. Discover and retain the child
+`child_work_ref` for its promoted independent work (empty if none). Discover and retain the child
 before handling author status; poll it independently. A child promoted after the first yield
 appears at the next park even if the immutable initial envelope has an empty `work_ref`.
 While the author lives it answers HTTP 202 `pending` with `outputs`: the ordered
 `{output_ref, outcome, text}` the author released so far. Its terminal answers 200 with
 `outcome`/`text`/`output_ref` holding only a new terminal output (a re-finalized released selection
 yields `silent` and empty text), the child reference, and the same `outputs`.
-A retained lost author answers HTTP 200 `status: "unresolved"`, `disposition: "retained"` and a
-typed `code`, with no authored `outcome` or `text`. The view preserves released `outputs` and
-the actual child references. Loss is established under the conversation gate or by the retained
-controller's absence; missing or unobservable identity alone proves no crash. Polling starts no
-new generation and never regenerates the original event. An explicit new event may request
-continuation after checking prior effects; it creates a new turn and retains the original reference.
-Old consumers accepting only `interrupted` for a lost author can reject the unresolved view and
-miss a child first discovered there until upgraded; `interrupted` remains the legacy wire shape
-on hosts without retained-work support. Send each `output_ref` at most once:
+An author whose attempt ended without a canonical answer (its recorded terminal, the runner's
+own end marker or a dead controller; a missing or unobservable identity alone proves nothing)
+answers HTTP 200 `failed` (`cancelled` when recorded) with `outcome: "silent"`, empty `text`, a
+typed `code`, its released `outputs` and the child reference. Polling starts no new generation and
+never regenerates the original event. An explicit new event may request continuation after
+checking prior effects; it creates a new turn and retains the original reference. Older hosts may
+answer `unresolved` (observe on) or `interrupted` (ended); current hosts send neither. Send each
+`output_ref` at most once:
 deduplicate by `output_ref`, never by text, since an identical correction is new speech. Without
 `continuation_version` the legacy shape is unchanged and the request waits for the author's terminal.
 
@@ -1015,7 +1228,7 @@ plugin_api: "2.0"            # major strict; minor = required minimum
 A payload without the field binds the legacy "1.3" generation by
 construction: an already-reviewed payload keeps loading on its existing
 hash-bound review PASS, but a NEW review PASS (LLM review, owner attestation,
-or native-seed trust) is refused until the field is declared.
+or an install-basis acceptance) is refused until the field is declared.
 
 ```python
 def register(api):
@@ -1033,8 +1246,8 @@ def register(api):
     )
 
     # HTTP routes — mounted at /api/extensions/<skill>/<path>. GET/HEAD under
-    # manifest, module/... and settings_section are host-owned (see "Loading
-    # more than one file").
+    # manifest, module/..., ui/<revision>/... and settings_section are
+    # host-owned (see "Loading more than one file").
     api.register_route("search", handler=http_search, methods=("POST",))
 
     # WebSocket message handlers (inbound) and broadcasts (outbound).
@@ -1449,11 +1662,11 @@ WebAssembly: your own routes serve them (`register_route` returning a standard
 response, streamed from an isolated child when required), the
 widget references them by `/api/extensions/<skill>/...` URL, and review
 sees each non-text asset as a content-hash-bound descriptor. The module
-endpoint stays JavaScript-only. Hub packages admit `.png .jpg .jpeg .gif .webp
-.svg`, `.mp3 .ogg .wav`, `.mp4 .webm`, `.woff .woff2 .ttf .otf`, and `.wasm`.
-ClawHub archives are capped at 8 MiB per file, 50 MiB uncompressed in total,
-and 200 files (`ouroboros/marketplace/fetcher.py`); OuroborosHub catalog files
-at 5 MiB each (`ouroboros/marketplace/ouroboroshub.py`). A large runtime image
+endpoint stays JavaScript-only. Installs from sources and ClawHub archives
+admit inert assets such as `.png .jpg .jpeg .gif .webp .svg`, `.mp3 .ogg .wav`,
+`.mp4 .webm`, `.woff .woff2 .ttf .otf` and `.wasm`, and refuse loadable binaries
+and credential-shaped files outside Cyber Pro. Both are capped at 8 MiB per
+file, 50 MiB in total and 200 files (`ouroboros/marketplace/fetcher.py`). A large runtime image
 — a v86 disk image of several megabytes and up — does not fit a package: have
 the installer fetch it through an exact `download` spec and serve it from
 `<skill_dir>/.ouroboros_env/resources/` (`skill_dir` comes from
@@ -1585,6 +1798,19 @@ also observe `refreshing` (v6.71.0): a background poll refetch that already has
 data keeps the content and shows a thin indicator instead of a loading swap —
 your declared `loading` label is reused unless you declare a `refreshing` one.
 
+### Your widget inside Ouroboros's messages
+
+Ouroboros can show an installed skill's widget inline in its own chat message
+with `show_card(widget={skill, tab_id, input?})`. Only a live tab qualifies (the
+tool refuses a disabled, unreviewed or unloaded skill and names the live tabs),
+and the card refers to the widget instead of copying it: the chat draws the tab
+`GET /api/widgets` lists for that skill, so a later disable or upgrade applies
+there too. Nothing extra is declared for this; keep the widget usable at a
+compact height, since a message gives it less room than the Widgets page.
+Ouroboros's own component cards (`show_card(components=...)`) reuse this
+catalog without routes: their `action`/`form` controls bind
+`submit: {id, once?}`, and a press returns to Ouroboros as owner input.
+
 ### Async job error contract
 
 Long-running widget actions follow the declarative async job contract: start
@@ -1623,9 +1849,20 @@ requires fresh reviewer approval. See ARCHITECTURE §13 for the shared runtime g
 
 ## Reference skills
 
-The simplest reference for each type lives in the OuroborosHub catalog
-(`razzant/OuroborosHub`); `unix_computer_use` ships bundled under
-`repo/skills/`:
+Bundled references live under `repo/skills/`: `ui_design` guides visual work;
+`design_demo` presents a visual choice in one self-contained page. Both are
+`type: instruction`, recommended and on by default on fresh and upgraded installs.
+Trusted installation needs no review call; an owner's Off or removal stands.
+`unix_computer_use` and `windows_computer_use` are bundled extensions.
+
+Non-declared delegated sessions receive an index of enabled, accepted or reviewed
+instruction skills from every installed bucket: bounded descriptions, triggers and
+absolute manifest paths. Workers may read these files and their references, never
+modify host skills. The index lives in host instructions; retries reuse its stored
+bytes. Bodies are read on demand. Declared-input sessions need explicit references
+in their brief.
+
+The OuroborosHub catalog (`razzant/OuroborosHub`) supplies other examples:
 
 - `weather` — `type: extension`, declarative form/key-value widget,
   reads no env keys.
@@ -1639,17 +1876,117 @@ You can read their full source under
 `data/skills/external/<name>/` for your own local skills, or by browsing
 `razzant/OuroborosHub` on GitHub.
 
-## Publishing
+## Sources and publishing
 
-### OuroborosHub (official, curated)
+### Where installed skills come from
 
-`razzant/OuroborosHub` is the official catalog. Finish the local payload and
-configure `GITHUB_TOKEN` in Settings → Secrets, then choose **Publish to
-OuroborosHub** on the skill card or ask Ouroboros in chat. This is one
-agent-driven flow; a separate manual Preflight or Review action is not required
-merely to start it. The browser first runs a read-only preflight for the
-selected skill and asks for explicit public-action confirmation. Cancelling
-creates no task.
+An install reads skills from its **sources** (Skills → Sources; the settings key
+`OUROBOROS_SKILL_SOURCES`): the skills built into the app, the public hub
+`razzant/OuroborosHub` as two rows (**Ouroboros**, the maintainer's Official
+skills, installed without review by default; **Ouroboros Community**, every
+other entry, reviewed before it runs), ClawHub, an optional local folder, and
+any git repository the owner adds. Until the owner chooses, a source acts on
+its suggested trust: Official installs without review; Community reviews each
+skill. `confirmed: false` does not suspend that choice. Built-ins default to
+trusted only while no list is saved; afterwards the Built in row decides.
+Each source has a trust: `trusted` installs without review; `review` reviews each skill, and blocker findings keep it off,
+even under Advisory, until the owner skips the review. The basis a skill was
+installed under is recorded in `data/state/skills/<name>/install.json` and does
+not change when the source's trust changes later.
+
+For `skill_install` and `skill_update` from a source that reviews each skill,
+the configured review decides (`check: "review"`, the default): the skill runs
+when the reviewers leave no blockers, and outside Cyber Pro only the owner skips
+a review. In Cyber Pro, where Ouroboros acts on its own judgment, it may instead
+record its own check (`check: "self"` after reading the exact release, with
+`check_notes` of 1–2000 characters explaining why it may run). The record holds
+`basis: "self_check"`; an edit invalidates it, and outside Cyber Pro that basis
+admits nothing. A trusted source ignores this choice and says so in the result.
+Every acceptance path keeps preflight, the owner's auto-grant setting,
+dependencies and readiness. Who reviews follows the review pool: under Blocking
+every marked reviewer; under Advisory Ouroboros may name `reviewers` (one or more
+pool rows) and must state why when it narrows the panel; a review the owner starts
+uses the whole pool. Unmarked rows it adds are advisers: heard, never counted.
+
+A git repository is a source in one of two shapes:
+
+- **A plain skills repository**: every folder (or the root) holding a
+  `SKILL.md` or `skill.json` is a skill, described by its manifest.
+- **A hub**: `hub.json` at the root, one `entries/<name>.json` per skill
+  (description, one or two categories, owner, version, `source` hosted at
+  `skills/<name>` or pointing at the author's repository at an exact commit,
+  release `digest`, `withdrawn`), the maintainer's `official.json`
+  (endorsements bound to digests) and `categories.json`.
+
+Private github.com HTTPS sources use the configured GitHub token after a read
+without it (this computer's git credentials still apply) is refused for
+authentication; other repositories use this computer's git credentials.
+
+Every install verifies its copy against the release digest: the SHA-256 of
+each payload file plus the manifest's raw dependency declaration
+(`install_specs`, `install` or `dependencies`), per-install notes left out
+(`ouroboros/skill_identity.py`). An update is a different digest, never a
+different version string. A skill whose files changed here shows as Modified;
+its update offers replace (the previous payload is kept as `.previous`), keep, or **Ask Ouroboros
+to merge**, which merges three-way when the original release can still be
+fetched.
+
+A review-basis replacement stays off while reviewed and keeps the previous
+payload, lifecycle state and install record durably. Executable new bytes keep
+the update; blockers (`review_blockers`), preflight failure (`preflight_failed`),
+an interrupted review (`review_unfinished`), or files/dependencies that could
+not be installed (`landing_failed`) restore the previous copy and its state,
+recording `update_rejected` with that reason. An owner Skip during
+review accepts the new bytes. After a rejection, **Update without review**
+(`skip_review: true`, replace only) installs that release with exact-digest
+`owner_skip` acceptance; preflight still runs. A later update clears the rejection.
+
+Builds set `OUROBOROS_STARTER_SKILLS` to catalog ids from any source. Only an
+absent value or `""` selects the defaults; `[]` and `"[]"` select none.
+`OUROBOROS_STARTER_SKILLS_TURN_ON` (default true) controls turning starters on
+when ready. The starter offer includes every configured id in its category;
+headless first start installs the selected built-ins before fetching git sources.
+
+### Publishing
+
+Finish the local payload and configure `GITHUB_TOKEN` in Settings → Secrets;
+publication uses HTTPS directly and needs no `gh` CLI. Choose **Publish** on
+the skill or ask Ouroboros in chat
+(`submit_skill_to_hub`). The destination is where the skill came from, else the
+hub, unless the owner picks another:
+
+- **Back to its origin**: the hub for a hosted hub entry, the author's
+  repository for a hub entry that points there, or the exact folder of the
+  plain repository it came from.
+- **The hub**: one entry, `entries/<name>.json` plus the hosted files under
+  `skills/<name>/`. The hub regenerates its v1 `catalog.json` for older apps
+  itself; a pull request that only updates one existing entry, by the owner the
+  hub recorded for it, merges automatically once checks pass, while new names,
+  owner changes and Official skills wait for the maintainer. A new entry names
+  one or two category ids from the hub's `categories.json`. A hub without
+  `hub.json` (an older one) gets its `catalog.json` row instead.
+- **A git source of the owner's**: the skill's folder in that repository. When
+  the GitHub account may push there, the pull request is merged at once and
+  the skill is published; otherwise it waits for that repository's
+  maintainers.
+
+**My skills** is optional: `<login>/ouroboros-skills` carries skills between
+your Ouroboros installations. When you choose it, your configured GitHub token
+creates a private repository or connects an existing repository, which may be
+public. A newly connected source is trusted; reconnecting keeps your saved
+name, trust and confirmation.
+
+The result reports separately whether the files reached the repository
+(`files_published`: `pull_request` or `merged`) and whether a catalog lists
+them (`listed`: `when_merged`, `listed`, or `needs_entry_update` when the hub
+lists the skill from its author's repository and that entry must move to the
+new commit in its own hub change). It carries the published files'
+`release_digest`, the value a hub entry states for them.
+
+This is one agent-driven flow; a separate manual Preflight or Review action is
+not required merely to start it. The browser first runs a read-only preflight
+for the selected skill and destination and asks for explicit public-action
+confirmation. Cancelling creates no task.
 
 The preflight returns one of five states:
 
@@ -1663,8 +2000,8 @@ The preflight returns one of five states:
   re-review it.
 - `repairable` — Betterleaks is missing or unhealthy; the ordinary task may
   start with the exact repair hint.
-- `hard_block` — authority, identity, source, or managed-task admission prevents
-  the task from starting.
+- `hard_block` — authority, identity, source, destination, or managed-task
+  admission prevents the task from starting.
 
 If the selected `user_repo` leaf lost its manifest after the card was opened,
 that exact `skill_publish` task may omit `bucket` while it lists/searches/reads
@@ -1699,41 +2036,26 @@ A successful publication also writes a durable local receipt to
 `data/state/skills/<name>/ouroboroshub.json` (`published` section: slug,
 version, content hash, repository, PR number/url, timestamp). The receipt is
 best-effort: a write failure is disclosed as `publication_recorded: false` in
-the tool result and never cancels the real PR. Both Skills views show it as
-quiet submission history — the submitted version (not the current local one),
-the PR link and whether the local files now differ from the submitted copy —
-in the card's details on My skills and under **Submission history** on the
-OuroborosHub card. It is history, not a status: it never claims that the PR
-merged or that the served Hub copy is yours, and it never gates an action. When
-the catalog lists the name, a local copy offers **Use Hub version** whichever
-way the versions differ. The receipt survives uninstall (including the startup
-cleanup of uninstalled state), adopt and reinstall; a republish overwrites it,
-and an explicit **Delete** of a local skill removes it with the rest of that
-skill's state.
+the tool result and never cancels the real PR. The skill's details show it as
+quiet submission history: the submitted version (not the current local one),
+the PR link and whether the local files now differ from the submitted copy. It
+is history, not a status: it never claims that the PR merged and never gates an
+action. The receipt survives uninstall (including the startup cleanup of
+uninstalled state) and reinstall; a republish overwrites it, and an explicit
+**Delete** of a local skill removes it with the rest of that skill's state.
 
-**Clear local submission** in that history deliberately forgets the local
-receipt. Nothing else needs it: the installed files, review and grants stay,
-the GitHub PR is not closed or changed, and Install, Use Hub version and Update
-never wait for it. It clears the receipt shown on the card; if another
-publication replaced it, refresh the card first.
+Forgetting the record in that history deliberately clears the local receipt.
+Nothing else needs it: the installed files, review and grants stay, the GitHub
+PR is not closed or changed, and installs and updates never wait for it. It
+clears the receipt shown; if another publication replaced it, refresh first.
 
-**Use Hub version** and **Update** (on the OuroborosHub card or the My skills
-menu) both confirm before anything changes: the local files, including any
-local edits, are replaced with the copy the Hub serves when the action runs —
-the version shown is the last one seen, not a pinned package. The skill's saved
-data, enablement and review history stay; the new files are reviewed again and
-may need access granted again. Cancelling sends nothing. Grants are bound to
-the content hash, so with auto-grant off an enabled extension whose new files
-need a granted key cannot reload: the replacement fails and rolls back to the
-previous copy, and a failed restore is reported.
-
-For a catalog update, the tool result and PR body name both the current catalog
-version and the proposed version. Versions are opaque strings: an older-looking
-or non-semantic version is allowed, while an identical version still needs to
-change before publishing an update.
+For an update of a catalog entry, the tool result and PR body name both the
+current catalog version and the proposed version. Versions are opaque strings:
+an older-looking or non-semantic version is allowed, while an identical version
+still needs to change before publishing an update.
 
 Publication succeeds only when the task records a validated pull-request
-receipt in the configured Hub repository for this exact skill. A branch,
+receipt in the destination repository for this exact skill. A branch,
 commit, refusal report, or unfinished attempt is partial progress, not
 successful publication. The pull request includes only a redacted scanner
 attestation: engine and version, ruleset digest, `blockers=0`, and
@@ -1743,9 +2065,9 @@ scanner output.
 ### ClawHub (third-party, registry-driven)
 
 ClawHub is the broader OpenClaw registry. Publishing requires an
-OpenClaw publisher account; once your skill is on the registry the
-ClawHub tab in the Marketplace will install it via the
-`adapt_openclaw_skill` translation pipeline. Note that the adapter
+OpenClaw publisher account; once your skill is on the registry, a search in
+Skills → Browse finds it and installs it via the `adapt_openclaw_skill`
+translation pipeline. Note that the adapter
 preserves the original `SKILL.openclaw.md` next to the translated
 `SKILL.md` so reviewers can cross-check both manifests.
 
@@ -1770,7 +2092,7 @@ def register(api):
 | Symptom | Likely cause |
 |---------|--------------|
 | `SKILL_EXEC_BLOCKED: review status is 'pending'` | Run `skill_review` for this skill. |
-| `SKILL_TOGGLE_ERROR: dependency fingerprint is stale` | Re-run `skill_review`; post-review deps reconciliation will reinstall. |
+| `SKILL_TOGGLE_ERROR` with `code: "dependencies_failed"` | The installer's words are in `detail` (network, platform); `toggle_skill enabled=true` again retries; packages never need a review. |
 | `EXTENSION_NOT_LIVE` on tool dispatch | The skill is disabled or the loader had a load_error — check the Skills UI. |
 | `SKILL_REPAIR_STALE: ...` | The selected payload or its admission revision changed; inspect the current state and the reported conflict before continuing. |
 | `PluginAPI.register_*` raises `ExtensionRegistrationError` | Usually the skill is missing the matching permission in its manifest. For `register_companion_process` the name must also be alnum/underscore and declared under `companion_processes` — see "Declaring a companion process". |

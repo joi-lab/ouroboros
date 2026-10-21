@@ -11,6 +11,7 @@
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
 import { tr } from './i18n.js';
 import { apiClient, apiFetch } from './api_client.js';
+import { documentReaderKind } from './document_reader.js';
 
 // At most this many `[Attached file: …]` lines ride the message text.
 export const ATTACHMENT_PREVIEW_COUNT = 25;
@@ -111,8 +112,19 @@ export function paintAttachmentOutcome(bubble, annotation) {
     return true;
 }
 
+const metaText = (view, atoms, note = '') => [atoms.fileExtension(view.name), atoms.humanSize(view.size), note]
+    .filter(Boolean).join(' · ');
+
+// The owner's own Markdown or text reads in the reader from its upload; any other file, an image
+// the host did not prove (served only as a download) included, keeps the file dialog.
+function readable(view) {
+    const kind = view.available ? documentReaderKind(view.name, view.mime) : '';
+    return kind === 'markdown' || kind === 'text' ? kind : '';
+}
+
 function cardHtml(view, atoms, note = view.available ? '' : tr('media.attachment_unavailable', 'Unavailable')) {
-    const meta = [atoms.fileExtension(view.name), atoms.humanSize(view.size), note].filter(Boolean).join(' · ');
+    const meta = metaText(view, atoms, note);
+    const kind = note ? '' : readable(view);
     return `<div class="chat-file-item${view.available ? '' : ' is-unavailable'}">
         <button type="button" class="chat-file-card" ${view.available ? 'aria-haspopup="dialog"' : 'disabled aria-disabled="true"'}
             aria-label="${escapeHtmlAttr(`${view.name}${meta ? ` — ${meta}` : ''}`)}">
@@ -121,7 +133,7 @@ function cardHtml(view, atoms, note = view.available ? '' : tr('media.attachment
                 <span class="chat-file-name" title="${escapeHtmlAttr(view.name)}">${escapeHtml(view.name)}</span>
                 <span class="chat-file-meta">${escapeHtml(meta)}</span>
             </span>
-            <span class="chat-file-more" aria-hidden="true">•••</span>
+            ${kind ? atoms.readLabelHtml(kind) : '<span class="chat-file-more" aria-hidden="true">•••</span>'}
         </button>
     </div>`;
 }
@@ -148,8 +160,7 @@ export function buildAttachmentBlock(atoms, rawViews) {
     block.innerHTML = [
         images.length ? `<div class="chat-gallery-grid${images.length > 1 ? ' is-multiple' : ''}">${images.map((view) => `
             <figure class="chat-gallery-item">
-                <img class="chat-photo" src="${escapeHtmlAttr(view.url)}" alt="${escapeHtmlAttr(view.name)}" loading="lazy" decoding="async">
-                ${atoms.photoActionsHtml()}
+                ${atoms.photoHtml(view.url, view.name, ' loading="lazy" decoding="async"')}
             </figure>`).join('')}</div>` : '',
         players.map((view) => `<div class="chat-attachment-player">${atoms.playerHtml({
             audio: view.kind === 'audio', src: view.url, title: view.name })}</div>`).join(''),
@@ -159,7 +170,7 @@ export function buildAttachmentBlock(atoms, rawViews) {
     images.forEach((view, index) => {
         const item = figures[index];
         if (!item) return;
-        atoms.wirePhotoActions(item, view.url, sourceOf(view), view.name, view.mime);
+        atoms.wirePhotoActions(item, view.url, sourceOf(view), view.name, view.mime, { meta: metaText(view, atoms) });
         atoms.listen(item.querySelector('.chat-photo'), 'error', () => degrade(atoms, block, item, view), { once: true }, item);
     });
     const playerRoots = block.querySelectorAll('.chat-attachment-player');
@@ -178,8 +189,12 @@ export function buildAttachmentBlock(atoms, rawViews) {
 
 function wireCard(atoms, item, view) {
     const card = item?.querySelector('.chat-file-card');
-    if (card && view.available) atoms.listen(card, 'click', () => atoms.openFileDialog({
-        source: sourceOf(view), filename: view.name, mime: view.mime || 'application/octet-stream' }, item), undefined, item);
+    if (!card || !view.available) return;
+    const kind = card.querySelector('.chat-file-more.is-read') ? readable(view) : '';
+    const file = { source: sourceOf(view), filename: view.name, mime: view.mime || 'application/octet-stream', kind,
+        meta: metaText(view, atoms), reader: kind ? { url: view.url } : null, size: view.size, canOpen: true };
+    atoms.listen(card, 'click', (event) => (kind ? atoms.openReader(file, item, card, event)
+        : atoms.openFileDialog(file, item)), undefined, item);
 }
 
 // A preview the engine cannot show (HEIC in Chromium, an unsupported codec) stays an
@@ -357,17 +372,15 @@ function keptFrame(frame) {
  * history read after a reload does not show the message saved (`reconcile`) — every
  * such bubble says so and offers "Send again": the SAME frame and id, which the host
  * rejoins if it saved the message after all (never a second message) or accepts now,
- * and "Discard", which forgets only this tab's copy. A saved row the host marks
- * `ingress_undispatched` (it proved the row never reached dispatch) keeps its frame
- * and offers both too: its Send again is the one retry the host hands over. A saved row
- * marked `ingress_pending` is the running host's, between its append and its dispatch
+ * and "Discard", which forgets only this tab's copy. A saved row marked
+ * `ingress_pending` is the running host's, between its append and its dispatch
  * (or echoed before a deferred dispatch): the frame waits for the next fact. A saved row
- * with none of the three came from a host process that has since ended (a restart came
+ * with neither dispatch fact came from a host process that has since ended (a restart came
  * between): whether it reached the agent is unknown and Send again would only rejoin
  * it, so its bubble says "Saved; delivery not confirmed" and the frame is dropped; the one action it keeps is "Send as a
  * new message", which only prepares the composer with the owner's words (`compose`) and sends nothing. Bubble
- * labels (markIngressSaved): `Input saved` on `ingress_dispatched` and `ingress_pending`,
- * `Saved, not delivered.` (frame kept) on `ingress_undispatched`. `count` feeds the chat
+ * labels (markIngressSaved): `Input saved` on `ingress_dispatched` and `ingress_pending`.
+ * `count` feeds the chat
  * instance's `hasPendingWork`, which keeps a Project room holding one hidden instead of
  * destroying it. Nothing here resends by itself or deletes an upload: those stay on the host.
  */
@@ -385,8 +398,10 @@ export function createUnconfirmedSends({ send, root, onDomWrite, showToast, comp
             else unreadable = true;
         }
     } catch { unreadable = true; }
+    // The tab's own storage, not an action of the owner's that failed: said, but not felt (toast.js, haptics.js).
     if (unreadable) showToast(tr('chat.send_unconfirmed_unread',
-        'This tab could not read an unsaved message it kept for a reload, so it cannot be offered again.'), 'error');
+        'This tab could not read an unsaved message it kept for a reload, so it cannot be offered again.'), 'error',
+        { haptic: false });
 
     function persist() {
         if (!storage || !storageKey) return;
@@ -396,7 +411,8 @@ export function createUnconfirmedSends({ send, root, onDomWrite, showToast, comp
                 .map(({ frame, views, ts }) => ({ frame: keptFrame(frame), views, ts }))));
         } catch {
             showToast(tr('chat.send_unconfirmed_unkept',
-                'This tab could not keep the unsaved message for a reload. Send again still works until then.'), 'error');
+                'This tab could not keep the unsaved message for a reload. Send again still works until then.'), 'error',
+                { haptic: false });
         }
     }
 
@@ -411,7 +427,7 @@ export function createUnconfirmedSends({ send, root, onDomWrite, showToast, comp
             showToast(tr('chat.send_again_offline', 'Still offline. Reconnect and send again.'), 'error');
             return;
         }
-        // The doubt waits for the next fact; a saved, undispatched row keeps its note, without actions.
+        // The doubt waits for the next fact; a pending saved row keeps its note, without actions.
         onDomWrite(() => (note.dataset.ingressUnconfirmed !== undefined ? note.remove() : clearActions(note), true));
     }
 
@@ -429,7 +445,7 @@ export function createUnconfirmedSends({ send, root, onDomWrite, showToast, comp
         return button;
     }
 
-    // The doubt on its bubble, or the saved-undispatched note markIngressSaved wrote, gains the two actions.
+    // The doubt on its bubble, or a pending saved note after a disconnect, gains the two actions.
     function mark(id, bubble) {
         const saved = bubble.querySelector('[data-ingress-saved]');
         let note = saved || bubble.querySelector('[data-ingress-unconfirmed]');
@@ -491,20 +507,17 @@ export function createUnconfirmedSends({ send, root, onDomWrite, showToast, comp
             const entry = frames.get(String(id || ''));
             if (entry) entry.queued = false;
         },
-        /** The host's saved row for an id (its echo or history): the only thing that ends a doubt — unless
-         *  the host proved that row never reached dispatch, which keeps the frame for its one handover, or
-         *  the running host has not yet said (`ingress_pending`), which keeps it for that word. A saved row
-         *  of a host process that has since ended (none of the three) ends it in a delivery doubt. */
+        /** The host's saved row for an id (its echo or history) ends a doubt once dispatch is confirmed.
+         *  `ingress_pending` keeps the frame waiting for that fact. A saved row of a host process that
+         *  has since ended (neither dispatch fact) ends it in a delivery doubt. */
         settle(row) {
             const id = String(row?.client_message_id || '');
             if (row?.role !== 'user' || row.ingress_accepted !== true || !frames.has(id)) return;
             const bubble = bubbleOf(id);
-            if (row.ingress_undispatched === true) {  // saved, never dispatched: the frame stays for its one handover
-                if (bubble) onDomWrite(() => mark(id, bubble));
-            } else if (row.ingress_dispatched === true) {
+            if (row.ingress_dispatched === true) {
                 forget(id);
             } else if (row.ingress_pending === true) {
-                // The running host took it and will say dispatched or undispatched: the frame waits for that,
+                // The running host took it and still owes dispatch: the frame waits for its confirmation,
                 // and a reload's first read that shows it so has answered for the kept copy (no doubt from `reconcile`).
                 frames.get(id).restored = false;
             } else if (bubble) {  // without its bubble the frame waits, so the doubt is not lost unseen

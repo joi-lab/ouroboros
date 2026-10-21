@@ -9,6 +9,7 @@ from threading import Thread
 from urllib.parse import urlparse
 
 import pytest
+from ouroboros.test_evidence import diagnostic_directory
 
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 WEB = Path(__file__).resolve().parents[1] / "web"
@@ -28,6 +29,7 @@ dashboard.activateTab('updates');
 
 @pytest.mark.parametrize(("engine", "width"), [("chromium", 1360), ("webkit", 390)])
 def test_refresh_keeps_text_and_install_action_then_shows_exact_failed_range(engine, width, tmp_path):
+    output = diagnostic_directory(tmp_path, "update-letter")
     if os.environ.get("OUROBOROS_RUN_UI_SMOKE") != "1":
         pytest.skip("Set OUROBOROS_RUN_UI_SMOKE=1")
     playwright = pytest.importorskip("playwright.sync_api")
@@ -101,7 +103,7 @@ def test_refresh_keeps_text_and_install_action_then_shows_exact_failed_range(eng
                 page.locator("#updates-letter-details summary").click()
                 assert "aaaaaaaa → bbbbbbbb" in page.locator("#updates-letter-provenance").inner_text()
                 assert "bbbbbbbb → cccccccc" in page.locator("#updates-letter-error").inner_text()
-                page.screenshot(path=str(tmp_path / f"update-letter-failed-{engine}-{width}.png"), full_page=True)
+                page.screenshot(path=str(output / f"update-letter-failed-{engine}-{width}.png"), full_page=True)
                 assert "subscription limits, local resources, or API budget" in page.locator("#updates-letter-resources").inner_text()
                 assert page.evaluate("document.documentElement.scrollWidth<=document.documentElement.clientWidth")
                 page.locator("#updates-letter-refresh").click()
@@ -118,8 +120,8 @@ def test_refresh_keeps_text_and_install_action_then_shows_exact_failed_range(eng
                 held.pop().fulfill(content_type="application/json", body=json.dumps(fresh))
                 page.wait_for_selector(".toast")
                 assert page.locator(".toast").inner_text() == "Description is up to date."
-                page.screenshot(path=str(tmp_path / f"update-letter-{engine}-{width}.png"), full_page=True)
-                print(f"visual evidence: {tmp_path / f'update-letter-{engine}-{width}.png'}")
+                page.screenshot(path=str(output / f"update-letter-{engine}-{width}.png"), full_page=True)
+                print(f"visual evidence: {output / f'update-letter-{engine}-{width}.png'}")
                 assert errors == []
             finally:
                 browser.close()

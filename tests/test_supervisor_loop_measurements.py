@@ -277,9 +277,15 @@ def _run_custody_tick(monkeypatch, *, failing_step=None):
         lambda: type("_D", (), {"clear_start_failure_latch": lambda self, **_k: False})(),
     )
     monkeypatch.setattr(sm, "threading", SimpleNamespace(Thread=tracked))
+    from ouroboros.maintenance import child as maintenance_child
+
     sm._periodic_supervisor_maintenance([0.0], [time.time()])
     for thread in threads:
         thread.join(5)
+    # A process's first pass also reserves its one maintenance child, whose thread may spawn
+    # a due job's process; a slow runner is still inside it at teardown. Join it here, as its owner.
+    if maintenance_child._thread is not None:
+        maintenance_child._thread.join(60)
     assert all(not thread.is_alive() for thread in threads)
 
 

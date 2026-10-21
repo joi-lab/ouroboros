@@ -42,8 +42,9 @@ explicit work-order review obligations.
   index, syntax of staged `.py` files), the tests preflight under its own policy
   (`skip_tests` is the one exemption, a documentation-only diff included; a
   managed resolution always runs it; a matching unsigned receipt of a complete run
-  counts), then the named row's look, then ONE review wave in which every pool seat,
-  shown the same test execution fact, answers both parts of the brief. The commit
+  counts), then the named row's look, then ONE review wave in which every seat on the panel (every pool
+  seat under Blocking; the pool seats Ouroboros named with a reason under
+  Advisory), shown the same test execution fact, answers both parts of the brief. The commit
   records its preflight fact: `performed` with the record id, `skipped` for an
   explicit `skip_advisory_review=True`, `not_performed` when no row was named.
   `preflight_reviewer` and `skip_advisory_review=True` are opposite choices
@@ -64,8 +65,8 @@ explicit work-order review obligations.
   missing advisory provider) leaves a durable trace: a `review_advisory_override`
   event in `events.jsonl` plus the persistent `advisory_overrides_count` /
   recent-overrides fields in `review_status`. Silent advisory is forbidden.
-- **Author finality remains evidence, not reviewer PASS:** task acceptance,
-  skill, and commit owners may record an explicit author disposition against the
+- **Author finality remains evidence, not reviewer PASS:** the authors of a task
+  result, a skill and a commit may record an explicit author disposition against the
   exact current subject after received feedback or a disclosed unavailable review under Advisory.
   Advisory and Cyber commit outcomes return before Git; explicit continuation uses
   the returned `review_reference` and author disposition, with independent current
@@ -85,8 +86,9 @@ explicit work-order review obligations.
   feedback can support Advisory choice without cancelling the other actors.
   Main judges semantic criteria and material evidence after acknowledging the
   observed owner source; source generation alone is not semantic supersession.
-  Historical feedback remains independently addressable. For Main's acceptance
-  decision, a queued outcome or predeclared stance is not proof of exposure.
+  Historical feedback remains independently addressable. For Main's finish over a
+  result review's findings, only findings actually shown to it count; a queued
+  outcome is not proof of exposure.
 **Obligation tracking:**
 - Every blocked `commit_reviewed` verdict mints "open obligations" — a structured
   list of the unresolved findings, synthesized to canonical issues
@@ -230,7 +232,7 @@ Ouroboros binds Ouroboros as the author, never the subject repository.
 | 6 | cross_platform | Does the diff use platform-specific APIs (`os.kill`, `os.setsid`, `os.killpg`, `os.getpgid`, `fcntl`, `msvcrt`, `signal.SIGKILL`, `signal.SIGTERM`, `subprocess` with `start_new_session`/`creationflags`, hardcoded `/` or `\\` in filesystem paths) outside the subject's platform abstraction layer, when it has one? Does it import Unix-only or Windows-only modules (`fcntl`, `msvcrt`, `winreg`, `resource`) at any level without a platform guard (a `sys.platform` check or the subject's equivalent)? | critical |
 | 7 | capability_regression | Does the diff REMOVE or NARROW a previously-supported user-facing behavior or capability — a tool/flag/mode/path that worked before now errors or is gated tighter (e.g. a new `is_dir`/existence guard that blocks a legitimate create, a tightened allowlist that drops a real path, a removed fallback)? If so, is it INTENTIONAL and disclosed as a breaking/capability change in the commit message + changelog? Accidental capability removal is the failure class this item names. Ask whether a golden "from zero" test would have caught it. **Guard-change trigger (executable requirements, not an essay):** ADDING or TIGHTENING a guard, filter, allowlist, or deny rule IS a capability change and fires this item. For such a diff the reviewer must verify two things: (a) the diff names and runs a positive test, existing or newly staged, that walks a legitimate flow THROUGH the new guard and proves it still succeeds — a negative "it blocks X" test alone is insufficient (a gate can pass its own probe while breaking every real run); (b) the diff or its disclosure NAMES THE SURVIVING POSITIVE PATH — the concrete actor and flow that still work after the change. A guard change without passing surviving-path evidence is a capability-regression finding, not a safety improvement; a missing *new* test is not. A guard keyed on model or provider identity (id, prefix, family, provider name) always fires this item; its positive test uses an identity that the diff's own literals do not contain, and a test that proves only refusal is insufficient. **Owner acceptance:** a narrowing counts as OWNER-ACCEPTED only when the subject's owner actually decided it (the owner's words or answer for this work, or a standing disclosure the subject keeps for this purpose) or it lies within authority the owner had already delegated for this work; the plan council's answers are the reviewers' view, not the owner's consent. Owner acceptance makes the finding advisory (disclosed, non-blocking). Intent wording, a commit-message disclosure, or a changelog row alone is disclosure, NOT acceptance. This names who accepts a narrowing; it adds no approval step. Severity follows the `Critical surface whitelist` below — silently removing a documented user-facing capability or a release contract is critical; removing or loosening an internal guard, proof or re-check is advisory and needs one line naming the residual; an owner-accepted narrowing or an internal-only refactor is advisory. | advisory |
 | 8 | changelog_accuracy | Do the exact wording, test counts, and minor description details in the subject's changelog or release-notes entry match what the diff actually does? Wording drift, off-by-one test counts, minor inaccuracies in descriptive prose — these belong here, NOT in a release-metadata or consistency item. This item exists so reviewers have a dedicated advisory bucket for prose-level changelog imprecision that does not affect release metadata, runtime behavior, or safety contracts. (PASS with "Not applicable" when the subject keeps no changelog.) | advisory |
-| 9 | perf_lifecycle | If the diff changes data readers or an endpoint, poller, subscription, timer, startup, shutdown or other batch operation: evaluate the total read cost as history, object count and project size grow, including nested repeats, cold caches and contention for shared resources. Where that growth can materially hurt responsiveness, is there proportionate evidence at representative scale, and was redundant work or within-operation reuse considered before adding infrastructure? This remains advisory, with no universal time limit, mandatory heavy benchmark or new approval gate. Does any interaction-path read scan an unbounded store per request/message/tick (a full-table read filtered in code is such a scan)? Is a subscription/observer/interval/listener added without a paired disposer? Does O(history) work run on a poll/stream path? Does a GET handler perform new steady-state durable writes? Where the subject documents these invariants, check against its definitions rather than re-deriving them here. (PASS with "Not applicable" if the diff touches none of these surfaces.) | advisory |
+| 9 | perf_lifecycle | If the diff changes data readers or an endpoint, poller, subscription, timer, startup, shutdown or other batch operation: evaluate the total read cost as history, object count and project size grow, including nested repeats, cold caches and contention for shared resources. Where that growth can materially hurt responsiveness, is there proportionate evidence at representative scale, and was redundant work or within-operation reuse considered before adding infrastructure? This remains advisory, with no universal time limit, mandatory heavy benchmark or new approval gate. Does any interaction-path read scan an unbounded store per request/message/tick (a full-table read filtered in code is such a scan)? Is a subscription/observer/interval/listener added without a paired disposer? Does each observed or non-terminal state name which live producer can still change it and which fact ends the observation (an unknown past is a fact on a terminal, not an open state)? Does O(history) work run on a poll/stream path? Does a GET handler perform new steady-state durable writes? Where the subject documents these invariants, check against its definitions rather than re-deriving them here. (PASS with "Not applicable" if the diff touches none of these surfaces.) | advisory |
 
 ### Severity rules
 
@@ -411,7 +413,7 @@ Ownership` section is delivered beside them.
 | 17 | evolution_durability | If the diff can change how self-modification is tested, committed or interrupted (preflight, commit, restart and reset paths, evolution scheduling, tests): do tests and preflight never mutate the live repository or live `data/`, does a local commit succeed without a remote, and does interrupted self-modification end in a reviewed commit or a preserved rescue/transaction pointer? | critical |
 | 18 | context_budget_ssot | If the diff changes context budgets, the context layout or a section's tier, or the ContextFit deficit/reclaim contract: is there still one budget SSOT that both context profiles, the docs and the drift-guard tests read; does the always-full core (BIBLE, SYSTEM, identity, scratchpad, knowledge index, marks) stay in view in every mode with the sealed story resident; does only the physical window turn content into addresses — people's words last (ARCHITECTURE `memory_floor.py`, §6 "Context fitting") — with every degraded span named by a visible on-demand pointer (P1), and does an owner-selected smaller target bound host material only; and does the coupling question stay independent of the context mode (coupling the two is an immune-system change under P3)? Outside Cyber Pro the owner selects the context mode. (PASS with "Not applicable" if no context-budget/layout change.) | critical |
 | 19 | delegated_transport | If the diff touches delegated execution or review transport (ARCHITECTURE §6 "Delegated subagents" and the session executors of `review_execution.py`, matched by role, not by a file list): (a) does the exact selected `subagent_id` route start with custody-durable requested→effective evidence, or return a typed refusal — never a host-chosen substitute, any fallback being a new explicit LLM choice? (b) does a capability reduction reach the durable envelope, the child prompt and the parent result? (c) is a result received only after a hash-bound read to EOF, and does a retry replay the recorded bytes? (d) is quota exhaustion judged only on positive evidence for the route's own model (unknown stays usable), and does spend settle through custody with root/parent lineage, unknown never shown as zero? (e) does the work order carry the complete assignment and host authority once, with no arbitrary size cap, compulsory file/question transport or duplicate objective, do plan normalization and reviewer inputs keep full content and tail-sensitive identity, and do real route limits keep the original input, cause and execution state? (f) does a legacy partial request stay recoverable byte-for-byte (exact selector, digest and range validation, durable source coverage) and refuse apply until complete, with reject still available? No vendor or harness name is branched on in core; source availability never proves reading. (PASS with "Not applicable" if no delegated-transport surface changed.) | critical |
-| 20 | source_completeness | Partial views and source truth: if the diff adds or changes a bounded view (projection, summary, omission marker, status count) or review evidence (plan, change review, preflight, acceptance): (a) does every cut say so in band — a marker naming what was cut and a reference to the existing file, blob, record or range the deciding actor can still open after the real merge, promotion and cleanup? A new store, copy or sidecar is not required when such a reference exists; (b) does a consumer that can authorize PASS, a destructive rewrite or replacement of a full contract read the named sources first, or abstain with the existing typed incomplete/degraded outcome? A marker or host claim alone is never sufficient; (c) do review records keep exact artifact bodies and source selectors, candidate SHA, reviewer route continuity and every omission, with continuity, transport and coverage discrepancies as typed facts beside them, so a failed or truncated delivery stays DEGRADED/NOT_RUN rather than PASS? File-read coverage is diagnostic (BIBLE P3), never a reason to discard a received verdict or drop its reviewer from quorum; no disclosure discards, blanks or relabels a body or its cause. | critical when applicable |
+| 20 | source_completeness | Partial views and source truth: if the diff adds or changes a bounded view (projection, summary, omission marker, status count) or review evidence (plan, change review, preflight, result review): (a) does every cut say so in band — a marker naming what was cut and a reference to the existing file, blob, record or range the deciding actor can still open after the real merge, promotion and cleanup? A new store, copy or sidecar is not required when such a reference exists; (b) does a consumer that can authorize PASS, a destructive rewrite or replacement of a full contract read the named sources first, or abstain with the existing typed incomplete/degraded outcome? A marker or host claim alone is never sufficient; (c) do review records keep exact artifact bodies and source selectors, candidate SHA, reviewer route continuity and every omission, with continuity, transport and coverage discrepancies as typed facts beside them, so a failed or truncated delivery stays DEGRADED/NOT_RUN rather than PASS? File-read coverage is diagnostic (BIBLE P3), never a reason to discard a received verdict or drop its reviewer from quorum; no disclosure discards, blanks or relabels a body or its cause. | critical when applicable |
 | 21 | canonical_memory_fork | If the diff touches Project/fork/execution roots, summaries, memory, or GC, does it preserve one canonical identity and distinguish authority/biography from execution-local state? Are referenced canonical artifacts promoted or retained before a child/root is collected, with missing legacy bytes represented as gaps? | critical when applicable |
 | 22 | context_building | Context inputs: does a new data/memory file that should reach LLM context appear there (`context.py`), and does a changed knowledge-base topic update `memory/knowledge/index-full.md`? | advisory |
 | 23 | gateway_parity | If the diff changes any browser-facing endpoint, WebSocket message, or frontend API call, are `ouroboros/gateway/contracts.py`, `ouroboros/gateway/router.py`, `web/modules/api_client.js`, `web/modules/api_types.js`, and `tests/test_gateway_parity.py` still aligned? Missing alignment is advisory unless it also breaks a frozen contract, safety guard, release metadata, or runtime behavior. | advisory |
@@ -419,6 +421,7 @@ Ownership` section is delivered beside them.
 | 25 | display_identity_replay | If the diff changes routing, steering, task cards, or history replay, does it preserve the event-time human `Project › Task` presentation snapshot in both live and replay paths while keeping opaque IDs as internal/debug facts? | advisory when applicable |
 | 26 | web_design_system | If the diff touches `web/` (modules, stylesheets, `index.html`, onboarding assets) or backend producers/delivery of owner-facing UI messages: does it conform to `docs/DESIGN.md`, first to its design bible (does each new or changed element take one of its roles: the plain room, an object or tray, a capsule tone, one height per role with states in colour; is a deliberate departure named in the commit message rather than introduced silently?), then to its type scale, foreground roles, status pairs and spacing tokens, and to the engineering rules in DEVELOPMENT.md "Design System" (no new inline visual styles, values live in `web/ui.css` tokens, shared components over page-local copies)? When the diff ADDS a UI control, chip, card, dialog, or visual pattern, does it reuse an existing shared frontend primitive (name it — the registry is ARCHITECTURE.md §3 "Navigation and shared UI contracts") or state in one line why none covers the need — and, because reuse alone does not show that two controls agree, does a control for an owner intent that already has a door come from that door (DESIGN "References and actions"), with the neighbouring rows of `docs/inventories/UI_CONTROL_TEXT_INVENTORY.md` named when control text is added or changed? The authoritative definitions live in those documents — check against them, do not re-derive them here. Check host/model authorship, explicit role/type and their preservation through live delivery and history against DESIGN's "Chat authorship and System rows"; Python producers are part of this surface. (PASS with "Not applicable" if neither frontend nor backend UI-message behavior changes.) | advisory |
 | 27 | size_cap_paydown | If the diff was shaped by a size limit (module cap, function gate, byte debt, or a reference book's size — added book text is paid by shortening the same book, the pairwise contribution-base rule): was it paid by making the code simpler where it lives? A reduction is honest when the reader holds fewer concepts, branches and state afterwards — dead code and duplicates removed, an existing owner reused; the same logic in fewer lines or tighter formatting is not one. An extraction is honest only when each resulting file has one responsibility you can state in one sentence without naming the other file, and the files have no mutual imports. A cap-driven bucket, a one-caller passthrough, or bytes bought by deleting contract-bearing comments, docstrings, messages or tests is a defect to report, not a paydown (BIBLE P7 «first simplify what exists»; DEVELOPMENT.md "Paying down a size cap"). | advisory when applicable |
+| 28 | capability_placement | Does the change add to the body a capability or a control that a setting, a declarative contribution or a skill could carry? If it opens a seam, does the seam ship with its first consumer, and does core consume the contract without naming a skill or vendor (DEVELOPMENT "Capability placement")? An honest answer is advice for the author, never a block. | advisory |
 
 ### Body severity rules
 
@@ -660,50 +663,51 @@ the prerequisite for trusting opaque bytes as EXECUTABLE payload inside
 the skill tree — the WASM there is a host-side WebAssembly runtime, a
 separate future topic from the browser-sandboxed `.wasm` above.
 
-Skills default to **disabled** and cannot be executed by `skill_exec`
-until review produces a fresh executable verdict. Skill review output is persisted
+A skill runs through `skill_exec` only when its exact current bytes are accepted
+(by a fresh executable review verdict or by one of the exact-byte bases below) and
+it is enabled (by the owner, or by an install's turn-on-when-ready request, never
+over an explicit Off). Skill review output is persisted
 to `~/Ouroboros/data/state/skills/<name>/review.json` with a content
 hash so an edit to the skill invalidates the previous verdict.
-`review.json`, `enabled.json`, `grants.json`, and marketplace/self-authored
-provenance are skill trust/control-plane state: they are mutated only
-through the review, toggle, launcher-grant, self-authored finalize,
-native launcher-seed trust, and marketplace paths, not through generic
-agent/browser file writes.
+`review.json`, `enabled.json`, `grants.json`, `install.json`, `owner_edit.json`,
+`update_backup.json` and marketplace/self-authored provenance are skill
+trust/control-plane state:
+they are mutated only through the review, toggle, launcher-grant, self-authored
+finalize, installer and owner-edit paths, not through generic agent/browser
+file writes.
 
-Native launcher-seed trust (v6.31.0) is a named, hash-pinned, audited
-exception to manual first review: when the LAUNCHER itself writes a
-bundled native skill payload (bootstrap seed, post-bootstrap new seed,
-or version resync — all marked by `.seed-origin`), it stamps
-`review.json` with `status=clean`, `reviewer_models=["repo_commit_gate"]`,
-and `review_profile="native_seed"`, because those exact payload bytes
-already passed the repo commit gate's review wave. The verdict is bound to
-the post-seed content hash (lifecycle control files excluded), so ANY
-later edit flips it stale and non-executable exactly like an ordinary
-review; removing `.seed-origin` reclassifies the skill as user-managed.
-Zero-grant native seeds (no secret keys, no privileged permissions, only
-tool/subprocess surface) also auto-enable — but only when no explicit
-owner enable/disable choice exists yet; a version resync never overrides
-an owner's disable. The verdict is additionally bound to the marker at
-LOAD time: a `native_seed` review whose `.seed-origin` is gone reads back
-as pending (non-executable). The owner opt-out is
-`OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS=false`; the trust never extends to
-clawhub/external/self-authored skills. Packaged installs bind native-seed
-trust to the SHA-pinned `repo.bundle`; source-mode installs copy current
-worktree bytes and therefore lack that packaged-byte provenance.
+A source the owner trusts is the named, digest-pinned exception to a first
+review: the installer (built-ins included) writes the host-owned
+`install.json` with basis `trusted` and the exact release digest, and the
+gate admits those bytes only (`trusted_source`); any later edit leaves the
+release and is unreviewed again. No synthetic `clean` verdict is written;
+the deterministic preflight still gates the bytes an install or update lands (a
+built-in re-seeded with an app update carries the app's own release); a source's
+trust never rewrites earlier installs. A skill installed from a source that
+reviews each skill keeps blocker findings non-executable even under Advisory
+until the owner skips the review. Enablement of such installs is the
+owner's choice or the install's turn-on-when-ready request, never over an
+explicit Off. The Built in row of the source list sets built-in trust;
+`OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS=false` only seeds that row while no list is saved.
+A built-in whose manifest `os` excludes this host is neither offered nor newly
+installed; an installed copy is still re-seeded and discovery hides it, except a
+Windows Unix-remote choice: the re-seed records `legacy_remote_platform=win32` in
+`.seed-origin` for an enabled, formerly unrestricted Unix copy whose ON was not
+recorded as automatic. Any executable acceptance admits its declared packages:
+Enable installs or repairs them; startup retries installed on/requested skills.
+Packages alone never require a paid review. Packaged installs take built-ins from the SHA-pinned
+`repo.bundle`; source mode copies worktree bytes, without that provenance.
 `skip_advisory_review` records only the commit's skipped preflight: the repo
 review wave, both parts, still runs.
 
 Self-authored skills carry payload-local `.self_authored.json` and
 owner-state `data/state/skills/<skill>/self_authored.json` provenance,
 but outside Cyber Pro they do not bypass review on the agent's own initiative. `skill_review` routes them
-through the same tri-model skill review as marketplace and user-managed
+through the same review-pool skill review as marketplace and user-managed
 skills; no deterministic PASS or enablement is written automatically.
-EXCEPTION (C1, v6.39; narrowed hub extension in v6.43 — owner attestation): the OWNER
-may explicitly skip the EXPENSIVE LLM review for their OWN skill (`source=external` or
-self-authored) or for a hash-verified official OuroborosHub payload (fresh sidecar +
-live-catalog hash match, no extra runtime-reachable files) via the owner-only
-`POST /api/owner/skills/<skill>/attest-review`. Native, ClawHub, and unverified
-OuroborosHub payloads are not attestable. The DETERMINISTIC preflight floor still runs
+EXCEPTION (owner attestation, "Skip review" / "Turn on anyway"): the OWNER may skip the
+LLM review for the exact bytes of a skill from any origin via the owner-only
+`POST /api/owner/skills/<skill>/attest-review`. The DETERMINISTIC preflight floor still runs
 (409 on failure); only the LLM phase is skipped. The result is a durable `clean` verdict
 with `review_profile=owner_attested`, `reviewer_models=[owner_attestation]`, bound to
 `content_hash` (a content edit stales it) and valid only while the owner-issued
@@ -713,15 +717,20 @@ configuration does not turn a self-authored decision into an owner attestation. 
 expressed owner instruction through `skill_owner_action`; the shared host owner
 checks the actual caller, resolved member source, selected revision and source
 eligibility before invoking this same attestation. The model interprets the
-owner's words; a formatted reference alone grants nothing. This remains the
-only owner-issued review bypass.
+owner's words; a formatted reference alone grants nothing. Without a review
+panel, exact bytes are accepted only by: a trusted source (`trusted`); Ouroboros's
+own recorded check of that release, only in Cyber Pro (`self_check`, its notes in
+`install.json`; outside Cyber Pro it admits nothing); the owner's Skip review or "Update without
+review" of that release (owner attestation, `owner_skip`); and an owner edit: the
+admitted selected-skill task the owner's own door started records `owner_edit.json`
+for each revision it writes. Each binds to exact bytes; any later edit leaves it.
 `OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS` is default-on as of v6.10.0 (the owner
 may disable it), in which case a fresh executable review grants only
 manifest-declared settings keys and host permissions for that exact content
 hash; when disabled, key and permission grants remain explicit.
 
-The Skills UI Repair affordance and automatic repair both start ordinary managed
-development tasks. Keep the selected skill, source request and admitted payload
+The Skills UI Repair affordance starts an ordinary managed development task; no
+automatic repair exists. Keep the selected skill, source request and admitted payload
 revision; a legacy `task_constraint.mode="skill_repair"` record remains readable
 as a selected-resource binding, never a reduced execution profile. Ordinary file,
 shell, browser, delegation and functional skill operations remain available
@@ -770,7 +779,7 @@ buckets, nested manifests, and path escapes remain refused.
 
 ### Output contract
 
-Reviewers return a JSON array covering every item below (16 items total).
+Reviewers return a JSON array covering every item below.
 Each entry carries `item`, `verdict` (`PASS`/`FAIL`), `severity`
 (`critical`/`advisory`), and `reason`. If one item has multiple distinct
 concrete problems, reviewers may return multiple `FAIL` entries for that
@@ -789,16 +798,17 @@ and do not return `PASS` for an item that also has a `FAIL` — the concrete
 | 4 | path_confinement | Do scripts stay inside the skill directory and the dedicated state dir (`~/Ouroboros/data/state/skills/<name>/`)? Absolute paths, `..` traversal, and writes to arbitrary user home subdirs are concrete FAIL. Reading from outside the skill dir is OK for read-only lookups (e.g. system info), write-path confinement is the strict rule. | critical |
 | 5 | env_allowlist | Is `env_from_settings` a short, justified list of settings keys? Core keys in `FORBIDDEN_SKILL_SETTINGS` (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `OPENAI_COMPATIBLE_API_KEY`, `CLOUDRU_FOUNDATION_MODELS_API_KEY`, `GIGACHAT_CREDENTIALS`, `GIGACHAT_PASSWORD`, `ANTHROPIC_API_KEY`, `MINIMAX_API_KEY`, `DEEPSEEK_API_KEY`, `GITHUB_TOKEN`, `OUROBOROS_NETWORK_PASSWORD`) may be declared only when the skill genuinely needs that provider/token for its stated purpose; runtime forwards them only after a fresh executable review and a content-bound desktop-launcher owner grant. v5.2.2 dual-track grants: both `type: script` skills (forwarded by `_scrub_env`) and `type: extension` skills (forwarded by `PluginAPIImpl.get_settings`) are eligible; `type: instruction` skills cannot receive core keys. Mark unjustified core-key requests or non-forbidden secrets unrelated to the purpose as FAIL. An empty list is the default and always fine. | critical |
 | 6 | timeout_and_output_discipline | Is `timeout_sec` reasonable for the stated workload (default 60, hard cap 300)? Do scripts print to stdout in chunks that the runtime can cap, rather than streaming unbounded output? Unbounded loops without a `break`/timeout path are a concrete FAIL. | advisory |
-| 7 | extension_namespace_discipline | `type: extension` only: does the extension register its tool/route/ws-handler/ui-tab under the namespace derived from its `name` (e.g. provider-safe tool/ws names like `ext_<len>_<token>_<surface>`, route `/api/extensions/<name>/…`)? Tool and WS short names must be alphanumeric/underscore and at most 24 characters. Namespace collisions with built-in surfaces are a concrete FAIL. If the extension uses `api.send_ws_message`, are emitted event names short/provider-safe and paired with reviewed host-owned widget `subscription` components rather than arbitrary same-origin JavaScript? If the extension declares streaming UI, is it a reviewed extension route consumed by a host-owned `stream` component? A reviewed `module` widget may also consume the skill's own routes (including streaming responses) and the skill's namespaced WebSocket events through the host-mediated bridge (`OuroborosWidget.fetch` / `OuroborosWidget.onEvent`), which is not arbitrary same-origin JavaScript. If the extension owns background resources (threads, sockets, EventSource clients, subprocesses), does it register cleanup with `api.on_unload(callback)`? If the extension declares a widget render block, is it one of the host-owned schemas (`iframe`, `module`, or declarative v1: forms/actions, markdown/code, JSON/kv/table, tabs/chart, stream/subscription, progress/poll, file/gallery/media, map/calendar/kanban, group/metric/callout), with media sourced from extension routes or safe data URLs and no arbitrary same-origin JavaScript? Nested interactive group/tab children must use stable identity and one host-owned lifecycle, while `subscription.render` stays transitively passive. For non-extension skills, verdict PASS with reason "Not applicable — type != extension." | severity-driven for applicable extensions |
+| 7 | extension_namespace_discipline | `type: extension` only: does the extension register its tool/route/ws-handler/ui-tab under the namespace derived from its `name` (e.g. provider-safe tool/ws names like `ext_<len>_<token>_<surface>`, route `/api/extensions/<name>/…`)? Tool and WS short names must be alphanumeric/underscore and at most 24 characters. Namespace collisions with built-in surfaces are a concrete FAIL. If the extension uses `api.send_ws_message`, are emitted event names short/provider-safe and paired with reviewed host-owned widget `subscription` components rather than arbitrary same-origin JavaScript? If the extension declares streaming UI, is it a reviewed extension route consumed by a host-owned `stream` component? A reviewed `module` widget may also consume the skill's own routes (including streaming responses) and the skill's namespaced WebSocket events through the host-mediated bridge (`OuroborosWidget.fetch` / `OuroborosWidget.onEvent`), which is not arbitrary same-origin JavaScript. If the extension owns background resources (threads, sockets, EventSource clients, subprocesses), does it register cleanup with `api.on_unload(callback)`? If the extension declares a widget render block, is it one of the host-owned schemas (`iframe`, `module`, or declarative v1: forms/actions, markdown/code, JSON/kv/table, tabs/chart, stream/subscription, progress/poll, file/gallery/media, map/calendar/kanban, group/metric/callout), with media sourced from extension routes or safe data URLs and no arbitrary same-origin JavaScript? Nested interactive group/tab children must use stable identity and one host-owned lifecycle, while `subscription.render` stays transitively passive. A `page_module` permission (contributions with `render.kind: host`; CREATING_SKILLS "Page modules") is the deliberate exception to "no arbitrary same-origin JavaScript": its `ui/` modules run as trusted code in the owner's pages, so confirm at the source level that each reaches the host only through its `ctx` and the skill's own `/api/extensions/<skill>/` routes (no other `/api/*`, WebSocket, feed or composer DOM, keystroke or clipboard capture, nor network beyond its declared `destination`; browser APIs its engine needs, such as speech, are fine) and that `dispose()` stops what it started; a module that reaches the host past its `ctx` is a concrete FAIL. For non-extension skills, verdict PASS with reason "Not applicable — type != extension." | severity-driven for applicable extensions |
 | 8 | widget_module_safety | **v5.7.0+. ``kind: "module"`` widgets only.** The host fetches reviewed ``widget.js`` through ``GET /api/extensions/<skill>/module/<entry>``, embeds the source into a sandboxed opaque-origin ``<iframe srcdoc sandbox="allow-scripts allow-pointer-lock allow-downloads" allow="autoplay; fullscreen; clipboard-write">`` with no ``allow-same-origin`` — ``document.cookie``, ``localStorage``, and ``sessionStorage`` throw ``SecurityError`` there by construction and need no source review — and injects a parent-mediated ``fetch`` bridge that rejects paths outside the owning skill route prefix. Reviewers confirm at the source level what the sandbox cannot: (a) no ``fetch``/``XMLHttpRequest`` URL outside ``/api/extensions/<skill>/`` and no bespoke ``postMessage`` protocol to ``window.parent`` beyond the host bridge; (b) the declared launch policy ``render.start`` (SSOT ``ouroboros/extension_ui_validation.py::WIDGET_START_MODES``; see CREATING_SKILLS "Launch policy") fits the widget's weight — ``auto`` only for a cheap instrument, ``manual`` for a program that should not run all the time, ``retain`` only for a program that genuinely must keep running while the owner is elsewhere and stays cheap while hidden; (c) a widget with state worth keeping registers ``window.__ouroWidgetOnDispose(fn)`` (never assigns over it) and saves that state through the skill's own routes, because the frame is disposable; (d) a module that declares ``render.appearance: host`` uses the optional ``OuroborosWidget.onTheme(callback)`` bridge; a real consumer should prove both resolved palettes, while ``independent``/``fixed`` modules remain author-owned. The declaration is author/reviewer intent, not a source-level proof or runtime gate for legacy payloads; a source mismatch or missing browser evidence is advisory unless it exposes a concrete runtime failure. Acceptable interactions: ``fetch('/api/extensions/<skill>/...')`` (through the host bridge), ``window.OuroborosWidget.fetch('/api/extensions/<skill>/...')``, ``window.OuroborosWidget.onTheme(callback)``, and host-supplied data attributes. Mark non-module widgets and non-extension skills PASS with reason "Not applicable". | severity-driven when kind=module |
 | 9 | inject_chat_minimization | Does any use of the `inject_chat` permission have a narrow, user-facing transport purpose? The Host Service enforces token auth, skill-source attribution, rate limits, in-flight limits, fresh executable review, enablement, and explicit content-hash-bound grants. Reviewed chat transports may carry the same raw owner text as direct chat, including slash commands such as `/panic`, `/restart`, `/review`, `/evolve`, `/bg`, and `/status`; reviewers must evaluate whether the transport itself is authorized, attributable, bounded, and user-facing rather than treating slash-shaped text as automatically forbidden. A skill that accepts external inbound traffic must still show local defense-in-depth appropriate to its transport: owner/chat binding or an equivalent access rule, bounded polling/backpressure, and no unaudited broadcast to unrelated parties. Missing local defense-in-depth is a concrete FAIL for network transports. The same criteria and severity govern `notify_owner` (`POST /notify`): one bounded, attributable, user-facing sentence the host shows in the owner's chat as a System row signed with the skill's name, never a way to inject conversation or wake the agent. Mark PASS with reason "Not applicable" when neither `inject_chat` nor `notify_owner` is declared. | critical |
-| 10 | event_subscription_minimization | Are `subscribe_event` and `subscribe_events` limited to the minimum host event topics required by the skill? `chat.outbound`, `chat.typing`, `chat.photo`, `chat.video`, `chat.document`, `chat.links`, `chat.quiz` and `chat.quiz_state` expose owner/agent conversation data (including delivered file bytes, outbound link actions and the owner's verbatim quiz answers) and require explicit justification. `chat.outbound` also carries the owner's notes and skill notices (`reminder`/`skill_notice` System rows), which may name a private event; their transport destination and handling need the same justification. Wildcards, undeclared topics, or forwarding subscribed chat content (notes and notices included) to unrelated external services are concrete FAILs. Mark PASS with reason "Not applicable" when `subscribe_event` is not declared. | critical |
+| 10 | event_subscription_minimization | Are `subscribe_event` and `subscribe_events` limited to the minimum host event topics required by the skill? `chat.outbound`, `chat.typing`, `chat.photo`, `chat.video`, `chat.document`, `chat.links`, `chat.quiz`, `chat.quiz_state` and `chat.card` expose owner/agent conversation data (including delivered file bytes, outbound link actions and the owner's verbatim quiz answers) and require explicit justification. `chat.outbound` also carries the owner's notes and skill notices (`reminder`/`skill_notice` System rows), which may name a private event; their transport destination and handling need the same justification. Wildcards, undeclared topics, or forwarding subscribed chat content (notes and notices included) to unrelated external services are concrete FAILs. Mark PASS with reason "Not applicable" when `subscribe_event` is not declared. | critical |
 | 11 | companion_process_safety | For `companion_process` / `supervised_task` skills: is every command declared as an argument list (not shell string), using an allowlisted runtime, with no writes outside `skill_dir` / `state_dir`, no unbounded restart loop, and cleanup on unload/panic? Does the process avoid inheriting secrets except through reviewed `env_from_settings` grants? Mark PASS with reason "Not applicable" when no long-lived process/task is declared — a transient `subprocess.run`/`subprocess.Popen` invocation of a build tool like `ffmpeg`, `ImageMagick`, or `git` inside a normal request handler is NOT a long-lived companion process and does not trigger this item (its safety belongs under items 4 / 6 / 13). | severity-driven when applicable |
 | 12 | host_token_handling | If the skill calls the Host Service API, does it use the provided `SkillToken.use_in_request()` only at request construction sites, avoid logging/serializing tokens, and keep all host-service calls on the loopback endpoint? Printing, persisting, exfiltrating, or embedding the token into user-visible output is a concrete FAIL. Mark PASS with reason "Not applicable" when the skill does not access the Host Service API. | critical |
 | 13 | error_handling | Does the skill surface actionable errors instead of swallowing exceptions, returning success on partial failure, or leaving users to inspect raw logs manually? Are retry/backoff paths bounded and purpose-specific? | advisory |
 | 14 | integration_preflight | Does the skill include cheap local preflight checks for the APIs/files/runtimes it depends on before spending provider budget or starting long work? Missing preflight for fragile external integrations is an advisory FAIL. | advisory |
 | 15 | bug_hunting | Are there obvious runtime bugs in reviewed code: wrong filenames, mismatched manifest script names, missing imports, impossible arguments, JSON/schema mismatches, blocking calls in async handlers, or untested happy-path assumptions? For every FAIL, cite the concrete runtime bug and state how you propose to fix it (file/symbol/change), so the author can apply the correction instead of guessing. Concrete likely runtime breakage should use `severity=critical`; latent issues, provider fragility, minor cleanup, or dead-code concerns should use `severity=advisory`. | severity-driven |
 | 16 | completion_notification | For long-running or user-visible work, does the skill emit or document a completion/failure notification path (for example a host event, `events.jsonl` append, or clear stdout marker consumed by Ouroboros)? A skill that must reach the owner directly (a reminder, a finished external job) declares `notify_owner` and hands the host one bounded sentence through `POST /notify`, shown as a signed System row in the owner's chat — judged as under item 9: attributable, bounded, user-facing, and never a way to inject conversation. Mark PASS with reason "Not applicable" for tiny synchronous utilities. | advisory |
+| 17 | context_snapshot_discipline | For `context_snapshot`: are the declared local snapshots compact deterministic facts, with honest dates/units/unknowns, no instructions, secrets or relative-age counters? Check atomic publication, the complete UTF-8 file bound and withdrawal on expiry/revocation (CREATING_SKILLS “Passive context snapshots”); no network, model or refresh belongs on prompt preparation. Mark other skills Not applicable. | severity-driven when applicable |
 
 ### Severity rules
 
@@ -829,7 +839,7 @@ and do not return `PASS` for an item that also has a `FAIL` — the concrete
   `permissions_honesty`, `no_repo_mutation`, `path_confinement`,
   `env_allowlist`, `inject_chat_minimization`,
   `event_subscription_minimization`, and `host_token_handling`.
-- Items 7, 8, 11, and 15 are severity-driven. A `FAIL` with
+- Items 7, 8, 11, 15 and 17 are severity-driven. A `FAIL` with
   `severity=critical` produces `blockers`; a `FAIL` with
   `severity=advisory` produces `warnings`. Reviewers MUST reserve
   critical severity for concrete dangerous or runtime-breaking cases
@@ -908,8 +918,8 @@ two manifests as part of items 2 (`permissions_honesty`) and 5
    (`manifest_schema`) because the skill should not have landed.
    v5.8 generalises the same readiness contract to official and local
    manifests that declare reviewed `install` / `dependencies` metadata:
-   A fresh executable review installs auto specs into `.ouroboros_env`, and enable/load/exec
-   paths refuse missing, failed, or stale dependency fingerprints.
+   Executable acceptance admits auto specs into `.ouroboros_env`; Enable prepares them,
+   while load/exec refuse missing, failed, or stale dependency fingerprints.
 4. **Plugin packages** — `openclaw.plugin.json` in the file pack means
    the publisher shipped a Node/TS plugin. The adapter refuses these,
    so seeing one in a successfully-installed skill is a contradiction
@@ -926,7 +936,7 @@ without the audit record).
 
 ### Skill review vs. repo review
 
-These are **separate surfaces** with separate models, prompts, and state:
+These are **separate surfaces** with separate prompts and state, drawn from the same review pool:
 
 - Repo review (the review pool's one wave, both parts, plus any preflight)
   protects the self-modifying `~/Ouroboros/repo/`. Its attempt state lives in
@@ -977,7 +987,7 @@ goal · done_when[] {id, claim, support} · affected_paths[] (files the work wil
 plan (prose: the reading of the ask and its bar, approach, constraints, decisions that are
       expensive to reverse with their alternatives, risks)
 ```
-`done_when` is what acceptance will judge: each `claim` an observable outcome, its `support` how it
+`done_when` is what the task's result review will judge: each `claim` an observable outcome, its `support` how it
 will be shown (run a check, inspect the artifact, a judgment and by whom). Ids are the mind's and
 stay stable across revisions.
 
@@ -990,7 +1000,7 @@ stay stable across revisions.
 | 3 | constraints and invariants | Are the real constraints named — budget, deadline, safety, irreversibility, commitments to others? |
 | 4 | deferrals | Is anything deferred that will be expensive to change once the work has started? |
 | 5 | evidence sufficiency | Is the evidence enough to judge? If not, read what is missing with your own tools when you have them, or name exactly what is missing — a locator, or a question for the mind — instead of inventing a gap. |
-| 6 | direction and health | Is this the right way to the outcome? Does an existing owner, primitive or contract in the subject already give the same owner-chosen result? Would the plan add a second home for a fact, a duplicate mechanism, state or a background loop nothing needs, or a concept a reader must trace across files (why it matters: DEVELOPMENT "Pragmatic SOLID")? Such an objection names all three: the plan element that adds the cost, the existing simpler path to the same owner-chosen outcome, and the concrete cost. Without all three it is advice, and a preference is advice. A method the owner fixed is not objectionable this way. |
+| 6 | direction and health | Is this the right way to the outcome? Does an existing owner, primitive or contract in the subject already give the same owner-chosen result? Would the plan add a second home for a fact, a duplicate mechanism, state or a background loop nothing needs, or a concept a reader must trace across files (why it matters: DEVELOPMENT "Pragmatic SOLID")? Such an objection names all three: the plan element that adds the cost, the existing simpler path to the same owner-chosen outcome, and the concrete cost. Without all three it is advice, and a preference is advice. A method the owner fixed is not objectionable this way. For a new capability or control: is it on the lowest rung that delivers it, and does a new seam ship with its first consumer (DEVELOPMENT "Capability placement")? Offering a lower rung is advice, also where the owner fixed the method. |
 | 7 | governance (body plans only) | Does the intention contradict BIBLE.md or a frozen contract? Name the principle or contract. |
 
 ### Height rule — what is an objection
@@ -1033,6 +1043,30 @@ Nobody votes, and whether an open objection holds is the host's fact, not part o
   is an objection only when leaving it open is expensive to reverse.
 - A plan with no file paths at all (a trip, a deck, a research question) is a first-class subject:
   the same questions apply, and repository conventions are irrelevant to it.
+
+---
+
+## Result Review Checklist
+
+Used by `review_change(subject="result")`: the mind asks for it, and under task review Required the host
+asks for it at a root delivery whose result carries produced work; task review Off refuses it. You review
+the RESULT of one task, not a code change. The host builds the subject, frozen at the call, in four parts:
+what was asked (the task, its owner's words and the claims it was held to, the latest accepted plan's
+`done_when` among them), the reply the task gives, what the task produced (files and effects, named by path
+and content hash) and the host-attested verification receipts.
+
+**One question: does this result do what was asked?**
+- Judge the result, never the method: how the work was done is not under review.
+- A partial result that says plainly what it did not do is honest, not a defect. A result that silently
+  narrows what was asked, claims what it did not do, or contradicts its own material is a defect.
+- Read the produced files you can reach; a claim about a file must match its content.
+- A finding names the concrete gap, where it is, and what would close it.
+
+### Severity rules
+
+- **critical** — the result fails what was asked or misstates what it delivers, so it should not be
+  delivered as it is.
+- **advisory** — a real improvement that does not block delivery.
 
 ---
 

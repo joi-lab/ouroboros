@@ -111,9 +111,10 @@ def test_unmarked_missing_file_after_executor_handoff_is_not_no_effect(tmp_path,
 
 
 @pytest.mark.parametrize("task_id", ["system:provider_test", "system:capability_probe"])
-def test_host_operation_bypasses_only_task_amendments_not_global_money(tmp_path, task_id):
+def test_host_operation_never_bypasses_global_money(tmp_path, task_id):
+    """A host operation pays through the same ledger and global cap. (The task-amendment overlay it
+    used to skip, the deleted task acceptance's root-cap amendments, left with the review fold.)"""
     from ouroboros import usage_accounting as ua
-    from ouroboros.usage_admission import effective_billing_fields
 
     scope = ua.UsageScope(drive_root=tmp_path, task_id=task_id, root_task_id=task_id,
                          non_task_operation=True, global_limit_usd=0.0)
@@ -121,17 +122,6 @@ def test_host_operation_bypasses_only_task_amendments_not_global_money(tmp_path,
     with ua.usage_scope(scope), pytest.raises(ua.BudgetExceeded):
         ua.execute_physical_attempt(ua.AttemptRequest(model="offline", provider="offline", reservation_usd=0.1),
                                     lambda: sent.append(True))
-    assert not sent
-    # An ID by itself cannot confer the host-only non-task authority.
-    with pytest.raises(ua.BillingAuthorityUnavailable) as unavailable:
-        effective_billing_fields(tmp_path, task_id, {"billing_group_id": task_id})
-    assert unavailable.value.kind == "unreadable" and unavailable.value.cause == "amendment_unreadable:ValueError"
-    foreign = ua.UsageScope(drive_root=tmp_path, task_id=task_id, root_task_id=task_id,
-                           non_task_operation=True, billing_group_id="bad:foreign")
-    with ua.usage_scope(foreign), pytest.raises(ua.BillingAuthorityUnavailable) as unavailable:
-        ua.execute_physical_attempt(ua.AttemptRequest(model="offline", provider="offline", reservation_usd=0.1),
-                                    lambda: sent.append(True))
-    assert unavailable.value.kind == "unreadable" and unavailable.value.cause == "amendment_unreadable:ValueError"
     assert not sent
 
 

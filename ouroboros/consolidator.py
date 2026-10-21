@@ -244,7 +244,7 @@ class KnowledgeReadContext:
                     measurement_basis="cold_estimate", measurement_density=facts.get("measurement_density", 1.0),
                     reclaim_goal_tokens=0,
                     **{key: pending[key] for key in ("working_note", "expected_view_revision", "keep_unit_ids", "restore_unit_refs", "schema_names")})
-                candidate, applied, _usage = compact_tool_history_llm(
+                candidate, applied = compact_tool_history_llm(
                     complete, request=request, observed_messages=observed["messages"],
                     observed_tool_schemas=observed["tool_schemas"], tool_schemas=values["tools"],
                     fit_candidate=fit_candidate, drive_root=self.context.drive_root,

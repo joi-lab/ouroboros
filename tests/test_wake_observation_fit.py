@@ -97,7 +97,6 @@ def test_failed_cross_family_fallback_projects_each_actual_candidate(main_call, 
     monkeypatch.setenv('OUROBOROS_MODEL_FALLBACKS', ','.join(targets))
     monkeypatch.setattr(fallback_cooldown, 'is_cooling_down', lambda *_args: False)
     monkeypatch.setattr(fallback_cooldown, 'attempts_per_model', lambda: 1)
-    monkeypatch.setattr(loop, '_run_main_reclaim', lambda *_args, **_kwargs: None)
     route_evidence = context._context_fit_route
     def capacity(task, **kwargs):
         route, evidence = route_evidence(task, **kwargs)
@@ -231,7 +230,6 @@ def test_a_real_overflow_before_any_response_retries_with_the_strictly_smaller_d
     provider proves otherwise, and the one strict-shrink retry carries the stored-source delivery —
     measured, priced, sealed and sent as one candidate."""
     ctx, gateway, _controller, events, _decide, _observations = main_call
-    monkeypatch.setattr(loop, "_run_main_reclaim", lambda *_a, **_kw: None)  # no other material to shrink here
     ctx.messages[:] = [ctx.context_fit_plan.messages_for("max")[0], {"role": "user", "content": FULL}]
     ctx.tools._ctx.task_metadata = {"wake_observation": deepcopy(WAKE)}
     overflow = result(outcome="failed", problem={"code": "provider_failed", "message": "too long", "context": {

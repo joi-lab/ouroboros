@@ -24,8 +24,10 @@ def test_navigation_shell_dom_has_sidebar_drawer_and_project_slots():
     assert '<aside id="project-panel"' in html
     assert 'data-mobile-nav-toggle' not in html
     assert 'id="nav-drawer-backdrop"' in html
-    assert 'data-nav-page="chat"' in html
-    assert 'class="nav-row-label"' in html
+    # The rows come from the page registry (pages.js), rendered by app.js into the sidebar's zones.
+    pages_js = _read("web/modules/pages.js")
+    assert 'data-nav-page="${escapeHtml(page.id)}"' in pages_js
+    assert '<span class="nav-row-label">${escapeHtml(page.label)}</span>' in pages_js
     assert 'id="nav-projects-list" class="nav-projects-list"' in html
     # The mobile trigger is shell-level (available on Skills/Dashboard/etc),
     # not a chat-only duplicate.
@@ -42,7 +44,7 @@ def test_navigation_shell_replaces_legacy_rail_selectors():
             "web/style.css",
             "web/modules/page_icons.js",
             "web/modules/skills.js",
-            "web/modules/marketplace.js",
+            "web/modules/skill_browse.js",
         )
     )
     assert "#nav-rail" not in combined
@@ -61,7 +63,10 @@ def test_navigation_state_and_mobile_drawer_are_first_class():
     assert "#primary-sidebar.open" in css
     assert ".nav-drawer-backdrop" in css
     assert ".mobile-nav-toggle" in css
-    assert "grid-template-columns: var(--sidebar-width) minmax(0, 1fr) auto;" in css
+    # The sidebar's column follows the sidebar's own box.
+    assert "grid-template-columns: auto minmax(0, 1fr);" in css.split("\n#app {", 1)[1].split("}", 1)[0]
+    assert "#app > #divider { display: none; }" in css
+    assert "#content {\n    grid-column: 2;" in css
     # One client-side route, read once on load and validated against the DOM
     # rather than a duplicated page list; never written back on navigation
     # (the desktop shell and the Telegram mini app have no address bar).
@@ -69,6 +74,16 @@ def test_navigation_state_and_mobile_drawer_are_first_class():
     assert "document.getElementById(`page-${name}`)" in app_js
     assert "hashchange" not in app_js
     assert "replaceState" not in app_js
+    assert "pushState" not in app_js
+    # The one history write is the layer stack's same-URL sentinel: pushed only while a layer is
+    # open, popped by Back, consumed by a programmatic close (web/tests/layers.test.js).
+    layers_js = _read("web/modules/layers.js")
+    assert "history.pushState(LAYER_STATE, '')" in layers_js
+    assert layers_js.count("pushState(") == 1
+    assert "if (stack.length && !hist.armed)" in layers_js
+    assert "replaceState" not in layers_js and "hashchange" not in layers_js and "location." not in layers_js
+    assert "const layers = createLayerStack();" in app_js
+    assert "layers.push({ id: 'drawer'" in app_js and "layers.push({ id: 'project'" in app_js
     assert ".mobile-nav-toggle {\n        position: fixed" not in css
     assert "flex: 0 0 44px;" in css
 
@@ -76,15 +91,29 @@ def test_navigation_state_and_mobile_drawer_are_first_class():
 def test_page_header_is_shared_foundation_for_top_pages():
     header_js = _read("web/modules/page_header.js")
     css = _read("web/style.css")
-    assert "export function renderMobileNavToggle()" in header_js
+    assert "export function renderMobileNavToggle({ inComposer = false } = {})" in header_js  # one ☰, a page's or a room's
     assert "toolbarHtml" in header_js
     assert "trailingHtml" in header_js
     # Actual toolbar class composition/escaping is exercised by page_header.test.js.
     assert "'app-page-toolbar'" in header_js and "'app-page-actions'" in header_js
-    assert "grid-template-areas:" in css
-    assert '"leading title toolbar"' in css
-    assert '"tabs tabs tabs"' in css
-    assert "align-items: start;" in css
+    # One row: leading (☰) · title (with the room's status) · toolbar/trailing; a tab strip is its own strip, so
+    # the row stays one row (P5). A page has no caption line: its sidebar row and its tabs name it.
+    assert 'grid-template-areas: "leading title toolbar";' in css
+    assert '"tabs tabs tabs"' not in css
+    assert "app-page-lede" not in header_js and "app-page-description" not in header_js
+    assert "description" not in header_js.split("export function renderPageHeader(", 1)[1].split(") {", 1)[0]
+    for rel in ("web/modules/dashboard.js", "web/modules/settings_ui.js", "web/modules/skills.js", "web/modules/widgets.js"):
+        page = _read(rel)
+        header_call = page.split("renderPageHeader({", 1)[1].split("})", 1)[0]
+        assert "description:" not in header_call, f"{rel} passes a caption line to its header"
+    assert "app-page-icon" not in header_js and "app-page-icon" not in css
+    # The Project panel's bar is the same component, rendered by app.js; index.html keeps no hand-written bar.
+    html = _read("web/index.html")
+    assert "project-panel-bar" not in html and "project-panel-close" not in html
+    app_js = _read("web/app.js")
+    assert "titleId: 'project-panel-title'" in app_js and "className: 'project-panel-bar project-inspector-header'" in app_js
+    assert "named: false" in app_js
+    assert "import { renderPageHeader } from './modules/page_header.js';" in app_js
     for path in (
         "web/modules/chat.js",
         "web/modules/files.js",
@@ -152,7 +181,8 @@ def test_project_panel_composer_and_welcome_contracts():
     assert ".project-panel-backdrop" in css
     assert "transition: transform 180ms ease, opacity 180ms ease;" in css
     assert ".project-panel.open" in css
-    assert "left: var(--sidebar-width);" in css  # sidebar stays clickable under backdrop
+    # The sidebar stays clickable beside the backdrop: docked, the dimmed room is the columns after the sidebar's.
+    assert 'html[data-layout="docked"] .project-panel-backdrop,' in css and "grid-column: 2 / -1;" in css
     assert ".chat-header-actions {\n        display: none;" not in css
     # Gateway Boundary: Turn into project (work_portal.js, the card's move) consumes the endpoint via
     # the api_client wrapper, and the raw route lives in api_client.js (no raw fetch in a chat module).
@@ -164,11 +194,29 @@ def test_project_panel_composer_and_welcome_contracts():
 
 def test_chat_header_controls_reorg_and_more_autodismiss():
     chat_js = _read("web/modules/chat.js")
-    # Restart + Panic are promoted to always-visible header buttons...
-    assert 'class="chat-header-btn ui-chrome-control" type="button" data-chat-command="restart"' in chat_js
-    assert 'class="chat-header-btn danger ui-chrome-control" type="button" data-chat-command="panic"' in chat_js
-    # ...and Consciousness / Evolve / Review move into the More overflow menu.
-    menu = chat_js.split('class="chat-header-menu"', 1)[1].split("</details>", 1)[0]
+    # Main's header actions are declared once in chat_header.js; chat.js mounts them.
+    header_markup = _read("web/modules/chat_header.js")
+    assert "actionsHtml: mainHeaderActionsHtml()," in chat_js
+    # Restart and Panic are header buttons; Panic always in the row, Restart visible in the row on a desk and
+    # inside the ⋯ menu in the stack layout, where the budget joins it (owner Q4=A): the same two nodes, placed by
+    # layout, so each keeps its one handler (confirmAndSendRestart; the budget's Dashboard → Costs click).
+    assert 'class="chat-header-btn ui-chrome-control" type="button" data-chat-command="restart"' in header_markup
+    assert 'class="chat-header-btn danger ui-chrome-control" type="button" data-chat-command="panic"' in header_markup
+    assert (chat_js + header_markup).count('type="button" data-chat-command="restart"') == 1, "one Restart node, never a second copy"
+    header_js = _read("web/modules/page_header.js")
+    placement = header_js.split("export function bindHeaderControlPlacement(", 1)[1].split("\n}\n", 1)[0]
+    assert "if (next === 'menu') {" in placement and "menu.prepend(budgetPill);" in placement and "menu.append(restart);" in placement
+    assert "headerActions.insertBefore(restart, panic);" in placement
+    # Driven by the layout AND the bar's own measured width, so a narrow docked column keeps one row too.
+    assert "layout === 'stack'" in placement and "bar.clientWidth < HEADER_FULL_ROW_MIN_WIDTH" in placement
+    assert "onLayoutChange(place)" in placement and "observer?.observe(bar);" in placement
+    assert "bindHeaderControlPlacement({ headerActions, budgetPill })" in chat_js
+    assert "disposeHeaderPlacement();" in chat_js
+    assert "await confirmAndSendRestart({ openConfirmDialog, ws });" in chat_js
+    # The stack layout's summary is the one ⋯ glyph; a desk keeps the word.
+    assert 'class="chat-header-more-word">More</span>' in header_markup and "${SHELL_ICONS.more}" in header_markup
+    # ...and Consciousness / Evolve / Review live in the More overflow menu.
+    menu = header_markup.split('class="chat-header-menu"', 1)[1].split("</details>", 1)[0]
     assert 'data-chat-command="bg"' in menu
     assert 'data-chat-command="evolve"' in menu
     assert 'data-chat-command="review"' in menu

@@ -59,13 +59,11 @@ export function setReviewAnchor(record, enabled, writePhase) {
     setInertCardPresentation(record, enabled);
     if (enabled) {
         record.titleEl.textContent = record.suggestedName || 'Reviews';
-        record.inlineTypingEl.style.display = 'none';
     } else {
         writePhase(record, 'working');
         if (!record.suggestedName && !record.lastHumanHeadline) {
             record.titleEl.textContent = '';  // the chip says Working; the title waits for a name (#1369)
         }
-        record.inlineTypingEl.style.display = '';
     }
     return true;
 }
@@ -783,6 +781,7 @@ function authorDispositionText(author, label = '') {
     ].filter(Boolean).join(' · ');
 }
 
+/** Read-only: a task-acceptance record stored before the result review replaced that machine. */
 export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
     const owner = text(ownerTaskId || detail?.task_id);
     const projection = detail?.review_projection;
@@ -861,8 +860,8 @@ export function reviewRecordGroupFromTaskDetail(detail, ownerTaskId = '') {
             // NOT_PERFORMED, QUORUM_FAILED and NOT_DISPATCHED reached no verdict: a warning, never a quiet neutral.
             tone: { PASS: 'done', FAIL: 'error' }[verdict] || 'warn', verdict, timestamp: text(panel.ts), ordinal: index,
             label: `${text(panel.surface) || 'review'} record ${text(panel.record_id)}`, summary: text(panel.reason),
-            superseded: false, replayed: false, revised: false, initiatorTaskId: owner, executions: [], execution: null,
-            detailRef: null,
+            superseded: false, replayed: false, revised: false, initiatorTaskId: owner,
+            executions: executionsFromReviewRecord(panel), execution: null, detailRef: null,
             detailText: [formatReviewProjection({ panels: [panel] }), text(panel.source_ref?.path) ? `Full record: ${text(panel.source_ref.path)}` : ''].filter(Boolean).join('\n'),
         };
     });

@@ -16,13 +16,16 @@ devtools/benchmarks/terminal_bench/harbor_installed_agent.py.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import pathlib
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -92,8 +95,8 @@ _ISO_SETTINGS_ALLOW_EXACT = frozenset({
     # The roster carries the delegation actor AND the review pool (its marked rows).
     "OUROBOROS_SUBAGENTS",
     "OUROBOROS_WEBSEARCH_MODEL",
-    # Review policy knobs (non-secret): must propagate so settings.json's task-acceptance
-    # self-review config is honored by isolated benchmark servers (else it silently
+    # Review policy knobs (non-secret): must propagate so settings.json's result-review
+    # config is honored by isolated benchmark servers (else it silently
     # falls back to the "auto" default and the end-of-task review never runs).
     "OUROBOROS_TASK_REVIEW_MODE", "OUROBOROS_REVIEW_ENFORCEMENT",
     # Shared paid review-cycle ceiling (non-secret): bench templates pin it to
@@ -426,8 +429,38 @@ def supervisor_state_is_ready(state: dict) -> bool:
     return bool(state.get("supervisor_ready")) and int(state.get("workers_total") or 0) > 0
 
 
+@contextlib.contextmanager
+def alarm_deferred():
+    """Hold a SIGALRM that lands inside the block and deliver it once the block is done.
+
+    A test's timeout alarm (pytest-timeout's signal method) raises from its handler wherever
+    the main thread is. Landing inside a server stop it would unwind the stop before the
+    forced kill and reap, and leave a live server for whatever runs next. Inside this block
+    the cleanup runs to completion first; the held alarm then reaches the handler it was
+    meant for, so the timeout still fails its test. Python runs signal handlers only in the
+    main thread, so another thread needs no hold, and a host without SIGALRM has no alarm.
+    """
+    if not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    held: list = []
+    previous = signal.signal(signal.SIGALRM, lambda _signum, frame: held.append(frame))
+    try:
+        yield
+    finally:
+        # None: a handler installed outside Python, which cannot be put back; the default stands in.
+        signal.signal(signal.SIGALRM, signal.SIG_DFL if previous is None else previous)
+        if held and callable(previous):
+            previous(signal.SIGALRM, held[0])
+        elif held and previous == signal.SIG_DFL:
+            signal.raise_signal(signal.SIGALRM)
+
+
 class IsolatedServer:
     """A throwaway Ouroboros server bound to an isolated clone + data root + port."""
+
+    # How long the server's tree gets after SIGTERM before it is force-killed.
+    stop_grace_sec = 15.0
 
     def __init__(self, clone: pathlib.Path, data_root: pathlib.Path, settings_path: pathlib.Path,
                  *, host: str = "127.0.0.1", settings_authoritative_env: bool = False,
@@ -742,17 +775,20 @@ class IsolatedServer:
                 "reason": "timeout", "campaign": campaign_summary(self.data_root)}
 
     def stop(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            pid = self.proc.pid
-            terminate_process_tree(self.proc)
-            try:
-                self.proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                kill_pid_tree(pid)
+        """SIGTERM the server's tree, then force-kill and reap it; a timeout alarm landing
+        inside is held until the tree is down (``alarm_deferred``)."""
+        with alarm_deferred():
+            if self.proc is not None and self.proc.poll() is None:
+                pid = self.proc.pid
+                terminate_process_tree(self.proc)
                 try:
-                    self.proc.wait(timeout=5)
+                    self.proc.wait(timeout=self.stop_grace_sec)
                 except subprocess.TimeoutExpired:
-                    pass
+                    kill_pid_tree(pid)
+                    try:
+                        self.proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
 
     def __enter__(self) -> "IsolatedServer":
         return self.start()

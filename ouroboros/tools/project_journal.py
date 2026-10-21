@@ -36,6 +36,7 @@ from ouroboros.utils import (
     append_jsonl,
     jsonl_generation_signature,
     utc_now_iso,
+    write_text_atomic,
 )
 
 log = logging.getLogger(__name__)
@@ -510,7 +511,8 @@ def _workpad_write(ctx: ToolContext, content: str, project_id: str = "") -> str:
     path = project_workpad_path(pid)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        path.write_text(body, encoding="utf-8")
+        # Replace, never truncate in place: a failed write leaves the previous page whole.
+        write_text_atomic(path, body)
     except OSError as exc:
         return f"⚠️ TOOL_ERROR (workpad_write): {exc}"
     return f"OK: workpad[{pid}] written ({len(body)} chars)."
@@ -789,7 +791,8 @@ def get_tools() -> List[ToolEntry]:
                 "description": (
                     "Optionally publish one short line about this live root's work. Your context facts repeat "
                     "its dated text as working thought, never an owner directive; revise it when your focus changes. "
-                    "OTHER live roots see it while this task is unsettled (waits included), until replaced; "
+                    "OTHER live roots see it, and the owner reads it under the work's name, while this task is "
+                    "unsettled (waits included), until replaced; "
                     "after settlement it is history. It is task-scoped, not a project-level record; "
                     "journal/workpad writes do not publish it and nothing refreshes it. source_ref names a "
                     "reader whose current answer is retained as evidence."

@@ -252,11 +252,13 @@ def test_directory_link_metadata_is_retained_whole_beside_the_paid_result(
 
 def _same_stat_rewrite(path, payload):
     """A timestamp-preserving rewrite (``cp -p``, ``rsync -t``, an archive tool):
-    new bytes of the same length, with the file's own times put back."""
+    new bytes of the same length, with the file's own times put back. The file is
+    regular, never a link, so the times go back through its path: Windows has no
+    no-follow ``utime`` (it raises NotImplementedError there)."""
     before = path.lstat()
-    assert len(payload) == before.st_size
+    assert stat.S_ISREG(before.st_mode) and len(payload) == before.st_size
     path.write_bytes(payload)
-    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns), follow_symlinks=False)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
 
 
 def _same_stat(left, right):

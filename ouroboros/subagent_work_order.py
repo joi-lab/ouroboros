@@ -364,6 +364,14 @@ def session_design_navigation(ctx: Any, *, target_root: str, source_root: str) -
             + navigation + digest)
 
 
+def session_host_references(ctx: Any, *, target_root: str, source_root: str) -> str:
+    """Host references pinned in a session's start request: own-body DESIGN navigation, then the
+    installed instruction-skill index for any workspace."""
+    from ouroboros.skill_catalogue import session_skill_index  # lazy, like the other skill reads here
+
+    return session_design_navigation(ctx, target_root=target_root, source_root=source_root) + session_skill_index(ctx)
+
+
 def start_binding_fingerprints(ctx: Any, prompt: str) -> tuple[str, str]:
     """Digest the exact brief and the existing normalized task authority."""
 

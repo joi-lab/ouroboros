@@ -740,7 +740,7 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
     monkeypatch.setattr("ouroboros.upgrade_notices.startup_upgrade_notices", noop)
     for name in (
         "_resume_interrupted_project_deletions", "_startup_prune_sweeps", "_startup_custody_sweep",
-        "_startup_worktree_prune", "_prune_delegated_snapshots", "_periodic_supervisor_maintenance",
+        "_prune_worktrees", "_prune_delegated_snapshots", "_periodic_supervisor_maintenance",
         # Its own owner notice is another startup side effect, asserted by
         # tests/test_retired_settings_chat_notice.py; here it would be a
         # crash alert (this harness's send_with_budget double records every
@@ -750,7 +750,7 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
         monkeypatch.setattr(server, name, noop)
     monkeypatch.setattr(server, "_start_supervisor_liveness_watchdog",
                         lambda _liveness, stop_event=None: rec.watchdog_stops.append(stop_event))
-    monkeypatch.setattr(server, "_process_bridge_updates", lambda _bridge, offset, _ctx: offset)
+    monkeypatch.setattr(server, "_process_bridge_updates", lambda _bridge, offset, _ctx, **_kw: offset)
     monkeypatch.setattr(server, "_check_pending_restart_drain", lambda _ctx: True)
     monkeypatch.setattr(bus_mod, "init", noop)
     monkeypatch.setattr(bus_mod, "LocalChatBridge", _Bridge)
@@ -761,10 +761,11 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
     monkeypatch.setattr(state_mod, "init", noop)
     monkeypatch.setattr(state_mod, "init_state", lambda **_k: state_mod.StateRead("current", "primary", {}))
     monkeypatch.setattr(state_mod, "load_state", lambda: {"owner_chat_id": 7})
-    for name in ("save_state", "update_state", "append_jsonl", "update_budget_from_usage",
-                 "rotate_jsonl_log_if_needed"):
+    for name in ("save_state", "update_state", "append_jsonl", "update_budget_from_usage"):
         monkeypatch.setattr(state_mod, name, noop)
-    monkeypatch.setattr(state_mod, "rotate_chat_log_if_needed", _tick_head)
+    # The tick's first rotator call (events.jsonl; the dialogue chains no longer rotate) is the tick head.
+    monkeypatch.setattr(state_mod, "rotate_jsonl_log_if_needed",
+                        lambda root, name, *_a, **_k: _tick_head(root) if name == "events.jsonl" else None)
     for name in ("enqueue_task", "enforce_task_timeouts", "enqueue_evolution_task_if_needed",
                  "cancel_task_by_id", "queue_deep_self_review_task",
                  "sort_pending", "check_scheduled_tasks"):
@@ -874,6 +875,23 @@ def test_healthy_tick_between_crashes_resets_the_count(monkeypatch, tmp_path):
     assert server._supervisor_error is None
     assert rec.steps == []
     assert rec.stop.waits == [2, 4, 2, 4]
+
+
+@pytest.mark.parametrize("published", [None, False])
+def test_a_kept_saved_queue_is_not_a_failed_tick(monkeypatch, tmp_path, published):
+    """A process that has not taken the saved queue into custody (its restore could not read it) keeps
+    that snapshot at every tick's publication (None): durable as it is, so the loop runs on. Only a
+    failed publication (False) is a crash."""
+    import server
+    import supervisor.queue as queue_pkg
+
+    rec = _supervisor_harness(monkeypatch, tmp_path, ["ok", "ok", "ok", "stop"])
+    monkeypatch.setattr(queue_pkg, "persist_queue_snapshot", lambda **_k: published)
+    _run(rec, server)
+    if published is None:
+        assert rec.alerts == [] and server._supervisor_error is None and rec.stop.waits == []
+    else:
+        assert len(rec.alerts) == 1 and "died after repeated crashes" in rec.alerts[0][1]
 
 
 def test_lifespan_teardown_stops_and_joins_the_loop_before_the_bus_goes_down():

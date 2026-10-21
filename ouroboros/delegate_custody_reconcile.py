@@ -1,7 +1,7 @@
 """Reconciliation of delegated runs: the settle-or-cancel sweeps and their recovery.
 
 The open-run and pending-invocation projections, the loop-exit release, the
-kill-path and orphan sweeps and the per-run settle-or-cancel core. Extracted
+kill-path, tree-Stop and orphan sweeps and the per-run settle-or-cancel core. Extracted
 from delegate_custody.py (v7 DEL1 split); delegate_custody.py re-exports every
 name, so every existing reference — the tools, the supervisor sweeps, the
 tests and monkeypatch targets — still finds them there.
@@ -10,6 +10,8 @@ tests and monkeypatch targets — still finds them there.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from ouroboros._usage_rows import REVIEW_ATTRIBUTION_KEYS
@@ -49,6 +51,37 @@ def open_runs(drive_root: Any, state: Optional[Dict[str, "RunCustody"]] = None) 
     return [custody for custody in state.values() if not custody.settled]
 
 
+def run_tree_id(custody: RunCustody) -> str:
+    """The task tree a run belongs to: its recorded root, else its own task (the custody store's tree key)."""
+    return str(custody.root_task_id or custody.task_id or "")
+
+
+def tree_open_runs(drive_root: Any, task_id: str) -> List[RunCustody]:
+    """The open runs a cascade Stop of ``task_id`` reaches (``stop_tree_runs``): the task's own and, when it is a
+    tree's root, every run of that tree, which the work projection counts as that root's live members."""
+    target = str(task_id or "")
+    return [custody for custody in open_runs(drive_root)
+            if target and target in {run_tree_id(custody), str(custody.task_id or "")}]
+
+
+def stop_tree_runs(drive_root: Any, task_id: str, *,
+                   gateway_factory: Optional[Callable[[], Any]] = None) -> List[Dict[str, Any]]:
+    """Cancel the open runs a cascade Stop of ``task_id`` reaches (``tree_open_runs``), behind the owner's verdict.
+
+    A run outlives every owner terminal that was not a verdict (``_reconcile_one``'s inverted floor), so
+    the open runs of a settled tree waited for exactly this one: the owner's cancellation, which also
+    speaks for a review panel's run. A Stop is a release surface: attach-only, no daemon is started and no
+    pending invocation is replayed (exit does not admit). An unconfirmed cancel leaves the run open.
+    """
+    from ouroboros.task_results import STATUS_CANCELLED
+
+    runs = tree_open_runs(drive_root, task_id)
+    if not runs:
+        return []
+    return _reconcile_each(drive_root, runs, gateway_factory or attach_only_gateway,
+                           deliberate_terminal=STATUS_CANCELLED)
+
+
 def pending_invocations(drive_root: Any,
                         rows: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """Invocations with a durable request row, no bound run, no definite refusal.
@@ -79,6 +112,19 @@ def attach_only_gateway() -> Any:
     return read_owned_gateway()
 
 
+_loop_exit_audit: ContextVar[Optional[Dict[str, Any]]] = ContextVar("loop_exit_audit", default=None)
+
+
+@contextmanager
+def defer_loop_exit_audit(usage: Dict[str, Any]):
+    """Retain only audit facts for delivery; resource release still finishes in this scope."""
+    token = _loop_exit_audit.set(usage)
+    try:
+        yield
+    finally:
+        _loop_exit_audit.reset(token)
+
+
 @timed_phase("release_task_runs")
 def release_task_runs(drive_root: Any, task_id: str, *,
                       gateway_factory: Optional[Callable[[], Any]] = None) -> List[Dict[str, Any]]:
@@ -93,11 +139,15 @@ def release_task_runs(drive_root: Any, task_id: str, *,
         terminal_reconcile_task,
     )
 
+    deferred = _loop_exit_audit.get()
     result = terminal_reconcile_task(
         drive_root, task_id, gateway_factory=gateway_factory or attach_only_gateway,
-        trigger="loop_exit",
+        trigger="loop_exit", audit=deferred is None,
     )
-    record_terminal_reconciliation(drive_root, task_id, result)
+    if deferred is None:
+        record_terminal_reconciliation(drive_root, task_id, result)
+    else:
+        deferred["delegate_terminal_reconciliation"] = result
     return list(result.get("outcomes") or [])
 
 
@@ -540,7 +590,7 @@ def _reconcile_one(drive_root: Any, gateway: Any, custody: RunCustody, *,
     try:
         detail = gateway.get_run(custody.run_id)
     except ClaudexorUnavailable as exc:
-        if _custody().daemon_says_absent(exc):
+        if _custody().daemon_says_absent(exc, gateway=gateway, run=custody):
             _custody().close_absent_run(drive_root, gateway, custody, "reconcile_absent")
             result = {"run_id": custody.run_id, "task_id": custody.task_id, "action": "absent"}
         else:

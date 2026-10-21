@@ -18,6 +18,7 @@ import subprocess
 import pytest
 
 from tests import test_ui_smoke_playwright as smoke
+from tests._work_projection_shared import with_work_fields
 from tests.test_chat_history_paging_browser import _idle
 from tests.test_room_work_backend_browser import Evidence, _decision_posts, _http, _launch, _open_chat, _wait_facts
 from tests.test_room_work_pager_return_browser import FILLER, LATER, _FRAMES, _seed_filler
@@ -114,13 +115,14 @@ def test_a_work_row_far_back_lands_on_its_work_and_back_returns(direct_server_wi
     server["start_server"]()
 
     def with_paused_answer(route):
-        """The server's census, plus the task whose answer is far back and whose post-task work is paused."""
+        """The server's census, plus the task whose answer is far back and whose post-task work is paused, with the
+        server's work projection of that census."""
         response = route.fetch()
         body = response.json()
         body["active_chat_activities"] = [*(body.get("active_chat_activities") or []), {
             "activity_id": TASK, "kind": "managed_task", "phase": "budget_paused", "pause_cause": "owner",
             "chat_id": chat_id, "task_attempt": 1, "started_at": 1792000000}]
-        route.fulfill(response=response, json=body)
+        route.fulfill(response=response, json=with_work_fields(body))
 
     with sync_playwright() as pw:
         browser, page, log = _launch(pw, engine)

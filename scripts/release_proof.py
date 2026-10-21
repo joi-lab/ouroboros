@@ -64,12 +64,12 @@ RELEASE_GATES = (
     "skill-smoke",
 )
 JOB_RESULTS = ("success", "failure", "cancelled", "skipped")
-# Owner decision of 2026-10-17: the official v7.7.0 tag alone may ship after
+# Owner decision of 2026-10-21: the official v7.7.1 tag alone may ship after
 # these test lanes concluded red (failed or timed out), disclosed in its proof
 # and notes, with follow-up patches. Every other gate and every other tag keeps
 # the strict bar, and ci.yml holds that tag at a verified draft.
 OWNER_EXCEPTION_REPOSITORY = "razzant/ouroboros"
-OWNER_EXCEPTION_TAG = "v7.7.0"
+OWNER_EXCEPTION_TAG = "v7.7.1"
 OWNER_WAIVABLE_GATES = ("full-test", "system-e2e-mock", "ui-smoke")
 COMMON_SMOKE_CHECKS = frozenset(
     {
@@ -127,6 +127,13 @@ REQUIRED_SMOKE_CHECKS = {
 AUTHENTICODE_PROOF_ID = "windows-x64"
 AUTHENTICODE_SMOKE_CHECKS = frozenset(
     {"authenticode_signer", "timestamp", "signed_payload_archive_match"}
+)
+# Like Windows signing, configuration selects the macOS state: a signed stable
+# build must prove both stapled tickets and Gatekeeper acceptance of the
+# copied-out app or the release stops; every other build is not_notarized.
+NOTARIZATION_PROOF_ID = "macos-arm64"
+NOTARIZATION_SMOKE_CHECKS = frozenset(
+    {"stapled_app", "stapled_dmg", "gatekeeper_app", "gatekeeper_dmg"}
 )
 
 
@@ -217,6 +224,8 @@ def command_record_smoke(args: argparse.Namespace) -> None:
                 "signerThumbprint": args.authenticode_thumbprint.upper(),
                 "publisher": args.authenticode_publisher,
             }
+    if args.proof_id == NOTARIZATION_PROOF_ID:
+        receipt["notarization"] = {"status": args.macos_notarization or "not_notarized"}
     _write_json(args.output, receipt)
 
 
@@ -286,6 +295,19 @@ def _authenticode_state(smoke: dict, checks: list, signer_thumbprint: str) -> di
     if missing:
         raise ValueError(f"windows-x64 receipt is missing signing checks: {sorted(missing)}")
     return {"status": "signed", "signerThumbprint": expected, "publisher": publisher}
+
+
+def _notarization_state(smoke: dict, checks: list) -> dict:
+    state = smoke.get("notarization")
+    claimed = NOTARIZATION_SMOKE_CHECKS & set(checks)
+    if state == {"status": "notarized"} and claimed == NOTARIZATION_SMOKE_CHECKS:
+        return state
+    if state == {"status": "not_notarized"} and not claimed:
+        return state
+    raise ValueError(
+        "macos-arm64 receipt does not record a consistent notarization state: a notarized "
+        f"DMG needs the checks {sorted(NOTARIZATION_SMOKE_CHECKS)}, an unnotarized one claims none"
+    )
 
 
 def _proof_files(
@@ -375,6 +397,8 @@ def _proof_files(
                 record["authenticode"] = _authenticode_state(
                     smoke, checks, windows_signer_thumbprint
                 )
+            if proof_id == NOTARIZATION_PROOF_ID:
+                record["notarization"] = _notarization_state(smoke, checks)
             records.append(record)
         except (OSError, ValueError) as exc:
             if proof_id not in ANDROID_DOWNLOAD_IDS:
@@ -464,6 +488,18 @@ def _release_notes(
             "Windows: this ZIP is unsigned. The release was built without a configured "
             "code-signing certificate, so Windows reports an unknown publisher; check the "
             "download against `SHA256SUMS` and its attestations below.",
+        ])
+    if records_by_id[NOTARIZATION_PROOF_ID]["notarization"]["status"] == "notarized":
+        lines.extend([
+            "",
+            "macOS: Apple notarized both the app and the DMG, each carries its stapled "
+            "ticket, and Gatekeeper accepted the app copied out of the DMG before publication.",
+        ])
+    else:
+        lines.extend([
+            "",
+            "macOS: this DMG is not notarized by Apple, so on macOS 15 and later open the "
+            "app once, then choose Open Anyway in System Settings → Privacy & Security.",
         ])
     if android["status"] != "verified":
         lines.extend([
@@ -573,7 +609,7 @@ def command_assemble(args: argparse.Namespace) -> None:
             ],
             # Eligibility is the exact official tag; waivedGates lists what it was used for.
             "ownerException": {
-                "decision": "Owner decision of 2026-10-17: release v7.7.0 with any residual red "
+                "decision": "Owner decision of 2026-10-21: release v7.7.1 with any residual red "
                             "test lanes disclosed; follow-up patches will address them.",
                 "repository": args.repository,
                 "tag": args.tag,
@@ -676,6 +712,7 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--check", action="append", default=[])
     smoke.add_argument("--authenticode-thumbprint", default="")
     smoke.add_argument("--authenticode-publisher", default="")
+    smoke.add_argument("--macos-notarization", choices=("notarized", "not_notarized"))
     smoke.set_defaults(func=command_record_smoke)
 
     assemble = commands.add_parser("assemble", help="assemble the release proof capsule")

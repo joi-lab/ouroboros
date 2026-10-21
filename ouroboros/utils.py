@@ -90,9 +90,9 @@ def emit_cognitive_operation_event(
     """Publish one typed lifecycle fact for a live cognitive operation.
 
     This is deliberately a direct worker event, rather than a UI ``log_event``
-    envelope.  The supervisor uses it only to spare its idle rail while the
-    physical call is in flight; deadlines, budgets, cancellation and the
-    absolute task ceiling remain independent.  Callers may omit ``lease_until``
+    envelope. Work leases spare the idle rail; display-only wait marks classify
+    reply preparation without granting that exemption. Deadlines, budgets,
+    cancellation and the task ceiling stay independent. Omit ``lease_until``
     so the supervisor derives a bounded ceiling from the task it owns.
     """
     if event_queue is None:
@@ -334,62 +334,6 @@ def atomic_write_json(path: pathlib.Path, payload: Any, *, trailing_newline: boo
     if trailing_newline:
         content += "\n"
     write_text_atomic(pathlib.Path(path), content, fsync=fsync)
-
-
-def sweep_stale_temp_files(root: pathlib.Path, *, min_age_sec: float = 3600.0,
-                           atomic_temps: bool = True, scripts: bool = True) -> int:
-    """Remove orphaned atomic-write temp files left behind by a hard kill.
-
-    ``atomic_write_json`` writes to a unique ``.{name}.tmp.<pid>.<tid>.<uuid>``
-    sibling then ``os.replace``s it into place; a SIGKILL between create and
-    rename can orphan the temp file (its try/finally cleanup never runs). This
-    sweeps the tree for such temp files older than ``min_age_sec`` — the age
-    guard avoids deleting a temp file from an in-flight write in another process.
-    Returns the number removed. Best-effort: never raises.
-
-    Only files whose suffix after the final ``.tmp.`` is the atomic signature
-    (pid/tid/uuid → hex digits and dots) are reaped, so a legitimate user dotfile
-    such as ``.config.tmp.backup`` is never deleted.
-
-    The data-root ``tmp_scripts/`` fallback is in scope too (CPL4-C20):
-    ``tools/shell.py`` unlinks its ``script_<uuid>.<ext>`` files in a
-    ``finally``, so one that survived is a hard-kill orphan. Only the
-    TOP-LEVEL fallback dir is swept here — task-drive copies die with their
-    drive's own GC prune — and only at startup, when no script can be live
-    (``scripts``); the whole-tree walk for atomic temps (``atomic_temps``) is the
-    expensive half and runs off the loop thread, in the first reconcile pass.
-    """
-    root = pathlib.Path(root)
-    if not root.is_dir():
-        return 0
-    hex_chars = set("0123456789abcdef.")
-    removed = 0
-    now = time.time()
-    try:
-        candidates = list(root.rglob(".*.tmp.*")) if atomic_temps else []
-        if scripts:
-            candidates.extend(root.glob("tmp_scripts/script_*"))
-    except OSError:
-        return 0
-    fallback_scripts = root / "tmp_scripts"
-    for tmp in candidates:
-        try:
-            if not tmp.is_file():
-                continue
-            if not (tmp.parent == fallback_scripts and tmp.name.startswith("script_")):
-                # Require the post-".tmp." suffix to be the atomic signature
-                # (hex/dot only) so we never delete an unrelated dotfile that
-                # happens to match.
-                suffix = tmp.name.rsplit(".tmp.", 1)
-                if len(suffix) != 2 or not suffix[1] or set(suffix[1]) - hex_chars:
-                    continue
-            if now - tmp.stat().st_mtime < min_age_sec:
-                continue
-            tmp.unlink()
-            removed += 1
-        except OSError:
-            continue
-    return removed
 
 
 def read_json_dict(path: pathlib.Path) -> Optional[Dict[str, Any]]:
@@ -953,6 +897,15 @@ def llm_usage_cost(event: Dict[str, Any]) -> float:
 
 def safe_relpath(p: str) -> str:
     """Normalize relative paths and reject traversal/NUL/control-char payloads."""
+    p = normalized_path_text(p).lstrip("/")
+    if ".." in pathlib.PurePosixPath(p).parts:
+        raise ValueError("Path traversal is not allowed.")
+    return p
+
+
+def normalized_path_text(p: str) -> str:
+    """The character refusal and separator spelling ``safe_relpath`` applies before its
+    traversal rule; a caller that judges ``..`` by the resolved location reuses only this."""
     if not isinstance(p, str):
         raise ValueError("Path must be a string.")
     for ch in p:
@@ -962,10 +915,7 @@ def safe_relpath(p: str) -> str:
             raise ValueError(
                 f"Path contains control character U+{ord(ch):04X}."
             )
-    p = p.replace("\\", "/").lstrip("/")
-    if ".." in pathlib.PurePosixPath(p).parts:
-        raise ValueError("Path traversal is not allowed.")
-    return p
+    return p.replace("\\", "/")
 
 def truncate_for_log(s: str, max_chars: int = 4000) -> str:
     if len(s) <= max_chars:

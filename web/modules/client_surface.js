@@ -2,6 +2,8 @@
  * (the pywebview JS bridge appears asynchronously after page load, so a
  * load-time snapshot could misclassify the desktop shell as a browser tab).
  * Deliberately no device taxonomy — the model classifies from raw facts. */
+import { isStackLayout } from './layout.js';
+
 /** Spread-ready chat-frame field: `{}` when the snapshot failed. */
 export function clientSurfaceField() {
     const snap = clientSurfaceSnapshot();
@@ -14,7 +16,8 @@ export function clientSurfaceSnapshot() {
             pywebview: Boolean(window.pywebview?.api),
             ua: String(navigator.userAgent || ''),
             viewport: { w: Number(window.innerWidth) || 0, h: Number(window.innerHeight) || 0 },
-            narrow_layout: window.matchMedia('(max-width: 980px)').matches,
+            // The shell's own switch (layout.js): the model hears "narrow" exactly when the owner sees the drawer.
+            narrow_layout: isStackLayout(),
             coarse_pointer: window.matchMedia('(pointer: coarse)').matches,
             captured_at: new Date().toISOString(),
         };

@@ -51,6 +51,7 @@ SEVERITY_DRIVEN_ITEMS = frozenset({
     "companion_process_safety",
     "extension_namespace_discipline",
     "widget_module_safety",
+    "context_snapshot_discipline",
 })
 
 # Backward-compatible export name for older imports.  New aggregation logic
@@ -88,6 +89,7 @@ def aggregate_skill_review_status(
     # as STATUS_PENDING (non-executable under every enforcement mode) and MUST
     # reload that way — never as advisory-overridable BLOCKERS or WARNINGS —
     # so honor them before the severity-driven aggregation below.
+    findings = [finding for finding in findings if not finding.get("additional")]
     if preflight_failed(findings):
         return STATUS_PENDING
     is_official_hub = review_profile == "official_hub"
@@ -184,7 +186,7 @@ def preflight_failed(findings: Any) -> bool:
     Re-review that would deterministically fail again (#335).
     """
     for finding in findings or []:
-        if not isinstance(finding, dict):
+        if not isinstance(finding, dict) or finding.get("additional"):
             continue
         if finding.get("verdict") == "FAIL" and (
             finding.get("item") in ("skill_preflight", "plugin_api_admission")
@@ -194,9 +196,58 @@ def preflight_failed(findings: Any) -> bool:
     return False
 
 
+# Acceptance reasons that make the current bytes executable without a critic PASS.
+ACCEPTANCE_REASONS = frozenset({"trusted_source", "self_check", "owner_skip", "owner_edit", "author_accepted_advisory"})
+
+
+def _acceptance_reason(acceptance: Any, current_hash: str) -> str:
+    """The local acceptance basis bound to the current bytes, or "".
+
+    ``acceptance`` carries host-owned install facts (``SkillReviewState.acceptance``):
+    the install basis with its release digest, and the owner-edit digest.
+    """
+    if not current_hash or not isinstance(acceptance, dict):
+        return ""
+    basis = str(acceptance.get("basis") or "")
+    if basis in {"trusted", "self_check", "owner_skip"} and acceptance.get("release_digest") == current_hash:
+        return "trusted_source" if basis == "trusted" else basis
+    if acceptance.get("owner_edit_digest") == current_hash:
+        return "owner_edit"
+    return ""
+
+
+def cyber_authority() -> bool:
+    """Whether Ouroboros acts on its own judgment now (Cyber Pro): reviews inform, never hold."""
+    from ouroboros.tools.review_helpers import review_enforcement_blocks
+
+    return not review_enforcement_blocks("blocking")
+
+
+def acceptance_in_force(acceptance: Any, current_hash: str, *, cyber: Optional[bool] = None) -> str:
+    """The acceptance basis that admits the current bytes now, or "".
+
+    Ouroboros's own recorded check (``self_check``) counts only while it holds Cyber Pro
+    authority: outside Cyber Pro a source that reviews each skill needs its review, and only
+    the owner skips one. The other bases do not depend on the mode.
+    """
+    reason = _acceptance_reason(acceptance, current_hash)
+    if reason == "self_check" and not (cyber_authority() if cyber is None else cyber):
+        return "owner_edit" if acceptance.get("owner_edit_digest") == current_hash else ""
+    return reason
+
+
+_ACCEPTANCE_SUMMARIES = {
+    "trusted_source": "Installed unchanged from a source the owner trusts; no review is required for these exact bytes.",
+    "self_check": "Ouroboros read this exact release and recorded why it may run.",
+    "owner_skip": "The owner skipped the review for these exact bytes.",
+    "owner_edit": "The owner, or Ouroboros on the owner's instruction, edited these exact bytes.",
+}
+
+
 def skill_review_gate(
     status: str, *, stale: bool = False, enforcement: Optional[str] = None,
     findings: Any = None, author_disposition: Any = None, current_hash: str = "",
+    acceptance: Any = None,
 ) -> Dict[str, Any]:
     """Structured, agent-facing explanation of whether a review is executable.
 
@@ -204,6 +255,15 @@ def skill_review_gate(
     without a prior verdict. Stale describes reviewer evidence, not author intent.
     Author fields are optional and appear only with a valid author disposition;
     callers without one retain the frozen gate key set.
+
+    ``acceptance`` adds the local bases that need no critic PASS for the current
+    bytes (trusted source, owner Skip, owner edit, and Ouroboros's own check only
+    under Cyber Pro, ``acceptance_in_force``); a deterministic preflight failure
+    recorded for the current bytes still refuses them. Under Cyber Pro the gate names
+    a basis in force instead of its own authority, so grants and dependencies follow it. A skill
+    installed from a source that reviews each skill (``acceptance["strict_review"]``)
+    keeps blocker findings non-executable even under Advisory, until the owner skips
+    the review for these bytes; an Advisory author acceptance is not one of its bases.
 
     Deterministic hard-gate failures (e.g. skill_preflight) are persisted as
     STATUS_PENDING by `_run_deterministic_preflight`, so they are non-executable
@@ -243,10 +303,16 @@ def skill_review_gate(
         except Exception:
             enforcement = "blocking"
     enforcement = str(enforcement or "blocking").lower()
-    from ouroboros.tools.review_helpers import review_enforcement_blocks
-
-    cyber = not review_enforcement_blocks("blocking")
-    if cyber:
+    cyber = cyber_authority()
+    accepted = acceptance_in_force(acceptance, current_hash, cyber=cyber)
+    fresh_preflight_failure = bool(findings is not None and not stale and preflight_failed(findings))
+    strict_review = bool(isinstance(acceptance, dict) and acceptance.get("strict_review"))
+    if cyber and accepted and not fresh_preflight_failure:
+        # The basis still says why these bytes run (keys, dependencies and the card read it).
+        executable = True
+        reason = accepted
+        summary = _ACCEPTANCE_SUMMARIES[accepted]
+    elif cyber:
         executable = True
         reason = "cyber_authority"
         summary = ("Cyber Pro permits acting on this payload by Ouroboros's judgment; "
@@ -255,7 +321,15 @@ def skill_review_gate(
         executable = False
         reason = "review_pending"
         summary = "Current deterministic preflight failed; author acceptance does not make this payload executable."
-    elif (author_current and author.get("action", "finish") == "finish"
+    elif accepted and fresh_preflight_failure:
+        executable = False
+        reason = "review_pending"
+        summary = "The deterministic preflight failed for these exact bytes; their acceptance basis does not make them executable."
+    elif accepted:
+        executable = True
+        reason = accepted
+        summary = _ACCEPTANCE_SUMMARIES[accepted]
+    elif (not strict_review and author_current and author.get("action", "finish") == "finish"
           and author["enforcement"] == "advisory" and enforcement == "advisory"
           and (raw_status != STATUS_PENDING or (terminal_basis and preflight_pass))):
         executable = True
@@ -278,7 +352,12 @@ def skill_review_gate(
         reason = "warnings_do_not_block_execution"
         summary = "Review is executable: warning findings are advisory and do not block execution."
     elif raw_status == STATUS_BLOCKERS:
-        if enforcement == "advisory":
+        if enforcement == "advisory" and strict_review:
+            executable = False
+            reason = "blocker_findings_need_owner"
+            summary = ("Review found blockers in a skill from a source that reviews each skill; it stays off "
+                       "until the owner skips the review for these bytes.")
+        elif enforcement == "advisory":
             executable = True
             reason = "blockers_allowed_by_advisory_enforcement"
             summary = "Review is executable because advisory enforcement allows blocker findings by operator choice."
@@ -306,8 +385,12 @@ def skill_review_gate(
     }
 
 
-def executable_review_requirement(gate: Dict[str, Any]) -> str:
-    """What a refused gate still needs: Advisory also admits a qualified author acceptance."""
+def executable_review_requirement(gate: Dict[str, Any], *, strict_review: bool = False) -> str:
+    """What a refused gate still needs: Advisory also admits a qualified author acceptance,
+    except for a skill from a source that reviews each skill (``strict_review``, the
+    acceptance fact beside the gate), whose blockers need the owner."""
+    if strict_review or str(gate.get("blocking_reason") or "") == "blocker_findings_need_owner":
+        return "the owner's Skip review for these exact bytes, or a review without blocker findings"
     if str(gate.get("review_enforcement") or "") == "advisory":
         return "a current executable reviewer verdict or a qualified Advisory author acceptance of these exact bytes"
     return "a current executable reviewer verdict"

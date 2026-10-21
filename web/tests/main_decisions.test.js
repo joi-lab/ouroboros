@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test, { mock } from 'node:test';
 import { NodeStub, fixture, turn } from './chat_decision_fixture.js';
-import { fixture as mediaFixture } from './helpers/media_dom.js';
+import { fixture as mediaFixture, NodeStub as MediaNode } from './helpers/media_dom.js';
 import { ElementStub, installDom, restoreDom } from './chat_dom_fixture.js';
 import { createChatInstance } from '../modules/chat.js';
 import { stampNodeTimestamp } from '../modules/chat_activity.js';
@@ -356,7 +356,17 @@ test('question materials use validated artifact identities and display their ori
     } finally { fx.decision.destroy(); fx.restore(); }
 });
 
-test('question photos reuse the existing file preview and action dialog from their custody address', async () => {
+test('question photos reuse the existing file preview and the reader, from their custody address', async t => {
+    // The media stub hosts the reader the way main_durable_edges does: a document, focus, replaceChildren.
+    const ownerDocument = Object.getOwnPropertyDescriptor(MediaNode.prototype, 'ownerDocument');
+    const replaceChildren = MediaNode.prototype.replaceChildren;
+    Object.defineProperty(MediaNode.prototype, 'ownerDocument', { configurable: true, get() { return globalThis.document; } });
+    MediaNode.prototype.replaceChildren = function(...nodes) { this.children = []; this.append(...nodes); };
+    t.after(() => {
+        if (ownerDocument) Object.defineProperty(MediaNode.prototype, 'ownerDocument', ownerDocument);
+        else delete MediaNode.prototype.ownerDocument;
+        if (replaceChildren) MediaNode.prototype.replaceChildren = replaceChildren; else delete MediaNode.prototype.replaceChildren;
+    });
     const fx = mediaFixture();
     try {
         const card = document.createElement('div');
@@ -373,11 +383,13 @@ test('question photos reuse the existing file preview and action dialog from the
         assert.match(rendered, /\/api\/tasks\/task-1\/artifacts\/material-safe.png/);
         assert.doesNotMatch(rendered, /arbitrary/);
         await card.querySelector('.chat-file-card').click();
-        assert.ok(document.body.querySelector('.chat-file-dialog [data-file-action="download"]')
-            || document.body.querySelector('[data-file-action="download"]'));
+        const reader = document.body.querySelector('.document-reader');
+        assert.ok(reader?.attributes.has('open'), 'the photo opens in the reader, not outside the app');
+        assert.ok(reader.querySelector('[data-reader-action="download"]'), 'Download stays');
+        const image = fx.tracker.created.filter((node) => node.tagName === 'IMG').at(-1);
+        assert.equal(image.getAttribute('src'), '/api/tasks/task-1/artifacts/material-safe.png');
         fx.controller.release(card);
-        assert.equal(document.body.querySelector('.chat-file-dialog').attributes.has('open'), false,
-            'retiring the question closes its reader');
+        assert.equal(document.body.querySelector('.document-reader'), null, 'retiring the question closes its reader');
     } finally { fx.controller.destroy(); fx.restore(); }
 });
 
@@ -637,7 +649,12 @@ test('Main completion has one Project reference, its caveat and time, without re
             assert.equal(bubble.querySelector('.project-answer-files'), null);
             assert.equal(bubble.querySelector('[data-answer-fold]'), null);
             assert.equal(Boolean(bubble.querySelector('.project-answer-limitation')), role === 'assistant');
-            assert.ok(bubble.children.some(node => node.classList.contains('msg-provenance')), 'time note survives');
+            // One compact time line (owner 17.10, Q7 A): the row's own time carries the end, no second note.
+            const time = bubble.querySelector('.msg-time');
+            assert.equal(time.title, 'Task end time not recorded');
+            assert.equal(time.children[0].textContent, 'End time not recorded');
+            assert.equal(bubble.children.filter(node => node.classList.contains('msg-provenance')).length,
+                role === 'assistant' ? 1 : 0);
         }
     } finally { restoreDom(env.prior); }
 });

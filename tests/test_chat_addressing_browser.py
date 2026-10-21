@@ -7,9 +7,8 @@ card cannot pass by disappearing before the final assertion.
 """
 
 import json
-import os
+import re
 import uuid
-from pathlib import Path
 
 import pytest
 
@@ -18,6 +17,7 @@ from tests.system_e2e.harness import (
     start_server, wait_durable_result, wait_until,
 )
 from tests.test_owner_wait_integration import wait_clone as clone_fixture
+from tests._shared import producer_evidence_dir
 from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET
 
 wait_clone = clone_fixture
@@ -29,11 +29,36 @@ _OBSERVE_CARDS = """() => {
         if (node.nodeType !== Node.ELEMENT_NODE) return;
         const cards = [...node.querySelectorAll('.chat-live-card')];
         if (node.matches('.chat-live-card')) cards.push(node);
-        for (const card of cards) window.__mountedCards.push(card.dataset.taskId);
+        for (const card of cards) {
+            window.__mountedCards.push(card.dataset.taskId);
+            window.__journal?.push({ mount: card.dataset.taskId, frame: window.__frame });  // where the journal runs
+        }
     };
     new MutationObserver(rows => rows.forEach(row => row.addedNodes.forEach(record)))
         .observe(document.documentElement, {childList:true, subtree:true});
 }"""
+
+
+# Every socket frame, numbered before the page handles it: a card's mount carries the number of the frame
+# being handled, so the frame that made the card is known.
+_FRAME_JOURNAL = """() => {
+    const Socket = window.WebSocket;
+    window.__journal = [];
+    window.__frame = 0;
+    window.WebSocket = class JournalWebSocket extends Socket {
+        constructor(...args) {
+            super(...args);
+            this.addEventListener('message', (event) => {
+                window.__frame += 1;
+                let frame = {};
+                try { frame = JSON.parse(event.data); } catch { /* not a JSON frame */ }
+                window.__journal.push({ frame: window.__frame, type: frame.type || '', task: frame.data?.task_id || '',
+                    checkpoint: frame.data?.checkpoint_kind || '' });
+            });
+        }
+    };
+}"""
+HOST_WAITS = ("usage_lock_wait", "control_store_wait")
 
 
 def _work_order(text):
@@ -110,7 +135,8 @@ def test_ordinary_addressing_card_tracks_real_work_through_metrics_and_reload(
         **original_env(server), "HOME": str(home), "USERPROFILE": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
     })
-    evidence = Path(os.environ.get("OUROBOROS_BROWSER_EVIDENCE_OUT") or tmp_path / "evidence") / f"addressing-{case}-{width}"
+    evidence = producer_evidence_dir(tmp_path / "evidence", "chat-addressing",
+                                     env="OUROBOROS_BROWSER_EVIDENCE_OUT") / f"addressing-{case}-{width}"
     evidence.mkdir(parents=True, exist_ok=True)
     with ToolCallOnlyModel([response] * 16) as stub:
         server = start_server(wait_clone, tmp_path / "instance", keyless_settings(stub, OUROBOROS_MAX_WORKERS=1))
@@ -122,6 +148,7 @@ def test_ordinary_addressing_card_tracks_real_work_through_metrics_and_reload(
                 errors = []
                 page.on("pageerror", lambda error: errors.append(str(error)))
                 page.add_init_script(f"({_CAPTURE_TEST_SOCKET})()")
+                page.add_init_script(f"({_FRAME_JOURNAL})()")
                 try:
                     page.goto(server.base_url, wait_until="domcontentloaded")
                     page.wait_for_function("() => window.__testSockets?.[0]?.readyState === WebSocket.OPEN")
@@ -178,23 +205,48 @@ def test_ordinary_addressing_card_tracks_real_work_through_metrics_and_reload(
                     assert metrics and metrics[-1]["tool_calls"] == len(steps)
                     page.get_by_text("The addressing attempt is complete.", exact=True).wait_for(timeout=30000)
                     card = page.locator(f'.chat-live-card[data-task-id="{task_id}"]')
-                    if case == "start_only":
+
+                    def addressing_only():
+                        """A busy host can make the turn wait for its own storage (accounting, control) as the
+                        follow-up starts. That wait is the turn's owner-visible activity (#1355): the turn then
+                        wears a card for it, live and on reload (tests/test_usage_wait_browser.py holds the lock
+                        on purpose). A start-only turn that waited for nothing only addressed work, and wears none."""
+                        return case == "start_only" and not [
+                            row for row in oracle.events("task_checkpoint") if row.get("task_id") == task_id
+                            and row.get("checkpoint_kind") in HOST_WAITS]
+
+                    if addressing_only():
                         assert card.count() == 0
                         assert task_id not in page.evaluate("() => window.__mountedCards")
+                    elif case == "start_only":
+                        card.wait_for(timeout=30000)
+                        waits = card.locator(".chat-live-line-title").filter(
+                            has_text=re.compile(r"^Waiting for (accounting access|control storage)$"))
+                        assert waits.count() >= 1, card.inner_html()
+                        # Addressing alone still earned nothing: the card was made by the wait's frame, not before it.
+                        journal = page.evaluate("() => window.__journal")
+                        made = next(row["frame"] for row in journal if row.get("mount") == task_id)
+                        waited = next((row["frame"] for row in journal
+                                       if row.get("task") == task_id and row.get("checkpoint") in HOST_WAITS), None)
+                        assert waited is not None and made >= waited, journal
                     else:
                         card.wait_for(timeout=30000)
                         assert card.count() == 1
                         # A tool row or a tool error is content: the direct turn
                         # wears the task card (chrome follows content, owner
                         # decision 16.09) — a visible chip, a title, and the
-                        # Main conversion control on an unbound turn.
+                        # Main conversion control on an unbound turn. The turn's
+                        # end lands after its reply and metrics, and an unnarrated
+                        # card is named once it has ended (#1369): wait for it.
+                        page.wait_for_function("id => document.querySelector(`.chat-live-card[data-task-id=\"${id}\"]`)"
+                                               "?.dataset.finished === '1'", arg=task_id, timeout=30000)
                         assert card.locator("[data-live-phase]").is_visible()
                         assert card.locator("[data-live-title]").inner_text().strip() != ""
                         assert card.locator("[data-turn-into-project]").count() == 1
                     page.screenshot(path=str(evidence / "live.png"), full_page=True, animations="disabled")
                     page.reload(wait_until="domcontentloaded")
                     page.get_by_text("The addressing attempt is complete.", exact=True).wait_for(timeout=30000)
-                    assert page.locator(f'.chat-live-card[data-task-id="{task_id}"]').count() == (0 if case == "start_only" else 1)
+                    assert page.locator(f'.chat-live-card[data-task-id="{task_id}"]').count() == (0 if addressing_only() else 1)
                     if case != "failed_tell":
                         assert page.locator('.msg-routing-annotation[data-annotation-status="scheduled"]').count() == 1
                     page.screenshot(path=str(evidence / "reloaded.png"), full_page=True, animations="disabled")

@@ -330,12 +330,45 @@ def test_a_body_plans_first_ask_includes_every_owner_marked_reviewer_and_says_so
     assert [s.slot_id for s in sub.calls[0]["slots"]] == ["s2", "s1", "s3"]
     ask = _record(harness)["asks"][0]
     assert ask["body_first_ask"] is True and ask["host_added"] == ["s1", "s3"]
+    assert ask["panel"]["widened_from"] == ["s2"] and ask["panel"]["strictness"] == "blocking"
     assert "first ask on a body plan" in text and "added s1, s3" in text
     system_prompt = _user_text(sub.calls[0]["request"].slot_messages["s2"][0]["content"])
     assert "## BIBLE.md (constitution" in system_prompt and "## ARCHITECTURE.md" in system_prompt
     # The second ask is the mind's choice.
     text, _ = _call(ctx, ask=["s2"], message="again")
     assert [s.slot_id for s in sub.calls[1]["slots"]] == ["s2"] and _record(harness)["asks"][1]["host_added"] == []
+
+
+def test_advisory_first_body_ask_requires_reason_and_preserves_the_named_panel(harness):
+    harness.monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
+    sub = harness.install({})
+    ctx = harness.make_ctx(active_workspace=False)
+    text, result = _write(ctx, affected_paths=["ouroboros/loop.py"], ask=["s2"])
+    assert "REVIEW_PANEL_REASON_REQUIRED" in text and result.code == "TOOL_ARG_ERROR"
+    assert sub.calls == [] and _record(harness) == plan_record.empty_record()
+    _write(ctx, affected_paths=["ouroboros/loop.py"], ask=["s2"], reason="one area changed")
+    assert [s.slot_id for s in sub.calls[0]["slots"]] == ["s2"]
+    ask = _record(harness)["asks"][0]
+    assert ask["host_added"] == [] and ask["panel"]["widened_from"] == []
+    assert ask["reason"] == ask["panel"]["reason"] == "one area changed"
+    from ouroboros.review_ledger import load_record
+    assert load_record(harness.drive, ask["record_id"])["panel"]["reason"] == "one area changed"
+
+
+def test_first_body_ask_adviser_alone_refuses_in_advisory_and_is_free_in_cyber(harness):
+    critic = _slots(("critic", "m/critic"))[0]
+    harness.monkeypatch.setattr("ouroboros.reviewer_slot_config.catalog_review_row", lambda *_: critic)
+    harness.monkeypatch.setattr("ouroboros.reviewer_slot_config._delivery_slot", lambda *_a, **_kw: critic)
+    harness.monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
+    sub = harness.install({"critic": _reply("A concern", objections=[("x", "explain this")])})
+    ctx = harness.make_ctx(active_workspace=False)
+    text, result = _write(ctx, affected_paths=["ouroboros/loop.py"], ask=["critic"], reason="optional critic")
+    assert "REVIEW_PANEL_EMPTY" in text and result.code == "TOOL_ARG_ERROR"
+    assert sub.calls == [] and _record(harness) == plan_record.empty_record()
+    harness.monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "cyber_pro")
+    _, result = _write(ctx, affected_paths=["ouroboros/loop.py"], ask=["critic"])
+    assert [s.slot_id for s in sub.calls[0]["slots"]] == ["critic"]
+    assert result.meta["plan_holding"] == 0
 
 
 def test_later_ask_continues_each_participant_with_delta_cross_talk_and_own_objections(harness):

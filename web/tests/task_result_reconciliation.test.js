@@ -55,7 +55,7 @@ test(' retained cancelled fact outranks untyped historical answer after result q
         assert.equal(fx.card('past').dataset.finished, '0');
         fx.instance.hydrateStateSnapshot({active_chat_activities: [], active_chat_activities_complete: true, supervisor_ready: true}, Infinity, 2);
         await new Promise(resolve => setImmediate(resolve));
-        assert.equal(fx.card('past').querySelector('[data-live-phase]').textContent, 'Cancelled');
+        assert.equal(fx.card('past').querySelector('[data-live-phase]').textContent, 'Stopped');
     } finally {fx.instance.destroy(); restoreDom(fx.prior);}
 });
 

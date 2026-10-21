@@ -1,4 +1,4 @@
-// Project unread (DESIGN "Project unread dot"): a Project revision is read only
+// Project unread (DESIGN "Unread"): a Project revision is read only
 // when a history read that STARTED after the revision was observed has been
 // painted in a visible room whose reader is at the newest messages. These run
 // the real createChatInstance consumer against a scripted history server.

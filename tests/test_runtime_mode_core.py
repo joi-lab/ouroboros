@@ -372,12 +372,12 @@ def test_skills_ui_reads_live_extension_state_fields():
     orchestration = (REPO / "web" / "modules" / "skills.js").read_text(encoding="utf-8")
     src = renderer + "\n" + orchestration
     assert "live_loaded" in src
-    assert "review_gate?.executable_review" in src or "review_gate.executable_review" in src
+    assert "gate.executable_review" in src  # the card reads the host's executable-review gate
     assert "executable_review" in src
     assert "skill.review_status === 'blockers' && !reviewReady(skill)" in src
     assert "function statusBadge(status, gate = null, profile = '')" in src
     assert "statusBadge(skill.review_status, skill.review_gate, skill.review_profile)" in src
-    assert "retry_install" in src
+    assert "find_in_browse" in src  # a failed install row leads back to Browse
     assert "result.error" in src
 
 

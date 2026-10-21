@@ -78,7 +78,6 @@ def test_vision_query_default_max_tokens():
 def test_summary_and_background_token_budgets():
     """Summary/background paths must stay above the raised floors."""
     from pathlib import Path
-    from ouroboros import context_compaction
 
     from ouroboros import consolidator
 
@@ -99,8 +98,6 @@ def test_summary_and_background_token_budgets():
     assert "chat_observed" not in synthesis and 'call_type="task_summary"' not in synthesis
     # The reflection log is a store only: no automatic lesson or register call remains.
     assert "chat_observed" not in Path("ouroboros/reflection.py").read_text(encoding="utf-8")
-    assert context_compaction._SUMMARY_OUTPUT_TOKENS == 32_768
-    assert context_compaction._summarizer_spec()["output_budget"] == 32_768
 
 
 def test_native_review_character_and_round_caps_are_retired():

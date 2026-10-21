@@ -153,6 +153,9 @@ def onboarding(monkeypatch, tmp_path):
 
     monkeypatch.setattr(gw_settings, "_start_supervisor_if_needed_for_request", _supervisor)
     monkeypatch.setattr(gw_settings, "_apply_settings_save_side_effects", _side_effects)
+    # The starter installer runs in the background after a completed save (tests below).
+    monkeypatch.setattr(gw_onboarding, "after_onboarding",
+                        lambda drive_root, ids: calls.setdefault("starter", []).append((drive_root, ids)))
 
     app = Starlette(routes=[
         Route("/api/onboarding/subagents/preview",
@@ -1583,3 +1586,4 @@ def test_an_unavailable_harness_row_with_a_verified_named_profile_is_routable():
     routable, refused = subscription_routable_harnesses(snapshot)
     assert "agy" not in routable
     assert refused["agy"] == "the engine reports it unavailable"
+

@@ -138,7 +138,7 @@ def test_stop_evolution_tasks_reports_settled_and_failed_honestly(monkeypatch, t
     assert incomplete is True
     assert any("Already settled" in line and "evo-done" in line for line in lines)
     assert any("INCOMPLETE" in line and "evo-stuck" in line for line in lines)
-    assert not any(line.startswith("🛑 Cancelled") for line in lines)
+    assert not any(line.startswith("🛑 Stopped") for line in lines)
 
 
 def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):

@@ -49,6 +49,7 @@ INDICATOR_WAIT_SEC = 3.0
 # Every first-party ``webview.start`` passes ``private_mode=False`` (launcher.py, launcher_onboarding.py):
 # pywebview's private mode erases the WebView's website data each time a window opens (ARCHITECTURE §3).
 PERSISTENT_WEBVIEW_STORAGE = True
+_SHELL_VERSION = read_version()  # the loaded code; a later in-place Update is not a new shell
 STATUS_POLL_SEC = 15.0
 _active = None  # the started indicator, for the exit and Panic paths
 _notifier = None  # the system-notification adapter, for the same paths (Windows' icons outlive a process)
@@ -70,32 +71,57 @@ def background_env(presentation: str) -> dict:
     return {BACKGROUND_ENV: "1" if presentation == "desktop_window" and sys.platform in ("win32", "darwin") else ""}
 
 
-WORKING_PHASES = ("thinking", "working", "finalizing")  # the page's own set (web/modules/project_activity.js)
+TRAY_LINE_MAX = 63  # the Windows notify-icon tooltip limit (launcher_tray.py)
 
 
 def status_line(port: int) -> str:
-    """The indicator's state line from the server's own ``/api/state``: work only from confirmed phases,
-    and an unknown state said as unknown (not ready, an error, an incomplete census, an unknown phase)."""
+    """The indicator's state line from the server's own ``/api/state`` work projection: a work is working,
+    pausing, paused or waiting as the server classified it, an incomplete projection is said as unknown, and
+    what waits for the owner is counted (gateway/work_status.py)."""
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/api/state", timeout=5) as response:
             state = json.loads(response.read().decode("utf-8"))
-        rows = state["active_chat_activities"]
-        phases = [str(row.get("phase") or "") for row in rows]
+        works = [work for work in state["works"] if isinstance(work, dict)]
+        summary = state["work_summary"]
     except Exception:
         return "Ouroboros: not responding"
     if state.get("supervisor_error"):
         return "Ouroboros: error, tasks are not running"
     if state.get("supervisor_ready") is not True:
         return "Ouroboros: starting"
-    if state.get("active_chat_activities_complete") is not True or not set(phases) <= {
-            *WORKING_PHASES, "queued", "budget_pausing", "budget_paused"}:
+    if state.get("works_complete") is not True or not isinstance(summary, dict) or summary.get("confirmed") is not True \
+            or any(work.get("activity") == "unknown" and work.get("confirmed") is not True for work in works):
         return "Ouroboros: activity unconfirmed"
-    working = sum(phase in WORKING_PHASES for phase in phases)
-    if working:
-        return f"Ouroboros: working on {working} task{'' if working == 1 else 's'}"
-    if "budget_pausing" in phases:  # settling its Pause: neither working nor paused yet, as on the page
-        return "Ouroboros: pausing"
-    return "Ouroboros: paused" if "budget_paused" in phases else "Ouroboros: waiting"
+    # A confirmed work whose only remainder is a run nobody can confirm is said beside the rest, never as all of it.
+    unconfirmed = sum(work.get("activity") == "unknown" for work in works)
+    known = [work for work in works if work.get("activity") != "unknown"]
+    # The server's order (working, queued, waiting, paused), with the room's own transitions.
+    activities = {work.get("activity") for work in known}
+    working = [work for work in known if work.get("activity") == "working"]
+    transitions = {work.get("transition") or "none" for work in working}
+    moving = [work for work in working if work.get("transition") != "pausing"]
+    if working and transitions == {"finalizing"}:
+        line = "Ouroboros: finalizing"  # only answers' upkeep runs, as the page says
+    elif working and "none" not in transitions and "pausing" in transitions:
+        line = "Ouroboros: pausing"  # settling its Pause: neither working nor paused yet, as on the page
+    elif moving:
+        line = f"Ouroboros: working on {len(moving)} task{'' if len(moving) == 1 else 's'}"
+    elif working:
+        line = "Ouroboros: pausing"
+    elif "queued" in activities:
+        line = "Ouroboros: queued"
+    elif "paused" in activities and "waiting" not in activities:
+        line = "Ouroboros: paused"
+    elif unconfirmed and not known:
+        line = f"Ouroboros: {unconfirmed} task{'' if unconfirmed == 1 else 's'} unconfirmed"
+    else:
+        line = "Ouroboros: waiting"
+    waits = sum(bool(work.get("turn")) for work in works)
+    if waits:
+        line += f" · {waits} {'waits' if waits == 1 else 'wait'} for you"
+    if unconfirmed and known:  # after what waits for the owner, which a cut line must keep
+        line += f" · {unconfirmed} unconfirmed"
+    return line if len(line) <= TRAY_LINE_MAX else line[:TRAY_LINE_MAX - 1] + "…"
 
 
 def signin_startup_on(port: int) -> bool:
@@ -504,6 +530,7 @@ class DesktopApi:
     built before one of them simply lacks it (the page then falls back and says so, DESIGN §9)."""
 
     _background = None  # set by the inheriting MainApi; a leading underscore keeps it off the bridge
+    _shell_facts = {}  # installed seed and loaded source, supplied by launcher.MainApi
 
     def request_attention(self, sound: bool = True, title: str = "", body: str = "", cue_when_visible: bool = True) -> dict:
         return self._background.attention(bool(sound), str(title or ""), str(body or ""), bool(cue_when_visible))
@@ -515,8 +542,8 @@ class DesktopApi:
         return self._background.appearance.request(theme, page, sequence)
 
     def shell_info(self) -> dict:
-        """What this desktop app is: its own version (not the core's), its storage and its notifications."""
-        return {"shell_version": read_version(), "persistent_storage": PERSISTENT_WEBVIEW_STORAGE,
+        """Installed bundle and loaded shell are separate facts; capabilities are read from this process."""
+        return {"shell_version": _SHELL_VERSION, **self._shell_facts, "persistent_storage": PERSISTENT_WEBVIEW_STORAGE,
                 "native_notifications": self._notifier_answer("status")}
 
     def request_native_notifications(self) -> dict:

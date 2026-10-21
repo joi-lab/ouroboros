@@ -6,7 +6,7 @@ machine-wide ``.worktree_ops.lock`` for 40 minutes, and every other mutating
 classifying, hashing, populating, copying and deleting a snapshot's files now run
 OUTSIDE the lock; the registry row, the baseline pin and the worktree admin dir
 are the only things written under it — row first, so everything after it is
-nameable by the startup GC. A held lock is a typed refusal that names its holder,
+nameable by custody GC. A held lock is a typed refusal that names its holder,
 a dead holder is evicted at once, and a pre-POST refusal is definitely unrun.
 """
 
@@ -21,7 +21,7 @@ import time
 
 import pytest
 
-from ouroboros import artifacts, subagent_worktrees as wt, workspace_patch_capture as capture
+from ouroboros import subagent_worktrees as wt, workspace_patch_capture as capture
 from ouroboros.platform_layer import _lock_identity, pid_is_alive
 from tests._delegated_transport_shared import _owned_gateway_uses_each_test_transport  # noqa: F401
 from tests.test_delegated_full_access import full_run  # noqa: F401
@@ -43,7 +43,7 @@ def _phase_spies(monkeypatch, snaps):
     """Record whether the lock was held when each phase ran."""
     seen: dict = {}
     real_verdicts, real_copy, real_git, real_git_env, real_save = (
-        capture.untracked_binary_verdicts, artifacts.copy_artifact_file, wt._git, wt._git_env, wt._save_registry)
+        capture.untracked_binary_verdicts, wt._fill_private_copy, wt._git, wt._git_env, wt._save_registry)
 
     def spy_git_env(repo_dir, *args, **kw):  # baseline staging goes through _git_env, not _git
         for marker in ("update-index", "write-tree", "commit-tree"):
@@ -55,9 +55,9 @@ def _phase_spies(monkeypatch, snaps):
         seen["classify"] = _lock_held(snaps)
         return real_verdicts(root, rels, **kw)
 
-    def spy_copy(source, destination, **kw):
+    def spy_copy(source, destination, copy_root):
         seen["copy"] = _lock_held(snaps)
-        return real_copy(source, destination, **kw)
+        return real_copy(source, destination, copy_root)
 
     def spy_git(repo_dir, *args, **kw):
         for marker in ("update-index", "commit-tree", "reset", "update-ref", "worktree"):
@@ -70,7 +70,7 @@ def _phase_spies(monkeypatch, snaps):
         return real_save(entries, data_dir)
 
     monkeypatch.setattr(capture, "untracked_binary_verdicts", spy_verdicts)
-    monkeypatch.setattr(artifacts, "copy_artifact_file", spy_copy)
+    monkeypatch.setattr(wt, "_fill_private_copy", spy_copy)
     monkeypatch.setattr(wt, "_git", spy_git)
     monkeypatch.setattr(wt, "_git_env", spy_git_env)
     monkeypatch.setattr(wt, "_save_registry", spy_save)
@@ -418,7 +418,7 @@ def test_a_failure_after_the_provisional_row_leaves_nothing_and_a_crash_is_gc_re
     def boom(*_a, **_k):
         raise OSError("copy failed")
 
-    monkeypatch.setattr(artifacts, "copy_artifact_file", boom)
+    monkeypatch.setattr(wt, "_fill_private_copy", boom)
     with pytest.raises(OSError, match="copy failed"):
         _provision(target, snaps, data, snapshot_id="snapFail")
     assert wt.find_execution_snapshot("snapFail", data_dir=data) is None
@@ -426,12 +426,15 @@ def test_a_failure_after_the_provisional_row_leaves_nothing_and_a_crash_is_gc_re
     assert not list(snaps.glob("dlg_*"))
 
     # A worker killed between the provisional row and the final row: the row is
-    # registered, custody never opened -> the startup GC removes checkout, ref, row.
+    # registered, custody never opened -> GC can remove it once the task is proven over.
     monkeypatch.setattr(wt, "_discard_snapshot_checkout", lambda *a, **k: None)
     with pytest.raises(OSError, match="copy failed"):
         _provision(target, snaps, data, snapshot_id="snapCrash")
     assert wt.find_execution_snapshot("snapCrash", data_dir=data) is not None
     assert "refs/ouroboros/delegated/snapCrash" in _git(target, "for-each-ref", "refs/ouroboros/").stdout
+    from ouroboros.task_results import write_task_result
+    write_task_result(data, "t1", "failed")
+    monkeypatch.setattr("supervisor.queue.task_settlement_liveness", lambda _task: False)
     report = wt.prune_execution_snapshots(set(), worktree_root=snaps, data_dir=data)
     assert report["removed"] == ["snapCrash"]
     assert wt.find_execution_snapshot("snapCrash", data_dir=data) is None

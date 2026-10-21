@@ -8,7 +8,6 @@ disable/reload can tear them down and purge modules cleanly.
 
 from __future__ import annotations
 
-import copy
 import functools  # noqa: F401
 import importlib
 import importlib.util
@@ -20,7 +19,7 @@ import os
 import pathlib
 import re  # noqa: F401
 import secrets  # noqa: F401
-import shutil
+import shutil  # noqa: F401 — facade compatibility
 import sys
 import threading
 import time  # noqa: F401
@@ -40,6 +39,7 @@ from ouroboros.contracts.plugin_api import (
     capability_available,  # noqa: F401
 )
 from ouroboros.event_bus import get_global_event_bus
+from ouroboros.extension_contributions import stage_contributions
 from ouroboros.extension_companion import CompanionDescriptor, get_global_supervisor, is_server_process  # noqa: F401
 from ouroboros.extension_ui_validation import (
     _assert_ws_message_type,  # noqa: F401
@@ -68,6 +68,8 @@ from ouroboros.extension_import_staging import (
     _purge_extension_bytecode,  # noqa: F401
     _stage_extension_import_tree,
     _sweep_stale_extension_imports,
+    extension_import_identity,
+    release_extension_import_tree,
 )
 from ouroboros.extension_liveness import (
     _apply_deps_block,  # noqa: F401
@@ -94,11 +96,15 @@ from ouroboros.extension_reconcile_queue import (
     announce_extension_state_change as _announce_extension_state_change,
 )
 from ouroboros.extension_registry_state import (
-    # The two live read-projections stay importable as ``extension_loader.<name>``
-    # (gateway/widgets.py, gateway/extensions.py, tests/test_gateway_widgets.py);
-    # their bodies belong to the module that owns ``_ui_tabs``/``_extensions``.
+    # The one-lock live reads stay importable as ``extension_loader.<name>`` (gateway/widgets.py,
+    # gateway/extensions.py, extension_process_runner.py, skill_lifecycle_actions.py, tests);
+    # their bodies belong to the module that owns ``_ui_tabs``/``_extensions`` and the surface maps.
+    list_companion_names,  # noqa: F401 — facade re-export (extraction contract)
+    list_routes,  # noqa: F401 — facade re-export (extraction contract)
+    list_ws_handlers,  # noqa: F401 — facade re-export (extraction contract)
     live_module_sources,  # noqa: F401 — facade re-export (extraction contract)
     live_widget_projection,  # noqa: F401 — facade re-export (extraction contract)
+    snapshot,  # noqa: F401 — facade re-export (extraction contract)
     _ExtensionLoadFailure,
     _ExtensionRegistrations,  # noqa: F401 — facade re-export (extraction contract)
     _PluginAPIConfig,
@@ -208,9 +214,12 @@ def _publish_out_of_process_registration(
         runtime_skill_dir=skill.skill_dir,
         dependency_site_dirs_enabled=dependency_site_dirs_enabled,
         plugin_api_generation=plugin_api_generation or negotiation.generation,
+        loaded_skill=skill,
     ))
     try:
         _stage_out_of_process_surfaces(api, skill, catalog)
+        if current_hash is not None:
+            stage_contributions(api, skill, current_hash)
         for name in names:
             if name not in declared:
                 raise ExtensionRegistrationError(
@@ -380,6 +389,14 @@ def reconcile_extension(
             _finalize_extension_reconcile(state, drive_root, skill_name, reason="desired_disabled", health_stamp=health_stamp)
             return state
 
+        if was_live and subject is not None:
+            with _lock:
+                bundle = _extensions.get(skill_name)
+            if bundle and bundle.runtime_identity:
+                was_live = bundle.runtime_identity == extension_import_identity(subject)
+            if was_live and bundle and bundle.catalog_identity is not None:
+                from ouroboros.extension_process_runner import extension_catalog_identity
+                was_live = bundle.catalog_identity == extension_catalog_identity(subject, drive_root, settings_reader)
         if was_live:
             state["action"] = "extension_already_live"
             if is_server_process():
@@ -636,7 +653,7 @@ def load_extension(
     state_dir = skill_state_dir(drive_root, skill.name)
     child_in_process_load = _force_in_process and os.environ.get("OUROBOROS_EXTENSION_PROCESS_CHILD") == "1"
     if not child_in_process_load:
-        _sweep_stale_extension_imports(drive_root, skill.name)
+        _sweep_stale_extension_imports(drive_root, skill.name, keep_hashes=(current_hash,))
     try:
         from ouroboros.skill_dependencies import auto_install_specs_for_skill
 
@@ -647,7 +664,9 @@ def load_extension(
     if auto_specs:
         deps_reason = _deps_block_reason(pathlib.Path(drive_root), skill)
         if deps_reason:
-            return f"skill {skill.name!r} cannot load until isolated dependencies are ready: {deps_reason}"
+            from ouroboros.skill_dependencies import dependency_sentence
+
+            return dependency_sentence(deps_reason)  # the same sentence liveness shows for this code
 
     # Core settings and privileged host capabilities require hash-bound grants.
     grant_status = grant_status_for_skill(pathlib.Path(drive_root), skill)
@@ -675,6 +694,7 @@ def load_extension(
                     drive_root=pathlib.Path(drive_root),
                     repo_dir=pathlib.Path(__file__).resolve().parents[1],
                     skills_repo_path=skill.skill_dir.parent,
+                    settings_reader=settings_reader,
                 )
                 # ABI-9: surfaces AND companions publish as ONE staged
                 # snapshot; the seam routes any failure to dispose+unload.
@@ -689,6 +709,10 @@ def load_extension(
                     current_hash=current_hash,
                     plugin_api_generation=negotiation.generation,
                 )
+                with _lock:
+                    bundle = _extensions[skill.name]
+                    bundle.runtime_identity = extension_import_identity(skill)
+                    bundle.catalog_identity = catalog.get("_cache_identity")
                 return None
         except Exception as exc:
             unload_extension(skill.name)
@@ -738,10 +762,12 @@ def load_extension(
                 runtime_skill_dir=(staged_import_root / "skill") if staged_import_root is not None else None,
                 dependency_site_dirs_enabled=bool(auto_specs),
                 plugin_api_generation=negotiation.generation,
+                loaded_skill=skill,
             ))
             if current_execution_mode() is ExecutionMode.IN_PROCESS:
                 api._disclose_model_capable_dispatch("register", "register")
             register(api)
+            stage_contributions(api, skill, current_hash)
             # ABI-9: nothing register() staged is visible yet; publish the
             # whole snapshot atomically (validate -> swap -> attach; deferred
             # side effects attach only after the swap).
@@ -753,6 +779,8 @@ def load_extension(
             with _lock:
                 _extension_modules[skill.name] = module
                 bundle = _extensions.get(skill.name)
+                if bundle:
+                    bundle.runtime_identity = staged_import_root.name
                 for tool_name in list(bundle.tools if bundle else []):
                     if tool_name in _tools:
                         _tools[tool_name]["skills_repo_path"] = str(skill.skill_dir.parent)
@@ -774,7 +802,7 @@ def load_extension(
     finally:
         if skill.name not in _extensions:
             if staged_import_root is not None:
-                shutil.rmtree(staged_import_root, ignore_errors=True)
+                release_extension_import_tree(staged_import_root)
     return None
 
 
@@ -867,7 +895,7 @@ def _unload_extension_locked(skill_name: str) -> None:
             if mod_name == prefix or mod_name.startswith(prefix + "."):
                 sys.modules.pop(mod_name, None)
         if import_root is not None:
-            shutil.rmtree(import_root, ignore_errors=True)
+            release_extension_import_tree(import_root)
     finally:
         with _lock:
             _unloading.discard(skill_name)
@@ -887,8 +915,11 @@ def reload_all(
     skill_names = {s.name for s in skills if s.manifest.is_extension()}
     with _lock:
         loaded_names = set(_extensions.keys())
+    # Also reclaim removed payloads after a process restart (empty registry).
+    state_skills = pathlib.Path(drive_root) / "state" / "skills"
+    cached_names = {p.name for p in state_skills.iterdir() if (p / "__extension_imports").is_dir()} if state_skills.is_dir() else set()
     results: Dict[str, Any] = {}
-    for gone in loaded_names - skill_names:
+    for gone in (loaded_names | cached_names) - skill_names:
         try:
             unload_extension(gone)
             _sweep_stale_extension_imports(drive_root, gone)
@@ -899,7 +930,7 @@ def reload_all(
         if not skill.manifest.is_extension():
             continue
         try:
-            _sweep_stale_extension_imports(drive_root, skill.name)
+            _sweep_stale_extension_imports(drive_root, skill.name, keep_hashes=(skill.content_hash,))
             state = reconcile_extension(
                 skill.name,
                 drive_root,
@@ -940,55 +971,9 @@ def reload_all(
     return results
 
 
-def snapshot() -> Dict[str, Any]:
-    """Return a read-only snapshot of live extension surfaces."""
-    with _lock:
-        return {
-            "extensions": sorted(_extensions.keys()),
-            "tools": sorted(_tools.keys()),
-            "routes": sorted(_routes.keys()),
-            "ws_handlers": sorted(_ws_handlers.keys()),
-            "ui_tabs": [
-                dict(copy.deepcopy(value), key=key)
-                for key, value in sorted(_ui_tabs.items())
-            ],
-            # Settings sections follow the same host-surfaced shape as UI tabs.
-            "settings_sections": [
-                dict(copy.deepcopy(value), key=key)
-                for key, value in sorted(_settings_sections.items())
-            ],
-        }
-
-
 def get_tool(name: str) -> Optional[Dict[str, Any]]:
     """The registered tool, if any (ABI-9: legacy descriptors digest-stamped)."""
     return _registry_get_tool_stamped(name)
-
-
-def list_ws_handlers() -> Dict[str, Any]:
-    with _lock:
-        return {k: dict(v) for k, v in _ws_handlers.items()}
-
-
-def list_routes() -> Dict[str, Any]:
-    with _lock:
-        return {k: dict(v) for k, v in _routes.items()}
-
-
-def list_companion_names() -> List[str]:
-    """Return host-spawnable companion names across loaded extensions.
-
-    Excludes the ``task:`` (supervised-task) and ``worker-skip:`` markers; used by
-    the out-of-process catalog so the host can spawn the declared companions.
-    """
-    with _lock:
-        names: List[str] = []
-        for bundle in _extensions.values():
-            for raw in bundle.companion_names:
-                name = str(raw or "")
-                if name and not name.startswith(("task:", "worker-skip:")):
-                    names.append(name)
-        return names
 
 
 __all__ = [

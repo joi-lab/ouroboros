@@ -6,7 +6,8 @@ import json
 
 import pytest
 
-from ouroboros import evidence_packs, late_review_marks, obligations, plan_record, store, store_import, task_store
+from ouroboros import evidence_packs, late_review_marks, plan_record, store, store_import, task_store
+from tests._store_journal_shared import store_state
 from tests import test_late_review_marks as late
 from tests.test_late_review_marks import council as council
 from tests.test_plan_record import _participant, _record
@@ -58,9 +59,9 @@ def test_plan_selection_is_pure_and_conservative(tmp_path, monkeypatch, raw, exp
 def test_schema_three_false_acceptance_zero_never_hides_pending_plan_after_old_write(tmp_path, tier):
     original = document("task", plan_record=_record([_pending()]), result="whole historical answer")
     _legacy_store(tmp_path, original, owned_root=tmp_path, tier=tier, shape="v3")
-    before = store.store_path(tmp_path).read_bytes()
+    before = store_state(store.store_path(tmp_path))  # rows and any write's trace; a first WAL open's header aside
     assert task_store.read_document(tmp_path, "task") == original
-    assert store.store_path(tmp_path).read_bytes() == before, "passive reads must not upgrade"
+    assert store_state(store.store_path(tmp_path)) == before, "passive reads must not upgrade"
     store_import.upgrade_current_schema(tmp_path)
     assert _flags(tmp_path, "task") == (0, None, 1)
     assert list(task_store.plan_collection_candidates(tmp_path)) == ["task"]
@@ -73,7 +74,6 @@ def test_schema_three_false_acceptance_zero_never_hides_pending_plan_after_old_w
     assert list(task_store.plan_collection_candidates(tmp_path)) == ["task"]
     assert _flags(tmp_path, "task") == (0, 1, 2)
     assert task_store.read_document(tmp_path, "task") == original
-    assert list(task_store.review_collection_candidates(tmp_path)) == []
 
 
 def test_actual_plan_writes_set_selection_until_the_last_pending_seat_settles(tmp_path):
@@ -184,13 +184,13 @@ def test_known_plan_work_uses_its_own_index_before_unknown_history(tmp_path, mon
     assert selected
     assert all(any("tasks_plan_collection" in step for step in _plan(tmp_path, statement, params))
                for statement, params in selected)
-    assert list(task_store.review_collection_candidates(tmp_path)) == ["acceptance"]
     assert _flags(tmp_path, "old-0") == (0, None, 1)
-    assert "plan_collection_pending" not in {*store.FLAG_COLUMNS.values(), *obligations.DUTY_SETS}
+    assert "plan_collection_pending" not in store.FLAG_COLUMNS.values()
     publish(tmp_path / "packer", document("quiet"))
     with store.open_store(tmp_path / "packer", write=True) as txn:
         txn.conn.execute("UPDATE tasks SET plan_collection_pending=1 WHERE task_id='quiet'")
-    assert evidence_packs.task_settled(tmp_path / "packer", "quiet"), "selector is not a new retention duty"
+    with store.open_store(tmp_path / "packer", write=False) as txn:
+        assert evidence_packs.task_packable(txn, "quiet"), "selector is not a new retention duty"
 
 
 def test_stopped_plan_classification_keeps_unknown_rows_for_next_pass(tmp_path, monkeypatch):
@@ -216,11 +216,16 @@ def test_real_late_collector_revisits_only_pending_plan_after_legacy_history(cou
             txn.store_task(document(f"old-{i:03}", plan_record=_record([_participant("done", status="answered")]),
                                     result="retained answer" * 500))
         txn.conn.execute("UPDATE tasks SET plan_collection_pending=NULL WHERE task_id LIKE 'old-%'")
-    commits, original_commit = [], store.commit
+    commits, original_commit, totals = [], store.commit, {}
 
     def committed(conn):
-        commits.append(conn.total_changes)
+        # total_changes is cumulative on a cached connection: this transaction's rows are the step.
+        total = conn.total_changes
+        commits.append(total - totals.get(id(conn), (conn, 0))[1])
+        totals[id(conn)] = (conn, total)
         return original_commit(conn)
+
+    store.close_connections()  # fresh connections count from zero
 
     with monkeypatch.context() as patch:
         patch.setattr(store, "commit", committed)
@@ -307,4 +312,6 @@ def test_storeless_roundtrip_and_reimport_preserve_plan_and_derive_selector(tmp_
     closed["plan_record"]["asks"][0]["participants"][0]["status"] = "answered"
     copied.write_text(json.dumps(closed), encoding="utf-8")
     store_import.ensure_current_store(restored, with_children=False)
+    assert task_store.read_document(restored, "task") == original  # boot only opens the store
+    store_import.run_legacy_reconcile(restored)
     assert task_store.read_document(restored, "task") == closed and _flags(restored, "task")[1] == 0

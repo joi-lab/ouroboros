@@ -23,6 +23,7 @@ _NEW_SKILL_REVIEW_PASS_ITEMS = [
     {"item": "integration_preflight", "verdict": "PASS", "severity": "advisory", "reason": "ok"},
     {"item": "bug_hunting", "verdict": "PASS", "severity": "critical", "reason": "ok"},
     {"item": "completion_notification", "verdict": "PASS", "severity": "advisory", "reason": "Not applicable"},
+    {"item": "context_snapshot_discipline", "verdict": "PASS", "severity": "advisory", "reason": "Not applicable"},
 ]
 
 

@@ -51,6 +51,8 @@ class ReviewActorRecord:
     # a positive receipt, never inferred from the status. The wave it ran in.
     error_event_logged: bool = False
     review_wave_id: str = ""
+    additional: bool = False
+    cost_kind: str = "unknown"
 
     def to_dict(self) -> Dict[str, Any]:
         # The durable id is the one the review substrate actually ran this row
@@ -68,6 +70,8 @@ class ReviewActorRecord:
             "tokens_in": self.tokens_in,
             "tokens_out": self.tokens_out,
             "cost_usd": self.cost_usd,
+            "cost_kind": self.cost_kind,
+            "additional": self.additional,
             "slot": self.slot,
             # LEGACY-READ-ONLY fallback: every live producer stamps slot_id (the one
             # dispatch entry is review._handle_multi_model_review — skill_review binds
@@ -108,7 +112,7 @@ class ParsedTriadReview:
         # actor_records holds ALL dispatched reviewers (responsive + errored), so
         # this honors the configured count: configured=1 & responded=1 -> met;
         # configured=3 & responded=1 -> NOT met (loud degraded surfaces).
-        return len(self.responsive_models) >= adaptive_quorum(len(self.actor_records))
+        return len(self.responsive_models) >= adaptive_quorum(sum(not r.additional for r in self.actor_records))
 
     @property
     def degraded_reasons(self) -> List[str]:
@@ -136,6 +140,8 @@ def _actor_record(
         tokens_in=int(actor.get("tokens_in", 0) or 0),
         tokens_out=int(actor.get("tokens_out", 0) or 0),
         cost_usd=(float(actor["cost_estimate"]) if actor.get("cost_estimate") is not None else None),
+        additional=bool(actor.get("additional")),
+        cost_kind=str(actor.get("cost_kind") or ("measured" if actor.get("cost_estimate") is not None else "unknown")),
         slot=idx + 1,
         slot_id=str(actor.get("slot_id") or ""),
         prompt_ref=dict(actor.get("prompt_ref") or {}),
@@ -260,14 +266,10 @@ def extract_fenced_json(text: str) -> Any:
 
 # Output SHAPE per surface — the ONE form fact the retrieving-route canonicalizer,
 # the session output schema and the strict parser branch on. Shape is FORM only
-# (no surface policy lives here: acceptance rules, tier classification and
-# quorum authority stay with their owners). Every surface not listed returns
-# the findings ARRAY contract; ``object`` is the whole-object acceptance verdict
-# (verdict/outcome_tier/criteria_used/dialogue_status/findings/summary), which
-# the array-only canonicalizer used to reduce to its findings list; ``report``
-# is a free-form markdown product that is never canonicalized or extracted.
+# (no surface policy lives here: quorum authority stays with its owner). Every
+# surface not listed returns the findings ARRAY contract; ``report`` is a
+# free-form markdown product that is never canonicalized or extracted.
 REVIEW_OUTPUT_SHAPES: Dict[str, str] = {
-    "task_acceptance": "object",
     "deep_self_review": "report",
     # The commit gate's retrieving seats answer the two-part brief (contract B):
     # one object {change, change_clean, coupling}. Packet seats on the same
@@ -278,20 +280,12 @@ REVIEW_OUTPUT_SHAPES: Dict[str, str] = {
     # never extracts or aggregates it; the whole text reaches plan_record.parse_reply.
     "plan_review": "plan_reply",
 }
-OBJECT_VERDICT_REQUIRED_KEYS = ("verdict",)
 TWO_PART_KEYS = ("change", "change_clean", "coupling")
 
 # Default output contract per SHAPE for a retrieving delivery whose surface did
 # not hand over its own `policy["output_contract"]`: the prompt must ask for the
-# same form the canonicalizer parses, or an obedient reviewer answering the
-# array contract on an object surface is demoted to malformed by its own host.
-REVIEW_JSON_OBJECT_CONTRACT = """\
-Return ONLY one JSON object with keys: verdict (PASS|FAIL|DEGRADED), findings
-([{severity, item, evidence, recommendation}] — an empty list when nothing is
-wrong), and summary, plus any keys the task's contract names. Never a bare
-array, never prose around the object: your host parses the object structurally
-and treats anything else as a non-response.
-"""
+# same form the canonicalizer parses, or an obedient reviewer answering another
+# surface's contract is read as malformed by its own host.
 REVIEW_REPORT_CONTRACT = """\
 Deliver the report itself as plain markdown prose — no JSON wrapper, no code
 fence around the whole answer. Most critical findings first, each with the
@@ -300,8 +294,17 @@ evidence you read; mark anything you could not verify as unverified.
 
 
 def review_output_shape(surface: str) -> str:
-    """``array`` | ``object`` | ``two_part`` | ``report`` | ``plan_reply`` for one review surface."""
+    """``array`` | ``two_part`` | ``report`` | ``plan_reply`` for one review surface."""
     return REVIEW_OUTPUT_SHAPES.get(str(surface or ""), "array")
+
+
+def request_output_shape(request: Any) -> str:
+    """The shape one request's seat answers: its policy's own ``output_shape`` when it names one (a
+    result wave rides the commit surface but asks contract A), else its surface's. The ask, the
+    session schema and the canonicalizer all read this one fact, so they never disagree."""
+    shape = str((getattr(request, "policy", None) or {}).get("output_shape") or "")
+    return shape if shape in {"array", "two_part", "report", "plan_reply"} else review_output_shape(
+        str(getattr(request, "surface", "") or ""))
 
 
 def default_output_contract(shape: str) -> str:
@@ -313,8 +316,7 @@ def default_output_contract(shape: str) -> str:
 
         return PLAN_REPLY_CONTRACT
     return {
-        "object": REVIEW_JSON_OBJECT_CONTRACT, "report": REVIEW_REPORT_CONTRACT,
-        "two_part": REVIEW_TWO_PART_OBJECT_CONTRACT,
+        "report": REVIEW_REPORT_CONTRACT, "two_part": REVIEW_TWO_PART_OBJECT_CONTRACT,
     }.get(str(shape or ""), REVIEW_JSON_ARRAY_CONTRACT)
 
 
@@ -490,18 +492,20 @@ def parse_seat_answers(result_json: Dict[str, Any], row_parts: Dict[str, Sequenc
         raw_text = str(actor.get("text") or "")
         model_label = model or "reviewer"
         slot_id = str(actor.get("slot_id") or "")
-        parts = [p for p in ("change", "coupling") if p in tuple(row_parts.get(slot_id) or ("change",))]
+        parts = [p for p in ("change", "coupling", "result") if p in tuple(row_parts.get(slot_id) or ("change",))]
         if str(actor.get("operation_state") or "") == "not_dispatched":
             record = _actor_record(actor, idx=idx, model_label=model_label, status="not_dispatched", raw_text=raw_text)
         elif str(actor.get("verdict") or "").upper() == "ERROR":
             record = _actor_record(actor, idx=idx, model_label=model_label, status="error", raw_text=raw_text)
         else:
-            if parts == ["change"]:
+            if parts in (["change"], ["result"]):
+                # Contract A: the change question of a packet seat, and the one question of every
+                # result seat (``review_change(subject="result")``), answer the findings array.
                 parsed = extract_json_array(raw_text, normalize=True)
                 if parsed is None or (not parsed and not empty_array_is_verified_clean(raw_text)):
                     answers = None
                 else:
-                    answers = {"change": _change_answer(_change_items(
+                    answers = {parts[0]: _change_answer(_change_items(
                         [e for e in parsed if isinstance(e, dict)], model_label=model_label, slot_id=slot_id))}
             else:
                 answers = parse_two_part_answer(raw_text, parts, model_label=model_label, slot_id=slot_id)
@@ -526,24 +530,6 @@ def parse_seat_answers(result_json: Dict[str, Any], row_parts: Dict[str, Sequenc
                                            "read_provenance": str(actor.get("read_provenance") or "")}
         records.append(record)
     return ParsedTriadReview(findings=findings, responsive_models=responsive, actor_records=records)
-
-
-def object_verdict_payload(payload: Any) -> Optional[Dict[str, Any]]:
-    """The WHOLE object verdict, or None — mirroring `parse_review_findings`'
-    object ladder (a verdict signal is required, findings are optional) with
-    the array branch's type discipline: a non-empty string verdict and, when
-    present, findings as a list of dicts. Shape only: semantic demotion
-    (tier/coach/criteria) stays with ``review_actor_aggregation``."""
-    if not isinstance(payload, dict) or not all(key in payload for key in OBJECT_VERDICT_REQUIRED_KEYS):
-        return None
-    if not isinstance(payload.get("verdict"), str) or not payload["verdict"].strip():
-        return None
-    findings = payload.get("findings")
-    if findings is not None and (
-        not isinstance(findings, list) or not all(isinstance(item, dict) for item in findings)
-    ):
-        return None
-    return payload
 
 
 def parse_review_findings(raw_text: str) -> tuple[Any, List[Dict[str, Any]], str]:
@@ -702,6 +688,7 @@ def parse_model_review_results(
     result_json: Dict[str, Any],
     *,
     required_items: Optional[Sequence[str]] = None,
+    additional: Sequence[str] = (),
 ) -> ParsedTriadReview:
     """Parse model result envelopes into normalized findings and actor records.
 
@@ -716,6 +703,7 @@ def parse_model_review_results(
     for idx, actor in enumerate(result_json.get("results") or []):
         if not isinstance(actor, dict):
             continue
+        actor = {**actor, "additional": bool(actor.get("additional") or actor.get("slot_id") in additional)}
         model = str(actor.get("model") or actor.get("request_model") or "").strip()
         raw_text = str(actor.get("text") or "")
         model_label = model or "reviewer"
@@ -758,6 +746,7 @@ def parse_model_review_results(
                 "reason": str(entry.get("reason") or "").strip(),
                 "model": model_label,
                 "slot_id": actor_slot_id,
+                **({"additional": True} if actor.get("additional") else {}),
                 **({"obligation_id": str(entry.get("obligation_id") or "")} if entry.get("obligation_id") else {}),
             })
         if required and not required.issubset(covered_items):
@@ -766,7 +755,7 @@ def parse_model_review_results(
         findings.extend(actor_findings)
         responsive_id = f"{model_label} [{actor_slot_id}]" if actor_slot_id else f"{model_label}#{idx + 1}"
         response_identity = f"slot:{actor_slot_id}" if actor_slot_id else f"actor:{idx}"
-        if response_identity not in responsive_ids:
+        if response_identity not in responsive_ids and not actor.get("additional"):
             responsive.append(responsive_id)
             responsive_ids.add(response_identity)
         records.append(_actor_record(actor, idx=idx, model_label=model_label, status="responded", raw_text=raw_text, parsed_items=actor_findings))
@@ -811,6 +800,9 @@ def emit_review_run_errors(ctx: Any, request: Any, actors: Sequence[Any], *, dri
         row["task_id"] = str(getattr(request, "task_id", "") or "")
         row["status"] = actor.status if actor.status in {"error", "not_dispatched"} else "parse_failure"
         row["error"] = actor.error or actor.reason or "Reviewer response was malformed or absent."
+        from ouroboros.review_records import review_failure_facts
+
+        row.update(review_failure_facts(row))  # the event row only: the actor record keeps its producer's facts
         meta = getattr(request, "usage_attribution", {}) or {}
         actor.error_event_logged = _append_review_model_error(
             ctx, row, source=str(request.surface or ""), skill_name=str(meta.get("review_skill") or ""),
@@ -876,7 +868,9 @@ def _append_review_model_error(ctx: Any, row: Dict[str, Any], *, source: str,
     """
     try:
         from ouroboros.usage_accounting import current_usage_scope
+        from ouroboros.review_records import review_failure_facts
 
+        row = {**row, **review_failure_facts(row)}
         binding, usage = row.get("recovery_binding") or {}, row.get("usage") or {}
         receipt = usage.get("claudexor") if isinstance(usage.get("claudexor"), dict) else {}
         metadata = getattr(ctx, "task_metadata", None)
@@ -907,171 +901,6 @@ def _append_review_model_error(ctx: Any, row: Dict[str, Any], *, source: str,
         return False
 
 
-# ── Reviewer prompt rule texts (byte-stable governance, cache-marked) ─────────
-# Moved from review_substrate._render_prompt_parts in v6.74.0: the substrate
-# crossed the 1600-line module gate, and these shared reviewer rule texts are
-# multi-model review primitives — this module's charter. They MUST stay
-# byte-stable across a surface's repeat calls (they live inside the cache-marked
-# governance segment).
-
-TIER_CLASSIFICATION_RULES = (
-        "outcome_tier classifies the CURRENT deliverable against the task's requirements and "
-        "evidence. Never classify solved unless the "
-        "claimed result is actually verified by the evidence — your veto over false success "
-        "claims is the point of this review. A real partial deliverable with honestly marked "
-        "gaps is best_effort, not a failure; it does not discharge useful work still owed to the "
-        "accepted goal. completion_coach is separate advice: the most useful authorized next "
-        "action under the real constraints, not necessarily a higher tier. Ask whether a "
-        "demanding person who made this request, seeing the result, would call it done well; "
-        "a sufficient result needs no invented improvement. For an incomplete tier, keep the "
-        "coach nonempty: name a reachable action or explain concretely why none remains for the "
-        "author and whose action is needed. Keep that advice consistent with DIALOGUE STATUS / "
-        "REACHABILITY; "
-        "the coach is neither evidence of success nor authority to stop or change the goal. "
-)
-
-ACCEPTANCE_SURFACE_RULES = (
-        "For TASK ACCEPTANCE: do not accept a 'solved' claim on assertion alone. Re-derive the "
-        "acceptance criteria from the FULL goal/spec narrative yourself (including prose context, "
-        "requirements implied outside bullet lists, and any named user-facing interface), enumerate "
-        "all affected components/surfaces you expect the deliverable to cover. If "
-        "`task_contract.acceptance_claims` is present, treat those "
-        "claim/surface/support entries as structured hints, not as an oracle: verify them against "
-        "the full goal and use `acceptance_support_refs` as the host-built support map. The claim's "
-        "`support` text names expected evidence; it is NOT evidence unless a receipt/tool/artifact/source "
-        "ref actually supports it. "
-        "Record in criteria_used which claims were supported, missing, partial, or rejected, and why. "
-        "Require the evidence each criterion calls for: observed execution for runnable behaviour "
-        "(the actual test/command and its observed output, not a narrative that it passes), "
-        "inspection of the actual artifact for content or visual claims, and reasoned judgment "
-        "grounded in cited sources for qualitative claims. A simpler method that keeps the outcome "
-        "is fulfilment; an owner- or parent-fixed method stays a constraint. "
-        "If the evidence covers only part of the affected surface list, do not classify solved; "
-        "name the uncovered criteria/surfaces in findings or completion_coach. "
-        "EVIDENCE INDEPENDENCE: from the diff and tool trace, identify which test/check files "
-        "the agent CREATED or MODIFIED this turn versus which were pre-existing or grader-owned. "
-        "Authorship and age are provenance, not proof or an automatic ceiling. Judge what grounds "
-        "the expected result independently of the implementation and whether the executed check "
-        "can expose a defect in the claimed consumer behavior. Task examples, an independent "
-        "oracle or derivation, and an unchanged relevant external expectation can support a new "
-        "test; a recorded discriminating failure before the fix strengthens that evidence. An "
-        "old test that misses the changed behavior is insufficient. Expectations copied from "
-        "the implementation's output, including edited expectations in an old test, or mocks "
-        "that replace the very behavior being claimed do not independently verify that behavior. "
-        "If those are the only passing evidence, treat the success claim as UNVERIFIED "
-        "(outcome_tier at most best_effort, never solved) and name the needed independent check. "
-        "State in your summary which evidence you judged independent and why. "
-        "VISIBLE UI EVIDENCE: when the deliverable changes a user-visible interface, require "
-        "evidence that at least one relevant real consumer flow was opened in an available browser "
-        "and the rendered result was actually inspected with vision. A screenshot file or attachment "
-        "without evidence of visual inspection is insufficient for solved. The implementer chooses "
-        "states, viewports, and additional engines according to task risk; mobile and WebKit are not "
-        "universal requirements, and an unavailable optional engine alone is not degradation. If "
-        "visual evidence the implementer judged necessary was unavailable, require an honest "
-        "best_effort/degraded result that names the gap. "
-        "ENVIRONMENT vs DELIVERABLE: a task_environment_error, round-budget exhaustion, sandbox "
-        "auto-evaluation, or provider/runtime fault is NOT itself an agent failure — judge "
-        "whether the requested artifact/answer was produced before the environment terminated; "
-        "do not FAIL a correct deliverable for an environment-imposed limit, note it as context. "
-        "ABSENT-PREMISE / INFEASIBLE DISPOSITION: when the terminal claim is that the task's "
-        "premise is absent or the request is infeasible (a required feature, referent, or mode "
-        "of operation does not exist on the inspected surfaces, or every remaining route would "
-        "breach the task's own stated method restrictions), the deliverable to judge is the "
-        "PREMISE ARGUMENT, not the named artifact: verify from the trace which concrete surfaces "
-        "were inspected and what each demonstrably cannot do, and whether any in-scope route "
-        "remains untried. Under that disposition the named artifact's absence is EXPECTED — do "
-        "not instantiate 'the deliverable exists' as a criterion against it (that begs the "
-        "question), and never coach continuation whose remaining routes breach the task's stated "
-        "restrictions: a route outside 'using only X' is not an actionable route, and demanding "
-        "it manufactures an artifact the task forbids. A WEAK premise argument still FAILs on "
-        "its own grounds: absence asserted without inspecting the surface that would host the "
-        "feature, or an untried in-scope route visible in the packet. "
-        "METRIC-GROUNDED EVIDENCE: when the task states an explicit success metric, contains a "
-        "worked example, or warns that grading uses held-out cases, treat an existence-only "
-        "(artifact_observation) or substring-only verification receipt as INSUFFICIENT for solved — "
-        "require evidence that the metric/example is actually met (an exact/exact_line/json_equals "
-        "receipt, or the metric value in the check output). ANTI-CHEAT: credible verification uses "
-        "ONLY public task info (instruction text, embedded examples, installed oracles, the agent's "
-        "own independent checks); if the evidence came from reading a hidden /tests/ dir, "
-        "solution.sh, copied verifier code, or an online answer, treat the success claim as "
-        "UNVERIFIED. "
-        "PROCESS, NOT ONLY OUTCOME: the packet includes a `tool_trajectory` (HOW the task was "
-        "solved) and a first-class `verification_summary`. Audit the process — if the agent used "
-        "the wrong tool, went the wrong direction, has a red verification never cleared by a green "
-        "re-run of the SAME criterion/check "
-        "(`verification_summary.unreconciled_red`, or a RED `latest_status`; "
-        "`reconciliation_identity` names, per receipt, WHICH authority clears it — "
-        "`criterion_id` (an authored criterion name), `check` (the canonical command text), "
-        "`artifact_paths` (the observed path SET, compared byte-for-byte, since a leading or "
-        "trailing space is a legal filename byte) or `none`; for `check`, `check_rendering` says "
-        "which renderer wrote the stored text, and receipts from DIFFERENT renderings are never "
-        "the same verification even when the text matches (an `unversioned` receipt predates the "
-        "current one and cannot be re-tokenized, so it is unknown, not equal). "
-        "`expected_whitespace_normalized` "
-        "is set for `check` ONLY, and means the same tokens however spaced still count as the "
-        "same check, while a changed ARGUMENT is a different check — so judge the substance and "
-        "not the command spelling. It is never set for the other identities, which normalize no "
-        "text at all, nor for a masked check, whose reconciliation ignores command text "
-        "entirely. The still-red verification is NOT necessarily "
-        "the last one — a later green of a DIFFERENT check leaves it standing — so read "
-        "`unreconciled_red_identity` for WHICH criterion/check/observed paths are still red, not "
-        "`latest_*`), grounded on a check "
-        "whose exit code may be MASKED (`verification_summary.check_exit_masking_unreconciled` — a "
-        "`| tail`/`grep`/`|| true` pipeline can report exit 0 over a real failure; command text "
-        "NEVER decides here, because dropping the masking pipe IS the fix and so necessarily "
-        "changes it: a masked check that NAMES a `criterion_id` is cleared only by a later CLEAN "
-        "verification naming that SAME id — a later clean receipt that omits its id does not clear "
-        "it — and a masked check naming NO criterion is cleared by ANY later clean verification; "
-        "so that green is weak evidence until such a clean re-grounding appears), or the "
-        "final claim "
-        "is not supported by the trajectory, say so. Judge whether a still-red check tests an "
-        "enduring requirement of the current task. Lawfully replacing or removing a chosen "
-        "means can make its check inapplicable when independent evidence verifies the "
-        "requirement through the path now used; explain that applicability without changing "
-        "the historical red receipt. Renaming a check or criterion does not retire the same "
-        "remaining defect. A claim that contradicts an applicable check or rests on an "
-        "unsupported process is at most best_effort; completion_coach names the useful "
-        "authorized next action. PROVENANCE: every "
-        "evidence block is tagged in `__provenance__` (host_attested / agent_supplied / "
-        "tool_result / artifact / hidden_or_restricted) — weigh host_attested over agent_supplied, "
-        "and NEVER credit a success claim to `hidden_or_restricted` evidence (a benchmark/test leak). "
-        "RETRIEVAL: `retrieval` (host_attested, when present) records NATIVE provider web searches "
-        "made inside the ANSWERING model's own request — how many, and the URLs it fetched. It is "
-        "FACTUAL CONTEXT, not a criterion: its absence means only that no native search was recorded "
-        "(native search may not be enabled, or the agent may have retrieved through the `web_search` "
-        "/ browser tools, which issue their own calls and are visible in `tool_trajectory`), and "
-        "must NOT be treated as a gap; its presence is not credit either — judge the substance of "
-        "the evidence as usual. "
-        "OBLIGATION REBUTTALS: `acceptance_obligations` (host_attested) lists the id/item/"
-        "recommendation of each obligation a prior review round raised; the agent's per-obligation "
-        "dispositions and rebuttal reasons arrive under `agent_supplied.agent_decision."
-        "obligation_dispositions`, joinable by id. Treat a 'rejected' disposition as a rebuttal to "
-        "that finding: if the argument is genuinely valid, do not re-raise the same finding; if it "
-        "is not, re-raise the finding and explain why the rebuttal fails. A rebuttal may dismiss or "
-        "reframe an obligation, but it is NEVER itself evidence for a criterion — 'supported' still "
-        "requires an independent host/tool/artifact receipt and 'solved' still requires the "
-        "evidence each criterion calls for. "
-        "REVIEW REGISTER: you are an outside perspective helping the task land, not a gate of last "
-        "resort. Concrete, reachable-now defects block; hypotheticals, style preferences, and hygiene "
-        "are advisory findings, not blockers. "
-        "REACHABILITY: a requirement that cannot be satisfied in THIS environment (a missing "
-        "credential/UI/network/tool, an owner-side dependency) is unavailable here — classify the "
-        "tier honestly, name the gap, and do not re-raise it as a blocking finding. "
-        "OBLIGATION IDENTITY: every finding carries disposition_kind — \"re_raise\" when it maintains "
-        "an obligation already listed in `acceptance_obligations` (then obligation_id MUST be that "
-        "exact id), \"new\" otherwise. A re_raise with a missing or unknown obligation_id is recorded "
-        "as new, so name ids precisely. When the agent's disposition rejected an obligation, "
-        "adjudicate the rebuttal: if the argument is valid, retire the finding — do not re-raise it; "
-        "if it is not, re_raise it and state in `evidence` why the argument fails. "
-        "DIALOGUE STATUS: dialogue_status is your typed judgement about the review DIALOGUE itself — "
-        "\"continue_actionable\" (a concrete, reachable-now improvement exists), \"unreachable_here\" "
-        "(the remaining gap cannot be closed in this environment), or \"stable_disagreement\" (both "
-        "positions are fully argued and further rounds will not change the outcome). An honest "
-        "terminal judgement ends the loop and surfaces both positions to the owner; it is not a "
-        "concession. "
-)
-
-
 def review_query_error_payload(
     *,
     ctx: Any,
@@ -1087,7 +916,10 @@ def review_query_error_payload(
     its durable actor record must name the same one its refs do. Imports stay
     lazy so this module's dependency graph remains the primitives it declares.
     """
-    payload = {"error": error, "usage": {}, "slot_id": slot_id, "prompt_ref": {}, "response_ref": {}}
+    from ouroboros.review_records import review_failure_facts
+
+    facts = review_failure_facts({"status": "error", "error": error})
+    payload = {"error": error, **facts, "usage": {}, "slot_id": slot_id, "prompt_ref": {}, "response_ref": {}}
     try:
         from ouroboros.observability import new_call_id, persist_call
         from ouroboros.tools.review_helpers import review_drive_root
@@ -1114,7 +946,7 @@ def review_query_error_payload(
             task_id=task_id,
             call_id=f"{call_id}_error",
             call_type="multi_model_review_error",
-            payload={"error": error},
+            payload={"error": error, **facts},
             manifest={"surface": "multi_model_review", "slot_id": slot_id, "model": model, "status": "error", "synthetic": True},
         )
     except Exception:

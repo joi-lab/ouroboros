@@ -136,11 +136,10 @@ def test_readers_resolve_loose_then_pack_and_blob_shared_with_active_task_stays_
     assert _loose(refs_c[0])  # an active task is never packed
     for ref in refs_a:
         assert obs.read_blob_ref(root, ref)["message"]["content"].startswith("answer task-a")
-    from ouroboros.repo_diff_capture import read_blob_bytes
-    packed_raw = read_blob_bytes(root, refs_a[2], expected_kind="json")
+    packed_raw = packs.blob_bytes(root, refs_a[2], expected_kind="json")
     assert hashlib.sha256(packed_raw).hexdigest() == refs_a[2]["sha256"]
     with pytest.raises(ValueError, match="unexpected kind"):
-        read_blob_bytes(root, refs_a[2], expected_kind="bin")
+        packs.blob_bytes(root, refs_a[2], expected_kind="bin")
     raw = read_actor_source_bytes(root, "task-a", handle_a)
     assert raw.startswith(b"# focus") and len(raw) == handle_a["size"]
     assert packs.handle_info(root, "task-a", handle_a["path"]) == {"size": handle_a["size"], "sha256": handle_a["sha256"], "loose": False}
@@ -316,12 +315,12 @@ def test_kill_at_each_packer_step_leaves_readable_state_and_rerun_completes(root
         real_upsert(root_, pack_path, sidecar)
         raise KeyboardInterrupt("kill -9 after the index upsert")
 
-    monkeypatch.setattr(packs, "replace_atomic", replace)
-    if step == "indexed":
-        monkeypatch.setattr(packs, "index_upsert", upsert)
-    with pytest.raises(KeyboardInterrupt):
-        packs.pack_task(root, "task-a", keep_shas=set())
-    monkeypatch.undo()
+    with monkeypatch.context() as patch:
+        patch.setattr(packs, "replace_atomic", replace)
+        if step == "indexed":
+            patch.setattr(packs, "index_upsert", upsert)
+        with pytest.raises(KeyboardInterrupt):
+            packs.pack_task(root, "task-a", keep_shas=set())
     packs._READERS.clear()
     # loose files are still there (nothing unlinked before the verified index), every reader works
     assert all(_loose(ref) for ref in refs) and _handle_path(root, "task-a", handle).exists()
@@ -457,54 +456,28 @@ def test_unpacker_restores_usage_archive(root):
     assert (directory / "segment_ep0002.jsonl").read_text(encoding="utf-8") == '{"attempt_id": "a"}\n', done.stdout
 
 
-# ---- the settle predicate ----------------------------------------------------------
+# ---- the packable predicate --------------------------------------------------------
 
-def test_settle_predicate_reads_status_obligations_operations_acceptance_and_money(root):
-    _task(root, "done", blobs=1)
-    _task(root, "live", blobs=1, status="running")
-    _task(root, "owed", blobs=1, canonical_terminal_projection_origin="terminal_transition")
-    _task(root, "reviewing", blobs=1, review_operations={"op": {"state": "dispatched"}})
-    _task(root, "indebted", blobs=1, acceptance_debt={"debt_id": "d1"})
-    from supervisor import terminal_delivery
-    assert terminal_delivery.register_pending_delivery(root, {"delivery_id": "dl-1", "task_id": "indebted", "chat_id": 1})
-    wanted = "task_acceptance:" + hashlib.sha256(b"d1").hexdigest()
-    _task(root, "discharged", blobs=1, acceptance_debt={"debt_id": "d1"},
-          review_projection={"panels": [{"late_settlement": {"reviewed_subject": {"retry_key": wanted}}}]})
-    settled = {t for t in ("done", "live", "owed", "reviewing", "indebted", "discharged") if packs.task_settled(root, t)}
-    assert settled == {"done", "discharged"}
-    assert packs.task_settlement_facts(root, "indebted")["open_acceptance"] is True
-    facts = packs.task_settlement_facts(root, "owed")
-    assert facts["terminal"] and "terminal_projection" in facts["obligations"]
-    assert packs.task_settlement_facts(root, "reviewing")["open_operations"]
-    assert packs.task_settlement_facts(root, "missing")["terminal"] is False
+@pytest.mark.parametrize("review", ["none", "closed", "open", "unclassified"])
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled", "rejected_duplicate",
+                                    "requested", "scheduled", "running", "interrupted"])
+def test_packable_is_a_terminal_row_with_no_open_review_and_nothing_else(root, status, review):
+    """Both directions: a terminal row packs whatever duty, projection or acceptance debt it carries, unless a
+    review of it is still open (its agent-session reader holds a retained handle's absolute path); a row no
+    body with the selector wrote (NULL) has no such reader and packs; a live row never packs."""
+    from ouroboros import store
+    from ouroboros.task_status import SETTLED_STATUSES
 
-
-def test_settle_predicate_waits_for_unresolved_money(tmp_path, monkeypatch):
-    from tests.fixtures_usage_store import _request
-    from ouroboros import usage_accounting as ua, usage_store
-    from ouroboros.usage_journal import IMPORT_REL
-
-    root = tmp_path / "data"
-    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(root))
-    monkeypatch.setenv("OUROBOROS_SETTINGS_PATH", str(root / "settings.json"))
-    monkeypatch.setenv("TOTAL_BUDGET", "100")
-    (root / "state").mkdir(parents=True)
-    (root / IMPORT_REL).write_text(json.dumps({"completed": True}), encoding="utf-8")
-    try:
-        _task(root, "paid", blobs=1)
-        _task(root, "open", blobs=1)
-        reservation = ua.reserve_attempt(_request(root, task_id="open", root_task_id="open"))
-        ua.mark_dispatched(reservation)
-        assert packs.task_settlement_facts(root, "open")["money_open"] is True
-        assert packs.task_settlement_facts(root, "paid")["money_open"] is False
-        assert packs.task_settled(root, "paid") and not packs.task_settled(root, "open")
-        report = packer.run_pass(root)
-        assert report["packed"] == 1
-        monkeypatch.setattr(usage_store, "hold", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("store down")))
-        assert packs.task_settlement_facts(root, "paid")["money_open"] is None  # unknown never settles
-        assert not packs.task_settled(root, "paid")
-    finally:
-        usage_store.forget(root)
+    pointers = {"none": {}, "closed": {"op": {"surface": "multi_model_review", "state": "closed"}},
+                "open": {"op": {"surface": "multi_model_review", "state": "dispatched"}}, "unclassified": {}}
+    _task(root, "t", blobs=1, status=status, canonical_terminal_projection_origin="terminal_transition",
+          review_operations=pointers[review], acceptance_debt={"debt_id": "d1"})
+    if review == "unclassified":
+        with store.open_store(root, write=True) as txn:
+            txn.conn.execute("UPDATE tasks SET review_collection_pending=NULL WHERE task_id='t'")
+    with store.open_store(root, write=False) as txn:
+        assert packs.task_packable(txn, "t") == (status in SETTLED_STATUSES and review != "open")
+        assert not packs.task_packable(txn, "missing")
 
 
 # ---- the supervisor side ----------------------------------------------------------
@@ -524,68 +497,89 @@ class _FakeChild:
         return -9 if self.killed.is_set() else 0
 
 
-def test_packer_tick_arms_first_spawns_one_supervised_child_then_rests(root, monkeypatch):
-    from ouroboros import process_custody
+def test_maintenance_tick_spawns_one_supervised_child_then_rests(root, monkeypatch):
+    from ouroboros import maintenance, process_custody
 
     seen = []
-    report = json.dumps({"status": "completed", **dict.fromkeys(packer._COUNTERS, 0), "packed": 1, "candidates": 1,
-                         "raw": 10, "compressed": 2, "unlinked": 1}).encode()
+    report = json.dumps({"status": "completed", "jobs": {"evidence_packing": {"state": "done", "items": 1}}}).encode()
     gate = threading.Event()
 
     def fake_spawn(cmd, **kwargs):
         seen.append((cmd, kwargs))
         assert gate.wait(10)
+        maintenance.run(root)  # the child's pass, in process
         return _FakeChild(report)
 
     monkeypatch.setattr(process_custody, "spawn_supervised", fake_spawn)
     monkeypatch.setattr(process_custody, "current_custody_session_id", lambda: "sess-1")
     (root / "logs").mkdir()
     _task(root, "task-a", blobs=1)
-    unit = packer.EvidencePacker()
-    assert unit.tick(root, REPO) is False  # the boot tick only arms
+    unit = maintenance.MaintenanceChild()
     assert unit.tick(root, REPO) is True
     assert unit.tick(root, REPO) is False  # one child at a time
     gate.set()
     unit._thread.join(10)
     assert not unit._thread.is_alive() and len(seen) == 1
     cmd, kwargs = seen[0]
-    assert cmd[1:3] == ["-m", "ouroboros.evidence_packer"] and "--custody-session" in cmd
-    assert kwargs["purpose"] == "evidence_packer" and kwargs["scope"] == "session"
+    assert cmd[1:3] == ["-m", "ouroboros.maintenance"] and "--custody-session" in cmd
+    assert kwargs["purpose"] == "maintenance" and kwargs["scope"] == "session"
     assert kwargs["env"]["OUROBOROS_DATA_DIR"] == str(root) and "OUROBOROS_UNRELATED" not in kwargs["env"]
     rows = [json.loads(line) for line in (root / "logs" / "supervisor.jsonl").read_text(encoding="utf-8").splitlines()]
-    phases = [row["phase"] for row in rows if row.get("type") == "storage_pack"]
-    assert phases[:1] == ["started"] and phases[-1] == "completed"
+    assert [row["phase"] for row in rows if row.get("type") == "maintenance"] == ["started", "completed"]
+    assert [row["phase"] for row in rows if row.get("type") == "storage_pack"][-1:] == ["completed"]
+    # The pass unlinked: one more look is owed (it records the moved directories' stamps), then quiet.
+    assert maintenance.due(root) == ["evidence_packing"]
+    assert unit.tick(root, REPO) is True
+    unit._thread.join(10)
+    assert len(seen) == 2 and maintenance.due(root) == []
+    # Quiet: the facts the look recorded hold, so the next tick spawns nothing and writes no row.
+    log = (root / "logs" / "supervisor.jsonl").read_bytes()
+    monkeypatch.setattr(process_custody, "spawn_supervised", lambda *a, **k: pytest.fail("quiet root spawned"))
+    assert unit.tick(root, REPO) is True
+    unit._thread.join(10)
+    assert (root / "logs" / "supervisor.jsonl").read_bytes() == log
     unit.stop()
     assert unit.tick(root, REPO) is False
 
 
-def test_packer_tick_rests_without_candidates_and_the_sweep_remembers_evaluated_tasks(root, monkeypatch):
-    from ouroboros import process_custody
+def test_packing_job_wakes_for_a_task_closing_never_for_a_live_tasks_writes(root, monkeypatch):
+    from ouroboros import maintenance
 
-    monkeypatch.setattr(process_custody, "spawn_supervised", lambda *a, **k: pytest.fail("spawned without candidates"))
-    unit = packer.EvidencePacker()
-    assert unit.tick(root, REPO) is False and unit.tick(root, REPO) is True
-    unit._thread.join(10)
-    assert not unit._thread.is_alive()
     _task(root, "live", blobs=1, status="running")
-    assert packer.changed_tasks(root) == ["live"]
-    _run(root)  # evaluated, not settled: recorded so the next tick does not re-read it
+    assert maintenance.run_job(root, "evidence_packing")["state"] == "done"  # the first look records its facts
+    assert "evidence_packing" not in maintenance.due(root) and packer.changed_tasks(root) == []
+    _result(root, "live", "running", step=2)
+    _task(root, "later", blobs=1, status="running")
+    assert "evidence_packing" not in maintenance.due(root)  # a live task's start and writes: no reason to spawn
+    assert maintenance.run_job(root, "evidence_packing") is None
+    assert packer.changed_tasks(root) == ["later"]  # a pass run for another reason looks once, records, rests
+    _run(root)
     assert packer.changed_tasks(root) == []
     _result(root, "live", "completed")
-    assert packer.changed_tasks(root) == ["live"]  # the result changed: evaluated again
+    assert "evidence_packing" in maintenance.due(root)  # a terminal row moved: a pass may be owed
+    assert packer.changed_tasks(root) == ["live"]
+    assert maintenance.run_job(root, "evidence_packing")["state"] == "done"
+    assert packs.published_generations(root, "live")
 
 
-def test_child_main_runs_a_pass_and_prints_the_report(root, monkeypatch):
+def test_child_main_runs_the_due_jobs_and_prints_the_report(root, monkeypatch):
+    from ouroboros import maintenance
+
     _task(root, "task-a", blobs=1)
-    monkeypatch.setattr(sys, "argv", ["evidence_packer", "--data-root", str(root), "--custody-session", "s"])
     from ouroboros import process_custody
     monkeypatch.setattr(process_custody, "adopt_session_id", lambda *a, **k: None)
     monkeypatch.setattr(process_custody, "start_parent_lifeline", lambda *a, **k: None)
+    monkeypatch.setattr(maintenance, "_lower_priority", lambda: None)
     import io
     out = io.StringIO()
     monkeypatch.setattr(sys, "stdout", out)
-    assert packer.main() == 0
+    assert maintenance.main(["--data-root", str(root), "--custody-session", "s"]) == 0
     report = json.loads(out.getvalue())
-    assert report["status"] == "completed" and report["packed"] == 1
-    assert packer._report_fields(out.getvalue().encode())["packed"] == 1
-    assert packer._report_fields(b"garbage") == {} and packer._report_fields(json.dumps({"status": "completed", "packed": -1}).encode()) == {}
+    assert report["status"] == "completed" and report["jobs"]["evidence_packing"]["state"] == "done"
+    assert packs.published_generations(root, "task-a")
+    fields = maintenance._report_fields(out.getvalue().encode())
+    assert fields["jobs"]["evidence_packing"] == {"state": "done", "items": 1}
+    assert maintenance._report_fields(b"garbage") == {}
+    assert maintenance._report_fields(json.dumps({"status": "completed", "jobs": {"unknown_job": {}}}).encode()) == {}
+    assert maintenance._report_fields(json.dumps(
+        {"status": "completed", "jobs": {"evidence_packing": {"state": "done", "items": -1}}}).encode()) == {}

@@ -13,6 +13,7 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import signal
 import subprocess
 import time
 import uuid
@@ -428,6 +429,40 @@ class ProcessContainer:
         elif self._token:
             from ouroboros.process_lifeline import kill_attributed_tree
             kill_attributed_tree(self._token, self._root, self._birth)
+
+    def interrupt_root(self) -> bool:
+        """Let a POSIX command export its KeyboardInterrupt result before tree teardown.
+
+        Only the spawned root is interrupted: signalling its workers too can
+        interrupt their cleanup. Birth AND token must still match; Windows keeps
+        its Job path. A sent signal proves no exit, so the owner still reaps.
+        """
+        if _pl.IS_WINDOWS or not self._birth or not self._token or self._root <= 1:
+            return False
+        if _pl.process_start_time(self._root) != self._birth:
+            return False
+        if pid_marker_state(self._root, self._token) != MARKER_MEMBER:
+            return False
+        return _pl.signal_pid(self._root, signal.SIGINT)
+
+    def terminate_tree(self, grace: float) -> None:
+        """Ask the attributed tree to stop (SIGTERM), waiting up to ``grace`` seconds for it to go.
+
+        A delivered signal is not an exit: ``reap`` still forces and verifies whatever remains.
+        Windows has no tree-wide TERM, so its kill-on-close Job in ``reap`` stays the stop there."""
+        if _pl.IS_WINDOWS or not self._token:
+            return
+        from ouroboros.process_lifeline import kill_attributed_tree
+        try:
+            kill_attributed_tree(self._token, self._root, self._birth, graceful=True)
+        except RuntimeError:
+            return  # An unenumerable table is reap's failure to report, not a reason to wait.
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            members = pids_with_env_marker(self._token, self._pgid, self._start_ticks)
+            if members is not None and all(pid == os.getpid() or pid_is_zombie(pid) for pid in members):
+                return
+            time.sleep(0.1)
 
     def reap(self) -> str:
         """Stop protection, reap, and only then release the independent guardian."""

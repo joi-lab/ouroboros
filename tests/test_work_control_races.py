@@ -12,6 +12,7 @@ import pytest
 from ouroboros.task_results import load_task_result, write_task_result
 from tests.test_owner_continue import _interrupted
 from tests.test_owner_relay import context, source
+from tests import _dialogue as dialogue_test
 from tests.test_swarm_host_admission import host, rows  # noqa: F401
 
 pytestmark = pytest.mark.serial
@@ -104,7 +105,7 @@ def test_retried_tell_crosses_pause_once_and_keeps_owed_mail(host, pause_first):
     assert host.pending == [target] and not host.running
     [mail] = drain_owner_entries(host.root, "receiver")
     assert mail_read_state(host.root, "receiver", mail["msg_id"]) is not True
-    relays = [r for r in rows(host.root / "logs/chat.jsonl") if r.get("type") == "relay_entry"]
+    relays = [r for r in dialogue_test.log_rows(host.root / "logs/chat.jsonl") if r.get("type") == "relay_entry"]
     assert len(relays) == 1 and relays[0]["relay"]["relay_id"] == event["relay_id"]
     # Only the owner's explicit Resume releases the fence; the same mail is read once.
     resumed = queue.resume_budget_paused_task("receiver")

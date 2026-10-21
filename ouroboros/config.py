@@ -80,13 +80,13 @@ from ouroboros.review_model_routes import (
     resolved_review_model_target,  # noqa: F401
 )
 from ouroboros.runtime_limits import (
-    EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC, WORKER_SPAWN_GRACE_SEC,  # noqa: F401
+    ARTIFACT_COMPRESSION_TIMEOUT_SEC, EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC, WORKER_SPAWN_GRACE_SEC,  # noqa: F401
     WORKER_READY_WINDOW_SEC,  # noqa: F401
     WORKER_READY_MAX_ATTEMPTS, WORKER_READY_CEILING_SEC,  # noqa: F401
     SUPERVISOR_EVENT_BATCH_MAX_EVENTS, SUPERVISOR_EVENT_BATCH_MAX_SEC, BUDGET_PROJECTION_RETRY_SEC,  # noqa: F401
     EXTENSION_STREAM_CHUNK_BYTES,  # noqa: F401
     EXTENSION_CHILD_CLEANUP_GRACE_SEC, LAUNCHER_STOP_GRACE_SEC, SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC,  # noqa: F401
-    NESTED_SETTLEMENT_MARGIN_SEC,  # noqa: F401
+    NESTED_SETTLEMENT_MARGIN_SEC, STOP_ADMISSION_DRAIN_SEC,  # noqa: F401
     NETWORK_WAIT_NOTE_INTERVAL_SEC, NETWORK_WAIT_BACKOFF_START_SEC, NETWORK_WAIT_BACKOFF_MAX_SEC,  # noqa: F401
     TCP_KEEPALIVE_IDLE_SEC, TCP_KEEPALIVE_INTERVAL_SEC, TCP_KEEPALIVE_PROBE_COUNT,  # noqa: F401
     EXTENSION_STREAM_METADATA_BYTES,  # noqa: F401
@@ -99,8 +99,6 @@ from ouroboros.runtime_limits import (
     WAKE_DEFAULT_SEC,  # noqa: F401
     _bounded_positive_int_setting,  # noqa: F401
     _clamped_number_setting,  # noqa: F401
-    get_acceptance_reserve_pct,  # noqa: F401
-    get_acceptance_review_est_sec,  # noqa: F401
     get_bg_wakeup_max_sec, get_bg_wakeup_min_sec,  # noqa: F401
     get_claudexor_harness_install_timeout_sec,  # noqa: F401
     get_claudexor_quota_refresh_timeout_sec,  # noqa: F401
@@ -399,8 +397,13 @@ def get_auto_grant_enabled() -> bool:
 
 
 def get_trust_native_seeded_skills() -> bool:
-    """Whether launcher-seeded native skills get the hash-pinned trust verdict."""
+    """Whether built-ins install trusted when the source list has no built-in row (the derived row reads it too)."""
     return _settings_flag_enabled("OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS")
+
+
+def get_starter_skills_turn_on() -> bool:
+    """Whether the build's starter installs request first enablement when ready."""
+    return _settings_flag_enabled("OUROBOROS_STARTER_SKILLS_TURN_ON")
 
 
 def get_runtime_mode() -> str:
@@ -572,14 +575,8 @@ def resolve_data_skills_dir(data_dir: pathlib.Path) -> Optional[pathlib.Path]:
 
 
 def get_ouroboroshub_catalog_url() -> str:
-    """Return the official OuroborosHub static catalog URL."""
+    """The public hub's v1 catalog URL: the derived hub source rows and the publish fallback read it."""
     return str(runtime_settings().get("OUROBOROS_HUB_CATALOG_URL") or SETTINGS_DEFAULTS["OUROBOROS_HUB_CATALOG_URL"]).strip()
-
-
-def get_ouroboroshub_skills_dir() -> pathlib.Path:
-    """Return ``<DATA_DIR>/skills/ouroboroshub/`` (created on demand by
-    ``ensure_data_skills_dir``, which makes every source subdir)."""
-    return ensure_data_skills_dir(DATA_DIR) / SKILL_SOURCE_OUROBOROSHUB
 
 
 def get_clawhub_registry_url() -> str:
@@ -816,7 +813,7 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
     compatibility migration is persisted only while that lock is held; the write contains
     the raw mapping plus the normalized pair, never a defaults-merged settings document."""
     from ouroboros.review_pool_migration import apply_at_read_seam, environment_overridable_keys
-    from ouroboros.server_runtime import MODEL_SLOT_KEYS, authored_model_slots, propose_unauthored_model_slots
+    from ouroboros.server_runtime import SAVED_MODEL_ROLE_KEYS, authored_model_slots, propose_unauthored_model_slots
     loaded: dict = {}
     try:
         raw = _settings_integrity.read_settings_json_verified(SETTINGS_PATH)
@@ -841,7 +838,7 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
         raw_env = environ.get(key)
         if raw_env is None or key in _DISK_AUTHORED_SETTINGS or key in ENDPOINT_AUTHORED_SETTINGS:  # DISK-authored
             continue
-        if raw_env == echo.get(key) or (key in loaded and (key in MODEL_SLOT_KEYS or key in SAVED_CHOICE_SETTINGS)):
+        if raw_env == echo.get(key) or (key in loaded and (key in SAVED_MODEL_ROLE_KEYS or key in SAVED_CHOICE_SETTINGS)):
             continue  # this tree's own projection of a proposal is no choice; a saved slot or choice (blank too) is the owner's
         if key == "OUROBOROS_RETURN_REASONING" and raw_env == "":
             settings[key] = ""

@@ -16,6 +16,7 @@ from ouroboros.project_dialogue import (
     append_chat_annotation,
     chat_annotation_receipt,
 )
+from tests import _dialogue as dialogue_test
 
 OPTIONS = [
     {"action": "steer_task", "task_id": "t-live", "label": "Fix CI"},
@@ -31,14 +32,13 @@ def _seed_refusal(root, cmid="cm-1", token="tok-1", options=OPTIONS, **extra):
 
 
 def _seed_origin(root, cmid="cm-1", text="original owner words", chat_id=0):
-    path = root / "logs" / "chat.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps({
-            "direction": "in", "client_message_id": cmid,
-            "text": text, "chat_id": chat_id,
-            "ts": "2026-10-06T12:00:00+00:00",
-        }) + "\n")
+    from ouroboros import dialogue_store as ds
+
+    ds.append(root, "chat", {
+        "direction": "in", "client_message_id": cmid,
+        "text": text, "chat_id": chat_id,
+        "ts": "2026-10-06T12:00:00+00:00",
+    })
 
 
 class _Queue:
@@ -304,8 +304,7 @@ def test_existing_task_picker_click_does_not_apply_or_report_new_root_effort(tmp
     assert "reasoning_effort" not in replay.json()
     assert len(queue.events) == 2 and len(mailbox.read_text().splitlines()) == 1
     # One visible relay row in the work's room, even after the replay (K4).
-    chat_rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text().splitlines()]
-    [relay_row] = [row for row in chat_rows if row.get("type") == "relay_entry"]
+    [relay_row] = [row for row in dialogue_test.chat_rows(tmp_path) if row.get("type") == "relay_entry"]
     assert relay_row["task_id"] == "t-live" and relay_row["relay"]["quotes"][0]["text"] == "original owner words"
 
 

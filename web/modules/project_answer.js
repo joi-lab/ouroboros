@@ -51,19 +51,24 @@ function syncFold(bubble, message, collapsed) {
     }
 }
 
-// One pair of window listeners for the app's lifetime, however many rows exist: a row holds
+// One set of window listeners for the app's lifetime, however many rows exist: a row holds
 // only listeners on its own nodes, so a released row needs no disposer here.
 let watching = false;
 let queued = false;
 function afterLayout(work) {
     if (typeof requestAnimationFrame === 'function') requestAnimationFrame(work);
 }
+// A feed whose width is still moving lays out only the rows near the screen (chat_reading_position.js marks it
+// [data-resizing]); measuring a row it skips would lay that row out again, on every frame of the move. Its rows are
+// measured once the width holds.
 function refreshFoldsSoon() {
     if (queued) return;
     queued = true;
     afterLayout(() => {
         queued = false;
-        document.querySelectorAll('.chat-bubble.project-answer').forEach(refreshProjectAnswerFold);
+        document.querySelectorAll('.chat-bubble.project-answer').forEach((bubble) => {
+            if (!bubble.closest('[data-resizing]')) refreshProjectAnswerFold(bubble);
+        });
     });
 }
 function watchFolds() {
@@ -71,6 +76,7 @@ function watchFolds() {
     watching = true;
     window.addEventListener('ouro:page-shown', refreshFoldsSoon);
     window.addEventListener('resize', refreshFoldsSoon);
+    window.addEventListener('ouro:feed-width-settled', refreshFoldsSoon);
 }
 
 export function decorateProjectRow(bubble, { role = 'system', projectId = '', projectName = '', terminalTime, addedAt,
@@ -92,12 +98,25 @@ export function decorateProjectRow(bubble, { role = 'system', projectId = '', pr
             warning.title = limitation;
             bubble.insertBefore(warning, actions);
         }
-        const note = bubble.ownerDocument.createElement('div');
-        note.className = 'msg-provenance';
-        note.textContent = terminalTimeNote(terminalTime, addedAt);
-        bubble.insertBefore(note, actions);
+        paintTerminalTime(bubble, terminalTimeNote(terminalTime, addedAt));
     }
     return actions;
+}
+
+// One compact time line (owner 17.10, Q7 A): the row's own time also says when its task ended, both facts only
+// when their minutes differ; the full instants are its tooltip and what a screen reader hears.
+function paintTerminalTime(bubble, { short, full }) {
+    const doc = bubble.ownerDocument;
+    const time = bubble.querySelector('.msg-time') || bubble.appendChild(doc.createElement('div'));
+    time.className = 'msg-time';
+    time.title = full;
+    const shown = doc.createElement('span');
+    shown.setAttribute('aria-hidden', 'true');
+    shown.textContent = short;
+    const spoken = doc.createElement('span');
+    spoken.className = 'msg-time-full';
+    spoken.textContent = full;
+    time.replaceChildren(shown, spoken);
 }
 
 /** Kept beside the authored body; adoption never replaces the selected text. */

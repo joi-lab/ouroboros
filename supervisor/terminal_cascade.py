@@ -170,16 +170,7 @@ def _cascade_descendant_rows(drive_root: pathlib.Path, task_id: str) -> Dict[str
     torn down by the cascade belongs in the tree's one summary too.
     """
     target = str(task_id or "").strip()
-    rows: Dict[str, Dict[str, Any]] = {}
-    try:
-        from ouroboros.task_results import list_task_results
-
-        for item in list_task_results(pathlib.Path(drive_root)):
-            tid = str(item.get("task_id") or item.get("id") or "")
-            if tid:
-                rows[tid] = item
-    except Exception:
-        log.debug("cascade digest durable-row scan failed for %s", target, exc_info=True)
+    queued = []
     try:
         from ouroboros.utils import read_json_dict
 
@@ -192,10 +183,18 @@ def _cascade_descendant_rows(drive_root: pathlib.Path, task_id: str) -> Dict[str
                     continue
                 task = item.get("task") if isinstance(item.get("task"), dict) else item
                 tid = str(item.get("id") or task.get("id") or "")
-                if tid and tid not in rows:
-                    rows[tid] = {**task, "status": status}
+                if tid:
+                    queued.append({**task, "task_id": tid, "status": status})
     except Exception:
         log.debug("cascade digest snapshot scan failed for %s", target, exc_info=True)
+
+    try:
+        from ouroboros.task_store import tree_facts
+
+        rows = tree_facts(drive_root, target, descendants=True, queue_rows=queued)
+    except Exception:
+        log.debug("cascade digest durable-row selection failed for %s", target, exc_info=True)
+        rows = {row["task_id"]: row for row in reversed(queued)}
 
     def _reaches_target(tid: str) -> bool:
         row = rows.get(tid) or {}
@@ -221,13 +220,13 @@ def _cascade_root_outcome(root_status: str) -> str:
     """How the tree's ONE message describes its root — from the ROOT'S OWN status.
 
     A cascade over a root that had already ``failed`` (or was killed on a budget
-    hard stop) used to describe it as "cancelled", which is the summary telling
+    hard stop) used to describe it as "stopped", which is the summary telling
     the owner a different story than the task card. Only a root this cascade
-    actually cancelled is called cancelled.
+    actually cancelled is called stopped.
     """
     status = str(root_status or "").strip().lower()
     if status == "completed":
-        return "completed before the cancellation (result preserved)"
+        return "completed before the stop (result preserved)"
     if status and status != "cancelled":
-        return f"already settled as {status} before the cancellation (result preserved)"
-    return "cancelled"
+        return f"already settled as {status} before the stop (result preserved)"
+    return "stopped"

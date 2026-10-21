@@ -7,6 +7,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from tests._dialogue import chat_rows
 
 from ouroboros import agent_task_pipeline as pipeline, config, model_wait
 from ouroboros import llm_claudexor as transport
@@ -44,7 +45,7 @@ def phase(tmp_path, monkeypatch):
     events, done, ready = queue.Queue(), threading.Event(), threading.Event()
     engine = Gateway([result(outcome="failed", problem={"code": "subscription_window_exhausted", "message": "quota"}), result()],
                      ["not_started", "response_received"])
-    monkeypatch.setattr(transport, "ensure_owned_gateway", lambda: engine)
+    monkeypatch.setattr(transport, "ensure_owned_gateway", lambda **_kw: engine)
     monkeypatch.setattr(transport, "model_sources", lambda **_kwargs: {"sources": [{"id": "codex", "credentialHarness": "fixture"}]})
     monkeypatch.setattr(transport, "model_catalog", lambda _source, account=None, *, requested_model=None: {
         "source": "codex", "credentialProfileId": account or "account-a",
@@ -432,7 +433,7 @@ def _controlled_worker(input_queue, output_queue, data_root, repo_root, resume):
             "ouroboros.extension_loader.reload_all": lambda *args, **kwargs: None,
             "supervisor.worker_process._prepare_worker_task_runtime": lambda: None,
             "supervisor.worker_process._adopt_published_extensions": lambda *_: None,
-            "ouroboros.llm_claudexor.ensure_owned_gateway": lambda: engine,
+            "ouroboros.llm_claudexor.ensure_owned_gateway": lambda **_kw: engine,
             "ouroboros.llm_claudexor.model_sources": lambda **_kwargs: {"sources": [{"id": "codex", "credentialHarness": "fixture"}]},
             "ouroboros.llm_claudexor.model_catalog": lambda source, account=None, **kwargs: {
                 "source": source, "credentialProfileId": account or "account-a", "models": [{"id": "exact-model"}] if resume.is_set() else []},
@@ -667,7 +668,6 @@ def test_split_root_facts_row_counts_the_actor_store_when_synthesis_runs_canonic
     two identical canonical stores into one, and a file present only in the actor's
     child store (before copy-back) was never walked — a confirmed-looking zero. Through
     the real dispatch the actor store is the row's recorded ``child_drive_root``."""
-    import json
     from ouroboros import post_task_synthesis
     from ouroboros.headless import task_artifacts_dir
 
@@ -685,7 +685,7 @@ def test_split_root_facts_row_counts_the_actor_store_when_synthesis_runs_canonic
         budget_drive_root=str(f.root), split_drive=True, project_scoped=False, project_task=False,
         parent_env=f.env, parent_task=parent_task)
     assert f.done.wait(5)
-    rows = [json.loads(line) for line in (f.root / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = chat_rows(f.root)
     [row] = [r for r in rows if r.get("summary_id") == f"task-facts:{f.task['id']}"]
     fact = row["files_rescued"]
     assert (fact["count"], fact["state"], fact["hash_computed"]) == (1, "positive", False)

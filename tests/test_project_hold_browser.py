@@ -6,12 +6,11 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 import threading
-from pathlib import Path
 
 import pytest
 
+from tests._shared import producer_evidence_dir
 from tests.test_project_admission_refusal_browser import (
     PROJECT, PROJECT_NAME, _open_project, _producers,
 )
@@ -39,7 +38,7 @@ def test_project_hold_reload_reconnect_and_automatic_same_id_recovery(
 
     server = direct_server_with_data
     url, root = server["url"], server["data_dir"]
-    evidence = Path(os.environ.get("OUROBOROS_TEST_TEMP_ROOT") or tmp_path) / "project-hold" / engine
+    evidence = producer_evidence_dir(tmp_path / "project-hold" / engine, "project-hold-" + engine)
     evidence.mkdir(parents=True, exist_ok=True)
     print(f"HOLD_EVIDENCE={evidence}")
     facts, calls, entered = {}, [], threading.Event()
@@ -117,9 +116,11 @@ def test_project_hold_reload_reconnect_and_automatic_same_id_recovery(
                     page.wait_for_function("() => window.__testSockets?.some(s => s.readyState === 1)")
                     _open_project(page)
                     panel = page.locator(f"#panel-pchat-{PROJECT}")
-                    # The room's status word sits in the panel bar (host), right after its title.
-                    page.wait_for_function("([id, text]) => document.getElementById(id)?.innerText.includes(text)",
-                                           arg=["project-panel", WAIT], timeout=30_000)
+                    # The room's status word sits in the panel bar (host), right after its title: the room waits,
+                    # and the hold's own label is said beside it on the work's row and card, never in the bar.
+                    page.wait_for_function("(text) => document.querySelector('#project-panel .project-panel-bar "
+                                           ".rw-trigger .status-badge')?.textContent.trim() === text",
+                                           arg="Waiting", timeout=30_000)
                     detail = page.request.get(url + f"/api/tasks/{TASK}").json()
                     census = page.request.get(url + "/api/state").json()["active_chat_activities"]
                     row = next(a for a in census if a["activity_id"] == TASK)

@@ -56,7 +56,6 @@ from ouroboros.utils import (
     sanitize_tool_args_for_log,
     sanitize_tool_result_for_log,
     truncate_for_log,
-    truncate_review_artifact,
     utc_now_iso,
 )
 
@@ -102,7 +101,7 @@ def _emit_live_log(tools: ToolRegistry, payload: Dict[str, Any]) -> None:
 
 
 def _publish_settlement(tools, drive_logs, row):
-    if completion_control_call(str(row.get("tool") or ""), row.get("args")):
+    if completion_control_call(str(row.get("tool") or "")):
         row["completion_control"] = True
     action = routing_action_for_tool(str(row.get("tool") or ""))
     if action:
@@ -305,7 +304,7 @@ def _get_tool_timeout(
 # per-call/run_command machinery and the deadline milestones own those.
 _DEADLINE_CLAMPED_TOOLS = frozenset({
     "web_search", "browse_page", "browser_action", "youtube_transcript",
-    "wait_task", "wait_tasks", "await_messages", "plan_task", "task_acceptance_review",
+    "wait_task", "wait_tasks", "await_messages", "plan_task",
     "analyze_screenshot", "vlm_query", "generate_image", "list_image_models", "recover_image",
 })
 
@@ -1003,7 +1002,7 @@ def _execute_with_timeout(
     # Host-stamped control calls are receipts, not substantive work.
     action = routing_action_for_tool(fn_name)
     receipt = {"routing_action": action} if action else {}
-    if completion_control_call(fn_name, _tc_args(tc)):
+    if completion_control_call(fn_name):
         receipt["completion_control"] = True
     # Durable/live start share identity for replay deduplication.
     live = _with_correlation({
@@ -1357,15 +1356,6 @@ def reclaim_trace_refs(tool_ctx: Any) -> Dict[str, Any]:
     return refs if isinstance(refs, dict) else {}
 
 
-def reclaim_negative_memo(tool_ctx: Any) -> set:
-    """Per-task set of non-shrinking reclaim unit keys (created on demand)."""
-    memo = getattr(tool_ctx, "_context_reclaim_negative_memo", None)
-    if not isinstance(memo, set):
-        memo = set()
-        tool_ctx._context_reclaim_negative_memo = memo
-    return memo
-
-
 def prune_reclaim_trace_refs(tool_ctx: Any, messages: List[Dict[str, Any]]) -> None:
     """Drop trace refs whose tool_call_id left the transcript (post-reclaim bound)."""
     refs = getattr(tool_ctx, "_tool_trace_refs", None)
@@ -1483,7 +1473,7 @@ def process_tool_results(
             trace_args = {"_repr": repr(exec_result["args_for_log"])}
         llm_trace["tool_calls"].append({
             "tool": fn_name,
-            **({"completion_control": True} if completion_control_call(fn_name, trace_args) else {}),
+            **({"completion_control": True} if completion_control_call(fn_name) else {}),
             "tool_call_id": exec_result["tool_call_id"],
             "args": trace_args,
             # Review sees the same complete/bounded tool view that Main saw.
@@ -1501,79 +1491,6 @@ def process_tool_results(
                 "host_annotations": list(typed.host_annotations)}
                if isinstance(typed, ToolResult) and typed.producer_text is not None else {}),
         })
-        if fn_name == "task_acceptance_review" and not is_error:
-            raw = str(exec_result.get("result") or "")
-            # The auto self-call leads with a compact improvement capsule and wraps
-            # the full ReviewRunResult JSON in <full_review>...</full_review> (M5).
-            # Extract that block so the FULL record still lands in review_runs even
-            # when the visible result is not pure JSON — otherwise an auto review
-            # that produced a capsule would record nothing and leave the objective
-            # unevaluated exactly when the feedback matters most.
-            payload = raw
-            if "<full_review>" in raw and "</full_review>" in raw:
-                payload = raw.split("<full_review>", 1)[1].rsplit("</full_review>", 1)[0].strip()
-            try:
-                parsed = json.loads(payload)
-                if isinstance(parsed, dict):
-                    deferred_to_host = (
-                        str(parsed.get("status") or "") == "deferred_to_host_acceptance"
-                        and parsed.get("authoritative") is False
-                    )
-                    if deferred_to_host:
-                        llm_trace.setdefault("acceptance_evidence_calls", []).append(parsed)
-                        if isinstance(parsed.get("acceptance_retry"), dict):
-                            # One explicit, source-bound retry of a disclosed local
-                            # preparation failure. Duplicate deliveries are idempotent.
-                            from ouroboros.acceptance_preparation import record_retry_intent
-
-                            record_retry_intent(llm_trace, parsed["acceptance_retry"], ctx)
-                        if ctx is not None:
-                            ctx._acceptance_request_pending = {
-                                **(parsed.get("request") or {}),
-                                "acceptance_subject": parsed.get("acceptance_subject"),
-                            }
-                    # A review run is the producer's own structure (an ``actors`` list, even empty/pending/
-                    # refused); completion, cap, historical and child acknowledgements carry none (#1602, #1318).
-                    elif isinstance(parsed.get("actors"), list):
-                        llm_trace.setdefault("review_runs", []).append(parsed)
-                    # v6.54.4 (review round 2): dissent is recorded on the agent-called
-                    # path too — merge into acceptance_decision without requiring an
-                    # agent_decision envelope.
-                    if not deferred_to_host and parsed.get("dissent_noted"):
-                        _dec = llm_trace.get("acceptance_decision") if isinstance(llm_trace.get("acceptance_decision"), dict) else {}
-                        _dec.setdefault("source", "agent_task_acceptance_review_tool")
-                        _dec["dissent_noted"] = True
-                        llm_trace["acceptance_decision"] = _dec
-                    agent_decision = parsed.get("agent_decision") if isinstance(parsed.get("agent_decision"), dict) else {}
-                    if agent_decision:
-                        from ouroboros.loop_acceptance import merge_agent_acceptance_stance
-
-                        merge_agent_acceptance_stance(llm_trace, agent_decision, ctx)
-                        if parsed.get("dissent_noted"):
-                            llm_trace["acceptance_decision"]["dissent_noted"] = True
-                        # v6.54.4 obligations layer: apply the agent's per-obligation
-                        # dispositions onto the host-collected per-task obligations.
-                        ob_dispositions = agent_decision.get("obligation_dispositions")
-                        if isinstance(ob_dispositions, list) and ob_dispositions:
-                            by_id = {
-                                str(e.get("id") or ""): e
-                                for e in ob_dispositions if isinstance(e, dict)
-                            }
-                            for ob in (llm_trace.get("acceptance_obligations") or []):
-                                if not isinstance(ob, dict):
-                                    continue
-                                entry = by_id.get(str(ob.get("id") or ""))
-                                if entry:
-                                    ob["disposition"] = str(entry.get("disposition") or "")
-                                    ob["disposition_reason"] = truncate_review_artifact(
-                                        str(entry.get("reason") or ""), limit=500,
-                                    )
-                                    # "agent_disposed", not "disposed": this status renders inside the
-                                    # host_attested catalog and must not read as host adjudication
-                                    # (host lifecycle values stay "open"/"disposed_by_re_review").
-                                    ob["status"] = "agent_disposed"
-            except Exception:
-                log.debug("Failed to parse task_acceptance_review tool result", exc_info=True)
 
     # These resident facts and exact bodies were included before allocation. Append
     # only after the complete assistant/tool block, before an owner-wait can park.

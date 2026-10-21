@@ -214,6 +214,23 @@ def _available_web_search_backends() -> list[str]:
     return [leg["backend"] for leg in resolve_web_search_route()["legs"]]
 
 
+def _web_search_unavailability() -> tuple[str, str]:
+    """``(reason, detail)`` for a route with no eligible leg, from the route's own causes.
+
+    Only a route whose every unavailable leg lacks a key is ``missing_credential``;
+    a key whose SDK is not installed keeps ``package_missing``."""
+    route = resolve_web_search_route()
+    if route.get("error"):
+        return "unsupported_selection", route["error"]
+    unavailable = route["unavailable"]
+    if not unavailable:
+        return "missing_credential", "web_search_backend"
+    reasons = dict.fromkeys("missing_credential" if leg["unavailable_reason"] == "no_credentials"
+                            else leg["unavailable_reason"] for leg in unavailable)
+    return "+".join(reasons), "web_search_backend: " + ", ".join(
+        f"{leg['source']} {leg['unavailable_reason']}" for leg in unavailable)
+
+
 def _web_search_backend_pin() -> str:
     return (runtime_setting("OUROBOROS_WEBSEARCH_BACKEND") or "").strip().lower()
 
@@ -304,7 +321,7 @@ def _web_search_openrouter(ctx: ToolContext, query: str, model: str = "", search
 
         active_model = _openrouter_model(model)
         if getattr(ctx, "emit_progress_fn", None):
-            ctx.emit_progress_fn(f"🔍 Searching via OpenRouter: {sanitize_tool_result_for_log(str(query or ''))[:100]}")
+            ctx.emit_progress_fn(f"🔍 Trying OpenRouter web search: {sanitize_tool_result_for_log(str(query or ''))[:100]}")
         with capture_attempt_ids() as attempt_ids:
             response = openrouter_web_search_server_tool(
                 api_key=api_key,
@@ -357,11 +374,12 @@ def _web_search_anthropic(ctx: ToolContext, query: str, model: str = "",
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not configured")
     try:
+        import anthropic  # noqa: F401 — the SDK's own import failure precedes any attempt claim
         from ouroboros.llm import anthropic_web_search_server_tool
 
         active_model = _anthropic_model(model)
         if getattr(ctx, "emit_progress_fn", None):
-            ctx.emit_progress_fn(f"🔍 Searching via Anthropic: {sanitize_tool_result_for_log(str(query or ''))[:100]}")
+            ctx.emit_progress_fn(f"🔍 Trying Anthropic web search: {sanitize_tool_result_for_log(str(query or ''))[:100]}")
         with capture_attempt_ids() as attempt_ids:
             response = anthropic_web_search_server_tool(
                 api_key=api_key,
@@ -582,6 +600,9 @@ def _web_search_openai(
         manifest = before_dispatch(reservation)
         mark_dispatched(reservation, candidate_manifest_ref=manifest)
         dispatched = True
+        if _attempt == 0:
+            # An attempt, not evidence that a search ran: that is the stream's own web_search_call below.
+            _search_progress(ctx, f"🔍 Trying OpenAI web search: {sanitize_tool_result_for_log(str(query or ''))[:100]}")
         try:
             send_started = True
             stream = client.responses.create(**candidate)
@@ -789,6 +810,9 @@ def _web_search(ctx: ToolContext, query: str, model: str = "", search_context_si
         if _web_search_deadline_exhausted(ctx):
             result = json.loads(_web_search_deadline_result())
             break
+        if tried:  # only a typed failure reaches another leg; say so before it is tried
+            _search_progress(ctx, f"↪ Trying {_SOURCE_LABELS[leg['source']]} after {_SOURCE_LABELS[tried[-1]['source']]} "
+                                  "web search failed; details in Logs")
         try:
             with capture_attempt_ids() as ids:
                 if leg["source"] == "openai":
@@ -819,6 +843,17 @@ def _web_search(ctx: ToolContext, query: str, model: str = "", search_context_si
                       **({"error": result["error"]} if "error" in result else {})})
         if "error" not in result or result.get("reason_code") in {"provider_outcome_unknown", "deadline_exhausted"}:
             break
+    last = _SOURCE_LABELS.get(tried[-1]["source"], "") if tried else ""
+    if "error" not in result and len(tried) > 1:
+        # A summary names who answered; it is no proof that a provider search ran or was billed.
+        _search_progress(ctx, f"🔍 Answer from {last} after {len(tried) - 1} failed source{'s' if len(tried) > 2 else ''}")
+    elif result.get("reason_code") == "provider_outcome_unknown":
+        _search_progress(ctx, f"⚠️ Web search outcome unknown ({last}); no further attempt or fallback was sent")
+    elif result.get("reason_code") == "deadline_exhausted":
+        _search_progress(ctx, "⚠️ Web search stopped: the owner deadline leaves no dispatch window")
+    elif "error" in result and tried:
+        # The exception text stays in the result and Logs, never in the owner's row.
+        _search_progress(ctx, f"⚠️ Web search failed ({last}); no source answered; details in Logs")
     text = json.dumps({**result, "route": route, "legs_tried": tried,
                        "backend_errors": [leg["error"] for leg in tried if "error" in leg]}, ensure_ascii=False, indent=2)
     if "error" in result:
@@ -828,6 +863,14 @@ def _web_search(ctx: ToolContext, query: str, model: str = "", search_context_si
         # keeps its ledger/custody and never acquires a completion fact here.
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=text))
     return text
+
+
+_SOURCE_LABELS = {"openai": "OpenAI", "openrouter": "OpenRouter", "anthropic": "Anthropic", "ddgs": "DDGS"}
+
+
+def _search_progress(ctx: ToolContext, text: str) -> None:
+    if getattr(ctx, "emit_progress_fn", None):
+        ctx.emit_progress_fn(text)
 
 
 def get_tools() -> List[ToolEntry]:

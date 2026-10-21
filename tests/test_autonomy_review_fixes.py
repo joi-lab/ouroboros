@@ -203,7 +203,7 @@ def test_unknown_exception_facts_row_does_not_invent_zero_rounds_or_buy_a_model_
 
     rows = []
     monkeypatch.setattr("ouroboros.project_dialogue.append_canonical_task_summary",
-                        lambda _root, row: rows.append(row))
+                        lambda _root, row, **_kw: rows.append(row))
     monkeypatch.setattr("ouroboros.llm_observability.chat_observed", lambda *_a, **_kw: pytest.fail("no new paid summary"))
     _record_task_facts(SimpleNamespace(drive_root=tmp_path), {"id": "unknown", "text": "Recover work"},
                        {"loop_evidence_unavailable": True},

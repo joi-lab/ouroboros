@@ -8,7 +8,6 @@ subagent → parent mailbox frame; forged owner provenance impossible).
 
 from __future__ import annotations
 
-import json
 import types
 
 import pytest
@@ -462,12 +461,13 @@ def test_history_replay_merges_projection_state(tmp_path, monkeypatch):
     logs = tmp_path / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     chat_path = logs / "chat.jsonl"
-    chat_path.write_text(json.dumps({
+    from ouroboros import dialogue_store as ds
+    ds.append(tmp_path, "chat", {
         "ts": "2026-08-31T00:00:00Z", "direction": "out", "chat_id": 1,
         "user_id": 7, "text": "Which?", "type": "quiz", "task_id": "task-1",
         "quiz": {"quiz_id": "q1", "options": [{"label": "A"}, {"label": "B"}],
                  "stake": "", "assumption": "x", "state": "open"},
-    }) + "\n")
+    })
     from ouroboros.gateway.history import _collect_chat_rows
 
     rows, _ = _collect_chat_rows(chat_path, tmp_path / "archive", 50,
@@ -740,12 +740,13 @@ def test_history_replay_carries_the_owner_comment(tmp_path, monkeypatch):
     logs = tmp_path / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     chat_path = logs / "chat.jsonl"
-    chat_path.write_text(json.dumps({
+    from ouroboros import dialogue_store as ds
+    ds.append(tmp_path, "chat", {
         "ts": "2026-09-01T00:00:00Z", "direction": "out", "chat_id": 1,
         "user_id": 7, "text": "Which?", "type": "quiz", "task_id": "task-1",
         "quiz": {"quiz_id": "q1", "options": [{"label": "A"}, {"label": "B"}],
                  "stake": "", "assumption": "x", "state": "open"},
-    }) + "\n")
+    })
     from ouroboros.gateway.history import _collect_chat_rows
 
     rows, _ = _collect_chat_rows(chat_path, tmp_path / "archive", 50,

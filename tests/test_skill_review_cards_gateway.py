@@ -771,9 +771,11 @@ def test_review_history_detail_rejects_non_canonical_skill_names(tmp_path):
 def test_chat_history_passes_skill_review_reference_fields(tmp_path):
     from ouroboros.gateway.history import _collect_chat_rows
 
-    chat_path = tmp_path / "chat.jsonl"
+    from ouroboros import dialogue_store as ds
+
+    chat_path = tmp_path / "logs" / "chat.jsonl"
     archive_dir = tmp_path / "archive"
-    append_jsonl(chat_path, {
+    ds.append(tmp_path, "chat", {
         "ts": "2026-08-15T00:00:00+00:00",
         "direction": "system",
         "type": "skill_review",
@@ -796,7 +798,7 @@ def test_chat_history_passes_skill_review_reference_fields(tmp_path):
         "format": "markdown",
         "text": "Skill review round 2 — snapshot abc123def456 (attempt 1): `alpha` — status=clean, source=skills",
     })
-    append_jsonl(chat_path, {
+    ds.append(tmp_path, "chat", {
         "ts": "2026-08-15T00:00:01+00:00",
         "direction": "system",
         "type": "skill_review",
@@ -804,7 +806,7 @@ def test_chat_history_passes_skill_review_reference_fields(tmp_path):
         "format": "markdown",
         "text": "legacy full-text review row without reference fields",
     })
-    append_jsonl(chat_path, {
+    ds.append(tmp_path, "chat", {
         "ts": "2026-08-15T00:00:02+00:00",
         "direction": "out",
         "chat_id": 1,

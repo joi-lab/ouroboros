@@ -364,20 +364,22 @@ class OuroborosAgent:
         )
 
     def _fence_request(self, accept: Tuple[str, ...], **request: Any) -> Dict[str, Any]:
-        """The ONE transport seam of the queue-owned acceptance fence.
+        """The ONE transport seam of the queue-owned root admission seal (``delivery_seal``),
+        whose stored names keep the ``acceptance_fence`` of its origin.
 
-        A direct turn runs inside the supervisor process: built with the queue's own
-        transition (``fence_transition``), it applies the fence in-process — no event,
-        no ack file, no wait (lock order: admission lock, then ``_queue_lock``). A pooled
+        An agent in the process that holds the queue (a process fact, whoever built it:
+        a direct turn, a Presence turn) applies the fence in-process — no event, no ack
+        file, no wait (lock order: admission lock, then ``_queue_lock``). A pooled
         worker cannot share ``_queue_lock``: it sends the event, polls its own one-shot
         ack and re-sends the SAME transition once — a read (``inspect``, asked many times a
         turn) is never re-sent, its loss is harmless; no answer raises ``TimeoutError`` (a
         gap), a refusal raises ``RuntimeError``. The ack is transport, not an authority.
         """
         request.setdefault("task_id", str(self._current_task_id or ""))
-        transition = getattr(self, "fence_transition", None)
-        if transition is not None:
-            ack = transition(**request)
+        if self._fence_in_process():
+            from supervisor import queue as task_queue  # the queue's public surface, resolved per call
+
+            ack = task_queue.transition_acceptance_fence(**request)
         elif self._event_queue is None:
             raise RuntimeError("acceptance fence requires a supervisor event queue")
         else:
@@ -401,6 +403,12 @@ class OuroborosAgent:
         if not ack.get("ok", True) or status not in accept:  # the row's typed state is the reason; only a malformed request keeps its error text
             raise RuntimeError(status if status not in ("", "error") else str(ack.get("error") or f"acceptance fence {request['action']} failed"))
         return ack
+
+    def _fence_in_process(self) -> bool:
+        """Whether this process holds the queue that owns this agent's data root (a process fact)."""
+        from supervisor.queue import owns_live_queue
+
+        return owns_live_queue(self.env.budget_drive_root or self.env.drive_root)
 
     def _send_fence_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
         """Send one pooled fence event and poll ITS OWN ``<token>.<req>.json`` ack; ``{}`` = unanswered."""
@@ -518,7 +526,7 @@ class OuroborosAgent:
                 actor_id=task.get("actor_id"),
                 delegation_role=task.get("delegation_role"),
                 # The producer's raw origin marker (promote_chat_to_task, presence_promote,
-                # api, ...): the acceptance packet reads run_origin from this record.
+                # api, ...): ``dialogue_provenance.run_origin`` reads it from this record.
                 source=task.get("source"),
                 project_id=str(task.get("project_id") or ""),
                 role=task.get("role"),
@@ -535,8 +543,6 @@ class OuroborosAgent:
                 workspace_mode=task.get("workspace_mode"),
                 task_constraint=task.get("task_constraint"),
                 task_contract=task.get("task_contract"),
-                **({"acceptance_original_root_cap": task["_acceptance_original_root_cap"]}
-                   if "_acceptance_original_root_cap" in task else {}),
                 model_lane=task.get("model_lane"),
                 requested_model_lane=task.get("requested_model_lane"),
                 parent_model_lane=task.get("parent_model_lane"),
@@ -576,7 +582,7 @@ class OuroborosAgent:
                     execution_owner=execution_owner,
                     child_drive_root=str(self.env.drive_root), budget_drive_root=str(canonical),
                     _is_direct_chat=bool(task.get("_is_direct_chat")),
-                    **{key: running[key] for key in ("started_at", "ts", "task_attempt", "acceptance_original_root_cap") if key in running},
+                    **{key: running[key] for key in ("started_at", "ts", "task_attempt") if key in running},
                 )
         except Exception:
             log.warning("Failed to persist running task status", exc_info=True)
@@ -743,11 +749,11 @@ class OuroborosAgent:
         # to the PROJECT FOLDER (project_room_lens_dir keys on this metadata; the
         # robot-room incident: "." resolved to the system repo and the agent
         # narrated the wrong tree). A set-but-broken working_dir rides as a LOUD
-        # note instead (never a silent repo fallback).
-        if bool(task.get("_is_direct_chat")) and _resolved_project_id and not str(task.get("workspace_root") or "").strip():
-            try:
-                from ouroboros.workspace_admission import room_chat_lens_dir
+        # note instead (never a silent repo fallback). Kept resources win (room_lens_applies).
+        from ouroboros.workspace_admission import room_chat_lens_dir, room_lens_applies
 
+        if _resolved_project_id and room_lens_applies(task):
+            try:
                 _room_dir, _room_note = room_chat_lens_dir(self.env.drive_root, _resolved_project_id)
                 if _room_dir:
                     task_metadata["_project_room_dir"] = _room_dir
@@ -801,9 +807,9 @@ class OuroborosAgent:
         _restore_saved_clocks(ctx, task, saved_start)
 
         if self._event_queue is not None:
-            # Optional runtime seam consumed by loop.py.  Unit/direct contexts
-            # remain compatible, while production queued tasks establish the
-            # admission fence in the supervisor process before reviewing.
+            # Optional runtime seam consumed by ``delivery_seal``.  Unit/direct contexts
+            # remain compatible, while production queued tasks seal root admission
+            # in the supervisor process before delivering an author stop.
             ctx.begin_acceptance_fence = self._begin_acceptance_fence
             ctx.inspect_acceptance_fence = self._inspect_acceptance_fence
             ctx.end_acceptance_fence = self._end_acceptance_fence
@@ -978,21 +984,10 @@ class OuroborosAgent:
             root_task_id = str(task.get("root_task_id") or metadata.get("root_task_id") or task_id)
             parent_task_id = str(task.get("parent_task_id") or metadata.get("parent_task_id") or "")
             budget_root = task.get("budget_drive_root") or metadata.get("budget_drive_root") or self.env.drive_root
-            root_limit_known = True
             try:
                 root_limit = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
             except (TypeError, ValueError):
                 root_limit = 0.0
-                root_limit_known = False
-            if task_id == root_task_id and not parent_task_id:
-                import math
-                task = dict(task)
-                task["_acceptance_original_root_cap"] = (
-                    {"state": "finite", "usd": root_limit, "source": "task_admission"}
-                    if root_limit_known and math.isfinite(root_limit) and root_limit > 0 else
-                    {"state": "unlimited", "source": "task_admission"}
-                    if root_limit_known and math.isfinite(root_limit) else
-                    {"state": "unknown", "source": "invalid_admission_setting"})
             from ouroboros.usage_admission import task_billing_fields
             from ouroboros.usage_ledger import BillingAuthorityUnavailable
             try:
@@ -1330,7 +1325,7 @@ class OuroborosAgent:
         ``narration`` is the VOICE of the note, not its text: only the model's own
         round narration (``loop_messages._emit_round_progress``) is the turn's
         speech. Every other caller — checkpoints, fallback and plan notes, the
-        acceptance, nudge and transport lines, and the whole ToolContext ABI
+        review, nudge and transport lines, and the whole ToolContext ABI
         (``emit_progress_fn``) — is the HOST talking about the turn, so it keeps
         the default. Both voices stay visible rows; the flag decides only whether
         a note may claim the card title and the collapsed activity line."""

@@ -642,9 +642,9 @@ def test_frontend_evolution_and_consciousness_controls_are_present():
     assert "evo-stop" in evolution
     assert "/evolve on" in evolution
     assert "/evolve off" in evolution
-    # Start button is hard-disabled in light mode (self-modification gate).
+    # Start is hard-disabled in light mode (self-modification gate); the behaviour, across
+    # an in-flight command too, is pinned by web/tests/evolution_commands.test.js.
     assert "runtime.runtime_mode" in evolution
-    assert "startBtn.disabled = isLightMode" in evolution
     from ouroboros.settings_setup_contract import build_setup_contract
     consciousness = next(row for row in build_setup_contract()["modelSlots"] if row["slot"] == "consciousness")
     assert consciousness["settingKey"] == "OUROBOROS_MODEL_CONSCIOUSNESS"

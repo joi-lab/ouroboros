@@ -22,7 +22,8 @@ def _doc(root, heading):
     return path
 
 
-def _start(tmp_path, monkeypatch, *, compiled=True, kind="body_copy", missing=False):
+def _start(tmp_path, monkeypatch, *, compiled=True, kind="body_copy", missing=False,
+           input_sources="declared", prepare=None):
     from ouroboros import claudexor_daemon, subagent_runtime
     from ouroboros.contracts.task_constraint import TaskConstraint
     from ouroboros.tools import delegate
@@ -42,7 +43,7 @@ def _start(tmp_path, monkeypatch, *, compiled=True, kind="body_copy", missing=Fa
         "source_root": str(system), "execution_root": str(target),
         "source_is_system_repo": kind != "foreign_copy",
     }} if kind.endswith("copy") else {})
-    contract = {"objective": "Inspect the selected source", "input_sources": "declared",
+    contract = {"objective": "Inspect the selected source", "input_sources": input_sources,
                 "context_requires_self_body_docs": True}
     ctx = ToolContext(
         repo_dir=system, system_repo_dir=system, drive_root=drive,
@@ -50,6 +51,8 @@ def _start(tmp_path, monkeypatch, *, compiled=True, kind="body_copy", missing=Fa
         workspace_root=target, workspace_mode="self_worktree" if kind.endswith("copy") else "external",
         task_constraint=TaskConstraint(mode="local_readonly_subagent"),
     )
+    if prepare:
+        prepare(ctx)
     task = {"id": ctx.task_id, "objective": contract["objective"], "task_contract": contract,
             "workspace_root": str(target), "metadata": metadata}
     canonical = compile_external_work_order(task)

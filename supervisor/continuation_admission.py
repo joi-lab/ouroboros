@@ -24,8 +24,9 @@
    (``continuation_writer_unsettled``): no diagnostic successor, no second
    writer, no timeout release. The owner's existing conversation and controls
    diagnose; the hold releases only when a fresh check finds the writers
-   settled (the owner's Resume, or a reconciliation at a tree member's
-   terminal) and no newer Stop/Pause/Restart hold has replaced it.
+   settled (the owner's Resume, a reconciliation at a tree member's terminal,
+   or the body cadence's re-check while the hold stands) and no newer
+   Stop/Pause/Restart hold has replaced it.
 
 A request that times out on the client is never "not admitted": the client
 retries with the same nonce and step 1 answers it.
@@ -133,9 +134,8 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
     root's closed fence they just read; while its queue latch is not projected
     (``latch_pending``, or a park that could not read it) that durable fence alone
     refuses every launch of the tree, so it stands in for the latch. The answered
-    predecessor's own late phase (D10) is custody too: running or open, or
-    paused (Resume would write again) — the Pause's own census alone reads its
-    saved pause as settled.
+    predecessor's own late phase is custody too while it runs or its state is
+    unreadable; a Pause ends it at once and saves nothing that could write again.
     ``purpose=CONTINUE_PURPOSE`` is the owner's Continue (#1572): a delegated
     run or unbound start the observation projects as ``independent_review``
     (a review surface registered it and it has no candidate-apply possibility),
@@ -145,7 +145,9 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
     panel still finishes and attaches its verdict. Missing or unknown
     provenance, ordinary delegations, author research copies, author model
     attempts, tool/process/merge/executor custody and unreadable custody keep
-    holding. The empty default is the complete census for every other consumer.
+    holding. Retained terminal HTTP failures without a receiver are not writers,
+    even with unresolved cost; this pure classification applies to every consumer.
+    The empty default is the complete census for every other consumer.
     """
     from ouroboros.budget_pause import observe_task_runs
     from ouroboros.owner_pause import tree_member_results
@@ -180,7 +182,7 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
     from ouroboros.post_task_checkpoint import late_phase_state
 
     late = late_phase_state(custody_root, predecessor)
-    if late and not (late == "paused" and owner_pause_fence_id):
+    if late:
         blockers.append({"kind": f"late_phase_{late}", "task_id": predecessor})
     for task in pending:
         tid = str(task.get("id") or "")
@@ -234,6 +236,7 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
         blockers.append({"kind": "process_custody_unreadable", "detail": str(exc)[:200]})
     try:
         from ouroboros import usage_store
+        from ouroboros.local_custody_repair import ended_unbound_model_request
         # The root's open attempts only (the store's open-set index).
         with usage_store.read(custody_root) as txn:
             attempts = txn.open_attempts(root_task_id=predecessor)
@@ -245,6 +248,8 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
                 if (isinstance(retired, dict) and retired.get("retired_at")
                         and type(attempt.get("local_answer_task_attempt")) is int
                         and retired.get("task_attempt") == attempt["local_answer_task_attempt"]):
+                    continue
+                if ended_unbound_model_request(attempt):
                     continue
                 # A reviewer's own send (its slot/skill attribution) is review
                 # custody: the owner Pause's readers list it as still finishing.
@@ -315,6 +320,57 @@ def action_writers(q: Any, predecessor: str, *, drive_root: Any = None,
                                purpose=purpose)
 
 
+# Integrity bound only: a recorded chain is a handful of Continues; a corrupted one
+# must never make one admission walk its edges without limit.
+_WORK_CHAIN_MAX_HOPS = 64
+
+
+def _work_name(record: Dict[str, Any]) -> str:
+    """An episode's name as its card shows it (coined, else authored), without Continue prefixes."""
+    for field in ("suggested_name", "title"):
+        name = str(record.get(field) or "").lstrip()
+        while name.startswith(CONTINUE_TITLE_PREFIX):
+            name = name[len(CONTINUE_TITLE_PREFIX):].lstrip()
+        if name.strip():
+            return name.strip()
+    return ""
+
+
+def _work_identity(q: Any, predecessor: str, result: Dict[str, Any]) -> tuple[str, str]:
+    """``(work_id, work_name)`` of the work a Continue of ``predecessor`` belongs to.
+
+    A stamped episode names its work. An older one is walked back over its
+    recorded ``predecessor_task_id`` edges to the first root, whose id and card
+    name are the work's. As in the work projection's walk over the same edges,
+    an edge to a record that cannot be read ends at the last episode read, and a
+    cycle (or the integrity bound) at the predecessor itself, so a stamped
+    successor and its unstamped episodes resolve to one work. Reads only stored
+    results, outside the queue lock.
+    """
+    from ouroboros.task_results import load_task_result
+
+    current, record, seen = predecessor, result, {predecessor}
+    for _hop in range(_WORK_CHAIN_MAX_HOPS):
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        continuation = metadata.get("continuation") if isinstance(metadata.get("continuation"), dict) else {}
+        if continuation.get("work_id"):
+            return str(continuation["work_id"]), str(continuation.get("work_name") or "") or _work_name(record)
+        earlier = str(continuation.get("predecessor_task_id") or "")
+        if not earlier:
+            return current, _work_name(record)
+        if earlier in seen:
+            break
+        try:
+            earlier_record = load_task_result(q.DRIVE_ROOT, earlier) if q is not None else None
+        except Exception:
+            earlier_record = None
+        if not isinstance(earlier_record, dict) or not earlier_record:
+            return current, _work_name(record)
+        current, record = earlier, earlier_record
+        seen.add(earlier)
+    return predecessor, _work_name(result)
+
+
 def _successor_task(q: Any, predecessor: str, result: Dict[str, Any], binding: Dict[str, Any],
                     verdict: Dict[str, Any], sources: Dict[str, Any], admission: Dict[str, Any]) -> Dict[str, Any]:
     from ouroboros.owner_continue import owner_corpus_rows, recorded_system_checkout, work_order_text
@@ -331,27 +387,37 @@ def _successor_task(q: Any, predecessor: str, result: Dict[str, Any], binding: D
         log.debug("Predecessor authority pointer unavailable for %s", predecessor, exc_info=True)
     deadline_at = str(binding.get("deadline_at") or "")
     text = work_order_text(predecessor, verdict["cause"], sources, deadline_at=deadline_at,
-                           authority_source=authority_source, checkout=recorded_system_checkout(result))
-    title = str(result.get("title") or result.get("suggested_name") or result.get("objective") or predecessor)
-    while title.startswith(CONTINUE_TITLE_PREFIX):
-        title = title[len(CONTINUE_TITLE_PREFIX):]
-    title = (title or predecessor)[:80]
+                           authority_source=authority_source, checkout=recorded_system_checkout(result),
+                           successor_task_id=str(binding.get("successor_task_id") or ""))
+    # Every episode carries its work: the first root's id and name. The title is
+    # that name under ONE prefix, however long the chain.
+    work_id, work_name = _work_identity(q, predecessor, result)
+    work_name = (work_name or _work_name(result)
+                 or (_work_name({"title": result.get("objective")}) or predecessor)[:80])
+    title = work_name[:80]
     original = sources.get("original") or {}
     origin_ref = original.get("origin_message_ref")
     from ouroboros.settings_scales import EFFORT_SCALE
 
-    # The same work keeps the effort it was explicitly started on. A root's stored value is
-    # only that explicit choice (dispatch stamps children alone; a switch_model is not
-    # stored), read from the result row its admission wrote even if no worker ever ran.
+    # The same work keeps the effort and the model ROLE it was explicitly started on. A
+    # root's stored values are only those explicit choices (dispatch stamps children alone;
+    # a switch_model is not stored; ``metadata.model_role`` names a slot such as a
+    # consciousness wake's, never the route it resolved to), read from the result row its
+    # admission wrote even if no worker ever ran. A task on the install default stores
+    # neither and so follows the current default.
     effort = str(result.get("reasoning_effort") or "")
     # Admission/replay persist under metadata until a worker publishes the canonical
     # contract. Merge stored carriers per field, canonical winning; don't normalize
     # an absent handbook choice into false before deciding whether to copy it.
     metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    model_role = str(metadata.get("model_role") or "").strip()
     stored = metadata.get("task_contract") if isinstance(metadata.get("task_contract"), dict) else {}
     canonical = result.get("task_contract") if isinstance(result.get("task_contract"), dict) else {}
     contract = {**stored, **canonical}
     self_body_docs = contract.get("context_requires_self_body_docs")
+    # The recorded resource choice rides with the folder (#1315), so placement keeps an explicit
+    # folder or opt-out instead of the destination room's default (``project_placement``).
+    intent = metadata.get("resource_intent")
     task: Dict[str, Any] = {
         **({"reasoning_effort": effort} if effort in EFFORT_SCALE else {}),
         **({"context_requires_self_body_docs": self_body_docs} if isinstance(self_body_docs, bool) else {}),
@@ -363,6 +429,8 @@ def _successor_task(q: Any, predecessor: str, result: Dict[str, Any], binding: D
         **{key: binding[key] for key in ("workspace_root", "workspace_mode") if binding.get(key)},
         "metadata": {
             **({"project_id": binding["project_id"]} if binding.get("project_id") else {}),
+            **({"model_role": model_role} if model_role else {}),
+            **({"resource_intent": dict(intent)} if isinstance(intent, dict) and intent.get("kind") else {}),
             # Keep verified owner-door provenance on its canonical carrier;
             # the new objective below is still the host's continuation text.
             **({"origin_message_ref": dict(origin_ref), "origin_message_text": original["content"]}
@@ -372,7 +440,8 @@ def _successor_task(q: Any, predecessor: str, result: Dict[str, Any], binding: D
             "objective_author": {"kind": "continuation", "predecessor_task_id": predecessor},
             "owner_corpus": owner_corpus_rows(sources),
             "continuation": {
-                "predecessor_task_id": predecessor, "cause": verdict["cause"],
+                "predecessor_task_id": predecessor, "work_id": work_id, "work_name": work_name,
+                "cause": verdict["cause"],
                 "owner_sources": {"original": sources.get("original"), "later": sources.get("later") or [],
                                   "held_owner_messages": sources.get("held_owner_messages") or {},
                                   "open_relays": sources.get("open_relays") or {}},
@@ -482,6 +551,10 @@ def admit_continuation(predecessor_task_id: str, *, action_nonce: str) -> Dict[s
     replay = _replay(q, predecessor, nonce, successor)
     if replay is not None:
         return replay
+    from supervisor.queue_snapshot import saved_queue_unowned
+
+    if saved_queue_unowned():  # a successor published now would replace the saved queue (#1952)
+        return {"ok": False, "error": "queue_not_restored"}
     try:
         result = load_task_result(q.DRIVE_ROOT, predecessor, strict=True) or {}
     except Exception:
@@ -617,9 +690,10 @@ def release_settled_continuations(tree_root: str) -> List[str]:
     """Release Continues whose predecessor ``tree_root`` has no unsettled writer left.
 
     The reconciliation half of the writer hold, called when a member of that
-    tree reaches its terminal. Only a row still under ITS OWN continuation hold
-    is released (a newer Restart/Pause/Stop hold is never overridden), and the
-    release is the ordinary selection, which re-checks the writers itself.
+    tree reaches its terminal and by ``recheck_held_continuations``. Only a row
+    still under ITS OWN continuation hold is released (a newer
+    Restart/Pause/Stop hold is never overridden), and the release is the
+    ordinary selection, which re-checks the writers itself.
     """
     from supervisor.events_budget import budget_hold_fact, observe_held_budget_selection, select_held_budget_row
 
@@ -639,4 +713,36 @@ def release_settled_continuations(tree_root: str) -> List[str]:
             outcome = select_held_budget_row(q, task, hold, selected_by="reconciliation", observation=observation)
             if outcome.get("ok"):
                 released.append(task_id)
+    return released
+
+
+def held_continuation_predecessors(pending: Any) -> List[str]:
+    """Each predecessor whose Continue still waits under its own writer hold, once."""
+    from supervisor.events_budget import budget_hold_fact
+
+    return sorted({str(((task.get("metadata") or {}).get("continuation") or {}).get("predecessor_task_id") or "")
+                   for task in list(pending or ()) if isinstance(task, dict)
+                   and (budget_hold_fact(task) or {}).get("reason") == HOLD_CONTINUATION_WRITER} - {""})
+
+
+def recheck_held_continuations(*, stop_requested: Any = None) -> List[str]:
+    """The body cadence's re-check of every writer-held Continue (``server_maintenance``).
+
+    A writer can settle while no member reaches a terminal: a delegated run's
+    custody closes, a model or tool handoff resolves, an owned process exits,
+    a late phase ends. A writer hold installs no root fence, so the held rows
+    themselves schedule this pass, and each distinct predecessor gets one
+    ``release_settled_continuations``: its selection re-checks the writers and
+    selects a row once. It runs off the loop and outside every custody and
+    store transaction, never from a repair (whose census it would re-enter).
+    """
+    from supervisor import queue as q
+
+    with q._queue_lock:
+        predecessors = held_continuation_predecessors(q.PENDING)
+    released: List[str] = []
+    for predecessor in predecessors:
+        if stop_requested is not None and stop_requested():
+            break
+        released.extend(release_settled_continuations(predecessor))
     return released

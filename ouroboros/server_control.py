@@ -340,9 +340,15 @@ def execute_panic_stop(
         from ouroboros.startup_historical_audit import audit
 
         attempt("startup-audit", audit.stop, native=True)
-        from ouroboros.evidence_packer import packer
+        from ouroboros.maintenance import child as maintenance_child
 
-        attempt("evidence-packer", packer.stop, native=True)
+        attempt("maintenance", maintenance_child.stop, native=True)
+        from ouroboros.storage import count as storage_count
+
+        attempt("storage-count", storage_count.stop, native=True)
+        from ouroboros.storage_free import free as storage_free
+
+        attempt("storage-free", storage_free.stop, native=True)
         import multiprocessing
 
         from ouroboros.claudexor_daemon import get_owned_daemon

@@ -8,12 +8,19 @@ that owes it. The owner-held sets (``custody_open``, closing custody receipts of
 sets, ``unknowns``, witnesses) are rows of the ``obligations`` table. ``members``
 reads both halves in one transaction; no set is a file any more (the importer
 reads the old set files once, the exporter writes them back for an older body).
-Every set owes work except the declared ``RECORD_SETS``, which are kept facts.
+Each set is owed to, and retired by, its own owner; no reader derives a global
+settlement from them (the evidence packer packs a task once its row is terminal).
+
+A periodic duty passes over its members through ``DutyRest``: a member it cannot
+progress now gets a typed outcome in the ``duty_rest`` record set, and the next pass
+selects it without reading its body until one of the recorded inputs changes.
 """
 from __future__ import annotations
 
+import datetime
+import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from ouroboros import store
 from ouroboros.store import StoreError
@@ -21,78 +28,27 @@ from ouroboros.store import StoreError
 BOOT_SETS = ("nonterminal", "synthesis", "terminal_projection", "delegated_runs",
              "promotions", "custody_open", "pending_drives", "upgrade_notices", "unknowns",
              "pause_notices", "pause_notice_receipts", "owner_questions")
-# Owed work: a task with a row here is not settled (the evidence packer's predicate). A stored set declared
-# in neither tuple owes too (an older or newer body's duty, an imported set file): an unknown duty never packs.
-DUTY_SETS = ("nonterminal", "synthesis", "terminal_projection", "delegated_runs", "promotions", "custody_open",
-             "pending_drives", "unknowns", "pause_notices", "local_custody_witnesses", "owner_questions",
-             "late_review_marks")
-# Kept facts, never owed: chat notice receipts, custody marks, definite start refusals.
-RECORD_SETS = ("upgrade_notices", "pause_notice_receipts", "custody_marks", "custody_refused")
+REST_SET = "duty_rest"  # the typed outcomes of ``DutyRest``: kept facts of a duty's pass, never debt
 ObligationsUnavailable = store.StoreError  # the sets are rows: unavailable exactly when the store is
 _FACT_COLUMNS = ("task_id", "headless_child_drive_root", "child_drive_root", "drive_root")
 
 
 def review_collection_pending(row: dict) -> bool:
-    """Conservative body-only selection for free acceptance collection, not a packer duty.
-    Live controllers remain candidates; actor death needs no body rewrite. Closed
-    legacy panels acquire no notice unless their own matching receipt already owes it."""
-    from ouroboros.review_projection import _actor_pending
-
+    """The ``tasks.review_collection_pending`` column's predicate, kept with the store schema: the
+    task holds an open review operation pointer (a malformed one counts). Its agent-session reader may
+    hold a retained handle's absolute path, so the packer keeps the task's loose files
+    (``evidence_packs.row_packable``), and the maintenance pass removes the pointer once its controller
+    is proven dead (``review_operation.retire_dead_review_pointers``). What the retired task acceptance
+    left (closed pointers, panels, ``acceptance-late:`` receipts) is history, never open work."""
     operations = row.get("review_operations", {})
-    projection = row.get("review_projection", {})
     if operations is None:
         operations = {}
-    if projection is None:
-        projection = {}
-    if not isinstance(operations, dict) or not isinstance(projection, dict):
+    if not isinstance(operations, dict):
         return True
-    pointed = set()
     for entry in operations.values():
         if not isinstance(entry, dict):
             return True
-        key = entry.get("retry_key")
-        if key is not None and not isinstance(key, str):
-            return True
-        pointed.add(key)
-        if entry.get("control_only") or entry.get("surface") != "task_acceptance":
-            continue
-        state = entry.get("state")
-        if not isinstance(state, str) or state not in {"closed", "collected", "preparation_unknown", "preparation_refused"}:
-            return True
-    panels, receipts = projection.get("panels", []), projection.get("late_notice_receipts", {})
-    if panels is None:
-        panels = []
-    if receipts is None:
-        receipts = {}
-    if not isinstance(panels, list) or not isinstance(receipts, dict):
-        return True
-    for panel in panels:
-        if not isinstance(panel, dict):
-            return True
-        if panel.get("surface") != "task_acceptance" or panel.get("authority") != "host_root":
-            continue
-        actors = panel.get("actors") or []
-        if not isinstance(actors, list) or any(not isinstance(actor, dict) for actor in actors):
-            return True
-        try:
-            pending = any(_actor_pending(actor) for actor in actors)
-        except TypeError:  # a malformed actor state cannot certify settled work
-            return True
-        if pending:
-            return True  # only the retained source can identify its retry key
-        late = panel.get("late_settlement")
-        if late is None:
-            continue
-        if not isinstance(late, dict) or not isinstance(late.get("reviewed_subject", {}), dict):
-            return True
-        key = str((late.get("reviewed_subject") or {}).get("retry_key") or "")
-        if not key or key in pointed:
-            continue
-        receipt = receipts.get(f"acceptance-late:{key}")
-        if receipt is None or isinstance(receipt, dict) and receipt.get("panel_id") != panel.get("panel_id"):
-            continue
-        if not isinstance(receipt, dict) or receipt.get("custody") != "terminal_outbox" \
-                or receipt.get("settled_at") != late.get("settled_at"):
+        if not entry.get("control_only") and entry.get("state") in {"preparing", "retained", "dispatched"}:
             return True
     return False
 
@@ -234,11 +190,12 @@ def drive_finished(root: Any, task: dict, row: dict | None = None) -> None:
             txn.conn.execute("UPDATE tasks SET pending_drive=0 WHERE task_id=?", (tid,))
 
 
-def result_rows(root: Any, name: str, *, exclude=()):
-    """Read only addressed candidates; unreadable members remain repair gaps."""
+def result_rows(root: Any, name: str, *, exclude=(), ids: Iterable[str] | None = None):
+    """Read only addressed candidates (``ids``: a pass's own selection of NAME's members);
+    unreadable members remain repair gaps."""
     import logging
     from ouroboros.task_results import load_task_result
-    for tid in members(root, name):
+    for tid in members(root, name) if ids is None else ids:
         if tid in exclude:
             continue
         try:
@@ -250,3 +207,96 @@ def result_rows(root: Any, name: str, *, exclude=()):
         except (OSError, ValueError, StoreError) as exc:
             add(root, "unknowns", f"task:{tid}", {"task_id": tid, "reason": type(exc).__name__})
             logging.getLogger(__name__).warning("Obligation %s/%s is unreadable", name, tid)
+
+
+def _instant(value: Any) -> datetime.datetime | None:
+    try:
+        stamp = datetime.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=datetime.timezone.utc)
+
+
+class DutyRest:
+    """One pass of a periodic duty over its addressed members, with durable rests.
+
+    A member the duty cannot progress now gets a typed outcome (``wait``) in the record set
+    ``duty_rest``, id ``<duty>:<task_id>``: what it waits on, with the inputs whose change could
+    let it progress -- the task row's signature (``write_seq``, ``updated_at``: every write of the
+    task moves it, so a new fact on the task always counts), the stamps of external inputs the
+    duty names, and an existing persisted retry instant (``due_at``). While they all hold, the
+    next pass selects the member without reading its body and writes nothing; the first change
+    puts it back exactly once. A rest never retires the debt: the member stays in its set and
+    every other reader still sees it; no attempt count or elapsed time decides anything here.
+    ``candidates`` maps each member to its own input stamps (or ``name`` reads a set's members);
+    ``wake`` names outcomes this pass examines anyway (work a restart re-establishes in memory).
+    """
+
+    def __init__(self, root: Any, duty: str, candidates: dict | None = None, *, name: str = "",
+                 inputs: dict | None = None, now: str | None = None, wake: Iterable[str] = ()) -> None:
+        from ouroboros.utils import utc_now_iso
+
+        self.root, self.duty, self.inputs = Path(root), _check_name(duty), dict(inputs or {})
+        prefix = self.duty + ":"
+        self.candidates = {str(tid): dict(facts or {}) for tid, facts in (candidates or {}).items()}
+        self.signatures: dict[str, list] = {}
+        self.marks: dict[str, dict] = {}
+        try:
+            with store.open_store(self.root, write=False) as txn:
+                if name:
+                    self.candidates = {str(tid): {} for tid in members_in(txn, name)}
+                self.signatures = {record["task_id"]: [record["write_seq"], record["updated_at"]] for record in
+                                   txn.conn.execute("SELECT task_id, write_seq, updated_at FROM tasks WHERE task_id IN "
+                                                    "(SELECT value FROM json_each(?))", (json.dumps(sorted(self.candidates)),))}
+                self.marks = {record["id"][len(prefix):]: json.loads(record["facts"]) for record in txn.conn.execute(
+                    "SELECT id, facts FROM obligations WHERE set_name=? AND id>=? AND id<?", (REST_SET, prefix, self.duty + ";"))}
+        except StoreError:
+            if name:
+                raise  # the set's members are unknown: the duty cannot pass
+            self.signatures, self.marks = {}, {}  # unknown rests prove nothing: every candidate is examined
+        now_at, wake = _instant(now or utc_now_iso()), set(wake)
+        self.resting = {tid: mark for tid, mark in self.marks.items()
+                        if tid in self.candidates and self._holds(tid, mark, now_at, wake)}
+        self.examine = [tid for tid in self.candidates if tid not in self.resting]
+        self._outcomes: dict[str, dict] = {}
+
+    def _holds(self, tid: str, mark: dict, now_at: datetime.datetime | None, wake: set) -> bool:
+        current = {**self.inputs, **self.candidates[tid]}
+        due = _instant(mark.get("due_at")) if mark.get("due_at") else None
+        return (mark.get("signature") == self.signatures.get(tid) and not wake & set(mark.get("waits_on") or ())
+                and all(current.get(key) == value for key, value in (mark.get("inputs") or {}).items())
+                and (not mark.get("due_at") or (due is not None and now_at is not None and due > now_at)))
+
+    def wait(self, task_id: str, *waits_on: str, due_at: str | None = None, inputs: Iterable[str] = (),
+             report: dict | None = None) -> None:
+        """TASK_ID, examined this pass, cannot progress until what it WAITS_ON changes; ``inputs``
+        names the pass's external stamps the outcome depends on (a member's own always count);
+        ``report`` is what the duty states about the member while it rests."""
+        tid = str(task_id)
+        if tid not in self.candidates or self.signatures.get(tid) is None or not waits_on:
+            return
+        stamps = {**{key: self.inputs[key] for key in inputs if key in self.inputs}, **self.candidates[tid]}
+        self._outcomes[tid] = {"task_id": tid, "signature": self.signatures[tid], "waits_on": sorted(set(waits_on)),
+                               **({"inputs": stamps} if stamps else {}), **({"due_at": str(due_at)} if due_at else {}),
+                               **({"report": dict(report)} if report else {})}
+
+    def commit(self) -> None:
+        """Write the pass's new outcomes and drop the rests of members that left, in one write
+        transaction; an outcome whose task was written after its selection is not recorded (that
+        write already puts the member back). Nothing new: nothing is written. A rest is never
+        authority, so a store that cannot take it leaves the members to the next pass."""
+        import logging
+
+        outcomes = {tid: facts for tid, facts in self._outcomes.items() if self.marks.get(tid) != facts}
+        departed = [tid for tid in self.marks if tid not in self.candidates]
+        if not outcomes and not departed:
+            return
+        try:
+            with store.open_store(self.root, write=True) as txn:
+                for tid in departed:
+                    txn.delete_row(REST_SET, f"{self.duty}:{tid}")
+                for tid, facts in outcomes.items():
+                    if list(txn.row(tid, "write_seq", "updated_at") or ()) == facts["signature"]:
+                        txn.put_row(REST_SET, f"{self.duty}:{tid}", facts)
+        except StoreError:
+            logging.getLogger(__name__).debug("Duty %s rests not recorded this pass", self.duty, exc_info=True)

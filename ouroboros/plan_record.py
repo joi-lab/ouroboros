@@ -17,7 +17,7 @@ Everything else is derived here and never stored: the open objections (a fold ov
 EACH SEAT'S OWN replies — an objection stands until the same seat lists it under
 ``withdrawn``; omission keeps it and flags ``not_adjudicated``; an unparseable reply
 changes nothing), who last saw which revision, the gate projection
-(``gate_projection``), the acceptance view (``acceptance_view``) and the review
+(``gate_projection``), the claims view (``acceptance_view``) and the review
 history the context views read (``record_history``). There is no cycle counter, no
 quorum, no aggregate and no fingerprint routing for plans.
 
@@ -337,15 +337,15 @@ def participant_views(record: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
 
 
 def pending_asks(record: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    """Asks with at least one participant still pending (dispatched, no settled answer)."""
+    """Asks with a counted participant pending; advisers retain their own custody only."""
     return [ask for ask in record.get("asks") or []
-            if any(p.get("status") == "pending" for p in ask.get("participants") or [])]
+            if any(p.get("owner_marked") and p.get("status") == "pending" for p in ask.get("participants") or [])]
 
 
 def asks_dispatched(record: Mapping[str, Any]) -> int:
-    """How many asks reached at least one reviewer (the force_plan fact)."""
+    """Asks that reached a participant counted by that ask (the force_plan fact)."""
     return sum(1 for ask in record.get("asks") or []
-               if any(p.get("dispatched") for p in ask.get("participants") or []))
+               if any(p.get("dispatched") and p.get("owner_marked") for p in ask.get("participants") or []))
 
 
 def engaged(record: Mapping[str, Any]) -> bool:
@@ -379,7 +379,7 @@ def gate_projection(record: Mapping[str, Any], *, enforcement: str, cyber_pro: b
     ``held`` ⟺ Blocking, not Cyber Pro, no owner hurry, and some open objection was
     raised by an owner-marked reviewer of the ask it answered — for any task. Silence,
     pending asks, refusals and mind-added critics never hold. A Swarm ``force_plan``
-    stays unmet until one ask reached at least one reviewer: under Blocking that holds
+    stays unmet until one ask reached at least one counted reviewer: under Blocking that holds
     the final answer while the mind never asked; an ask that no route could take (a
     recorded attempt) counts as attempted — disclosed, not held, outages never hold.
     Advisory, the owner's hurry and Cyber Pro disclose an unmet obligation once a plan
@@ -438,13 +438,14 @@ def gate_projection(record: Mapping[str, Any], *, enforcement: str, cyber_pro: b
     return decision
 
 
-# ------------------------------------------------------------------ acceptance
+# ------------------------------------------------------------------ claims view
 
 def acceptance_view(record: Mapping[str, Any], ingress_claims: List[Dict[str, Any]], *,
                     legacy: Optional[Mapping[str, Any]] = None) -> tuple[List[Dict[str, str]], str, Dict[str, Any]]:
-    """``(claims, source, exhibit)`` for task acceptance: ingress claims win; otherwise
-    the LATEST revision's ``done_when`` binds, open objections or not (legacy selected
-    claims when the task only has a v1/v2 record). The exhibit carries the ACTUAL text
+    """``(claims, source, exhibit)`` — the claims a task's result is held to (result
+    review, plan facts): ingress claims win; otherwise the LATEST revision's
+    ``done_when`` binds, open objections or not (legacy selected claims when the task
+    only has a v1/v2 record). The exhibit carries the ACTUAL text
     of every revision's ``done_when``, which revisions the council saw, and the
     objections open now — and, when ingress wins, the adopted promises stay visible."""
     from ouroboros.contracts.task_contract import normalize_acceptance_claims
@@ -551,7 +552,7 @@ def legacy_facts(root: Any, task_id: str) -> tuple[Dict[str, Any], Dict[str, str
     ``error`` is ``{}`` or names the read that failed (``source`` = ``plan_review_state`` or
     ``author_plan``, plus the message); the projection is then built without that piece. Each
     caller chooses its policy in one line: the gate holds as unreadable, the tool's read says
-    so, the acceptance binder refuses to bind without the bar, the task detail names it."""
+    so, the claims binder refuses to bind without the bar, the task detail names it."""
     from ouroboros.task_results import load_plan_review_state
 
     try:
@@ -789,12 +790,24 @@ def append_attempt(root: Any, task_id: str, attempt: Mapping[str, Any]) -> Dict[
     return _update_plan_record(root, task_id, _append)
 
 
+def _ask_panel_outcomes(ask: Dict[str, Any]) -> None:
+    from ouroboros.review_ledger import panel_not_reached
+    from ouroboros.reviewer_slot_config import review_cost_facts
+
+    rows = ask.get("participants") or []
+    for row in rows:
+        row.update(review_cost_facts(row.get("cost"), route=str(row.get("route") or ""), model=str(row.get("model") or "")))
+    if "panel" in ask:
+        ask["panel"]["not_reached"] = panel_not_reached(rows)
+
+
 def append_ask(root: Any, task_id: str, ask: Mapping[str, Any]) -> Dict[str, Any]:
     """Record one dispatched ask (participants with their typed dispatch state)."""
     def _append(record: Dict[str, Any]) -> Dict[str, Any]:
         if any(str(a.get("ask_id") or "") == str(ask.get("ask_id") or "") for a in record.get("asks", [])):
             raise PlanRecordInvalid(f"PLAN_RECORD_INVALID: ask {ask.get('ask_id')!r} is already recorded")
         record["asks"] = [*record.get("asks", []), copy.deepcopy(dict(ask))]
+        _ask_panel_outcomes(record["asks"][-1])
         return record
 
     return _update_plan_record(root, task_id, _append)
@@ -814,10 +827,43 @@ def update_participant(root: Any, task_id: str, *, ask_id: str, seat_id: str, fa
                     if facts.get("status") == "pending" and str(participant.get("status") or "pending") != "pending":
                         return record
                     participant.update(copy.deepcopy(dict(facts)))
+                    _ask_panel_outcomes(ask)
                     return record
         raise PlanRecordInvalid(f"PLAN_RECORD_INVALID: no participant {seat_id!r} in ask {ask_id!r}")
 
     return _update_plan_record(root, task_id, _merge)
+
+
+def claim_ask_completion(root: Any, task_id: str, ask_id: str, custody: Mapping[str, str]) -> Optional[Dict[str, Any]]:
+    """Claim this ask's one completion frame under the record lock, using ask-time standing.
+
+    An adviser-only consultation still announces its own completion. A council with
+    counted participants announces when those finish, retaining every adviser's row.
+    """
+    claimed = False
+    def claim(record: Dict[str, Any]) -> Dict[str, Any]:
+        nonlocal claimed
+        claimed = False
+        ask = next((a for a in record.get("asks", []) if a.get("ask_id") == ask_id), {})
+        participants = ask.get("participants") or []
+        counted = [p for p in participants if p.get("owner_marked")] or participants
+        if counted and not ask.get("completion_announced") and not any(
+                p.get("status") == "pending" and not custody.get(str(p.get("seat_id") or "")) for p in counted):
+            ask["completion_announced"] = claimed = True
+        return record
+    record = _update_plan_record(root, task_id, claim)
+    return record if claimed else None
+
+
+def release_ask_completion(root: Any, task_id: str, ask_id: str) -> None:
+    """Release an undelivered frame's claim under the record lock for the next callback."""
+    def release(record: Dict[str, Any]) -> Dict[str, Any]:
+        for ask in record.get("asks", []):
+            if ask.get("ask_id") == ask_id:
+                ask.pop("completion_announced", None)
+                break
+        return record
+    _update_plan_record(root, task_id, release)
 
 
 def collection_pending(value: Any) -> bool:

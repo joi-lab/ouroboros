@@ -16,7 +16,7 @@ one root/task/wave, the open set). ``read_usage_records`` (every row) exists for
 explicit audits and the export only.
 
 Locking: one configuration per installation, recorded at import. ``enforced``
-uses SQLite's own file locks (rollback journal, ``synchronous=FULL``) under the
+uses SQLite's own file locks (the shared journal policy, ``synchronous=FULL``) under the
 existing acquisition contract: ``hold`` is the money acquisition primitive the
 sliced send waits (``_usage_wait``) retry, so Stop and deadlines are honoured
 between slices; ``name`` (no kernel file locks: Drive/FUSE/NFS per the existing
@@ -337,6 +337,7 @@ class Txn:
     def __init__(self, conn: sqlite3.Connection, root: pathlib.Path, *, write: bool) -> None:
         self.conn, self.root, self.writable = conn, root, write
         self.committed = False
+        self._handoff = False
         self._buckets: Dict[Tuple[str, str], Bucket] = {}
         self._marker: Optional[list] = None
 
@@ -373,6 +374,21 @@ class Txn:
             before = cursor["seq_first"]
         return [dict(record) for record in self.conn.execute(_TASK_PAGE_SQL, (
             str(task_id), str(category), before, int(limit)))]
+
+    def review_seat_costs(self, category: str, *, limit: int) -> List[Dict[str, Any]]:
+        """What one reviewer seat cost in one wave: per (wave, row), the summed cost of every
+        physical attempt — its turns and its verdict-extraction calls, whatever model served each —
+        with the distinct models seen (``models``, comma-joined), newest wave first, at most ``limit``.
+
+        ``priced`` is false when any attempt of the seat had no known price; the category/time
+        index addresses only this category. No payload fields."""
+        return [dict(record) for record in self.conn.execute(
+            "SELECT review_wave_id AS wave_id, review_slot_id AS row_id, GROUP_CONCAT(DISTINCT model) AS models, "
+            "SUM(CAST(cost_usd AS REAL)) AS usd, MIN(COALESCE(pricing_known, 0)) AS priced, "
+            "MAX(ts_last_epoch) AS last_epoch FROM attempts INDEXED BY attempts_category_time "
+            "WHERE category=? AND COALESCE(review_wave_id, '') != '' AND COALESCE(review_slot_id, '') != '' "
+            "GROUP BY review_wave_id, review_slot_id ORDER BY last_epoch DESC LIMIT ?",
+            (str(category), int(limit)))]
 
     def bucket(self, scope: str, key: str = "") -> Bucket:
         address = (scope, str(key))
@@ -438,6 +454,8 @@ class Txn:
             self.conn.execute("DELETE FROM meta WHERE key=?", (key,))
         else:
             self.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, _json(value)))
+        if key == "export" and value is not None:
+            self._handoff = True
 
     def marker(self) -> list:
         """``[epoch, seq]``: continues the journal's ``[compaction_epoch, seq]``."""
@@ -608,12 +626,28 @@ def _header_tier(path: pathlib.Path) -> Optional[str]:
     return _core.header_tier(path, _APPLICATION_ID)
 
 
-def _connect(path: pathlib.Path, tier: str, *, create: bool = False, wait_sec: float = 0.0) -> sqlite3.Connection:
+def hand_off(root: pathlib.Path | str) -> bool:
+    """``store.hand_off`` for the money store: a WAL file is checkpointed into DELETE mode."""
+    path = pathlib.Path(root) / STORE_REL
+    if not _core.wal_file(path):
+        return False
+    tier = _header_tier(path)
+    if tier is None:
+        raise UsageLedgerCorrupt(f"usage store unreadable at handoff: {path}")
+    try:
+        _core.prepare_handoff(path, tier, wait_sec=USAGE_LOCK_TIMEOUT_SEC)
+    except _core.StoreBusy as exc:
+        raise UsageLockUnavailable(str(exc), reason=exc.reason) from exc
+    return True
+
+
+def _connect(path: pathlib.Path, tier: str, *, create: bool = False, wait_sec: float = 0.0,
+             shared: bool = False) -> sqlite3.Connection:
     """The shared connection with the money error vocabulary (``ouroboros.store.connect``)."""
     try:
-        return _core.connect(path, tier, create=create, wait_sec=wait_sec)
+        return _core.connect(path, tier, create=create, wait_sec=wait_sec, shared=shared)
     except sqlite3.Error as exc:
-        raise UsageAccountingError(f"usage store unavailable: {path}: {exc}") from exc
+        raise _typed(exc) from exc
 
 
 def _commit(conn: sqlite3.Connection) -> None:
@@ -639,6 +673,8 @@ def store_tier(root: pathlib.Path, *, wait_sec: float, migrate: bool = True) -> 
     cached = _READY.get(str(path))
     if cached is not None and identity is not None and cached[0] == identity:
         return cached[1]
+    if cached is not None:
+        forget(root)
     lock = _process_lock(path)
     if not lock.acquire(timeout=max(0.0, wait_sec)):
         raise UsageLockUnavailable("usage store migration in progress", reason="contention")
@@ -661,8 +697,10 @@ def _stored_meta(path: pathlib.Path, tier: str, wait_sec: float) -> Dict[str, An
     with contextlib.ExitStack() as stack:
         if tier == TIER_NAME:
             stack.enter_context(_named_lock(path.parent.parent, LOCK_REL.name, timeout_sec=wait_sec, stale_sec=90.0))
-        conn = _connect(path, tier, wait_sec=wait_sec)
-        stack.callback(conn.close)
+        if path.name == STORE_REL.name:
+            conn = stack.enter_context(_core.connection(path, tier, wait_sec=wait_sec, opener=_connect))
+        else:  # retired copies must be closed before abandonment can rename them back
+            conn = stack.enter_context(contextlib.closing(_connect(path, tier, wait_sec=wait_sec)))
         try:
             records = conn.execute("SELECT key, value FROM meta WHERE key IN ('import', 'export')").fetchall()
         except sqlite3.OperationalError as exc:
@@ -696,18 +734,31 @@ def hold(root: pathlib.Path | str, *, timeout_sec: float = USAGE_LOCK_TIMEOUT_SE
     with contextlib.ExitStack() as stack:
         if tier == TIER_NAME:
             stack.enter_context(_named_lock(root, LOCK_REL.name, timeout_sec=timeout_sec, stale_sec=90.0))
-        conn = _connect(root / STORE_REL, tier, wait_sec=timeout_sec)
-        stack.callback(conn.close)
+        conn = stack.enter_context(_core.connection(root / STORE_REL, tier, wait_sec=timeout_sec, opener=_connect))
         txn = Txn(conn, root, write=write)
+        handoff = False
         try:  # the enforced tier's COMMIT waits for readers to drain
             with _core.transaction(conn, write=write, finish=txn.commit,
                                    commit_wait_sec=USAGE_LOCK_TIMEOUT_SEC if tier == TIER_ENFORCED else None):
-                if write and not exporting and txn.meta("export") is not None:
+                handoff = txn.meta("export") is not None
+                if write and not exporting and handoff:
                     raise UsageExportInProgress(f"usage store is being exported for a switch; money writes are "
                                                 f"refused until it completes or is abandoned: {root / STORE_REL}")
                 yield txn
+            handoff = handoff or txn._handoff
         except sqlite3.Error as exc:
             raise _typed(exc) from exc
+        finally:
+            if handoff:
+                stack.close()
+                with _named_lock(root, LOCK_REL.name, timeout_sec=timeout_sec, stale_sec=90.0) \
+                        if tier == TIER_NAME else contextlib.nullcontext():
+                    try:
+                        _core.prepare_handoff(root / STORE_REL, tier, wait_sec=timeout_sec)
+                    except _core.StoreBusy as exc:
+                        raise UsageLockUnavailable(str(exc), reason=exc.reason) from exc
+                    except sqlite3.Error as exc:
+                        raise _typed(exc) from exc
 
 
 def _typed(exc: sqlite3.Error) -> UsageAccountingError:
@@ -864,7 +915,6 @@ def _build(tmp: pathlib.Path, tier: str, records: Sequence[Dict[str, Any]], prov
     last_seq = max((int(row["seq"]) for row in records), default=0)
     conn = _connect(tmp, tier, create=True)
     try:
-        conn.execute("PRAGMA synchronous = FULL")
         conn.executescript(_SCHEMA)
         conn.execute(f"PRAGMA application_id = {_APPLICATION_ID[tier]}")
         conn.execute("BEGIN IMMEDIATE")
@@ -1059,6 +1109,7 @@ def export_journal(root: pathlib.Path | str, *, resume: bool = False) -> Dict[st
     if isinstance(state, dict) and "usage_ledger_high_water_seq" in state:
         atomic_write_json(root / "state" / "state.json", {**state, "usage_ledger_high_water_seq": mark["marker"]}, fsync=True)
     retired = path.with_name(mark["store_retired_as"])
+    forget(root)  # Windows requires every process-owned cached handle closed before rename
     os.replace(path, retired)
     _fsync_directory(path.parent)
     forget(root)
@@ -1129,5 +1180,6 @@ def abandon_export(root: pathlib.Path | str, *, retired_as: Optional[str] = None
 
 
 def forget(root: pathlib.Path | str) -> None:
-    """Drop this process's readiness memo for ``root`` (tests, export)."""
+    """Close this process's cached connections and readiness memo (tests, export)."""
+    _core.close_connections(pathlib.Path(root) / STORE_REL)
     _READY.pop(str(pathlib.Path(root) / STORE_REL), None)

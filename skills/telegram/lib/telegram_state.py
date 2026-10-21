@@ -48,10 +48,16 @@ def _remember_message(api, chat_id: int, message_id: int, record: dict) -> None:
             for stale in list(latest)[:-_MAX_MESSAGE_REFS]:
                 latest.pop(stale, None)
         path = _state_file(api, "message_refs.json")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(path)
+        # The map is derived: losing an entry costs one reference, never the
+        # owner's message or a confirmed chunk's later siblings.
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            api.log("warning", f"Telegram message reference was not saved ({type(exc).__name__}); "
+                               "its reply reference may be unavailable or stale.")
 
 
 def _owner_message_seen(api, chat_id: int, message_id: int) -> None:
@@ -116,7 +122,9 @@ def _mirror_options(api, event: dict, chat_id: int) -> dict:
     """A client mirrors one host row; all of its physical parts share this fact."""
     task_id = str(event.get("subagent_task_id") or event.get("task_id") or "")
     kind = str(event.get("kind") or event.get("type") or event.get("system_type") or "message")
-    if event.get("subagent_event") or kind == "task_summary":
+    if (event.get("subagent_event") or kind == "task_summary"
+            or event.get("role") == "system" and event.get("system_type") == "project_completion_summary"):
+        # Telegram shows a status/salvage notice, not Main's completion_answer.
         kind = "work_card"
     elif event.get("quiz_id"):
         kind = "question"
@@ -182,8 +190,33 @@ def _jsonl_tail(
     max_entries: int,
     tail_bytes: int,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Return a parsed JSONL tail and whether either bound omitted a prefix."""
+    """A bounded tail; canonical chat/progress come only from the dialogue store.
+
+    The legacy path is an address, not a file fallback. Missing import coverage
+    raises a typed outcome before a notifier can mark the window as observed.
+    Other telemetry files still use the shared JSONL parser.
+    """
     path = pathlib.Path(path)
+    if path.parent.name == "logs" and path.name in {"chat.jsonl", "progress.jsonl"}:
+        from ouroboros import dialogue_store as ds
+
+        root, stream = path.parent.parent, path.stem
+        upper = ds.stream_end(root, stream)
+        lower = max(0, upper - tail_bytes)
+        entries = [row for row in ds.newest(root, stream, before=upper, limit=max_entries + 1)
+                   if row.seq >= lower]
+        omitted_prefix = lower > 0 or len(entries) > max_entries
+        if len(entries) > max_entries:
+            entries = entries[-max_entries:]
+            lower = entries[0].seq
+        coverage = ds.range_coverage(root, stream, lower=lower, upper=upper)
+        if coverage["mismatch"]:
+            raise ds.StoreError(f"{stream}: a segment could not be imported")
+        if coverage["pending"]:
+            raise ds.StoreMigrating(f"{stream}: history is still importing")
+        if coverage["gaps"]:
+            raise ds.StoreError(f"{stream}: recorded invalid intervals in the requested window")
+        return [entry.row for entry in entries], omitted_prefix
     try:
         omitted_prefix = path.stat().st_size > tail_bytes
     except OSError:
@@ -376,7 +409,7 @@ _SUBAGENT_ICONS = {
 _SUBAGENT_TERMINAL = {"completed", "completed_warn", "failed", "cancelled", "rejected"}
 _SUBAGENT_LABELS_EN = {"scheduled": "queued", "running": "running", "update": "running", "progress": "running",
     "completed": "done", "completed_warn": "done (warn)", "failed": "failed",
-    "cancelled": "cancelled", "rejected": "rejected (duplicate)",
+    "cancelled": "stopped", "rejected": "rejected (duplicate)",
     "interrupted": "interrupted", "_title": "subagent"}
 _SUBAGENT_LABELS = Index("subagent", _SUBAGENT_LABELS_EN, "the status words of a subagent card")
 

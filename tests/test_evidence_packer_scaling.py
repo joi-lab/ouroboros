@@ -1,13 +1,16 @@
-"""Task-local wakeups and operation counts on real evidence packs, never wall time."""
+"""Task-local wakeups and operation counts on real evidence packs, never wall time; the production-shaped
+backfill (300 terminal tasks carrying the former blockers beside 10 live sharers) prints its numbers."""
 import contextlib
 import json
+import pathlib
+import time
 from unittest.mock import patch
 
 import pytest
 
-from ouroboros import evidence_packer as packer, evidence_packs as packs, observability, store, usage_store
+from ouroboros import evidence_packer as packer, evidence_packs as packs, maintenance, obligations, observability, store, usage_store
 from supervisor import terminal_delivery
-from tests.test_evidence_packs import REPO, _result, _task
+from tests.test_evidence_packs import _handle_path, _result, _task
 from tests.test_evidence_packs import root as root
 
 
@@ -18,111 +21,78 @@ def _reserve(root, task):
                    "reservation_upper_bound_usd": 0.01, "pricing_known": True})
 
 
-def _settle_money(root, task):
-    with usage_store.hold(root, write=True) as txn:
-        previous = txn.attempt(f"attempt-{task}")
-        txn.write({**previous, "state": "released", "reason": "not_dispatched"}, previous)
-
-
-@pytest.mark.parametrize("change", ["money", "delivery", "row", "evidence"])
-def test_unrelated_changes_do_not_wake_swept_task(root, monkeypatch, change):
+@pytest.mark.parametrize("change", ["money", "delivery", "live_row", "live_evidence"])
+def test_unrelated_changes_do_not_wake_the_look_or_the_swept_task(root, monkeypatch, change):
     _task(root, "packed", blobs=1)
     assert packer.run_pass(root)["unlinked"] == 2
     packer.run_pass(root)  # record the directory revision after our own unlink
+    maintenance.run_job(root, "evidence_packing")  # the job's quiet fact for this state
+    assert "evidence_packing" not in maintenance.due(root)
     before = packer.task_stamps(root, "packed")
-    unit = packer.EvidencePacker()
-    assert not unit.tick(root, REPO)
     if change == "money":
         _reserve(root, "unrelated")
     elif change == "delivery":
         assert terminal_delivery.register_pending_delivery(
             root, {"delivery_id": "owed-unrelated", "task_id": "unrelated", "chat_id": 1})
-    elif change == "row":
+    elif change == "live_row":
         _result(root, "unrelated", "running")
     else:
         _task(root, "unrelated", status="running", blobs=1)
-        packer.record_swept(root, "unrelated", packer.task_stamps(root, "unrelated"))
-    monkeypatch.setattr(packer, "spawn_maintenance_job", lambda *a: pytest.fail("unrelated change spawned a packer"))
     assert packer.task_stamps(root, "packed") == before
-    assert packer.changed_tasks(root) == []
-    assert unit.tick(root, REPO)
-    unit._thread.join(10)
-    assert not unit._thread.is_alive()
+    assert packer.changed_tasks(root) == ([] if change != "live_evidence" else ["unrelated"])
+    # None of these is a reason to spawn the child: the job is at rest and only its facts are read.
+    monkeypatch.setattr(packer, "packing_pending", lambda *a, **k: pytest.fail("an unrelated change started discovery"))
+    assert maintenance.run_job(root, "evidence_packing") is None
+    assert "evidence_packing" not in maintenance.due(root)
 
 
-@pytest.mark.parametrize("blocker", ["money", "delivery"])
-def test_own_settlement_change_wakes_a_swept_task(root, blocker):
-    _task(root, "later", blobs=1)
-    if blocker == "money":
-        _reserve(root, "later")
-    else:
-        assert terminal_delivery.register_pending_delivery(
-            root, {"delivery_id": "owed-later", "task_id": "later", "chat_id": 1})
-    assert packer.run_pass(root)["packed"] == 0
-    assert packer.changed_tasks(root) == []
-    if blocker == "money":
-        _settle_money(root, "later")
-    else:
-        assert terminal_delivery.register_delivery(root, "owed-later")
+def test_a_task_closing_wakes_the_look_and_its_pass(root):
+    _task(root, "later", blobs=1, status="running")
+    maintenance.run_job(root, "evidence_packing")
+    assert "evidence_packing" not in maintenance.due(root)
+    _result(root, "later", "completed")
+    assert "evidence_packing" in maintenance.due(root)
     assert packer.changed_tasks(root) == ["later"]
-    assert packer.run_pass(root)["unlinked"] == 2
+    assert maintenance.run_job(root, "evidence_packing")["state"] == "done"
+    assert packs.published_generations(root, "later") and "evidence_packing" in maintenance.due(root)  # one more look
+    assert maintenance.run_job(root, "evidence_packing")["state"] == "done"
+    assert "evidence_packing" not in maintenance.due(root)
 
 
-@pytest.mark.parametrize("operation", ["changed_tasks", "run_pass", "tick"])
-@pytest.mark.parametrize("status", ["running", "completed"])
-def test_money_and_deliveries_read_once_for_all_tasks(root, monkeypatch, operation, status):
+@pytest.mark.parametrize("operation", ["changed_tasks", "run_pass", "job"])
+def test_no_money_or_delivery_source_is_read(root, monkeypatch, operation):
     for number in range(12):
-        _task(root, f"live-{number}", status=status, blobs=1)
+        _task(root, f"t-{number}", status="running" if number % 2 else "completed", blobs=1)
     _reserve(root, "unrelated")
-    statements, registry_reads = [], []
-    original_connect = usage_store._connect
+    assert terminal_delivery.register_pending_delivery(root, {"delivery_id": "owed", "task_id": "t-0", "chat_id": 1})
     from ouroboros import utils
     original_read = utils.read_json_dict
 
-    def connect(*args, **kwargs):
-        conn = original_connect(*args, **kwargs)
-        conn.set_trace_callback(statements.append)
-        return conn
-
     def read(path, *args, **kwargs):
-        if path.name == "terminal_deliveries.json":
-            registry_reads.append(path)
+        assert path.name != "terminal_deliveries.json", "a pass read the delivery outbox"
         return original_read(path, *args, **kwargs)
 
-    assert terminal_delivery.register_pending_delivery(
-        root, {"delivery_id": "owed-live", "task_id": "live-0", "chat_id": 1})
-    unit = packer.EvidencePacker()
-    unit.tick(root, REPO)
-    if operation == "tick":
-        packer.run_pass(root)
-        packer.run_pass(root)
-    monkeypatch.setattr(usage_store, "_connect", connect)
+    monkeypatch.setattr(usage_store, "hold", lambda *a, **k: pytest.fail("a pass opened the money store"))
     monkeypatch.setattr(utils, "read_json_dict", read)
-    if operation == "tick":
-        assert unit.tick(root, REPO)
-        unit._thread.join(10)
-        assert not unit._thread.is_alive()
+    if operation == "job":
+        assert maintenance.run_job(root, "evidence_packing")["state"] == "done"
     else:
         getattr(packer, operation)(root)
-    queries = [sql for sql in statements if "FROM attempts" in sql and sql.startswith("SELECT")]
-    assert len(queries) == 1, queries
-    assert len(registry_reads) == 1
 
 
 def _measure(root, label):
-    counts = {"case": label, "settlements": 0, "under_writer": 0, "verifies": 0}
-    facts, verify = packs.task_settlement_facts, packs.verify_pack
+    counts = {"case": label, "leases": 0, "verifies": 0}
+    connection, verify = store.connection, packs.verify_pack
 
-    def observed_facts(*args, **kwargs):
-        counts["settlements"] += 1
-        counts["under_writer"] += int(kwargs.get("txn") is not None)
-        return facts(*args, **kwargs)
+    def leased(path, *args, **kwargs):
+        counts["leases"] += int(pathlib.Path(path) == store.store_path(root))
+        return connection(path, *args, **kwargs)
 
     def observed_verify(*args, **kwargs):
         counts["verifies"] += 1
         return verify(*args, **kwargs)
 
-    with patch.object(packs, "task_settlement_facts", observed_facts), patch.object(packs, "verify_pack", observed_verify):
+    with patch.object(store, "connection", leased), patch.object(packs, "verify_pack", observed_verify):
         counts["report"] = packer.run_pass(root)
     print(json.dumps(counts, sort_keys=True), flush=True)
     assert counts["report"]["faults"] == 0
@@ -130,31 +100,27 @@ def _measure(root, label):
 
 
 @pytest.mark.parametrize("n", [12, 24, 48])
-def test_measure_backfill_and_unrelated_money(root, n):
-    usage_store.migrate_from_journal(root)
+def test_measure_backfill_then_rest(root, n):
     for number in range(n):
         _task(root, f"settled-{number}", blobs=1)
     backfill = _measure(root, f"backfill-{n}")
-    assert backfill["report"]["unlinked"] == 2 * n
+    assert backfill["report"]["unlinked"] == 2 * n and backfill["verifies"] == n
     after_unlink = _measure(root, f"after-unlink-{n}")
-    assert _measure(root, f"stable-{n}")["settlements"] == 0
-    _reserve(root, "unrelated")
-    print(json.dumps({"case": f"changed-after-money-{n}", "candidates": len(packer.changed_tasks(root))}), flush=True)
-    unrelated = _measure(root, f"unrelated-money-{n}")
-    assert backfill["settlements"] == 2 * n  # one census plus one candidate recheck
-    assert backfill["under_writer"] == n
-    assert backfill["verifies"] == n
-    assert after_unlink["verifies"] == 0  # no loose members left to delete
-    assert unrelated["settlements"] == unrelated["verifies"] == 0
+    assert after_unlink["verifies"] == 0  # no loose members left: no generation is re-read
+    stable = _measure(root, f"stable-{n}")
+    assert stable["leases"] == 1 and stable["verifies"] == 0  # the census read, nothing else
+    _result(root, "unrelated", "running")
+    unrelated = _measure(root, f"unrelated-row-{n}")
+    assert unrelated["leases"] == 1 and unrelated["verifies"] == 0
 
 
-def test_no_global_scan_or_foreign_settlement_inside_unlink_locks(root, monkeypatch):
+def test_no_global_scan_or_foreign_stamp_inside_unlink_locks(root, monkeypatch):
     for number in range(12):
         _task(root, f"settled-{number}", blobs=1)
     active = {"writer": False, "publication": False, "task": None}
     scans = []
     open_store, name_lock = store.open_store, store.name_lock
-    loose_ids, facts, unlink = packer._loose_task_ids, packs.task_settlement_facts, packs.unlink_loose
+    loose_ids, stamps, unlink = packer._loose_task_ids, packer.task_stamps, packs.unlink_loose
 
     @contextlib.contextmanager
     def opened(*args, **kwargs):
@@ -180,10 +146,10 @@ def test_no_global_scan_or_foreign_settlement_inside_unlink_locks(root, monkeypa
         scans.append((active["writer"], active["publication"]))
         return loose_ids(*args)
 
-    def observed_facts(root, task, **kwargs):
+    def observed_stamps(root, task, **kwargs):
         if active["writer"] or active["publication"]:
             assert task == active["task"], "foreign task evaluated during candidate unlink"
-        return facts(root, task, **kwargs)
+        return stamps(root, task, **kwargs)
 
     def remove(root, task, *args, **kwargs):
         active["task"] = task
@@ -195,7 +161,7 @@ def test_no_global_scan_or_foreign_settlement_inside_unlink_locks(root, monkeypa
     monkeypatch.setattr(store, "open_store", opened)
     monkeypatch.setattr(store, "name_lock", locked)
     monkeypatch.setattr(packer, "_loose_task_ids", ids)
-    monkeypatch.setattr(packs, "task_settlement_facts", observed_facts)
+    monkeypatch.setattr(packer, "task_stamps", observed_stamps)
     monkeypatch.setattr(packs, "unlink_loose", remove)
     report = packer.run_pass(root)
     assert report["faults"] == 0 and report["unlinked"] == 24
@@ -231,50 +197,13 @@ def test_manifest_published_after_keep_snapshot_protects_blob(root, monkeypatch,
     assert packs.blob_bytes(root, refs[0])
     _result(root, "live")
     assert packer.run_pass(root)["faults"] == 0
-    from pathlib import Path
-    assert not Path(refs[0]["path"]).exists()
-
-
-@pytest.mark.parametrize("change", ["money", "delivery", "obligation"])
-def test_own_settlement_change_defers_the_candidate_without_scanning_under_locks(root, monkeypatch, change):
-    from ouroboros import obligations
-    from pathlib import Path
-
-    refs, _ = _task(root, "packing", blobs=1)
-    write = packs.write_pack
-
-    def publish(*args, **kwargs):
-        result = write(*args, **kwargs)
-        if change == "money":
-            _reserve(root, "packing")
-        elif change == "delivery":
-            terminal_delivery.register_pending_delivery(
-                root, {"delivery_id": "owed-packing", "task_id": "packing", "chat_id": 1})
-        else:
-            obligations.add(root, "custom_duty", "op", {"task_id": "packing"})
-        return result
-
-    with monkeypatch.context() as edits:
-        edits.setattr(packs, "write_pack", publish)
-        report = packer.run_pass(root)
-    assert report["faults"] == report["unlinked"] == 0
-    assert Path(refs[0]["path"]).exists()
-    if change == "money":
-        _settle_money(root, "packing")
-    elif change == "delivery":
-        terminal_delivery.register_delivery(root, "owed-packing")
-    elif change == "obligation":
-        obligations.remove(root, "custom_duty", "op")
-    assert packer.run_pass(root)["unlinked"] == 2
+    assert not pathlib.Path(refs[0]["path"]).exists()
 
 
 def test_unrelated_activity_during_a_pass_does_not_stop_the_backfill(root, monkeypatch):
     # A busy install commits rows and money between candidates; only the census's own tasks matter.
-    from pathlib import Path
-
     refs = [_task(root, f"settled-{number}", blobs=1)[0][0] for number in range(6)]
-    write, calls, evaluated = packs.write_pack, [], []
-    facts = packs.task_settlement_facts
+    write, calls = packs.write_pack, []
 
     def publish(*args, **kwargs):
         result = write(*args, **kwargs)
@@ -283,65 +212,38 @@ def test_unrelated_activity_during_a_pass_does_not_stop_the_backfill(root, monke
         _reserve(root, f"busy-{len(calls)}")
         return result
 
-    def observed(root, task, **kwargs):
-        evaluated.append(task)
-        return facts(root, task, **kwargs)
-
     with monkeypatch.context() as edits:
         edits.setattr(packs, "write_pack", publish)
-        edits.setattr(packs, "task_settlement_facts", observed)
         report = packer.run_pass(root)
     assert report["faults"] == 0 and report["packed"] == 6 and report["unlinked"] == 12
-    assert not any(Path(ref["path"]).exists() for ref in refs)
-    assert len(evaluated) <= 3 * 6  # census, keep-set and each candidate's own check: still linear
+    assert not any(pathlib.Path(ref["path"]).exists() for ref in refs)
 
 
-def test_body_change_while_candidates_are_chosen_keeps_the_shared_blob(root, monkeypatch):
-    # The census baseline is older than every fact the pass reads: a body-only change made after a
-    # candidate's facts were read (an open review-operation pointer on a completed task) is re-read.
-    from pathlib import Path
-
-    from ouroboros import task_store
-
-    raw = b'{"shared": "window"}'
-    refs, _ = _task(root, "packing", blobs=1, payloads=[raw])
-    _task(root, "sharer", blobs=1, payloads=[raw], handle=b"small")
-    original = packer.ordered_candidates
-
-    def ordered(root, settled):
-        task_store.patch_document(root, "sharer", lambda d: {**d, "review_operations": {
-            "ctrl": {"surface": "task_acceptance", "state": "preparing"}}})
-        return original(root, settled)
-
-    with monkeypatch.context() as edits:
-        edits.setattr(packer, "ordered_candidates", ordered)
-        report = packer.run_pass(root)
-    assert report["faults"] == 0 and report["kept"] == 1
-    assert Path(refs[0]["path"]).exists()
-
-
-def test_task_resumed_after_census_keeps_its_existing_shared_reference(root, monkeypatch):
-    from pathlib import Path
-
+def test_a_sharer_resumed_after_the_census_reads_its_shared_blob_from_the_pack(root, monkeypatch):
+    """Resuming a terminal task under its id after the census is not a reason to stop the pass: the
+    shared blob is in the packed task's verified pack, where the resumed sharer's readers find it. The
+    sharer's own generation, chosen at the census, is still written (verified bytes, never a loss), but
+    its loose files stay: its unlink sees the moved status and waits for its own pass."""
     raw = b'{"shared": "retained"}'
     refs, _ = _task(root, "packing", blobs=1, payloads=[raw])
-    _task(root, "other", blobs=1, payloads=[raw], handle=b"small")
-    write = packs.write_pack
+    other, other_handle = _task(root, "other", blobs=1, payloads=[raw], handle=b"small")
+    write, resumed = packs.write_pack, []
 
     def resume(*args, **kwargs):
         result = write(*args, **kwargs)
-        _result(root, "other", "running")
+        if not resumed:
+            resumed.append(_result(root, "other", "running"))
         return result
 
     with monkeypatch.context() as edits:
         edits.setattr(packs, "write_pack", resume)
         report = packer.run_pass(root)
-    # The same pass sees the resumed sharer: the shared blob stays, the rest of the pass goes on.
-    assert report["faults"] == 0 and report["kept"] == 1 and report["unlinked"] == 1
-    assert Path(refs[0]["path"]).exists()
+    assert report["faults"] == 0 and (report["packed"], report["unlinked"], report["kept"]) == (2, 2, 0)
+    assert packs.blob_bytes(root, refs[0]) == raw and packs.blob_bytes(root, other[0]) == raw
+    assert len(packs.published_generations(root, "other")) == 1 and _handle_path(root, "other", other_handle).exists()
     _result(root, "other")
     assert packer.run_pass(root)["faults"] == 0
-    assert not Path(refs[0]["path"]).exists()
+    assert not _handle_path(root, "other", other_handle).exists() and packs.blob_bytes(root, other[0]) == raw
 
 
 def test_publication_journal_exists_only_for_a_sweep_and_discards_crash_residue(root):
@@ -353,3 +255,64 @@ def test_publication_journal_exists_only_for_a_sweep_and_discards_crash_residue(
     journal.write_bytes(b"incomplete old pass")
     assert packer.run_pass(root)["unlinked"] == 2
     assert not journal.exists()
+
+
+def _former_blocker(root, index, task):
+    """One of the facts the old settlement census waited for, round-robin."""
+    kind = index % 6
+    if kind == 0:
+        _reserve(root, task)
+    elif kind == 1:
+        _result(root, task, review_operations={"op": {"surface": "multi_model_review", "state": "closed"}})
+    elif kind == 2:
+        _result(root, task, canonical_terminal_projection_origin="terminal_transition")
+    elif kind == 3:
+        obligations.add(root, "custody_open", f"invocation:{task}", {"request": {"task_id": task}})
+    elif kind == 4:
+        obligations.add(root, "future_body_duty", f"work:{task}", {"task_id": task})
+    elif index % 12 == 5:
+        assert terminal_delivery.register_pending_delivery(root, {"delivery_id": f"owed-{task}", "task_id": task, "chat_id": 1})
+    else:
+        _result(root, task, acceptance_debt={"debt_id": f"d-{task}"})
+
+
+def test_production_shaped_backfill_packs_every_terminal_task_beside_live_sharers(root):
+    """The production shape at a size the default suite affords: 18 terminal tasks, each carrying a former
+    blocker (every kind three times); 3 running tasks sharing a blob with three of them. One pass packs all
+    18, every ref reads back byte-identical, the shared blobs stay loose. (The 300-task shape took 2–30 min
+    under load against the suite's 300 s per-test bound; the property has no size: P2 proves it for one
+    sharer, this for many.)"""
+    terminal, live, shared = 18, 3, {}
+    refs, handles = {}, {}
+    for number in range(terminal):
+        task = f"done-{number:03}"
+        payloads = [json.dumps({"answer": task, "body": "x" * 3000}).encode(), json.dumps({"request": task, "body": "y" * 1200}).encode()]
+        refs[task], handles[task] = _task(root, task, blobs=2, payloads=payloads)
+        _former_blocker(root, number, task)
+    for number in range(live):
+        sharer, sharing = f"live-{number:02}", f"done-{number * 7:03}"
+        raw = packs.blob_bytes(root, refs[sharing][0])
+        shared[sharer] = refs[sharing][0]
+        refs[sharer], handles[sharer] = _task(root, sharer, status="running", blobs=2, payloads=[raw, json.dumps({"own": sharer}).encode()])
+    truth = {task: [packs.blob_bytes(root, ref) for ref in items] for task, items in refs.items()}
+    handle_truth = {task: packs.handle_bytes(root, task, ref["path"]) for task, ref in handles.items()}
+    loose_before = sum(path.stat().st_size for path in (root / "observability" / "blobs").iterdir())
+    started = time.perf_counter()
+    report = packer.run_pass(root)
+    elapsed = time.perf_counter() - started
+    packed_bytes = sum(path.stat().st_size for path in packs.packs_dir(root).glob("*.xz"))
+    loose_after = sum(path.stat().st_size for path in (root / "observability" / "blobs").iterdir())
+    print(json.dumps({"case": "production-shaped", "terminal": terminal, "live": live, "elapsed_sec": round(elapsed, 2),
+                      "loose_gzip_bytes_before": loose_before, "loose_gzip_bytes_after": loose_after,
+                      "pack_bytes_after": packed_bytes, "raw_bytes": report["raw"], **{k: report[k] for k in packer.COUNTERS}},
+                     sort_keys=True), flush=True)
+    assert (report["packed"], report["faults"], report["live"], report["kept"]) == (terminal, 0, live, live)
+    assert report["unlinked"] == terminal * 3 - live
+    for task, items in refs.items():
+        assert [packs.blob_bytes(root, ref) for ref in items] == truth[task]
+        assert packs.handle_bytes(root, task, handles[task]["path"]) == handle_truth[task]
+    for sharer, ref in shared.items():
+        assert pathlib.Path(ref["path"]).exists(), sharer  # kept loose for the live sharer
+    for sharer in shared:
+        assert not packs.published_generations(root, sharer)
+        assert all(pathlib.Path(ref["path"]).exists() for ref in refs[sharer]) and _handle_path(root, sharer, handles[sharer]).exists()

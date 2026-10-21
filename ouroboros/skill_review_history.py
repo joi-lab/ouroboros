@@ -558,6 +558,7 @@ def append_history(
     rebuttal_sha256: str = "",
     replayed_from_ts: str = "",
     wave_id: str = "",
+    panel: Optional[Dict[str, Any]] = None,
 ) -> None:
     try:
         payload: Dict[str, Any] = {
@@ -571,6 +572,8 @@ def append_history(
             payload["single_reviewer_no_diversity"] = True
         if raw_actor_records:
             payload["raw_actor_records"] = list(raw_actor_records)
+        if panel:
+            payload["panel"] = dict(panel)
         # Max-Review-Cycles facts (Q17/Q23): the paid-dispatch fact and the
         # panel contract identity ride the history row — counts and free-replay
         # decisions are DERIVED from this ledger (P7, no counter file).

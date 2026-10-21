@@ -581,11 +581,11 @@ def test_history_failed_main_keeps_outcome_and_post_work_controls_until_close(tm
         root_phase_checkpoint={"post_task_synthesis": post_work},
         model_waits={wait["wait_id"]: wait},
     )
-    with (tmp_path / "logs" / "progress.jsonl").open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps({
-            "type": "task_model_wait", "task_id": "fin-task", "chat_id": 1,
-            "ts": "2026-08-17T10:00:06+00:00", **wait,
-        }) + "\n")
+    from ouroboros import dialogue_store as ds
+    ds.append(tmp_path, "progress", {
+        "type": "task_model_wait", "task_id": "fin-task", "chat_id": 1,
+        "ts": "2026-08-17T10:00:06+00:00", **wait,
+    })
 
     messages = _history_messages(tmp_path)
     rows = [m for m in messages if m.get("task_id") == "fin-task"]

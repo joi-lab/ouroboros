@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from ouroboros.utils import iter_jsonl_objects, jsonl_chain_handles, utc_now_iso
+from ouroboros.utils import utc_now_iso
 from ouroboros.store import StoreError
 
 DELIVERY_VERSION = 1
@@ -109,13 +109,13 @@ class PresenceDeliveryRecorder:
 
     Only this Host receipt writer owns these keys. Other chat writers and
     rotation do not invalidate its incrementally maintained projection. A new
-    Host rebuilds once; an ambiguous required write discards the projection.
+    Host probes the named receipt on its first use; an ambiguous required write discards the projection.
 
     ``record`` reports ``history_coverage``: ``indexed`` (the last rebuild plus this
     writer's own writes; concurrent chat writers are not re-scanned) or ``gapped``
     (a retained row was malformed, so ``duplicate=false`` is not proof of absence).
-    A physically unreadable archive raises rather than reading as empty history.
-    Each append starts on a JSONL record boundary, even after a torn tail.
+    Pending or failed imports raise rather than reading as empty history.
+    Receipt reads probe their deterministic client id, never another room's history.
     """
 
     def __init__(self, data_dir: Path) -> None:
@@ -123,38 +123,41 @@ class PresenceDeliveryRecorder:
         self._lock = threading.Lock()
         self._index: dict[tuple[str, ...], str] | None = None
         self._history_gapped = False
+        self._checked: set[tuple[str, ...]] = set()
 
-    def _rebuild(self) -> dict[tuple[str, ...], str]:
+    def _rebuild(self, client_id: str) -> dict[tuple[str, ...], str]:
+        from ouroboros import dialogue_store as ds
+
         index: dict[tuple[str, ...], str] = {}
-        gaps: set[str] = set()
-        with jsonl_chain_handles(self.data_dir / "logs" / "chat.jsonl", strict=True) as handles:
-            for path, handle in handles:
-                for row in iter_jsonl_objects(path, _handle=handle, gap_reasons=gaps):
-                    try:
-                        parsed = _payload_from_row(row)
-                    except (TypeError, AttributeError, ValueError):
-                        # A malformed retained receipt is also an unobserved
-                        # interval, not proof that its identity never existed.
-                        gaps.add("invalid_presence_delivery_row")
-                        continue
-                    if parsed is None:
-                        continue
-                    skill, payload = parsed
-                    key = _key(skill, payload)
-                    digest = hashlib.sha256(_canonical(payload)).hexdigest()
-                    if key in index and index[key] != digest:
-                        raise OSError("conflicting retained presence delivery receipts")
-                    index[key] = digest
-        self._history_gapped = bool(gaps)
+        ds.require_imported(self.data_dir, "chat")
+        self._history_gapped = bool(ds.range_coverage(self.data_dir, "chat")["gaps"])
+        for entry in ds.iter_probes(self.data_dir, "chat", [("client_message_id", client_id)]):
+            try:
+                parsed = _payload_from_row(entry.row)
+            except (TypeError, AttributeError, ValueError):
+                self._history_gapped = True
+                continue
+            if parsed is None:
+                continue
+            skill, payload = parsed
+            key = _key(skill, payload)
+            digest = hashlib.sha256(_canonical(payload)).hexdigest()
+            if key in index and index[key] != digest:
+                raise OSError("conflicting retained presence delivery receipts")
+            index[key] = digest
         return index
 
     def record(self, skill: str, value: Any) -> dict[str, Any]:
         payload = validate_delivery(value)
         key = _key(skill, payload)
         digest = hashlib.sha256(_canonical(payload)).hexdigest()
+        client_id = "presence-delivery:" + hashlib.sha256(_canonical({"key": key})).hexdigest()
         with self._lock:
             if self._index is None:
-                self._index = self._rebuild()
+                self._index, self._checked = {}, set()
+            if key not in self._checked:
+                self._index.update(self._rebuild(client_id))
+                self._checked.add(key)
             previous = self._index.get(key)
             if previous is not None:
                 if previous != digest:
@@ -189,7 +192,7 @@ class PresenceDeliveryRecorder:
                     "out" if payload["state"] in {"delivered", "accepted"} else "system",
                     _stable_numeric_id("presence-conversation", conversation_key), 0,
                     payload["text"], fmt=payload["format"], source=f"skill:{skill}",
-                    client_message_id="presence-delivery:" + hashlib.sha256(_canonical({"key": key})).hexdigest(),
+                    client_message_id=client_id,
                     transport=transport, task_id=task_id, record_type="presence_delivery",
                     drive_root=self.data_dir, require_write=True, ensure_record_boundary=True,
                 )

@@ -70,8 +70,11 @@ export function resetOutcome(action = {}) {
             ? 'Resource reads are shown below with their own freshness.'
             : 'Usage and remaining resets have not been updated. Refresh reads this account without repeating the reset.',
     };
+    // A reset in flight or not yet confirmed is a quiet fact (never amber, docs/DESIGN.md "Status marks"); the provider's
+    // own "already used" is a warning worth reading.
     if (!receipt || ['pending', 'unknown', 'already_used'].includes(receipt.outcome)) return {
-        tone: 'warn', title: receipt?.state === 'running' ? 'Reset is in progress' : 'Reset outcome is unconfirmed',
+        tone: receipt?.outcome === 'already_used' ? 'warn' : 'neutral',
+        title: receipt?.state === 'running' ? 'Reset is in progress' : 'Reset outcome is unconfirmed',
         body: receipt?.outcome === 'already_used'
             ? 'The provider reports that the reset was already used. This does not confirm that this request applied it.'
             : 'The provider may have applied this request. Check the same request without creating another reset.',

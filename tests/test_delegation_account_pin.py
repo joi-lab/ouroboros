@@ -51,13 +51,15 @@ def test_a_pinned_route_is_judged_by_its_own_subject_exactly():
         constraint = ({"used_ratio": 1.0, "resets_at": reset} if spent
                       else {"used_ratio": 0.4, "resets_at": reset})
         return {"subject": {"harness": "some-route", "subject_id": profile},
-                "freshness": "fresh", "constraints": [constraint]}
+                "freshness": "fresh", "constraints": [constraint],
+                "availability": {"state": "exhausted" if spent else "available", "resets_at": reset if spent else None}}
 
     class _Quota:
         def __init__(self, snaps, absences=None):
             self._snaps, self._absences = snaps, absences
-        def quota_snapshots(self): return self._snaps
-        def quota_absences(self): return self._absences or []
+        def quota_state(self, **_scope):
+            return {"snapshots": self._snaps, "absences": self._absences or [],
+                    "availability_scope": {"model": None, "requestKind": "text", "basis": "quota_block"}}
 
     spent_pin_live_sibling = _Quota([_snap("koshak", spent=True),
                                      _snap("acct-b", spent=False)])
@@ -244,7 +246,8 @@ def test_a_retry_health_check_judges_the_stored_pin_not_the_current_setting(
         constraint = ({"used_ratio": 1.0, "resets_at": reset} if spent
                       else {"used_ratio": 0.4, "resets_at": reset})
         return {"subject": {"harness": "some-route", "subject_id": profile},
-                "freshness": "fresh", "constraints": [constraint]}
+                "freshness": "fresh", "constraints": [constraint],
+                "availability": {"state": "exhausted" if spent else "available", "resets_at": reset if spent else None}}
 
     quota: dict = {"snapshots": []}
     script = ["transport_error", "ok"]
@@ -257,6 +260,9 @@ def test_a_retry_health_check_judges_the_stored_pin_not_the_current_setting(
                                    "accessProfilesSupported": ["readonly"]}]}
         def quota_snapshots(self): return quota["snapshots"]
         def quota_absences(self): return []
+        def quota_state(self, *, model=None, request_kind="text", **_kw):
+            return {"snapshots": quota["snapshots"], "absences": [],
+                    "availability_scope": {"model": model, "requestKind": request_kind, "basis": "quota_block"}}
         def find_project_id(self, root): return "prj-existing"
         def start_run(self, request, *, idempotency_key=""):
             bodies.append(request)

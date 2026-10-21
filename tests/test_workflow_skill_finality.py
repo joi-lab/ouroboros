@@ -146,8 +146,9 @@ def test_toggle_schema_states_the_gate_its_enable_owner_obeys(subject, monkeypat
     assert json.loads(skill_exec._handle_toggle_skill(ctx, skill="demo", enabled=False))["enabled"] is False
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
     refused = skill_exec._handle_toggle_skill(ctx, skill="demo", enabled=True)
-    assert refused.startswith("⚠️ SKILL_TOGGLE_ERROR") and (
-        "cannot enable until the review gate permits the current bytes: a current executable reviewer verdict\"") in refused
+    # Inverted pin: the refusal is typed (code + one owner sentence); the gate's need moved to ``detail``.
+    assert refused.startswith("⚠️ SKILL_TOGGLE_ERROR") and '"code": "acceptance"' in refused and (
+        '"detail": "a current executable reviewer verdict"') in refused
 
 
 def test_refusals_name_the_authorities_their_gate_admits(subject, monkeypatch):
@@ -167,7 +168,7 @@ def test_refusals_name_the_authorities_their_gate_admits(subject, monkeypatch):
         assert ran.startswith("⚠️ SKILL_EXEC_BLOCKED") and f"Execution needs {needed}. " in ran, ran
         save_enabled(ctx.drive_root, "demo", False)
         toggled = skill_exec._handle_toggle_skill(ctx, skill="demo", enabled=True)
-        assert f"cannot enable until the review gate permits the current bytes: {needed}\"" in toggled, toggled
+        assert '"error": "It turns on after a review passes."' in toggled and f'"detail": "{needed}"' in toggled, toggled
         granted = prepare_skill_grant(load_skill(directory, ctx.drive_root), ctx.drive_root, [])
         assert granted["error"] == f"key and permission grants need the review gate to permit the current bytes: {needed}"
         assert granted["review_gate"]["blocking_reason"] == "review_pending"
@@ -187,7 +188,7 @@ def test_grant_prompt_does_not_ask_for_a_review_the_gate_already_permits(subject
     gate = loaded.review.gate_for(loaded.content_hash)
     assert (loaded.review.status, gate["blocking_reason"]) == ("pending", "author_accepted_advisory")
     refused = skill_exec._handle_toggle_skill(ctx, skill="demo", enabled=True)
-    assert "requested key and permission grants" in refused, "the gate passed; grants are still required"
+    assert "Grant it the keys and permissions" in refused, "the gate passed; grants are still required"
     save_enabled(ctx.drive_root, "demo", True)
     ran = skill_exec._handle_skill_exec(ctx, skill="demo", script="hello.py")
     assert ran.startswith("⚠️ SKILL_EXEC_GRANT_REQUIRED") and "inject_chat" in ran

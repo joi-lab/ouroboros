@@ -1,11 +1,12 @@
 ---
 name: unix_computer_use
 description: Local and remote desktop observation/input tools with coordinate normalization (local macOS/Linux by default; optional OSWorld HTTP and SSH Mac backends).
-version: 0.4.3
+version: 0.5.0
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
 runtime: python3
+os: [darwin, linux]
 permissions: [tool, subprocess, net]
 env_from_settings: []
 when_to_use: The user asks Ouroboros to inspect a desktop, take a screenshot, click/type/press keys, drag, or operate a local/explicitly configured remote GUI under human or benchmark supervision.
@@ -18,8 +19,11 @@ model_experience:
 
 This bundled extension exposes a reviewable computer-use substrate for local
 macOS/Linux desktops and explicitly configured remote targets. **All actions are
-for supervised, low-risk workflows under human or benchmark observation.** Windows
-support is deferred to a separate backend/skill.
+for supervised, low-risk workflows under human or benchmark observation.** It is
+offered and on by default on macOS and Linux (`os`); Windows desktops use
+`windows_computer_use`. A previously enabled Unix remote skill stays available
+on Windows through later OFF/ON. Actor-less legacy ON is retained too: manual
+and early automatic choices cannot be distinguished. This adds no local Windows backend.
 
 Tools:
 
@@ -112,10 +116,11 @@ Connection registry:
   target must never land on the host).
 
 Permissions note: the remote backends require the `net` permission. `net` needs
-no owner grant (skill grants only gate `inject_chat`/`subscribe_event`), but it
-does remove this skill from the launcher's native auto-enable class — so on a
-fresh install the owner must ENABLE it explicitly (a benchmark runner does this
-via `save_enabled`). Local-only computer use is unaffected once enabled.
+no owner grant (skill grants only gate `inject_chat`/`subscribe_event`), and the
+launcher names this skill among the bundled seeds that start enabled anyway; the
+network is used for configured connections, which the owner, a runner or the
+agent can add via `add_connection`. Agents should use only explicitly provided
+targets as described above. An owner who turns the skill off keeps it off across updates.
 
 The skill intentionally does not hide OS permission requirements, and missing
 backends produce explicit errors with the capability report instead of

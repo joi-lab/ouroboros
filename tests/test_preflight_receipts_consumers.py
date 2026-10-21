@@ -22,6 +22,7 @@ from ouroboros import preflight_receipts as receipts
 from ouroboros import preflight_runner as pr
 from ouroboros import review_ledger
 from ouroboros.commit_admission import run_tests_preflight_with_proof
+from ouroboros.test_evidence import diagnostic_directory
 from ouroboros.tools.review_helpers import _run_review_preflight_tests
 from tests import _contributor_packet_shared as shared
 from tests.test_preflight_receipts import (  # noqa: F401 -- gate_env: the shared autouse gate environment
@@ -407,7 +408,8 @@ def test_a_contributor_rerun_on_the_same_review_drive_reuses_the_proposals_run(t
     head, head_tree = _git(repo, "rev-parse", "HEAD"), _git(repo, "rev-parse", "HEAD^{tree}")
     _git(repo, "checkout", "-q", "--detach", base)
     monkeypatch.setattr(module, "REPO", repo)
-    drive = tmp_path / "review-drive"
+    # The wrapper's persistent review drive lives outside this test's disposable scratch.
+    drive = diagnostic_directory(tmp_path / "review-drive", "contributor-rerun")
     proposal = {"base_sha": base, "head_sha": head}
 
     first, refusal = module._contributor_tests_preflight(ToolContext(repo_dir=repo, drive_root=drive), proposal,

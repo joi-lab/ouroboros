@@ -691,8 +691,8 @@ def test_confirm_absorb_requires_positive_evidence(tmp_path, monkeypatch):
     first = _commit(clone, "one")
     data_root = tmp_path / "data"
     _campaign(data_root, 0)
-    state = {"sha": first[:8], "uptime": 100}
-    monkeypatch.setattr(run_live_lanes, "_api", lambda base, method, path, payload=None, timeout=0: dict(state))
+    state = {"sha": first[:8], "born": time.time() - 100}  # served uptime runs on while real Git work below takes time
+    monkeypatch.setattr(run_live_lanes, "_api", lambda *_a, **_k: {"sha": state["sha"], "uptime": int(time.time() - state["born"])})
     pre = run_live_lanes.self_mod_snapshot(_FakeServer(), clone, data_root)
     assert pre["head"] == first and pre["sha"] == first[:8] and pre["cycles"] == 0 and pre["state_read"]
     # No promotion: the runtime declined, and a liveness check alone would have said PASS.
@@ -704,14 +704,14 @@ def test_confirm_absorb_requires_positive_evidence(tmp_path, monkeypatch):
     second = _commit(clone, "two")
     _campaign(data_root, 1, {"commit_sha": second, "cycle_outcome": "absorbed", "restart_verified": True,
                              "verified_by": "boot_reconciliation"})
-    state.update({"sha": second[:8], "uptime": 100})
+    state["sha"] = second[:8]
     out = run_live_lanes.confirm_absorb(_FakeServer(absorb={"absorbed": True, "reason": "absorbed"}), clone,
                                         data_root, pre, timeout=1, ready_timeout=1)
     assert out["confirmed"] is False and out["reason"] == "not_restarted" and out["head_moved"] is True
     assert out["transaction"] == {"commit_sha": second, "cycle_outcome": "absorbed", "restart_verified": True,
                                   "verified_by": "boot_reconciliation"}
     # Every fact present: counter advanced, sha moved, uptime reset, healthy, serving the clone HEAD.
-    state["uptime"] = 0
+    state["born"] = time.time()
     out = run_live_lanes.confirm_absorb(_FakeServer(absorb={"absorbed": True, "reason": "absorbed"}), clone,
                                         data_root, pre, timeout=1, ready_timeout=1)
     assert out["confirmed"] is True and out["reason"] == "absorbed" and out["serving_head"] is True
@@ -1129,7 +1129,7 @@ def test_sm1_changes_the_shared_palette_for_both_documents():
     assert len(text.splitlines()) == len(original.splitlines())
     palette = scenarios.sm1_palette_tokens(text)
     assert scenarios.SM1_REQUIRED_PALETTE <= palette.keys() and all(palette.values())
-    assert all(f"--accent-{alpha}" in palette for alpha in ("04", "05", "08", "10", "12", "18", "22", "25", "35", "45", "55", "65"))
+    assert all(f"--accent-{alpha}" in palette for alpha in ("04", "05", "08", "10", "12", "18", "22", "25", "35", "45", "55"))
     for document, prefix in (("web/index.html", "/static"), ("web/onboarding_template.html", "/onboarding/static")):
         assert f'href="{prefix}/ui.css"' in (REPO_ROOT / document).read_text(encoding="utf-8")
 

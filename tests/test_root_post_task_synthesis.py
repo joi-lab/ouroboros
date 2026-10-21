@@ -13,6 +13,8 @@ the one memory call left, the fallback draft of one unit, is made only while
 consciousness is off.
 """
 
+from tests import _dialogue as dialogue_test
+
 import json
 from types import SimpleNamespace
 
@@ -411,7 +413,7 @@ def _capture_facts_row(tmp_path, usage, *, task_overrides=None):
         llm_trace=trace,
         drive_logs=drive_logs,
     )
-    [row] = [json.loads(line) for line in (drive_logs / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    [row] = dialogue_test.log_rows(drive_logs / "chat.jsonl")
     return row
 
 

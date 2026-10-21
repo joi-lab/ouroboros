@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -184,6 +186,9 @@ _NOTIFY = Index("notify", {
     "project_finished": "{icon} {label} · {word}{tail}",
     "project_finished_details": "{label} · finished{tail}. Review and verification details are in the app.",
     "budget": "⚠️ Budget: {pct}% (${spent} / ${total})",
+    "cost_final": "${amount}",
+    "cost_up_to": "up to ${amount}",
+    "cost_tracked": "Tracked: {cost}",
 }, "push notifications about finished tasks and the budget")
 _PHASE_ICONS = {"done": "✅", "warn": "⚠️", "error": "❌", "cancelled": "🚫"}
 
@@ -239,6 +244,27 @@ def _announce_summary(row: Dict[str, Any], *, notify_all: bool) -> bool:
     return notify_all
 
 
+def _cost_text(presentation: Any, lang: str) -> str:
+    """The task card's own cost words (web ``costPresentationMeta``) for a root's whole-tree
+    carrier: a final amount, ``up to`` while costs may still arrive, ``Tracked:`` when some
+    step has no price. Nothing known is no money part here, never a zero or a guess; the
+    retired ``cost_usd`` alias is not a current price (#971)."""
+    if (not isinstance(presentation, dict) or presentation.get("scope") != "root_tree"
+            or not presentation.get("has_rows")):
+        return ""
+    try:
+        amount = float(presentation["tracked_amount"])
+    except (KeyError, TypeError, ValueError):
+        return ""
+    if not math.isfinite(amount):
+        return ""
+    # ``toFixed(2)``: the exact binary value, a tie going up, as the card rounds it.
+    money = str(Decimal(amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    texts = _NOTIFY[lang]
+    cost = texts.format("cost_final" if presentation.get("tracked_final") else "cost_up_to", amount=money)
+    return texts.format("cost_tracked", cost=cost) if presentation.get("has_unpriced") else cost
+
+
 def _completion_text(row: Dict[str, Any], tid: str, lang: str, parts=()) -> str:
     """Render the host's compact view on both existing completion transports."""
     parts = list(parts)
@@ -268,8 +294,13 @@ async def _check_tasks_notify(
     *, trust_env: bool = False,
 ) -> Tuple[Optional[BaseException], bool]:
     """Returns (last transient send failure if any, whether a send was delivered)."""
+    from ouroboros.store import StoreError
+
     notify_all = _notify_enabled(settings, "TELEGRAM_NOTIFY_TASKS")
-    summaries = _summary_ids_in_tail(api)
+    try:
+        summaries = _summary_ids_in_tail(api)
+    except StoreError as exc:
+        return exc, False  # An unknown window cannot initialize or advance the seen ids.
     if "notified_task_ids" not in state:
         # First observation → treat the existing backlog as seen
         # so enabling the toggle doesn't blast a notification for every old task.
@@ -297,11 +328,8 @@ async def _check_tasks_notify(
             tr = load_task_result(_data_dir(api), tid) or {}
         except Exception:
             tr = {}
-        try:
-            if tr.get("cost_usd") is not None:
-                parts.append(f"${float(tr.get('cost_usd')):.2f}")
-        except (TypeError, ValueError):
-            pass
+        if cost := _cost_text(tr.get("cost_presentation"), lang):
+            parts.append(cost)
         msg = _completion_text(e, tid, lang, parts)
         from ouroboros.chat_chain import format_address, row_address
 

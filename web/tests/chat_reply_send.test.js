@@ -57,7 +57,7 @@ function fixture() {
 }
 
 const replyButton = (bubble) => bubble.children.find((child) => child.className === 'chat-message-actions')
-    ?.children.find((child) => child.className === 'chat-message-reply');
+    ?.children.find((child) => child.classList.contains('chat-message-reply'));
 
 test('Reply on an answer sends the next message with that row\'s address; the echo quotes it; the strip leaves', async () => {
     const f = fixture();

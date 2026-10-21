@@ -1,6 +1,7 @@
 """Focused v6.64 Project lifecycle, canonical-dialogue, and sidebar guards."""
 
 from __future__ import annotations
+from tests._dialogue import advance_room_revision
 
 import asyncio
 import json
@@ -10,19 +11,7 @@ import pytest
 
 
 def test_project_lifecycle_revision_binding_and_no_resurrection(tmp_path):
-    from ouroboros.projects_registry import (
-        begin_project_deletion,
-        bind_task_to_project,
-        complete_project_deletion,
-        create_project,
-        get_project,
-        get_reserved_project,
-        increment_project_visible_revision,
-        list_projects,
-        project_binding_for_task,
-        reconcile_projects,
-        reserved_project_chat_ids,
-    )
+    from ouroboros.projects_registry import begin_project_deletion, bind_task_to_project, complete_project_deletion, create_project, get_project, get_reserved_project, list_projects, project_binding_for_task, reconcile_projects, reserved_project_chat_ids
 
     project = create_project(tmp_path, "alpha", name="Alpha")
     memory_dir = tmp_path / "projects" / "alpha"
@@ -50,13 +39,13 @@ def test_project_lifecycle_revision_binding_and_no_resurrection(tmp_path):
     assert binding["source_ref"] == first_ref
     assert binding["source_text"] == owner_text
 
-    assert increment_project_visible_revision(tmp_path, project_id="alpha")["visible_revision"] == 1
-    assert increment_project_visible_revision(tmp_path, chat_id=project["chat_id"])["visible_revision"] == 2
+    assert advance_room_revision(tmp_path, project_id="alpha")["visible_revision"] == 1
+    assert advance_room_revision(tmp_path, chat_id=project["chat_id"])["visible_revision"] == 2
     deleting = begin_project_deletion(tmp_path, "alpha")
     assert deleting["lifecycle"] == "deleting"
     assert deleting["routing_generation"] == 1
     assert get_project(tmp_path, "alpha") is None  # admission is already closed
-    assert increment_project_visible_revision(tmp_path, project_id="alpha") is None
+    assert advance_room_revision(tmp_path, project_id="alpha") is None
     with pytest.raises(ValueError, match="cannot accept bindings"):
         bind_task_to_project(tmp_path, "task-after-fence", "alpha", origin={"absent": "system"})
 
@@ -402,8 +391,10 @@ def test_project_sidebar_and_menu_static_contracts():
     css = (root / "web" / "style.css").read_text(encoding="utf-8")
 
     assert 'class="nav-projects-header"' in html
-    assert '<svg class="nav-chevron"' in html
-    assert 'aria-label="New project"><svg' in html
+    # The header's chevron and "+" are the shell's shared glyphs, rendered from the page registry (pages.js).
+    pages = (root / "web" / "modules" / "pages.js").read_text(encoding="utf-8")
+    assert '<span class="nav-chevron" aria-hidden="true">${SHELL_ICONS.chevron}</span>' in pages
+    assert 'aria-label="New project">${SHELL_ICONS.plus}</button>' in pages
     assert ".nav-projects-header" in css
     assert ".nav-projects-header .nav-row-meta:not(:empty)" in css
     projects_css = css[css.index(".nav-projects-header"):css.index("/* New Project dialog */")]
@@ -412,11 +403,10 @@ def test_project_sidebar_and_menu_static_contracts():
     assert "project_seen_revision" in app
     assert "acknowledgeProjectAfterPaint" in app
     assert "inst.refreshHistory?.({ revision })" in app
-    assert "paint?.read" in app  # painted AND at the newest messages (DESIGN "Project unread dot")
+    assert "paint?.read" in app  # painted AND at the newest messages (DESIGN "Unread")
     assert "await markProjectViewed(project.id, revision)" in app
     assert "async function markProjectViewed" in app
     assert "await fetchJson('/api/ui/preferences'" in app
-    assert "item.append(btn, trailing)" in app
     assert "hideProjectFromSidebar" not in app
     assert "project_last_viewed" not in app
     assert "project_hidden" not in app
@@ -449,14 +439,13 @@ def test_project_activity_stays_out_of_main_static_contract():
     root = Path(__file__).resolve().parents[1]
     chat = (root / "web" / "modules" / "chat.js").read_text(encoding="utf-8")
 
-    unread_fn = chat[
-        chat.index("function incrementUnreadIfNeeded"):
-        chat.index("onWs('typing'")
-    ]
-    project_guard = unread_fn.index("if (isKnownProjectFrame(msg)) return;")
-    increment = unread_fn.index("state.unreadCount++;")
-    assert project_guard < increment
-    assert "Project visible_revision is the sole unread authority" in unread_fn
+    # Main's number is its room revision against its read cursor, the comparison a Project row makes (owner Q1 = B,
+    # 19.10.2026); no frame of any room counts in the browser (tests/test_main_unread_counter.py: another room's
+    # message never moves Main's revision).
+    assert "incrementUnreadIfNeeded" not in chat and "unreadCount" not in chat
+    app = (root / "web" / "app.js").read_text(encoding="utf-8")
+    assert "observeMainRevision(data.main_visible_revision);" in app
+    assert "Math.max(0, revision - seen)" in app
 
     # Main has its own compact host-stamped completion row. Project progress,
     # logs and ordinary summaries never enter its live fan-out.
@@ -484,8 +473,6 @@ def test_project_activity_stays_out_of_main_static_contract():
     assert "PROJECT_ROW_TYPES.has(msg.system_type)" in fanout
     assert "appendTaskSummaryToLiveCard(msg);" in fanout
     assert "updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: true });" in fanout
-    assert "incrementUnreadIfNeeded(msg);" in fanout
-    assert "incrementUnreadIfNeeded();" not in chat
 
     # History replay renders the durable compact completion independently of
     # task-card reconstruction.
@@ -495,7 +482,6 @@ def test_project_activity_stays_out_of_main_static_contract():
     ]
     assert "appendTaskSummaryToLiveCard(msg" in history
     assert "PROJECT_ROW_TYPES.has(msg.system_type)" in history
-    assert "incrementUnreadIfNeeded" not in history
     # The lifecycle row points at its Project through the door, which alone decides the
     # fallback word: a missing or never-given name reads `Project`, never the raw id.
     project_answer = (root / "web" / "modules" / "project_answer.js").read_text(encoding="utf-8")

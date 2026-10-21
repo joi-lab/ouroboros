@@ -126,6 +126,8 @@ def mark_pending(drive_root: Any, *, origin: str) -> str:
 
 def supervisor_evidence(drive_root: Any) -> Tuple[str, str]:
     """``("none"|"present"|"unknown", path)``: did a supervisor already run here?"""
+    from ouroboros import dialogue_store as ds
+
     root = pathlib.Path(drive_root)
     try:  # only proven absence is absence; a file where a directory belongs is unknown
         for rel in _EVIDENCE_FILES:
@@ -134,6 +136,10 @@ def supervisor_evidence(drive_root: Any) -> Tuple[str, str]:
                 return "present", str(rel)
             except FileNotFoundError:
                 confirm_absent(root / rel)
+        if ds.present(root) and ds.stream_end(root, "chat") > 0:
+            return "present", str(ds.STORE_REL)
+        # Before the first cutover an older body's nonempty live file is also
+        # evidence. This is a stat only; initialization never imports history.
         for rel in _EVIDENCE_NONEMPTY_FILES:
             try:
                 if os.lstat(root / rel).st_size > 0:
@@ -149,6 +155,8 @@ def supervisor_evidence(drive_root: Any) -> Tuple[str, str]:
                 confirm_absent(root / rel)
     except OSError as exc:
         return "unknown", f"{type(exc).__name__} errno={exc.errno}"
+    except ds.StoreError as exc:
+        return "unknown", str(exc)
     return "none", ""
 
 

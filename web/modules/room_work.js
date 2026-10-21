@@ -1,51 +1,42 @@
 /**
  * The room's work status in its bar (DESIGN "Room work status"). The bar's one status control, right after
- * the room's title, paints the word, tone and dots the chat's producer gives it and opens this room's current
- * work as one Shade under the bar, in Main and a Project alike. Presentation only, over the chat instance's
- * own owners; it keeps no task state, phase vocabulary, poller, pager, question index or permission:
- *   membership  this room's census (`activeDirectActivities`), the owner's unconfirmed sends
- *               (`pendingSubmissions`) and unfinished foreground cards the census does not list
- *               (`liveCardRecords`); a Project with nothing else keeps its latest represented root card
- *   words       task_phase_chip.js: a loaded card's own chip, else the census presenter
- *   controls    task_control_menu.openTaskControls for the row's exact activity id, offered only while
- *               the current census confirms it; a loaded card stops through its own card path
+ * the room's title, paints the word, tone and mark the chat's producer gives it (the room in the server's work
+ * projection, work_status.roomStatusView; status_mark.js draws the mark) and opens this room's work as one Shade under
+ * the bar, in Main and a Project alike. Presentation only, over the chat instance's own owners; it keeps no task
+ * state, phase vocabulary, poller, pager, question index or permission:
+ *   membership  this room's works (`works()`, the instance's reconciled projection: one row per work, helpers and
+ *               Continue episodes inside it), the owner's unconfirmed sends (`pendingSubmissions`); a Project with
+ *               nothing else keeps its latest represented root card
+ *   words       work_status.workRowView: the work's word, its line beside it and its mark
+ *   controls    the work's own controls (work_status.openWorkControls), offered only while the current projection
+ *               confirms them; a loaded card stops through its own card path
  *   question    the instance's revealQuestion (chat_decision.js); it navigates and never answers
  *   reading     the instance's reading intent and timeline anchors (`Back to reading`); an unloaded row reads
  *               the page around its task through the instance's pager (`around`), Back its own page (`revisit`)
  */
 import { fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
-import { bindContentButton, isForegroundLiveCard } from './chat_activity.js';
+import { bindContentButton } from './chat_activity.js';
 import { compareHistoryPosition } from './chat_history_replay.js';
 import { createHistoryReveal } from './chat_history_reveal.js';
 import { fmt, tr } from './i18n.js';
 import { taskCancelPending } from './log_events.js';
+import { desiredLiveCardPhase, replayTerminalPhase } from './task_phase_chip.js';
+import { createStatusMark, markView, paintStatusMark } from './status_mark.js';
+import { closeTaskControlMenu, createTaskResumeButton, requestStop, taskControlBusy } from './task_control_menu.js';
 import {
-    activityWaitPhase, censusTaskFacts, censusTaskPhase, desiredLiveCardPhase, replayTerminalPhase,
-} from './task_phase_chip.js';
-import {
-    REUSABLE_TASK_IDS, closeTaskControlMenu, createTaskResumeButton, openTaskControls, requestStop, resumeRunEligibility,
-    taskControlActions, taskControlBusy,
-} from './task_control_menu.js';
+    OUTCOME_TONES, amberNote, clock, openWorkControls, workControls, workMenuActions, workQuestion, workRowView,
+} from './work_status.js';
 import { showToast } from './toast.js';
 
 const NAME_CHARS = 160;
 const REPLY_CHARS = 60;
-// A known outcome keeps its status colour; an unfinished lifecycle (Finalizing…) is said beside it.
-const OUTCOME_TONES = { done: 'done', warn: 'caution', cancelled: 'caution', error: 'failed', timeout: 'failed', lifecycle_error: 'failed' };
 const GROUP_RANK = { needs: 0, progress: 1, waiting: 2, unconfirmed: 3, latest: 4 };
-const NO_CONTROLS = Object.freeze({ menu: false, resume: false });
 const clean = (value) => String(value ?? '').replace(/\s+/g, ' ').trim();
+const listOf = (value) => (Array.isArray(value) ? value : []);
 const clip = (text, max) => (text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text);
 let sequence = 0;
-
-// An old parked turn must not read as today's: another day names its date.
-function clock(seconds) {
-    const date = new Date(Number(seconds) * 1000);
-    if (!Number(seconds) || !Number.isFinite(date.getTime())) return '';
-    return new Date().toDateString() === date.toDateString()
-        ? date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        : date.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-}
+// A status sentence's own dot speaks only at rest: the room at rest says Online beside its green dot.
+const AT_REST = Object.freeze({ shape: 'dot', hue: 'ok' });
 
 /** The latest represented root card: the newest unfinished one, else the newest of all. */
 export function latestRepresentedRoot(records = []) {
@@ -55,32 +46,23 @@ export function latestRepresentedRoot(records = []) {
     return roots.filter((record) => !record.finished).at(-1) || roots.at(-1) || null;
 }
 
-/** A row's one colour, from the presenter's own fields and the row's facts, never from its words. */
-export function roomWorkTone(view = {}, { confirmed = true, settled = false } = {}) {
-    const outcome = OUTCOME_TONES[view.phase];
-    if (outcome) return outcome;
-    if (settled) return 'ended';
-    if (!confirmed || view.phase === 'unknown') return 'unknown';
-    if (view.waiting || view.phase === 'waiting' || view.phase === 'paused') return 'wait';
-    if (view.phase === 'queued') return 'queued';
-    return view.motion ? 'live' : 'quiet';
+/** A card's own words as a row's view (a settled row, the Project's latest root): a known outcome keeps its tone and
+ *  its dot; any other state of a card is unconfirmed here (a ring). The owner's move is a work's turn, never a card's. */
+export function cardRowView(view = {}, { settled = false } = {}) {
+    const outcome = OUTCOME_TONES[view.phase] ? String(view.phase) : '';
+    return { word: String(view.text || ''), secondary: String(view.secondary || ''),
+        tone: OUTCOME_TONES[outcome] || (settled ? 'ended' : 'unknown'), mark: outcome ? 'none' : 'ring', owner: false,
+        outcome, focus: '' };
 }
 
-/** The question a confirmed census row waits on, by its exact quiz id; none without positive wait evidence. */
-export function waitedQuestion(activity) {
-    if (!activity || activity._activityUnconfirmed || activityWaitPhase(activity) !== 'owner_wait') return null;
-    const quizId = String(activity.owner_wait?.quiz_id || activity.required_question?.quiz_id || '');
-    return quizId ? { quizId } : null;
-}
-
-/** What a row may offer: only what the current census confirms for that exact id. A loaded card answers
- *  with its own Stop predicate; stale, offline or reusable rows offer nothing. */
-export function rowControls({ id = '', record = null, activity = null, confirmed = false, stopEligible = () => false } = {}) {
-    const key = String(id || '').trim();
-    if (!confirmed || !activity || !key) return NO_CONTROLS;
-    const resume = Boolean(resumeRunEligibility(record || { groupId: key }, activity));
-    const stop = record ? Boolean(stopEligible(record)) : !REUSABLE_TASK_IDS.has(key);
-    return { menu: stop || resume, resume };
+/** The card a work's row goes to: its current episode's, else another of its episodes' root cards that is shown
+ *  (Continue episodes share one card, task_episodes.js). */
+export function workCard(work, records) {
+    for (const id of [work?.episode?.task_id, work?.work_id, ...listOf(work?.members?.ids)]) {
+        const record = records?.get?.(String(id || ''));
+        if (record && !record.isSubagent && record.root?.isConnected && !record.root.hidden) return record;
+    }
+    return null;
 }
 
 /**
@@ -89,9 +71,9 @@ export function rowControls({ id = '', record = null, activity = null, confirmed
  */
 export function createRoomWork({
     page, asPanel = false, ws = null, statusBadge, messagesDiv, reading, stateSnapshots = null, revealQuestion = null,
-    activeDirectActivities: activities = new Map(), liveCardRecords: records = new Map(),
-    pendingSubmissions: pending = new Map(), pendingSuggestedNames: names = new Map(), modelWaits = null,
-    stopEligible = () => false, cancelRunFromCard = null, refreshHeaderControlState = async () => {},
+    works = () => null, liveCardRecords: records = new Map(),
+    pendingSubmissions: pending = new Map(), pendingSuggestedNames: names = new Map(),
+    cancelRunFromCard = null, refreshHeaderControlState = async () => {},
     captureVisibleTimelineAnchor = () => null, restoreVisibleTimelineAnchor = () => false, hostReady = () => true,
     historyPager = null, showLatest = null,
 } = {}) {
@@ -110,11 +92,6 @@ export function createRoomWork({
         return node;
     };
     const decorative = (node) => { node.setAttribute('aria-hidden', 'true'); return node; };
-    const marker = (className) => {
-        const node = decorative(element('span', `nav-activity-marker chat-live-typing ${className}`));
-        for (let i = 0; i < 3; i += 1) node.appendChild(element('span'));
-        return node;
-    };
 
     // ---- the status control: the room's real status badge inside one disclosure button
     const trigger = element('button', 'rw-trigger ui-chrome-control');
@@ -123,11 +100,10 @@ export function createRoomWork({
     trigger.setAttribute('aria-haspopup', 'dialog');
     trigger.setAttribute('aria-expanded', 'false');
     trigger.setAttribute('aria-controls', `${uid}-surface`);
-    // The status's one mark follows its word, as on the sidebar's rows: three dots or one.
-    const dots = marker('rw-dots');
-    const dot = decorative(element('span', 'rw-mark'));
-    // Said as well as drawn: work with a question waiting names the wait in the control's name.
-    const waitNote = element('span', 'rw-sr', 'A question waits for your answer');
+    // The status's one mark follows its word, as on the sidebar's rows.
+    const mark = createStatusMark(doc);
+    // Said as well as drawn: what waits for the owner is named in the control's name where the word does not say it.
+    const waitNote = element('span', 'rw-sr');
     const caret = decorative(element('span', 'rw-caret'));
     const badgeParent = statusBadge.parentNode;
     const badgeNext = statusBadge.nextSibling || null;
@@ -135,7 +111,7 @@ export function createRoomWork({
     // One bar per room: the Project panel bar, or Main's header. The status follows the room's own title in the
     // bar's title row, so a changing word takes the title's room and never moves a neighbour.
     const bar = panel?.querySelector?.('.project-panel-bar') || (asPanel ? null : page.querySelector('.chat-page-header'));
-    trigger.append(statusBadge, dot, dots, waitNote, caret);
+    trigger.append(statusBadge, mark, waitNote, caret);
     const titleRow = bar?.querySelector('.app-page-title-row');
     if (titleRow) titleRow.appendChild(trigger);
     else badgeParent?.insertBefore(trigger, badgeNext);
@@ -189,6 +165,7 @@ export function createRoomWork({
     let outsideClick = null;
     let scheduled = 0;
     let lastInside = false;
+    let pressing = false;       // a pointer press until its click: focus moves meanwhile change no row
     let latestLabel = null;
     let detailSequence = 0;
     let menuIntent = 0;
@@ -218,11 +195,17 @@ export function createRoomWork({
     }
 
     // `text` is the bounded visible name; `full` is the whole one, for the accessible name and the details.
+    // Its card's coined name first (the newest), then the work's own name (never a Continue's "Continue: …"
+    // title), then the card's title.
     function nameOf(item, bubble) {
         const named = (full, source) => ({ text: clip(full, NAME_CHARS), full, source });
-        const own = clean(item.record?.suggestedName || item.record?.titleEl?.textContent);
+        const coinedOnCard = clean(item.record?.suggestedName);
+        if (coinedOnCard) return named(coinedOnCard, 'card');
+        const work = clean(item.work?.name);
+        if (work) return named(work, 'work');
+        const own = clean(item.record?.titleEl?.textContent);
         if (own) return named(own, 'card');
-        const coined = clean(names.get(item.id));
+        const coined = clean(names.get(item.episode) || names.get(item.id));
         if (coined) return named(coined, 'task_named');
         const read = clean(detailNames.get(item.id));
         if (read) return named(read, 'task_detail');
@@ -236,88 +219,95 @@ export function createRoomWork({
         return named(tr('room_work.name.earlier', 'Reply to an earlier message'), 'neutral');
     }
 
+    // The current work of this room, by its id: what a press re-checks before any effect.
+    const workOf = (id) => listOf(works()?.works).find((work) => String(work.work_id) === id) || null;
+
     function collect() {
-        const online = connected();
+        // A closed socket or a host that is not ready proves nothing current: each work stays, unconfirmed (a ring)
+        // and without controls, as an incomplete body leaves it.
+        const current = connected() && hostReady();
+        const state = works() || {};
         const items = [];
-        for (const [id, activity] of activities) {
-            const record = records.get(id) || null;
-            if (record?.isSubagent || censusTaskFacts(activity).ended) continue;
-            const census = censusTaskPhase(activity, null, online, Boolean(modelWaits?.waiting?.(id)));
-            // Words are the loaded card's own chip; motion and waiting stay the census presenter's.
-            const view = record && !record.finished ? { ...desiredLiveCardPhase(record),
-                motion: census.motion, waiting: census.waiting, secondaryMotion: census.secondaryMotion } : census;
-            items.push({ id, kind: String(activity.kind || '') === 'managed_task' ? 'task' : 'direct', activity, record, view,
-                confirmed: online && hostReady() && !activity._activityUnconfirmed,
-                cmid: String(activity.clientMessageId || activity.client_message_id || ''),
-                startedAt: Number(activity.started_at) || 0, attempt: activity.task_attempt ?? null });
-        }
-        // An unfinished foreground card the census does not list: offered, unconfirmed, with no controls.
-        for (const [id, record] of records) {
-            if (activities.has(id) || record.isSubagent || !isForegroundLiveCard(record)) continue;
-            items.push({ id, kind: record.direct ? 'direct' : 'task', activity: null, record,
-                view: desiredLiveCardPhase(record), confirmed: false, cmid: '', startedAt: 0, attempt: null });
+        for (const work of listOf(state.works)) {
+            const id = String(work.work_id || '');
+            if (!id) continue;
+            const episode = String(work.episode?.task_id || id);
+            const shown = current ? work : { ...work, activity: 'unknown', because: [], tails: [], turn: [], confirmed: false,
+                mark: 'ring' };
+            const view = workRowView(shown, { stopping: records.get(episode)?.cancelPendingPolicy || '' });
+            items.push({ id, kind: work.kind === 'task' ? 'task' : 'direct', work, record: workCard(work, records), view,
+                episode, attempt: state.attempts?.get?.(episode) ?? null, activity: current ? String(work.activity || '') : 'unknown',
+                online: current, confirmed: current && work.confirmed !== false,
+                cmid: String(work.client_message_id || ''),
+                startedAt: Number(work.since) || 0 });
         }
         for (const [cmid, sent] of pending) {
-            items.push({ id: `pending:${cmid}`, kind: 'pending', activity: null, record: null, confirmed: true, cmid,
-                startedAt: Math.floor((Number(sent?.timestamp) || 0) / 1000), attempt: null,
-                view: { phase: 'working', text: tr('room_work.sending', 'Sending…'), motion: true, waiting: false } });
+            items.push({ id: `pending:${cmid}`, kind: 'pending', work: null, record: null, confirmed: true, cmid,
+                startedAt: Math.floor((Number(sent?.timestamp) || 0) / 1000), episode: '', attempt: null, activity: 'pending',
+                view: { word: tr('room_work.sending', 'Sending…'), secondary: '', tone: 'live', mark: 'moving', owner: false,
+                    outcome: '', focus: '' } });
         }
         // A Project with nothing else keeps its way to the latest represented root card.
         if (asPanel && !items.length) {
             const latest = latestRepresentedRoot([...records.values()]);
-            if (latest) items.push({ id: latest.groupId, kind: 'task', activity: null, record: latest, latest: true,
-                view: desiredLiveCardPhase(latest, replayTerminalPhase(latest)), confirmed: false, cmid: '',
-                startedAt: 0, attempt: null });
+            if (latest) items.push({ id: latest.groupId, kind: 'task', work: null, record: latest, latest: true,
+                view: cardRowView(desiredLiveCardPhase(latest, replayTerminalPhase(latest)), { settled: latest.finished }),
+                confirmed: false, cmid: '', startedAt: 0, episode: latest.groupId, attempt: null, activity: '' });
         }
         return items.map(decorate);
     }
 
     function decorate(item) {
-        const { view, record } = item;
+        const { view, record, work } = item;
         const card = record?.root?.isConnected ? record.root : null;
         const bubble = item.cmid && !card ? bubbleFor(item.cmid) : null;
         const name = nameOf(item, bubble);
         const finished = Boolean(item.latest && record?.finished);
-        const group = item.latest ? 'latest' : !item.confirmed || view.phase === 'unknown' ? 'unconfirmed'
-            : view.phase === 'waiting' ? 'needs' : view.motion && !view.waiting ? 'progress' : 'waiting';
-        const sub = view.phase === 'queued' ? 1 : view.phase === 'paused' ? 3 : view.waiting ? 2 : 0;
-        const controls = item.kind === 'pending' || item.latest ? NO_CONTROLS
-            : rowControls({ id: item.id, record, activity: item.activity, confirmed: item.confirmed, stopEligible });
+        // The owner's turn first, then moving work, then work that waits; unconfirmed work last.
+        const group = item.latest ? 'latest' : view.tone === 'unknown' ? 'unconfirmed'
+            : view.owner ? 'needs' : view.tone === 'live' ? 'progress' : 'waiting';
+        const sub = { queued: 1, waiting: 2, paused: 3 }[item.activity] || 0;
+        // The server's controls for a work it lists, even one it could not confirm (Stop stays offered); a work kept
+        // from an incomplete body and every work over a closed socket has none.
+        const controls = work && item.online ? workControls(work) : null;
         return {
             key: item.id, id: item.id, kind: item.kind, name: name.text, fullName: name.full, nameSource: name.source,
             view, group, slot: group, rank: GROUP_RANK[group] * 10 + sub, confirmed: item.confirmed,
-            latest: Boolean(item.latest), settled: finished, outcomeKnown: finished, attempt: item.attempt,
+            latest: Boolean(item.latest), settled: finished, outcomeKnown: finished, episode: item.episode,
+            attempt: item.attempt, activity: item.activity, work,
             card: Boolean(card), target: card || bubble, loaded: Boolean(card || bubble),
-            startedAt: item.startedAt, cmid: item.cmid, canMenu: controls.menu, canResume: controls.resume,
-            question: item.confirmed ? waitedQuestion(item.activity) : null,
-            tone: roomWorkTone(view, { confirmed: item.confirmed, settled: finished }),
+            startedAt: item.startedAt, cmid: item.cmid, controls,
+            canMenu: Boolean(controls && workMenuActions(controls).length), resume: controls?.resume || '',
+            question: item.confirmed ? workQuestion(work) : null, tone: view.tone,
         };
     }
 
-    // A press's answer (loading|absent|moved|unknown) holds while the work's census facts stay as they were:
+    // A press's answer (loading|absent|moved|unknown) holds while the work's facts stay as they were:
     // work that changed may have a message now, so its row claims nothing again until a press asks.
-    const lookupFacts = (row) => `${row.view?.phase}|${row.attempt ?? ''}|${row.cmid || ''}`;
+    const lookupFacts = (row) => `${row.activity}|${row.episode}|${row.attempt ?? ''}|${row.cmid || ''}`;
     function lookupOf(row) {
         const found = lookups.get(row.id);
         if (found && found.state !== 'loading' && found.facts !== lookupFacts(row)) lookups.delete(row.id);
         return lookups.get(row.id)?.state || '';
     }
 
-    // Work that left the census while the list is open: its row stays, settled, until close. Finish withdraws
+    // Work that left the projection while the list is open: its row stays, settled, until close. Finish withdraws
     // the controls, never the way to its name, card or details; the word is its card's own final one, if known.
     function settled(row) {
-        const record = records.get(row.id);
+        const record = records.get(row.episode) || records.get(row.id);
         const outcome = record?.finished ? desiredLiveCardPhase(record, replayTerminalPhase(record)) : null;
         const card = record?.root?.isConnected ? record.root : null;
         const target = card || (row.cmid ? bubbleFor(row.cmid) : null);
-        const view = outcome || { phase: 'ended', text: tr('room_work.ended', 'No longer listed as active') };
+        const view = outcome ? cardRowView(outcome, { settled: true })
+            : { word: tr('room_work.ended', 'No longer listed as active'), secondary: '', tone: 'ended', mark: 'ring',
+                owner: false, outcome: '', focus: '' };
         const name = nameOf({ ...row, record }, target);
         const refreshedName = name.source === 'neutral' ? {} : {
             name: name.text, fullName: name.full, nameSource: name.source,
         };
         return { ...row, ...refreshedName, view, group: 'ended', settled: true, outcomeKnown: Boolean(outcome), canMenu: false,
-            canResume: false, question: null, card: Boolean(card), target, loaded: Boolean(target),
-            tone: roomWorkTone(view, { settled: true }) };
+            controls: null, resume: '', question: null, card: Boolean(card), target, loaded: Boolean(target),
+            tone: view.tone };
     }
 
     const sorter = (a, b) => (a.rank - b.rank) || (b.startedAt - a.startedAt) || a.key.localeCompare(b.key);
@@ -362,7 +352,7 @@ export function createRoomWork({
 
     // What a press on an unloaded row found out about where its message is (DESIGN "Room work status").
     function whereText(row) {
-        const ended = row.settled || ['done', 'caution', 'failed'].includes(row.tone);
+        const ended = row.settled || Boolean(row.view.outcome);
         return { loading: tr('room_work.lookup.loading', 'Loading its message…'),
             absent: ended ? tr('room_work.lookup.absent_ended', 'No message saved in this chat.') : tr('room_work.lookup.absent', 'No message yet.'),
             moved: tr('room_work.lookup.moved', 'This work is in another room.'),
@@ -378,7 +368,8 @@ export function createRoomWork({
                 tr('room_work.detail.ended_text', 'No longer listed as active; its outcome is not known here. This row stays until the list closes.')]);
         const where = whereText(row);
         if (where) lines.push([tr('room_work.detail.where', 'Where'), where]);
-        if (!row.confirmed && !row.settled && !row.latest) lines.push([tr('room_work.detail.why', 'Why no controls'),
+        const uncontrolled = !row.confirmed && !row.canMenu && !row.resume && !row.settled && !row.latest;
+        if (uncontrolled) lines.push([tr('room_work.detail.why', 'Why no controls'),
             tr('room_work.detail.why_text', 'The latest update did not confirm this work, so nothing here can be paused or stopped.')]);
         const what = row.kind === 'pending' ? tr('room_work.what.pending', 'Your message, being sent')
             : row.kind === 'direct' ? (row.cmid ? tr('room_work.what.reply', 'A reply to your message')
@@ -398,33 +389,41 @@ export function createRoomWork({
         const main = element('div', 'rw-main');
         const nameEl = element('span', 'rw-name');
         const state = element('span', 'rw-state');
-        const rowDots = marker('rw-row-dots');
-        const rowLead = decorative(element('span', 'rw-lead'));
+        const mark = createStatusMark(doc);
         const word = element('span', 'rw-word');
         const secondary = element('span', 'rw-secondary');
         const where = element('span', 'rw-where');
         const chev = decorative(element('span', 'rw-chev'));
         where.append(chev);
-        state.append(rowDots, rowLead, word, secondary, where);
-        main.append(nameEl, state);
+        state.append(mark, word, secondary, where);
+        // The episode's own focus line, quieter, under the state (work_status.workRowView's `focus`).
+        const focus = element('span', 'rw-focus');
+        focus.hidden = true;
+        main.append(nameEl, state, focus);
         const verb = element('span', 'rw-verb');
         const moreSlot = element('span', 'rw-more-slot');
         const detail = element('div', 'rw-detail');
         detail.id = `${uid}-detail-${(detailSequence += 1)}`;
         detail.hidden = true;
         el.append(main, verb, moreSlot, detail);
-        view = { el, main, nameEl, dots: rowDots, lead: rowLead, word, secondary, where, chev, verb, moreSlot,
-            detail, question: null, resume: null, more: null, row: null, full: null, detailKey: '', attempt: undefined };
+        view = { el, main, nameEl, mark, word, secondary, focus, where, chev, verb, moreSlot,
+            detail, question: null, resume: null, resumeTarget: '', more: null, row: null, full: null, detailKey: '',
+            episode: undefined };
         // The name stays selectable text: a drag that selected it does not navigate.
         bindContentButton(main, () => activateRow(view.row), () => rowIsTarget(view.row));
-        // Keyboard focus shows the whole name (CSS unclamps it). Not :focus-within: a press on Resume or ⋯
-        // must not grow the row under the pointer before mouse-up.
+        // Keyboard focus shows the whole name (CSS unclamps it), and only the row keyboard reads shows it. Not
+        // :focus-within, and a press changes no row: nothing in the list moves under a pointer. A row folding on
+        // the focus a press gives it, or on the blur a press elsewhere causes, would move the pressed row (or
+        // the ⋯ a menu opens from) before mouse-up; a grown row folds when keyboard focus reads another row or
+        // the list closes.
         main.addEventListener('focus', () => {
+            if (pressing) return;
             let keyboard = false;
             try { keyboard = main.matches?.(':focus-visible') === true; } catch { /* an engine without the selector */ }
+            if (keyboard) for (const other of views.values()) if (other !== view) other.el.dataset.reading = '0';
             el.dataset.reading = keyboard ? '1' : '0';
         });
-        main.addEventListener('blur', () => { el.dataset.reading = '0'; });
+        main.addEventListener('blur', () => { if (!pressing) el.dataset.reading = '0'; });
         views.set(row.key, view);
         return view;
     }
@@ -461,7 +460,7 @@ export function createRoomWork({
         });
         const full = row.fullName || row.name;
         // Every row says its state under its name (5A); where an unloaded row's message is, its press finds out.
-        const state = [row.view.text, row.view.secondary].filter(Boolean).join(' · ');
+        const state = [row.view.word, row.view.secondary].filter(Boolean).join(' · ');
         if (navigable || lookable || detailable) {
             main.setAttribute('role', 'button');
             main.tabIndex = 0;
@@ -484,15 +483,16 @@ export function createRoomWork({
         main.dataset.target = navigable ? 'card' : lookable ? 'history' : detailable ? 'details' : 'none';
         // The whole name is in the DOM; CSS clamps it to two lines, focus and open details show it whole.
         if (view.full !== full) { view.full = full; view.nameEl.textContent = full; }
-        // Three dots are work (moving only for confirmed motion, still when queued); one dot is a single fact.
-        const dotted = row.tone === 'live' || row.tone === 'queued';
-        view.dots.hidden = !dotted;
-        view.dots.dataset.state = row.tone === 'live' ? 'working' : 'queued';
-        view.lead.hidden = dotted || row.tone === 'quiet';
-        if (view.word.textContent !== row.view.text) view.word.textContent = row.view.text;
+        // The work's shape in its word's ink; something in it that waits for the owner is the amber dot in its place
+        // (a pause is not the owner's move), and a known outcome is a dot in the outcome's tone beside its word.
+        paintStatusMark(view.mark, markView({ mark: row.view.mark, owner: row.view.owner, outcome: row.view.outcome }));
+        if (view.word.textContent !== row.view.word) view.word.textContent = row.view.word;
         const secondary = String(row.view.secondary || '');
         if (view.secondary.textContent !== secondary) view.secondary.textContent = secondary;
         view.secondary.hidden = !secondary;
+        const focus = row.settled ? '' : String(row.view.focus || '');
+        if (view.focus.textContent !== focus) view.focus.textContent = focus;
+        view.focus.hidden = !focus;
         view.chev.hidden = !detailable;
         view.where.hidden = !detailable;
         view.detail.hidden = !isOpen;
@@ -509,10 +509,11 @@ export function createRoomWork({
                 }
             }
         }
-        // A new episode of the same work never inherits a menu opened for the previous one.
-        if (view.attempt !== undefined && view.attempt !== row.attempt
+        // A new episode (or a new attempt of it) never inherits a menu opened for the previous one.
+        const episode = `${row.episode}|${row.attempt ?? ''}`;
+        if (view.episode !== undefined && view.episode !== episode
             && view.more?.getAttribute('aria-expanded') === 'true') closeTaskControlMenu();
-        view.attempt = row.attempt;
+        view.episode = episode;
         reconcileActions(view, row);
     }
 
@@ -542,29 +543,30 @@ export function createRoomWork({
             const label = tr('room_work.view_question', 'View question');
             if (view.question.textContent !== label) view.question.textContent = label;
         }
-        const wantResume = row.canResume && !row.settled;
-        if (wantResume && !view.resume) {
-            // The shared button re-checks eligibility at press time; its id never changes.
-            view.resume = createTaskResumeButton(row.id, {
-                canResume: () => currentControls(row.id, view.row?.attempt).resume, onSettled: refresh,
-            });
-            view.resume.classList.add('rw-action', 'rw-pill', 'rw-pill-resume');
-            view.verb.append(view.resume);
-        } else if (!wantResume && view.resume) {
+        // Resume stands only where the work's own Resume control names its exact target.
+        const wantResume = row.settled ? '' : row.resume;
+        if (view.resume && view.resumeTarget !== wantResume) {
             keepFocus(view.resume);
             view.resume.remove();
             view.resume = null;
+        }
+        if (wantResume && !view.resume) {
+            // The shared button re-checks the work's control at press time; its target never changes.
+            view.resume = createTaskResumeButton(wantResume, {
+                canResume: () => currentControls(view.row)?.resume === wantResume, onSettled: refresh,
+            });
+            view.resume.classList.add('rw-action', 'rw-pill', 'rw-pill-resume');
+            view.resumeTarget = wantResume;
+            view.verb.append(view.resume);
         }
         if (view.resume) {
             const label = tr('task.control.resume', 'Resume');
             if (view.resume.textContent !== label) view.resume.textContent = label;
         }
-        // The ⋯ is the one door to every other action: the shared task controls, aimed at this exact id.
+        // The ⋯ is the one door to every other action: the work's own controls, each aimed at its exact target.
         const wantMore = row.canMenu && !row.settled;
-        const actionKey = wantMore ? taskControlActions({
-            cancelPending: Boolean(records.get(row.id)?.cancelPendingPolicy),
-            budgetPaused: activities.get(row.id)?.phase === 'budget_paused',
-            resumeVisible: row.canResume,
+        const actionKey = wantMore ? workMenuActions(row.controls, {
+            cancelPending: Boolean(records.get(row.episode)?.cancelPendingPolicy),
         }).join(',') : '';
         // A row may keep its menu door while the actions behind it change (Working → Paused).
         // Withdraw the old portal immediately, not just its ability to dispatch stale actions.
@@ -576,7 +578,6 @@ export function createRoomWork({
         if (wantMore && !view.more) {
             const button = element('button', 'rw-more');
             button.type = 'button';
-            button.dataset.id = row.id;  // Pause reads its exact target here, never the nearest card
             button.innerHTML = '<svg class="rw-more-glyph" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false"><circle cx="3" cy="8" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="13" cy="8" r="1.4"/></svg>';
             button.setAttribute('aria-haspopup', 'menu');
             button.setAttribute('aria-expanded', 'false');
@@ -592,52 +593,48 @@ export function createRoomWork({
             view.more.remove();
             view.more = null;
         }
+        if (view.more) view.more.dataset.id = row.episode;  // Pause reads its exact target here, never the nearest card
         view.more?.setAttribute('aria-label', fmt('Task actions: {name}', { name: full }));
         view.el.dataset.verb = view.question ? 'question' : view.resume ? 'resume' : '';
     }
 
-    // The shared controls for one exact id. A loaded card stops through its own card path, so its chip
-    // follows at once; a row without a card first reads the durable record, as Activity does, so a stop
-    // already pending is not offered again as a fresh Wrap up.
-    function currentControls(id, attempt) {
-        const activity = activities.get(id);
-        const confirmed = open && !destroyed && !page.hidden && page.isConnected && connected() && hostReady()
-            && activity && !activity._activityUnconfirmed && !censusTaskFacts(activity).ended
-            && (activity.task_attempt ?? null) === attempt;
-        return rowControls({ id, record: records.get(id), activity, confirmed, stopEligible });
+    // The work's current controls, only while the list is shown over a live connection and the projection still
+    // lists the same episode (and attempt): a press re-checks them before any effect.
+    function currentControls(row) {
+        const work = row ? workOf(row.id) : null;
+        const current = open && !destroyed && !page.hidden && page.isConnected && connected() && hostReady()
+            && work && String(work.episode?.task_id || work.work_id) === row.episode
+            && (works()?.attempts?.get?.(row.episode) ?? null) === row.attempt;
+        return current ? workControls(work) : null;
     }
 
+    // A loaded card stops through its own card path, so its chip follows at once; a row without a card first
+    // reads the durable record, as Activity does, so a stop already pending is not offered again as a fresh Wrap up.
     async function openControls(row, anchor) {
         const intent = ++menuIntent;
-        if (!currentControls(row.id, row.attempt).menu) return;
-        const record = records.get(row.id) || null;
-        let cancelPending = Boolean(record?.cancelPendingPolicy);
-        let stop = record && !record.finished && cancelRunFromCard ? (action) => cancelRunFromCard(record, action) : null;
-        if (!stop) {
+        if (!currentControls(row)) return;
+        const loaded = (id) => { const record = records.get(id); return record && !record.finished && cancelRunFromCard ? record : null; };
+        let cancelPending = Boolean(records.get(row.episode)?.cancelPendingPolicy);
+        if (!loaded(row.episode)) {
             let stored = null;
-            try { stored = await fetchTaskDetailStrict(row.id); } catch (exc) {
+            try { stored = await fetchTaskDetailStrict(row.episode); } catch (exc) {
                 if (exc?.status !== 404) {
                     showToast(`Could not refresh task state: ${exc?.message || exc}`, 'error');
                     return;
                 }
             }
-            if (intent !== menuIntent || !anchor.isConnected || !currentControls(row.id, row.attempt).menu) return;
+            if (intent !== menuIntent || !anchor.isConnected || !currentControls(row)) return;
             cancelPending = taskCancelPending(stored);
-            stop = (action) => requestStop(row.id, action).then(() => refresh(), (exc) => {
-                if (exc?.status !== 404) showToast(`Cancel failed: ${exc?.message || exc}`, 'error');
-                return refresh();
-            });
         }
         const canAct = (action) => {
-            const current = currentControls(row.id, row.attempt);
-            if (intent !== menuIntent || !anchor.isConnected || !current.menu || taskControlBusy(row.id)) return false;
-            return taskControlActions({
-                cancelPending: cancelPending || Boolean(records.get(row.id)?.cancelPendingPolicy),
-                budgetPaused: activities.get(row.id)?.phase === 'budget_paused',
-                resumeVisible: current.resume,
+            const current = currentControls(row);
+            if (intent !== menuIntent || !anchor.isConnected || !current || taskControlBusy(row.episode)) return false;
+            return workMenuActions(current, {
+                cancelPending: cancelPending || Boolean(records.get(row.episode)?.cancelPendingPolicy),
             }).includes(action);
         };
-        openTaskControls(anchor, row.id, { record, activity: activities.get(row.id), cancelPending, canAct, stop });
+        const stopOne = (target, action) => (loaded(target) ? cancelRunFromCard(loaded(target), action) : requestStop(target, action));
+        openWorkControls(anchor, workOf(row.id), { cancelPending, canAct, stopOne, afterAction: () => refresh() });
     }
 
     // ---- paint
@@ -677,38 +674,50 @@ export function createRoomWork({
         });
     }
 
+    // The word goes whole or not at all (DESIGN "Shell"): shown, measured, dropped when the row would cut it, in one
+    // task so nothing paints between; the mark stays and the control's name keeps the word. Measured again when the
+    // word or the bar's width changes (the bar is sized by the page, so this never feeds itself).
+    let fittedWord = null;
+    function fitWord() {
+        if (destroyed) return;
+        delete trigger.dataset.word;
+        if (statusBadge.scrollWidth > statusBadge.clientWidth + 1) trigger.dataset.word = 'off';
+    }
+
     function paintTrigger() {
         const text = clean(statusBadge.textContent);
-        const current = rows.filter((row) => !row.settled && !row.latest);
         const listed = rows.length > 0;
-        // Word, tone and dots come together from the chat's producer (computeDerivedChatStatus via setStatus);
-        // the control paints them and never ranks row tones or reads a class name for a second opinion.
-        // Before the producer's first answer the room is not online yet: an unknown tone paints as offline.
+        // Word, tone, mark and what waits for the owner come together from the chat's producer
+        // (work_status.roomStatusView via setStatus); the control paints them and never ranks row tones or reads a
+        // class name for a second opinion. Before the producer's first answer the room is not online yet: an unknown
+        // tone paints as offline.
         const tone = statusBadge.dataset.tone || 'offline';
-        const dotsMode = statusBadge.dataset.dots || 'one';
         trigger.disabled = !listed;
         trigger.dataset.tone = tone;
         trigger.dataset.open = open ? '1' : '0';
         trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
         trigger.title = text;  // the whole status word, never clipped away (an extra, not the only path)
         caret.hidden = !listed;
-        // Owner 15.10 (3C): live work keeps three moving dots, queued work three still dots; a fact is one dot.
-        dots.hidden = dotsMode === 'one';
-        dots.dataset.state = dotsMode === 'moving' ? 'working' : 'queued';
-        dot.hidden = !dots.hidden;
-        // One mark, one more fact (owner 16.10): the mark turns amber while a question waits for the owner's answer
-        // and the word does not already say so — beside Working, Queued, a pause or an access wait alike.
-        const mixed = !['offline', 'starting', 'wait'].includes(tone) && current.some((row) => row.question);
-        trigger.dataset.wait = mixed ? '1' : '0';
-        waitNote.hidden = !mixed;
+        // The work's shape in the word's ink; while something in the room waits for the owner (a question, or an action
+        // only the owner takes) the amber dot takes its place and the word keeps its own ink: Working with a question
+        // elsewhere stays Working. A pause by the owner or by Ouroboros is not the owner's move. The room at rest says
+        // Online beside its green dot.
+        const owner = statusBadge.dataset.owner === '1';
+        const reshaped = paintStatusMark(mark, tone === 'online' && !owner ? AT_REST : markView({ mark: statusBadge.dataset.mark, owner }));
+        // The owner's move said in words too, where the word does not already say it.
+        const said = amberNote(statusBadge.dataset.amber || '');
+        if (waitNote.textContent !== said) waitNote.textContent = said;
+        waitNote.hidden = !said;
+        // A new word, or a mark of another width beside the same word (the owner's dot for the dots), is measured again.
+        if (text !== fittedWord || reshaped) { fittedWord = text; fitWord(); }
         if (!listed && open) close({ restoreFocus: false });
     }
 
     function paintNote() {
-        const census = stateSnapshots?.latest?.();
+        const latest = stateSnapshots?.latest?.();
         const message = !connected() ? tr('room_work.note.reconnecting', 'Reconnecting — showing the last known state.')
             : !hostReady() ? tr('room_work.note.starting', 'Ouroboros is starting…')
-                : census?.active_chat_activities_complete === false
+                : Array.isArray(latest?.works) && latest.works_complete === false
                     ? tr('room_work.note.partial', 'Not all current work could be confirmed; this list may be incomplete.') : '';
         if (note.textContent !== message) note.textContent = message;
         note.hidden = !message || !open;
@@ -738,6 +747,7 @@ export function createRoomWork({
         frozen = null;
         order = [];
         expanded.clear();
+        for (const view of views.values()) view.el.dataset.reading = '0';  // it reopens at rest
         // A list dismissed while a row still looks drops that look: the reader left before it answered.
         if ([...lookups.values()].some((found) => found.state === 'loading')) { navigationIntent += 1; live.textContent = ''; }
         lookups.clear();
@@ -783,8 +793,9 @@ export function createRoomWork({
         close({ restoreFocus: false });
         scrollToNode(target);
         showBack(place.anchor, place);
-        const summary = records.get(row.id)?.summaryButtonEl;
-        const focus = summary?.isConnected ? summary : target;
+        // The card's one control of its own, "Show details", takes the keyboard; a portal (which hides it) takes it itself.
+        const disclosure = records.get(row.id)?.disclosureEl;
+        const focus = disclosure?.isConnected && disclosure.getClientRects?.().length ? disclosure : target;
         if (focus === target && !target.hasAttribute?.('tabindex')) target.setAttribute('tabindex', '-1');
         focus.focus?.({ preventScroll: true });
     }
@@ -819,7 +830,8 @@ export function createRoomWork({
         const intent = ++navigationIntent;
         const anchor = captureVisibleTimelineAnchor();
         close({ restoreFocus: false });
-        const shown = await revealQuestion?.(row.id, row.question.quizId, { focus: 'question' });
+        // The task that asked (a Continue or a helper), never the work's first root.
+        const shown = await revealQuestion?.(row.question.taskId || row.id, row.question.quizId, { focus: 'question' });
         if (shown && !destroyed && intent === navigationIntent && !page.hidden && page.isConnected) showBack(anchor);
     }
 
@@ -886,6 +898,9 @@ export function createRoomWork({
     });
     listen(back, 'click', goBack);
     listen(doc, 'pointerdown', (event) => {
+        // A press lasts until the click its release makes (a touch's mouse events follow its pointerup), so a
+        // focus move inside it, its own or a closing menu handing focus back, folds nothing under the pointer.
+        pressing = true;
         const target = event.target;
         // The shared task-controls menu is a portal outside the list but part of its interaction.
         if (target?.closest?.('.task-control-menu')) return;
@@ -905,6 +920,12 @@ export function createRoomWork({
             }, 600);
         }
     }, true);
+    // A press that makes no click (a cancelled touch, a release outside the window) ends at the next key or
+    // press, so keyboard reading never waits on it.
+    const endPress = () => { pressing = false; };
+    listen(doc, 'click', endPress, true);
+    listen(doc, 'pointercancel', endPress, true);
+    listen(doc, 'keydown', endPress, true);
     listen(doc, 'focusin', (event) => {
         if (!event.target?.closest?.('.task-control-menu')) lastInside = surface.contains(event.target) || trigger.contains(event.target);
     }, true);
@@ -966,6 +987,9 @@ export function createRoomWork({
         trigger.hidden = away;
     }) : null;
     watcher?.observe(page, { attributes: true, attributeFilter: ['hidden'] });
+    const Resize = globalThis.ResizeObserver;
+    const sizer = bar && typeof Resize === 'function' ? new Resize(() => fitWord()) : null;
+    sizer?.observe(bar);
 
     function schedule() {
         if (destroyed || scheduled) return;
@@ -1000,6 +1024,7 @@ export function createRoomWork({
             clearTimeout(outsideClickTimer);
             if (outsideClick) doc.removeEventListener('click', outsideClick, true);
             watcher?.disconnect();
+            sizer?.disconnect();
             for (const dispose of disposers.splice(0)) dispose();
             openHost?.removeAttribute('data-rw-open');
             // The badge returns where the product put it; this module's nodes go.

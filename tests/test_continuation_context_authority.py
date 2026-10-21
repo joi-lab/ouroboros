@@ -1,4 +1,4 @@
-"""Focused continuity-source, narrative, and Main projection regressions."""
+"""Focused continuity-source, predecessor-brief and Main projection regressions."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import copy
 import json
 
 import pytest
+
+from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY
 
 
 def _ref(task_id: str) -> dict:
@@ -17,21 +19,6 @@ def _source(task_id: str) -> dict:
         **_ref(task_id),
         "arguments": {"task_id": task_id, "include_authority": True},
     }
-
-
-def _summary(root, task_id: str, text: str) -> None:
-    from ouroboros.project_dialogue import append_canonical_task_summary
-
-    ref = _ref(task_id)
-    assert append_canonical_task_summary(root, {
-        "type": "task_summary",
-        "summary_kind": "authored_root_summary",
-        "summary_id": f"task-narrative:{task_id}",
-        "task_id": task_id,
-        "result_ref": ref,
-        "source_coverage": {"task_result": ref},
-        "text": text,
-    })
 
 
 @pytest.mark.parametrize("result", ["Use the existing tower", "r" * 20_000, "\x00" * 6_000])
@@ -134,39 +121,98 @@ def test_legacy_declared_reference_keeps_unknown_omission_sizes_and_cannot_regai
     assert project_helper_predecessor_authority(brief, declared=True) == brief
 
 
-def test_a_stored_authored_narrative_wins_without_chat_access(tmp_path):
-    # Nothing writes an authored narrative any more; the readers keep serving the
-    # ones earlier versions stored beside a task result and in the chat log.
-    from ouroboros.task_results import load_task_result, write_task_result
+def _narrative(task_id: str, text: str, *, kind: str = "authored_root_summary") -> dict:
+    ref = _ref(task_id)
+    return {"summary_kind": kind, "summary_id": f"task-narrative:{task_id}", "task_id": task_id,
+            "result_ref": ref, "source_coverage": {"task_result": ref}, "text": text}
+
+
+@pytest.mark.parametrize("kind,served", [("authored_root_summary", True), ("terminal_result_projection", False)])
+def test_a_stored_legacy_narrative_is_the_notes_row_and_main_never_substitutes(tmp_path, kind, served):
+    """Nothing writes an authored narrative any more; a record an earlier version wrote
+    still serves it — as the foldable notes row after the assignment, never as a
+    stand-in for the answer inside the frozen prefix. The answer keeps the envelope's
+    whole-or-pointer form at every size; a terminal projection is not a narrative."""
+    from types import SimpleNamespace
+
+    from ouroboros.agent_startup_checks import validate_task_authority_sources
+    from ouroboros.main_context_authority import (
+        PREDECESSOR_NOTES_NAME, predecessor_notes_message, project_main_task_authority,
+    )
+    from ouroboros.task_results import write_task_result
 
     task_id = "narrative-root"
-    ref = _ref(task_id)
-    row = {
-        "summary_kind": "authored_root_summary",
-        "summary_id": f"task-narrative:{task_id}", "task_id": task_id,
-        "result_ref": ref, "source_coverage": {"task_result": ref},
-        "text": "The authored account of what actually happened.",
-    }
-    _summary(tmp_path, task_id, row["text"])
-    write_task_result(tmp_path, task_id, "completed", result="raw", continuation_narrative=row)
-    stored = load_task_result(tmp_path, task_id)
-    assert stored["status"] == "completed"
-    assert stored["continuation_narrative"]["text"] == row["text"]
+    text = "The authored account of what actually happened."
+    write_task_result(tmp_path, task_id, "completed", result="R" * 200001,
+                      continuation_narrative=_narrative(task_id, text, kind=kind))
+    task = {"id": "next", "text": "continue", "budget_drive_root": str(tmp_path),
+            "predecessor_authority_source": _pull_source(task_id)}
+    assert validate_task_authority_sources(SimpleNamespace(drive_root=tmp_path, budget_drive_root=tmp_path), task) == {}
+    brief = task["predecessor_authority"]
+    assert brief["result"]["kind"] == "bounded_field_preview" and brief["result"]["full_chars"] == 200001
+    assert "continuation_narrative" in brief["omitted_fields"]
 
-    from ouroboros.main_context_authority import project_main_task_authority
+    projected = project_main_task_authority(task)["predecessor_authority"]
+    assert projected == brief, "Main's copy is the brief itself: no substitution, no narrative keys"
+    assert "narrative_status" not in json.dumps(projected)
+    note = predecessor_notes_message(task, drive_root=tmp_path)
+    if served:
+        assert note["role"] == "user" and note[HOST_CONTEXT_KIND_KEY] == PREDECESSOR_NOTES_NAME
+        assert note["content"].endswith(text) and "continuation_narrative" in note["content"]
+        assert f"get_task_result(task_id={task_id!r}, include_authority=True)" in note["content"]
+    else:
+        assert note is None
 
-    authority = {
-        "task_id": task_id, "source": _source(task_id),
-        "result": "R" * 200001, "task_contract": {"objective": "old"},
-        **{key: stored[key] for key in ("continuation_narrative",)},
-    }
-    (tmp_path / "logs" / "chat.jsonl").unlink()
-    projected = project_main_task_authority(
-        {"id": "next", "predecessor_authority": authority}, drive_root=tmp_path,
-    )["predecessor_authority"]
-    assert projected["result"]["narrative_status"] == "available"
-    assert projected["result"]["narrative"]["text"] == row["text"]
-    assert "R" * 200001 not in json.dumps(projected)
+
+def test_an_ordinary_fold_names_its_notes_for_the_successor_and_a_noteless_view_clears_them(tmp_path):
+    """17.10 review: the notes row read only review-history selections, so a task that folded ordinary
+    work handed its successor nothing. Every applied fold now names the surviving notes in the result."""
+    from types import SimpleNamespace
+
+    from ouroboros.agent_startup_checks import validate_task_authority_sources
+    from ouroboros.main_context_authority import WORKING_NOTES_FIELD, predecessor_notes_message, publish_working_notes
+    from ouroboros.task_results import load_task_result, write_task_result
+    from tests.test_context_renewal import NOTE, _noted
+
+    task_id = "ordinary-fold-root"
+    write_task_result(tmp_path, task_id, "running", result="")
+    folded = _noted(tmp_path)
+    ref = publish_working_notes(SimpleNamespace(task_id=task_id, drive_root=tmp_path), folded)
+    assert load_task_result(tmp_path, task_id)[WORKING_NOTES_FIELD] == ref
+    task = {"id": "next", "text": "continue", "budget_drive_root": str(tmp_path),
+            "predecessor_authority_source": _pull_source(task_id)}
+    assert validate_task_authority_sources(SimpleNamespace(drive_root=tmp_path, budget_drive_root=tmp_path), task) == {}
+    note = predecessor_notes_message(task, drive_root=tmp_path)
+    assert NOTE in note["content"] and WORKING_NOTES_FIELD in note["content"]
+    plain = [row for row in folded if not isinstance(row.get("content"), list)]  # a view whose notes were retired
+    assert publish_working_notes(SimpleNamespace(task_id=task_id, drive_root=tmp_path), plain) is None
+    assert load_task_result(tmp_path, task_id)[WORKING_NOTES_FIELD] is None
+    assert predecessor_notes_message(task, drive_root=tmp_path) is None
+
+
+def test_a_narrative_only_in_the_chat_log_is_the_notes_row_by_its_exact_task(tmp_path):
+    """Records written before narratives were stored beside the result keep theirs in the chat
+    log; the notes row reads it by exact task identity from the dialogue store, nothing else."""
+    from types import SimpleNamespace
+
+    from ouroboros import dialogue_store as ds
+    from ouroboros.agent_startup_checks import validate_task_authority_sources
+    from ouroboros.main_context_authority import predecessor_notes_message
+    from ouroboros.task_results import write_task_result
+
+    task_id = "chat-narrative-root"
+    write_task_result(tmp_path, task_id, "completed", result="done")
+    task = {"id": "next", "text": "continue", "budget_drive_root": str(tmp_path),
+            "predecessor_authority_source": _pull_source(task_id)}
+    assert validate_task_authority_sources(SimpleNamespace(drive_root=tmp_path, budget_drive_root=tmp_path), task) == {}
+    assert predecessor_notes_message(task, drive_root=tmp_path) is None  # no narrative anywhere: no row
+    row = {**_narrative(task_id, "What the earlier version wrote to chat."), "chat_id": 1, "type": "task_summary"}
+    ds.append(tmp_path, "chat", {**row, "task_id": "another-task", "text": "Not this task's account."})
+    receipt = ds.append(tmp_path, "chat", row)
+    note = predecessor_notes_message(task, drive_root=tmp_path)
+    assert note[HOST_CONTEXT_KIND_KEY] == "predecessor_notes"
+    assert note["content"].endswith("What the earlier version wrote to chat.")
+    assert f"chat:{receipt.seq}" in note["content"] and "Not this task's account." not in note["content"]
 
 
 @pytest.mark.parametrize("parent_has_narrative", [False, True])
@@ -214,124 +260,40 @@ def test_child_copyback_preserves_the_authoritative_narrative(tmp_path, parent_h
     )
 
 
-def test_bounded_legacy_lookup_accepts_only_authored_exact_row(tmp_path):
+def test_main_projection_shows_the_brief_once_and_the_objective_once():
+    """Main's provider copy is the materialized brief at the top level; the equal copy the
+    contract spread nests is dropped, a different identity stays; a contract objective that
+    IS the assignment becomes a typed reference, any other objective stays a string; and no
+    size threshold rewrites an answer (a 200001-char result rides exactly as the brief says)."""
+    import hashlib
+
     from ouroboros.main_context_authority import project_main_task_authority
 
-    task_id = "legacy-root"
-    narrative = "Legacy authored account"
-    _summary(tmp_path, task_id, narrative)
-    raw = "X" * 200001
-    authority = {
-        "task_id": task_id, "source": _source(task_id),
-        "result": raw, "task_contract": {"objective": "old"},
-    }
-    projected = project_main_task_authority(
-        {"id": "next", "predecessor_authority": authority}, drive_root=tmp_path,
-    )["predecessor_authority"]
-    assert projected["result"]["narrative"]["text"] == narrative
-
-    terminal = json.loads(json.dumps(authority))
-    terminal["continuation_narrative"] = {
-        "text": "terminal must not count", "task_id": task_id,
-        "summary_id": f"task-terminal:{task_id}",
-        "summary_kind": "terminal_result_projection",
-    }
-    miss = project_main_task_authority(
-        {"id": "next", "predecessor_authority": terminal}, drive_root=tmp_path,
-    )["predecessor_authority"]
-    assert miss["result"]["narrative_status"] == "available"
-    assert miss["result"]["narrative"]["text"] == narrative
-
-
-def test_legacy_mismatch_and_terminal_only_rows_emit_gap_without_writes(tmp_path):
-    from ouroboros.main_context_authority import project_main_task_authority
-    from ouroboros.task_results import load_task_result
-
-    task_id = "legacy-gap"
-    chat = tmp_path / "logs" / "chat.jsonl"
-    chat.parent.mkdir(parents=True)
-    rows = [
-        {
-            "type": "task_summary",
-            "summary_kind": "authored_root_summary",
-            "summary_id": f"task-narrative:{task_id}",
-            "task_id": task_id,
-            "result_ref": {**_ref(task_id), "extra": "wrong"},
-            "source_coverage": {"task_result": {**_ref(task_id), "extra": "wrong"}},
-            "text": "wrong source must not be accepted",
-        },
-        {
-            "type": "task_summary",
-            "summary_kind": "terminal_root_projection",
-            "summary_id": f"task-terminal:{task_id}",
-            "task_id": task_id,
-            "result_ref": _ref(task_id),
-            "source_coverage": {"task_result": _ref(task_id)},
-            "text": "terminal projection is not a narrative",
-        },
-    ]
-    chat.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
-    authority = {
-        "task_id": task_id,
-        "source": _source(task_id),
-        "result": "Q" * 200001,
-        "task_contract": {"objective": "keep"},
-    }
-    projected = project_main_task_authority(
-        {"id": "next", "predecessor_authority": authority}, drive_root=tmp_path,
-    )["predecessor_authority"]
-    assert projected["result"]["narrative_status"] == "unavailable"
-    assert load_task_result(tmp_path, task_id) is None
-
-
-def test_main_projection_is_deep_and_deduplicates_two_raw_keys_and_current_contract(tmp_path):
-    from ouroboros.main_context_authority import project_main_task_authority
-
-    second = {
-        "task_id": "older", "source": _source("older"),
-        "result": "Y" * 200001, "task_contract": {"objective": "older"},
-        "unknown": {"nested": ["keep", {"x": 1}]},
-    }
-    first = {
-        "task_id": "first", "source": _source("first"),
-        "result": "A" * 200001, "final_answer": "A" * 200001,
-        "task_contract": {"objective": "first", "predecessor_authority": second},
-        "predecessor_authority": second,
-    }
-    contract = {"objective": "next", "predecessor_authority": first}
-    task = {"id": "next", "task_contract": contract, "predecessor_authority": first}
+    brief = {"task_id": "first", "source": _source("first"), "kind": "bounded_continuation_envelope",
+             "result": "A" * 200001, "task_contract": {"objective": "first"}, "omitted_fields": {"trace_summary": 12}}
+    work_order = "[CONTINUE] Continue was requested for task first.\n\nOwner's original instruction (verbatim):\nShip it"
+    task = {"id": "next", "text": work_order, "predecessor_authority": brief,
+            "task_contract": {"objective": work_order, "context": "keep", "predecessor_authority": copy.deepcopy(brief)}}
     before = copy.deepcopy(task)
-    projected = project_main_task_authority(task, drive_root=tmp_path)
+
+    projected = project_main_task_authority(task)
 
     assert task == before
-    assert "predecessor_authority" not in projected["task_contract"]
-    nested = projected["predecessor_authority"]["task_contract"]["predecessor_authority"]
-    assert nested["task_id"] == "older"
-    assert nested["unknown"] == second["unknown"]
-    first_result = projected["predecessor_authority"]["result"]
-    assert first_result["narrative_status"] == "unavailable"
-    assert projected["predecessor_authority"]["final_answer"]["narrative_status"] == "unavailable"
-    assert nested["result"]["narrative_status"] == "unavailable"
+    assert projected["predecessor_authority"] == brief and "narrative_status" not in json.dumps(projected)
+    assert "predecessor_authority" not in projected["task_contract"], "the brief appears once"
+    assert projected["task_contract"]["context"] == "keep"
+    assert projected["task_contract"]["objective"] == {
+        "representation": "assignment", "chars": len(work_order),
+        "sha256": hashlib.sha256(work_order.encode("utf-8")).hexdigest(),
+        "rule": "The objective is this task's assignment, the first user turn of this conversation; "
+                "it is not repeated here."}
+    assert work_order not in json.dumps(projected), "the work order is not repeated inside the Runtime view"
 
-
-@pytest.mark.parametrize("key", ["result", "final_answer"])
-@pytest.mark.parametrize("size,omitted", [(199999, False), (200000, False), (200001, True)])
-def test_predecessor_threshold_is_strict_and_key_specific(tmp_path, key, size, omitted):
-    from ouroboros.context_budget import PREDECESSOR_RESULT_INLINE_CHARS
-    from ouroboros.main_context_authority import project_main_task_authority
-
-    assert PREDECESSOR_RESULT_INLINE_CHARS == 200000
-    value = "Z" * size
-    authority = {
-        "task_id": "threshold", "source": _source("threshold"),
-        key: value, "task_contract": {"objective": "keep"},
-    }
-    projected = project_main_task_authority(
-        {"id": "next", "predecessor_authority": authority}, drive_root=tmp_path,
-    )["predecessor_authority"][key]
-    assert (isinstance(projected, dict) and projected.get("raw_result_resident") is False) is omitted
-    if not omitted:
-        assert projected == value
+    other = {**brief, "task_id": "older", "source": _source("older")}
+    kept = project_main_task_authority({"id": "next", "text": "do it", "predecessor_authority": brief,
+                                        "task_contract": {"objective": "A shorter title", "predecessor_authority": other}})
+    assert kept["task_contract"]["predecessor_authority"] == other, "a different identity is not a duplicate"
+    assert kept["task_contract"]["objective"] == "A shorter title", "only the assignment itself is referenced"
 
 
 def test_numeric_http_code_does_not_hide_response_body_overflow():

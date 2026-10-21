@@ -47,17 +47,14 @@ const shape = (node) => ({
     arrowHidden: node.children[2].attributes['aria-hidden'],
 });
 
-test('one intent, one control: every layout is the same node with the same name and the same press', () => {
+test('one intent, one control: both forms are the same node with the same name and the same press', () => {
     withDom((sent) => {
         const project = { id: 'launch', name: 'OpenClaw 2.0 <b>x</b>', chat_id: 42 };
         const inline = projectReference(project);
-        const bar = projectReference(project, { layout: 'bar', state: 'background' });
         const footer = projectReference(project, { layout: 'footer' });
-        // The callers pick a layout; the classes are the door's own business.
+        // The callers pick one of two forms; the classes are the door's own business.
         assert.equal(inline.className, 'chat-live-project-card-btn chat-quiz-project');
-        assert.equal(bar.className, 'chat-live-project-card-btn');
         assert.equal(footer.className, 'chat-live-project-card-btn chat-live-bound-pointer');
-        assert.deepEqual(shape(inline), shape(bar));
         assert.deepEqual(shape(inline), shape(footer));
         assert.deepEqual(shape(inline), {
             tag: 'BUTTON', type: 'button', intent: 'open-project',
@@ -65,32 +62,35 @@ test('one intent, one control: every layout is the same node with the same name 
             icon: PAGE_ICONS.projects, iconHidden: 'true', arrowHidden: 'true',
         });
         // The name is text: a Project name can never inject markup.
-        for (const node of [inline, bar, footer]) assert.equal(node.children[1].textContent, 'OpenClaw 2.0 <b>x</b>');
-        // The arrow alone says "opens"; words appear only as a closed state of the same control.
-        assert.equal(inline.children[2].textContent, '↗');
-        assert.equal(footer.children[2].textContent, '↗');
-        assert.equal(bar.children[2].textContent, 'running in background ↗');
+        for (const node of [inline, footer]) assert.equal(node.children[1].textContent, 'OpenClaw 2.0 <b>x</b>');
+        // The arrow alone says "opens", in both forms.
+        for (const node of [inline, footer]) assert.equal(node.children[2].textContent, '↗');
         // Phones and the Telegram shell have no hover: the accessible name says everything the pixels do.
-        assert.equal(inline.attributes['aria-label'], 'Open project OpenClaw 2.0 <b>x</b>');
-        assert.equal(inline.title, inline.attributes['aria-label']);
-        assert.equal(bar.attributes['aria-label'], 'Open project OpenClaw 2.0 <b>x</b>, running in background');
-        for (const node of [inline, bar, footer]) node.listeners.get('click')();
-        assert.deepEqual(sent, Array(3).fill({
+        for (const node of [inline, footer]) {
+            assert.equal(node.attributes['aria-label'], 'Open project OpenClaw 2.0 <b>x</b>');
+            assert.equal(node.title, node.attributes['aria-label']);
+        }
+        for (const node of [inline, footer]) node.listeners.get('click')();
+        assert.deepEqual(sent, Array(2).fill({
             type: 'ouro:open-project', detail: { project, task_id: '', quiz_id: '' },
         }));
     });
 });
 
-test('a question reference opens that exact question, and an unknown state or layout adds nothing', () => {
+test('a question reference opens that exact question; any other layout or a state word is the plain inline capsule', () => {
     withDom((sent) => {
         const node = projectReference({ id: 'launch', name: 'Launch', chat_id: 7 }, { taskId: 't1', quizId: 'q1' });
         assert.equal(node.attributes['aria-label'], 'Open this question in Launch');
         node.listeners.get('click')();
         assert.deepEqual(sent[0].detail, { project: { id: 'launch', name: 'Launch', chat_id: 7 }, task_id: 't1', quiz_id: 'q1' });
-        const odd = projectReference({ id: 'launch', name: 'Launch' }, { layout: 'sidebar', state: 'paused' });
-        assert.equal(odd.className, 'chat-live-project-card-btn');
-        assert.equal(odd.children[2].textContent, '↗');
-        assert.equal(odd.dataset.state, undefined);
+        // Two forms only: the retired `bar` layout and `background` words, or any other, read as the inline capsule.
+        for (const [layout, state] of [['bar', 'background'], ['sidebar', 'paused']]) {
+            const odd = projectReference({ id: 'launch', name: 'Launch' }, { layout, state });
+            assert.equal(odd.className, 'chat-live-project-card-btn chat-quiz-project');
+            assert.equal(odd.children[2].textContent, '↗');
+            assert.equal(odd.attributes['aria-label'], 'Open project Launch');
+            assert.equal(odd.dataset.state, undefined);
+        }
     });
 });
 
@@ -130,4 +130,27 @@ test('the door is the only place that raises the event or builds the control', (
     const helpers = fs.readFileSync(path.join(WEB, 'modules', 'ui_helpers.js'), 'utf8');
     assert.doesNotMatch(helpers, /export function (renderProjectChip|createSystemMessageAction)\b/);
     assert.match(helpers, /export function createSystemMessageActions\(/);
+});
+
+test('one recipe in two forms: no outline, hairline, ring or tile, no width of its own, hover only for a hovering pointer', () => {
+    // Owner 17.10 (Q2 = C): the receipt keeps its capsule, and the capsule reads as one chip.
+    const css = fs.readFileSync(path.join(WEB, 'style.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+    const REFERENCE = /chat-quiz-project|chat-live-project-|chat-live-bound-pointer/;
+    const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map(([, sel, body]) => ({ sel: sel.trim(), body }))
+        .filter(({ sel }) => REFERENCE.test(sel));
+    assert.ok(rules.length >= 8, 'the recipe is found');
+    for (const { sel, body } of rules) {
+        assert.doesNotMatch(body, /border(-top)?\s*:\s*1px/, `${sel}: no outline, hairline or ring`);
+        assert.doesNotMatch(body, /max-width\s*:[^;]*ch\b/, `${sel}: no width chosen by its surroundings`);
+        assert.doesNotMatch(body, /text-decoration\s*:\s*underline/, `${sel}: no underline-only state`);
+        if (sel.includes('chat-live-project-icon')) assert.doesNotMatch(body, /background/, `${sel}: one fill, no tile`);
+    }
+    // Only the recipe's own selectors size the capsule: no ancestor restyles it.
+    assert.deepEqual([...new Set(rules.map(({ sel }) => sel).filter((sel) => /^\.(system-message-actions|msg-routing-annotation|chat-bubble)/.test(sel)))], []);
+    for (const { index } of css.matchAll(/\.(chat-live-project-card-btn|chat-quiz-project|chat-live-bound-pointer)[^{},]*:hover/g)) {
+        const before = css.slice(0, index);
+        const media = before.lastIndexOf('@media');
+        assert.ok(media >= 0 && /^@media \(hover: hover\)/.test(before.slice(media)) && !/\n\}/.test(before.slice(media)),
+            'a reference hover is gated by (hover: hover)');
+    }
 });

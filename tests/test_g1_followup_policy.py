@@ -178,6 +178,7 @@ def test_stale_restore_never_clears_new_stop_or_enables_independent_disable(worl
     stop(root)
     outcome = restore(root, registered['id'], old)
     assert outcome['status'] == 'stale_hold'
+    assert outcome['changed'] is True  # no tick ran since the Stop: this refusal persisted the new hold
     new = row(root, registered['id'])['followup_hold']['hold_id']
     assert new != old
     assert restore(root, registered['id'], new)['ok']

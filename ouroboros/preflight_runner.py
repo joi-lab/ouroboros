@@ -568,9 +568,11 @@ def _observed_worker_ids(temp_root: pathlib.Path) -> set:
         return set()
 
 
-def _preflight_env(temp_root: pathlib.Path, repo_worktree: pathlib.Path, *, create=True,
+def _preflight_env(temp_root: pathlib.Path, repo_worktree: pathlib.Path, *, create=True, cwd=None,
                    workers: Optional[int] = None) -> dict:
-    from ouroboros.test_environment import isolated_environment, without_launch_descriptors
+    from ouroboros.test_environment import (
+        DIAGNOSTIC_OUTPUT_KEYS, isolated_environment, retain_diagnostic_outputs, without_launch_descriptors,
+    )
     from ouroboros.preflight_node import node_environment
     from ouroboros.test_parallelism import NESTED_WORKERS_ENV
 
@@ -578,7 +580,8 @@ def _preflight_env(temp_root: pathlib.Path, repo_worktree: pathlib.Path, *, crea
     # The scrub drops settings keys (`test_environment.settings_keys`), secret suffixes,
     # `NODE_OPTIONS`, `VIRTUAL_ENV`, the OUROBOROS_/GH_/GIT_/PYTEST_/PYTHON/UV_/PIP_
     # prefixes and launch descriptors; writable paths are re-rooted under `temp_root`.
-    env = node_environment(without_launch_descriptors(isolated_environment(temp_root, repo_worktree, create=create)))
+    env = node_environment(without_launch_descriptors(isolated_environment(
+        temp_root, repo_worktree, create=create, keep=DIAGNOSTIC_OUTPUT_KEYS)))
     # PREPENDED, so `-p ouroboros_preflight_probe` resolves to the gate's own
     # worker-count plugin and not to anything the candidate tree or the
     # operator's PYTHONPATH happens to shadow it with.
@@ -588,6 +591,13 @@ def _preflight_env(temp_root: pathlib.Path, repo_worktree: pathlib.Path, *, crea
     # the serial/legacy passes, which pass no `-n` at all.
     env["PYTEST_XDIST_AUTO_NUM_WORKERS"] = str(_allocated_worker_count(temp_root) if workers is None else workers)
     env[NESTED_WORKERS_ENV] = env["PYTEST_XDIST_AUTO_NUM_WORKERS"]
+    from ouroboros.test_evidence import EVIDENCE_ENV, EVIDENCE_POINTER
+    pointer = temp_root / EVIDENCE_POINTER
+    evidence = pointer.read_text(encoding="utf-8").strip() if create and pointer.is_file() else str(temp_root / "evidence")
+    env.update({"OUROBOROS_TEST_TEMP_ROOT": str(temp_root), EVIDENCE_ENV: evidence})
+    if create:
+        retain_diagnostic_outputs(temp_root, env, cwd=cwd or repo_worktree)
+    env.setdefault("OUROBOROS_UI_EVIDENCE_DIR", str(pathlib.Path(evidence) / "ui"))
     return env
 
 
@@ -789,6 +799,23 @@ def _partial_stream_text(chunk) -> str:
     return chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else str(chunk)
 
 
+def _controller_diagnostics(output_root) -> str:
+    """Keep xdist/timeout classification independent of a long display preview."""
+    patterns = (*_WORKER_CRASH_PATTERNS, *_TIMEOUT_BANNER_PATTERNS)
+    found = {}
+    for name in ("stdout.bin", "stderr.bin"):
+        with (pathlib.Path(output_root) / name).open("rb") as stream:
+            start = True
+            while chunk := stream.readline(8192):
+                if start:
+                    text = _strip_decoration(chunk.decode("utf-8", "replace"))
+                    for index, pattern in enumerate(patterns):
+                        if index not in found and pattern.search(text):
+                            found[index] = text
+                start = chunk.endswith(b"\n")
+    return "\n".join(found.values()) + ("\n" if found else "")
+
+
 def _execute_pytest_pass(
     agent_python: str,
     worktree: pathlib.Path,
@@ -818,84 +845,43 @@ def _execute_pytest_pass(
     """
     from ouroboros.process_containment import ProcessContainer
 
+    from ouroboros.test_evidence import CapturedPass, FileOutput
+
     container = ProcessContainer(lifeline=True, overload=True)
-    # `container.spawn`, not `Popen` + `adopt`: it applies the process-group/session
-    # kwargs AND leaves no window between the process existing and being contained.
-    # On Windows job membership only takes effect at assignment, so a descendant
-    # started in that window is outside the job and survives terminate/close.
-    proc = container.spawn(
-        [agent_python, "-m", "pytest", *args],
-        cwd=str(worktree),
-        env=_preflight_env(temp_root, worktree),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    reap_error = ""
+    output = FileOutput(temp_root, "pytest")
+    proc = None
+    reap_error = "lane did not finish"
     try:
+        proc = container.spawn(
+            [agent_python, "-m", "pytest", *args], cwd=str(worktree),
+            env=_preflight_env(temp_root, worktree), stdout=output.stdout, stderr=output.stderr,
+        )
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-            returncode: Optional[int] = proc.returncode
-            output = (stdout or "") + (stderr or "")
-        except subprocess.TimeoutExpired as first_timeout:
+            returncode: Optional[int] = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
             _terminate_preflight_tree(proc, temp_root)
-            # Seeded from the FIRST timeout, which already carries everything
-            # pytest had flushed. The retry below exists to collect more, not to
-            # be the only source: if it times out too — the exact case this path
-            # anticipates — an empty seed threw away the one excerpt naming the
-            # last test pytest started.
-            partial = (
-                _partial_stream_text(first_timeout.output)
-                + _partial_stream_text(first_timeout.stderr)
-            )
-            # Reaped BEFORE the retry, not only after it: the retry blocks on an
-            # escaped grandchild still holding the inherited stdout/stderr pipe,
-            # and that grandchild is precisely what the container can kill.
-            reap_error = container.reap()
+            returncode = None
+        # Regular files do not wait for a detached child's pipe EOF. Reap even
+        # after green, before reading or releasing anything the lane wrote.
+        reap_error = container.reap()
+        if proc.poll() is None:
             try:
-                stdout, stderr = proc.communicate(timeout=10)
-                # Only a RICHER excerpt replaces the seed; a retry that returns
-                # nothing must not erase what the first timeout captured.
-                partial = ((stdout or "") + (stderr or "")) or partial
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                for stream in (proc.stdout, proc.stderr):
-                    try:
-                        if stream is not None:
-                            stream.close()
-                    except Exception:
-                        pass
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    pass
-            returncode, output = None, partial
-        # UNCONDITIONAL, including after a green pass, and BEFORE the return so
-        # the verdict can carry it. `communicate` returning only proves the pytest
-        # CONTROLLER exited: a test that spawned a detached child with redirected
-        # stdio and a temp-path-free argv is invisible to both the `pgrep -P` walk
-        # (its parent is gone, so the ppid links are gone with it). The container
-        # still names it, through the membership
-        # token the kernel copied into every descendant's environment — including a
-        # `setsid()` escapee's — resolved from the live process table HERE rather
-        # than sampled earlier, so a child born and orphaned in the same instant is
-        # not missed. The scan is what keeps pass 1 out of pass 2: it kills what it
-        # can and BLOCKS on whatever is left. A second call is inert (the handles
-        # are consumed by the first), so the timeout path's earlier reap stands.
-        if not reap_error:
-            reap_error = container.reap()
-        return returncode, output, reap_error
-    finally:
-        # A crash/exception path (not only timeout) can leak a detached child;
-        # never hand a live tree back to the orchestrator.
+                reap_error = reap_error or "direct pytest process did not exit after reap"
+        preview = output.finish(returncode=returncode, containment_error=reap_error,
+                                argv=[agent_python, "-m", "pytest", *args])
         try:
-            if proc.poll() is None:
-                _terminate_preflight_tree(proc, temp_root)
-        except Exception:
-            pass
-        # Reached with the reap already done on every returning path; it still
-        # runs on the raising one, where no verdict can carry the reason anyway.
+            preview = _controller_diagnostics(output.root) + preview
+        except OSError as exc:
+            output.failed("controller diagnostics", exc)
+        return CapturedPass(returncode, preview, reap_error, output.errors)
+    finally:
+        if proc is not None and proc.poll() is None:
+            _terminate_preflight_tree(proc, temp_root)
         container.reap()
         container.close()
+        output.close()
 
 
 _TRUNCATION_MARKER = "\n...(truncated)..."
@@ -1172,23 +1158,65 @@ def _release_hermetic_tree(repo, temp_root, worktree, worktree_added: bool, unpr
     repository keeps the registration for whoever proves those processes gone.
     The marker is the enclosing layers' retention protocol; this decision does
     not depend on the marker write succeeding."""
-    if unproven:
+    from ouroboros.test_environment import retention_markers
+    if unproven or retention_markers(temp_root):
         from ouroboros.test_environment import retain_tree
 
-        retain_tree(temp_root, f"hermetic preflight: {unproven}")
+        retain_tree(temp_root, f"hermetic preflight: {unproven or 'retention marker or unreadable subtree'}")
         return
     if worktree_added:
-        subprocess.run(
+        removed = subprocess.run(
             ["git", "worktree", "remove", "--force", str(worktree)],
             cwd=str(repo),
             capture_output=True,
             text=True,
             timeout=30,
         )
-    shutil.rmtree(temp_root, ignore_errors=True)
+        if removed.returncode:
+            from ouroboros.test_environment import retain_tree
+            retain_tree(temp_root, f"git worktree removal failed: {removed.stderr}")
+            return
+    from ouroboros.test_evidence import remove_scratch_tree
+    remove_scratch_tree(temp_root)
 
 
-def run_hermetic_pytest(
+def _assemble_live_source(repo, worktree, evidence):
+    """Apply the admitted live projection and retain the actual tested recipe once.
+
+    Source evidence is exported AFTER the disposable index/files agree with their
+    respective source projections. Exporting twice paid twice and left ambiguous
+    earlier inputs if the second export only partly completed.
+    """
+    from ouroboros.test_evidence import describe_gaps, source_evidence, write_record
+
+    combined = _run_git(repo, ["diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-color",
+                             "--src-prefix=a/", "--dst-prefix=b/", "HEAD"], binary_stdout=True)
+    if combined.returncode != 0:
+        raise RuntimeError(combined.stderr.strip() or "git diff HEAD failed")
+    _apply_diff(worktree, combined.stdout or b"")
+    _copy_untracked(repo, worktree)
+    try:
+        source = source_evidence(worktree, evidence["path"] / "source")
+        if source.get("gaps"):
+            # A proof covers its whole recorded candidate: a gap makes this run ineligible.
+            raise RuntimeError("untracked inputs not recorded: " + describe_gaps(source["gaps"]))
+        source["source_repository"] = str(repo)
+        write_record(evidence["path"] / "source" / "source.json", source)
+    except (RuntimeError, subprocess.SubprocessError, OSError) as exc:
+        evidence["retain_reason"] = f"candidate evidence incomplete: {exc}"
+        from ouroboros.test_evidence import diagnostics_incomplete
+        diagnostics_incomplete(str(exc))  # Preserve an enclosing disposable Git owner too.
+        raise
+
+
+def _record_lane(evidence, lane, result, **facts) -> None:
+    """One lane's observed exit/containment and its separate diagnostic errors."""
+    evidence.setdefault("lanes", []).append({"lane": lane, **facts})
+    evidence.setdefault("evidence_errors", []).extend(result.get("evidence_errors", ()) if isinstance(result, dict)
+                                                      else getattr(result, "evidence_errors", ()))
+
+
+def _run_hermetic_pytest(
     repo_dir: pathlib.Path | str,
     *,
     timeout: int = _DEFAULT_PREFLIGHT_TIMEOUT_SEC,
@@ -1197,6 +1225,7 @@ def run_hermetic_pytest(
     phase: str = "post_commit",
     ctx=None,
     selected: bool = False, base: str | None = None, extra_tests=(), full_tests=False, test_reason="",
+    evidence=None,
 ) -> Optional[str]:
     """Run Node and both pytest lanes in one disposable candidate checkout.
 
@@ -1217,14 +1246,10 @@ def run_hermetic_pytest(
     previous_proof = getattr(ctx, "_preflight_test_proof", None)
     previous_inventory = getattr(ctx, "_preflight_test_inventory", None)
     if ctx is not None:
-        ctx._preflight_test_proof = None
-        ctx._preflight_tests_passed = False
-        ctx._preflight_test_inventory = None
+        ctx._preflight_test_proof, ctx._preflight_tests_passed, ctx._preflight_test_inventory = None, False, None
     timeout = _resolve_preflight_timeout(timeout)
-    # Checked BEFORE anything runs. `_diagnosis` renders inside this budget, so a
-    # non-positive one produced an empty string for a real failure — which the
-    # loop below reads as "no diagnosis", i.e. as success. A budget that cannot
-    # render a failure must stop the gate, never silently pass it.
+    # Check before execution: an unrenderable failure used to become an empty
+    # string, which the caller reads as success. Never silently green a red run.
     if max_output <= 0:
         return (
             f"⚠️ PRE_PUSH_TEST_ERROR: max_output must be positive (got {max_output}); "
@@ -1273,6 +1298,8 @@ def run_hermetic_pytest(
     unproven_teardown = ""
     selection, subject, inventory = None, None, {}
     try:
+        from ouroboros.test_evidence import EVIDENCE_POINTER
+        (temp_root / EVIDENCE_POINTER).write_text(str(evidence["path"]), encoding="utf-8")
         # Install before compiling specs: -p must name the actual nonce module.
         probe_module = _install_worker_probe(temp_root)
         passes = _preflight_pass_specs(pytest_args, probe_module=probe_module)
@@ -1307,16 +1334,7 @@ def run_hermetic_pytest(
         # reject or silently drop. Pin content-changing diff config and retain
         # raw bytes end to end (the byte/EOL contracts live in _run_git/_apply_diff).
         try:
-            combined_proc = _run_git(
-                repo,
-                ["diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-color",
-                 "--src-prefix=a/", "--dst-prefix=b/", "HEAD"],
-                binary_stdout=True,
-            )
-            if combined_proc.returncode != 0:
-                raise RuntimeError(combined_proc.stderr.strip() or "git diff HEAD failed")
-            _apply_diff(worktree, combined_proc.stdout or b"")
-            _copy_untracked(repo, worktree)
+            _assemble_live_source(repo, worktree, evidence)
         # Capture/apply timeouts and filesystem faults are assembly failures,
         # not pytest timeouts or missing interpreters from the outer handlers.
         except (RuntimeError, subprocess.SubprocessError, OSError) as exc:
@@ -1343,7 +1361,8 @@ def run_hermetic_pytest(
                                      extra_tests=extra_tests, full_tests=full_tests, test_reason=test_reason)
             if pytest_args is not None:
                 raise ValueError("selected scope cannot be combined with custom pytest arguments")
-            passes = selection_passes(selection, probe_module=probe_module, temp_root=temp_root)
+            passes = selection_passes(selection, probe_module=probe_module, temp_root=temp_root,
+                                      inventory_dir=evidence["path"])
 
         subject = capture_preflight_test_subject(
             worktree, timeout=timeout, pytest_args=pytest_args,
@@ -1354,6 +1373,8 @@ def run_hermetic_pytest(
         can_reuse = isinstance(previous_proof, PreflightTestProof) and previous_proof.covers(subject)
         receipt = None if can_reuse else FullGateReceipt.prepare(ctx, subject, passes, probe_module, agent_python, temp_root, worktree)
         if can_reuse or receipt.covered():
+            evidence.update(reuse="process_proof" if can_reuse else "receipt", reused_from=getattr(
+                ctx, "_preflight_previous_evidence", None) if can_reuse else receipt.evidence)
             ctx._preflight_test_proof = previous_proof if can_reuse else subject
             ctx._preflight_test_inventory = previous_inventory if can_reuse else None
             ctx._preflight_tests_passed = True
@@ -1363,7 +1384,10 @@ def run_hermetic_pytest(
         started = time.monotonic()
         unproven_teardown = "the node lane did not return, so its teardown is unconfirmed"
         node_result = run_node_tests(worktree, temp_root, timeout, max_output)
+        evidence["execution"] = (node_result or {}).get("execution", "not_run")
         unproven_teardown = (node_result or {}).get("reap_error") or ""
+        if node_result is not None:
+            _record_lane(evidence, "node", node_result, returncode=node_result.get("returncode"), containment_error=unproven_teardown)
         if node_error := (node_result or {}).get("error"):
             return _with_retention_notice(node_error, unproven_teardown, worktree, max_output)
         empty_passes: list[str] = []
@@ -1379,13 +1403,17 @@ def run_hermetic_pytest(
             # Headers report this pass, not cumulative shared-budget time.
             pass_started = time.monotonic()
             unproven_teardown = f"the {spec.label} pass did not return, so its teardown is unconfirmed"
-            returncode, output, reap_error = _execute_pytest_pass(
+            evidence["execution"] = "attempted"
+            lane_result = _execute_pytest_pass(
                 agent_python, worktree, temp_root, spec.args, remaining
             )
+            returncode, output, reap_error = lane_result
+            _record_lane(evidence, "pytest", lane_result, returncode=returncode, containment_error=reap_error, **{"pass": spec.label})
             unproven_teardown = reap_error
+            evidence["execution"] = "executed"
             inventory_error = ""
-            if selection is not None:
-                inventory[spec.label], inventory_error = read_inventory(temp_root, spec.label)
+            if selection is not None:  # the full native inventory is run evidence; ledgers stay compact
+                inventory[spec.label], inventory_error = read_inventory(evidence["path"], spec.label)
                 if ctx is not None:
                     ctx._preflight_test_inventory = inventory
             elapsed = time.monotonic() - pass_started
@@ -1484,7 +1512,42 @@ def run_hermetic_pytest(
     except Exception as exc:
         failure = f"⚠️ PRE_PUSH_TEST_ERROR: hermetic preflight failed: {exc}"
     finally:
+        evidence["cleanup"] = (repo, temp_root, worktree, worktree_added, unproven_teardown)
         from ouroboros.preflight_inventory import record_failed_attempt
         record_failed_attempt(ctx, selection, subject, inventory)
-        _release_hermetic_tree(repo, temp_root, worktree, worktree_added, unproven_teardown)
     return _with_retention_notice(failure, unproven_teardown, worktree, max_output)
+
+
+def run_hermetic_pytest(repo_dir, *, timeout=_DEFAULT_PREFLIGHT_TIMEOUT_SEC, pytest_args=None,
+                       max_output=8000, phase="post_commit", ctx=None, selected=False, base=None,
+                       extra_tests=(), full_tests=False, test_reason="") -> Optional[str]:
+    """Existing gate, with durable raw evidence also on green and ctx-less calls.
+
+    Evidence location is diagnostic, never part of the reusable test identity.
+    The internal runner still owns assembly, selection, lane verdicts and green receipts.
+    """
+    from ouroboros.test_evidence import evidence_directory, finish_gate
+
+    repo = pathlib.Path(repo_dir).resolve()
+    try:
+        evidence = {"path": evidence_directory(repo, ctx=ctx,
+            parent=getattr(ctx, "_preflight_evidence_parent", None))} if (repo / ".git").exists() else None
+    except OSError as exc:
+        evidence = f"⚠️ PRE_PUSH_TEST_ERROR: preflight evidence destination unavailable: {exc}"
+    if not isinstance(evidence, dict):
+        if ctx is not None:
+            ctx._preflight_tests_passed, ctx._preflight_test_proof, ctx._preflight_test_inventory = False, None, None
+        return evidence
+    if ctx is not None:
+        ctx._preflight_previous_evidence = getattr(ctx, "_preflight_test_evidence", None)
+        ctx._preflight_test_evidence = str(evidence["path"])
+    print(f"PREFLIGHT_EVIDENCE {evidence['path']}", file=sys.stderr, flush=True)
+    verdict = "preflight interrupted before a verdict"
+    try:
+        verdict = _run_hermetic_pytest(repo, timeout=timeout, pytest_args=pytest_args,
+                                       max_output=max_output, phase=phase, ctx=ctx, evidence=evidence,
+                                       selected=selected, base=base, extra_tests=extra_tests,
+                                       full_tests=full_tests, test_reason=test_reason)
+        return verdict
+    finally:
+        finish_gate(evidence, verdict, phase, _release_hermetic_tree)

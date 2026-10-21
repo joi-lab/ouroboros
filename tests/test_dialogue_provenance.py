@@ -1,3 +1,5 @@
+
+from tests import _dialogue as dialogue_test
 import json
 from types import SimpleNamespace
 
@@ -109,7 +111,7 @@ def test_presence_task_facts_row_persists_normalized_provenance(tmp_path):
         {"tool_calls": []},
         logs,
     )
-    row = json.loads((logs / "chat.jsonl").read_text(encoding="utf-8"))
+    row = json.loads(dialogue_test.log_text(logs / "chat.jsonl"))
     assert row["type"] == "task_summary"
     assert row["presence_provenance"] == presence_provenance_from_task(_presence_task())
 

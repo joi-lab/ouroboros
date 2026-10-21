@@ -204,6 +204,9 @@ if _is_macos:
             'CFBundleShortVersionString': open('VERSION').read().strip(),
             'CFBundleVersion': open('VERSION').read().strip(),
             'NSHighResolutionCapable': True,
+            'NSMicrophoneUsageDescription': 'Ouroboros uses your microphone for dictation and voice when you start them.',
+            # WebKit refuses webkitSpeechRecognition (Browser speech) in an app without this string.
+            'NSSpeechRecognitionUsageDescription': 'Ouroboros uses speech recognition when you dictate with Browser speech.',
             'LSMinimumSystemVersion': '12.0',
         },
     )

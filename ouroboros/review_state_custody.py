@@ -33,6 +33,18 @@ def _rs():
 
 
 _ACTIVE_REVIEW_OPERATION_STATES = frozenset({"in_flight", "custody_lost"})
+# How long a seat launch waits for the shared review-state lock before binding its start token
+# (``checkpoint_pending_review_invocation``). That binding is bookkeeping before a paid start, so
+# other writers of the file are waited out instead of refusing the seat. A transport bound, not a
+# judgment: longer than the lock's 90 s stale-holder horizon (``acquire_review_state_lock``), so a
+# lock left by a dead writer is reclaimed inside the wait; only a live writer wedged mid-write
+# outlasts it, and that refusal carries the lock facts.
+SEAT_LAUNCH_LOCK_WAIT_SEC = 120.0
+
+
+class ReservedReviewSlotRefused(ValueError):
+    """The reserved commit-review row cannot take this start token: the attempt or row is missing,
+    closed, or bound to another operation or token. The seat's own reason, never a busy lock."""
 
 
 def _attempt_review_roster_rows(item: "CommitAttemptRecord") -> List[Dict[str, Any]]:
@@ -98,6 +110,9 @@ def checkpoint_pending_review_invocation(
     Its logical status does not revoke that physical operation's custody; the
     paid attempt, retry key and exact in-flight slot below are the authority.
     This checkpoint records no verdict and never changes the commit status.
+    A busy review-state lock is waited out (``SEAT_LAUNCH_LOCK_WAIT_SEC``): the binding is
+    bookkeeping before a paid start. Only a reserved row that cannot take this token refuses,
+    as ``ReservedReviewSlotRefused`` naming why.
     """
     expected = {
         "review_retry_key": str(review_retry_key or ""),
@@ -107,9 +122,9 @@ def checkpoint_pending_review_invocation(
         "invocation_id": str(invocation_id or ""),
     }
     if not all(expected.values()):
-        raise ValueError("pending review invocation checkpoint is incomplete")
+        raise ReservedReviewSlotRefused("pending review invocation checkpoint is incomplete")
     if expected["surface"] not in {"multi_model_review", "scope_review"}:
-        raise ValueError(f"unsupported commit-review surface {surface!r}")
+        raise ReservedReviewSlotRefused(f"unsupported commit-review surface {surface!r}")
     still_sends = _left_before_launch_still_sends(expected["operation_id"])
 
     def _mutate(state: AdvisoryReviewState) -> None:
@@ -124,51 +139,51 @@ def checkpoint_pending_review_invocation(
             or not current.paid
             or current.review_retry_key != expected["review_retry_key"]
         ):
-            raise ValueError("reserved commit-review attempt is unavailable")
+            raise ReservedReviewSlotRefused("reserved commit-review attempt is unavailable")
         if expected["surface"] == "multi_model_review":
             rows = current.triad_raw_results
         else:
             wrapper = current.scope_raw_result
             rows = wrapper.get("raw_results") if isinstance(wrapper, dict) else None
         if not isinstance(rows, list):
-            raise ValueError("reserved commit-review roster is unavailable")
+            raise ReservedReviewSlotRefused("reserved commit-review roster is unavailable")
         matches = [
             row for row in rows
             if isinstance(row, dict)
             and str(row.get("slot_id") or row.get("slot") or "") == expected["slot_id"]
         ]
         if len(matches) != 1:
-            raise ValueError("reserved commit-review slot identity is ambiguous")
+            raise ReservedReviewSlotRefused("reserved commit-review slot identity is ambiguous")
         row = matches[0]
         if str(row.get("operation_id") or "") != expected["operation_id"]:
-            raise ValueError("reserved commit-review operation identity changed")
+            raise ReservedReviewSlotRefused("reserved commit-review operation identity changed")
         row_state = str(row.get("operation_state") or "")
         if row_state == "pending_dispatch" and still_sends:
             # The author left this seat on an addressed message before its first launch (G1's receptive
             # yield records it pending_dispatch); it still sends, and this start makes it in flight.
             row["operation_state"] = "in_flight"
         elif row_state != "in_flight":  # a Pause preparation never sends; a settled or lost row stays closed
-            raise ValueError("reserved commit-review operation is not in flight")
+            raise ReservedReviewSlotRefused("reserved commit-review operation is not in flight")
         prior = str(row.get("pending_invocation_id") or "")
         if prior and prior != expected["invocation_id"]:
-            raise ValueError("reserved commit-review invocation identity changed")
+            raise ReservedReviewSlotRefused("reserved commit-review invocation identity changed")
         row["pending_invocation_id"] = expected["invocation_id"]
         row["late_result_pending"] = True
         current.late_result_pending = True
         current.updated_ts = _rs()._utc_now()
 
-    _rs().update_state(pathlib.Path(drive_root), _mutate)
+    _rs().update_state(pathlib.Path(drive_root), _mutate, lock_timeout_sec=SEAT_LAUNCH_LOCK_WAIT_SEC)
 
 
 def _left_before_launch_still_sends(operation_id: str) -> bool:
-    """This process's live seat for ``operation_id`` was detached by an addressed message, not by
-    Pause: its preparation goes on and sends. The caller is that seat itself, about to start."""
+    """This process's live seat for ``operation_id`` was detached by an addressed message or a departed
+    author, not by Pause: its preparation goes on and sends. The caller is that seat itself, about to start."""
     from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK
-    from ouroboros.review_pause import ADDRESSED_EVENT
+    from ouroboros.review_pause import ADDRESSED_EVENT, DEPARTED_EVENT
 
     with _ACTIVE_LOCK:
         entry = next((item for item in _ACTIVE.values() if item.operation_id == operation_id), None)
-        return bool(entry is not None and getattr(entry, "author_left_for", "") == ADDRESSED_EVENT
+        return bool(entry is not None and getattr(entry, "author_left_for", "") in {ADDRESSED_EVENT, DEPARTED_EVENT}
                     and not getattr(entry, "pause_before_launch", False))
 
 

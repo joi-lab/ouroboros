@@ -32,6 +32,7 @@ def test_self_pause_refused_and_nonce_reuses_the_provider_call(tmp_path):
 
 
 def test_mind_pause_other_root_records_actor_and_resume_keeps_attribution(tmp_path, monkeypatch):
+    from ouroboros.control_actor import pause_author
     from ouroboros.owner_pause import read_fence
     from ouroboros.task_results import write_task_result
     from supervisor.events_mind_controls import _apply
@@ -44,6 +45,9 @@ def test_mind_pause_other_root_records_actor_and_resume_keeps_attribution(tmp_pa
     assert result["ok"]
     fence = read_fence(tmp_path, "other")
     assert fence["actor"] == "mind" and fence["actor_task_id"] == "mind-root"
+    # The owner reads who decided and why: Ouroboros, in its own sentence.
+    assert fence["by"]["actor"] == "ouroboros" and fence["by"]["text"] == "finish the earlier request"
+    assert fence["by"]["at"] and pause_author(fence)["text"] == "finish the earlier request"
     assert _apply(_event("pause_task", "other"))["fence_id"] == fence["fence_id"]
     resumed = _apply(_event("resume_task", "other", "resume-call"))
     assert resumed["ok"], resumed
@@ -64,6 +68,33 @@ def test_panic_hold_survives_mind_resume_but_owner_can_select_it(tmp_path, monke
     assert _apply(_event("resume_task", "other"))["error"] == "panic_requires_owner_resume"
     assert task["_budget_pause_hold"]["reason"] == HOLD_PANIC
     assert resume_budget_paused_task("other")["ok"]
+
+
+@pytest.mark.parametrize("declared", ["owner", "ouroboros"])
+def test_a_declared_pause_author_grants_a_mind_no_panic_release(tmp_path, monkeypatch, declared):
+    """Provenance, never power: whoever a Pause's fence names, a mind's Resume of a Panic hold is refused."""
+    from ouroboros.owner_pause import read_fence
+    from ouroboros.task_results import write_task_result
+    from supervisor.events_budget import HOLD_PANIC, hold_budget_row
+    from supervisor.events_mind_controls import _apply
+    from supervisor.owner_pause_control import request_owner_pause
+
+    q, _state, workers = _install_queue(tmp_path, monkeypatch)
+    task = {"id": "other", "root_task_id": "other", "_attempt": 1, "type": "task", "admitted_dispatch": "none"}
+    workers.PENDING.append(task)
+    write_task_result(tmp_path, "other", "scheduled", root_task_id="other")
+    by = {"actor": declared, "text": "", "at": "2026-10-20T00:43:00+00:00"}
+    assert request_owner_pause("other", request_id="press", by=by)["ok"]
+    assert read_fence(tmp_path, "other")["by"] == by
+    hold_budget_row(task, reason=HOLD_PANIC)
+    assert _apply(_event("resume_task", "other"))["error"] == "panic_requires_owner_resume"
+    assert task["_budget_pause_hold"]["reason"] == HOLD_PANIC
+    # Nor does a declaration take power away: a declared Pause without Panic resumes as before.
+    workers.PENDING.append({"id": "plain", "root_task_id": "plain", "_attempt": 1, "type": "task",
+                            "admitted_dispatch": "none"})
+    write_task_result(tmp_path, "plain", "scheduled", root_task_id="plain")
+    assert request_owner_pause("plain", request_id="press-plain", by=by)["ok"]
+    assert _apply(_event("resume_task", "plain", "resume-plain"))["ok"]
 
 
 def test_mind_continue_and_owner_button_race_share_one_successor(tmp_path, monkeypatch):

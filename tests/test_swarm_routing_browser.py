@@ -11,7 +11,6 @@ then uses the supported Stop control to retire its isolated work.
 import base64
 import hashlib
 import json
-import os
 import uuid
 from pathlib import Path
 
@@ -27,6 +26,7 @@ from tests.system_e2e.harness import (
     start_server, wait_durable_result, wait_until,
 )
 from tests.test_owner_wait_integration import wait_clone as clone_fixture
+from tests._shared import producer_evidence_dir
 from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET
 
 wait_clone = clone_fixture
@@ -135,7 +135,8 @@ def test_swarm_admission_precedes_model_and_survives_replay_and_reload(
         **original_env(server), "HOME": str(home), "USERPROFILE": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
     })
-    evidence = Path(os.environ.get("OUROBOROS_BROWSER_EVIDENCE_OUT") or tmp_path / "evidence")
+    evidence = producer_evidence_dir(tmp_path / "evidence", "swarm-routing",
+                                     env="OUROBOROS_BROWSER_EVIDENCE_OUT")
     evidence = evidence / f"swarm-{room}-{width}-{'caption' if caption_only else 'text'}"
     evidence.mkdir(parents=True, exist_ok=True)
     with ScriptedStubModel(steps, gate=gate) as stub:

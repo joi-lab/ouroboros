@@ -6,13 +6,12 @@ actual gateway and SPA. Receipts and screenshots are retained on failure too.
 
 import uuid
 import json
-import os
-from pathlib import Path
 
 import pytest
 
 from devtools.benchmarks.common.server_runner import _api
 from tests.test_owner_wait_integration import wait_clone as clone_fixture
+from tests._shared import producer_evidence_dir
 from tests.system_e2e.harness import (
     ArtifactOracle, KeylessIsolatedServer, ModelGate, ScriptedStubModel,
     body_text, keyless_settings, start_server, wait_durable_result,
@@ -35,7 +34,8 @@ def _nf_environment(tmp_path, monkeypatch):
 
 
 def _nf_evidence(tmp_path, stem):
-    path = Path(os.environ.get("OUROBOROS_BROWSER_EVIDENCE_OUT") or tmp_path / "evidence") / stem
+    path = producer_evidence_dir(tmp_path / "evidence", "main-results",
+                                 env="OUROBOROS_BROWSER_EVIDENCE_OUT") / stem
     path.mkdir(parents=True, exist_ok=True)
     return path
 

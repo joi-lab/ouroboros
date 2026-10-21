@@ -76,11 +76,13 @@ def test_worker_saves_once_after_prior_frames_and_before_done(worker, monkeypatc
     entered, release = threading.Event(), threading.Event()
     preparations = []
     original = deepcopy(worker.events)
+    # Phase barriers, including the heartbeat's cold store work: only bound hangs.
+    hang = 60
 
     def prepare(root, task):
         preparations.append((root, task["id"], task["_attempt"]))
         entered.set()
-        assert release.wait(5)
+        assert release.wait(hang), "terminal file preparation was never released"
         write_task_result(root, task["id"], "completed", result="The answer", artifact_status="ready")
         return {"task_id": task["id"], "result": {}, "error": ""}
 
@@ -88,7 +90,7 @@ def test_worker_saves_once_after_prior_frames_and_before_done(worker, monkeypatc
     thread = threading.Thread(target=worker.run)
     thread.start()
     try:
-        assert entered.wait(5)
+        assert entered.wait(hang), "terminal file preparation never started"
         assert [worker.output.get_nowait()["type"] for _ in range(2)] == [
             "send_message", "task_metrics_event"]
         assert worker.output.empty(), "task_done must not release the busy slot before saving"
@@ -108,7 +110,8 @@ def test_worker_saves_once_after_prior_frames_and_before_done(worker, monkeypatc
         assert busy.busy_task_id == "file-root"
     finally:
         release.set()
-        thread.join(5)
+        thread.join(hang)
+        assert not thread.is_alive(), "terminal file worker did not finish"
     assert not thread.is_alive() and not worker.crashes
     done = worker.output.get_nowait()
     assert done["type"] == "task_done" and done["_files_prepared_attempt"] == 3
@@ -310,11 +313,14 @@ def test_legacy_completion_uses_one_off_drain_job(file_recovery, monkeypatch):
     ctx, worker, pushed, jobs, returned = file_recovery
     entered, release = threading.Event(), threading.Event()
     preparations = []
+    # Phase barriers (``release`` is always set in ``finally``): the bound only breaks a real hang and
+    # must not time either side's store work, e.g. the heartbeat's cold usage store, 5 s under load (#1944).
+    hang = 60
 
     def prepare(root, task):
         preparations.append(task["id"])
         entered.set()
-        assert release.wait(5)
+        assert release.wait(hang)
         write_task_result(root, task["id"], "completed", result="The saved answer", artifact_status="ready")
         return {"task_id": task["id"], "result": None, "error": ""}
 
@@ -325,7 +331,7 @@ def test_legacy_completion_uses_one_off_drain_job(file_recovery, monkeypatch):
     thread = threading.Thread(target=task_reaper._recover_terminal_files, args=(jobs.get_nowait(),))
     thread.start()
     try:
-        assert entered.wait(5)
+        assert entered.wait(hang)
         events.dispatch_event(event, ctx)
         task_reaper.retry_terminal_file_recoveries()
         assert jobs.empty() and not pushed and worker.busy_task_id == "prepared"
@@ -334,7 +340,7 @@ def test_legacy_completion_uses_one_off_drain_job(file_recovery, monkeypatch):
         assert ctx.RUNNING["other"]["last_heartbeat_at"] > 0
     finally:
         release.set()
-        thread.join(5)
+        thread.join(hang)
     assert not thread.is_alive() and preparations == ["prepared"]
     events.dispatch_event(event, ctx)  # Original duplicate is not a failed returned frame.
     task_reaper.retry_terminal_file_recoveries()

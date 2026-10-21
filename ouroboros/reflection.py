@@ -1,9 +1,9 @@
 """The task-reflection log: retained history and host rows, never an automatic lesson writer.
 
 ``logs/task_reflections.jsonl`` keeps the automatic post-task reflections earlier
-versions wrote and the host rows still appended here, today one row per late
-acceptance settlement (``plan_review_facts.learn_from_late_settlement``, no model
-call). Every row is dated evidence, not current understanding: the acting mind
+versions wrote and the host rows they appended (one row per late task-acceptance
+settlement, no model call; the result review that replaced that machine writes
+none). Every row is dated evidence, not current understanding: the acting mind
 alone authors lessons, the Pattern Register and the backlog (``knowledge_write``).
 A Project task's row lives on its project store with a bounded canonical pointer,
 so project facts never enter the global log. The legacy trace classifier remains

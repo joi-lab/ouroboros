@@ -1,7 +1,8 @@
 """Late review feedback kept in view as a host mark of its owning room (#1738), end to end.
 
-A real publisher (a late acceptance settlement, a plan council reply that settles after its
-task ended) persists the full source, then keeps ONE host mark in the room that owns the work.
+A real publisher (a plan council reply that settles after its task ended) persists the full
+source, then keeps ONE host mark in the room that owns the work; the helper's own tests publish
+the record a pre-fold late acceptance settlement wrote, whose marks stay as history.
 The next request of that room carries it through the real memory view and context assembly;
 another room's request does not; consciousness reads every room's. Showing, reading, a page seal and a fitted window never
 release it; only the integrating mind's ``memory_mark(release_id, reason)`` does, and a replay
@@ -10,8 +11,6 @@ calls a model or the network.
 """
 from __future__ import annotations
 
-import dataclasses
-import hashlib
 import json
 import re
 import threading
@@ -179,7 +178,6 @@ def test_the_next_request_of_the_owning_room_carries_it_and_another_room_never_d
 
 def test_showing_reading_sealing_and_a_fitted_window_never_release_it(tmp_path):
     from ouroboros import chat_chain, memory_inventory
-    from ouroboros.llm_local import _compact_local_text
 
     shared.world(tmp_path)
     record = _record(tmp_path, "main1", 1, "KEEP-THIS-CRITIQUE")
@@ -204,7 +202,6 @@ def test_showing_reading_sealing_and_a_fitted_window_never_release_it(tmp_path):
     assert level.addressed, "the window took everything it may take"
     fitted = mv.render_room(snapshot, level)
     assert "KEEP-THIS-CRITIQUE" in fitted and f"release_id='{mark_id}'" in fitted and "memory_read(source_ref=" in fitted
-    assert "KEEP-THIS-CRITIQUE" in _compact_local_text(fitted, "dynamic")
     assert [mark["id"] for mark in _late_marks(tmp_path)] == [mark_id]
 
 
@@ -263,112 +260,6 @@ def test_the_marks_source_reader_survives_retention_packing_its_bytes(tmp_path):
     assert "PACKED-CRITIQUE" in source and f"sha256 {record['source_ref']['sha256'][:12]}" in source
 
 
-# --- real publisher: a late acceptance settlement -----------------------------------------------
-
-def _late_wave(tmp_path, monkeypatch, verdict="FAIL", chat_id=1):
-    from ouroboros.review_substrate import ReviewSlot
-    from ouroboros.task_results import write_task_result
-    from tests.test_acceptance_async_operation import _released_wave, _SlotModel, _terminal_ctx
-
-    settled = threading.Event()
-    module = __import__("ouroboros.review_custody", fromlist=["_settle_review_attempt"])
-    original = module._settle_review_attempt
-
-    def settle(*args, **kwargs):
-        try:
-            return original(*args, **kwargs)
-        finally:
-            settled.set()
-
-    monkeypatch.setattr("ouroboros.review_custody._settle_review_attempt", settle)
-    gates = {"model/a": threading.Event()}
-    ctx = _terminal_ctx(tmp_path, task_id="late-root")  # chat 1
-    if chat_id != 1:
-        write_task_result(tmp_path, "late-root", "completed", chat_id=chat_id, result="The delivered answer.")
-    try:
-        first = _released_wave(tmp_path, ctx, slots=[ReviewSlot(slot_id="a", model="model/a", effort="high",
-                                                                timeout_sec=20)],
-                               model=_SlotModel(gates, {"model/a": verdict}), task_id="late-root")
-        run = {**json.loads(json.dumps(dataclasses.asdict(first))), "authority": "host_root",
-               "panel_id": "panel_1", "binding_hash": "binding-one", "candidate_hash": "c1"}
-        ctx._execution_trace["review_runs"].append(run)
-        gates["model/a"].set()
-        assert settled.wait(10)
-        events = []
-        while not any(e.get("system_type") == "acceptance_late_settlement" for e in events):
-            events.append(ctx.event_queue.get(timeout=10))
-    finally:
-        gates["model/a"].set()
-    return ctx, events
-
-
-def test_a_late_acceptance_settlement_keeps_its_verdict_in_view_once(tmp_path, monkeypatch):
-    from ouroboros.acceptance_settlement import enqueue_late_acceptance_settlement, late_publication_owed
-    from ouroboros.task_results import load_task_result
-
-    ctx, events = _late_wave(tmp_path, monkeypatch)
-    row = next(e for e in events if e.get("system_type") == "acceptance_late_settlement")
-    stored = load_task_result(tmp_path, "late-root")
-    panel = stored["review_projection"]["panels"][0]
-    marks = _late_marks(tmp_path)
-    assert len(marks) == 1 and marks[0]["room_id"] == "1"
-    mark = marks[0]
-    assert mark["id"] == late_review_mark_id("task_acceptance", "late-root", "acceptance-late:acceptance-subject-one")
-    assert row["text"] in mark["text"] and "rejected it" in mark["text"], "the card's own sentence, verbatim"
-    assert mark["target_ref"] == {**panel["applied_source_ref"], "task_id": "late-root"}
-    source = _memory_read(_ctx(tmp_path, "root0001"), source_ref=mark["target_ref"])
-    raw = __import__("ouroboros.artifacts", fromlist=["x"]).read_actor_source_bytes(
-        tmp_path, "late-root", panel["applied_source_ref"])
-    assert hashlib.sha256(raw).hexdigest() == panel["applied_source_ref"]["sha256"]
-    assert f"sha256 {panel['applied_source_ref']['sha256'][:12]}" in source
-    assert row["text"].splitlines()[0] in room_text(tmp_path)
-    # Every settler of the wave ends in the same publisher: a recovery replay keeps one mark.
-    assert enqueue_late_acceptance_settlement(ctx, "late-root", "acceptance-subject-one", stored, panel) == "published"
-    assert [m["id"] for m in _late_marks(tmp_path)] == [mark["id"]]
-    assert _release(tmp_path, mark["id"], direct=True)["ok"]
-    assert enqueue_late_acceptance_settlement(ctx, "late-root", "acceptance-subject-one", stored, panel) == "published"
-    assert _late_marks(tmp_path) == [] and not late_publication_owed("late-root", "acceptance-subject-one")
-
-
-def test_an_unproven_room_publishes_the_card_and_keeps_no_mark(tmp_path, monkeypatch):
-    _ctx_unused, events = _late_wave(tmp_path, monkeypatch, verdict="PASS", chat_id=777)
-    assert any(e.get("system_type") == "acceptance_late_settlement" for e in events)
-    assert _late_marks(tmp_path) == []
-
-
-def test_a_failed_acceptance_mark_stays_owed_past_a_restart_and_maintenance_places_it(tmp_path, monkeypatch):
-    from ouroboros import acceptance_settlement
-    from ouroboros.late_review_marks import replay_owed_late_reviews
-
-    real = ChronicleStore.publish
-    monkeypatch.setattr(ChronicleStore, "publish", _refuse_publication)
-    _ctx_unused, _events = _late_wave(tmp_path, monkeypatch)
-    assert _late_marks(tmp_path) == [] and len(_owed_rows(tmp_path)) == 1
-    monkeypatch.setattr(ChronicleStore, "publish", real)
-    with acceptance_settlement._LATE_LOCK:  # a restart drops the process-local publication duty
-        acceptance_settlement._LATE_UNPUBLISHED.clear()
-    assert replay_owed_late_reviews(tmp_path)["settled"] == 1 and _owed_rows(tmp_path) == {}
-    [mark] = _late_marks(tmp_path)
-    assert mark["review"]["publication_id"] == "acceptance-late:acceptance-subject-one" and "rejected it" in mark["text"]
-
-
-def test_a_failed_mark_keeps_the_late_publication_owed_until_a_replay_places_it(tmp_path, monkeypatch):
-    from ouroboros import late_review_marks
-    from ouroboros.acceptance_settlement import enqueue_late_acceptance_settlement, late_publication_owed
-    from ouroboros.task_results import load_task_result
-
-    real = late_review_marks.publish_late_review
-    monkeypatch.setattr(late_review_marks, "publish_late_review",
-                        lambda root, record: late_review_marks.LateReviewMark("failed", detail="lock timeout"))
-    ctx, _events = _late_wave(tmp_path, monkeypatch)
-    assert late_publication_owed("late-root", "acceptance-subject-one") and _late_marks(tmp_path) == []
-    monkeypatch.setattr(late_review_marks, "publish_late_review", real)
-    stored = load_task_result(tmp_path, "late-root")
-    panel = stored["review_projection"]["panels"][0]
-    assert enqueue_late_acceptance_settlement(ctx, "late-root", "acceptance-subject-one", stored, panel) == "published"
-    assert len(_late_marks(tmp_path)) == 1 and not late_publication_owed("late-root", "acceptance-subject-one")
-
-
 def _owed_rows(root):
     from ouroboros import store
     from ouroboros.late_review_marks import OWED_SET
@@ -384,16 +275,15 @@ def _refuse_publication(self, records, *, scan_state=None):
 def _sweep(root, monkeypatch):
     """The real off-loop maintenance pass, its unrelated steps idle: owed late reviews are replayed there."""
     import supervisor.workspace_preparation as preparation
-    from ouroboros import evidence_packer
     from ouroboros import server_maintenance as maintenance
+    from ouroboros.maintenance import child as maintenance_child
 
     monkeypatch.setattr(maintenance, "DATA_DIR", root)
-    for name in ("_STARTUP_PRUNES_OWED", "_STARTUP_TREES_OWED", "_STARTUP_SOURCE_PRUNES_OWED", "_STARTUP_TEMP_SWEEP_OWED"):
-        monkeypatch.setattr(maintenance, name, [False])
+    monkeypatch.setattr(maintenance, "_run_reconcile_prunes", lambda *_a: None)
     monkeypatch.setattr(maintenance, "_periodic_zombie_reconcile", lambda **_kw: None)
     monkeypatch.setattr(maintenance, "_run_drive_custody_pass", lambda *_a: None)
     monkeypatch.setattr(preparation, "recover_interrupted_preparations", lambda *_a, **_kw: None)
-    monkeypatch.setattr(evidence_packer.packer, "tick", lambda *_a, **_kw: None)
+    monkeypatch.setattr(maintenance_child, "tick", lambda *_a, **_kw: None)
     maintenance._run_periodic_reconcile_sweep([0], latch=SimpleNamespace(release=lambda: None))
 
 

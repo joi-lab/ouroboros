@@ -411,6 +411,8 @@ _VERIFY_RUN_KINDS = frozenset({
 
 
 def _target_binding_operation(name: str, args: dict[str, Any]) -> str | None:
+    if name == "review_change" and str(args.get("subject") or "").strip() == "result":
+        return None  # a result review reads this task's own result, never a workspace target
     operation = _TARGET_BINDING_OPERATIONS.get(name)
     if operation is not None:
         return operation

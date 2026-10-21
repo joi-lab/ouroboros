@@ -26,6 +26,7 @@ _ADDED_OWNERS = {
     "WORKER_READY_CEILING_SEC": runtime_limits,
     # A spawned direct-Restart successor's bounded wait for its exiting parent's data-root admission.
     "SERVER_ADMISSION_WAIT_SEC": runtime_limits,
+    "STOP_ADMISSION_DRAIN_SEC": runtime_limits,
     # The supervisor loop's bounded events pass and the budget-projection retry interval.
     "SUPERVISOR_EVENT_BATCH_MAX_EVENTS": runtime_limits,
     "SUPERVISOR_EVENT_BATCH_MAX_SEC": runtime_limits,
@@ -126,6 +127,7 @@ _ADDED_OWNERS = {
 
 _MOVED_OWNERS = {
     "WORKER_SPAWN_GRACE_SEC": runtime_limits,
+    "ARTIFACT_COMPRESSION_TIMEOUT_SEC": runtime_limits,
     "WORKER_READY_WINDOW_SEC": runtime_limits,
     "WORKER_READY_MAX_ATTEMPTS": runtime_limits,
     "EXTENSION_STREAM_CHUNK_BYTES": runtime_limits,
@@ -217,8 +219,8 @@ _MOVED_OWNERS = {
     "MAX_SUBAGENT_DEPTH_HARD_CAP": runtime_limits,
     "_bounded_positive_int_setting": runtime_limits,
     "_clamped_number_setting": runtime_limits,
-    "get_acceptance_reserve_pct": runtime_limits,
-    "get_acceptance_review_est_sec": runtime_limits,
+    # get_acceptance_reserve_pct / get_acceptance_review_est_sec left with the task-acceptance launch
+    # floor (the review fold); their two keys are retired in settings_defaults.
     "get_delegate_wait_max_sec": runtime_limits,
     "get_delegate_wait_sec": runtime_limits,
     "get_llm_transport_read_timeout_sec": runtime_limits,

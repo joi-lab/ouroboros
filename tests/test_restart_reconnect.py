@@ -462,10 +462,16 @@ def test_owner_restart_cleanup_disables_second_custody_reconcile(monkeypatch):
 
 
 def test_auto_resume_skips_owner_restart_no_resume_flag(tmp_path, monkeypatch):
+    import supervisor.queue as queue
     import supervisor.workers as workers
 
-    original_drive = workers.DRIVE_ROOT
-    workers.DRIVE_ROOT = tmp_path
+    # The marker is consumed only after the queue holding its Restart holds is published (#1982),
+    # so the queue snapshot belongs to this test's root too: the worker-shared root may hold an
+    # earlier test's snapshot naming work this process never restored, which (correctly) keeps it.
+    snapshot = tmp_path / "state" / "queue_snapshot.json"
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", snapshot)
+    monkeypatch.setattr(queue, "QUEUE_PUBLICATION", None)
     flag = tmp_path / "state" / "owner_restart_no_resume.flag"
     flag.parent.mkdir(parents=True)
     flag.write_text("owner_restart", encoding="utf-8")
@@ -476,11 +482,9 @@ def test_auto_resume_skips_owner_restart_no_resume_flag(tmp_path, monkeypatch):
         raise AssertionError("owner restart flag should be checked before load_state")
 
     monkeypatch.setattr(workers, "load_state", fail_load_state)
-    try:
-        workers.auto_resume_after_restart()
-    finally:
-        workers.DRIVE_ROOT = original_drive
+    workers.auto_resume_after_restart()
 
+    assert snapshot.is_file(), "the Restart holds were not published"
     assert not flag.exists()
     assert not compat_flag.exists()
 

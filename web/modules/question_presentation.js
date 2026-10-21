@@ -43,6 +43,14 @@ export const questionDeliveryPending = row => deliveryOwed(row) && row.question_
 export const unknownDeliveryRemovable = row => questionDeliveryPending(row)
     && (row.quiz_state || row.state) === 'answered' && row.question_delivery?.reason_code === 'late_answer_delivery_unknown';
 
+// The lifecycle code of one row: a settled state names itself; an open one says whether the task waits.
+function lifecycleKey(row) {
+    const state = row.quiz_state || row.state || 'unknown';
+    const { waiting, resumed } = waitFacts(row);
+    return !QUIZ_LIFECYCLE.includes(state) ? 'unknown' : state !== 'open' ? state
+        : waiting ? 'waiting' : resumed ? 'resumed' : 'open';
+}
+
 export function questionPresentation(row = {}) {
     if (deliveryOwed(row)) {
         if ((row.quiz_state || row.state) !== 'answered') {
@@ -53,13 +61,22 @@ export function questionPresentation(row = {}) {
             ? tr('question.status.answer_unknown', 'Answer recorded · delivery unknown')
             : tr('question.status.answer_pending', 'Answer recorded · delivery pending') };
     }
-    const state = row.quiz_state || row.state || 'unknown';
-    const { waiting, resumed } = waitFacts(row);
-    const key = !QUIZ_LIFECYCLE.includes(state) ? 'unknown' : state !== 'open' ? state
-        : waiting ? 'waiting' : resumed ? 'resumed' : 'open';
+    const key = lifecycleKey(row);
     // The English words stay the source (and the Python twin's); the install language reads
     // them by the lifecycle code (web/modules/i18n.js).
     return { status: tr(`question.status.${key}`, STATUS[key]) };
+}
+
+// The dot beside that word (DESIGN "Quiz card"): the owner's amber only while the task positively waits for the
+// answer, ok once it is answered, the head's own disabled ink for a replaced or closed question, and neutral for
+// every other lifecycle (unanswered, the task continued or finished, status unavailable).
+const MARK_HUES = { waiting: 'owner', answered: 'ok', superseded: 'ink', closed: 'ink' };
+
+/** The question head's mark as a status-mark view ({ shape, hue }, web/modules/status_mark.js). */
+export function questionMark(row = {}) {
+    // An answer whose late delivery became unknown waits for the owner to stop counting it (Remove from pending).
+    if (unknownDeliveryRemovable(row)) return { shape: 'dot', hue: 'owner' };
+    return { shape: 'dot', hue: MARK_HUES[lifecycleKey(row)] || 'neutral' };
 }
 
 export function normalizeQuiz(msg) {

@@ -100,7 +100,7 @@ BASE_DISABLED = [
     "peek_task", "cancel_task", "discard_child_result",
     "web_search", "browse_page", "browser_action", "youtube_transcript",
     "analyze_screenshot", "vlm_query", "view_image", "ocr_pdf", "extract_video_frames",
-    "advisory_review", "task_acceptance_review", "request_deep_self_review",
+    "advisory_review", "request_deep_self_review",
     "plan_task",
 ]
 

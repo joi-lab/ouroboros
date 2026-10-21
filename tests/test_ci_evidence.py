@@ -57,6 +57,17 @@ def _producer(tmp_path, source, *, timeout=60, **options):
     return result, public, private
 
 
+def _retire_injected_export_fault(result, error):
+    """An injected export fault proves no process: retire only the producer's own exact marker."""
+    from tests._shared import retire_synthetic_retention
+
+    for line in result.stderr.splitlines():
+        if line.startswith("SAFE_TEST_RETAINED "):
+            root = Path(line.split(" ", 1)[1])
+            retire_synthetic_retention(root, f"test diagnostics incomplete: {error}",
+                                       f"retention marker or unreadable subtree: {root / 'OUROBOROS_RETAINED.txt'}")
+
+
 def _summary(tmp_path, public, *, producer="success", artifact="success",
              artifact_url=ARTIFACT_URL, scope="full", label=None):
     summary = tmp_path / "summary.md"
@@ -262,14 +273,17 @@ def test_passing_cases_do_not_overwrite_failed_session_exit(tmp_path):
 def test_export_failure_never_changes_the_producer_exit(tmp_path, fails):
     source = "def test_producer():\n    " + (f"assert False, {SECRET!r}\n" if fails else "pass\n")
     result, public, private = _producer(tmp_path, source, broken_export=True)
-    assert result.returncode == int(fails), result.stdout + result.stderr
-    assert "CI_DIAGNOSTICS_INCOMPLETE" in result.stdout
-    assert private.is_file() and not (public / "results.json").exists()
-    summary, _ = _summary(tmp_path, public, producer="failure" if fails else "success",
-                          artifact="failure", artifact_url="")
-    assert f"Producer step: **{'failure' if fails else 'success'}**" in summary
-    assert "diagnostics_incomplete" in summary and "Case outcomes: **unknown**" in summary
-    assert SECRET not in summary
+    try:
+        assert result.returncode == int(fails), result.stdout + result.stderr
+        assert "CI_DIAGNOSTICS_INCOMPLETE" in result.stdout
+        assert private.is_file() and not (public / "results.json").exists()
+        summary, _ = _summary(tmp_path, public, producer="failure" if fails else "success",
+                              artifact="failure", artifact_url="")
+        assert f"Producer step: **{'failure' if fails else 'success'}**" in summary
+        assert "diagnostics_incomplete" in summary and "Case outcomes: **unknown**" in summary
+        assert SECRET not in summary
+    finally:
+        _retire_injected_export_fault(result, "FileExistsError")
 
 
 @pytest.mark.parametrize("payload", [None, "not-json", "[]", '{"reports":[{}]}',
@@ -523,14 +537,18 @@ def test_journal_failure_is_one_line_and_never_changes_the_producer_exit(tmp_pat
         """
     result, public, _ = _producer(tmp_path, source, conftest=conftest,
                                   broken_export=broken == "directory")
-    assert result.returncode == int(fails), result.stdout + result.stderr
-    disclosed = [line for line in result.stdout.splitlines()
-                 if line.startswith("CI_DIAGNOSTICS_INCOMPLETE: incremental journal disabled")]
-    assert len(disclosed) == 1, result.stdout
-    assert result.stdout.count("CI_DIAGNOSTICS_INCOMPLETE") == (2 if broken == "directory" else 1)
-    if broken != "directory":  # The final export does not depend on the journal.
-        assert _results(public)["session_exit_code"] == int(fails)
-        assert not _events(public)
+    try:
+        assert result.returncode == int(fails), result.stdout + result.stderr
+        disclosed = [line for line in result.stdout.splitlines()
+                     if line.startswith("CI_DIAGNOSTICS_INCOMPLETE: incremental journal disabled")]
+        assert len(disclosed) == 1, result.stdout
+        assert result.stdout.count("CI_DIAGNOSTICS_INCOMPLETE") == (2 if broken == "directory" else 1)
+        if broken != "directory":  # The final export does not depend on the journal.
+            assert _results(public)["session_exit_code"] == int(fails)
+            assert not _events(public)
+    finally:
+        _retire_injected_export_fault(result, {"directory": "FileExistsError", "open": "IsADirectoryError",
+                                               "write": "ValueError"}[broken])
 
 
 def test_torn_and_invalid_journal_rows_are_skipped(tmp_path):

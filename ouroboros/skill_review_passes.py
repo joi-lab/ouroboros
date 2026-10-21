@@ -269,6 +269,8 @@ def _reserve_skill_wave(ctx, drive_root, skill, file_packs, models, row_plan, at
     if resume:
         return resume
     wave = {"wave_id": wave_id, "binding": getattr(ctx, "_skill_review_wave_binding", {}),
+            "panel": dict(getattr(ctx, "_skill_review_panel", {}) or {}),
+            "additional": [sid for sid, extra in zip(ids, (row_plan or {}).get("additional") or []) if extra],
             "chunks": [{"retry_key": _skill_review_retry_key(
                 skill_name=skill.name, wave_id=wave_id, content_hash=content_hash,
                 contract_fingerprint=contract_fp, rebuttal_sha256=rebuttal_sha,
@@ -572,7 +574,7 @@ def _seat_plan(row_plan: Dict[str, Any], indexes: List[int], count: int) -> Dict
 
 
 def _responded_slots(parsed: Any) -> set:
-    return {record.slot_id for record in parsed.actor_records if record.status == "responded" and record.slot_id}
+    return {record.slot_id for record in parsed.actor_records if record.status == "responded" and record.slot_id and not record.additional}
 
 
 def run_skill_review_passes(
@@ -736,9 +738,17 @@ def run_skill_review_passes(
                 **({"checking_source": checking_source} if checking_source is not None else {}),
             })
         seat_models = [models[i] for i in seats]
-        if wave is None:
-            return run_review(ctx, content=content, prompt=prompt, models=seat_models,
+        def deliver():
+            from ouroboros.skill_review_output import skill_result_panel
+            text = run_review(ctx, content=content, prompt=prompt, models=seat_models,
                               stable_prefix_len=stable_prefix_len, **delivery)
+            try:
+                result = json.loads(text)
+            except (TypeError, ValueError):
+                return text  # the caller reports a non-JSON answer as such
+            return json.dumps(skill_result_panel(result, delivery.get("row_plan") or {})) if isinstance(result, dict) else text
+        if wave is None:
+            return deliver()
         chunk = wave["chunks"][chunk_index]
         if chunk["retry_key"] != retry_key:
             raise RuntimeError("Skill Review chunk identity changed before reconciliation")
@@ -752,8 +762,7 @@ def run_skill_review_passes(
                 drive_root, skill.name, str(ctx._skill_review_lifecycle_job_id), str(wave.get("wave_id") or ""),
                 chunk_index, retry_key)
         try:
-            return run_review(ctx, content=content, prompt=prompt, models=seat_models,
-                              stable_prefix_len=stable_prefix_len, **delivery)
+            return deliver()
         finally:
             for name, value in prior.items():
                 setattr(ctx, name, value)
@@ -817,11 +826,12 @@ def run_skill_review_passes(
         # skill under-reviewed — a trust-gate hole). A retrieving seat's first-pass answer
         # covered every chunk's files, so it counts in each. adaptive_quorum matches the
         # single-pass gate (1 reviewer => degraded-but-allowed).
-        parsed = parse_model_review_results(chunk_json, required_items=required_items)
+        advisers = [sid for sid, extra in zip(slot_ids, plan.get("additional") or []) if extra]
+        parsed = parse_model_review_results(chunk_json, required_items=required_items, additional=advisers)
         if idx == 0:
             retrieved = _responded_slots(parsed) & {slot_ids[i] for i in retrieving}
         responsive = len(parsed.responsive_models) + (len(retrieved) if idx else 0)
-        required = adaptive_quorum(len(models))
+        required = adaptive_quorum(len(models) - len(advisers))
         if responsive < required:
             return (
                 prompt, advisory_evidence, "",

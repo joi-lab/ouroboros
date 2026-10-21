@@ -1,7 +1,7 @@
 /**
  * Continue episodes of one work (owner QB = A, FINAL_DESIGN D10): a Continue is the next episode of
  * the SAME card. The current episode owns the status chip; every episode is one meta line under the
- * title — `Episode 1 · 17:33–18:15 · Failed: <the shared cause sentence>`, `Episode 2 · since 19:42` —
+ * title — with its own name, time and past outcome —
  * never a column of chips.
  *
  * The chain is the host's explicit fact only: a settled task's `continued_by` or `continuation_offer`
@@ -12,6 +12,7 @@
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
 import { taskDoneIsTerminal, taskPresentation, taskReasonDetail, taskTerminalPhase } from './log_events.js';
 import { fmt } from './i18n.js';
+import { outcomeTone } from './task_phase_chip.js';
 import { projectCollapsedActivity, renderCollapsedActivity } from './chat_activity.js';
 
 export function admittedSuccessor(row) {
@@ -22,6 +23,8 @@ export function admittedSuccessor(row) {
 /** Fold one row's facts into a task's episode: when its attempt started, when and how it ended. */
 export function noteEpisodeFacts(previous = {}, row = {}) {
     const next = { ...previous };
+    const name = String(row.suggested_name || row.task_name || row.title || '').trim();
+    if (name) next.name = name;
     const time = row?.terminal_time && typeof row.terminal_time === 'object' ? row.terminal_time : null;
     next.started ||= String(time?.attempt?.started_at || row?.started_at || '');
     const terminal = row?.outcome_final === true || row?.system_type === 'task_summary' || taskDoneIsTerminal(row);
@@ -35,7 +38,6 @@ export function noteEpisodeFacts(previous = {}, row = {}) {
     return next;
 }
 
-const TONE = { done: 'ok', warn: 'warn', error: 'error', cancelled: 'neutral' };
 const pad = (n) => String(n).padStart(2, '0');
 const toDate = (raw) => {
     const value = typeof raw === 'number' ? raw : Date.parse(String(raw || ''));
@@ -61,7 +63,7 @@ export function episodeSpan(started, ended) {
 
 /**
  * Paint the episode lines. One episode is not a chain: the block stays empty and hidden.
- * `current` is the last episode: its chip is the card's, so its line carries only its time.
+ * `current` is the last episode: its chip is the card's, so its line carries its own name and time.
  */
 export function renderEpisodes(el, episodes = []) {
     if (!el) return false;
@@ -69,8 +71,9 @@ export function renderEpisodes(el, episodes = []) {
         const current = index === episodes.length - 1;
         const span = episodeSpan(episode.started, current && !episode.ended ? '' : episode.ended);
         const outcome = !current && episode.phase ? taskPresentation(episode.phase).headline : '';
-        const tone = TONE[episode.phase] || 'neutral';
+        const tone = outcomeTone(episode.phase) || 'neutral';  // the chips' outcome tones
         const parts = [`<span class="chat-live-episode-label">${escapeHtml(fmt('Episode {n}', { n: index + 1 }))}</span>`];
+        if (episode.name) parts.push(`<span class="chat-live-episode-name">${escapeHtml(episode.name)}</span>`);
         if (span) parts.push(`<span class="chat-live-episode-span">${escapeHtml(span)}</span>`);
         if (outcome) {
             const cause = String(episode.cause || '').trim();
@@ -90,11 +93,12 @@ export function renderEpisodes(el, episodes = []) {
  * The episode chains of one chat instance. `records` is its card registry; `reanchor(record, ts)` moves a
  * card to where its work began (earliest wins); `activity(record)` is the census row its controls read.
  * The host's admitted successor carries the SAME work, so its card takes the predecessor's place and
- * name, and every episode is one meta line on it. The predecessor's node folds away; its record stays to
- * take late rows. A successor with no card here runs where this chat sees none of its frames (a Main
+ * name, and every episode is one meta line on it. Earlier content is disclosed using its original nodes;
+ * the hidden physical shell/record stays to take late rows. A successor with no card here runs where
+ * this chat sees none of its frames (a Main
  * portal's room): `follow(successorId, predecessor)` may mint its card from the facts it holds.
  */
-export function createTaskEpisodes({ records, reanchor, activity, follow = () => false }) {
+export function createTaskEpisodes({ records, reanchor, activity, follow = () => false, expand = () => {} }) {
     const predecessors = new Map();  // successor task id -> predecessor task id
 
     function chainOf(taskId) {
@@ -107,17 +111,53 @@ export function createTaskEpisodes({ records, reanchor, activity, follow = () =>
         return chain;
     }
 
+    // Rehome the ORIGINAL content nodes, not snapshots of their DOM or lifecycle. Their physical
+    // record/controller still receives late files, reviews and history. Old controls stay in its
+    // hidden shell; only the current card offers work controls.
+    function disclose(record, chain) {
+        const host = record.episodeHistoryEl;
+        if (!host) return;
+        for (const [index, previous] of chain.entries()) {
+            let disclosure = previous.episodeDisclosure;
+            if (!disclosure) {
+                disclosure = document.createElement('details');
+                disclosure.className = 'chat-episode-history';
+                disclosure.dataset.episodeTask = previous.groupId;
+                const summary = document.createElement('summary');
+                disclosure.appendChild(summary);
+                const onToggle = () => { if (disclosure.open) expand(previous); };
+                disclosure.addEventListener('toggle', onToggle);
+                previous.episodeDisclosure = disclosure;
+                previous.episodeDisclosureDispose = () => disclosure.removeEventListener('toggle', onToggle);
+            }
+            const facts = previous.episode || {};
+            const label = [fmt('Episode {n}', { n: index + 1 }), facts.name,
+                episodeSpan(facts.started, facts.ended), facts.phase && taskPresentation(facts.phase).headline,
+                facts.cause].filter(Boolean).join(' · ');
+            if (disclosure.firstElementChild.textContent !== label) disclosure.firstElementChild.textContent = label;
+            for (const content of [previous.timelineEl, previous.reviewsHostEl, previous.subagentsEl]) {
+                if (content && content.parentNode !== disclosure) disclosure.appendChild(content);
+            }
+            const position = host.children[index] || null;
+            if (position !== disclosure) host.insertBefore(disclosure, position);
+        }
+        host.hidden = false;
+    }
+
     function sync(record) {
         if (!record || record.isSubagent || !record.root) return false;
         // Its own first row, remembered before the card moves to where the work began.
         if (record.ownStartedAt === undefined && record.root.dataset.ts) record.ownStartedAt = Number(record.root.dataset.ts);
+        record.episode ||= {};
+        // Its own name only: once in a chain, suggestedName carries the work's borrowed one.
+        if (!record.episodeName) record.episode.name ||= record.suggestedName || '';
         const successorId = [...predecessors].find(([, predecessor]) => predecessor === record.groupId)?.[0];
         if (successorId && records.get(successorId)) return sync(records.get(successorId));
         const chain = chainOf(record.groupId).map((id) => records.get(id)).filter(Boolean);
         if (!chain.length) return false;
         let changed = false;
         // The work keeps its first name (a successor's own "Continue: …" title is the mechanism's).
-        const name = chain[0].suggestedName || chain[0].titleEl?.textContent || '';
+        const name = chain[0].episode?.name || chain[0].suggestedName || chain[0].titleEl?.textContent || '';
         if (name && record.episodeName !== name) {
             record.episodeName = name;
             record.suggestedName = name;
@@ -134,6 +174,7 @@ export function createTaskEpisodes({ records, reanchor, activity, follow = () =>
             if (!predecessor.root.hidden) { predecessor.root.hidden = true; changed = true; }
             predecessor.root.dataset.episodeOf = record.groupId;
         }
+        disclose(record, chain);
         const startedAt = Number(chain[0].root.dataset.ts);
         if (Number.isFinite(startedAt)) changed = reanchor(record, startedAt) || changed;
         const current = { ...(record.episode || {}) };
@@ -146,6 +187,23 @@ export function createTaskEpisodes({ records, reanchor, activity, follow = () =>
     }
 
     return {
+        /** Naming belongs with the chain: physical names and the work heading differ. */
+        rename(record, name) {
+            if (!record || record.isSubagent) return false;
+            record.episode = { ...record.episode, name };
+            if (record.episodeName) return sync(record);
+            const titleChanged = Boolean(record.titleEl && record.titleEl.textContent !== name);
+            let changed = record.suggestedName !== name || titleChanged;
+            record.suggestedName = name;
+            if (titleChanged) record.titleEl.textContent = name;
+            // Restore the deferred collapsed activity after naming.
+            changed = renderCollapsedActivity(record, projectCollapsedActivity({
+                suggestedName: name, headline: record.collapsedActivity,
+                previous: record.collapsedActivity,
+            })) || changed;
+            changed = sync(record) || changed;
+            return Boolean(changed && record.root?.isConnected);
+        },
         /** A row or task detail of this card landed: its episode facts and the host's chain fact, if any. */
         note(record, row) {
             if (!record || record.isSubagent || !row || typeof row !== 'object') return false;

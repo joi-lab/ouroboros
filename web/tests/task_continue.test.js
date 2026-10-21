@@ -84,9 +84,11 @@ test('a lost answer is retried under the SAME nonce; an already accepted press n
     assert.match(toasts[0][0], /^Continue not confirmed: network timeout/);
     assert.equal(await continueTaskAction('root-1', { request, storage, toast }), 'root-1-cabc');
     assert.equal(seen[0][1], seen[1][1], 'the retry carries the same action nonce');
-    // Held without named blockers: the fact, never a promise that earlier work is merely settling (#1721).
-    assert.equal(toasts[1][0], 'Continue accepted and held: earlier work is not proven settled. '
-        + 'Resume in Activity checks it again.');
+    // Held without named blockers: the fact, never a promise that earlier work is merely settling (#1721). It starts
+    // by itself once that work settles: no Resume is offered for it.
+    assert.equal(toasts[1][0], "Continue accepted; it starts by itself when the earlier attempt's work finishes: "
+        + 'earlier work is not proven settled.');
+    assert.doesNotMatch(toasts[1][0], /Resume/);
     assert.ok(!toasts[1][0].includes('root-1-cabc'), 'compact acknowledgement hides opaque identity');
     const refused = async () => { throw Object.assign(new Error('continue refused: already_continued'), {
         body: { reason_code: 'already_continued', successor_task_id: 'root-1-cabc' } }); };
@@ -221,6 +223,25 @@ test('an event row never erases the offer; a root that ended without an answer r
         }
         await flush();
         assert.deepEqual(reads, ['crashed-root']);
+    } finally {
+        restoreDom(prior);
+    }
+});
+
+test('a child card never shows Continue, even when a replayed row carries its parent\'s offer', () => {
+    const { prior } = installDom();
+    try {
+        // A rejected subagent's notice rides under the parent's task id and can carry the parent's offer.
+        const row = { is_progress: true, task_terminal_status: 'cancelled',
+            continuation_offer: { eligible: true, cause: 'snapshot_restore' } };
+        const parent = settledRootCard('parent-probe');
+        syncContinueAction(parent, row);
+        assert.equal(parent.root.querySelector('[data-continue-task]')?.textContent, 'Continue', 'the root keeps its offer');
+        const child = settledRootCard('child-probe', { isSubagent: true });
+        syncContinueAction(child, row);
+        assert.equal(child.root.querySelector('[data-continue-task]'), null);
+        syncContinueAction(child, { ...row, continuation_offer: { eligible: false, refusal: 'not_a_root_task' } });
+        assert.equal(child.root.querySelector('[data-continue-refusal]'), null, 'no refusal line on a child either');
     } finally {
         restoreDom(prior);
     }
@@ -394,6 +415,6 @@ test('a held Continue toasts the blockers its census observed, not a generic wai
     const request = async () => ({ ok: true, held: true, successor_task_id: 'pred-1-s1', blockers });
     assert.equal(await continueTaskAction('held-facts', { request, storage: memoryStorage(), toast: (t, k) => toasts.push([t, k]) }),
         'pred-1-s1');
-    assert.deepEqual(toasts, [['Continue accepted and held: a delegated start has an unknown outcome (no run was recorded). '
-        + 'Resume in Activity checks it again.', 'ok']]);
+    assert.deepEqual(toasts, [["Continue accepted; it starts by itself when the earlier attempt's work finishes: "
+        + 'a delegated start has an unknown outcome (no run was recorded).', 'ok']]);
 });

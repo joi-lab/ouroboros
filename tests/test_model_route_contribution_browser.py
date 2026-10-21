@@ -184,8 +184,11 @@ def test_claude_variant_agent_and_reviewer_rows_keep_exact_selection(route_ui):
         entry['profile']['harness_id'] = 'claude'
     ui['fixture']['status']['harnesses'] = [{'id': 'claude', 'display_name': 'Claude Code', 'enabled': True,
         'status': 'ok', 'models': [{'id': 'claude-future', 'credential_profile_id': 'personal'}]}]
+    # Available is the engine's verdict for the exact scope it answered (#1981), never a bare fresh row.
     ui['fixture']['status']['quota'] = [{'subject': {'harness': 'claude', 'subject_id': 'personal'},
-                                        'freshness': 'fresh', 'constraints': []}]
+                                        'freshness': 'fresh', 'constraints': [], 'availability': {'state': 'available'}}]
+    ui['fixture']['status']['availability_scope'] = {'model': 'claude-future[1M]', 'requestKind': 'text',
+                                                     'basis': 'quota_block'}
     items = ui['settings']['OUROBOROS_SUBAGENTS']['items']
     # A reviewer is a catalog row marked Reviewer; an unmarked twin is an ordinary agent.
     items[2].update(review_eligible=True, route={'kind': 'agent_session', 'target_id': target,

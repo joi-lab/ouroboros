@@ -17,11 +17,14 @@ function focusable(root) {
  * Install after mounting a dialog; dispose before removing it. Only boundary
  * Tab presses are intercepted, leaving native editing/radio behavior intact.
  * onEscape belongs to the caller's result contract (confirm/input/Project).
+ * `preventScroll` returns focus without scrolling its container, for an opener
+ * in a scrolled feed whose place must not move.
  */
 export function bindDialogFocus(dialog, {
     initialFocus,
     returnFocus = dialog.ownerDocument.activeElement,
     onEscape,
+    preventScroll = false,
 } = {}) {
     const doc = dialog.ownerDocument;
     let disposed = false;
@@ -33,7 +36,7 @@ export function bindDialogFocus(dialog, {
         // An independently mounted nested dialog owns its own keyboard cycle.
         if (event.target.closest('[aria-modal="true"]') !== dialog) return;
         if (event.key === 'Escape' && onEscape) {
-            event.preventDefault();
+            event.preventDefault();  // layers.back() relies on it: Back closes this dialog and keeps the layer under it
             event.stopPropagation();
             onEscape();
         } else if (event.key === 'Tab') {
@@ -57,7 +60,7 @@ export function bindDialogFocus(dialog, {
         dialog.removeEventListener('keydown', onKey);
         const ownedFocus = dialog.contains(doc.activeElement) || doc.activeElement === doc.body;
         if (originalTabIndex === null) dialog.removeAttribute('tabindex');
-        if (restoreFocus && ownedFocus && returnFocus && available(returnFocus)) returnFocus.focus();
+        if (restoreFocus && ownedFocus && returnFocus && available(returnFocus)) returnFocus.focus({ preventScroll });
     };
 }
 
@@ -151,8 +154,11 @@ export function bindPopoverPosition(popup, { anchor, point, align = 'start', onA
 /**
  * Bind an already mounted menu using the popup geometry above. Adapted from
  * Project row actions; close() notifies once, destroy() only cleans up.
+ * `align` is the anchor edge the menu lines up with (default end).
+ * `initialFocus: false` leaves focus where it is: a menu a pointer opened from
+ * beside a field must not take the field's focus (a phone keeps its keyboard).
  */
-export function bindMenu(menu, { anchor, point, onClose } = {}) {
+export function bindMenu(menu, { anchor, point, onClose, align = 'end', initialFocus = true } = {}) {
     const doc = menu.ownerDocument;
     let disposed = false;
     const items = () => Array.from(menu.querySelectorAll('[role^="menuitem"]')).filter(available);
@@ -206,7 +212,7 @@ export function bindMenu(menu, { anchor, point, onClose } = {}) {
     doc.defaultView.addEventListener('blur', onBlur);
     const openedAt = anchor?.getBoundingClientRect();
     const position = bindPopoverPosition(menu, {
-        anchor, point, align: 'end', onAnchorScroll: () => {
+        anchor, point, align, onAnchorScroll: () => {
             const now = anchor?.getBoundingClientRect();
             // A queued scroll event can arrive after opening without moving
             // the trigger. Only an actual anchor move invalidates this menu.
@@ -215,6 +221,6 @@ export function bindMenu(menu, { anchor, point, onClose } = {}) {
             }
         },
     });
-    items()[0]?.focus();
+    if (initialFocus) items()[0]?.focus();
     return { close, reposition: position.reposition, destroy: cleanup };
 }

@@ -45,6 +45,7 @@ jobs:
           fetch-depth: 0
       - uses: ./.github/actions/setup-python-env
         with:
+          interpreter: shipped  # the SQLite and journal mode fresh installs run, as the full lane
           install-project: 'false'
         id: setup_python
       - name: Install UI smoke Chromium and WebKit

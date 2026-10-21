@@ -148,6 +148,9 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
         "supervisor.events_chat_delivery", "ouroboros/tools/core_artifacts.py"),
     "send_links": _handled(
         "supervisor.events_chat_delivery", "ouroboros/tools/core_artifacts.py"),
+    "send_card": _handled(
+        "supervisor.events_chat_delivery", "ouroboros/tools/cards.py",
+        note="the card is stored before the event; the row carries its identity, the body stays in the store"),
     "send_message": _handled(
         "supervisor.events_chat_delivery", "ouroboros/agent.py",
         "supervisor/task_reaper.py", "supervisor/terminal_delivery.py", idle_input=True),
@@ -188,7 +191,8 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
     "toggle_evolution": _handled(
         "supervisor.events_runtime_controls", "ouroboros/tools/control_runtime.py"),
     "typing_start": _handled(
-        "supervisor.events_chat_delivery", "ouroboros/agent.py"),
+        "supervisor.events_chat_delivery", "ouroboros/agent.py", "ouroboros/model_sleep.py",
+        note="a start, or the same attempt running again after a wait (``announce_resumed``)"),
 
     # --- telemetry_only: recorded in the ledger, no runtime action follows -----
     "plan_task_deadline_skip": _telemetry(

@@ -1,11 +1,12 @@
 """#1725: fields whose words reach the owner say so; their bytes and handlers are unchanged.
 
-Claim and stop rationale changed only their descriptions. These tests pin, through
-the real handlers, that the claim the author submits is the exact text a finish
-selects (no rewrite, no spacing repair), and that the descriptions tell the author
-who reads each field. Model promotes and routes to existing projects must name
-the root they create (owner answer B, 13 Oct), refused before launch effects, while the
-owner, API and already-queued entrances keep the lexical first-line name.
+The stop rationale changed only its description (the claim field left with the
+task-acceptance tool). These tests pin, through the real handlers, that the answer
+the author submits is the exact text a finish stages (no rewrite, no spacing repair),
+and that the rationale's description tells the author who reads it. Model promotes
+and routes to existing projects must name the root they create (owner answer B,
+13 Oct), refused before launch effects, while the owner, API and already-queued
+entrances keep the lexical first-line name.
 """
 
 import json
@@ -33,23 +34,12 @@ def _tool_schema(module, name):
 
 @pytest.mark.parametrize("claim", CLAIMS)
 def test_an_explicit_finish_stages_the_claim_bytes_as_the_answer(tmp_path, claim):
-    from ouroboros.tools.review import _handle_task_acceptance_review
+    from ouroboros.tools.control_runtime import _finish_task
 
     ctx = _root(tmp_path)
-    reply = json.loads(_handle_task_acceptance_review(ctx, claim=claim, goal="g", author_action="finish",
-                                                      rationale="Complete."))
+    reply = json.loads(_finish_task(ctx, action="finish", answer=claim, rationale="Complete."))
     assert reply["status"] == "completion_requested"
     assert ctx._completion_request["answer"] == claim
-
-
-@pytest.mark.parametrize("claim", CLAIMS)
-def test_a_root_nomination_carries_the_claim_bytes_as_its_subject(tmp_path, monkeypatch, claim):
-    from ouroboros.tools.review import _handle_task_acceptance_review
-
-    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "required")
-    payload = json.loads(_handle_task_acceptance_review(_root(tmp_path), claim=claim, goal="g"))
-    assert payload["status"] == "deferred_to_host_acceptance"
-    assert payload["request"]["subject"] == claim
 
 
 def test_owner_and_api_admission_keep_the_first_line_name():
@@ -144,12 +134,8 @@ def test_a_named_promote_is_admitted_under_its_name_and_a_queued_untitled_event_
 
 
 def test_the_descriptions_name_the_reader_without_changing_the_shapes():
-    from ouroboros.tools import control, review
+    from ouroboros.tools import control
 
-    claim = _tool_schema(review, "task_acceptance_review")["parameters"]["properties"]["claim"]
-    assert claim["type"] == "string"
-    assert "bytes submitted for review" in claim["description"]
-    assert "owner reads them as your reply" in claim["description"] and "parent as your report" in claim["description"]
     finish = _tool_schema(control, "finish_task")["parameters"]
     assert finish["required"] == ["action"]
     assert "owner reads it as the stop's cause on the task row" in finish["properties"]["rationale"]["description"]

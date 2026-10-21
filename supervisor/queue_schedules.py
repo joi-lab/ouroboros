@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import copy
 import datetime
 import json
 import logging
@@ -37,9 +38,6 @@ from supervisor.schedule_time import (
     schedule_next_run as _schedule_next_run,
     timezone_for_schedule as _timezone_for_schedule,
 )
-
-
-
 
 log = logging.getLogger(__name__)
 
@@ -169,7 +167,7 @@ def schedule_transaction(drive_root: pathlib.Path | None = None):
     The transaction takes BOTH locks ITSELF — the queue lock first, the table's
     sidecar file lock second — so no caller can compose the pair in the other
     order. Asking callers to order them was the bug: ``schedule_followup`` wraps
-    its cap-read and its write in one transaction, then ``upsert_scheduled_task``
+    its pending read and its write in one transaction, then ``upsert_scheduled_task``
     reached for the queue lock INSIDE that hold, against the scheduler tick's
     queue-then-table order. Owning the order here is what makes every caller
     provably consistent instead of individually audited.
@@ -840,6 +838,17 @@ def check_scheduled_tasks(*, stop: Callable[[], bool] | None = None) -> None:
         except Exception:
             log.debug("Failed to sync skill schedules during scheduler tick", exc_info=True)
     collision_names = _skill_collisions(root, datetime.datetime.now(datetime.timezone.utc))
+    from supervisor.followup_policy import control_guard, scan_policy, refresh_policy
+
+    # Copy the table while its writers are excluded. Policy reads below own no Q
+    # or table lock; a changed row/restart is retried rather than overwritten.
+    with schedule_transaction(root):
+        try:
+            snapshot = copy.deepcopy(load_schedule_store(root))
+        except ScheduleStoreUnreadable:
+            log.error("Scheduled task store is unreadable; skipping this scheduler pass")
+            return
+    observed = scan_policy(root, snapshot)
     claims: List[Dict[str, Any]] = []
     due_notes: List[Dict[str, Any]] = []
     with schedule_transaction(root):
@@ -857,11 +866,13 @@ def check_scheduled_tasks(*, stop: Callable[[], bool] | None = None) -> None:
         for record in list(data.get("tasks") or []):
             if not isinstance(record, dict):
                 continue
-            from supervisor.followup_policy import control_guard, refresh_policy
+            prior, view = observed.get(str(record.get("id") or ""), (None, None))
+            if (record != prior or data.get("followup_restart") != snapshot.get("followup_restart")):
+                continue
             try:
                 with control_guard(root, record):
                     occurrences.repair_followup_binding(record)
-                    view = refresh_policy(root, data, record)
+                    view = refresh_policy(root, data, record, observed=view)
             except Exception as exc:
                 if not occurrences.contention(exc):  # contention: this row waits a pass
                     log.exception("Follow-up policy persistence unavailable")
@@ -952,9 +963,15 @@ def check_scheduled_tasks(*, stop: Callable[[], bool] | None = None) -> None:
             if view.get("hold") or view["wait"] or record.get("followup_hold"):
                 continue
             if notes.is_note(record):
-                note, note_changed = notes.consume(record, due_at, now)
-                due_notes.extend([note] if note else [])
-                changed = changed or note_changed
+                # Notes publish here, unlike task claims whose admission rechecks
+                # controls later. Their final control fence must therefore be here.
+                with control_guard(root, record):
+                    view = refresh_policy(root, data, record)
+                    if view.get("hold") or view["wait"] or record.get("followup_hold"):
+                        continue
+                    note, note_changed = notes.consume(record, due_at, now)
+                    due_notes.extend([note] if note else [])
+                    changed = changed or note_changed
                 continue
             claims.append(occurrences.claim(record, due_at))
             changed = True

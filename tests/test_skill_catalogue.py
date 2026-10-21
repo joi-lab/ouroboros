@@ -334,6 +334,7 @@ def test_empty_catalogue_keeps_the_install_hint(registry):
     assert page["skills"] == [] and page["count"] == page["returned"] == page["offset"] == 0
     assert page["next"] is None and page["snapshot"]
     assert "OUROBOROS_SKILLS_REPO_PATH" in page["hint"] and "install" in page["hint"].lower()
+    assert "skill_search" in page["hint"] and "skill_install" in page["hint"]
     stale, typed = _consumer(registry, {"snapshot": "previous-installation"})
     assert typed.status == "error" and stale["ok"] is False
     assert stale["error"]["code"] == "SKILLS_SNAPSHOT_CHANGED"

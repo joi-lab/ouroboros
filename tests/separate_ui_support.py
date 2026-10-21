@@ -40,6 +40,8 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from tests.ui_console_errors import PageErrors
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = Path("docs/examples/separate_ui")
 CADDY_ENV = "SEPARATE_UI_CADDY"
@@ -402,8 +404,12 @@ class Core:
         return self.process.log_text().count("Starting Ouroboros server on")
 
     def jsonl(self, relative: str) -> list[dict]:
-        """Rows of one of the core's own JSONL records (``logs/chat.jsonl`` ...)."""
+        """Core log rows: dialogue from SQL, other streams from their JSONL records."""
         path = self.data_dir / relative
+        if relative in {"logs/chat.jsonl", "logs/progress.jsonl"}:
+            from tests._dialogue import log_rows
+
+            return log_rows(path)
         if not path.exists():
             return []
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -448,7 +454,9 @@ def real_core(root: Path, *, provider: bool = True, password: str = PASSWORD, se
             values.update(dict.fromkeys(("OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_FALLBACKS"),
                                         "openai-compatible::mock-model"))
             values.update(OPENAI_COMPATIBLE_API_KEY="separate-ui-key", OPENAI_COMPATIBLE_BASE_URL=model.base_url,
-                          OUROBOROS_MAX_WORKERS=1, OUROBOROS_RUNTIME_MODE="light")
+                          OUROBOROS_MAX_WORKERS=1, OUROBOROS_RUNTIME_MODE="light",
+                          # a fresh root with a ready provider would clone the skill hub at boot (#1995)
+                          OUROBOROS_STARTER_SKILLS="[]")
         if values:
             (data_dir / "settings.json").write_text(json.dumps(values), encoding="utf-8")
         port = free_port()
@@ -679,8 +687,7 @@ class BrowserSession:
         self.context = self.browser.new_context(viewport={"width": viewport[0], "height": viewport[1]}, **options)
         self.context.add_init_script(_RECORD_LOADS)
         self.page = self.context.new_page()
-        self.errors: list[str] = []
-        self.page.on("pageerror", lambda error: self.errors.append(str(error)))
+        self.errors = PageErrors(self.page, name)
 
     def loads(self) -> list[str]:
         return self.page.evaluate("() => JSON.parse(sessionStorage.getItem('__loads') || '[]')")
@@ -724,8 +731,7 @@ class BrowserSession:
         }""", [path, headers or {}])
 
     def unexpected_errors(self) -> list[str]:
-        # WebKit reports a fetch that a navigation cancelled as an access-control failure.
-        return [e for e in self.errors if not (self.name == "webkit" and e.endswith("due to access control checks."))]
+        return self.errors.unexpected()
 
     def close(self) -> None:
         self.browser.close()

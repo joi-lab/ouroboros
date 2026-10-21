@@ -140,7 +140,7 @@ def test_queued_and_executing_turns_leave_the_default_executor_free(tmp_path, mo
     assert ctx.presence_turns.live() == [] and not any(ctx._inflight.values())
 
 
-def test_retries_join_turns_whose_waiters_were_cancelled_even_at_full_budget(tmp_path):
+def test_retries_join_turns_whose_waiters_were_cancelled_even_at_full_budget(tmp_path, monkeypatch):
     """Cancelled waiters (one executing turn, one queued) leave both turns running with their
     capacity; retries join them although the in-flight budget is full, and each event runs once."""
     calls, entered, release = [], threading.Event(), threading.Event()
@@ -152,6 +152,18 @@ def test_retries_join_turns_whose_waiters_were_cancelled_even_at_full_budget(tmp
         return _answer(**kwargs)
 
     app, binding_id, ctx = _presence_app(tmp_path, runner)
+    _resolve_preparation_once(monkeypatch, ctx, binding_id)
+    # A retry joins only while its turn is live, and this runner leaves no durable row for a late
+    # retry to replay. The turns are released once both retries have joined, never after a fixed
+    # sleep a loaded runner's preparation reads outlast (a late retry would run its event again).
+    outcomes, start_or_join = [], ctx.presence_turns.start_or_join
+
+    def recording(turn_id, **kwargs):
+        outcome = start_or_join(turn_id, **kwargs)
+        outcomes.append((turn_id, *outcome))
+        return outcome
+
+    monkeypatch.setattr(ctx.presence_turns, "start_or_join", recording)
 
     async def scenario():
         # One conversation: e-0 executes, e-1..e-4 queue behind it; five turns fill the budget.
@@ -173,8 +185,11 @@ def test_retries_join_turns_whose_waiters_were_cancelled_even_at_full_budget(tmp
         refused = await _turn(app, binding_id, "e-5")
         assert refused.status_code == 429, "a NEW event still meets the budget"
         retries = {event_id: asyncio.create_task(_turn(app, binding_id, event_id)) for event_id in ("e-0", "e-2")}
-        await asyncio.sleep(0.2)
-        assert not any(retry.done() for retry in retries.values()), "a retry joins; it is never refused"
+        await _until(lambda: len(outcomes) == 8)  # five starts, the refused e-5, then both retries
+        live = {turn_id: execution for turn_id, execution, _began in outcomes[:5]}
+        assert [(execution is live.get(turn_id), began) for turn_id, execution, began in outcomes[6:]] == [
+            (True, False)] * 2, "a retry joins its live turn; it is never refused and never starts another"
+        assert not any(retry.done() for retry in retries.values())
         assert calls == ["e-0"] and ctx._inflight[BUDGET] == 5
 
         release.set()

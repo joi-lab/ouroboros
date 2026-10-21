@@ -165,8 +165,11 @@ def native_file_api(port, read_sizes):
             return original(size)
         response.read = read
         return response
+    from ouroboros.launcher_background import DesktopApi
+    # The names MainApi's class body reads, as the sibling harness supplies them (headless, no facts).
     namespace = {'actual_port':port,'pathlib':__import__('pathlib'),'shutil':shutil,'tempfile':tempfile,
                  'base64':base64,'log':logging.getLogger(__name__),
+                 'DesktopApi':DesktopApi,'background':None,'_shell_facts':lambda: {},
                  'urllib':SimpleNamespace(parse=urllib.parse,request=SimpleNamespace(urlopen=open_recorded))}
     exec(compile(ast.Module(body=selected,type_ignores=[]),str(source),'exec'),namespace)
     return namespace['MainApi'](), hashlib.sha256(source.read_bytes()).hexdigest()

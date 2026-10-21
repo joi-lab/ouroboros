@@ -10,6 +10,7 @@ import pytest
 from ouroboros import budget_pause as bp, store
 from ouroboros.artifacts import read_actor_source_bytes
 from tests._budget_pause_exact_helpers import _loop_ctx
+from tests._store_journal_shared import use_journal
 from tests.test_store import document, publish
 
 
@@ -61,6 +62,8 @@ def _contended_save(root, monkeypatch, stage, transaction, *, on_hold=None):
 @pytest.mark.parametrize("stage", ["seed", "checkpoint"])
 @pytest.mark.parametrize("transaction", ["begin", "commit"])
 def test_real_save_contention_releases_to_same_snapshot(tmp_path, monkeypatch, rail, stage, transaction):
+    if transaction == "commit":  # a reader holds only a rollback-journal COMMIT; a WAL COMMIT waits for none
+        use_journal(monkeypatch, "PERSIST")
     publish(tmp_path, document("member", status="running"))
     ctx, limit = _loop_ctx(tmp_path, "member")
     messages, trace = copy.deepcopy(limit.messages), copy.deepcopy(limit.llm_trace)

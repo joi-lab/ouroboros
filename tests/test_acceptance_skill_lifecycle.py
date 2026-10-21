@@ -1,9 +1,9 @@
-"""The acceptance packet's per-skill lifecycle facts (visibility only).
+"""The per-skill lifecycle facts of a task's related skills (visibility only).
 
-A task that authored or repaired a skill used to hand the panel no way to see
-whether that skill actually reached a reviewed, ready, enabled state. These
-facts close that gap. They are facts, never a gate: acceptance judges quality,
-never the execution route.
+A task that authored or repaired a skill used to leave no way to see whether
+that skill actually reached a reviewed, ready, enabled state. These facts close
+that gap; the task's completion observations carry them to post-task synthesis.
+They are facts, never a gate on the execution route.
 """
 
 from __future__ import annotations
@@ -11,8 +11,6 @@ from __future__ import annotations
 import json
 import pathlib
 
-from ouroboros.review_evidence import build_task_acceptance_evidence
-from ouroboros.review_evidence_refs import acceptance_evidence_ref_vocabulary
 from ouroboros.skill_loader import find_skill
 from ouroboros.skill_readiness import (
     _skill_names_from_review_history,
@@ -20,7 +18,6 @@ from ouroboros.skill_readiness import (
     skill_names_touched_by_trace,
     skill_readiness_for_execution,
 )
-from ouroboros.tools.registry import ToolContext
 
 
 def _write_skill(drive_root: pathlib.Path, name: str) -> pathlib.Path:
@@ -45,12 +42,6 @@ def _write_history(drive_root: pathlib.Path, name: str, root_task_id: str) -> No
     projection = drive_root / "state" / "skill_review_root_tasks.jsonl"
     with projection.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"root_task_id": root_task_id, "skill": name}) + "\n")
-
-
-def _ctx(drive_root: pathlib.Path, tmp_path: pathlib.Path, task_id: str) -> ToolContext:
-    repo = tmp_path / "repo"
-    repo.mkdir(exist_ok=True)
-    return ToolContext(repo_dir=repo, drive_root=drive_root, task_id=task_id)
 
 
 def test_the_lifecycle_scan_joins_trace_edits_and_this_root_task_history(tmp_path):
@@ -89,8 +80,8 @@ def test_the_lifecycle_facts_match_the_readiness_predicate(tmp_path):
     assert row["ready"] is readiness.ready
     assert row["blockers"] == readiness.blockers
     assert row["enabled"] is bool(skill.enabled)
-    # An unreviewed, disabled self-authored skill is exactly what the panel
-    # needs to see, so the row must be honest rather than empty.
+    # An unreviewed, disabled self-authored skill is exactly what must stay
+    # visible, so the row must be honest rather than empty.
     assert row["ready"] is False
     assert row["blockers"]
 
@@ -159,56 +150,9 @@ def test_real_skill_payload_selectors_feed_lifecycle_rows(tmp_path):
     )] == ["command-edited", "script-edited", "delegate-edited"]
 
 
-def test_split_root_packet_reads_skill_lifecycle_from_the_canonical_root(tmp_path):
-    canonical = tmp_path / "canonical"
-    execution = tmp_path / "execution"
-    canonical.mkdir()
-    execution.mkdir()
-    _write_skill(canonical, "canonical-skill")
-    ctx = ToolContext(
-        repo_dir=tmp_path, drive_root=execution, budget_drive_root=canonical,
-        task_id="task-split-skill",
-    )
-
-    packet = build_task_acceptance_evidence(
-        ctx,
-        llm_trace={"tool_calls": [{
-            "tool": "skill_review", "args": {"skill": "canonical-skill"},
-        }]},
-        drive_root=execution,
-        task_id="task-split-skill",
-    )
-
-    assert packet["skill_lifecycle"][0]["name"] == "canonical-skill"
-    assert packet["skill_lifecycle"][0].get("present", True) is True
-
-
-def test_the_packet_carries_the_section_and_the_vocabulary_resolves_it(tmp_path):
+def test_no_touched_skill_yields_no_lifecycle_rows(tmp_path):
     drive_root = tmp_path / "drive"
     drive_root.mkdir()
-    _write_skill(drive_root, "alpha")
-    ctx = _ctx(drive_root, tmp_path, "task-skill")
-    trace = {"tool_calls": [
-        {"tool": "write_file", "args": {"path": "data/skills/external/alpha/SKILL.md"},
-         "status": "ok"},
-    ]}
-    packet = build_task_acceptance_evidence(
-        ctx, llm_trace=trace, drive_root=drive_root, task_id="task-skill",
-    )
-    assert packet["skill_lifecycle"][0]["name"] == "alpha"
-    assert packet["__provenance__"]["skill_lifecycle"] == "host_attested"
-    assert acceptance_evidence_ref_vocabulary(packet)["skill_lifecycle"] == "packet_section"
-
-
-def test_no_touched_skill_adds_no_section(tmp_path):
-    drive_root = tmp_path / "drive"
-    drive_root.mkdir()
-    ctx = _ctx(drive_root, tmp_path, "task-plain")
-    packet = build_task_acceptance_evidence(
-        ctx, llm_trace={"tool_calls": [{"tool": "run_command", "status": "ok"}]},
-        drive_root=drive_root, task_id="task-plain",
-    )
-    assert "skill_lifecycle" not in packet
     assert acceptance_skill_lifecycle(drive_root, {"tool_calls": []}, "") == []
     assert acceptance_skill_lifecycle(None, {"tool_calls": []}, "") == []
 
@@ -241,19 +185,3 @@ def test_bounded_history_projection_discloses_both_omission_limits(tmp_path):
         "path": "state/skill_review_root_tasks.jsonl",
         "reader": "read_file",
     }
-
-    ctx = _ctx(drive_root, tmp_path, "task-bounded-history")
-    packet = build_task_acceptance_evidence(
-        ctx, llm_trace={"tool_calls": [{
-            "tool": "skill_review", "args": {"skill": "visible"},
-        }]}, drive_root=drive_root, task_id="task-bounded-history",
-    )
-    assert packet["skill_lifecycle_history_coverage"]["truncated"] is True
-    assert packet["skill_lifecycle_complete"] is False
-    assert acceptance_evidence_ref_vocabulary(packet)["skill_lifecycle"] == "partial"
-    partial = next(
-        row for row in packet["__unresolved_partial_artifacts__"]
-        if row["tool"] == "skill_lifecycle"
-    )
-    assert partial["status"] == "not_materialized_for_reviewer"
-    assert partial["source_ref"] == history["coverage"]["source_ref"]

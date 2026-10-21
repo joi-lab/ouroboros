@@ -2,33 +2,37 @@
 
 ## Roots, Ports and One Server per Data Directory
 
-A deployment places Ouroboros with the existing environment keys, read at start:
-`OUROBOROS_REPO_DIR` (the body checkout), `OUROBOROS_DATA_DIR` (memory, state,
-settings, logs), `OUROBOROS_SETTINGS_PATH`, `OUROBOROS_PID_FILE` (the launcher's
-single-instance lock), `OUROBOROS_PORT_FILE` (where the main server publishes its
-bound port) and `OUROBOROS_APP_ROOT` (the parent of the defaults,
-`~/Ouroboros`). Work roots take a saved setting first, then the environment,
-then the `~/Ouroboros` default: `OUROBOROS_SUBAGENT_PROJECTS_ROOT`,
-`OUROBOROS_SUBAGENT_WORKTREE_ROOT`, `OUROBOROS_DELIVERABLES_ROOT`. Compose,
-systemd or a shell may load these from an env file; Ouroboros reads no env file of
-its own. A direct `server.py` without `OUROBOROS_REPO_DIR` serves the checkout it
-runs from. Set `OUROBOROS_DATA_DIR` explicitly in every new recipe: with only
-`OUROBOROS_APP_ROOT`, a direct server keeps its historical `~/Ouroboros/data`
-(ARCHITECTURE §7).
+Paths: `OUROBOROS_REPO_DIR` (checkout), `OUROBOROS_DATA_DIR` (memory/state/settings/logs),
+`OUROBOROS_SETTINGS_PATH`, `OUROBOROS_PID_FILE` (launcher lock),
+`OUROBOROS_PORT_FILE`; `OUROBOROS_APP_ROOT` defaults to `~/Ouroboros`. Work roots
+(`OUROBOROS_SUBAGENT_PROJECTS_ROOT`, `OUROBOROS_SUBAGENT_WORKTREE_ROOT`,
+`OUROBOROS_DELIVERABLES_ROOT`) prefer saved settings, then environment, then
+defaults. Compose/systemd/shell may load an env file; Ouroboros does not.
+A direct server defaults to its checkout and `~/Ouroboros/data` even with APP_ROOT:
+specify DATA_DIR (ARCHITECTURE §7).
 
-`OUROBOROS_SERVER_PORT` is the requested main port for a direct server and for
-the launcher (default 8765); when it is taken the server falls back to the next
-free port, skipping this installation's Host Service and local-model ports, and
-the source CLI, Settings, extensions and the launcher read the port it actually
-published. The packaged desktop CLI deliberately uses `~/Ouroboros/data` and
-scrubs path overrides (including `OUROBOROS_PORT_FILE`) before starting its
-inner CLI; select a relocated server with `--url` or `OUROBOROS_URL`. A container publishes a fixed port: keep the request free inside it.
+`OUROBOROS_SERVER_PORT` defaults to 8765; fallback skips Host Service/local-model
+ports. Source CLI, Settings, extensions and launcher use the published port.
+Desktop CLI scrubs path overrides and uses `~/Ouroboros/data`; relocated servers
+need `--url` or `OUROBOROS_URL`.
+Keep containers' published port free.
 
-Exactly one server runs on one data directory. Each server holds a kernel lock on
-`<data>/state/server.lock` for its lifetime, whatever repository, PID file or
-port it uses; a second one waits briefly (a Restart successor) and then exits 2
-with the reason, and a filesystem without kernel file locks refuses the start.
-A server from a release before this lock is not detected by it: stop it first.
+One server holds `<data>/state/server.lock` until exit, regardless of repository,
+PID file or port. A second waits briefly for Restart, then exits 2;
+unsupported kernel locks refuse startup. Stop releases predating this lock first.
+`state/install.json` binds the root. Boot/write atomically mints and logs a
+copy/move identity, clearing cached verdicts. Checks cache paths; identity stat
+changes trigger parsing. Stop before copy/move. Paths never authorize
+foreign locks, transactions or processes. Layout children belong to their install;
+bare roots work. Foreign tasks keep local history and rest with
+`foreign_install_root` until explicitly moved.
+
+To move a task: stop and back up both installs, copy its required child files
+into the destination's task layout, then call
+`task_results.write_task_result` on the destination with the existing status,
+updated `budget_drive_root`, `drive_root`/`child_drive_root` as applicable, and
+cleared `reason_code`/`reason_detail`. Keep sources through adoption.
+Copying the directory alone never rewrites those pointers.
 
 ## Containers
 
@@ -42,6 +46,17 @@ profile per volume set; never point two containers at one data volume.
 | Update | build and deploy a new image | Settings → Update, as on the desktop |
 | Entry | `python server.py` | the common launcher, `--no-ui` |
 | Volumes | data, work, `HOME` | one parent volume, or body/data/work/home |
+
+**Interpreter.** The image's Python is python-build-standalone release 20261009:
+CPython 3.10.22 and SQLite 3.53.1, the same assets
+`scripts/download_python_standalone.sh` and `scripts/download_python_standalone.ps1`
+pin for the desktop packages. It is not Debian's `python:3.10-slim` (SQLite 3.46.1).
+Desktop installs receive that interpreter only by installing the app again.
+Settings → Update replaces the repository and its packages; it does not replace
+the bundled interpreter. A managed container keeps its runtime venv on a volume.
+A venv whose interpreter no longer matches this image is left untouched, and the
+log names the recovery step: stop, move that directory aside, start again. Code
+and data stay; packages that lived only in the old venv do not.
 
 **Exposure.** Both images bind `0.0.0.0` and set no `OUROBOROS_NETWORK_PASSWORD`:
 a missing password only warns and the gate then admits every request, so a
@@ -81,6 +96,13 @@ nonzero, so `on-failure` retries it with Docker's growing delay until the cause 
 fixed; a second managed container sharing the data volume loses the launcher lock
 and exits 0. `init: true` reaps orphans the launcher or server cannot. See
 Docker's [restart policy documentation](https://docs.docker.com/engine/containers/start-containers-automatically/).
+
+**Boot health.** Each recipe probes `GET /api/health` inside the container. The
+probe succeeds while the process is alive and `boot.phase` is not `failed`,
+including before the server opens its socket. There is no start deadline: a long
+boot does not become an unhealthy container and does not by itself restart it.
+`restart: on-failure` still follows a real process exit. `boot.phase` `failed`
+marks the container unhealthy.
 
 ## Trusted Docker / Kubernetes Non-Local Binds
 

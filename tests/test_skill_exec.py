@@ -7,6 +7,8 @@ trivial python3 script. No network, no real LLM calls — the
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import json
 import shlex
@@ -969,12 +971,9 @@ def test_skill_exec_allows_warnings_under_blocking(tmp_path, monkeypatch):
     assert "hello from skill" in payload["stdout"]
 
 
-def test_toggle_skill_blocks_stale_dependency_fingerprint(tmp_path, monkeypatch):
-    from ouroboros.marketplace.isolated_deps import (
-        DEPS_STATE_FILENAME,
-        FINGERPRINT_FILENAME,
-        isolated_env_dir,
-    )
+def test_toggle_skill_refreshes_a_stale_dependency_fingerprint(tmp_path, monkeypatch):
+    """Inverted pin: a stale fingerprint used to refuse Enable; the enable owner now refreshes it."""
+    from ouroboros.marketplace.isolated_deps import DEPS_STATE_FILENAME, FINGERPRINT_FILENAME, isolated_env_dir
     from ouroboros.skill_loader import skill_state_dir
 
     skills_root = tmp_path / "skills"
@@ -996,11 +995,14 @@ def test_toggle_skill_blocks_stale_dependency_fingerprint(tmp_path, monkeypatch)
     env_dir = isolated_env_dir(skill_dir)
     env_dir.mkdir(parents=True)
     (env_dir / FINGERPRINT_FILENAME).write_text(json.dumps(stale_state), encoding="utf-8")
+    installs = []
+    monkeypatch.setattr("ouroboros.marketplace.isolated_deps._install_python_packages",
+                        lambda packages, *args, **kwargs: installs.append(list(packages)) or [])
 
     resp = skill_exec_mod._handle_toggle_skill(ctx, skill="alpha", enabled=True)
 
-    assert json.loads(resp.split(": ", 1)[1])["deps_status"] == "stale"
-    assert not (state_dir / "enabled.json").exists()
+    assert json.loads(resp)["enabled"] is True and installs == [["wheel"]]
+    assert (state_dir / "enabled.json").exists()
 
 
 def test_skill_exec_refuses_missing_manifest_permission_grant(tmp_path, monkeypatch):
@@ -1326,7 +1328,7 @@ def test_selected_skill_blocks_self_authored_marker_write(tmp_path):
 
 
 def test_skill_development_review_uses_ordinary_extension_reconciliation(tmp_path, monkeypatch):
-    import types
+    from ouroboros.skill_review import SkillReviewOutcome
 
     ctx = _make_ctx(tmp_path)
     skills_root = tmp_path / "skills"
@@ -1339,7 +1341,7 @@ def test_skill_development_review_uses_ordinary_extension_reconciliation(tmp_pat
     monkeypatch.setattr(
         skill_exec_mod,
         "_review_skill_impl",
-        lambda _ctx, skill_name: types.SimpleNamespace(
+        lambda _ctx, skill_name: SkillReviewOutcome(
             skill_name=skill_name,
             status="pass",
             content_hash="hash",
@@ -1447,11 +1449,7 @@ def test_stale_review_job_is_marked_interrupted(tmp_path, monkeypatch):
     assert data["interrupt_reason"] == "owner_process_exited"
     events_text = (ctx.drive_root / "logs" / "events.jsonl").read_text(encoding="utf-8")
     assert "skill_review_interrupted" in events_text
-    progress = [
-        json.loads(line)
-        for line in (ctx.drive_root / "logs" / "progress.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    progress = dialogue_test.log_rows(ctx.drive_root / "logs" / "progress.jsonl")
     assert progress[-1]["task_id"] == "skill_lifecycle_review_alpha_skill-job-old"
     assert progress[-1]["lifecycle"]["status"] == "interrupted"
     assert progress[-1]["lifecycle"]["phase"] == "interrupted"
@@ -1603,9 +1601,9 @@ def test_toggle_skill_rejects_stale_pass_review(tmp_path, monkeypatch):
 
     resp = skill_exec_mod._handle_toggle_skill(ctx, skill="alpha", enabled=True)
     assert "SKILL_TOGGLE_ERROR" in resp
-    # Default Advisory: the stale verdict no longer counts; the gate names both authorities it admits.
-    assert ("cannot enable until the review gate permits the current bytes: a current executable reviewer "
-            "verdict or a qualified Advisory author acceptance of these exact bytes") in resp
+    # Default Advisory: the stale verdict no longer counts; the typed refusal's detail names both authorities.
+    assert '"error": "It turns on after a review passes."' in resp and ('"detail": "a current executable reviewer '
+            'verdict or a qualified Advisory author acceptance of these exact bytes"') in resp
     assert '"blocking_reason": "review_stale"' in resp
 
 

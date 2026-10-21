@@ -265,6 +265,9 @@ def commit_review_contract_fingerprint() -> str:
         if any(writable):
             for row, access in zip(rows, writable):
                 row.append(access)
+        if any(row_plan.get("additional") or []):
+            for row, extra in zip(rows, row_plan["additional"]):
+                row.append({"additional": bool(extra)})
         # What each seat is ASKED is contract identity: a seat that gains or
         # loses the coupling question is a different review.
         parts = {str(slot_id or ""): list(seat_parts) for slot_id, seat_parts in zip(row_plan["slot_ids"], row_plan["parts"])}
@@ -444,11 +447,30 @@ def count_paid_review_cycles(ctx: ToolContext, *, root_task_id: str) -> int:
         return 0
     from ouroboros.review_state import load_state, make_repo_key
 
-    state = load_state(pathlib.Path(ctx.drive_root))
-    attempts = state.filter_attempts(
-        repo_key=make_repo_key(pathlib.Path(ctx.repo_dir)),
-        tool_name=_current_review_tool_name(ctx),
-    )
+    tool = _current_review_tool_name(ctx)
+    if tool in ("review_change", "review_result"):  # review_change waves: canonical custody
+        from ouroboros.tools.review_change_custody import paid_repo_key, review_state_root
+
+        state = load_state(review_state_root(ctx))
+        owner = paid_repo_key(ctx, ctx.repo_dir)
+        # Filter unrelated history before filesystem provenance reads; equal
+        # physical keys share one resolution within this observation only.
+        owners = {str(pathlib.Path(ctx.repo_dir).resolve()): owner}
+        paid = 0
+        for item in state.filter_attempts(tool_name=tool):
+            if not item.paid or item.root_task_id != root:
+                continue
+            if tool == "review_result":  # a result's allowance is its root task's, wherever its material lives
+                paid += 1
+                continue
+            key = item.review_budget_repo_key or owners.get(item.repo_key)
+            if key is None:
+                key = owners[item.repo_key] = paid_repo_key(ctx, item.repo_key)
+            paid += key == owner
+        return paid
+    else:
+        state = load_state(pathlib.Path(ctx.drive_root))
+        attempts = state.filter_attempts(repo_key=make_repo_key(pathlib.Path(ctx.repo_dir)), tool_name=tool)
     return sum(
         1
         for item in attempts
@@ -479,16 +501,21 @@ def check_review_cycles_ceiling(
         return None
     if paid < cap:
         return None
-    message = (
+    head = (
         f"⚠️ REVIEW_CYCLES_EXHAUSTED: this task tree (root {root}) already spent "
         f"{paid} of {cap} paid review wave(s) "
         "(OUROBOROS_REVIEW_MAX_CYCLES). Refusing to buy another review.\n"
+    )
+    message = head + ((
         "Honest exits: finalize honestly with what is already reviewed and committed; "
         "escalate to the owner (the ceiling is the owner's Max Review Cycles setting — "
         "3/5/unlimited are one settings change away); or leave the remaining work to a "
         "follow-up task with its own budget. A rebuttal cannot buy past the ceiling — "
         "rebuttal cycles count toward it."
-    )
+    ) if review_enforcement_blocks() else (
+        "The paid review allowance is spent. Decide whether what was reviewed is enough: finish, "
+        "or land with a plain statement of what was not reviewed."
+    ))
     return {"message": message, "cycles_paid": paid, "cap": cap}
 
 
@@ -852,10 +879,14 @@ def _check_overlapping_review_attempt(ctx: ToolContext) -> Optional[str]:
     ctx._review_open_peers = []
 
     def _mutate(state):
+        from ouroboros.review_ledger import counted_pending
+        from ouroboros.review_state_custody import _attempt_review_roster_rows
+
         expired = state.expire_stale_attempts(now_ts=_utc_now())
         rows = [
             item for item in state.get_active_attempts(repo_key=repo_key)
             if item.tool_name in REVIEWED_MUTATIVE_TOOLS
+            and counted_pending(_attempt_review_roster_rows(item), pending=True)
         ]
         return ReviewStateMutation(rows, changed=bool(expired))
 
@@ -1004,23 +1035,15 @@ def commit_preflight_choice_error(selector: str, *, skipped: bool, continuation:
 
 
 def compose_commit_panel(ctx: ToolContext, reviewers: Sequence[str], reason: str) -> Any:
-    """This commit's panel through the ONE composer ``review_change`` uses
-    (``review_change.compose_panel``, decision 1A). In Cyber Pro the marked pool rows are
-    the owner's menu: ``reviewers`` names the counted seats (an enabled catalog row outside
-    the pool is an added critic, never the quorum) and ``reason`` says why; below Cyber Pro
-    the whole pool judges and ``reviewers`` only add critics outside it. No ``reviewers`` is
-    ``None``: the configured pool exactly as the gate reads it today (an empty pool is the
-    Main seat alone). The runtime mode is the gate's own reading (the
-    ``mode`` fact of its record). Raises ``ReviewChangeArgumentError`` — before anything is
-    staged, reviewed or recorded."""
-    from ouroboros.runtime_mode_policy import runtime_mode_at_least
-    from ouroboros.tools import git as git_mod
+    """Freeze the shared own-body panel before staging or paying for review."""
     from ouroboros.tools import review_change as rc
+    from ouroboros.reviewer_slot_config import review_strictness
+    from ouroboros.config import get_review_enforcement
+    from ouroboros.tools import git as git_mod
 
     request = rc.parse_request({"root": "system_repo", "subject": "index", "reviewers": list(reviewers), "reason": reason})
-    if not request.reviewers:
-        return None
-    return rc.compose_panel(request, adds_only=not runtime_mode_at_least(git_mod._current_runtime_mode(), "cyber_pro"))
+    return rc.compose_panel(request, body=True,
+                            strictness=review_strictness(get_review_enforcement(), git_mod._current_runtime_mode()))
 
 
 def release_diagnostics(ctx: ToolContext, paths: Optional[List[str]], source: str) -> Dict[str, Any]:
@@ -1323,7 +1346,7 @@ def _review_ledger_facts(ctx: ToolContext, commit_message: str, *, goal: str, sc
     panel = commit_panel_facts(ctx)
     return {
         **_review_body_facts(ctx),
-        "composition": str(panel.get("composition") or "full_pool"),
+        "panel": panel, "composition": str(panel.get("composition") or "full_pool"),
         "composition_reason": str(panel.get("reason") or ""), "chosen_by": str(panel.get("chosen_by") or "owner"),
         "task_id": task_id, "root_task_id": resolve_root_task_id(ctx),
         "review_wave_id": resolve_review_wave(ReviewRequest(
@@ -1439,7 +1462,7 @@ def settle_commit_review_ledger(ctx: ToolContext, commit_message: str, *, goal: 
             # The composition facts the panel was built with (requested rows, added critics,
             # the reason) ride the record's panel block as on ``review_change`` (its
             # ``reason_missing`` is the composer's: a panel that names the whole pool owes none).
-            record.panel = {**dict(record.panel or {}), **commit_panel_facts(ctx)}
+            record.panel = {**commit_panel_facts(ctx), **dict(record.panel or {})}
             if rejoined and existing is None:
                 # Late answers to a wave whose dispatching attempt left no record: the
                 # rules and brief the seats saw are not this attempt's — say so.

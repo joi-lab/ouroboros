@@ -93,7 +93,10 @@ def _collect_seat(root, ctx, wave, chunk, slot_id, operation_id):
             payload["choices"] = [{"message": {"content": actor.raw_text}}]
         else:
             payload["error"] = actor.error or "The recorded reviewer has no terminal result yet."
-        return slot.model, parse_model_response(slot.model, payload, None)
+        from ouroboros.reviewer_slot_config import review_cost_facts
+        result = parse_model_response(slot.model, payload, None)
+        result.update(review_cost_facts(result.get("cost_estimate"), route=slot.route.value, model=slot.model))
+        return slot.model, result
     except (OSError, ValueError, KeyError, TypeError) as exc:
         # A missing request cannot borrow today's model or rights. Keep this
         # reserved seat in the quorum denominator and leave its outcome unknown.
@@ -118,6 +121,7 @@ def collect_skill_review_wave(ctx, drive_root, file_packs, *, required_items):
     from ouroboros.triad_review import parse_model_review_results
 
     wave = ctx._skill_review_resume
+    advisers = set(wave.get("additional") or [])
     owner, chunks = wave["binding"], wave["chunks"]
     if len(chunks) != len(file_packs):
         return {"error": "Original Skill Review chunk roster is incomplete"}
@@ -144,13 +148,16 @@ def collect_skill_review_wave(ctx, drive_root, file_packs, *, required_items):
         if index == 0:
             models = [model for model, _row in collected]
         rows = [row for _model, row in collected]
+        for row in rows:
+            row["additional"] = row.get("slot_id") in advisers
         parsed = parse_model_review_results({"results": rows}, required_items=required_items)
         if index == 0:
             whole = _responded_slots(parsed)
         answered = len(parsed.responsive_models) + (len(whole - set(operations)) if index else 0)
-        pending = pending or answered < adaptive_quorum(len(roster)) or any(
+        pending = pending or answered < adaptive_quorum(len(roster - advisers)) or any(
             row.get("late_result_pending") or row.get("operation_state") in {"in_flight", "custody_lost"}
-            for row in rows)
+            for row in rows if not row.get("additional"))
         results.extend(rows)
     return {"model_count": len(models), "recorded_models": models, "results": results,
+            "additional": list(advisers), "panel": dict(wave.get("panel") or {}),
             "collection_pending": pending}

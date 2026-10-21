@@ -86,7 +86,7 @@ def test_foreground_nonzero_completion_is_not_unresolved_effect(tmp_path, monkey
 @pytest.mark.parametrize('service', [False, True])
 def test_pause_during_process_preparation_prevents_process_start(tmp_path, monkeypatch, service):
     from ouroboros.tools.registry import ToolRegistry
-    from ouroboros.tools import shell
+    from ouroboros.tools import shell_outputs
     from ouroboros.owner_pause import install_fence
     from ouroboros.task_results import load_task_result
 
@@ -98,7 +98,8 @@ def test_pause_during_process_preparation_prevents_process_start(tmp_path, monke
     def preparation(*_a, **_k):
         install_fence(tmp_path, 'root', request_id='during-preparation')
         return {}
-    monkeypatch.setattr(shell, '_snapshot_declared_outputs', preparation)
+    # Both process doors take their output baseline through the shell_outputs owner.
+    monkeypatch.setattr(shell_outputs, '_snapshot_declared_outputs', preparation)
     args = {'cmd': [sys.executable, '-c', f'from pathlib import Path; Path({str(marker)!r}).touch()']}
     if service:
         args['name'] = 'held'

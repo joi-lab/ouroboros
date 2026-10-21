@@ -755,12 +755,14 @@ def _run_s33(candidate, root: pathlib.Path, *, held_turns: bool, slow_auth: bool
             auth_gate.release.set()
             for gate in model_gates:
                 gate.release.set()
-            for turn in turns.values():
-                turn.join(timeout=S33_SETTLE_SEC)
-            if server is not None:
-                server.stop()
-            for turn in turns.values():
-                turn.join(timeout=10)
+            try:
+                for turn in turns.values():
+                    turn.join(timeout=S33_SETTLE_SEC)
+            finally:  # the scenario's ceiling landing inside these joins must not skip the stop
+                if server is not None:
+                    server.stop()
+                for turn in turns.values():
+                    turn.join(timeout=10)
 
 
 def _assert_panic_tears_down(server, oracle, member: str, diagnosis) -> None:

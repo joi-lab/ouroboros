@@ -4,6 +4,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+from ouroboros import dialogue_import
 from ouroboros.gateway.history import make_chat_history_endpoint
 from tests._store_shared import seed_result
 
@@ -241,6 +242,7 @@ def test_chat_history_backfills_from_rotated_archive(tmp_path):
     )
     (logs / "progress.jsonl").write_text("", encoding="utf-8")
 
+    assert dialogue_import.run_dialogue_import(tmp_path)["state"] == "done"
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "50"})))
     payload = json.loads(response.body.decode("utf-8"))["messages"]
@@ -288,7 +290,7 @@ def test_history_gap_metadata_keeps_reader_failures_fail_soft(tmp_path, monkeypa
     def fail(*_args, **_kwargs):
         raise RuntimeError("synthetic reader failure")
 
-    monkeypatch.setattr(history, "_read_chat_history_entries", fail)
+    monkeypatch.setattr(history, "_recent_entries", fail)
     rows, quota, gaps = history._collect_chat_rows(
         tmp_path / "chat.jsonl",
         tmp_path / "archive",
@@ -314,10 +316,10 @@ def test_history_gap_metadata_keeps_legacy_reader_call_shape(tmp_path, monkeypat
         "ts": "2026-08-21T18:01:00Z",
     }
 
-    def legacy(_live, _archive, _want, _predicate):
+    def legacy(_root, _stream, _want, _predicate):
         return [row]
 
-    monkeypatch.setattr(history, "_read_chat_history_entries", legacy)
+    monkeypatch.setattr(history, "_recent_entries", legacy)
     rows, quota = history._collect_chat_rows(
         tmp_path / "chat.jsonl",
         tmp_path / "archive",
@@ -383,6 +385,7 @@ def test_progress_history_backfills_from_rotated_archive(tmp_path):
     )
     (logs / "chat.jsonl").write_text("", encoding="utf-8")
 
+    assert dialogue_import.run_dialogue_import(tmp_path)["state"] == "done"
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"n_progress": "10"})))
     payload = json.loads(response.body.decode("utf-8"))["messages"]
@@ -548,6 +551,7 @@ def test_chat_history_backfill_quota_is_thread_aware(tmp_path):
     )
     (logs / "progress.jsonl").write_text("", encoding="utf-8")
 
+    assert dialogue_import.run_dialogue_import(tmp_path)["state"] == "done"
     endpoint = make_chat_history_endpoint(tmp_path)
     # want=2 (< the 4 unrelated live rows): old quota would stop before reading
     # the archive; thread-aware quota reads it because 0 live rows match `pc`.

@@ -8,8 +8,8 @@ from ouroboros.chat_chain import format_address, row_address
 from ouroboros.owner_relay import held_owner_messages, quote_rows, retain_owner_message
 from ouroboros.owner_mailbox import write_owner_message
 from ouroboros.loop_round_limits import _drain_incoming_messages
+from ouroboros import dialogue_store
 from ouroboros.tools.control_relay import _tell_task
-from ouroboros.utils import append_jsonl
 from tests.test_owner_relay import source, context
 
 
@@ -31,7 +31,7 @@ def test_written_owner_message_is_not_held_until_drained(tmp_path):
     row, origin = source(tmp_path)
     ctx = context(tmp_path, row)
     later = {**row, "text": "later words", "client_message_id": "later", "ts": "2026-10-01T01:00:00Z"}
-    append_jsonl(tmp_path / "logs/chat.jsonl", later)
+    dialogue_store.append(tmp_path, "chat", later)
     handle = format_address(row_address(later))
     write_owner_message(tmp_path, later["text"], "teller", msg_id="mail", client_message_id="later")
     assert quote_rows(ctx, [handle])[1].startswith("QUOTE_NOT_HELD")
@@ -42,7 +42,7 @@ def test_written_owner_message_is_not_held_until_drained(tmp_path):
     assert handle in str(messages)
 
 
-def test_retained_quotes_survive_compaction_and_exact_pause_restore(tmp_path):
+def test_retained_quotes_survive_compaction_and_exact_pause_restore(tmp_path, monkeypatch):
     from ouroboros.owner_wait import continuation_state, restore_continuation_state
     row, handle = source(tmp_path)
     ctx = context(tmp_path, row)
@@ -50,7 +50,10 @@ def test_retained_quotes_survive_compaction_and_exact_pause_restore(tmp_path):
     ctx._owner_directives = []
     ctx._open_relays = {"r": {"relay_id": "r", "source": {"chat_id": 1}}}
     state = continuation_state(ctx, [], {}, {}, 0, [], set())
-    (tmp_path / "logs/chat.jsonl").unlink()  # possession no longer depends on replaying history
+    def replayed(*_args, **_kwargs):
+        raise AssertionError("possession replayed dialogue history")
+
+    monkeypatch.setattr(dialogue_store, "transaction", replayed)  # possession no longer depends on history
     restored = context(tmp_path)
     restore_continuation_state(SimpleNamespace(_ctx=restored), state, [], {}, {}, set())
     assert quote_rows(restored, [handle])[0][0]["text"] == row["text"]

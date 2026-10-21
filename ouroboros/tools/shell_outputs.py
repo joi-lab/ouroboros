@@ -42,10 +42,11 @@ from ouroboros.tool_access import (
     resource_root_path,
     user_files_path_block_reason,
 )
-from ouroboros.utils import safe_relpath
+from ouroboros.utils import normalized_path_text, safe_relpath, sanitize_tool_result_for_log
 from ouroboros.workspace_executor import BackendPathNoMatch, executor_ref_from_ctx
 from ouroboros.workspace_executor import map_backend_path as executor_map_backend_path
 from ouroboros.workspace_executor import map_backend_path_lexical as executor_map_backend_path_lexical
+from ouroboros.workspace_executor import map_host_path as executor_map_host_path
 
 
 log = logging.getLogger(__name__)
@@ -58,8 +59,13 @@ def _protected_output_source_reason(
     label: str,
     changed_paths: set[str],
     binding: ResolvedResourceBinding | None = None,
+    *,
+    judge_changes: bool = True,
 ) -> str:
-    """Return a block reason for protected/control-plane output sources."""
+    """Return a block reason for protected/control-plane output sources.
+
+    ``judge_changes=False`` is the pre-launch view: whether a repo output was
+    generated is known only after the process, so only static refusals apply."""
 
     from ouroboros.config import get_runtime_mode
     from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
@@ -98,7 +104,7 @@ def _protected_output_source_reason(
             rel = source.name
         if is_protected_runtime_path(rel):
             return f"protected repo output {rel} is not a deliverable artifact"
-        if label in {"active_workspace", "system_repo"} and not _changed_path_covers(rel, changed_paths):
+        if judge_changes and label in {"active_workspace", "system_repo"} and not _changed_path_covers(rel, changed_paths):
             return f"unchanged repo output {rel} is not a generated deliverable"
 
     try:
@@ -138,12 +144,26 @@ def _resolve_declared_output(
     cwd_root: str = "",
     changed_paths: set[str] | None = None,
     binding: ResolvedResourceBinding | None = None,
+    *,
+    judge_changes: bool = True,
 ) -> tuple[pathlib.Path | None, str]:
     text = str(raw_item or "").strip()
     if not text:
         return None, "empty output path"
-    raw = pathlib.Path(text).expanduser()
+    try:
+        relative = normalized_path_text(text)
+    except ValueError as exc:
+        return None, f"declared output is not a usable path: {exc}"
     executor_ref = executor_ref_from_ctx(ctx)
+    if not (is_absolute_path_text(text) or text.startswith("~")):
+        # Outputs alone may spell ``..`` (#1797): the root walk below judges the
+        # resolved location as for the absolute spelling, and the original spelling
+        # is resolved, never a collapsed one, so a symlinked parent keeps its meaning.
+        backend_cwd = _backend_cwd(executor_ref, work_dir) if ".." in pathlib.PurePosixPath(relative).parts else ""
+        if backend_cwd:
+            # In a mapped cwd the backend resolves ``..``: the same spelling as an absolute backend path.
+            text, relative = f"{backend_cwd.rstrip('/')}/{relative}", ""
+    raw = pathlib.Path(text).expanduser()
     # is_absolute_path_text (not Path.is_absolute) so a backend output path like
     # "/workspace/out.txt" maps through the executor on Windows too, where
     # Path.is_absolute() is False for drive-less roots.
@@ -158,7 +178,7 @@ def _resolve_declared_output(
     elif is_absolute_path_text(text) or text.startswith("~"):
         lexical_source, source = raw, raw.resolve(strict=False)
     else:
-        lexical_source = pathlib.Path(work_dir) / safe_relpath(text)
+        lexical_source = pathlib.Path(work_dir) / relative
         source = lexical_source.resolve(strict=False)
     changed = changed_paths or set()
 
@@ -212,7 +232,7 @@ def _resolve_declared_output(
                     "resource ceiling"
                 )
             protected_reason = _protected_output_source_reason(
-                ctx, source, "user_files", changed, binding,
+                ctx, source, "user_files", changed, binding, judge_changes=judge_changes,
             )
             if protected_reason:
                 return None, protected_reason
@@ -234,7 +254,7 @@ def _resolve_declared_output(
                     "resource ceiling"
                 )
         protected_reason = _protected_output_source_reason(
-            ctx, source, label, changed, binding,
+            ctx, source, label, changed, binding, judge_changes=judge_changes,
         )
         if protected_reason:
             return None, protected_reason
@@ -246,7 +266,47 @@ def _resolve_declared_output(
     return None, f"output escapes allowed artifact roots: {text}; allowed_roots: {allowed}"
 
 
-def _directory_fingerprint_from_entries(root: pathlib.Path, entries: list[tuple[str, os.stat_result, pathlib.Path]]) -> str:
+def _backend_cwd(executor_ref, work_dir: pathlib.Path) -> str:
+    """The executor's spelling of ``work_dir``, or ``""`` where no mapping covers it."""
+    if executor_ref is None:
+        return ""
+    try:
+        return executor_map_host_path(executor_ref, pathlib.Path(work_dir))
+    except ValueError:
+        return ""
+
+
+def _declared_output_refusal(
+    ctx: ToolContext,
+    outputs: List[str] | None,
+    work_dir: pathlib.Path,
+    cwd_root: str = "",
+    binding: ResolvedResourceBinding | None = None,
+) -> str:
+    """The pre-launch answer for a declaration the resolver already refuses.
+
+    Absent and not-yet-changed outputs are not refused here; the post-run
+    registration re-resolves every output, symlinks included."""
+    reasons = []
+    for raw_item in outputs or []:
+        try:
+            _source, reason = _resolve_declared_output(
+                ctx, str(raw_item or ""), work_dir, cwd_root=cwd_root, binding=binding, judge_changes=False,
+            )
+        except (ValueError, RuntimeError) as exc:
+            reason = sanitize_tool_result_for_log(f"declared output could not be resolved: {raw_item}: {type(exc).__name__}: {exc}")
+        except Exception:  # noqa: BLE001 — unknown I/O; the baseline that follows discloses it
+            continue
+        if reason:
+            reasons.append(reason)
+    if not reasons:
+        return ""
+    return ("⚠️ RESOURCE_POLICY_BLOCKED: declared outputs refused before the process started; nothing ran. "
+            "Correct or remove these outputs and call again:\n" + "\n".join(f"- {reason}" for reason in reasons))
+
+
+def _directory_fingerprint_from_entries(root: pathlib.Path, entries: list[tuple[str, os.stat_result, pathlib.Path]],
+                                       *, strict: bool = False) -> str:
     digest = hashlib.sha256()
     for rel, st, child in sorted(entries, key=lambda item: item[0]):
         digest.update(rel.encode("utf-8", errors="replace"))
@@ -257,11 +317,12 @@ def _directory_fingerprint_from_entries(root: pathlib.Path, entries: list[tuple[
             try:
                 digest.update(os.readlink(child).encode("utf-8", errors="replace"))
             except OSError:
-                pass
+                if strict:
+                    raise
     return digest.hexdigest()
 
 
-def _directory_fingerprint(path: pathlib.Path) -> tuple[bool, int, str]:
+def _directory_fingerprint(path: pathlib.Path, *, strict: bool = False) -> tuple[bool, int, str]:
     root = pathlib.Path(path).resolve(strict=False)
     total = 0
     entries: list[tuple[str, os.stat_result, pathlib.Path]] = []
@@ -273,22 +334,34 @@ def _directory_fingerprint(path: pathlib.Path) -> tuple[bool, int, str]:
             except ValueError:
                 rel = safe_relpath(str(child))
             entries.append((rel, st, child))
-            if child.is_file() and not child.is_symlink():
+            if stat.S_ISREG(st.st_mode):
                 total += st.st_size
-        return True, total, _directory_fingerprint_from_entries(root, entries)
+        return True, total, _directory_fingerprint_from_entries(root, entries, strict=strict)
     except OSError:
+        if strict:
+            raise
         return False, -1, ""
 
 
-def _fingerprint_output(path: pathlib.Path) -> tuple[bool, int, str]:
+def _fingerprint_output(path: pathlib.Path, *, strict: bool = False) -> tuple[bool, int, str]:
+    """``(exists, size, digest)``; ``(False, -1, "")`` is absence or, unless ``strict``, unreadability.
+
+    ``strict`` is the pre-run baseline: only a path that does not exist is absent, so a
+    stat, walk or read failure on an existing output raises instead of reading as new."""
     try:
-        if path.is_dir():
-            return _directory_fingerprint(path)
-        if not path.is_file():
+        try:
+            mode = path.stat().st_mode  # explicit: Path.is_dir() hides some stat failures as False
+        except (FileNotFoundError, NotADirectoryError):
+            return False, -1, ""
+        if stat.S_ISDIR(mode):
+            return _directory_fingerprint(path, strict=strict)
+        if not stat.S_ISREG(mode):
             return False, -1, ""
         measured = stream_artifact_file(path)
         return True, measured["size"], measured["sha256"]
     except OSError:
+        if strict:
+            raise
         return False, -1, ""
 
 
@@ -302,6 +375,8 @@ def _snapshot_declared_outputs(
 ) -> Dict[str, tuple[bool, int, str]]:
     snapshots: Dict[str, tuple[bool, int, str]] = {}
     for raw_item in outputs or []:
+        # The static view, as the pre-launch refusal: a tracked file is judged
+        # changed or unchanged only after the run, so it keeps its baseline.
         source, block_reason = _resolve_declared_output(
             ctx,
             str(raw_item or ""),
@@ -309,10 +384,36 @@ def _snapshot_declared_outputs(
             cwd_root=cwd_root,
             changed_paths=changed_paths,
             binding=binding,
+            judge_changes=False,
         )
         if source is not None and not block_reason:
-            snapshots[str(source)] = _fingerprint_output(source)
+            snapshots[str(source)] = _fingerprint_output(source, strict=True)
     return snapshots
+
+
+def _declared_output_baseline(
+    ctx: ToolContext,
+    outputs: List[str] | None,
+    work_dir: pathlib.Path,
+    cwd_root: str = "",
+    changed_paths: set[str] | None = None,
+    binding: ResolvedResourceBinding | None = None,
+) -> tuple[Dict[str, tuple[bool, int, str]], str]:
+    """``(baseline, problem)``: a baseline that could not be taken is said before launch.
+
+    Without it registration cannot tell an unchanged existing output from a new one,
+    so the problem also rides in the result; no baseline evidence is invented."""
+    try:
+        return _snapshot_declared_outputs(
+            ctx, outputs, work_dir, cwd_root=cwd_root, changed_paths=changed_paths, binding=binding,
+        ), ""
+    except Exception as exc:  # noqa: BLE001 — disclosed, never a clean empty baseline
+        problem = sanitize_tool_result_for_log(f"{type(exc).__name__}: {exc}")[:500]
+    if getattr(ctx, "emit_progress_fn", None):
+        # The owner's row states the fact; the exception text rides in the result only.
+        ctx.emit_progress_fn("⚠️ Output baseline unavailable: an existing output may be registered "
+                             "without proof that this run changed it; details in the tool result.")
+    return {}, problem
 
 
 def _scan_directory_output_members(
@@ -396,14 +497,14 @@ def _register_process_outputs(
     registered = False  # at least one canonical artifact record was actually created
     for raw_item in outputs:
         text = str(raw_item or "").strip()
-        source, block_reason = _resolve_declared_output(
-            ctx,
-            text,
-            work_dir,
-            cwd_root=cwd_root,
-            changed_paths=changed_paths,
-            binding=binding,
-        )
+        try:
+            source, block_reason = _resolve_declared_output(
+                ctx, text, work_dir, cwd_root=cwd_root, changed_paths=changed_paths, binding=binding,
+            )
+        except Exception as exc:  # noqa: BLE001 — output failure must not replace the completed process result
+            notes.append(sanitize_tool_result_for_log(f"output could not be resolved: {text}: {type(exc).__name__}: {exc}"))
+            failed = True
+            continue
         if block_reason:
             notes.append(block_reason)
             failed = True

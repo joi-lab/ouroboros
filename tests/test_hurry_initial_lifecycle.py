@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import queue as stdqueue
 import threading
 import time
@@ -168,7 +170,7 @@ def test_real_admission_hurry_and_pre_running_death_recover(pool, monkeypatch, o
         assert {key: value for key, value in row.items() if key != "owner_hurry"} == before_hurry
     assert row["owner_hurry"]["attempt_key"] == 1
     assert [entry["kind"] for entry in drain_owner_entries(pool.root, task_id)] == [KIND_HURRY]
-    assert not (pool.root / "logs/chat.jsonl").exists()
+    assert not dialogue_test.log_rows(pool.root / "logs/chat.jsonl")
     assert not ledger_rows(pool.root)
     if phase == "pending":
         workers.assign_tasks()

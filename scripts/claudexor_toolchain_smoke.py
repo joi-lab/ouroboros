@@ -23,12 +23,12 @@ engine — and nothing more.
 ``--harness-install codex`` (the Windows consumer lane) then goes one step further,
 on the same isolated toolchain: the engine's side-effect-free ``--dry-run`` disclosure
 must be admitted (an unsupported platform refuses it typed), the
-production ``install_missing_harness_cli`` performs the real pinned install from the
-npm registry into the engine's HOME-anchored toolchain under the disposable home, and
-the idempotent re-install's receipt must name a ``release_verified`` executable
-there — on Windows a native image or the package-declared Node entry, never an npm
-shell shim. It must answer ``--version`` with the pin, using the managed Node for a
-Node entry. The production-started owned daemon's harness rows and ``claudexor
+production ``install_missing_harness_cli`` performs the real install of the exact
+version the engine selects from the npm registry into the engine's HOME-anchored
+toolchain under the disposable home, and the idempotent re-install's receipt must
+name that version and an executable there — on Windows a native image or the
+package-declared Node entry, never an npm shell shim. It must answer ``--version``
+with that version, using the managed Node for a Node entry. The production-started owned daemon's harness rows and ``claudexor
 doctor`` must launch the bare harness through the engine's resolver and identify
 that same entry and version; that daemon is always stopped. It
 still proves no login, OAuth, account or model task.
@@ -301,9 +301,12 @@ def verify_install_receipt(receipt: Dict[str, Any], harness: str, toolchain: pat
         escapes = toolchain.resolve() not in binary.resolve().parents
     except (OSError, RuntimeError):  # a loop, or a path the OS will not resolve
         escapes = True
+    # Either npm evidence class passes, as in production: ``release_verified`` at the
+    # engine's release-tested baseline, ``deterministic_only`` for the newer exact npm
+    # release a fresh managed Codex install selects since Claudexor 4.4.0. The summary
+    # reports which one; a version-less script class fails the version check below.
     problems = [
         problem for problem, broken in (
-            ("verification is not release_verified", receipt["verification"] != "release_verified"),
             ("installedVersion differs from pinnedVersion",
              receipt["installedVersion"] != receipt["pinnedVersion"]),
             (f"it is not beneath the disposable engine toolchain {toolchain}",
@@ -530,6 +533,8 @@ HARNESS_LIMITS = (
     "can authenticate or run a task here.",
     "- The doctor's overall `{harness}` status is reported, not asserted: with no "
     "credentials it is expected to be not ready; only its `installed` check is required.",
+    "- The receipt's `verification` is reported, not asserted: `deterministic_only` means "
+    "the engine selected a release newer than the one it was verified against.",
     "- Only `{harness}` was installed; Claude and every other vendor were not attempted.",
 )
 

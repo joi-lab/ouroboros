@@ -2,16 +2,12 @@
 
 Opening a room returns its newest rows however many other rooms' archives were
 written since; every older page returns the next older rows of the same room and
-is never empty while history remains; archives a Project's lens rules out are
-skipped by their summaries (``history_segments``), never at the cost of a row.
+is never empty while history remains; a room's rows are addressed out of the store
+(``RoomLens``), never read out of other rooms' history.
 """
 
-import os
-
 from ouroboros.gateway import history_paging
-from ouroboros.gateway.history_segments import SegmentSummary, room_segment_lens, segment_summary
 from tests.test_chat_history_paging import isolated_runtime, pages, request, row, write  # noqa: F401
-from tests._room_shared import RoomsFromBindings
 
 
 def foreign_archives(root, stamp, count=3):
@@ -103,33 +99,16 @@ def test_the_read_ceiling_bounds_each_request_but_loses_nothing(tmp_path, monkey
         write(tmp_path / "archive" / f"chat_20260901T00000{index}.jsonl",
               [row(index * 10 + item, chat_id=chat, ts=f"2026-09-01T0{index}:00:{item:02d}Z") for item in range(10)])
     write(tmp_path / "logs" / "chat.jsonl", [row(99, text="foreign live")])
-    monkeypatch.setattr(history_paging, "_READ_CEILING_BYTES", 1)
+    monkeypatch.setattr(history_paging, "_READ_CEILING_ROWS", 1)
     loaded = list(pages(tmp_path, chat_id=str(chat)))
     assert len(loaded) > 2 and loaded[0]["window"]["complete"] is False
     assert sorted(message["text"] for page in loaded for message in page["messages"]) == sorted(
         f"human-{index}" for index in range(40))
 
 
-def test_main_and_rooms_sharing_its_lens_never_skip_an_archive():
-    assert room_segment_lens(1, {7}, [], RoomsFromBindings({"task": 7})) is None
-    assert room_segment_lens(42, {7}, [], RoomsFromBindings({"task": 7})) is None
-    may_hold = room_segment_lens(7, {7}, [], RoomsFromBindings({"task": 7, "other": 8}))
-    assert may_hold(SegmentSummary(frozenset({7}), frozenset(), frozenset()))
-    assert may_hold(SegmentSummary(frozenset({1}), frozenset({"task"}), frozenset()))
-    assert not may_hold(SegmentSummary(frozenset({1, 8}), frozenset({"other"}), frozenset()))
-
-
-def test_a_rewritten_archive_gets_a_fresh_summary(tmp_path):
-    path = tmp_path / "chat_20260901T000000.jsonl"
-    write(path, [row(0, chat_id=5)])
-    assert segment_summary(path, os.stat(path)).chat_ids == frozenset({5})
-    write(path, [row(0, chat_id=6), row(1, chat_id=6)])
-    assert segment_summary(path, os.stat(path)).chat_ids == frozenset({6})
-
-
-def test_a_replayed_page_skips_the_archives_its_first_read_ruled_out(tmp_path, monkeypatch):
+def test_a_replayed_page_decodes_only_the_rooms_rows(tmp_path, monkeypatch):
     """A page re-read by its frozen handle (a released page coming back) costs what its
-    first read did: the same room view rules the same archives out."""
+    first read did: the same room lens addresses the same rows, no foreign archive row is decoded."""
     from ouroboros.projects_registry import create_project
 
     project = create_project(tmp_path, "replay", name="Replay")
@@ -140,13 +119,11 @@ def test_a_replayed_page_skips_the_archives_its_first_read_ruled_out(tmp_path, m
     write(tmp_path / "logs" / "chat.jsonl", [row(9, text="foreign live")])
     status, first = request(tmp_path, chat_id=str(chat))
     assert status == 200 and len(first["messages"]) == 3
-    parsed, entries = [], history_paging.HistorySource._entries
-    monkeypatch.setattr(history_paging.HistorySource, "_entries", lambda self, start, end, gaps: (
-        parsed.append((self.source, start, end)), entries(self, start, end, gaps))[1])
+    decoded, entries = [], history_paging.HistorySource._entries
+    monkeypatch.setattr(history_paging.HistorySource, "_entries", lambda self, rows: (
+        decoded.extend((self.source, entry.seq) for entry in rows), entries(self, rows))[1])
     status, again = request(tmp_path, chat_id=str(chat), cursor=first["page_cursor"])
     assert status == 200
     assert [message["history_id"] for message in again["messages"]] == [
         message["history_id"] for message in first["messages"]]
-    live_base = sum(path.stat().st_size for path in (tmp_path / "archive").glob("chat_*.jsonl"))
-    assert parsed and all(end <= own.stat().st_size or start >= live_base
-                          for source, start, end in parsed if source == "chat"), parsed
+    assert decoded and all(seq < own.stat().st_size for source, seq in decoded if source == "chat"), decoded

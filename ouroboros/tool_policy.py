@@ -251,6 +251,10 @@ def name_miss_guidance(
     outside the namespace or the callable catalog is named, and nothing is called.
     """
     select = f'list_available_tools(namespace="{namespace}")'
+    successor = canonical_tool_name(requested) if namespace == BUILTIN_NAMESPACE else requested
+    if successor != requested:  # a saved or remembered built-in spelling: the rename is the fact the caller lacks
+        return [f"{requested!r} was renamed {successor!r} (not called).",
+                *name_miss_guidance(successor, namespace, rows, discovery=discovery)]
     if rows is None:
         return [f"The current catalog of {namespace} could not be read here"
                 + ("; list_available_tools reports it with any discovery omission." if discovery else ".")]

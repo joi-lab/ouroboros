@@ -36,7 +36,7 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.delenv(MODEL_ACCOUNTS_KEY, raising=False)
     monkeypatch.setattr(transport.config, "CLAUDEXOR_MODEL_POLL_INTERVAL_SEC", 0.001)
     gateway = Gateway()
-    monkeypatch.setattr(transport, "ensure_owned_gateway", lambda: gateway)
+    monkeypatch.setattr(transport, "ensure_owned_gateway", lambda **_kw: gateway)
     with ua.usage_scope(ua.UsageScope(drive_root=root, task_id="task-one", root_task_id="task-one")):
         yield root, gateway, LLMClient()
 

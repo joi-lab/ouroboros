@@ -89,8 +89,11 @@ export function mountRouteIframeWidget(mount, tab, render) {
 }
 
 // `messageHandlers` is the page's Set of WebSocket message handlers (fanned from
-// `ctx.ws.on('message')`); the frame's event subscription registers into it.
-export async function mountModuleWidget(mount, tab, render, mountSignal = null, messageHandlers = null) {
+// `ctx.ws.on('message')`); the frame's event subscription registers into it. `inline` is a
+// frame shown in a message instead (a living card, card_frames.js): `{fit(contentHeight),
+// fault(text)}` — the message's size policy replaces the board's floor and declared height,
+// and a fault is the card's to show.
+export async function mountModuleWidget(mount, tab, render, mountSignal = null, messageHandlers = null, inline = null) {
     // Reviewed JS runs in an opaque iframe; the parent bridge is its only
     // scriptable I/O path and only reaches this skill's extension route prefix
     // and this skill's namespaced WebSocket events, preserving route IO without
@@ -160,7 +163,8 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
     iframe.srcdoc = srcdoc;
     mount.replaceChildren(iframe);
     let appliedHeight = frameHeight(render);
-    setFrameHeight(iframe, appliedHeight);
+    if (inline) inline.fit(autoHeight ? 0 : appliedHeight);
+    else setFrameHeight(iframe, appliedHeight);
     const pendingRequests = new Map();
     let disposed = false;
     let disposing = null;
@@ -311,6 +315,7 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
             if (!autoHeight) return;
             const measured = Number(msg.height);
             if (!Number.isFinite(measured) || measured <= 0) return;
+            if (inline) { inline.fit(measured + WIDGET_FRAME_BORDER_RESERVE); return; }
             const nextHeight = Math.min(maxHeight, Math.max(WIDGET_FRAME_DEFAULT_HEIGHT, measured + WIDGET_FRAME_BORDER_RESERVE));
             // Stamped before the early return: that return fires exactly when the
             // frame is pinned at max_height, which is the one case these two
@@ -325,7 +330,8 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
         if (msg.type === 'ouro-widget-error') {
             const label = msg.kind === 'csp' ? 'Widget blocked by frame policy' : 'Widget script error';
             const detail = msg.kind === 'csp' ? (msg.source || msg.message) : msg.message;
-            setWidgetCardFault(mount.closest('[data-widget-key]'), `${label}: ${detail || 'unknown'}`);
+            if (inline) inline.fault(`${label}: ${detail || 'unknown'}`);
+            else setWidgetCardFault(mount.closest('[data-widget-key]'), `${label}: ${detail || 'unknown'}`);
             return;
         }
         if (msg.type === 'ouro-widget-theme') {

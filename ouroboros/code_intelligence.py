@@ -39,7 +39,7 @@ SEARCH_SKIP_GLOBS = frozenset({
     "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.webp",
     "*.woff", "*.woff2", "*.ttf", "*.eot",
     "*.min.js", "*.min.css", "*.map",
-    "*.db", "*.sqlite", "*.sqlite3",
+    "*.db", "*.sqlite", "*.sqlite3", *(f"*.{db}-{part}" for db in ("db", "sqlite", "sqlite3") for part in ("journal", "wal", "shm")),
     "*.lock",
 })
 _SKIP_DIRS = set(SKIP_DIRS)

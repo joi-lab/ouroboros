@@ -142,3 +142,24 @@ The owner's choice in `widget_start_mode` overrides `start`. Stop always wins. I
 
 - **`kind: "iframe"`:** a frame whose `src` is `/api/extensions/<skill>/<render.route>`, with the same `sandbox` and `allow` attributes, no bridge and no document policy. Remove it at once on stop.
 - **`kind: "declarative"`:** a component description the host draws itself. The components are listed in `CREATING_SKILLS.md`. An interface that does not draw them should say the card is not supported rather than guess.
+
+## 9. Frames in a message
+
+Ouroboros can show a widget, or a small app of its own, inside its own chat message: a living card ([`CLIENT_CONTRACT.md`](CLIENT_CONTRACT.md) §5 "Living cards"). A frame in a message is not a Widgets card. It never joins the widgets view's cards or launch policy, and leaving the widgets view stops nothing in a message; the message disposes its frames when its row goes, and with the page. The builtin implementation is `web/modules/card_frames.js` and `web/modules/chat_cards.js`.
+
+- **Size.** A frame in a message is at least 120 pixels tall and at most 70 % of the window's height. Taller content is cut until the owner presses Expand (then up to the 8192-pixel ceiling); Collapse cuts it again. There is no 320-pixel floor. A module widget's `height` is honoured up to the cap; a self-sizing one reports through `ouro-widget-resize` as on the widgets view. A declarative widget shown in a message is measured and cut the same way. The builtin host runs at most three frames in one feed, started when they come near the view; a frame far from it rests as the card's words with Open.
+- **A skill's widget in a message** is the tab `GET /api/widgets` lists for the card's `{skill, tab_id}`. When it is not listed, show the card's words and say that the skill is off. The module bridge, its events and the theme work as on the widgets view; a widget fault is shown on the card. The card's `input` (an object) gives a declarative widget's form fields of the same names their first values; what the owner typed in this page session wins. A module widget gets no input.
+- **An app** is HTML Ouroboros wrote, read as text from `GET /api/cards/{card_id}/app` and never opened as a page. It runs in its own frame, not the module frame: a created `<iframe>` with `sandbox="allow-scripts"` and nothing else (no `allow` attribute), whose `srcdoc` property is set to `<!doctype html><html data-theme="light|dark"><head>`, then this document policy as the head's first element, then a viewport line, the theme and the bridge script, then `</head><body>`, the app's HTML and `</body></html>`:
+
+  ```
+  default-src 'none'; script-src 'unsafe-inline' blob: data:; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; font-src data:
+  ```
+
+  An app has no fetch, WebSocket or load, no skill route, no request relay, no events, no downloads and no links out. No page policy covers two paths to the network: navigating its own frame (every navigation is a request; when one loads a second document the host removes the frame and says so on the card, while a navigation answered without a document leaves the app running) and WebRTC. The frame keeps the app away from Ouroboros and the page, not from the network; its only author is Ouroboros, which has the network anyway. The theme reaches the app as `data-theme` and the custom properties `--ouro-text`, `--ouro-text-meta`, `--ouro-accent`, `--ouro-surface`, `--ouro-tray`, `--ouro-border`, `--ouro-ok`, `--ouro-warn`, `--ouro-error`, `--ouro-font` and `--ouro-radius`.
+- **The app bridge** is three messages from the frame and one from the page, each carrying the mount's nonce; the page acts only on messages from that frame's own window:
+  - `ouro-card-resize {height}`: the content height. The bridge reports it itself as the document grows.
+  - `ouro-card-state {state}`: JSON text of at most 32 KiB. The host keeps it per card and app bytes in the tab's session storage and hands it back at the next mount.
+  - `ouro-card-submit {value, summary}`: the host puts one line into the owner's draft, `From «<title>»: <summary>` followed by the value as compact JSON when that is 300 characters or fewer, and focuses the field. It never sends: only the owner's Send does.
+  - `ouro-card-theme {theme: {name, css}}`, page to frame: the theme changed.
+
+  Inside the frame an app uses `window.OuroborosCard = {resize(height), state: {value, save(value)}, submit(value, summary), theme, onTheme(callback)}`.

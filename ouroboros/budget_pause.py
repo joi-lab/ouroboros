@@ -488,9 +488,9 @@ def set_budget_pause(root: Any, task_id: str, row: Dict[str, Any],
 
 
 def budget_pause_row(root: Any, task_id: str) -> Dict[str, Any]:
-    from ouroboros.task_results import load_task_result
+    from ouroboros.store_hot_facts import controls
 
-    row = load_task_result(pathlib.Path(root), str(task_id), strict=True) or {}
+    row = controls(root, str(task_id))
     pause = row.get("budget_pause")
     return dict(pause) if isinstance(pause, dict) else {}
 

@@ -40,7 +40,7 @@ function validRecord(value, quiz) {
 }
 
 export function createQuizSubmission({ apiFetch, readQuestion, accept, canUse, onDomWrite, showToast = () => {},
-    storage = () => globalThis.localStorage, waitMs = WAIT_MS }) {
+    paintHead = () => false, storage = () => globalThis.localStorage, waitMs = WAIT_MS }) {
     const views = new Map();
     let disposed = false;
     const alive = view => !disposed && views.get(view.card) === view;
@@ -100,6 +100,7 @@ export function createQuizSubmission({ apiFetch, readQuestion, accept, canUse, o
             const attempt = record.attempt;
             const held = Boolean(attempt) && !terminal(card.dataset.state);
             card.dataset.submission = held ? view.phase : '';
+            paintHead(card);  // the head's mark follows the answer in flight
             card.setAttribute('aria-busy', held && ['sending', 'checking'].includes(view.phase) ? 'true' : 'false');
             const field = card.querySelector('.chat-quiz-comment');
             const reason = card.querySelector('.chat-quiz-close-reason');

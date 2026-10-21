@@ -28,7 +28,7 @@ import logging
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, List, Optional, Tuple
 
 from ouroboros.review_slot_cancel import (  # noqa: F401 — re-exported seam surface
     ReviewSessionSucceededResultUnavailable,
@@ -43,10 +43,9 @@ from ouroboros.delegate_custody_usage import (
     observe_failed_review_send, observe_review_usage, session_usage_once,
 )
 from ouroboros.triad_review import (
-    ACCEPTANCE_SURFACE_RULES,
-    TIER_CLASSIFICATION_RULES,
     TWO_PART_SESSION_OUTPUT_SCHEMA,
     default_output_contract,
+    request_output_shape,
     review_output_shape,
 )
 from ouroboros.deadline_utils import (
@@ -59,6 +58,7 @@ from ouroboros.review_session_custody import (
     owned_started_review_custody,
     recorded_review_shape,
     review_recovery_facts,
+    continue_review_run,
 )
 from ouroboros.review_session_preparation import prepare_review_session_request, render_review_session_prompt
 from ouroboros.review_session_usage import (review_event_identity, session_custody_attribution,
@@ -139,7 +139,7 @@ class ReviewSessionWaitingOnUser(RuntimeError):
     itself (BR2-2); anything unverified says the run may still be live, and a
     verify read that finds the run already SUCCEEDED never raises this at all
     (completion wins). Answering support for hosted review lanes is a
-    deliberate non-goal (owner: no acceptance host-wait; see docs/ARCHITECTURE.md).
+    deliberate non-goal (owner: no host-wait for a review lane; see docs/ARCHITECTURE.md).
     """
 
 _DELIVERY_RANK = {"api_chat": 0, "native_tool_rounds": 1, "agent_session": 2}
@@ -164,70 +164,19 @@ def panel_delivery_class(slots: Any) -> str:
 # Policy keys a retrieving executor consumes itself (`review_native_episode`,
 # `AgentSessionReviewExecutor`); the rendered Policy JSON omits them so the api
 # pack states the review contract once, in its governance segment.
-ROUTE_OWNED_POLICY_KEYS = frozenset({"output_contract", "native_data_root", "review_source_closure"})
+ROUTE_OWNED_POLICY_KEYS = frozenset({"output_contract", "native_data_root"})
 
 
 def review_output_contract(request: ReviewRequest) -> str:
-    """The surface's output contract — required keys, tier and acceptance rules,
-    the DEGRADED escape hatch — as ONE text every delivery honours: the api pack
-    renders it into its byte-stable governance segment, and a surface hands the
-    same text to its retrieving rows as ``policy["output_contract"]``."""
-    classify_tier = bool(request.policy.get("classify_outcome_tier"))
-    # Acceptance-only prompt POLICY (criteria/dialogue/obligation keys and the
-    # surface rules) keys on the surface; the output SHAPE those keys imply is
-    # the separate form fact `review_output_shape` the canonicalizer consumes.
-    acceptance = request.surface == "task_acceptance"
-    # The tier keys belong in the REQUIRED key list, not trailing prose — models
-    # honor the explicit "Return JSON with keys" list and otherwise drop them,
-    # which silently kills the best_effort/completion-coach lexicon.
-    tier_keys = (
-        ', outcome_tier ("solved"|"best_effort"|"blocked_with_evidence"), completion_coach'
-        if classify_tier
-        else ""
-    )
-    # For task acceptance the reviewer makes its derived acceptance criteria
-    # VISIBLE — recorded per-actor in the review trace / objective axis (M4) so
-    # "for whom we review" is auditable. Reviewer reasoning, not a new
-    # authoritative gate (criteria live in actors[].parsed, not a separate phase).
-    criteria_key = (
-        ', criteria_used (the acceptance criteria you re-derived from the full goal narrative '
-        'and checked, as [{criterion, status (supported|missing|partial|rejected), evidence_refs}]; evidence_refs must name concrete '
-        'host-attested receipts/artifacts/tool results for every contributing criterion; '
-        # D-Q5: the host resolves each ref by EXACT match against the packet's
-        # enumerable exhibit keys — the vocabulary below is the closed set of forms.
-        'each evidence_ref is resolved by EXACT match against the evidence packet, so use these exact forms: '
-        'claim ids from task_contract.acceptance_claims (which count as evidence ONLY while '
-        'acceptance_support_refs shows that claim supported by a passing receipt — otherwise cite the exhibit itself), '
-        'verification_receipts[i] receipt ids (rows of the verification_receipts exhibit list; '
-        'only a green pass/observed receipt supports a criterion), acceptance_obligations ids, artifact manifest names, '
-        'or HOST-ATTESTED top-level packet section names (the agent-supplied sections — reasoning_notes, '
-        'candidate_answers, agent_supplied — and task_contract itself are NOT evidence: cite the exhibit '
-        'that proves the work instead) — a ref that resolves to nothing cannot support a criterion)'
-        if acceptance
-        else ""
-    )
-    # v6.74.0 acceptance-dialogue keys (A3/A5): reviewer-authored obligation
-    # identity and the typed dialogue judgement. Both live in the REQUIRED key
-    # list for the same reason as the tier keys above.
-    dialogue_key = (
-        ', dialogue_status ("continue_actionable"|"unreachable_here"|"stable_disagreement")'
-        if acceptance
-        else ""
-    )
-    findings_shape = (
-        '[{severity, item, evidence, recommendation, disposition_kind ("new"|"re_raise"), '
-        'obligation_id (required when disposition_kind="re_raise")}]'
-        if acceptance
-        else "[{severity, item, evidence, recommendation}]"
-    )
-    tier_rules = TIER_CLASSIFICATION_RULES if classify_tier else ""
-    acceptance_rules = ACCEPTANCE_SURFACE_RULES if acceptance else ""
+    """The surface's output contract — the required keys and the DEGRADED
+    escape hatch — as ONE text every delivery honours: the api pack renders it
+    into its byte-stable governance segment, and a surface hands the same text
+    to its retrieving rows as ``policy["output_contract"]``. The output SHAPE is
+    the separate form fact ``review_output_shape`` the canonicalizer consumes."""
     return (
-        f"Return JSON with keys: verdict (PASS|FAIL|DEGRADED){tier_keys}{criteria_key}{dialogue_key}, findings "
-        f"({findings_shape}), and summary. "
-        + tier_rules
-        + acceptance_rules
-        + "If you cannot judge because evidence is missing, return DEGRADED and explain."
+        "Return JSON with keys: verdict (PASS|FAIL|DEGRADED), findings "
+        "([{severity, item, evidence, recommendation}]), and summary. "
+        "If you cannot judge because evidence is missing, return DEGRADED and explain."
     )
 
 
@@ -236,7 +185,7 @@ def _render_prompt_parts(request: ReviewRequest, slot: ReviewSlot) -> tuple[str,
 
     Cache segmentation (v6.74.0, B1): the byte-stable governance instruction and
     the task-stable contract (goal/scope/checklist/policy — stable across the
-    improvement passes of ONE task) are the two cache-marked segments; the
+    review rounds of ONE task) are the two cache-marked segments; the
     mutable tail (subject, evidence, refs) is never marked, and the slot label
     lives at its TAIL so concurrent same-model slots share a warm prefix."""
     evidence = json.dumps(request.evidence, ensure_ascii=False, indent=2, default=str)
@@ -318,8 +267,8 @@ def _request_messages(request: ReviewRequest, slot: ReviewSlot) -> List[Dict[str
     # Default shape is cache-friendly (v6.74.0, B1): two cache-marked system
     # segments — the byte-stable governance instruction and the task-stable
     # contract (goal/scope/checklist/policy, unchanged across a task's
-    # improvement passes) — followed by the unmarked mutable evidence tail as
-    # the user message. The large evidence body changes every pass by design
+    # review rounds) — followed by the unmarked mutable evidence tail as
+    # the user message. The large evidence body changes every round by design
     # and is honestly not cached.
     from ouroboros.tools.review_helpers import cached_prompt_blocks
 
@@ -391,7 +340,7 @@ class ReviewSlotExecutor:
 
     def _output_contract(self) -> str:
         contract = str((self.assignment.request.policy or {}).get("output_contract") or "")
-        return contract or default_output_contract(review_output_shape(self.assignment.request.surface))
+        return contract or default_output_contract(request_output_shape(self.assignment.request))
 
     def prompt_payload(self) -> Dict[str, Any]:
         """Route-owned projection of what will actually be sent (for the durable
@@ -451,7 +400,7 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
                 "model_role": f"reviewer:{slot.slot_id}",
                 "model_account_override": slot.session_profile,
                 "reasoning_effort": slot.effort,
-                "processing_preference": slot.processing_preference or None,
+                "processing_preference": slot.processing_preference,
                 "max_tokens": int(request.max_tokens or slot.max_tokens),
                 "temperature": request.temperature if request.temperature is not None else slot.temperature,
                 "no_proxy": bool(request.no_proxy),
@@ -578,66 +527,19 @@ REVIEW_SESSION_OUTPUT_SCHEMA: Dict[str, Any] = {
 }
 
 
-# The OBJECT contract's schema (task acceptance): the whole verdict object. The
-# host keeps exact evidence-ref resolution and tier/coach demotion for itself
-# (an enum of every exhibit key would mint a schema larger than the packet), so
-# the schema pins only the shape the canonicalizer preserves whole.
-ACCEPTANCE_SESSION_OUTPUT_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "required": ["verdict", "findings", "summary"],
-    "properties": {
-        "verdict": {"type": "string", "enum": ["PASS", "FAIL", "DEGRADED"]},
-        "outcome_tier": {"type": "string", "enum": ["solved", "best_effort", "blocked_with_evidence"]},
-        "completion_coach": {"type": "string"},
-        "criteria_used": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["criterion", "status"],
-                "properties": {
-                    "criterion": {"type": "string"},
-                    "status": {"type": "string", "enum": ["supported", "missing", "partial", "rejected"]},
-                    "evidence_refs": {"type": "array", "items": {"type": "string"}},
-                },
-            },
-        },
-        "dialogue_status": {
-            "type": "string",
-            "enum": ["continue_actionable", "unreachable_here", "stable_disagreement"],
-        },
-        "findings": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["severity", "item", "evidence", "recommendation"],
-                "properties": {
-                    "severity": {"type": "string"},
-                    "item": {"type": "string"},
-                    "evidence": {"type": "string"},
-                    "recommendation": {"type": "string"},
-                    "disposition_kind": {"type": "string", "enum": ["new", "re_raise"]},
-                    "obligation_id": {"type": "string"},
-                },
-            },
-        },
-        "summary": {"type": "string"},
-    },
-}
-
-
-def review_session_output_schema(surface: str) -> Optional[Dict[str, Any]]:
+def review_session_output_schema(surface: str, shape: str = "") -> Optional[Dict[str, Any]]:
     """The session verdict schema, shaped to the SURFACE's own clean contract.
 
     The shared schema admits ``{"findings": []}`` — the honest clean verdict for an
     ordinary advisory reviewer. Skill Review's matrix contract requires all checklist
     rows (PASS included): its schema demands ``minItems: 1`` and the downstream parser
     still verifies exact item coverage. The commit gate's ``two_part`` shape asks for
-    contract B's one object; an ``object`` surface (task acceptance) for the whole
-    verdict object; a ``report`` surface for NO schema — its prose passes verbatim.
+    contract B's one object; a ``report`` surface for NO schema — its prose passes verbatim.
+    ``shape`` is the request's own when it names one (``triad_review.request_output_shape``).
     """
-    shape = review_output_shape(surface)
-    if shape in ("report", "object", "two_part"):
-        return {"object": ACCEPTANCE_SESSION_OUTPUT_SCHEMA, "two_part": TWO_PART_SESSION_OUTPUT_SCHEMA}.get(shape)
+    shape = shape or review_output_shape(surface)
+    if shape in ("report", "two_part"):
+        return {"two_part": TWO_PART_SESSION_OUTPUT_SCHEMA}.get(shape)
     if shape == "plan_reply":
         # The planning organ's reply object (prose, the participant's own objections and
         # withdrawals): the generic item/verdict shape would conform-and-launder it.
@@ -750,6 +652,7 @@ class SessionInvocation:
     operation_id: str = ""
     pending_invocation_checkpoint: Optional[Callable[[str], None]] = None
     owner_deadline_at: str = ""
+    # The facts dict request preparation fills (input limit, a turn delivered as sources); None = a fresh one.
     source_delivery: Optional[Dict[str, Any]] = None
     # #1609: the seat's configured technical access ('' = historical read-only) and its wave's frozen checking source.
     access: str = ""
@@ -770,11 +673,8 @@ def run_delegated_review_session(
     """
     from ouroboros import delegate_custody as custody
     from ouroboros.claudexor_daemon import ensure_owned_gateway
-    from ouroboros.gateways.claudexor import (
-        WINDOW_EXHAUSTED_CODES, ClaudexorSubscriptionWindowExhausted, ClaudexorUnavailable, final_attempt_facts,
-        run_failure_error,
-    )
-    from ouroboros.subagents import delegated_run_shape, route_health
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable, final_attempt_facts, run_failure_error
+    from ouroboros.subagents import delegated_run_shape
     from ouroboros.usage_accounting import current_usage_scope
     from ouroboros.review_checking import bind_checking_thread, session_checking, terminal_seat_evidence
     task_id, surface, slot_id, timeout_sec, logical_key_extra, output_schema, \
@@ -793,9 +693,14 @@ def run_delegated_review_session(
     gateway, route = None, session_route
     recovering, project_id, existing_project = False, "", ""  # also bound on early recovery failures
     observed, summary = {}, {}  # a failure after start still names what it observed
+    delivery_facts = invocation.source_delivery if invocation.source_delivery is not None else {}
+    continuations, stopped_summaries = [], []
     start_attempted, start_refused = False, False  # only submit witnesses POST entry
     try:
         record = custody.invocation_record(custody_drive, retry_token) if retry_token else None
+        if record is not None and record["state"] == "legacy_gap":
+            raise ReviewRouteUnavailable(f"legacy_gap: {record['reason']}; delegated invocation needs repair",
+                                         code="review_custody_legacy_gap")
         if record is not None and record["state"] == "started" and record["run_id"]:
             run_id, started_custody = owned_started_review_custody(custody, custody_drive, record, task_id)
         if record is not None and (run_id or record["state"] == "pending"):
@@ -806,8 +711,13 @@ def run_delegated_review_session(
             raise ReviewRouteUnavailable("delegated retry token has no durable invocation; refusing a second paid run",
                                          code="review_custody_lost")
         if recovering:
+            source_request = record.get("work_order_source_request") or {}
+            delivery_facts.update(source_request)
+            recovery_prompt = prompt
+            if source_request.get("original_prompt_sha256") == hashlib.sha256(prompt.encode("utf-8")).hexdigest():
+                recovery_prompt = str((run_request or {}).get("prompt") or "")
             route, project_id, existing_project, key, schema_asked = review_recovery_facts(
-                record, run_request, started_custody, prompt=prompt, root=root,
+                record, run_request, started_custody, prompt=recovery_prompt, root=root,
                 claimant_task_id=task_id, claimant_surface=surface, claimant_slot_id=slot_id,
                 claimant_operation_id=str(invocation.operation_id or ""))
             shape = recorded_review_shape(run_request)  # replay original rights and checking copy
@@ -830,22 +740,8 @@ def run_delegated_review_session(
             from ouroboros.review_thread_continuity import require_delegated_review_threads
             require_delegated_review_threads(gateway)
         if not recovering and not run_id and not (use_thread and thread_id):
-            unavailable, reset_at = route_health(
-                gateway, route.route_id, shape, route_model=route.model,
-                pinned_profile=str(getattr(route, "profile_id", "") or ""))
-            if unavailable in WINDOW_EXHAUSTED_CODES or reset_at:
-                raise ClaudexorSubscriptionWindowExhausted(
-                    "delegated review route subscription window is exhausted"
-                    + (f" (resets {reset_at})" if reset_at else "")
-                    + "; this slot fails typed — never a silent fallback onto "
-                    "metered API spend", reset_at=reset_at,
-                    code=(unavailable or "subscription_window_exhausted"))
-            if unavailable:
-                raise ReviewRouteUnavailable(
-                    f"delegated review route unavailable: {unavailable}", code=unavailable)
+            _require_route_headroom(gateway, route, shape)
         if not recovering:
-            from ouroboros.acceptance_retrieving import prepare_session_source
-            prepare_session_source(invocation.source_delivery, task_id=task_id)
             from ouroboros.delegate_registration_policy import minted_review_root, resolve_registration
             project_id, owned_project_id, _persistent, ephemeral = resolve_registration(  # a sticky thread keeps it
                 gateway, root, "", shape.access, minted=not use_thread and minted_review_root(root, custody_drive))
@@ -875,7 +771,9 @@ def run_delegated_review_session(
             run_request = prepare_review_session_request(
                 invocation, route, prompt=prompt, root=root, ephemeral=ephemeral,
                 thread_id=thread_id, schema_asked=schema_asked,
-                shape=shape, execution=checking.get("execution"), instructions=checking.get("instructions", ""))
+                shape=shape, execution=checking.get("execution"), instructions=checking.get("instructions", ""),
+                input_limit=(getattr(gateway, "ask_input_limits", lambda: {})() or {}).get(route.route_id),
+                source_root=custody_drive, delivery_facts=delivery_facts)
         if not run_id:
             from ouroboros.budget_pause import dispatch_fenced
 
@@ -903,7 +801,8 @@ def run_delegated_review_session(
                     surface=surface, slot_id=slot_id,
                     # #112: pending recovery replays the request row's lineage.
                     root_task_id=root_task_id, parent_task_id=parent_task_id,
-                    review_source_delivery=dict(invocation.source_delivery or {}),
+                    review_source_delivery=delivery_facts,
+                    work_order_source_request=delivery_facts,
                     **usage_custody, **checking.get("custody", {}),
                 )
             except BillingAuthorityUnavailable as exc:  # Outer pre-start boundary owns cleanup; nothing sent.
@@ -964,6 +863,22 @@ def run_delegated_review_session(
         window = float(timeout_sec) if timeout_sec is not None else 300.0
         poll_deadline = time.monotonic() + window
         detail = _poll_session_terminal(gateway, custody, custody_drive, entry, run_id, window)
+        seen_runs = {run_id}
+        while str(custody.summary_of(detail).get("state") or "") != "succeeded":
+            stopped = custody.summary_of(detail)
+            successor = continue_review_run(gateway, custody_drive, entry, detail, invocation,
+                remaining=poll_deadline - time.monotonic(), seen=seen_runs)
+            if successor is None:
+                break
+            continuations.append({"from_run_id": run_id, "run_id": successor.run_id,
+                                  "resumable": stopped.get("resumable") or detail.get("resumable") or {}})
+            stopped_summaries.append(stopped)
+            entry, run_id = successor, successor.run_id
+            turn_id = ""  # A successor is never the stopped run's thread turn.
+            seen_runs.add(run_id)
+            state["delegated_run_id"] = run_id
+            detail = _poll_session_terminal(gateway, custody, custody_drive, entry, run_id,
+                                            max(0.0, poll_deadline - time.monotonic()))
         late_success = time.monotonic() >= poll_deadline  # a terminal the deadline read discovered
         if shape.investigation:  # every terminal turn retains its own named outputs and delta
             checking["evidence"] = terminal_seat_evidence(
@@ -977,14 +892,11 @@ def run_delegated_review_session(
             state.pop("delegated_run_id", None)
             raise run_failure_error(run_id, run_state, summary.get("failure"))
         text = _full_session_text(gateway, run_id, detail)
-        spend, estimated = custody.disclosed_spend(summary)
+        spend, estimated, combined_summary = _combined_session_usage(custody, stopped_summaries, summary)
         thread_receipt: Dict[str, Any] = {}
         if use_thread:
-            from ouroboros.review_thread_continuity import review_thread_receipt as receipt_for
-            thread_receipt = receipt_for(gateway, thread_id, run_id, turn_id,
-                expected_profile=str(getattr(route, "profile_id", "") or ""),
-                applied_profile=observed.get("profile_id", ""))
-            turn_id = str(thread_receipt.get("turn_id") or turn_id)
+            thread_receipt, thread_id, turn_id = _session_thread_receipt(
+                gateway, thread_id, run_id, turn_id, route, observed, continued=bool(continuations))
         state.pop("pending_invocation_id", None)
         state.pop("delegated_run_id", None)
         return {
@@ -998,11 +910,13 @@ def run_delegated_review_session(
             "idempotent_recovery": recovering,
             "late_success_accepted": late_success,
             "settlement": settlement,
+            "review_source_delivery": delivery_facts,
+            "review_continuations": continuations,
             "route_id": str(entry.route_id), "run_dir": str(summary.get("runDir") or ""),
             # One final attempt, never the requested pool or a mixed summary route.
             "effective_route_ids": [observed["harness_id"]] if observed.get("harness_id") else [],
             "observed_attempt": observed, "model": observed.get("model", ""),
-            "usage": session_usage_facts(run_id, requested_route=str(entry.route_id), observed_attempt=observed, summary=summary),
+            "usage": session_usage_facts(run_id, requested_route=str(entry.route_id), observed_attempt=observed, summary=combined_summary),
             "spend": spend, "spend_estimated": estimated,
             # D22/D29 applied facts are verbatim telemetry, never inferred.
             "applied_profile": observed.get("profile_id", ""),
@@ -1034,12 +948,68 @@ def run_delegated_review_session(
             exc.delegated_run_started, exc.delegated_run_id = True, run_id
             exc.delegated_usage = session_usage_facts(run_id, requested_route=str(getattr(route, "route_id", "") or ""),
                                                       observed_attempt=observed, summary=summary)  # #1578
+            if continuations:
+                exc.delegated_usage["review_continuations"] = continuations
         if checking.get("evidence"):
             exc.checking_evidence = checking["evidence"]
         raise
     finally:
         if gateway is not None:
             gateway.close()
+
+
+def _require_route_headroom(gateway: Any, route: Any, shape: Any) -> None:
+    """A fresh seat starts only on a route with headroom: a spent subscription window fails the slot
+    typed, never a silent fallback onto metered API spend."""
+    from ouroboros.gateways.claudexor import WINDOW_EXHAUSTED_CODES, ClaudexorSubscriptionWindowExhausted
+    from ouroboros.subagents import route_health
+
+    unavailable, reset_at = route_health(gateway, route.route_id, shape, route_model=route.model,
+                                         pinned_profile=str(getattr(route, "profile_id", "") or ""))
+    if unavailable in WINDOW_EXHAUSTED_CODES or reset_at:
+        raise ClaudexorSubscriptionWindowExhausted(
+            "delegated review route subscription window is exhausted"
+            + (f" (resets {reset_at})" if reset_at else "")
+            + "; this slot fails typed — never a silent fallback onto metered API spend",
+            reset_at=reset_at, code=(unavailable or "subscription_window_exhausted"))
+    if unavailable:
+        raise ReviewRouteUnavailable(f"delegated review route unavailable: {unavailable}", code=unavailable)
+
+
+def _combined_session_usage(custody: Any, stopped: List[Dict[str, Any]],
+                            summary: Dict[str, Any]) -> Tuple[Any, bool, Dict[str, Any]]:
+    """The seat's money and tokens across its continuations: a sum only when every run disclosed it."""
+    spend, estimated = custody.disclosed_spend(summary)
+    combined = dict(summary)
+    if stopped:
+        spends = [custody.disclosed_spend(item) for item in [*stopped, summary]]
+        spend = sum(value for value, _estimated in spends) if all(value is not None for value, _ in spends) else None
+        estimated = any(flag for _value, flag in spends)
+        for key in ("inputTokens", "outputTokens", "cachedInputTokens"):
+            values = [item.get(key) for item in [*stopped, summary]]
+            combined[key] = sum(values) if all(type(v) in (int, float) for v in values) else None
+    return spend, estimated, combined
+
+
+def _session_thread_receipt(gateway: Any, thread_id: str, run_id: str, turn_id: str, route: Any,
+                            observed: Dict[str, Any], *, continued: bool) -> Tuple[Dict[str, Any], str, str]:
+    """The thread receipt of the seat's final run, with the thread and turn it names."""
+    from ouroboros.review_thread_continuity import review_thread_receipt as receipt_for
+
+    try:
+        receipt = receipt_for(gateway, thread_id, run_id, turn_id,
+                              expected_profile=str(getattr(route, "profile_id", "") or ""),
+                              applied_profile=observed.get("profile_id", ""))
+    except ReviewRouteUnavailable as exc:
+        if not continued or exc.code != "review_thread_receipt_missing":
+            raise
+        # continueFrom may move the session or use an evidence packet.
+        # Collect its answer without claiming it advanced the old thread.
+        receipt, thread_id = {"prior_thread_id": thread_id, "run_id": run_id,
+                              "status": "continuation_not_in_thread"}, ""
+    return receipt, thread_id, str(receipt.get("turn_id") or turn_id)
+
+
 def _effective_route_carries_schema(gateway: Any, route_id: str) -> bool:
     """Can the EFFECTIVE route actually carry ``outputSchema`` on this run (D19)?
 
@@ -1326,6 +1296,8 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         return {**(session_failure_identity(self._session_usage) if run_id else {}),
                 "delegated_run_started": bool(run_id), "delegated_run_id": run_id,
                 "pending_invocation_id": pending, **({"checking_evidence": evidence} if evidence else {}),
+                **({"review_continuations": self._session_usage["review_continuations"]}
+                   if self._session_usage.get("review_continuations") else {}),
                 **({"delegated_start_unrequested": True} if getattr(failure, "delegated_start_unrequested", None) is True else {})}
 
     def restore_custody(self, state: Dict[str, Any]) -> None:
@@ -1368,7 +1340,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 slot_id=slot.slot_id,
                 timeout_sec=logical_timeout,
                 logical_key_extra=(self.assignment.call_id,),
-                output_schema=review_session_output_schema(request.surface),
+                output_schema=review_session_output_schema(request.surface, request_output_shape(request)),
                 session_route=session_route_for_review_slot(slot),
                 retry_state=self._retry_state,
                 reconcile_only=bool(getattr(request, "reconcile_only", False)),
@@ -1378,7 +1350,6 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 operation_id=self.assignment.call_id,
                 pending_invocation_checkpoint=self._pending_invocation_checkpoint,
                 owner_deadline_at=str(getattr(request, "deadline_at", "") or ""),
-                source_delivery=(getattr(request, "slot_source_delivery", None) or {}).get(slot.slot_id),
                 access=str(getattr(slot, "session_access", "") or ""),
                 checking_source=getattr(request, "checking_source", None) or None,
             )
@@ -1393,7 +1364,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         # Array/object surfaces REQUEST the structured verdict; a report surface
         # asks for no schema, so neither its absence nor its non-conformance is
         # a landing of any reason.
-        schema_requested = review_session_output_schema(request.surface) is not None
+        schema_requested = review_session_output_schema(request.surface, request_output_shape(request)) is not None
         if schema_requested and not facts["schema_asked"]:
             # An effective transport that cannot carry the schema is a landing
             # below the ask, disclosed rather than silently downgraded (D4).
@@ -1438,6 +1409,8 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             "late_success_accepted": bool(facts.get("late_success_accepted")),
             "output_conformance": conformance,
             "settlement": facts["settlement"],
+            "review_source_delivery": facts.get("review_source_delivery") or {},
+            "review_continuations": facts.get("review_continuations") or [],
             # The ledger row is written by settle_run (record_subscription_session);
             # cost rides here for the actor record only, finality following the
             # spendEstimated fact, never re-derived.
@@ -1473,7 +1446,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             llm=self.llm,
             deadline_at=getattr(self.assignment.request, "deadline_at", "") or "",
             transport_timeout_sec=getattr(self.assignment.slot, "transport_timeout_sec", None),
-            shape=review_output_shape(self.assignment.request.surface),
+            shape=request_output_shape(self.assignment.request),
         )
         usage = dict(self._session_usage)
         deltas = list(self._deltas)

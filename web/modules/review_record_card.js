@@ -12,6 +12,10 @@ const count = (value) => {
 // types a planned wait as `pending_dispatch` and an exceptional one otherwise.
 export const actorAwaiting = (actor) => text(actor?.operation_state) === 'pending_dispatch' && text(actor?.transport_status) !== 'success';
 export const actorUnresolved = (actor) => ['in_flight', 'custody_lost'].includes(text(actor?.operation_state));
+// A ledger seat whose answer is still owed (its planned wait, an open operation, or the ledger's own
+// `pending` status) is awaiting, never "not reached"; a seat with a readable answer was reached.
+export const actorOwed = (actor) => actorAwaiting(actor) || actorUnresolved(actor) || text(actor?.transport_status) === 'pending';
+const actorAnswered = (actor) => ['valid', 'partial'].includes(text(actor?.parse_status));
 
 function compactCoverage(coverage) {
     if (!coverage || typeof coverage !== 'object') return '';
@@ -48,6 +52,82 @@ export function panelFactsText(facts) {
     return parts.join(' · ');
 }
 
+// The owner's words for the pool facts (IMPL_SPEC §5: the Reviewer tick means whose agreement
+// counts); a word outside these prints as recorded, never guessed.
+const STRICTNESS_WORDS = { blocking: 'Blocking', advisory: 'Advisory', cyber_pro: 'Cyber Pro' };
+const CHOOSER_WORDS = { ouroboros: 'Ouroboros', host: 'the host', owner: 'you' };
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const usdText = (value) => `$${value < 0.01 ? value.toFixed(4) : value.toFixed(2)}`;
+
+/** Whether the record carries the review pool's facts; an older record prints exactly as before. */
+export function panelPoolRecorded(facts) {
+    return Boolean(facts && typeof facts === 'object' && (Array.isArray(facts.pool) || text(facts.strictness)));
+}
+
+/** One seat's cost: the measured amount, `subscription`, or `cost unknown` (a gap is never $0). */
+export function seatCostText(cost) {
+    const usd = Number(cost?.usd);
+    if (cost?.kind === 'subscription') return 'subscription';
+    return cost?.kind === 'usd' && cost.usd !== null && Number.isFinite(usd) ? usdText(usd) : 'cost unknown';
+}
+
+/** The wave total over its priced seats, naming the seats that total cannot include. */
+export function waveTotalText(cost) {
+    const seats = cost?.seats && typeof cost.seats === 'object' ? cost.seats : {};
+    const [priced, subscription, unknown] = [count(seats.usd), count(seats.subscription), count(seats.unknown)];
+    const total = Number(cost?.usd);
+    const money = priced && cost.usd !== null && Number.isFinite(total)
+        ? `${usdText(total)}${unknown ? ' for the priced seats' : ''}` : (unknown ? 'cost unknown' : '');
+    const parts = [money, subscription ? `${plural(subscription, 'seat')} on a subscription` : '',
+        priced && unknown ? `${plural(unknown, 'seat')} cost unknown` : ''].filter(Boolean);
+    return parts.length ? `Wave total: ${parts.join(' · ')}` : '';
+}
+
+/** Who sat on a pool-era panel and why, in plain words: strictness, who chose, k of n ticked
+ * reviewers, advisers (heard, never counted), the reason or the widening, the seats still
+ * awaited, those never reached and why, the wave total and the models. Facts every seat
+ * shares are said once here. */
+export function panelPoolLines(panel) {
+    const facts = panel?.panel_facts && typeof panel.panel_facts === 'object' ? panel.panel_facts : {};
+    const ticked = Array.isArray(facts.pool) ? facts.pool.length : null;
+    const [counted, advisers] = [count(facts.seats), count(facts.additional_seats)];
+    const [strictness, chooser, reason] = [text(facts.strictness), text(facts.chosen_by), text(facts.reason)];
+    const lines = [`Panel: ${[
+        STRICTNESS_WORDS[strictness] || strictness,
+        chooser ? `chosen by ${CHOOSER_WORDS[chooser] || chooser}` : '',
+        ticked ? `${counted} of ${plural(ticked, 'ticked reviewer')}`
+            : `${ticked === 0 ? 'no reviewer ticked · ' : ''}${plural(counted, 'counted seat')}`,
+        advisers ? `${plural(advisers, 'adviser')}, not counted` : '',
+    ].filter(Boolean).join(' · ')}`];
+    const widened = (Array.isArray(facts.widened_from) ? facts.widened_from : []).map(text).filter(Boolean);
+    const why = widened.length
+        ? `widened to every ticked reviewer (Blocking) from the requested ${widened.join(', ')}${reason ? ` · reason given: ${reason}` : ''}`
+        : reason || (facts.reason_missing === true ? 'no reason given' : '');
+    if (why) lines.push(`Why these reviewers: ${why}`);
+    const actors = (Array.isArray(panel?.actors) ? panel.actors : []).filter((actor) => actor && typeof actor === 'object');
+    // A settled record's lost seat is terminal (its outcome unknown, never re-sent): not reached, never awaited.
+    const settled = text(panel?.record_state) === 'settled';
+    const owedHere = (actor) => actorOwed(actor) && !(settled && text(actor?.operation_state) === 'custody_lost');
+    const owed = actors.filter(owedHere).map((actor) => `${text(actor.slot_id) || '?'}${actor.additional ? ' (adviser)' : ''}`);
+    if (owed.length) lines.push(`Awaiting an answer: ${owed.join(', ')}`);
+    // The record's list is read against each seat's own status, which a late answer moves on.
+    const reached = new Set(actors.filter((actor) => owedHere(actor) || actorAnswered(actor)).map((actor) => text(actor.slot_id)));
+    for (const seat of Array.isArray(facts.not_reached) ? facts.not_reached : []) {
+        const seatId = text(seat?.seat_id);
+        if (seatId && !reached.has(seatId)) lines.push(`Not reached: ${seatId} (${text(seat.cause) || 'cause not recorded'})`);
+    }
+    const total = waveTotalText(panel?.cost);
+    if (total) lines.push(total);
+    const models = [
+        facts.distinct_models != null ? plural(count(facts.distinct_models), 'distinct model') : '',
+        facts.distinct_engines != null ? plural(count(facts.distinct_engines), 'distinct engine') : '',
+        count(facts.observed_unknown_seats) ? `model not observed on ${plural(count(facts.observed_unknown_seats), 'seat')}` : '',
+        facts.single_model_panel === true ? 'one model on every seat (repeated runs, not independent reviewers)' : '',
+    ].filter(Boolean);
+    if (models.length) lines.push(`Panel models: ${models.join(' · ')}`);
+    return lines;
+}
+
 /** One reviewer's answer per brief part, in the order the seat was asked. */
 export function seatAnswersText(seat) {
     const answers = seat?.answers && typeof seat.answers === 'object' ? seat.answers : null;
@@ -77,7 +157,10 @@ export function formatReviewProjection(projection) {
             `Review panel ${panelId}: ${String(panel.surface || 'review')} · authority=${String(panel.authority || 'unspecified')} · verdict=${verdictText} · transport=${String(panel.transport_status || 'unknown')} · parse=${String(panel.parse_status || 'unknown')} · quorum=${String(quorum.contributed ?? 0)}/${String(quorum.configured ?? 0)} (required ${String(quorum.required ?? 0)}) · enforcement=${String(panel.enforcement_impact || 'unknown')}${panel.single_reviewer_no_diversity ? ' · single-reviewer (no diversity)' : ''}${panel.dialogue && panel.dialogue.status ? ` · dialogue=${String(panel.dialogue.status)}` : ''}${panel.superseded ? ' · superseded' : ''}`,
         );
         if (panel.reason) lines.push(`Panel reason: ${String(panel.reason)}`);
-        const facts = panelFactsText(panel.panel_facts);
+        // A preflight seats one named row, ticked or not, and owes no reason: never a pool panel.
+        const pooled = text(panel.surface) !== 'preflight' && panelPoolRecorded(panel.panel_facts);
+        if (pooled) lines.push(...panelPoolLines(panel));
+        const facts = pooled ? '' : panelFactsText(panel.panel_facts);
         if (facts) lines.push(`Panel composition: ${facts}`);
         const coverage = compactCoverage(panel.coverage);
         if (coverage) lines.push(`Panel coverage: ${coverage}`);
@@ -91,8 +174,10 @@ export function formatReviewProjection(projection) {
         (Array.isArray(panel.actors) ? panel.actors : []).forEach((actor) => {
             if (!actor || typeof actor !== 'object') return;
             const slotId = String(actor.slot_id || '?');
+            // A pool-era seat leads with the two facts that differ seat by seat: counted or not, and its cost.
+            const seat = pooled ? `${actor.additional ? 'adviser, not counted' : 'counted'} · ${seatCostText(actor.cost)} · ` : '';
             lines.push(
-                `Reviewer ${slotId}: role=${String(actor.actor_role || 'reviewer')} · provider=${String(actor.provider || 'unknown')} · model=${String(actor.model || 'unknown')} · transport=${actorAwaiting(actor) ? 'awaiting' : String(actor.transport_status || 'unknown')} · parse=${actorAwaiting(actor) ? 'awaiting' : String(actor.parse_status || 'unknown')} · verdict=${String(actor.semantic_verdict || 'none')}${actor.outcome_tier ? ` · outcome_tier=${String(actor.outcome_tier)}` : ''}${actor.dialogue_status ? ` · dialogue=${String(actor.dialogue_status)}` : ''} · quorum=${actor.quorum_contribution ? 'contributes' : 'abstains'} · enforcement=${String(actor.enforcement_impact || 'unknown')}${actorAwaiting(actor) || actorUnresolved(actor) ? sinceLocalTime(actor.awaiting_since) : ''}`,
+                `Reviewer ${slotId}: ${seat}role=${String(actor.actor_role || 'reviewer')} · provider=${String(actor.provider || 'unknown')} · model=${String(actor.model || 'unknown')} · transport=${actorAwaiting(actor) ? 'awaiting' : String(actor.transport_status || 'unknown')} · parse=${actorAwaiting(actor) ? 'awaiting' : String(actor.parse_status || 'unknown')} · verdict=${String(actor.semantic_verdict || 'none')}${actor.outcome_tier ? ` · outcome_tier=${String(actor.outcome_tier)}` : ''}${actor.dialogue_status ? ` · dialogue=${String(actor.dialogue_status)}` : ''} · quorum=${actor.quorum_contribution ? 'contributes' : 'abstains'} · enforcement=${String(actor.enforcement_impact || 'unknown')}${actorAwaiting(actor) || actorUnresolved(actor) ? sinceLocalTime(actor.awaiting_since) : ''}`,
             );
             const actorCoverage = compactCoverage(actor.coverage);
             if (actorCoverage) lines.push(`Reviewer ${slotId} coverage: ${actorCoverage}`);

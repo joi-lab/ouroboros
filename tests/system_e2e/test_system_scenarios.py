@@ -57,7 +57,6 @@ import pytest
 from ouroboros.settings_defaults import SETTINGS_DEFAULTS, settings_env_keys
 from tests.system_e2e.harness import (
     _CREDENTIAL_SHAPE_RE,
-    ACCEPTANCE_KEYS_MARKER,
     KEYLESS_PACKET_ROWS,
     KEYLESS_REVIEW_ROWS,
     LANE_MOCK,
@@ -203,14 +202,9 @@ def test_stub_classification_review_branch_beats_finalization():
         {"role": "system", "content": REVIEWER_SLOT_MARKER + "\nSurface: plan_review\n [OWNER_STOP]"},
         {"role": "user", "content": "Subject: ..."},
     ]}
-    acceptance_body = {"messages": [
-        {"role": "system", "content": REVIEWER_SLOT_MARKER + "\n" + ACCEPTANCE_KEYS_MARKER},
-        {"role": "user", "content": "Subject: ..."},
-    ]}
     assert classify_call(two_part_body) == "two_part_review"
     assert classify_call(triad_body) == "triad_review"
     assert classify_call(slot_body) == "reviewer_slot"
-    assert classify_call(acceptance_body) == "acceptance"
     assert classify_call({"messages": [{"role": "user", "content": "[FINALIZE_NOW] wrap up"}]}) == "finalization"
     assert classify_call({"messages": [{"role": "user", "content": "hi"}],
                           "response_format": {"type": "json_object"}}) == "safety"

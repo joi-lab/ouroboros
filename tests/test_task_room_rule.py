@@ -8,6 +8,8 @@ pinned or origin-addressed row keeps its producer's address).
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 from types import SimpleNamespace
 
@@ -31,7 +33,7 @@ def _bus(monkeypatch, root):
 
 
 def _progress_rows(root):
-    return [json.loads(line) for line in (root / "logs/progress.jsonl").read_text().splitlines()]
+    return dialogue_test.log_rows(root / "logs/progress.jsonl")
 
 
 def _world(root):
@@ -107,7 +109,7 @@ def test_a_fixed_row_type_keeps_its_producers_address_and_borrows_no_lineage(tmp
     rooms = _world(tmp_path)
     bus, sent = _bus(monkeypatch, tmp_path)
     bus.send_with_budget(rooms["native"], "Not delivered", task_id="kid-1", role="system", system_type=system_type)
-    stored = [json.loads(line) for line in (tmp_path / "logs/chat.jsonl").read_text().splitlines()][-1]
+    stored = dialogue_test.log_rows(tmp_path / "logs/chat.jsonl")[-1]
     assert stored["chat_id"] == rooms["native"] == sent[-1][0][0], "the producer's address stands"
     assert not {"delegation_role", "parent_task_id", "root_task_id"} & set(stored), "the target is not the speaker"
 

@@ -181,7 +181,7 @@ def stamp_root_final_phase(
 def prepare_terminal_send_event(
     env_drive_root: Any, task: Dict[str, Any], text: str,
     usage: Dict[str, Any], send_event: Dict[str, Any],
-    *, presence: bool,
+    *, presence: bool, custody_audit: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Preserve raw host salvage, then build the one live/replay projection."""
     timing = usage.get("_finalization_timing")
@@ -196,19 +196,16 @@ def prepare_terminal_send_event(
     if not presence and task.get("_is_direct_chat") and (task.get("metadata") or {}).get("_host_operation"):
         correlation = host_operation_reply_kwargs(task.get("origin_message_ref"))
         send_event.setdefault("progress_meta", {}).update(correlation.get("progress_meta", {}))
-    # Loop cleanup may have cancelled a run after the last model observation.
-    # Read the audit it already persisted before constructing this delivery.
-    from ouroboros.task_results import load_task_result
+    # Cleanup may settle a run after the model observed it. Read only this task's
+    # current rows; annotation and result persistence follow the live queue put.
+    from ouroboros.delegate_terminal import terminal_custody_disclosure
 
-    try:
-        current = load_task_result(
+    if custody_audit is None:
+        custody_audit = terminal_custody_disclosure(
             pathlib.Path(task.get("budget_drive_root") or env_drive_root), str(task.get("id") or ""),
-        ) or {}
-    except Exception:
-        log.warning("Current delegated receipt was unavailable at final delivery", exc_info=True)
-        current = {}
-    if isinstance(current.get("delegate_terminal_reconciliation"), dict):
-        usage["delegate_terminal_reconciliation"] = current["delegate_terminal_reconciliation"]
+            usage.get("delegate_terminal_reconciliation"),
+        )
+    usage["delegate_terminal_reconciliation"] = custody_audit
     origin = str(usage.get("terminal_origin") or "")
     notice = str(usage.get("terminal_provider_notice") or "")
     # One voice: the host disclosure stays a typed field OF THE RESULT (CLI
@@ -243,9 +240,17 @@ def prepare_terminal_send_event(
     )
 
 
-def terminal_result_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
-    """Additive durable origin/full-copy fields; unknown producers stay legacy."""
+def terminal_result_fields(usage: Dict[str, Any], *, existing: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Carry current custody and origin facts without minting empty custody envelopes."""
+    from ouroboros.delegate_terminal import _stored_disclosure_matches
+
     fields: Dict[str, Any] = {}
+    audit = usage.get("delegate_terminal_reconciliation")
+    prior = existing or {}
+    if isinstance(audit, dict) and (prior.get("delegate_terminal_reconciliation")
+            or "delegated_runs_unreconciled" in prior or not _stored_disclosure_matches({}, audit)):
+        fields["delegate_terminal_reconciliation"] = dict(audit)
+        fields["delegated_runs_unreconciled"] = list(audit.get("unreconciled") or [])
     origin = str(usage.get("terminal_origin") or "")
     if origin in _STAMPED_TERMINAL_ORIGINS:
         fields["terminal_origin"] = origin
@@ -539,19 +544,14 @@ def focus_source_projection(
     return {**payload, **current, **({"reason": reason} if reason else {})}
 
 
-def review_source_reader(task_id: str, ref: Dict[str, Any]) -> Dict[str, Any]:
-    """A receiver-independent selector for one author's immutable acceptance source."""
-    return {"tool": "get_task_result", "arguments": {
-        "task_id": task_id, "review_source_sha256": str(ref.get("sha256") or "")}}
-
-
 def host_acceptance_source(drive_root: Any, task_id: str, digest: str) -> tuple:
     """``(ref, bytes)`` of this physical author's own HOST acceptance record, named by digest.
 
-    The digest fixes the path (no caller path, no store search); the bytes must
-    hash to it and decode to a host-root task-acceptance run of this very task,
-    or this raises. The model's ``review_source_sha256`` reader and the owner's
-    record download (``gateway.task_archive.serve_task_source``) share it.
+    These records are history: the retired task acceptance wrote them and nothing
+    writes a new one. The digest fixes the path (no caller path, no store search);
+    the bytes must hash to it and decode to a host-root task-acceptance run of this
+    very task, or this raises. The model's ``review_source_sha256`` reader and the
+    owner's record download (``gateway.task_archive.serve_task_source``) share it.
     """
     from ouroboros.artifacts import read_actor_source_bytes
     from ouroboros.source_retention import retained_task_roots
@@ -579,11 +579,11 @@ def host_acceptance_source(drive_root: Any, task_id: str, digest: str) -> tuple:
 
 def review_source_projection(drive_root: Any, task_id: str, digest: str,
                              start_char: Any = None, end_char: Any = None) -> Dict[str, Any]:
-    """Read a physical author's exact acceptance source, including historical panels.
+    """Read a physical author's exact host acceptance record, named by its digest.
 
-    Only host acceptance panels (``host_acceptance_source``) and the canonical
-    debt's exact pinned subject qualify; no caller path, successor substitution
-    or artifact-store search.
+    Host acceptance panels (``host_acceptance_source``) and the exact subject an
+    older record's acceptance debt pinned qualify (both read-only history); no
+    caller path, successor substitution or artifact-store search.
     """
     from ouroboros.artifacts import read_actor_source_bytes, text_source_range_projection
 
@@ -595,12 +595,8 @@ def review_source_projection(drive_root: Any, task_id: str, digest: str,
 
         debt = (load_task_result(drive_root, task_id, strict=True) or {}).get("acceptance_debt") or {}
         historical_ref = debt.get("source_ref") or {}
-        if historical_ref.get("sha256") == digest:
-            from ouroboros.acceptance_history import read_acceptance_history
-
-            read_acceptance_history(drive_root, task_id, debt)
-            ref = historical_ref
-            raw = read_actor_source_bytes(drive_root, task_id, ref)
+        if isinstance(historical_ref, dict) and historical_ref.get("sha256") == digest:
+            ref, raw = historical_ref, read_actor_source_bytes(drive_root, task_id, historical_ref)
         else:
             ref, raw = host_acceptance_source(drive_root, task_id, digest)
         projection, reason = text_source_range_projection(raw.decode("utf-8"), unavailable["kind"], start_char, end_char)

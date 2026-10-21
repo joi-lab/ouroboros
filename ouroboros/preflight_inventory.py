@@ -47,7 +47,8 @@ def pytest_sessionfinish(session, exitstatus):
 '''
 
 
-def selection_passes(selection, *, probe_module="", temp_root=None):
+def selection_passes(selection, *, probe_module="", temp_root=None, inventory_dir=None):
+    """Probe modules live in scratch; ``inventory_dir`` (default temp_root) keeps the full JSONL."""
     from ouroboros import preflight_runner as pr
 
     passes = []
@@ -57,7 +58,7 @@ def selection_passes(selection, *, probe_module="", temp_root=None):
             module += "_" + uuid.uuid4().hex
             probe = pr._probe_dir(Path(temp_root))
             probe.mkdir(parents=True, exist_ok=True)
-            result = Path(temp_root) / f"inventory-{spec.label}.jsonl"
+            result = Path(inventory_dir or temp_root) / f"inventory-{spec.label}.jsonl"
             result.write_text("", encoding="utf-8")
             (probe / f"{module}.py").write_text(SOURCE.replace("__RESULT_PATH__", repr(str(result))), encoding="utf-8")
         args = [arg for arg in spec.args if arg != "tests/"]

@@ -14,6 +14,7 @@ import base64
 import json
 from types import SimpleNamespace
 
+from ouroboros import dialogue_import, dialogue_store as ds
 from ouroboros.gateway import history, history_paging
 from ouroboros.gateway.history import make_chat_history_endpoint
 from tests._store_shared import seed_result
@@ -21,11 +22,19 @@ from tests._store_shared import seed_result
 TS = "2026-10-16T10:00:{:02d}Z"
 
 
-def _append(root, name, rows, *, raw=""):
+def _append(root, name, rows):
+    for row in rows:
+        ds.append(root, name, row)
+
+
+def _older_body_appended(root, name, rows, *, raw=""):
+    """A store-unaware body wrote to ``logs/<name>.jsonl`` after the cutover; the next boot's
+    cutover imports its rows at their chain place and records what it could not read."""
     path = root / "logs" / f"{name}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(raw + "".join(json.dumps(row) + "\n" for row in rows))
+    dialogue_import.cutover(root)
 
 
 def _read(root, cursor=None, chat=1):
@@ -82,18 +91,17 @@ def test_a_shown_task_that_changes_after_it_settled_takes_the_newest_page_again(
 def test_an_after_read_that_cannot_read_a_stored_row_refuses(tmp_path):
     _append(tmp_path, "chat", [{"ts": TS.format(0), "direction": "in", "chat_id": 1, "text": "hello"}])
     _, page = _read(tmp_path)
-    # A line its writer has not finished is read next time: the delta answers without it.
-    _append(tmp_path, "chat", [], raw=json.dumps({"ts": TS.format(1), "direction": "in", "chat_id": 1, "text": "half"}))
-    status, partial = _read(tmp_path, page["after_cursor"])
-    assert status == 200 and partial["messages"] == []
-    _append(tmp_path, "chat", [], raw="\n")
-    status, finished = _read(tmp_path, partial["after_cursor"])
-    assert status == 200 and [row["text"] for row in finished["messages"]] == ["half"]
+    _older_body_appended(tmp_path, "chat", [{"ts": TS.format(1), "direction": "in", "chat_id": 1, "text": "whole"}])
+    status, finished = _read(tmp_path, page["after_cursor"])
+    assert status == 200 and [row["text"] for row in finished["messages"]] == ["whole"]
     # A stored line nobody can read would be stepped over: the delta refuses instead.
-    _append(tmp_path, "chat", [{"ts": TS.format(2), "direction": "in", "chat_id": 1, "text": "after it"}],
-            raw="{not json\n")
+    _older_body_appended(tmp_path, "chat", [{"ts": TS.format(2), "direction": "in", "chat_id": 1, "text": "after it"}],
+                         raw="{not json\n")
     status, refused = _read(tmp_path, finished["after_cursor"])
     assert status == 409 and refused["reason_code"] == "history_delta_reset"
+    status, fresh = _read(tmp_path)
+    assert status == 200 and "chat_malformed_jsonl" in fresh["window"]["truncated_by"]
+    assert [row["text"] for row in fresh["messages"]] == ["hello", "whole", "after it"]
 
 
 def test_a_shown_skill_operation_that_ended_takes_the_newest_page_again(tmp_path, monkeypatch):
@@ -201,16 +209,3 @@ def test_a_page_that_could_not_read_a_shown_task_carries_no_after_cursor(tmp_pat
     switch["on"] = False
     status, page = _read(tmp_path)
     assert status == 200 and "done" in _cursor(page["after_cursor"])["tasks"]
-
-
-def test_a_delta_after_a_page_that_met_an_unfinished_line_still_compares_with_the_window(tmp_path):
-    from ouroboros.projects_registry import create_project
-
-    chat = create_project(tmp_path, "late", name="Late")["chat_id"]
-    _append(tmp_path, "chat", [{"ts": TS.format(5), "direction": "out", "chat_id": chat, "text": "shown answer"}],
-            raw="")
-    _append(tmp_path, "chat", [], raw=json.dumps({"ts": TS.format(6), "direction": "out", "chat_id": chat,
-                                                  "text": "being written"}))
-    _, page = _read(tmp_path, chat=chat)
-    assert page["window"]["latest_message"] is None  # the unfinished line may be the newest message
-    assert _cursor(page["after_cursor"])["newest"] == TS.format(5)

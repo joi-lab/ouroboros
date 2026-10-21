@@ -27,6 +27,7 @@ def terminal_reconcile_task(
     gateway_factory: Optional[Callable[[], Any]] = None,
     trigger: str = "terminal_boundary",
     deliberate_terminal: str = "",
+    audit: bool = True,
 ) -> Dict[str, Any]:
     """Reconcile durable starts, then re-audit runs, invocations, and patches.
 
@@ -59,17 +60,38 @@ def terminal_reconcile_task(
         )
     except Exception:
         log.warning("Terminal delegated custody reconciliation failed for %s", mine, exc_info=True)
-    _audit_task_custody(drive_root, mine, result)
+    if audit:
+        _audit_task_custody(drive_root, mine, result)
+    else:
+        result["audit_status"] = "pending"
     return result
 
 
-def custody_audit_snapshot(drive_root: Any) -> Dict[str, Any]:
-    """One shared read of the custody rows for a BATCH of audits: the held runs, the
-    closing receipts still owed and the pending invocations, reused by every audit in
-    the batch (the boot backfill must not re-read the store four times per stored row).
-    """
-    from ouroboros.delegate_custody_current import snapshot
+def terminal_custody_disclosure(
+    drive_root: Any, task_id: str, reconciliation: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Freeze this task's delivery facts without persisting or emitting an annotation."""
+    result = {
+        "task_id": str(task_id or ""),
+        "trigger": str((reconciliation or {}).get("trigger") or "final_delivery"),
+        "outcomes": list((reconciliation or {}).get("outcomes") or []),
+        "unreconciled": [], "audit_status": "ok",
+    }
+    _audit_task_custody(drive_root, result["task_id"], result, emit_evidence=False)
+    return result
 
+
+def custody_audit_snapshot(drive_root: Any, *, task_id: str = "") -> Dict[str, Any]:
+    """Read one task's runs/requests, or share held/closing rows across a maintenance batch.
+
+    Delivery names its task; unrelated run bodies and request references stay unread.
+    Batch backfill shares the unaddressed snapshot once, never once per result.
+    """
+    from ouroboros.delegate_custody_current import snapshot, task_snapshot
+
+    if task_id:
+        view = task_snapshot(drive_root, task_id)
+        return {"state": view["runs"], "pending": view["pending"], "current": True}
     return snapshot(drive_root)
 
 
@@ -88,23 +110,16 @@ def _audit_task_custody(drive_root: Any, mine: str, result: Dict[str, Any], *,
     they are their panel's obligation, so they are never this task's open
     delegation, pending invocation or terminal receipt (issue #1006).
     """
-    if snapshot is None:
-        # An unshared audit replayed the rotated chain once per projection plus
-        # a private pass for terminal_runs; one snapshot serves them all (I18).
-        # A failed read leaves the audit's own fail-closed arms untouched.
+    audit_failure = "" if mine else "missing_task_id"
+    if snapshot is None and not audit_failure:
         try:
-            snapshot = custody_audit_snapshot(drive_root)
+            snapshot = custody_audit_snapshot(drive_root, task_id=mine)
         except Exception:
             log.debug("Custody audit snapshot unavailable for %s", mine, exc_info=True)
-    state = snapshot.get("state") if snapshot is not None else None
-    pending = snapshot.get("pending") if snapshot is not None else None
-    # Since the audit builds its own snapshot above, the keyword rides on EVERY
-    # call, not only on a shared batch: `state` is the documented contract of
-    # these projections, and a seam over them must accept it. It is dropped only
-    # when the snapshot read itself failed, so each projection then replays for
-    # itself and the fail-closed arms below stay reachable.
-    state_kw: Dict[str, Any] = {} if state is None else {"state": state}
-    audit_failure = ""
+            audit_failure = "snapshot_unavailable"
+    state = snapshot.get("state") if snapshot is not None else {}
+    pending = snapshot.get("pending") if snapshot is not None else []
+    state_kw: Dict[str, Any] = {"state": state}
     if custody.custody_log_unreadable(drive_root):
         audit_failure = "custody_log_unreadable"
     try:
@@ -119,8 +134,7 @@ def _audit_task_custody(drive_root: Any, mine: str, result: Dict[str, Any], *,
         invocation_ids = (
             [
                 str(row.get("invocation_id") or "")
-                for row in (pending if pending is not None
-                            else custody.pending_invocations(drive_root))
+                for row in pending
                 if str(row.get("task_id") or "") == mine
                 and str(row.get("invocation_id") or "")
                 and not custody.review_owned_source(row.get("source"))
@@ -651,6 +665,7 @@ def _task_is_terminal(drive_root: Any, task_id: str) -> bool:
 
 def record_terminal_reconciliation(
     drive_root: Any, task_id: str, result: Mapping[str, Any], *, addressed: bool = False,
+    emit_evidence: bool = False,
 ) -> bool:
     """Attach the audit to the task record without choosing lifecycle policy.
 
@@ -698,9 +713,12 @@ def record_terminal_reconciliation(
             delegate_terminal_reconciliation=dict(result),
             delegated_runs_unreconciled=list(result.get("unreconciled") or []),
         )
-        return bool(landed) and _stored_disclosure_matches(
+        changed = bool(landed) and _stored_disclosure_matches(
             stored if isinstance(stored, dict) else {}, landed,
         )
+        if changed and emit_evidence:
+            _emit_audit_evidence(drive_root, landed)
+        return changed
     except Exception:
         log.warning("Failed to persist terminal custody audit for %s", task_id, exc_info=True)
         return False
@@ -780,6 +798,7 @@ __all__ = [
     "refresh_disposed_reconciliation",
     "refresh_recently_settled_terminals",
     "refresh_terminal_reconciliation",
+    "terminal_custody_disclosure",
     "terminal_reconcile_task",
 ]
 

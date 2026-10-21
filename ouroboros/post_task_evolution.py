@@ -147,7 +147,8 @@ def _closed_objectives_digest(drive_root: pathlib.Path) -> Optional[str]:
     so it cannot rot when prose formatting changes. An objective is closed when its latest cycle
     outcome is absorbed (already shipped), abandoned/no_op (attempted and dropped), or the
     objective/review axis recorded outcome_tier == "blocked_with_evidence" (hard-blocked).
-    A typed review-cap/unavailable stop is only this attempt's limit, not a
+    A typed review-cap/unavailable stop, or a result review of the task still pending
+    in the review ledger, is only this attempt's limit, not a
     permanently closed objective. Its retained task source remains discoverable;
     this readout neither schedules a retry nor resets campaign counters.
     Deduped by the SSOT fingerprint so the same base objective appears once. "" when nothing.
@@ -193,6 +194,7 @@ def _closed_objectives_digest(drive_root: pathlib.Path) -> Optional[str]:
         axes = row.get("outcome_axes") if isinstance(row.get("outcome_axes"), dict) else {}
         objective = axes.get("objective") if isinstance(axes.get("objective"), dict) else {}
         review = axes.get("review") if isinstance(axes.get("review"), dict) else {}
+        # An old row may carry a task-acceptance decision written before the result review.
         decision = review.get("acceptance_decision") if isinstance(review.get("acceptance_decision"), dict) else {}
         if (objective.get("reason") in {REASON_REVIEW_CYCLES_EXHAUSTED, REASON_REVIEW_QUORUM_UNREACHABLE}
                 or (decision.get("status") == ACCEPTANCE_FINALIZED_UNACCEPTED
@@ -202,13 +204,14 @@ def _closed_objectives_digest(drive_root: pathlib.Path) -> Optional[str]:
             axis_obj = axes.get(axis) if isinstance(axes.get(axis), dict) else {}
             if str(axis_obj.get("outcome_tier") or "") == "blocked_with_evidence":
                 merged["blocked"] = True
+    pending = _pending_result_review_tasks(drive_root)
     seen = set()
     out: list = []
     for task_id in reversed(order):  # newest first
         info = by_task.get(task_id) or {}
         blocked = bool(info.get("blocked"))
         outcome = str(info.get("cycle_outcome") or "")
-        waiting = info.get("waiting_for_review") and outcome not in {"absorbed", "abandoned"}
+        waiting = (info.get("waiting_for_review") or task_id in pending) and outcome not in {"absorbed", "abandoned"}
         if not waiting and outcome not in {"absorbed", "abandoned", "no_op"} and not blocked:
             continue
         objective = str(info.get("objective") or "").strip().replace("\n", " ")
@@ -226,6 +229,19 @@ def _closed_objectives_digest(drive_root: pathlib.Path) -> Optional[str]:
         tag = "BLOCKED" if blocked else (str(info.get("cycle_outcome") or "DROPPED").upper())
         out.append(f"- [{tag}] {objective}")
     return "\n".join(out)
+
+
+def _pending_result_review_tasks(drive_root: pathlib.Path) -> set:
+    """Tasks whose own result review is still pending, read once from the review
+    ledger's hot index (a row count can never exceed the index's byte bound)."""
+    try:
+        from ouroboros import review_ledger as ledger
+
+        rows = ledger.recent_records(drive_root, limit=ledger.INDEX_MAX_BYTES, hot_only=True, surface="result")
+    except Exception:
+        log.debug("Review ledger unreadable for the closed-objectives digest", exc_info=True)
+        return set()
+    return {str(row.get("task_id") or "") for row in rows if row.get("state") == ledger.STATE_PENDING}
 
 
 def _active_campaign_objective() -> str:

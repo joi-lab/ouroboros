@@ -296,3 +296,26 @@ def test_automatic_plan_review_authority_carries_claims_not_reviewer_transport(t
     envelope = task["predecessor_authority"]
     again = build_task_contract({"objective": "next", "predecessor_authority": envelope})
     assert again["predecessor_authority"] == envelope
+
+
+def test_an_owner_source_in_history_still_importing_is_a_typed_refusal_never_a_crash(tmp_path):
+    """A start naming an owner message the store cannot answer yet (its archive segment still imports)
+    is refused with the typed, retryable outcome; once the segment is imported the same start passes."""
+    from ouroboros import dialogue_import
+    from ouroboros.agent_startup_checks import validate_task_authority_sources
+    from ouroboros.project_dialogue import build_owner_message_ref
+    from tests import _dialogue as dialogue_test
+
+    row = {"ts": "2026-09-01T00:00:01Z", "chat_id": 1, "direction": "in", "text": "start the audit",
+           "client_message_id": "owner-old"}
+    dialogue_test.seed(tmp_path, archives={"chat_20260901T000000.jsonl": [row]},
+                       live={"chat": [{**row, "client_message_id": "owner-new", "text": "later"}]})
+    dialogue_import.cutover(tmp_path)  # the archive is planned, not imported yet
+    env = SimpleNamespace(drive_root=tmp_path, budget_drive_root=tmp_path)
+    ref = build_owner_message_ref(chat_id=1, client_message_id="owner-old", ts=row["ts"], text=row["text"])
+    refusal = validate_task_authority_sources(env, {"id": "resume", "origin_message_ref": ref})
+    assert refusal["reason_code"] == "authority_source_unavailable" and "still being upgraded" in refusal["detail"]
+    dialogue_test.import_all(tmp_path)
+    task = {"id": "resume", "origin_message_ref": ref}
+    assert validate_task_authority_sources(env, task) == {} and task["origin_message_text"] == "start the audit"
+

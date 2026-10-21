@@ -86,6 +86,7 @@ def test_headless_public_export_list_preserves_extraction_and_terminal_file_help
         "finalize_task_artifacts",
         "task_is_readonly_subagent",
         "prepare_task_drive",
+        "drive_candidates",
         "prune_headless_task_drives",
         "prune_task_drives",
         "task_artifacts_dir",

@@ -39,6 +39,8 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 # host summarizer/review passes); delegated children are excluded by role.
 _NON_MAIN_TASK_TYPES = frozenset({"presence", "review", "summarize"})
 CLOCK_NOTE_PREFIX = "[Host clock at this request: "
+# The kept line is typed host state: a later line supersedes it (``context_source_view``).
+CLOCK_ROW_NAME = "ouroboros_send_clock"
 
 
 @dataclass(frozen=True)
@@ -142,7 +144,9 @@ def main_send_scope(policy: Optional[SendClockPolicy],
         yield clock
     note = clock.consumed_note() if policy is not None else None
     if note and isinstance(canonical, list):
-        canonical.append({"role": "user", "content": note})
+        from ouroboros.context_budget import bound_host_row
+
+        canonical.append(bound_host_row(CLOCK_ROW_NAME, note))  # typed host state; the wire copy drops the keys
 
 
 def _tail_note(messages: List[Any], notes: List[str]) -> Tuple[Optional[str], List[Any]]:

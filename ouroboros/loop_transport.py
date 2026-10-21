@@ -843,9 +843,16 @@ def provider_terminal_fallback_text(
                 f"after {waited_sec / 60.0:.1f} min. No new summary request was sent. "
                 "Completed work and the original attempt-cost records are preserved.")
     if is_context_overflow:
+        from ouroboros.context_anchor import REFUSED_INPUTS_KEY
+
+        refused = min((int(v) for v in (accumulated_usage.get(REFUSED_INPUTS_KEY) or {}).values() if v), default=0)
+        parts = ", ".join(f"{label} ~{int(tokens):,}" for label, tokens in accumulated_usage.get("_context_refusal_frame") or [])
+        facts = "; ".join(fact for fact in (f"smallest refused request ~{refused:,} tokens" if refused else "",
+                                             f"largest parts: {parts}" if parts else "") if fact)
         return (
             "⚠️ The context exceeded the selected model window; no further provider call was made. "
-            "Any files written so far are preserved in the workspace."
+            "The recovery passes, the configured fallback and a renewed view could not make it fit"
+            f"{f' ({facts})' if facts else ''}. The exact transcript and any files written so far are preserved."
         )
     if is_transport_wait:
         if unknown:

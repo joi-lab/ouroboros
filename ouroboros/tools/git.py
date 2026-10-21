@@ -1441,8 +1441,8 @@ def get_tools() -> List[ToolEntry]:
         "continuation (review_reference + author_disposition). preflight_reviewer optionally buys "
         "ONE named row's early look at the worktree first (review_change surface=preflight): it informs, never "
         "gates, and its record never answers the panel. Without it the commit records preflight not_performed, "
-        "a fact rather than a bypass. reviewers/reason compose the panel by review_change's rule (in Cyber Pro the "
-        "marked pool rows are a menu; below it the whole pool judges and named rows outside it are only added)."
+        "a fact rather than a bypass. reviewers/reason follow strictness: Blocking widens to the whole pool; Advisory "
+        "requires at least one ticked reviewer and a reason when narrowed; Cyber Pro composes freely. Unticked advisers never count."
     )
     skip_advisory_description = (
         "Record that this commit deliberately goes without a preflight (preflight: skipped). The deterministic "
@@ -1456,8 +1456,8 @@ def get_tools() -> List[ToolEntry]:
         "skip_tests": {"type": "boolean", "default": False, "description": "Skip pre-commit tests."},
         "review_rebuttal": {"type": "string", "default": "", "description": "A NEW content-hashed counter-argument buys one paid re-review within capacity; repeating it is free-refused."},
         "preflight_reviewer": {"type": "string", "default": "", "description": "One ENABLED catalog row (id or handle; a review-pool member or not) for an early informational look at the worktree before the panel; unknown or disabled is TOOL_ARG_ERROR."},
-        "reviewers": {"type": "array", "items": {"type": "string"}, "default": [], "description": "The panel's seats by catalog id or handle, under review_change's panel rule: in Cyber Pro the marked pool rows are the owner's menu and the named pool rows ARE the counted panel (say why in reason; an enabled row outside the pool is an added critic, never the quorum); below Cyber Pro the whole pool judges and a named row outside it is only added. Omitted = the whole pool; unknown or disabled is TOOL_ARG_ERROR."},
-        "reason": {"type": "string", "default": "", "description": "Why the panel named in reviewers is composed as it is; recorded with the review (a narrowed panel without one is recorded reason_missing)."},
+        "reviewers": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Enabled catalog ids/handles. Blocking widens a subset to every ticked reviewer. Advisory allows a subset with at least one ticked reviewer and requires reason when narrowed. Cyber Pro composes freely. Omitted means the whole pool. Unticked advisers are heard, not counted; unknown or disabled is TOOL_ARG_ERROR."},
+        "reason": {"type": "string", "default": "", "description": "Why these reviewers; required when an Advisory panel is narrowed. Missing reason refuses at $0 before staging."},
         "skip_advisory_review": {"type": "boolean", "default": False, "description": skip_advisory_description},
         "goal": {"type": "string", "default": "", "description": "High-level goal of this change. Used by the panel's coupling questions to judge completeness."}, "scope": {"type": "string", "default": "", "description": "Declared scope boundary. Without a goal it is the intended transformation the panel's coupling questions judge the change against (completeness, forgotten adjacent surfaces)."},
         "review_reference": {"type": "object", "description": "Exact reference a prior commit call of this task returned, for the free explicit Advisory or Cyber Pro continuation."},

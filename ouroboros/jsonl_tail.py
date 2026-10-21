@@ -1,7 +1,7 @@
 """Rotation-aware JSONL reads: captured byte ranges and bounded filtered tails.
 
 ``JsonlChainSnapshot`` shares physical capture/read/segment ownership between
-history pagination, wake observations, Presence reentry and the swarm rollup,
+file-backed event history and the swarm rollup,
 whose selection policies remain separate. The filtered-tail reader below serves
 context and endpoints.
 
@@ -272,7 +272,8 @@ def coverage_line(coverage: dict) -> str:
     whose = f"task {task_id}" if task_id else "all tasks"
     live_size, live_window = int(coverage.get("live_size") or 0), int(coverage.get("live_window") or 0)
     unread = "live_size" not in coverage
-    whole = live_window >= live_size and not coverage.get("archives_bounded") and not unread
+    whole = (live_window >= live_size and not coverage.get("archives_bounded") and not unread
+             and not coverage.get("older_available") and not coverage.get("gaps"))
     unit = str(coverage.get("unit") or "rows")  # tools.jsonl counts logical calls (#1316)
     if shown and matched > shown:
         rows = f"newest {shown} of {matched} matching {unit} in the window"
@@ -282,7 +283,11 @@ def coverage_line(coverage: dict) -> str:
         rows = f"newest {shown} matching {unit} in the window"
     else:
         rows = f"no matching {unit}"
-    if unread:
+    if coverage.get("dialogue"):
+        window = f"SQL coordinates [{coverage['lower']}, {coverage['upper']})"
+        if coverage.get("older_available"):
+            window += "; older matching rows available"
+    elif unread:
         window = "unread"
     elif live_window >= live_size:
         window = "whole live file"

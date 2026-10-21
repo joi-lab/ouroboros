@@ -130,7 +130,7 @@ def run_node_tests(
     files = candidate_node_tests(worktree)
     if not files:
         return None
-    result = {"files": len(files), "node": None, "returncode": None, "error": None, "reap_error": ""}
+    result = {"files": len(files), "node": None, "returncode": None, "error": None, "reap_error": "", "execution": "not_run"}
     node = resolve_node()
     if not node:
         result["error"] = pr._diagnosis(
@@ -170,54 +170,36 @@ def run_node_tests(
     # NODE_OPTIONS admits --test-only/--test-*-pattern/--require: an inherited
     # operator value can silently green a red suite — same class the pytest
     # lane closes by scrubbing PYTEST_* (see _preflight_env).
-    env = pr._preflight_env(temp_root, worktree)
+    env = pr._preflight_env(temp_root, worktree, cwd=pathlib.Path(worktree) / WEB_DIR)
     env.pop("NODE_OPTIONS", None)
-    proc = container.spawn(
-        [node, "--test", f"--test-concurrency={env['PYTEST_XDIST_AUTO_NUM_WORKERS']}", *files],
-        cwd=str(pathlib.Path(worktree) / WEB_DIR),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    reap_error = ""
+    from ouroboros.test_evidence import FileOutput
+
+    capture = FileOutput(temp_root, "node")
+    proc = None
+    argv = [node, "--test", f"--test-concurrency={env['PYTEST_XDIST_AUTO_NUM_WORKERS']}", *files]
     try:
+        proc = container.spawn(argv, cwd=str(pathlib.Path(worktree) / WEB_DIR),
+                               env=env, stdout=capture.stdout, stderr=capture.stderr)
+        result["execution"] = "executed"
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-            returncode: Optional[int] = proc.returncode
-            output = (stdout or "") + (stderr or "")
-        except subprocess.TimeoutExpired as expired:
+            returncode: Optional[int] = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
             pr._terminate_preflight_tree(proc, temp_root)
-            partial = (
-                pr._partial_stream_text(expired.output)
-                + pr._partial_stream_text(expired.stderr)
-            )
-            reap_error = container.reap()
+            returncode = None
+        reap_error = container.reap()
+        if proc.poll() is None:
             try:
-                stdout, stderr = proc.communicate(timeout=10)
-                partial = ((stdout or "") + (stderr or "")) or partial
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                for stream in (proc.stdout, proc.stderr):
-                    try:
-                        if stream is not None:
-                            stream.close()
-                    except Exception:
-                        pass
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    pass
-            returncode, output = None, partial
-        if not reap_error:
-            reap_error = container.reap()
+                reap_error = reap_error or "direct node process did not exit after reap"
+        output = capture.finish(returncode=returncode, containment_error=reap_error, argv=argv)
+        result["evidence_errors"] = list(capture.errors)
     finally:
-        try:
-            if proc.poll() is None:
-                pr._terminate_preflight_tree(proc, temp_root)
-        except Exception:
-            pass
+        if proc is not None and proc.poll() is None:
+            pr._terminate_preflight_tree(proc, temp_root)
         container.reap()
         container.close()
+        capture.close()
     elapsed = time.monotonic() - started
     result["returncode"] = returncode
     result["reap_error"] = reap_error

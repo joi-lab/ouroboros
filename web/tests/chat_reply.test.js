@@ -5,9 +5,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createChatReplies } from '../modules/chat_reply.js';
+import { createMessageActions } from '../modules/message_actions.js';
+import { createChatReadingPosition } from '../modules/chat_reading_position.js';
 import { installDomDouble } from './dom_double.js';
 
-function fixture() {
+function fixture({ actions = undefined } = {}) {
     const env = installDomDouble();
     const { doc, el } = env;
     const feed = el('div', { className: 'chat-messages' });
@@ -16,8 +18,8 @@ function fixture() {
     const wrap = el('div', { className: 'chat-input-wrap' }, textRow);
     doc.body.append(feed, wrap);
     const positions = [];
-    const replies = createChatReplies({ chatId: 1, feed, input, key: 'ouro_chat_reply',
-        reading: () => ({ cancel() { positions.push('cancel'); }, scroll() { positions.push('scroll'); }, stick: true }) });
+    const replies = createChatReplies({ chatId: 1, feed, input, key: 'ouro_chat_reply', actions,
+        reading: () => ({ cancel() { positions.push('cancel'); }, scroll() { positions.push('scroll'); }, remember() {}, stick: true }) });
     const bubble = (role, text, { address = '', taskId = '' } = {}) => {
         const node = el('div', { className: `chat-bubble ${role}`, dataset: { ...(taskId ? { taskId } : {}) } },
             el('div', { className: 'sender', text: role === 'user' ? 'You' : 'Ouroboros' }),
@@ -34,6 +36,134 @@ function fixture() {
 
 const owner = (address, text = 'please check the logs') => ({ row_address: address, role: 'user', text });
 
+test('an explicit quote landing replaces the old-width anchor before reflow; later reading owns its place', async t => {
+    const env = installDomDouble(), frames = [], prior = globalThis.requestAnimationFrame;
+    globalThis.requestAnimationFrame = callback => frames.push(callback);
+    t.after(() => { globalThis.requestAnimationFrame = prior; env.restore(); });
+    const feed = env.el('div'), input = env.el('textarea');
+    const row = env.el('div', { dataset: { rowAddress: 'row:1@then#123456789abc' } });
+    env.doc.body.append(feed, input); feed.append(row);
+    Object.assign(feed, { clientWidth: 0, clientHeight: 300, scrollHeight: 1200, scrollTop: 0 });
+    feed.getBoundingClientRect = () => ({ top: 0 });
+    row.getBoundingClientRect = () => ({ top: 600 - feed.scrollTop });
+    const reading = createChatReadingPosition({ feed, visible: () => true, alive: () => true, ready: () => true,
+        anchors: { capture: () => ({ top: feed.scrollTop }), restore: anchor => { feed.scrollTop = anchor.top; return true; } },
+        changed() {}, afterWrite() {}, activity() {}, updateButton() {} });
+    const unbind = reading.bindGestures(() => {});
+    const replies = createChatReplies({ feed, input, reading: () => reading,
+        history: () => ({ exact: () => { feed.clientWidth = 389; return row; } }) });
+    t.after(() => { replies.destroy(); unbind(); });
+    assert.deepEqual(await replies.reveal(row.dataset.rowAddress), { state: 'found' });
+    assert.equal(env.doc.activeElement, row);
+    assert.equal(feed.scrollTop, 528);
+    reading.reflow();
+    assert.equal(feed.scrollTop, 528, 'the queued resize must keep the measured landing, not restore the opening at 0');
+    feed.emit('wheel', { deltaY: -120 });
+    feed.scrollTop = 408; reading.scroll();
+    frames.splice(0).forEach(callback => callback());
+    feed.clientWidth = 360; reading.reflow();
+    assert.equal(feed.scrollTop, 408, 'a later resize preserves the reader’s gesture, not the quote landing');
+});
+
+test('a reveal that moves nothing hands a following reader the live edge back; a gesture, newer reveal or exit decides instead', async t => {
+    const env = installDomDouble(), frames = [], prior = globalThis.requestAnimationFrame;
+    globalThis.requestAnimationFrame = callback => frames.push(callback);
+    t.after(() => { globalThis.requestAnimationFrame = prior; env.restore(); });
+    const feed = env.el('div'), input = env.el('textarea');
+    env.doc.body.append(feed, input);
+    Object.assign(feed, { clientWidth: 400, clientHeight: 300, scrollHeight: 1200, scrollTop: 900 });
+    feed.getBoundingClientRect = () => ({ top: 0 });
+    const reading = createChatReadingPosition({ feed, visible: () => true, alive: () => true, ready: () => true,
+        anchors: { capture: () => ({ top: feed.scrollTop }), restore: anchor => { feed.scrollTop = anchor.top; return true; } },
+        changed() {}, afterWrite() {}, activity() {}, updateButton() {} });
+    const unbind = reading.bindGestures(() => {});
+    const answers = [];
+    const replies = createChatReplies({ feed, input, reading: () => reading,
+        history: () => ({ exact: () => null, reference: () => new Promise(resolve => answers.push(resolve)) }) });
+    t.after(() => { replies.destroy(); unbind(); });
+    const settle = () => { while (frames.length) frames.splice(0).forEach(callback => callback()); };
+    const arrive = () => reading.mutate(() => { feed.scrollHeight += 400; }, { remoteContent: true });
+    const address = 'row:1@then#aaaaaaaaaaaa';
+
+    let shown = replies.reveal(address);
+    assert.equal(reading.stick, false, 'an arrival does not pull the view while the read is pending');
+    arrive();
+    assert.equal(reading.nearBottom(), false);
+    answers.shift()({ state: 'unknown' });
+    assert.deepEqual(await shown, { state: 'unknown' });
+    settle();
+    assert.equal(reading.stick, true);
+    assert.equal(reading.nearBottom(), true, 'what arrived while it loaded is shown');
+    arrive();
+    assert.equal(reading.nearBottom(), true, 'and the next reply is followed, with no ↓');
+
+    shown = replies.reveal(address);
+    feed.emit('wheel', { deltaY: -120 });  // the reader turns back while it loads
+    settle();
+    answers.shift()({ state: 'unknown' });
+    assert.equal(await shown, null);
+    settle();
+    assert.equal(reading.stick, false, 'the gesture decided; the failed read does not override it');
+
+    reading.stick = true; reading.followAfterLayout(); settle();  // ↓
+    const older = replies.reveal(address), newer = replies.reveal('row:1@then#bbbbbbbbbbbb');
+    answers.shift()({ state: 'unknown' });
+    assert.equal(await older, null, 'the newer reveal superseded it');
+    assert.equal(reading.stick, false);
+    answers.shift()({ state: 'absent' });
+    assert.deepEqual(await newer, { state: 'absent' });
+    settle();
+    assert.equal(reading.stick, true, 'the newer failure keeps the intent the reader had before both');
+
+    shown = replies.reveal(address);
+    reading.cancel();  // the room left the screen (closeTransient)
+    answers.shift()({ state: 'unknown' });
+    assert.equal(await shown, null);
+    assert.equal(reading.stick, false);
+    reading.stick = true;
+    shown = replies.reveal(address);
+    answers.shift()({ state: 'unavailable', left: true });  // a page was drawn around it, without the exact row
+    assert.deepEqual(await shown, { state: 'unavailable', left: true });
+    settle();
+    assert.equal(reading.stick, false, 'the drawn page is where the reader now is');
+});
+
+test('a quote that cannot land says why; only a read that may answer differently asks to try again', async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const env = installDomDouble();
+    t.after(() => env.restore());
+    env.doc.getElementById = id => env.doc.body.descendants().find(node => node.id === id) || null;
+    const feed = env.el('div'), input = env.el('textarea');
+    const bubble = env.el('div', { className: 'chat-bubble user' }, env.el('div', { className: 'sender', text: 'You' }),
+        env.el('div', { className: 'message', text: 'and this one?' }));
+    env.doc.body.append(feed, input); feed.append(bubble);
+    const answers = [];
+    const replies = createChatReplies({ feed, input, reading: () => ({ cancel() {}, scroll() {}, remember() {}, stick: false }),
+        history: () => ({ exact: () => null, async reference() {
+            const next = answers.shift();
+            if (next instanceof Error) throw next;
+            return next;
+        } }) });
+    t.after(() => replies.destroy());
+    replies.decorate(bubble, { role: 'user', reply_to: { address: 'task:work-1', role: 'assistant', kind: 'work_card', snippet: 'Work' } });
+    const typed = (status, reasonCode) => Object.assign(new Error(`HTTP ${status}`), { status, body: { reason_code: reasonCode } });
+    const said = [];
+    for (const answer of [{ state: 'moved', task_id: 'work-1' }, { state: 'unknown', error: typed(503, 'history_source_unavailable') },
+        { state: 'unknown', error: typed(503, 'migrating') }, { state: 'unknown' }, new TypeError('offline')]) {
+        answers.push(answer);
+        bubble.querySelector('.chat-quote-main').click();
+        await new Promise(resolve => setImmediate(resolve));
+        said.push(env.doc.body.querySelectorAll('.toast').at(-1)?.textContent);
+    }
+    assert.deepEqual(said, [
+        'This work is in another room.',
+        'Saved history that may hold the quoted message could not be read.',
+        'Saved history is being upgraded. Try again shortly.',
+        'Could not load the quoted message. Try again.',
+        'Could not load the quoted message. Try again.',
+    ]);
+});
+
 test('a saved row gets Reply beside Copy; a row without an address (an unsaved echo, an older host) stays as today', () => {
     const f = fixture();
     try {
@@ -44,8 +174,9 @@ test('a saved row gets Reply beside Copy; a row without an address (an unsaved e
         f.replies.decorate(saved, owner('row:1@a#1'));
         assert.equal(saved.dataset.rowAddress, 'row:1@a#1');
         const actions = saved.children.find((child) => child.classList.contains('chat-message-actions'));
-        assert.deepEqual(actions.children.map((child) => child.className), ['chat-message-reply', 'chat-message-copy'],
+        assert.deepEqual(actions.children.map((child) => child.className.split(' ')[0]), ['chat-message-reply', 'chat-message-copy'],
             'one control row: Reply, then Copy');
+        assert.ok(actions.children[0].classList.contains('ui-hit-area'), 'Reply gains the shared finger hit area');
         assert.equal(actions.children[0].getAttribute('aria-label'), 'Reply', 'an icon-only control has a name');
         assert.ok(saved.classList.contains('has-reply'));
         const legacy = f.bubble('assistant', 'an answer');
@@ -121,7 +252,7 @@ test('the owner\'s reply shows his quote; an unresolved address says so; a quote
         const gone = f.bubble('user', 'and this?');
         f.feed.append(gone);
         f.replies.decorate(gone, { role: 'user', reply_to: { address: 'row:9@x#0', unresolved: true } });
-        assert.match(f.quote(gone).querySelector('.chat-quote-text').textContent, /not available/);
+        assert.match(f.quote(gone).querySelector('.chat-quote-text').textContent, /Open quoted message/);
         assert.equal(f.quote(gone).dataset.kind, 'message');
     } finally { f.close(); }
 });
@@ -208,7 +339,8 @@ test('the owner\'s echo adopts the saved row\'s address and with it Reply; Send 
     } finally { f.close(); }
 });
 
-test('a work card offers Reply first and quotes the work by its task address', () => {
+test('a work card draws no Reply of its own; its row menu quotes the work by its task address', () => {
+    // Owner 17.10 (Q9 B): Reply on a work card lives only in its row menu; the action row holds commands.
     const f = fixture();
     try {
         const actions = f.el('div', { className: 'chat-live-actions' });
@@ -218,17 +350,47 @@ test('a work card offers Reply first and quotes the work by its task address', (
             activityEl: f.el('div', { text: 'Reading the third project' }), phaseEl: f.el('div', { text: 'Working' }) };
         const stop = f.el('button', { text: 'Stop…' });
         actions.append(stop);
-        assert.equal(f.replies.syncCard(record, true), true);
-        assert.deepEqual(actions.children.map((child) => child.textContent), ['Reply', 'Stop…']);
-        assert.equal(record.cardReplyEl.getAttribute('aria-label'), 'Reply to this work');
-        assert.equal(root.dataset.rowAddress, 't-9'.replace(/^/, 'task:'));
-        record.cardReplyEl.click();
+        assert.equal(f.replies.cardRef(record), null, 'nothing to quote before the card is known as a root work card');
+        f.replies.syncCard(record, true);
+        assert.deepEqual(actions.children.map((child) => child.textContent), ['Stop…'], 'the action row keeps only commands');
+        assert.equal(root.querySelector('.btn'), null, 'no Reply capsule anywhere on the card');
+        assert.equal(root.dataset.rowAddress, 't-9'.replace(/^/, 'task:'), 'the card is a quote\'s jump target');
+        f.replies.start(f.replies.cardRef(record));
         assert.deepEqual(f.replies.frameField(), { reply_to: 'task:t-9' });
         const staged = JSON.parse(f.storage.get('ouro_chat_reply'));
         assert.equal(staged.kind, 'work_card');
         assert.equal(staged.author_label, 'Audit');
         assert.equal(staged.snippet, 'Reading the third project');
-        assert.equal(f.replies.syncCard(record, false), true, 'not a root work card any more: no Reply');
-        assert.equal(record.cardReplyEl, null);
+        f.replies.syncCard(record, false);
+        assert.equal(f.replies.cardRef(record), null, 'not a root work card any more: no Reply');
+        assert.equal(root.dataset.rowAddress, 'task:t-9', 'a quote of it still finds it');
     } finally { f.close(); }
+});
+
+test('the registered message actions stand between Reply and Copy on the rows they apply to, until the room goes', () => {
+    const actions = createMessageActions();
+    actions.register({ key: 'read_aloud', label: 'Read aloud', icon: 'volume', applies: (row) => row.role === 'assistant',
+        run() {} });
+    const f = fixture({ actions });
+    try {
+        const answer = f.bubble('assistant', 'The audit found three stale projects.');
+        answer.append(f.el('button', { className: 'chat-message-copy' }));
+        const mine = f.bubble('user', 'please check the logs');
+        mine.append(f.el('button', { className: 'chat-message-copy' }));
+        f.feed.append(answer, mine);
+        f.replies.decorate(answer, { row_address: 'row:1@b#2', role: 'assistant' });
+        f.replies.decorate(mine, owner('row:1@a#1'));
+        const row = (node) => node.children.find((child) => child.classList.contains('chat-message-actions'))
+            .children.map((child) => child.className.split(' ')[0]);
+        assert.deepEqual(row(answer), ['chat-message-reply', 'chat-message-action', 'chat-message-copy'],
+            'Copy keeps the corner; the registered action stands beside Reply');
+        assert.deepEqual(row(mine), ['chat-message-reply', 'chat-message-copy'], 'an action draws only where it applies');
+        const off = actions.register({ key: 'save', label: 'Save', applies: () => true, run() {} });
+        assert.deepEqual(row(mine), ['chat-message-reply', 'chat-message-action', 'chat-message-copy'],
+            'a later registration reaches the rows already drawn');
+        off();
+        f.replies.destroy();
+        actions.register({ key: 'late', label: 'Late', applies: () => true, run() {} });
+        assert.deepEqual(row(mine), ['chat-message-reply', 'chat-message-copy'], 'a destroyed room draws nothing more');
+    } finally { f.restore(); }
 });

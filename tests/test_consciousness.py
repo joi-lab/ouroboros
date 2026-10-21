@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros import consciousness as clock_module
+from ouroboros import dialogue_store
 from ouroboros.consciousness import (
     ARCHIVED_INBOX_REL,
     INTERVAL_STATE_KEY,
@@ -119,9 +120,8 @@ def test_boot_discloses_invalid_wake_boundary_and_uses_process_start(caplog, clo
 
 
 def _chat_row(**row):
-    with (_chat_path := row.pop("root") / "logs" / "chat.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row) + "\n")
-    return _chat_path
+    """A chat row the dialogue writers would have stored, in the canonical store."""
+    return dialogue_store.append(row.pop("root"), "chat", row)
 
 
 def test_restored_boundary_reaches_the_launched_wake_text(clock):
@@ -155,7 +155,8 @@ def test_an_accepted_wake_advances_the_observation_boundary_and_a_refused_one_do
     assert clock.clock.tick(T0 + FLOOR + 2) == "launched"
     assert '"first"' in clock.launches[-1]["text"]  # the refused window is observed again, whole
     accepted = clock.store[OBSERVATION_STATE_KEY]
-    assert accepted["task_id"] == "wake0001" and accepted["upper"] == (clock.root / "logs" / "chat.jsonl").stat().st_size
+    # The boundary is the chain coordinate the next row takes (the file size, when the chain was a file).
+    assert accepted["task_id"] == "wake0001" and accepted["upper"] == dialogue_store.stream_end(clock.root, "chat")
     # The observation was bound to the registered wake before its turn could run.
     bound = clock.launches[-1]["task"]["metadata"]["wake_observation"]
     assert bound["composition"] == {"owner_message": 1} and bound["source"]["sha256"]
@@ -240,10 +241,12 @@ def test_inventory_source_failure_never_advances_accepted_boundary(clock, monkey
 
 
 @pytest.mark.parametrize('version', [1, 2])
-def test_inline_inventory_migrates_and_retains_closed_task_late_review(clock, version):
+def test_inline_inventory_migrates_to_the_source_bound_transitions(clock, version):
+    """A v1 inline inventory migrates to the v2 source-bound record (a late-review wake of a
+    closed task left with the acceptance machine; the migration stays)."""
     from ouroboros import consciousness_wake as wake
     from ouroboros.consciousness import OBSERVATION_STATE_KEY
-    from tests.test_consciousness_wake import _late_panel, _write
+    from tests.test_consciousness_wake import _write
 
     _write(clock.root, 'old', status='completed', ts=_iso(T0 - 86400))
     prior = wake.observe_wake(clock.root, boundary=None, since=T0 - 10, now=T0).boundary
@@ -254,13 +257,6 @@ def test_inline_inventory_migrates_and_retains_closed_task_late_review(clock, ve
     assert ('task old completed' in clock.launches[-1]['text']) is (version == 1)
     accepted = clock.store[OBSERVATION_STATE_KEY]['transitions']
     assert set(accepted) == {'version', 'source_ref'} and accepted['version'] == 2
-    projection, _ref = _late_panel(clock.root, 'old', settled_at=T0 - 70000)
-    _write(clock.root, 'old', review_projection=projection)
-    for index in (2, 3):
-        clock.receipt['task_id'] = f'wake000{index}'
-        clock.clock._next_wake_at = T0 + index * FLOOR
-        assert clock.clock.tick(T0 + index * FLOOR) == 'launched'
-        assert ('late review settled for task old' in clock.launches[-1]['text']) is (index == 2)
 
 
 @pytest.mark.parametrize('failure', ['write', 'readback', 'bootstrap_write'])

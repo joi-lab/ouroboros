@@ -1,6 +1,8 @@
 """Owner-approved room provenance; all history and registry data are synthetic."""
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 
 import pytest
@@ -213,7 +215,7 @@ def test_terminal_projection_row_of_a_presence_turn_carries_the_room_facts(tmp_p
     stored = __import__("ouroboros.task_results", fromlist=["load_task_result"]).load_task_result(tmp_path, "presence-turn-1")
     assert append_terminal_task_projection(tmp_path, "presence-turn-1", {"id": "presence-turn-1", "chat_id": chat_id},
                                            stored, {"status": "completed", "chat_id": chat_id})
-    row = next(json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
+    row = next(json.loads(line) for line in dialogue_test.log_text(tmp_path / "logs" / "chat.jsonl").splitlines()
                if json.loads(line).get("type") == "task_summary")
     assert row["presence_provenance"]["conversation_id"] == "-100"
     assert RoomLabelResolver(projects=[]).label(row) == f"Presence telegram -100 [chat_id={chat_id}]"
@@ -222,5 +224,5 @@ def test_terminal_projection_row_of_a_presence_turn_carries_the_room_facts(tmp_p
     plain = __import__("ouroboros.task_results", fromlist=["load_task_result"]).load_task_result(tmp_path, "plain-task")
     assert append_terminal_task_projection(tmp_path, "plain-task", {"id": "plain-task", "chat_id": 5}, plain,
                                            {"status": "completed", "chat_id": 5})
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     assert "presence_provenance" not in next(r for r in rows if r.get("task_id") == "plain-task")

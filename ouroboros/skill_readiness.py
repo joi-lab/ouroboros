@@ -100,13 +100,14 @@ def acceptance_skill_lifecycle(
     task_started_at: str = "",
     history_coverage: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """Per-skill lifecycle facts for the acceptance packet — VISIBILITY ONLY.
+    """Per-skill lifecycle facts of the skills a task touched — VISIBILITY ONLY.
 
-    Names come from the task's own trace plus any skill whose review history
-    records this ``root_task_id`` (which is how a child-authored payload shows
-    up at all). A UI or manual review carries no root task id and is simply not
-    joined. Acceptance judges quality, never the execution route, so nothing
-    here is a gate.
+    The task's completion observations
+    (``task_finalization.build_completion_observations``) read them. Names come
+    from the task's own trace plus any skill whose review history records this
+    ``root_task_id`` (which is how a child-authored payload shows up at all). A
+    UI or manual review carries no root task id and is simply not joined.
+    Nothing here is a gate.
     """
     root = pathlib.Path(drive_root) if drive_root else None
     if root is None:
@@ -244,6 +245,14 @@ def _skill_names_from_review_history(
     return {"names": names, "coverage": coverage}
 
 
+# Unready packages are installed by the enable owner, never by a paid review: whatever admits the
+# bytes admits their declared dependencies (skill_dependencies.ensure_skill_dependencies).
+_DEPENDENCY_ACTION = {"phase": "dependencies", "tool": "toggle_skill", "reason": (
+    "toggle_skill enabled=true installs or refreshes the declared dependencies when the review gate admits "
+    "the current bytes; it repairs an enabled skill too. Enable only where owner intent covers it, "
+    "never over an owner's OFF.")}
+
+
 def skill_readiness_for_execution(
     drive_root: pathlib.Path,
     skill: Any,
@@ -322,11 +331,11 @@ def skill_readiness_for_execution(
                 msg = f"deps_not_ready:{deps_status}"
                 blockers.append(msg)
                 agent_fixable.append(msg)
-                next_actions.append({"phase": "dependencies", "tool": "skill_review", "reason": "Reconcile dependencies; an unchanged matched review verdict replays without a new panel."})
+                next_actions.append(dict(_DEPENDENCY_ACTION))
             elif deps_state.get("specs_hash") != install_specs_hash(auto_specs):
                 blockers.append("deps_stale")
                 agent_fixable.append("deps_stale")
-                next_actions.append({"phase": "dependencies", "tool": "skill_review", "reason": "Refresh the declared dependency fingerprint."})
+                next_actions.append(dict(_DEPENDENCY_ACTION))
         # G3 (capinv-447) third readiness state: manually-installed dependencies
         # are DISCLOSED, not silently dropped from the dependency list. They do
         # not hard-block (the owner may have installed them system-wide, and no

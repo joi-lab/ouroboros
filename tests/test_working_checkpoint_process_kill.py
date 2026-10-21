@@ -201,7 +201,7 @@ def test_sigkill_between_checkpoint_temp_and_replace_keeps_previous_state_and_re
     # existing stale-temp sweep's (every boot, once older than its age guard).
     wc.discard(drive, TASK_ID)
     assert temp.is_file()
-    from ouroboros.utils import sweep_stale_temp_files
+    from ouroboros.temp_sweep import sweep_stale_temp_files
 
     assert sweep_stale_temp_files(drive, min_age_sec=3600.0, scripts=False) == 0, "a fresh temp is never reaped"
     assert sweep_stale_temp_files(drive, min_age_sec=0.0, scripts=False) == 1 and not temp.exists()

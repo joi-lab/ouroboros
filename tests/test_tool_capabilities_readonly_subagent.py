@@ -49,7 +49,6 @@ def test_local_readonly_subagent_execute_blocks_forbidden_tools(tmp_path, monkey
         "update_identity",
         "commit_reviewed",
         "preflight_review",
-        "task_acceptance_review",
         "skill_review",
         "request_restart",
         "enable_tools",

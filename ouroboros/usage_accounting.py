@@ -442,7 +442,7 @@ def capture_attempt_ids() -> Iterator[list[str]]:
         _ATTEMPT_COLLECTOR.reset(token)
 @contextlib.contextmanager
 def physical_attempt_limit(maximum: int) -> Iterator[None]:
-    """Bound physical provider sends in this actor context (acceptance uses 2)."""
+    """Bound physical provider sends in this actor context (a P3 packet reviewer's rail uses 2)."""
     state = _AttemptLimit(maximum=max(0, int(maximum)))
     token = _PHYSICAL_LIMIT.set(state)
     try:
@@ -504,12 +504,6 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
 
         scope = replace(scope, **task_billing_fields({"id": scope.task_id}, scope.root_task_id,
                                                     scope.root_limit_usd, scope.drive_root))
-    if scope.billing_group_id and scope.drive_root:
-        from ouroboros.usage_admission import effective_billing_fields
-        scope = replace(scope, **effective_billing_fields(scope.drive_root, scope.root_task_id, {
-            key: getattr(scope, key) for key in ("root_limit_usd", "root_limit_source", "root_limit_revision", "billing_group_id",
-                "billing_group_limit_usd", "billing_group_limit_source", "billing_group_limit_revision")},
-            non_task_operation=scope.non_task_operation))
     if request.root_limit_usd is not None and (scope.root_limit_usd is None or request.root_limit_usd < scope.root_limit_usd):
         scope = replace(scope, root_limit_usd=request.root_limit_usd, root_limit_source="attempt_request", root_limit_revision=None)
     if request.global_limit_usd is None and scope.global_limit_usd is not None:
@@ -1030,11 +1024,8 @@ def _transition_once(reservation: AttemptReservation, state: str, **fields: Any)
             if fence := member_fence(scope):
                 from ouroboros.llm_attempt import _PhysicalSendNotStarted
                 raise _PhysicalSendNotStarted(str(fence.get("reason") or "owner_pause"))
-            from ouroboros.usage_admission import effective_billing_fields
-            effective = effective_billing_fields(reservation.drive_root, scope.root_task_id, {
-                key: getattr(scope, key) for key in ("root_limit_usd", "root_limit_source", "root_limit_revision",
-                    "billing_group_id", "billing_group_limit_usd", "billing_group_limit_source", "billing_group_limit_revision")},
-                non_task_operation=scope.non_task_operation)
+            effective = {key: getattr(scope, key) for key in ("root_limit_usd", "root_limit_source", "root_limit_revision",
+                "billing_group_id", "billing_group_limit_usd", "billing_group_limit_source", "billing_group_limit_revision")}
             if scope.root_limit_source == "attempt_request":
                 effective.update(root_limit_usd=scope.root_limit_usd, root_limit_source=scope.root_limit_source,
                                  root_limit_revision=scope.root_limit_revision)

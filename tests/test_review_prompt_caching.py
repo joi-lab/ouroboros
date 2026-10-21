@@ -1537,38 +1537,6 @@ def test_review_seat_usage_flows_through_substrate_once():
     assert usage_events[0]["ledger_attempt_ids"] == ["a1"]
 
 
-def test_acceptance_panel_declines_wave_on_insufficient_budget(monkeypatch, tmp_path):
-    """The acceptance admission decline returns a terminal DEGRADED without a
-    single reviewer call (loop-side wiring of the shared budget gate)."""
-    from types import SimpleNamespace
-    import ouroboros.loop as loop_mod
-    import ouroboros.review_substrate as rs
-    from ouroboros.tools import review_helpers
-
-    calls = {"panel": 0}
-    monkeypatch.setattr(rs, "triad_delivery_slots", lambda **k: [SimpleNamespace(model="m1"), SimpleNamespace(model="m2")])
-    def _boom(*a, **k):
-        calls["panel"] += 1
-        raise AssertionError("reviewer must not be called")
-    monkeypatch.setattr(rs, "run_review_request", _boom)
-    monkeypatch.setattr(
-        review_helpers, "review_wave_budget_gate",
-        lambda ctx, **k: {"fits": False, "estimated_wave_usd": 30.0, "remaining_usd": 1.0, "limit_usd": 50.0, "slots": 2},
-    )
-    tools = SimpleNamespace(_ctx=SimpleNamespace(task_id="t", drive_root=str(tmp_path), pending_events=[]))
-    ctx = loop_mod._TaskAcceptanceContext(
-        tools=tools, content="done", task_id="t", task_type="task",
-        llm_trace={"tool_calls": []}, drive_root=tmp_path,
-        messages=[{"role": "system", "content": ""}, {"role": "user", "content": "goal"}],
-        emit_progress=lambda _m, *, incident=None: None, mode="required", subtree_statuses=[],
-        budget_profile=None, passes_done=0, evidence={"k": "v"},
-    )
-    result = loop_mod._execute_task_acceptance_panel(ctx)
-    assert calls["panel"] == 0
-    assert result.aggregate_signal == "DEGRADED" and result.degraded
-    assert any("review_wave_budget_insufficient" in r for r in result.degraded_reasons)
-
-
 def test_pre_routing_zero_settlement_requires_openrouter_provider(tmp_path):
     """A direct-provider 404 with the router signature stays unresolved: the
     confirmed-$0 class is gated on provider == openrouter."""

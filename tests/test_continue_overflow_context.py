@@ -1,4 +1,4 @@
-"""A real Continue envelope survives Main's provider-refusal address recovery.
+"""A real Continue brief survives Main's provider-refusal address recovery.
 
 Admission, startup, first-request construction, file delivery and the recovery
 loop are real. Only the model transport is a fixture; no provider is called.
@@ -21,14 +21,12 @@ from tests.test_owner_continue import NONCE, _interrupted
 
 
 def _run_refusal(registry, messages, task, monkeypatch):
-    from ouroboros import context_compaction, loop, usage_accounting as ua
+    from ouroboros import loop, usage_accounting as ua
     from ouroboros.llm_attempt import _attempt_request, _physical_candidate
     from ouroboros.model_send_seal import persist_physical_candidate
 
     inputs = []
     monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_a: False)
-    monkeypatch.setattr(context_compaction, "_call_summarizer",
-                        lambda *_a, **_kw: pytest.fail("Unseen output must not buy a helper summary"))
     monkeypatch.setattr("ouroboros.loop_llm_call._sleep_within_deadline", lambda *_a, **_kw: True)
 
     class Provider:
@@ -71,7 +69,7 @@ def _run_refusal(registry, messages, task, monkeypatch):
 
 @pytest.mark.parametrize("flag", [True, False, None])
 @pytest.mark.parametrize("mode", ["max", "low"])
-def test_continue_envelope_survives_overflow_relocation(tmp_path, monkeypatch, flag, mode):
+def test_continue_brief_survives_overflow_relocation(tmp_path, monkeypatch, flag, mode):
     from ouroboros.agent_startup_checks import validate_task_authority_sources
     from ouroboros.artifacts import read_actor_source_bytes
     from ouroboros.context import build_llm_messages
@@ -124,13 +122,15 @@ def test_continue_envelope_survives_overflow_relocation(tmp_path, monkeypatch, f
     assert len({request["model"] for request in inputs}) == 1
     assert inputs[1]["reasoning_effort"] == inputs[2]["reasoning_effort"]
     assert any(m.get("tool_call_id") == "read-evidence" for m in inputs[1]["messages"])
-    # Source views take only confirmed-exposed bodies: Max recovers through task-local Low
-    # with the never-answered read in place; Low has no lower mode, so its late rescue relocates it.
-    assert any(m.get("tool_call_id") == "read-evidence" for m in inputs[2]["messages"]) is (mode == "max")
+    # Nothing shown is addressable, so the second pass runs whole: the floor (Max: books to navigation)
+    # and the disclosed late rescue of the never-answered read, before the one retry.
+    assert not any(m.get("tool_call_id") == "read-evidence" for m in inputs[2]["messages"])
+    record = next(m for m in registry._ctx.messages if _capsule_metadata(m)[1])
+    capsule = _capsule_metadata(record)[1]
+    assert capsule["retention"] == "source_view"
+    checkpoint = json.loads(read_actor_source_bytes(env.drive_root, task["id"], capsule["checkpoint_ref"]))
+    refused_read = next(m for m in inputs[1]["messages"] if m.get("tool_call_id") == "read-evidence")
+    assert refused_read in checkpoint["messages"], "the refused request's body stays exactly retrievable"
     if mode == "low":
-        record = next(m for m in registry._ctx.messages if _capsule_metadata(m)[1])
-        capsule = _capsule_metadata(record)[1]
-        assert capsule["retention"] == "source_view"
-        checkpoint = json.loads(read_actor_source_bytes(env.drive_root, task["id"], capsule["checkpoint_ref"]))
-        assert checkpoint["messages"] == inputs[1]["messages"], "the refused request stays exactly retrievable"
+        assert checkpoint["messages"] == inputs[1]["messages"]  # Low has no floor below it: the refused request itself
     assert load_task_result(env.drive_root, "pred-1") == before, "recovery never rewrites predecessor authority"

@@ -539,15 +539,16 @@ def test_main_offers_no_member_resume_beyond_its_own_interrupted_grant(host, tmp
 
 @pytest.mark.serial
 @pytest.mark.parametrize("settled", [False, True])
-def test_an_unreadable_root_keeps_the_member_unknown_and_its_main_action_unavailable(
+def test_an_unreadable_root_refuses_its_members_resume_at_the_action(
     host, tmp_path, monkeypatch, settled,  # noqa: F811
 ):
-    """The root's own document stops decoding after a census read (bytes no UTF-8 decoder accepts):
-    the member's state is unknown — an incomplete census, never quiet completeness or an invented Resume.
-    While the tree's Pause settles, its census reads that root anyway; once settled, the member's own
-    interrupted-Resume check is the only reader the failure reaches (fence and facts are signature-cached)."""
+    """The root's own document stops decoding after a census read (bytes no UTF-8 decoder accepts,
+    written outside the store). The census answers from typed hot facts and never decodes bodies
+    (task cards, PERSISTENCE), so that corruption reaches only the action's strict authority read:
+    Resume refuses, writes no fence and sends nothing; it never invents a resumable member."""
     import sqlite3
 
+    from ouroboros.owner_pause import read_fence
     from supervisor import workers
     from tests.test_project_hold_recovery import worker
     from tests.test_resume_handover import _stop_boot
@@ -557,20 +558,15 @@ def test_an_unreadable_root_keeps_the_member_unknown_and_its_main_action_unavail
     if settled:
         _settle_owner_fence(host.root, ROOT)
     client = _member_http(host.root)
-    shown = _member_state(client)
-    assert _attention_rows(shown, CHILD), "offered while its facts read"
+    assert _attention_rows(_member_state(client), CHILD), "offered while its facts read"
     with sqlite3.connect(host.root / "state" / "current.sqlite") as conn:
         conn.execute("UPDATE task_bodies SET body = CAST(X'7B22FF' AS TEXT) WHERE task_id = ?", (ROOT,))
     with pytest.raises(Exception):
         load_task_result(host.root, ROOT, strict=True)
-    unknown = _member_state(client, complete=False)
-    assert not _attention_rows(unknown, CHILD), "no Resume from unreadable authority"
-    # Main's real consumer keeps the shown action visible but unavailable: not runnable, not silently gone.
-    assert _main_consumer([shown, unknown], CHILD) == {
-        "card": True, "sender": "System", "resume": True, "enabled": False, "stop": False, "posted": [],
-        "reason": "Needs Resume after the restart."}
+    before = read_fence(host.root, ROOT)
     sent = worker(host, monkeypatch)
     assert client.post(f"/api/tasks/{CHILD}/resume").status_code != 200, "the API refuses unreadable authority"
+    assert read_fence(host.root, ROOT) == before
     workers.assign_tasks()
     assert not sent
 

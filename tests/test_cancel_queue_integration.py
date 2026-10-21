@@ -33,7 +33,8 @@ from tests.worker_pool_support import affirm_ready
 qenv = _qenv
 
 
-def test_drop_cancelled_pending_consults_the_intent_projection(qenv, monkeypatch):
+@pytest.mark.parametrize("attempt", [1, 2])
+def test_drop_cancelled_pending_consults_the_intent_projection(qenv, monkeypatch, attempt):
     from supervisor import workers
 
     emitted: list = []
@@ -44,7 +45,7 @@ def test_drop_cancelled_pending_consults_the_intent_projection(qenv, monkeypatch
 
     qenv.q.PENDING[:] = [
         {"id": "keepme", "chat_id": 1},
-        {"id": "dropme", "chat_id": 1},
+        {"id": "dropme", "chat_id": 1, "_attempt": attempt},
     ]
     write_task_result(qenv.drive, "dropme", "scheduled")
     ci.request_cancel(qenv.drive, "dropme", reason="parent stopped the plan")
@@ -54,6 +55,8 @@ def test_drop_cancelled_pending_consults_the_intent_projection(qenv, monkeypatch
     assert [t["id"] for t in qenv.q.PENDING] == ["keepme"]
     stored = load_task_result(qenv.drive, "dropme")
     assert stored["status"] == STATUS_CANCELLED
+    assert stored["result"] == ("Cancelled before start." if attempt == 1
+                                else "Cancelled before this continuation started.")
     assert "cost_accounting_status" in stored  # reconstructed, not omitted
     assert ci.active_intent(qenv.drive, "dropme") is None
     assert emitted and emitted[0][0] == "dropme" and emitted[0][1] == "cancelled"

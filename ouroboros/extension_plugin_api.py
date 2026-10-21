@@ -218,6 +218,7 @@ class PluginAPIImpl:
         self._env_allow = frozenset(str(k).strip() for k in (config.env_allowlist or []))
         self._env_allow_upper = frozenset(k.upper() for k in self._env_allow)
         self._state_dir = pathlib.Path(config.state_dir)
+        self._loaded_skill = config.loaded_skill
         self._drive_root = pathlib.Path(config.drive_root) if config.drive_root is not None else self._state_dir
         self._subscribe_events = frozenset(str(t).strip() for t in (config.subscribe_events or []) if str(t).strip())
         self._companion_specs = {
@@ -814,6 +815,11 @@ class PluginAPIImpl:
             if import_root is not None or content_hash is not None:
                 bundle.import_root = import_root
             bundle.plugin_api_generation = self._plugin_api_generation
+            if self._loaded_skill is not None:
+                bundle.loaded_skill = self._loaded_skill
+                declaration = self._loaded_skill.manifest.context_snapshot
+                bundle.context_snapshot = ({"path": declaration["path"], "state_dir": str(self._state_dir)}
+                                           if declaration else None)
             digest = uuid.uuid4().hex
             bundle.generation_digest = digest
             self._published_generation = digest
@@ -842,6 +848,10 @@ class PluginAPIImpl:
                     live[key] = value
                     bundle_keys.append(key)
             bundle.module_sources.update(staged.module_sources)
+            if staged.contributions is not None:
+                bundle.contributions = staged.contributions
+                bundle.contribution_problems = staged.contribution_problems
+                bundle.host_sources = staged.host_sources
             bundle.unload_callbacks.extend(staged.unload_callbacks)
             # Recorded on the bundle BEFORE the attach below so a mid-attach
             # failure's unload reaps every effect (unsubscribing a

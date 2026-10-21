@@ -1,4 +1,6 @@
 """Exact generic call evidence survives metrics, the free facts row and history."""
+
+from tests import _dialogue as dialogue_test
 import asyncio
 import json
 import time
@@ -6,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from ouroboros import dialogue_store
 from ouroboros.agent_task_pipeline import emit_task_results
 from ouroboros.gateway.history import make_chat_history_endpoint
 from ouroboros.post_task_synthesis import _record_task_facts, task_tool_metrics
@@ -59,7 +62,7 @@ def test_actual_metrics_summary_and_history_keep_complete_tool_census(tmp_path, 
     stored_before = load_task_result(tmp_path, task["id"])
     _record_task_facts(env, task, {**usage, "outcome_axes": metric["outcome_axes"],
                                    "reason_code": metric["reason_code"]}, trace, logs)
-    facts = next(json.loads(line) for line in (logs / "chat.jsonl").read_text().splitlines()
+    facts = next(json.loads(line) for line in dialogue_test.log_text(logs / "chat.jsonl").splitlines()
                  if json.loads(line).get("summary_kind") == "host_task_facts")
     replay = next(row for row in _history(tmp_path) if row["system_type"] == "task_summary")
     addressing = sum(1 for name in names if name.strip() in ("start_task", "move_to_project", "tell_task"))
@@ -108,7 +111,7 @@ def test_unknown_and_legacy_evidence_keep_absence_distinct_from_zero(tmp_path, m
                        {"loop_evidence_unavailable": True, "tool_calls": []}, tmp_path / "logs")
     [unknown] = _history(tmp_path)
     assert all(unknown[key] is None for key in ("tool_calls", "tool_errors", "routing_tool_calls", "completion_tool_calls", "tool_call_counts"))
-    append_jsonl(tmp_path / "logs/chat.jsonl", {"type": "task_summary", "task_id": "legacy",
+    dialogue_store.append(tmp_path, "chat", {"type": "task_summary", "task_id": "legacy",
         "direction": "system", "chat_id": 1, "text": "Legacy summary", "tool_calls": 1, "rounds": 2})
     legacy = next(row for row in _history(tmp_path) if row["task_id"] == "legacy")
     assert all(key not in legacy for key in ("tool_call_counts", "tool_errors", "routing_tool_calls", "completion_tool_calls"))

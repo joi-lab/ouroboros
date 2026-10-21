@@ -30,6 +30,7 @@ import subprocess
 
 import pytest
 
+from ouroboros import dialogue_store
 from tests import test_ui_smoke_playwright as smoke
 from tests.test_chat_history_paging_browser import _OBSERVE_HISTORY, _idle, _step
 from tests.test_room_work_backend_browser import (
@@ -90,10 +91,8 @@ def _seed_filler(data_dir, chat_id, tag, count, later=False):
         if index % 2 == 0:
             row["client_message_id"] = f"pg-{name}"
         rows.append(row)
-    path = data_dir / "logs" / "chat.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as stream:
-        stream.write("".join(json.dumps(row) + "\n" for row in rows))
+    for row in rows:
+        dialogue_store.append(data_dir, "chat", row)
 
 
 def _reads(page, chat_id):

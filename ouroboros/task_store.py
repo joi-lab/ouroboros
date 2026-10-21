@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from ouroboros import store
+from ouroboros import store, store_task_cards
 from ouroboros.store import Txn, open_store
 
 FACT_KEYS = ("task_id", "status", "ts", "updated_at", "delegation_role", "parent_task_id", "project_id", "root_task_id",
@@ -35,10 +35,8 @@ def read_document(root: Any, task_id: str, *, txn: Optional[Txn] = None, signed:
     task_id = str(task_id)
     with open_store(root, write=False) as txn:
         stamp = signature(root, task_id, txn=txn) if signed else None
-        body = txn.body_text(task_id)
-        rows = txn.handoff_records([task_id]) if body is not None else []
-    document = None if body is None else store.project_handoffs(
-        json.loads(body), store.decode_handoffs([task_id], rows)[task_id])
+        raw = txn.raw(task_id)
+    document = store.materialize(task_id, *raw)
     return (document, stamp) if signed else document
 
 
@@ -84,15 +82,18 @@ def _fetch(txn: Txn, where: str = "", params: Iterable[Any] = (), order: str = "
     A reader decodes AFTER its transaction closed (``_decode``), so a writer's COMMIT never
     waits behind a listing's ``json.loads``."""
     clause = f"WHERE {where}" if where else ""
+    cards, join = store_task_cards.select(txn)
     rows = txn.conn.execute(
-        f"SELECT b.body, t.* FROM tasks AS t JOIN task_bodies AS b ON b.task_id = t.task_id {clause} {order}",
+        f"SELECT b.body, t.*{cards} FROM tasks AS t JOIN task_bodies AS b ON b.task_id = t.task_id{join} {clause} {order}",
         tuple(params)).fetchall()
     return rows, txn.handoff_records([record["task_id"] for record in rows])
 
 
 def _decode(rows: list, handoff_records: list) -> List[Dict[str, Any]]:
+    """The documents of ``_fetch``'s rows: each row carries its body and its card columns."""
     handoffs = store.decode_handoffs([record["task_id"] for record in rows], handoff_records)
-    return [store.project_handoffs(json.loads(record["body"]), handoffs[record["task_id"]]) for record in rows]
+    return [store_task_cards.project(store.project_handoffs(json.loads(record["body"]), handoffs[record["task_id"]]), record)
+            for record in rows]
 
 
 class Reprepare(Exception):
@@ -286,6 +287,14 @@ def _display_sql(column: str = "b.body") -> str:
     return view
 
 
+def _card_sql(view: str) -> str:
+    """``view`` with the task's card row merged over it (``store_task_cards.project`` in SQL, one
+    ``json_patch`` per carded row): the row's non-NULL facts replace the view's, in place or appended."""
+    patch = ("json_remove(json_object(" + ", ".join(f"'{name}', c.{name}" for name in store_task_cards.FIELDS) + "), "
+             + ", ".join(f"CASE WHEN c.{name} IS NULL THEN '$.{name}' ELSE '$.held' END" for name in store_task_cards.FIELDS) + ")")
+    return f"CASE WHEN c.task_id IS NULL THEN {view} ELSE json_patch({view}, {patch}) END"
+
+
 def display_documents(root: Any, task_ids: Iterable[str],
                       versions: Optional[Dict[str, int]] = None) -> Dict[str, str]:
     """The display views (``DISPLAY_DROPPED``) of several documents as JSON text, row-backed
@@ -297,9 +306,11 @@ def display_documents(root: Any, task_ids: Iterable[str],
     if not ids:
         return {}
     with open_store(root, write=False) as txn:
+        _columns, join = store_task_cards.select(txn)
+        view = _card_sql(_display_sql()) if join else _display_sql()
         record = txn.conn.execute(  # '' || ...: the view travels as a string, decoded per use
-            f"SELECT json_group_array(json_array(t.task_id, '' || {_display_sql()}, t.write_seq)) FROM tasks AS t "
-            "JOIN task_bodies AS b ON b.task_id = t.task_id WHERE t.task_id IN (SELECT value FROM json_each(?))",
+            f"SELECT json_group_array(json_array(t.task_id, '' || {view}, t.write_seq)) FROM tasks AS t "
+            f"JOIN task_bodies AS b ON b.task_id = t.task_id{join} WHERE t.task_id IN (SELECT value FROM json_each(?))",
             (json.dumps(ids),)).fetchone()
         handoff_rows = txn.handoff_records(ids)
     handoffs = store.decode_handoffs(ids, handoff_rows)
@@ -332,18 +343,78 @@ def task_ids(root: Any) -> List[str]:
         return txn.task_ids()
 
 
+def tree_facts(root: Any, tree_id: str, *, descendants: bool = False,
+               queue_rows: Iterable[dict] = ()) -> Dict[str, dict]:
+    """Typed membership; only underived roots need their legacy body.
+
+    Descendant selection closes over the indexed parent chain, including bridges
+    present only in the queue snapshot. Durable rows win over queue rows. The
+    caller still applies its own depth/ancestry rule to this selected superset.
+    """
+    from ouroboros.store_hot_facts import task_columns
+
+    tree_id = str(tree_id)
+    with open_store(root, write=False) as txn:
+        legacy = {}
+        for record in txn.conn.execute(
+                "SELECT t.task_id,t.status,t.parent_task_id,b.body FROM tasks AS t "
+                "JOIN task_bodies AS b ON b.task_id=t.task_id WHERE t.root_task_id IS NULL"):
+            document = json.loads(record["body"])
+            legacy[record["task_id"]] = {"task_id": record["task_id"], "status": record["status"],
+                "parent_task_id": record["parent_task_id"], "root_task_id": task_columns(document)["root_task_id"]}
+        selected = {row["task_id"]: dict(row) for row in txn.conn.execute(
+            "SELECT task_id,status,parent_task_id,root_task_id FROM tasks WHERE root_task_id=?", (tree_id,))}
+        selected.update({tid: row for tid, row in legacy.items() if row["root_task_id"] == tree_id})
+        if not descendants:
+            return selected
+        queued = {}
+        for row in queue_rows:
+            tid = str(row.get("task_id") or row.get("id") or "")
+            if tid:
+                queued.setdefault(tid, row)
+        # A queue record cannot replace a durable row, even when that row is
+        # outside the selected tree. This addressed read preserves that rule.
+        durable_queue = {row["task_id"]: dict(row) for row in txn.conn.execute(
+            "SELECT task_id,status,parent_task_id,root_task_id FROM tasks "
+            "WHERE task_id IN (SELECT value FROM json_each(?))", (json.dumps(list(queued)),))}
+        queued.update({tid: legacy.get(tid, row) for tid, row in durable_queue.items()})
+        anchors = {tree_id, *selected}
+        while True:
+            rows = txn.conn.execute(
+                "WITH RECURSIVE reach(id) AS (SELECT value FROM json_each(?) UNION "
+                "SELECT t.task_id FROM tasks AS t JOIN reach ON t.parent_task_id=reach.id) "
+                "SELECT task_id,status,parent_task_id,root_task_id FROM tasks "
+                "WHERE task_id IN (SELECT id FROM reach)", (json.dumps(sorted(anchors)),)).fetchall()
+            selected.update({row["task_id"]: legacy.get(row["task_id"], dict(row)) for row in rows})
+            reached = {tree_id, *selected}
+            while True:
+                extra = {tid for tid, row in queued.items() if tid not in reached and (
+                    str(row.get("root_task_id") or "") == tree_id or str(row.get("parent_task_id") or "") in reached)}
+                if not extra:
+                    break
+                reached.update(extra)
+            new = reached - anchors - selected.keys()
+            selected.update({tid: row for tid, row in queued.items() if tid in reached and tid not in selected})
+            if not new:
+                return selected
+            anchors.update(reached)
+
+
 _COLLECTION_BATCH = 64  # bounds selection/materialization and one classification commit
 DRIVE_RETENTION_BATCH = 64  # bounds directory-name selection and one classification commit
 
 
 def drive_retention_facts(root: Any, task_ids: Iterable[str], *,
-                          stop: Optional[Callable[[], bool]] = None) -> Dict[str, Dict[str, Any]]:
+                          stop: Optional[Callable[[], bool]] = None, record: bool = True) -> Dict[str, Dict[str, Any]]:
     """Cheap facts for one bounded batch of drive names, never a scan of task history.
 
     A missing row/body or NULL projection stays a strict-read candidate. Legacy
     classification reads coherent bodies outside the selector transaction and
     commits only still-NULL write_seq matches, without changing bodies/signatures.
     An old body's REPLACE clears the nullable projection even after schema upgrade.
+    ``record=False`` is the read-only reader (the free-space preview): the facts a
+    legacy body yields fill the answer but no column, and a store behind the current
+    schema answers nothing rather than upgrading (the next prune does both).
     """
     from ouroboros.retention import task_result_retention_at
     from ouroboros.task_results import load_task_result
@@ -355,6 +426,8 @@ def drive_retention_facts(root: Any, task_ids: Iterable[str], *,
     with open_store(root, write=False) as txn:
         schema = txn.meta("schema_version")
     if schema is not None and int(schema) < store.SCHEMA_VERSION:
+        if not record:
+            return {}
         from ouroboros.store_import import upgrade_current_schema
 
         upgrade_current_schema(root)
@@ -386,7 +459,7 @@ def drive_retention_facts(root: Any, task_ids: Iterable[str], *,
         except (store.StoreError, ValueError, TypeError, AttributeError):
             # Leave NULL: the pruner's strict read retains the original diagnostic.
             continue
-    if classified and not stopped():
+    if record and classified and not stopped():
         with open_store(root, write=True) as txn:
             txn.conn.executemany(
                 "UPDATE tasks SET drive_retention_at=? WHERE task_id=? AND write_seq=? "
@@ -455,8 +528,25 @@ def _collection_candidates(root: Any, column: str, predicate: Callable[[dict], b
         return  # failed acquisition/classification leaves the same candidates owed
 
 
+def reclassify_review_collection(root: Any, task_id: str) -> bool:
+    """Write back a ``review_collection_pending`` 1 the current predicate no longer selects (a row an older
+    body flagged for its acceptance collection, which nothing rewrites now). Changes no body or write_seq;
+    a racing body writer wins. True when the column was cleared."""
+    from ouroboros.obligations import review_collection_pending
+
+    with open_store(root, write=False) as txn:
+        stamp = txn.row(str(task_id), "write_seq", "review_collection_pending")
+        body = txn.body_text(str(task_id)) if stamp is not None and stamp[1] == 1 else None
+    if body is None or review_collection_pending(json.loads(body)):
+        return False
+    with open_store(root, write=True) as txn:
+        return txn.conn.execute("UPDATE tasks SET review_collection_pending=0 WHERE task_id=? AND write_seq=? "
+                                "AND review_collection_pending=1", (str(task_id), stamp[0])).rowcount == 1
+
+
 def review_collection_candidates(root: Any, *, stop: Optional[Callable[[], bool]] = None) -> Iterable[str]:
-    """Possible acceptance collection/late-notice work; unrelated plans stay out."""
+    """Tasks holding an open review operation pointer (``obligations.review_collection_pending``);
+    unrelated plans stay out."""
     from ouroboros.obligations import review_collection_pending
 
     yield from _collection_candidates(root, "review_collection_pending", review_collection_pending, stop)

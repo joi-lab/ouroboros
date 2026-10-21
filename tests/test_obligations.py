@@ -246,10 +246,6 @@ def test_recovery_reads_open_members_among_2000_completed(tmp_path, monkeypatch)
     monkeypatch.setattr(results, "read_document", counted)
     monkeypatch.setattr(results, "list_task_results", lambda *a, **kw: pytest.fail("history enumeration"))
     monkeypatch.setattr(status, "effective_task_result", lambda root, row, **kw: row)
-    from ouroboros import post_task_synthesis as synthesis
-    from supervisor import owner_pause_control
-    monkeypatch.setattr(synthesis, "revoke_late_phase_grant", lambda *a, **kw: None)
-    monkeypatch.setattr(owner_pause_control, "retain_late_phase_latch", lambda *a: None)
     monkeypatch.setattr(pipeline, "_settle_terminal_projection", lambda *a, **kw: None)
     monkeypatch.setattr(projection, "settle_terminal_projection", lambda *a, **kw: "settled")
     status.reconcile_orphaned_running_tasks(tmp_path)
@@ -292,11 +288,13 @@ def test_addressed_custody_backfill_keeps_terminal_receipt_without_history(tmp_p
 def test_an_old_body_writing_a_legacy_latch_file_is_reconciled_into_an_intent(tmp_path):
     """P6': a file an unaware body wrote while the store existed is a new row at the next
     import; the legacy cancel latch carve-out stamps it and it becomes an intent."""
-    from ouroboros import startup_migrations as m
+    from ouroboros import startup_migrations as m, store_import
     from ouroboros.cancel_intents import cancel_pending
     from ouroboros.utils import atomic_write_json
     m.prepare_startup_state(tmp_path)
     atomic_write_json(tmp_path / "task_results/old-task.json", {"task_id": "old-task", "status": "cancel_requested"})
-    assert m.prepare_startup_state(tmp_path)["status"] == "reconciled"
+    assert m.prepare_startup_state(tmp_path)["status"] == "unchanged"
+    assert not cancel_pending(tmp_path, "old-task", strict=True)
+    assert store_import.run_legacy_reconcile(tmp_path)["root_report"]["status"] == "reconciled"
     assert results.load_task_result(tmp_path, "old-task", strict=True)["_schema_version"] == 1
     assert cancel_pending(tmp_path, "old-task", strict=True)

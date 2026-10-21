@@ -59,18 +59,16 @@ from ouroboros.subagent_messages import initiator_meta, subagent_message_meta
 from ouroboros.utils import utc_now_iso, append_jsonl, truncate_review_artifact as _truncate_with_notice
 from ouroboros.utils import in_worker_process
 from ouroboros.post_task_checkpoint import (
-    LatePhaseRun,
     POST_TASK_SYNTHESIS_INFLIGHT as _POST_TASK_SYNTHESIS_INFLIGHT,
     POST_TASK_SYNTHESIS_LOCK as _POST_TASK_SYNTHESIS_LOCK,
-    bind_late_phase_run,
     post_task_checkpoint_witness, begin_root_post_task, PostTaskCheckpointChanged,
     reserve_post_task_synthesis, release_post_task_synthesis, post_task_dispatch_evidence,
     is_root_post_task as _is_root_post_task,
     post_task_synthesis_is_open as _post_task_synthesis_is_open,
+    post_task_synthesis_is_paused as _post_task_synthesis_is_paused,
     post_task_synthesis_is_terminal as _post_task_synthesis_is_terminal,
     root_checkpoint_roots as _root_checkpoint_roots,
     root_post_task_already_completed as _root_post_task_already_completed,
-    reset_late_phase_run,
     set_root_post_task_checkpoint as _set_root_post_task_checkpoint,
     settle_terminal_projection as _settle_terminal_projection,
 )
@@ -137,15 +135,16 @@ def _run_post_task_processing_async(
     on_reflection: Callable[[Dict[str, Any] | None, Any], None] | None = None,
     sealed_final: Dict[str, Any] | None = None,
     event_queue: Any = None,
-    resume: Dict[str, Any] | None = None,
     expected_record: Dict[str, Any] | None = None,
     owner_liveness=None, claim_guard=None, stop_requested=None,
 ) -> None:
-    """Run best-effort post-task work off the reply path (``resume``: a saved late-phase Pause).
+    """Run best-effort post-task work off the reply path.
 
     No stage authors a lesson, the Pattern Register or the backlog; that is the
     acting mind's ordinary ``knowledge_write``. ``on_reflection`` is a split Project
     root's canonical chooser entry; the promotion stage hands it the sealed final.
+    An owner Pause ends the remaining stages at once, disclosed like a Stop;
+    nothing is saved to resume.
     """
     task_snapshot = json.loads(json.dumps(task, ensure_ascii=False, default=str))
     trace_snapshot = json.loads(json.dumps(llm_trace, ensure_ascii=False, default=str))
@@ -176,11 +175,11 @@ def _run_post_task_processing_async(
     parent_wait = current_model_wait()
     role_overrides = copy.deepcopy(parent_wait.overrides) if parent_wait else {}
     # No reservation exists until all fallible, unpaid snapshot preparation is done.
-    usage_snapshot = resume["usage_snapshot"] if resume else _pre_synthesis_usage_snapshot(env, task_snapshot, usage)
+    usage_snapshot = _pre_synthesis_usage_snapshot(env, task_snapshot, usage)
     post_task_key, phase_witness = None, None
     if _is_root_post_task(task_snapshot):
         post_task_key, phase_witness = begin_root_post_task(env, task_snapshot,
-            resume=bool(resume), expected_record=expected_record, owner_liveness=owner_liveness,
+            expected_record=expected_record, owner_liveness=owner_liveness,
             claim_guard=claim_guard, stop_requested=stop_requested, event_queue=event_queue)
         if post_task_key is None:
             return None
@@ -217,15 +216,10 @@ def _run_post_task_processing_async(
         checkpoint_status = "degraded"
         skipped: list[str] = []
         interrupted = current = ""
-        saved = resume or {}
-        completed: list[str] = list(saved.get("completed_stages") or ())
-        retired: list[str] = []
-        late_token = bind_late_phase_run(late := LatePhaseRun(saved.get("marks"), saved.get("drafts")))
         try:
             # The free facts row precedes every paid stage, so neither Stop nor a
             # failed paid stage costs the card its facts; it is not a stage.
-            if not resume:
-                _record_task_facts(env, task_snapshot, usage_snapshot, trace_snapshot, drive_logs)
+            _record_task_facts(env, task_snapshot, usage_snapshot, trace_snapshot, drive_logs)
             from ouroboros.llm import LLMClient
             from ouroboros.memory import Memory
 
@@ -239,7 +233,7 @@ def _run_post_task_processing_async(
                 try:
                     from ouroboros.post_task_evolution import maybe_promote
 
-                    late_phase_step("promotion:promote", lambda: maybe_promote(env, task_snapshot, sealed_snapshot, llm_client))
+                    maybe_promote(env, task_snapshot, sealed_snapshot, llm_client)
                 except Exception as error:
                     propagate_paid_interruption(error)
                     # An ordinary chooser failure is this stage's own typed failure
@@ -247,7 +241,7 @@ def _run_post_task_processing_async(
                     failure = "promotion_failed"
                     log.warning("Post-task evolution promotion failed", exc_info=True)
                 if on_reflection is not None:
-                    late_phase_step("promotion:global", lambda: on_reflection(sealed_snapshot, llm_client))
+                    on_reflection(sealed_snapshot, llm_client)
                 return failure
 
             # All late model work belongs to this one scoped worker.  This keeps
@@ -260,23 +254,13 @@ def _run_post_task_processing_async(
                     env, task_memory, llm_client)),
                 ("promotion", _promotion),
             ]
-            # A Pause saved by an earlier version may name a stage that no longer
-            # exists (its reflection): it is retired, never run, and its saved outputs
-            # (an entry, nominations, a callback's candidates) cause no effect. A later
-            # Pause of the remainder carries what was retired until the phase settles.
-            names = [name for name, _run in stages]
-            retired = [stage for stage in dict.fromkeys([*(saved.get("retired_stages") or ()), saved.get("stage"),
-                                                         *(saved.get("remaining_stages") or ())])
-                       if stage and stage not in names and stage not in completed]
             from ouroboros.post_task_synthesis import (
                 POST_TASK_INTERRUPT_KINDS, post_task_interruption, propagate_paid_interruption,
             )
             from ouroboros.usage_accounting import BudgetExceeded
 
-            stage_errors = bool(saved.get("stage_errors"))
+            stage_errors = False
             for index, (name, run_stage) in enumerate(stages):
-                if name in completed:
-                    continue
                 if _owner_stop_requested():
                     interrupted = "owner_stopped"
                     skipped = [stage for stage, _run in stages[index:]]
@@ -311,32 +295,25 @@ def _run_post_task_processing_async(
                         break
                     stage_errors = True
                     log.warning("Post-task stage %s failed for %s", name, stage_task_id, exc_info=True)
-                completed.append(name)
             if not interrupted and not stage_errors:
                 checkpoint_status = "completed"
         except Exception:
             log.warning("Post-task setup failed for %s", stage_task_id, exc_info=True)
         finally:
-            if interrupted == "owner_pause" and _owner_stop_requested():  # Stop outranks Pause: nothing saved
-                interrupted, skipped = "owner_stopped", [current, *skipped]
-            # The owner's Pause keeps the remainder (D10); a failed save stays an honest degraded.
-            if not (interrupted == "owner_pause" and park_late_phase(
-                    env, task_snapshot, current, [current, *skipped], completed, late=late, inputs=(
-                        usage, usage_snapshot, trace_snapshot, sealed_snapshot, drive_logs,
-                        on_reflection), state=dict(stage_errors=stage_errors,
-                                                   **({"retired_stages": retired} if retired else {})))):
-                reasons = [f"{interrupted}:skipped={','.join(skipped)}"] if interrupted else []
-                if retired:  # disclosed, never silently dropped: the stage does not exist any more
-                    reasons.append(f"stage_retired:skipped={','.join(retired)}")
-                try:
-                    _publish_root_post_task_checkpoint(
-                        env, task_snapshot, checkpoint_status, expected=phase_witness,
-                        stop_requested=stop_requested, stop_reason=";".join(reasons),
-                        event_queue=event_queue,
-                    )
-                except Exception:
-                    log.warning("Post-task result publication remains owed for %s", stage_task_id, exc_info=True)
-            reset_late_phase_run(late_token)
+            if interrupted == "owner_pause":
+                # The owner's Pause ends the upkeep at once, the stage it stopped
+                # included, and nothing is saved to resume; Stop outranks it.
+                interrupted = "owner_stopped" if _owner_stop_requested() else interrupted
+                skipped = [current, *skipped]
+            try:
+                _publish_root_post_task_checkpoint(
+                    env, task_snapshot, checkpoint_status, expected=phase_witness,
+                    stop_requested=stop_requested,
+                    stop_reason=f"{interrupted}:skipped={','.join(skipped)}" if interrupted else "",
+                    event_queue=event_queue,
+                )
+            except Exception:
+                log.warning("Post-task result publication remains owed for %s", stage_task_id, exc_info=True)
             _release_owner()  # The following owner-Pause census must see the phase's physical return.
             if not in_worker_process():
                 # Pooled completion still owes child files and accepted inputs.
@@ -401,29 +378,32 @@ def _run_post_task_processing_async(
 
 def recover_pending_root_post_task_synthesis(
     drive_root: Any, repo_dir: Any = None,
-    *, exclude_task_ids: frozenset[str] = frozenset(), resume_task_id: str = "",
+    *, exclude_task_ids: frozenset[str] = frozenset(),
     startup: bool = True, owner_liveness=None, claim_guard=None, stop_requested=None, event_queue=None,
 ) -> int:
     """Service existing synthesis debt; only proven absent/unsent work may dispatch.
 
     Startup retains its prior-worker proof. A steady-state caller supplies the
-    queue's tri-state physical liveness and settlement interlock. A saved Pause
-    never auto-runs; only startup revokes its unconsumed Resume grant. Paid or
-    unknown legacy pending_once is indeterminate, just like a lost running phase.
+    queue's tri-state physical liveness and settlement interlock. A Pause an
+    earlier version saved never runs: the steady-state pass ends it once
+    (``end_saved_late_phase_pause``), startup leaves it for that pass, and a rest an
+    earlier version left on its Resume is examined anyway. Paid or unknown legacy
+    pending_once is indeterminate, just like a lost running phase. A member that
+    waits on a recorded projection cause rests (``obligations.DutyRest``).
     """
     from types import SimpleNamespace
-    from ouroboros.post_task_synthesis import resume_paused_late_phase, revoke_late_phase_grant
+    from ouroboros.post_task_synthesis import end_saved_late_phase_pause
     from ouroboros.post_task_checkpoint import post_task_synthesis_in_flight
-    from ouroboros.obligations import result_rows
-    from ouroboros.terminal_projection import terminal_projection_owed
+    from ouroboros.obligations import DutyRest, result_rows
+    from ouroboros.install_identity import StoreForeign, require_task_roots, rest_foreign_member
+    from ouroboros.terminal_projection import delivery_registry_stamp, rest_deferral, terminal_projection_owed
 
     root = pathlib.Path(drive_root).resolve(strict=False)
-    if resume_task_id:
-        return int(resume_paused_late_phase(root, repo_dir or root.parent, str(resume_task_id)))
     if not startup and owner_liveness is None:
         return 0  # An empty/foreign process-local map cannot prove physical absence.
-    recovered = 0
-    for stored in result_rows(root, "synthesis", exclude=exclude_task_ids):
+    recovered, rest = 0, DutyRest(root, "synthesis_recovery", name="synthesis", wake=("owner_resume",),
+                                  inputs={"terminal_deliveries": delivery_registry_stamp(root)})
+    for stored in result_rows(root, "synthesis", exclude=exclude_task_ids, ids=rest.examine):
         if stop_requested and stop_requested():
             break
         task_id = str(stored.get("task_id") or stored.get("id") or "")
@@ -432,28 +412,33 @@ def recover_pending_root_post_task_synthesis(
         try:
             task = {**stored, "id": task_id, "root_task_id": str(stored.get("root_task_id") or task_id)}
             task.setdefault("budget_drive_root", str(root))
+            require_task_roots(task)
             env = SimpleNamespace(repo_dir=pathlib.Path(repo_dir or task.get("repo_dir") or root.parent),
                                   drive_root=root, drive_path=lambda rel, _root=root: _root / rel)
             governing_root = _root_checkpoint_roots(env, task)[0]
             authority = (load_task_result(governing_root, task_id, strict=True) or {}
                          if governing_root != root else stored)
+            here = rest if governing_root == root else None  # a rest keys on this root's row
             if post_task_synthesis_in_flight(governing_root, task_id):
                 continue
             checkpoint = (authority or stored).get("root_phase_checkpoint") or {}
             phase = str(checkpoint.get("post_task_synthesis") or "")
             if not _post_task_synthesis_is_open(phase):
-                if terminal_projection_owed(task_id, authority):
-                    _settle_terminal_projection(governing_root, task_id, task=task, event_queue=event_queue)
-                continue
-            if phase == "paused":
-                if startup:
-                    revoke_late_phase_grant(governing_root, task_id, reason="restart_no_resume")
-                    from supervisor.owner_pause_control import retain_late_phase_latch
-                    retain_late_phase_latch(governing_root, task_id)
+                waits = {} if terminal_projection_owed(task_id, authority) else {"on": "nothing_owed"}
+                if not waits:
+                    _settle_terminal_projection(governing_root, task_id, task=task, event_queue=event_queue, waits=waits)
+                rest_deferral(here, task_id, waits)
                 continue
             if owner_liveness is not None and owner_liveness(task_id) is not False:
                 continue
+            if _post_task_synthesis_is_paused(phase):
+                if not startup and end_saved_late_phase_pause(
+                        env, task, governing_root, authority, owner_liveness=owner_liveness,
+                        claim_guard=claim_guard, stop_requested=stop_requested, event_queue=event_queue):
+                    recovered += 1
+                continue
             if not _is_root_post_task(task):
+                rest_deferral(here, task_id, {"on": "not_root_post_task"})
                 continue
             dispatched = phase == "running" or post_task_dispatch_evidence(governing_root, task_id, authority)
             if dispatched:
@@ -484,10 +469,13 @@ def recover_pending_root_post_task_synthesis(
                 stop_requested=stop_requested, event_queue=event_queue)
             fresh = load_task_result(governing_root, task_id, strict=True) or {}
             recovered += int((fresh.get("root_phase_checkpoint") or {}).get("post_task_synthesis") != phase)
+        except StoreForeign as exc:
+            rest_foreign_member(rest, task_id, stored, exc)
         except PostTaskCheckpointChanged:
             continue  # A newer Pause, completed result or task attempt owns the phase.
         except Exception:
             log.warning("Post-task recovery remains owed for %s", task_id, exc_info=True)
+    rest.commit()
     return recovered
 
 
@@ -570,19 +558,24 @@ def _derive_host_bound_loop_outcome(
     """Derive once from the current durable mutation-evidence binding."""
     _attach_host_mutation_projection(env, task, llm_trace)
     loop_outcome = apply_skill_publish_receipt_veto(derive_loop_outcome(text or "", usage, llm_trace), task, llm_trace)
-    return _apply_terminal_custody_outcome(env, task, loop_outcome)
+    return _apply_terminal_custody_outcome(env, task, loop_outcome, usage=usage)
 
 
 def _apply_terminal_custody_outcome(
     env: Any, task: Dict[str, Any], loop_outcome: Dict[str, Any],
+    *, usage: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    """Make the terminal custody audit authoritative for result and event axes."""
+    """Use the delivery snapshot, or a legacy caller's stored audit, for custody axes."""
 
     drive_root = task.get("budget_drive_root") or getattr(env, "drive_root", None)
     if drive_root is None:
         return loop_outcome
-    existing = load_task_result(drive_root, str(task.get("id") or "")) or {}
-    unreconciled = existing.get("delegated_runs_unreconciled")
+    audit = (usage or {}).get("delegate_terminal_reconciliation")
+    if isinstance(audit, dict):
+        unreconciled = audit.get("unreconciled")
+    else:
+        existing = load_task_result(drive_root, str(task.get("id") or "")) or {}
+        unreconciled = existing.get("delegated_runs_unreconciled")
     if not isinstance(unreconciled, list) or not unreconciled:
         return loop_outcome
     overlaid = {
@@ -709,6 +702,7 @@ def _collect_review_evidence_bundle(
             env.drive_root,
             task_id=str(task.get("id") or ""),
             repo_dir=getattr(env, "repo_dir", None),
+            canonical_root=task.get("budget_drive_root"),
         )
     except Exception:
         log.debug("Failed to collect review evidence", exc_info=True)
@@ -858,6 +852,13 @@ def emit_task_results(
     """
     from ouroboros.subagent_bootstrap import actor_first_terminal_projection
     actor_fact, usage, llm_trace = actor_first_terminal_projection(ctx, task, usage, llm_trace, task.get("budget_drive_root") or getattr(env, "drive_root", None))
+    from ouroboros.delegate_terminal import terminal_custody_disclosure, record_terminal_reconciliation
+
+    custody_root = task.get("budget_drive_root") or env.drive_root
+    with timed_phase("custody_audit", timing=usage.get("_finalization_timing") or {}):
+        custody_audit = terminal_custody_disclosure(custody_root, str(task.get("id") or ""),
+                                                   usage.get("delegate_terminal_reconciliation"))
+    usage["delegate_terminal_reconciliation"] = custody_audit
     loop_outcome = _derive_host_bound_loop_outcome(env, task, text, usage, llm_trace)
     # A silent wake's words stay internal. Clean, it publishes nothing (no chat row, owed outbox
     # row, live send or delivery subject); otherwise only a host notice of its outcome.
@@ -907,7 +908,8 @@ def emit_task_results(
         # Final frames carry their own durable identity; replay must not depend
         # on a nearby progress row that may age out independently.
         send_event["progress_meta"] = dict(_message_meta)
-    send_event = prepare_terminal_send_event(env.drive_root, task, published, usage, send_event, presence=_presence)
+    send_event = prepare_terminal_send_event(env.drive_root, task, published, usage, send_event,
+                                             presence=_presence, custody_audit=custody_audit)
     if notice:  # the host's words, never the model's: a System row with its own delivery identity
         from supervisor.terminal_delivery import project_terminal_result_event
 
@@ -933,6 +935,12 @@ def emit_task_results(
     # Answer first (owner 1A(1)): the owner's answer is on the live bus before
     # the heavy tail below (cost ledger, evidence capture, the result store).
     _live_delivered = _root_outbox and not quiet and _deliver_answer_first(env, task, event_queue, pending_events, register=_presence)
+    # A failed live put keeps its owed/buffered answer and skips optional annotation.
+    # Children and silent wakes retain their existing buffered/no-chat lifecycle.
+    if _live_delivered or not _root_outbox or quiet:
+        with timed_phase("custody_annotation", timing=usage.get("_finalization_timing") or {}):
+            record_terminal_reconciliation(custody_root, str(task.get("id") or ""), custody_audit,
+                                           addressed=True, emit_evidence=True)
     duration_sec = round(time.time() - start_time, 3)
     task_cost_fields = _task_cost_fields(env, task)
     try:
@@ -968,8 +976,7 @@ def emit_task_results(
     # outbox row registered above is the crash insurance for this window.
     with timed_phase("result_store", timing=usage.get("_finalization_timing") or {}):
         _store_task_result(env, task, text, usage, llm_trace, review_evidence=review_evidence,
-                           loop_outcome=loop_outcome, cost_fields=task_cost_fields,
-                           final_delivery=None if quiet else send_event)
+                           loop_outcome=loop_outcome, cost_fields=task_cost_fields)
     if _live_delivered:
         # The live copy's timing snapshot was frozen at its enqueue; the store span
         # completed after it and is journaled as its own correlated row.
@@ -1153,8 +1160,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
                        usage: Dict[str, Any], llm_trace: Dict[str, Any],
                        review_evidence: Dict[str, Any] | None = None,
                        loop_outcome: Dict[str, Any] | None = None,
-                       cost_fields: Dict[str, Any] | None = None,
-                       final_delivery: Dict[str, Any] | None = None) -> None:
+                       cost_fields: Dict[str, Any] | None = None) -> None:
     """Store task result for parent task retrieval.
 
     ``loop_outcome``, when supplied by ``emit_task_results``, is the SINGLE already-
@@ -1163,10 +1169,6 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
     do not derive/flag a second time. It is only re-derived here when called without one.
     """
     try:
-        from ouroboros.review_projection import publish_acceptance_checkpoint
-
-        publish_acceptance_checkpoint(env, llm_trace, task_id=str(task.get("id") or ""),
-                                      drive_root=env.drive_root, chat_id=task.get("chat_id"))
         trace_summary = build_trace_summary(llm_trace)
         from ouroboros.cost_projection import with_cost_aliases
 
@@ -1188,7 +1190,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
                 expected_output=str(task.get("expected_output") or ""),
                 receipts=task_verification_receipts(None, env.drive_root, task),
             )
-        loop_outcome = _apply_terminal_custody_outcome(env, task, loop_outcome)
+        loop_outcome = _apply_terminal_custody_outcome(env, task, loop_outcome, usage=usage)
         outcome_axes = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")})
         execution_status = str((outcome_axes.get("execution") or {}).get("status") or "")
         reason_code = str(loop_outcome.get("reason_code") or "")
@@ -1217,11 +1219,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
         artifact_record = verification_refs.get("artifact")
         if artifact_record and artifact_record not in artifacts:
             artifacts.append(artifact_record)
-        # An eligible forced/launch-skip answer must not re-hash artifact bodies
-        # on its urgent terminal path. Existing registrations and copyback own them.
-        collected_artifacts = collect_task_artifact_records(
-            env.drive_root, str(task.get("id") or ""), measure="acceptance_history_seed" not in llm_trace,
-        )
+        collected_artifacts = collect_task_artifact_records(env.drive_root, str(task.get("id") or ""))
         artifacts = merge_artifact_records(artifacts, collected_artifacts)
         provisional = {
             **existing,
@@ -1275,20 +1273,11 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
                 root_phase_checkpoint = dict(incoming_checkpoint)
             elif isinstance(existing_checkpoint, dict):
                 root_phase_checkpoint = dict(existing_checkpoint)
-            else:
-                root_phase_checkpoint = {
-                    "phase": "task_acceptance",
-                    "status": "not_required",
-                    "pass_index": 0,
-                }
+            # A pre-fold row may also carry the task-acceptance phase fields (``phase``,
+            # ``status``, ``pass_index``); nothing reads them and new rows carry none.
             root_phase_checkpoint.setdefault("post_task_synthesis", "pending_once")
         review_projection = _compact_review_projection(llm_trace, task, env.drive_root)
         model_execution = model_execution_projection(usage)
-        from ouroboros.acceptance_history import retain_acceptance_history
-        history_fields = retain_acceptance_history(
-            env.drive_root, task, text, llm_trace, review_evidence or {},
-            observations, artifacts, final_delivery, usage=usage,
-        )
         write_task_result(
             env.drive_root,
             str(task.get("id") or ""),
@@ -1345,7 +1334,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             parent_cognitive_route=task.get("parent_cognitive_route"),
             subagent_availability=task.get("subagent_availability"),
             metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
-            result=text or "", **terminal_result_fields(usage),
+            result=text or "", **terminal_result_fields(usage, existing=existing),
             final_answer=str(loop_outcome.get("final_answer") or ""),
             trace_summary=trace_summary,
             trace_refs=loop_outcome.get("trace_refs") or {},
@@ -1357,7 +1346,6 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             verification_ledger=verification_refs.get("inline"),
             artifact_bundle=artifact_bundle,
             artifacts=artifacts,
-            **history_fields,
             **({"root_phase_checkpoint": root_phase_checkpoint} if root_phase_checkpoint else {}),
             **({"swarm_efficiency": swarm_efficiency} if swarm_efficiency else {}),
             ts=utc_now_iso(),
@@ -1544,6 +1532,4 @@ from ouroboros.post_task_synthesis import (  # noqa: E402, F401 -- intentional p
     _post_task_paid_interruption,
     _run_memory_fallback_draft,
     _run_scratchpad_consolidation,
-    late_phase_step,
-    park_late_phase,
 )

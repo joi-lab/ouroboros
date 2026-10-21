@@ -362,8 +362,8 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
     one rendering memory gives a chat row (``render_row_text``: a quiz answer is
     ``chose (N) <label>`` and the owner's comment, never the question framed before
     them): people's words ride whole, every other row under the disclosed bound."""
+    from ouroboros import dialogue_store as ds
     from ouroboros.dialogue_provenance import render_row_text, row_author
-    from ouroboros.gateway._helpers import read_rotated_jsonl_entries
     from ouroboros.projects_registry import list_projects
     from ouroboros.utils import truncate_within_limit
 
@@ -381,11 +381,21 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
 
     dialogue_rows: list = []
     root = pathlib.Path(ctx.DRIVE_ROOT)
-    rows, gaps = read_rotated_jsonl_entries(
-        root / "logs" / "chat.jsonl", root / "archive", "chat", 20,
-        lambda row: bool(str(row.get("text") or "").strip()),
-        max_archives=2, include_gaps=True,
-    )
+    upper = before = ds.stream_end(root, "chat")
+    rows, gaps = [], set()
+    while before and len(rows) < 20:
+        page = ds.newest(root, "chat", before=before, limit=20)
+        if not page:
+            before = 0
+            break
+        rows.extend(entry for entry in reversed(page) if str(entry.row.get("text") or "").strip())
+        before = page[0].seq
+    coverage = ds.range_coverage(root, "chat", lower=rows[19].seq if len(rows) >= 20 else 0, upper=upper)
+    if not coverage["imported"]:
+        gaps.add("a segment could not be imported" if coverage["mismatch"] else "history is still importing")
+    if coverage["gaps"]:
+        gaps.add("recorded invalid intervals")
+    rows = [entry.row for entry in reversed(rows[:20])]
     for row in rows:
         text = render_row_text(row).strip() if str(row.get("text") or "").strip() else ""
         if text:
@@ -410,7 +420,7 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
             # A bounded read cannot count bytes/rows it deliberately did not
             # visit. The exact historical messages remain available by id.
             "dialogue_rows": None,
-            "dialogue_source": "chat_history (canonical chat and archives)",
+            "dialogue_source": "chat_history (state/dialog.sqlite)",
             "dialogue_gaps": sorted(gaps),
         },
     }

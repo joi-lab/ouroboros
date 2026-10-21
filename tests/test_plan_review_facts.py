@@ -1,8 +1,9 @@
-"""Plan-review facts for a late review settlement (``ouroboros.plan_review_facts``).
+"""Plan-review facts of one task (``ouroboros.plan_review_facts``).
 
-A panel settling after its task ended leaves one bounded host row in the reflection
-log: the settled verdict, each reviewer's output and the plan review's facts —
-bounded, with a source pointer, never a score.
+What the plan's reviewers objected to and how the author answered, projected from the
+task's plan record (else its earlier-schema plan-review state) — bounded, with a source
+pointer, never a score. The reflection row a late task-acceptance settlement appended is
+retired with task acceptance.
 """
 from __future__ import annotations
 
@@ -10,13 +11,9 @@ import json
 
 import pytest
 
-from ouroboros import plan_review_facts as facts_mod
 from ouroboros.plan_review_facts import (
-    LATE_SETTLEMENT_TASK_TYPE,
     PLAN_REVIEW_REFLECTION_CHARS,
     facts_from_state,
-    late_settlement_reflection_entry,
-    learn_from_late_settlement,
     plan_review_reflection_slice,
     render_plan_review_section,
 )
@@ -280,33 +277,16 @@ def test_the_measured_section_leads_with_its_heading_and_carries_the_facts():
     assert "author_plan" in rendered
 
 
-def _late_result(tmp_path, task_id="late-1", retry_key="rk-1", **fields):
+def _task_result(tmp_path, task_id, **fields):
     from ouroboros.task_results import write_task_result
 
-    write_task_result(tmp_path, task_id, "completed", text="Ship the deck", result="done", **fields, review_projection={
-        "panels": [{"panel_id": "panel_1", "late_settlement": {
-            "note": "Reviewers later passed it.\nSecond line of the host's sentence.",
-            "reviewed_subject": {"retry_key": retry_key, "panel_id": "panel_1"},
-            "reviewer_outputs": [{"slot_id": "a", "verdict": "PASS", "model": "model/a"}]}}]})
+    write_task_result(tmp_path, task_id, "completed", text="Ship the deck", result="done", **fields)
     return task_id
 
 
-def test_the_late_settlement_row_is_bounded_and_sourced(tmp_path, monkeypatch):
-    monkeypatch.setattr(facts_mod, "plan_review_reflection_slice", lambda root, tid, task=None: None)
-    task_id = _late_result(tmp_path)
+def test_the_slice_passes_the_task_contract_to_the_claims_source(tmp_path, monkeypatch):
+    from ouroboros.task_results import load_task_result
 
-    entry = late_settlement_reflection_entry(tmp_path, task_id, "rk-1")
-
-    assert entry["type"] == entry["task_type"] == LATE_SETTLEMENT_TASK_TYPE
-    assert entry["supplement_id"] == "acceptance-late:rk-1" and entry["task_id"] == task_id
-    assert entry["reflection"].startswith("Reviewers later passed it.")
-    assert entry["reflection"].splitlines()[1] == f"Source: get_task_result(task_id={task_id}), review_projection panel panel_1."
-    assert "- a (model/a): PASS" in entry["reflection"]
-    assert entry["source_ref"]["panel_id"] == "panel_1" and entry["goal"] == "Ship the deck"
-    assert late_settlement_reflection_entry(tmp_path, task_id, "unknown-key") is None
-
-
-def test_the_late_row_passes_the_result_so_the_claims_source_sees_the_task_contract(tmp_path, monkeypatch):
     seen = {}
 
     def claims(ctx, contract, root, tid):
@@ -315,12 +295,13 @@ def test_the_late_row_passes_the_result_so_the_claims_source_sees_the_task_contr
 
     _patch_sources(monkeypatch, state={"waves": [_wave()]}, author=None)
     monkeypatch.setattr("ouroboros.review_evidence_sections._accept_effective_claims", claims)
-    task_id = _late_result(tmp_path, task_contract={"acceptance_claims": [{"id": "claim_1", "claim": "The deck has ten slides"}]})
+    task_id = _task_result(tmp_path, "t-claims", task_contract={"acceptance_claims": [{"id": "claim_1", "claim": "The deck has ten slides"}]})
 
-    entry = late_settlement_reflection_entry(tmp_path, task_id, "rk-1")
+    facts = plan_review_reflection_slice(tmp_path, task_id, task=load_task_result(tmp_path, task_id))
 
     assert seen["contract"]["acceptance_claims"][0]["id"] == "claim_1"
-    assert "Plan review (ingress_contract claims; 3 of 3 elements)" in entry["reflection"]
+    assert facts["claims_source"] == "ingress_contract"
+    assert {row["id"] for row in facts["elements"]} == {"claim_1", "claim_2", "decision_1"}
 
 
 def _organ_participant(seat, *, reply, owner_marked=True):
@@ -328,12 +309,12 @@ def _organ_participant(seat, *, reply, owner_marked=True):
             "status": "answered", "reply": {"prose": "", "objections": [], "withdrawn": [], **reply}}
 
 
-def test_an_organ_task_late_row_names_each_objection_with_its_standing(tmp_path):
-    """An organ task has no legacy elements: its late row names every objection of the plan
+def test_an_organ_task_slice_names_each_objection_with_its_standing(tmp_path):
+    """An organ task has no legacy elements: its slice names every objection of the plan
     record and whether its raiser withdrew it; a plan nobody objected to says so."""
     from ouroboros import plan_record as pr
 
-    task_id = _late_result(tmp_path)
+    task_id = _task_result(tmp_path, "organ-1")
     pr.append_revision(tmp_path, task_id, pr.compose_revision(
         None, goal="ship", plan="outline, then draft", done_when=["five slides"], affected_paths=[]), body=False)
     pr.append_ask(tmp_path, task_id, {"ask_id": "a1", "ts": "t1", "revision": 1, "message": "look", "participants": [
@@ -342,95 +323,23 @@ def test_an_organ_task_late_row_names_each_objection_with_its_standing(tmp_path)
     pr.append_ask(tmp_path, task_id, {"ask_id": "a2", "ts": "t2", "revision": 1, "message": "export added", "participants": [
         _organ_participant("triad_a", reply={"withdrawn": [{"id": "o1", "why": "added"}]})]})
 
-    reflection = late_settlement_reflection_entry(tmp_path, task_id, "rk-1")["reflection"]
-
-    (line,) = [row for row in reflection.splitlines() if row.startswith("Plan record (")]
-    assert "1 revision(s), 2 ask(s); 3 of 3 objections" in line
-    assert "triad_a/o1 withdrawn" in line and "triad_a/o2 open, owner-marked, not adjudicated" in line
-    assert line.endswith("critic_x/o3 open")  # an added critic's objection is open, never owner-marked
-    assert "Plan review (" not in reflection
-    # Scope R1, D1: the slice carries exactly what the row prints — counts and the fold — and no unrendered projection.
+    # Scope R1, D1: the slice carries exactly the counts and the fold — and no unrendered projection.
     facts = plan_review_reflection_slice(tmp_path, task_id, task={"task_contract": {}})
     assert set(facts) == {"organ", "source_ref", "claims_source", "revisions", "asks", "objections"}
     assert facts["revisions"] == 1 and facts["asks"] == 2 and [o["id"] for o in facts["objections"]] == ["o1", "o2", "o3"]
     assert facts["source_ref"]["field"] == "plan_record"
+    standing = {(o["seat_id"], o["id"]): o for o in facts["objections"]}
+    assert standing[("triad_a", "o1")]["open"] is False  # withdrawn by its raiser
+    assert standing[("triad_a", "o2")]["open"] is True and standing[("triad_a", "o2")]["holds"] is True
+    assert standing[("triad_a", "o2")]["not_adjudicated"] is True  # open, owner-marked, not adjudicated
+    assert standing[("critic_x", "o3")]["open"] is True  # an added critic's objection is open...
+    assert standing[("critic_x", "o3")]["holds"] is False  # ...and never owner-marked
+    assert standing[("critic_x", "o3")]["not_adjudicated"] is False
 
-    quiet = _late_result(tmp_path, task_id="late-2")
+    quiet = _task_result(tmp_path, "organ-2")
     pr.append_revision(tmp_path, quiet, pr.compose_revision(
         None, goal="ship", plan="outline", done_when=["five slides"], affected_paths=[]), body=False)
     pr.append_ask(tmp_path, quiet, {"ask_id": "a1", "ts": "t1", "revision": 1, "message": "look",
                                     "participants": [_organ_participant("triad_a", reply={"prose": "fine"})]})
-    assert "1 ask(s); 0 of 0 objections): none raised" in late_settlement_reflection_entry(tmp_path, quiet, "rk-1")["reflection"]
-
-
-def test_a_failing_plan_fact_read_still_leaves_the_late_row_with_its_verdict(tmp_path, monkeypatch):
-    monkeypatch.setattr(facts_mod, "plan_review_reflection_slice",
-                        lambda root, tid, task=None: (_ for _ in ()).throw(ValueError("dialogue source torn")))
-    task_id = _late_result(tmp_path)
-
-    entry = late_settlement_reflection_entry(tmp_path, task_id, "rk-1")
-
-    assert entry["reflection"].startswith("Reviewers later passed it.")
-    assert "Plan-review facts unavailable: dialogue source torn" in entry["reflection"]
-
-
-def test_learning_from_a_late_settlement_appends_one_routed_row_and_never_raises(tmp_path, monkeypatch):
-    from ouroboros.task_results import load_task_result
-
-    monkeypatch.setattr(facts_mod, "plan_review_reflection_slice", lambda root, tid, task=None: None)
-    task_id = _late_result(tmp_path)
-    result = load_task_result(tmp_path, task_id)
-
-    assert learn_from_late_settlement(tmp_path, result, "rk-1") is True
-    assert learn_from_late_settlement(tmp_path, result, "unknown-key") is False
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "task_reflections.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert [row["supplement_id"] for row in rows] == ["acceptance-late:rk-1"]
-
-    monkeypatch.setattr("ouroboros.reflection.append_reflection_routed",
-                        lambda env, task, entry: (_ for _ in ()).throw(OSError("disk gone")))
-    assert learn_from_late_settlement(tmp_path, result, "rk-1") is False
-
-
-def test_a_project_bound_late_row_lands_on_the_project_drive_with_a_canonical_pointer(tmp_path, monkeypatch):
-    import ouroboros.project_facts as pf
-    from ouroboros.task_results import load_task_result
-
-    monkeypatch.setattr(pf, "_project_store_root", lambda pid: tmp_path / "projects" / pid)
-    monkeypatch.setattr(facts_mod, "plan_review_reflection_slice", lambda root, tid, task=None: None)
-    canonical = tmp_path / "data"
-    task_id = _late_result(canonical, task_id="late-proj", project_id="slime", budget_drive_root=str(canonical))
-    result = load_task_result(canonical, task_id)
-
-    assert learn_from_late_settlement(canonical, result, "rk-1") is True
-
-    project_log = tmp_path / "projects" / "slime" / "logs" / "task_reflections.jsonl"
-    [row] = [json.loads(line) for line in project_log.read_text(encoding="utf-8").splitlines()]
-    assert row["type"] == LATE_SETTLEMENT_TASK_TYPE and row["task_id"] == "late-proj"
-    [pointer] = [json.loads(line) for line in (canonical / "logs" / "task_reflections.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert pointer["type"] == "project_reflection_pointer" and pointer["project_id"] == "slime"
-
-
-def test_every_path_that_announces_a_settlement_writes_the_row_and_a_replay_does_not(tmp_path, monkeypatch):
-    """Maintenance and recovery announce through enqueue_late_acceptance_settlement directly,
-    so the learning hook lives there: a NEW announcement writes one row, an already delivered
-    notice writes none."""
-    from types import SimpleNamespace
-
-    from ouroboros import acceptance_settlement as settlement
-    from ouroboros.task_results import load_task_result
-    from supervisor import terminal_delivery
-
-    monkeypatch.setattr(facts_mod, "plan_review_reflection_slice", lambda root, tid, task=None: None)
-    monkeypatch.setattr(terminal_delivery, "pending_deliveries", lambda root: [])
-    outcomes = iter([terminal_delivery.ENQUEUE_QUEUED, terminal_delivery.ENQUEUE_ALREADY_DELIVERED])
-    monkeypatch.setattr(terminal_delivery, "enqueue_terminal_delivery_outcome", lambda root, row, event_queue=None: next(outcomes))
-    task_id = _late_result(tmp_path, task_id="late-m")
-    result = load_task_result(tmp_path, task_id)
-    panel = result["review_projection"]["panels"][0]
-    ctx = SimpleNamespace(drive_root=tmp_path, budget_drive_root=str(tmp_path))
-
-    assert settlement.enqueue_late_acceptance_settlement(ctx, task_id, "rk-1", result, panel) == "announced"
-    assert settlement.enqueue_late_acceptance_settlement(ctx, task_id, "rk-1", result, panel) == "published"
-
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "task_reflections.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert [row["supplement_id"] for row in rows] == ["acceptance-late:rk-1"]
+    calm = plan_review_reflection_slice(tmp_path, quiet, task={"task_contract": {}})
+    assert calm["asks"] == 1 and calm["objections"] == []  # none raised

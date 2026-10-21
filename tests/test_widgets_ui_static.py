@@ -13,15 +13,21 @@ def _widgets_js() -> str:
     )
 
 
+def _render_js() -> str:
+    """The declarative renderer, split out of widgets.js for its second consumer."""
+    return _read("web/modules/widget_render.js")
+
+
 def _framed_widget_sources() -> str:
-    """widgets.js (page host, dispatcher, declarative renderer) plus the framed
-    mounts split out of it (widget_module.js), the in-frame bootstrap
-    (widget_frame.js), the framed-card chrome (widget_card.js), the card
-    reorder handles (widget_reorder.js) and the declarative chart helpers
-    (widget_chart.js). Negative pins run against this union so the moved code
-    never leaves their coverage."""
+    """widgets.js (page host, dispatcher) plus the declarative renderer split
+    out of it (widget_render.js), the framed mounts (widget_module.js), the
+    in-frame bootstrap (widget_frame.js), the framed-card chrome
+    (widget_card.js), the card reorder handles (widget_reorder.js) and the
+    declarative chart helpers (widget_chart.js). Negative pins run against this
+    union so the moved code never leaves their coverage."""
     return (
         _widgets_js()
+        + _render_js()
         + _read("web/modules/widget_module.js")
         + _read("web/modules/widget_frame.js")
         + _read("web/modules/widget_card.js")
@@ -42,12 +48,14 @@ def test_widgets_support_declarative_schema_components():
     moved to the dedicated tests below (escape/sanitize, media source guard,
     download host helper, etc.)."""
     source = _widgets_js()
+    renderer = _render_js()
     assert "render.kind === 'declarative'" in source
     # Sentinel components — proof the declarative router is wired
-    assert "type === 'form'" in source
-    assert "type === 'action'" in source
-    assert "type === 'table'" in source
-    assert "type === 'markdown'" in source
+    assert "from './widget_render.js'" in source
+    assert "type === 'form'" in renderer
+    assert "type === 'action'" in renderer
+    assert "type === 'table'" in renderer
+    assert "type === 'markdown'" in renderer
     # Lifecycle / cleanup discipline: a list rebuild disposes every mounted
     # card first; leaving stops everything except the frames the owner keeps
     # running (phase 3).
@@ -134,38 +142,44 @@ def test_widgets_escape_and_sanitize_untrusted_content():
     escapeHtml-around-untrusted-content discipline that remains local
     (table cells, JSON dumps).
     """
-    source = _widgets_js()
-    assert "renderMarkdownSafe" in source
+    renderer = _render_js()
+    assert "renderMarkdownSafe" in renderer
     # Widgets must NOT redeclare the SSOT helper locally.
     assert "function renderMarkdownSafe" not in _framed_widget_sources(), (
-        "widgets.js must use renderMarkdownSafe from utils.js (SSOT), not a local copy"
+        "the widget renderer must use renderMarkdownSafe from utils.js (SSOT), not a local copy"
     )
-    assert "escapeHtml(JSON.stringify(value, null, 2))" in source
-    assert "renderTableCell(row, c)" in source
+    assert "escapeHtml(JSON.stringify(value, null, 2))" in renderer
+    assert "renderTableCell(row, c)" in renderer
     # The table cell renderer and its http(s)-only link guard moved to
     # widget_chart.js (cycle-A fix round, ratchet room); the guard still exists.
     assert "function safeTableHref" in _read("web/modules/widget_chart.js")
 
 
 def test_widgets_media_sources_are_constrained_to_extension_routes_or_data_urls():
+    # The renderer resolves routes through the place it renders in; the Widgets
+    # page passes the card's own skill routes (behaviour: web/tests/widget_render.test.js).
     source = _widgets_js()
-    assert "function safeMediaSrc" in source
-    assert "effectiveTarget = ''" in source
-    assert "state[effectiveTarget || spec.target || 'result']" in source
-    assert "safeMediaSrc(tab, component, state, target)" in source
-    assert "const route = spec.route || spec.api_route || '';" in source
+    renderer = _render_js()
+    assert "function safeMediaSrc" in renderer
+    assert "effectiveTarget = ''" in renderer
+    assert "state[effectiveTarget || spec.target || 'result']" in renderer
+    assert "safeMediaSrc(ctx, component, state, target)" in renderer
+    assert "const route = spec.route || spec.api_route || '';" in renderer
+    assert "return ctx.routePath(route, params);" in renderer
     assert "extensionRoutePath(tab.skill, route, params)" in source
-    assert "data:(image\\/" in source
-    assert "parsed.pathname.startsWith(expectedPrefix)" in source
-    assert "parsed.origin === window.location.origin" in source
+    assert "routePrefix: extensionRoutePrefix(tab.skill)" in source
+    assert "data:(image\\/" in renderer
+    assert "expectedPrefix && parsed.origin === window.location.origin" in renderer
+    assert "parsed.pathname.startsWith(expectedPrefix)" in renderer
     assert "javascript:" not in _framed_widget_sources()
-    assert "`${treePath}.gallery.${idx}`, passiveTarget" in source
+    assert "`${treePath}.gallery.${idx}`, passiveTarget" in renderer
 
 
 def test_widgets_downloads_use_host_handler_not_navigation():
     source = _widgets_js()
     helper = _read("web/modules/ui_helpers.js") + _read("web/modules/ui_primitives.js")
-    assert "data-widget-download-url" in source
+    assert "data-widget-download-url" in _render_js()
+    assert "button.dataset.widgetDownloadUrl" in source
     assert "event.preventDefault();" in source
     assert "downloadViaHostBridge(" in source
     assert "download_file_to_downloads" in helper
@@ -418,7 +432,7 @@ def test_widgets_launch_policy_controls_and_stop_suppression():
     assert "startModeWrites = write.catch(() => {});" in page
     set_mode = page.split("async function setWidgetStartMode(key, mode) {", 1)[1].split("bindWidgetCardMenus", 1)[0]
     assert set_mode.index("await write;") < set_mode.index("const card = liveCardFor(list, key);")
-    assert "bindWidgetCardMenus(list, setWidgetStartMode, widths);" in page
+    assert "bindWidgetCardMenus(list, setWidgetStartMode, widths, removeKeptCard);" in page
     assert "event.target.closest('[data-widget-power]')" in page
     # Force-stop + eviction on a vanished card; the frame keeps its ack window.
     removed_branch = page.split("for (const key of plan.removed) {", 1)[1].split("for (const tab of nextTabs) {", 1)[0]
@@ -531,7 +545,7 @@ def test_widgets_card_width_is_owner_ui_preference():
     assert "widget_size: readSizes(prefs.widget_size)," in sync
     assert "widths.readSizes(" not in source
     assert "save: (payload) => apiClient.saveUiPreferences(payload)," in source
-    assert "const cardMenus = bindWidgetCardMenus(list, setWidgetStartMode, widths);" in source
+    assert "const cardMenus = bindWidgetCardMenus(list, setWidgetStartMode, widths, removeKeptCard);" in source
     assert "export function createWidgetWidths(list, options)" in reorder
     assert "list.parentElement?.querySelector('[data-widget-arrange-status]')" in reorder
     assert "const mode = plan.availableColumns > 1 ? 'columns' : 'stack';" in reorder
@@ -557,7 +571,7 @@ def test_widgets_card_width_is_owner_ui_preference():
 
 
 def test_widget_form_label_is_accessible_heading_fallback():
-    source = _widgets_js()
+    source = _render_js()
     assert "const heading = component.title || component.label || '';" in source
     assert 'aria-label="${escapeHtml(heading)}"' in source
     assert "heading ? `<h4>${escapeHtml(heading)}</h4>` : ''" in source
@@ -645,7 +659,7 @@ def test_widgets_v5_7_0_new_components_render():
     (HTML5 drag with on_move POST). All three must be present in the
     declarative renderer so authors can reference them in widgets, and
     none of them may bring skill-supplied JS into the SPA origin."""
-    source = _widgets_js()
+    source = _render_js()
     assert "type === 'map'" in source
     assert "type === 'calendar'" in source
     assert "type === 'kanban'" in source
@@ -658,13 +672,13 @@ def test_widgets_v5_7_0_new_components_render():
 
 
 def test_widgets_render_subscription_children():
-    source = _widgets_js()
+    source = _render_js()
     assert "type === 'subscription'" in source
     assert "component.render" in source
     assert "widget-subscription-render" in source
     assert "inheritedTarget = ''" in source
     assert "component.target || inheritedTarget || 'result'" in source
-    assert "renderComponent(tab, child, view, `${treePath}.render.${idx}`, target)" in source
+    assert "renderComponent(ctx, child, view, `${treePath}.render.${idx}`, target)" in source
     assert "const passiveTarget = inheritedTarget ? target : '';" in source
     assert "value_key" in source
     assert "items_key" in source
@@ -674,11 +688,13 @@ def test_widgets_render_subscription_children():
 
 def test_widgets_schema_v1_composition_uses_stable_tree_keys():
     source = _widgets_js()
-    assert "function componentIdentity" in source
-    assert "function indexComponentTree" in source
-    assert "type === 'group'" in source
-    assert "type === 'metric'" in source
-    assert "type === 'callout'" in source
+    renderer = _render_js()
+    assert "function componentIdentity" in renderer
+    assert "function indexComponentTree" in renderer
+    assert "indexComponentTree(components)" in source
+    assert "type === 'group'" in renderer
+    assert "type === 'metric'" in renderer
+    assert "type === 'callout'" in renderer
     assert "visibleKeys.forEach((key)" in source
     assert "components[Number(" not in _framed_widget_sources()
     assert "data-widget-kanban-key" in source
@@ -691,9 +707,10 @@ def test_widgets_forms_charts_and_kanban_keep_host_owned_contracts():
     renderer with its number formatter and http(s)-only link guard followed in
     the cycle-A fix round."""
     source = _widgets_js()
+    renderer = _render_js()
     helper = _read("web/modules/ui_helpers.js") + _read("web/modules/ui_primitives.js")
     chart = _read("web/modules/widget_chart.js")
-    assert "renderSafeField(" in source
+    assert "renderSafeField(" in renderer
     assert "collectSafeFieldValues(" in source
     assert "includePasswords: false" in source
     assert "pendingActions.has(key)" in source
@@ -705,11 +722,11 @@ def test_widgets_forms_charts_and_kanban_keep_host_owned_contracts():
     assert "spanGaps: false" in chart
     assert "export function finiteChartValue" in chart
     assert "data.map(finiteChartValue)" in chart
-    assert "aria-label=" in source
-    assert "renderChartDataTable(config, label, !chartAvailable)" in source
+    assert "aria-label=" in renderer
+    assert "renderChartDataTable(config, label, !chartAvailable)" in renderer
     assert "export function renderChartDataTable" in chart
-    assert "data-widget-kanban-move" in source
-    assert "widget-kanban-empty" in source
+    assert "data-widget-kanban-move" in renderer
+    assert "widget-kanban-empty" in renderer
     assert "listen('change', (event) =>" in source
     assert "select?.closest('[data-widget-kanban-key]')" in source
     assert "{ card_id: cardId, column_id: columnId }" in source
@@ -741,7 +758,7 @@ def test_widgets_responsive_design_system_styles_are_host_owned():
 
 
 def test_widget_public_tones_share_the_host_normalizer_and_canonical_css():
-    source = _widgets_js()
+    source = _render_js()
     helper = _read("web/modules/ui_helpers.js") + _read("web/modules/ui_primitives.js")
     style = _read("web/style.css")
     assert "function widgetTone" not in _framed_widget_sources()
@@ -755,7 +772,7 @@ def test_widget_public_tones_share_the_host_normalizer_and_canonical_css():
 
 
 def test_widget_metrics_share_the_standard_empty_value_and_numeric_formatter():
-    source = _widgets_js()
+    source = _render_js()
     assert "const numericValue = text ? Number(text) : Number.NaN;" in source
     assert "!Number.isNaN(numericValue) && !Number.isFinite(numericValue)" in source
     assert "const structured = raw !== null && typeof raw === 'object';" in source

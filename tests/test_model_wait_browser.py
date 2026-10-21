@@ -17,6 +17,15 @@ TASK = "analysis-task"
 API_LANE = "api:openai"
 
 
+def _chip_look(card):
+    """The card chip's status mark (docs/DESIGN.md "Status marks"): its body tone, the mark's shape and hue, and
+    whether any of its dots animates."""
+    return card.locator('[data-live-phase]').evaluate("""el => { const mark = el.querySelector(':scope > .status-mark');
+        const dots = [...mark.querySelectorAll('i')].map(dot => getComputedStyle(dot).animationName);
+        return {tone: el.dataset.chipTone, shape: mark.dataset.shape, hue: mark.dataset.hue,
+            animation: dots.find(name => name !== 'none') || 'none'}; }""")
+
+
 @pytest.fixture
 def waiting_ui(subscription_ui):
     ui = subscription_ui
@@ -149,7 +158,8 @@ def test_multiple_waits_toggle_and_exact_role_switch_wait_for_application(waitin
     card = page.locator(f'.chat-live-card[data-task-id="{TASK}"]')
     assert page.locator('.model-wait-row').count() == 2
     assert card.locator('[data-live-phase]').inner_text() == 'Waiting for access'
-    assert not card.locator('[data-live-typing]').is_visible()
+    # Quota that resumes by itself: a neutral chip with still dots, nothing that moves and no owner's amber.
+    assert _chip_look(card) == {'tone': 'neutral', 'shape': 'still', 'hue': 'ink', 'animation': 'none'}
     assert card.get_attribute('data-expanded') == '0'
     assert 'worker slot' in card.locator('[data-wait-slot]').inner_text()
     assert light.locator('[data-wait-auto]').is_checked()
@@ -371,9 +381,14 @@ def test_wait_reconnect_preserves_unsubmitted_form_without_context_or_animation(
     ui, page = waiting_ui, waiting_ui["page"]
     row = page.locator('[data-wait-id="main-wait"]')
     page.evaluate("() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done)))")
-    assert page.locator('.chat-live-card[data-model-waiting="1"] .chat-live-phase').evaluate(
-        "el => getComputedStyle(el).animationName"
-    ) == "none"
+    waiting_card = page.locator('.chat-live-card[data-model-waiting="1"]')
+    # An automatic wait is neutral and still; the same wait once only the owner can end it is the owner's move, amber.
+    assert _chip_look(waiting_card) == {'tone': 'neutral', 'shape': 'still', 'hue': 'ink', 'animation': 'none'}
+    ui['rows']['main-wait'].update(revision=2, auto_continue=False, requires_owner_action=True)
+    ui['emit'](ui['rows']['main-wait'])
+    page.wait_for_function("() => document.querySelector('.chat-live-card[data-model-waiting=\"1\"] .chat-live-phase')"
+                           "?.dataset.chipTone === 'owner'")
+    assert _chip_look(waiting_card) == {'tone': 'owner', 'shape': 'dot', 'hue': 'owner', 'animation': 'none'}
     row.locator('[data-wait-change]').click()
     field = row.locator('[data-model-role-model]')
     field.wait_for()
@@ -467,7 +482,7 @@ def test_paid_review_controls_survive_author_terminal_and_reload(waiting_ui, tmp
     card.wait_for()
     assert waiter.is_visible(), 'paid review outlives the terminal author'
     assert page.locator('[data-wait-id="main-wait"]').count() == 0
-    assert not card.locator('[data-live-typing]').is_visible()
+    assert _chip_look(card) == {'tone': 'ok', 'shape': 'dot', 'hue': 'ok', 'animation': 'none'}
     waiter.locator('[data-wait-auto]').uncheck()
     waiter.locator('[data-wait-notice]').filter(has_text='Request accepted').wait_for()
     assert ui['controls'][-1]['decision_id'] == f'model_wait:{TASK}:light-wait'
@@ -615,12 +630,13 @@ def test_a_checked_role_save_that_did_not_land_is_told_once_its_wait_settles(wai
     closing = {**copy.deepcopy(repeat), 'wait_id': 'closing-wait', 'role': 'light', 'revision': 1, 'state': 'waiting'}
     for key in ('applied_request_id', 'resolution'):
         closing.pop(key, None)
-    ui['rows']['closing-wait'] = closing
+    # This wait is closing-task's own: the census (which the frame below reads again) lists it under no other task.
     frame({'type': 'log', 'chat_id': 1, 'data': {'type': 'task_model_wait', 'task_id': task, 'chat_id': 1,
                                                  'ts': '2026-09-06T22:03:01Z', **closing}})
     answers['closing-wait'] = [lambda body: (202, {
         'ok': True, 'decision_id': body['decision_id'], 'request_id': body['request_id'], 'state': 'waiting',
-        'duplicate': False, 'applied': False, 'saved': False, 'wait': pending('closing-wait', body)})]
+        'duplicate': False, 'applied': False, 'saved': False,
+        'wait': {**copy.deepcopy(closing), 'pending_action': {k: v for k, v in body.items() if k != 'decision_id'}}})]
     closing_view = choose('closing-wait', 'closing-model')
     closing_view.locator('[data-wait-notice]').filter(has_text='Settings were not saved.').wait_for()
     frame({'type': 'log', 'chat_id': 1, 'data': {'type': 'task_done', 'task_id': task, 'status': 'completed',

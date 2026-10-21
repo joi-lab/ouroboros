@@ -100,7 +100,7 @@ def test_only_observed_running_writers_earn_the_wait_or_stop_advice():
     for unknown in ({"kind": "delegated_run", "state": "stop_unknown", "stop_outcome": "pending_invocation_unbound"},
                     {"kind": "delegated_run", "state": "stop_requested"}, {"kind": "model_handoff"},
                     {"kind": "custody_unreadable"}, {"kind": "tree_census_unreadable"},
-                    {"kind": "late_phase_paused"}, {"kind": "tool_handoff"}, "not-a-row"):
+                    {"kind": "late_phase_unknown"}, {"kind": "tool_handoff"}, "not-a-row"):
         assert not only_running_writers([unknown]), unknown
         # Beside a running writer it still holds: waiting or stopping would not settle it.
         assert not only_running_writers([{"kind": "running_member", "task_id": "x"}, unknown]), unknown

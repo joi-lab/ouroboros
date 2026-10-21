@@ -1,17 +1,21 @@
-"""Maintenance discovery returns the sweep while preserving packer lifetime and packing authority."""
+"""Evidence discovery runs in the maintenance child: the server's reconcile pass only reserves the
+child slot (no stamp walk on a server thread) while the child keeps its lifetime, exit census and
+packing authority."""
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 import time
 
 import pytest
 
-from ouroboros import evidence_packer as packer, evidence_packs as packs, store, store_switch
+from ouroboros import evidence_packer as packer, evidence_packs as packs, maintenance, store, store_switch
+from tests._store_journal_shared import exclusive_hold
 from tests.test_evidence_packs import REPO, _FakeChild, _task, root as root
 
 pytestmark = pytest.mark.serial
+
+_QUIET = json.dumps({"status": "completed", "jobs": {}}).encode()
 
 
 def _join(unit):
@@ -19,45 +23,44 @@ def _join(unit):
     assert not unit._thread.is_alive()
 
 
-def test_reconcile_releases_its_latch_during_real_stamp_discovery(root, monkeypatch):
-    from ouroboros import server_maintenance as maintenance
+def test_reconcile_pass_reserves_the_child_and_walks_no_stamp_in_the_server(root, monkeypatch):
+    from ouroboros import server_maintenance
 
     _task(root, "candidate", blobs=1)
-    unit = packer.EvidencePacker()
-    assert not unit.tick(root, REPO)
+    unit = maintenance.MaintenanceChild()
     entered, release = threading.Event(), threading.Event()
-    original = packer._stamp
     calls = []
 
-    def stamp(*args, **kwargs):
+    def due(data_root):
+        assert threading.current_thread().name == "maintenance-child"
         entered.set()
         assert release.wait(10)
-        return original(*args, **kwargs)
+        return ["evidence_packing"]
 
-    monkeypatch.setattr(packer, "_stamp", stamp)
-    monkeypatch.setattr(packer, "packer", unit)
-    monkeypatch.setattr(maintenance, "DATA_DIR", root)
-    monkeypatch.setattr(maintenance, "_stop_requested", lambda *_: False)
-    monkeypatch.setattr(maintenance, "_periodic_zombie_reconcile", lambda **_: None)
-    monkeypatch.setattr(maintenance, "_run_drive_custody_pass", lambda *_: None)
-    monkeypatch.setattr(maintenance, "_step_recovered", calls.append)
-    for name in ("_STARTUP_PRUNES_OWED", "_STARTUP_TREES_OWED", "_STARTUP_SOURCE_PRUNES_OWED", "_STARTUP_TEMP_SWEEP_OWED"):
-        monkeypatch.setattr(maintenance, name, [False])
+    monkeypatch.setattr(packer, "_stamp", lambda *a, **k: pytest.fail("a stamp walk ran on a server thread"))
+    monkeypatch.setattr(maintenance, "due", due)
+    monkeypatch.setattr(maintenance, "child", unit)
+    monkeypatch.setattr(server_maintenance, "DATA_DIR", root)
+    monkeypatch.setattr(server_maintenance, "_stop_requested", lambda *_: False)
+    monkeypatch.setattr(server_maintenance, "_periodic_zombie_reconcile", lambda **_: None)
+    monkeypatch.setattr(server_maintenance, "_run_drive_custody_pass", lambda *_: None)
+    monkeypatch.setattr(server_maintenance, "_step_recovered", calls.append)
+    monkeypatch.setattr(server_maintenance, "_run_reconcile_prunes", lambda *_a: None)
     monkeypatch.setattr("supervisor.workspace_preparation.recover_interrupted_preparations", lambda *a, **k: None)
     monkeypatch.setattr("ouroboros.late_review_marks.replay_owed_late_reviews", lambda *a, **k: None)
-    monkeypatch.setattr("ouroboros.review_operation.collect_orphaned_operations_softly", lambda *a, **k: None)
+    monkeypatch.setattr("ouroboros.review_operation.local_reviews_settled", lambda *a, **k: True)
     spawns = []
-    report = json.dumps({"status": "completed", **dict.fromkeys(packer._COUNTERS, 0)}).encode()
-    monkeypatch.setattr(packer, "spawn_maintenance_job", lambda *a: spawns.append(a) or _FakeChild(report))
+    monkeypatch.setattr(maintenance, "spawn_maintenance_job", lambda *a: spawns.append(a) or _FakeChild(_QUIET))
     latch, marker, finished = threading.Lock(), [0.0], threading.Event()
     latch.acquire()
-    sweep = threading.Thread(target=lambda: (maintenance._run_periodic_reconcile_sweep(marker, latch=latch), finished.set()))
+    sweep = threading.Thread(target=lambda: (server_maintenance._run_periodic_reconcile_sweep(marker, latch=latch),
+                                             finished.set()))
     sweep.start()
     try:
         assert entered.wait(5)
-        assert finished.wait(1), "candidate discovery still occupies the reconcile pass"
+        assert finished.wait(1), "the job-facts read still occupies the reconcile pass"
         assert not latch.locked() and marker[0] > 0 and calls == ["reconcile_sweep"]
-        assert not unit.tick(root, REPO), "overlapping discovery admitted"
+        assert not unit.tick(root, REPO), "overlapping dispatch admitted"
         assert unit.live_children() == [unit._thread]
         unit.stop()
         assert unit.live_children() == [unit._thread], "Stop is not evidence of reader exit"
@@ -66,7 +69,7 @@ def test_reconcile_releases_its_latch_during_real_stamp_discovery(root, monkeypa
         sweep.join(10)
         _join(unit)
     assert unit.live_children() == []
-    assert spawns == [], "discovery spawned after Stop"
+    assert spawns == [], "spawned after Stop"
 
 
 @pytest.mark.parametrize("count", [1, 128])
@@ -99,19 +102,19 @@ def test_changed_discovery_short_circuits_but_quiet_install_still_scans(root, mo
                       "quiet_cpu": time.process_time() - cpu}))
 
 
-def test_archive_only_skips_task_discovery_and_spawns_existing_child(root, monkeypatch):
+def test_archive_only_spawns_the_child_without_a_task_census_in_the_server(root, monkeypatch):
     archive = root / packs.USAGE_ARCHIVE_REL
     archive.mkdir(parents=True)
     (archive / "segment_ep1_0001.jsonl").write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(packer, "_loose_task_ids", lambda *a: pytest.fail("archive-only needs no task census"))
+    maintenance.run_job(root, "evidence_packing")  # archives the waiting segment: quiet again
+    (archive / "segment_ep1_0002.jsonl").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(packer, "_loose_task_ids", lambda *a: pytest.fail("the server took a task census"))
     calls = []
-    report = json.dumps({"status": "completed", **dict.fromkeys(packer._COUNTERS, 0)}).encode()
-    monkeypatch.setattr(packer, "spawn_maintenance_job", lambda *a: calls.append(a) or _FakeChild(report))
-    unit = packer.EvidencePacker()
-    assert not unit.tick(root, REPO)
+    monkeypatch.setattr(maintenance, "spawn_maintenance_job", lambda *a: calls.append(a) or _FakeChild(_QUIET))
+    unit = maintenance.MaintenanceChild()
     assert unit.tick(root, REPO)
     _join(unit)
-    assert len(calls) == 1
+    assert len(calls) == 1 and calls[0][2] == "maintenance"
 
 
 def test_discovery_does_not_rebuild_a_missing_index(root, monkeypatch):
@@ -122,10 +125,10 @@ def test_discovery_does_not_rebuild_a_missing_index(root, monkeypatch):
     assert not (packs.packs_dir(root) / packs.INDEX_NAME).exists()
 
 
-@pytest.mark.parametrize("busy", ["facts", "packs", "packs_sql", "packs_sql_cached", "money"])
-def test_real_contention_defers_discovery_without_waiting_or_spawning(root, monkeypatch, busy):
-    from ouroboros import usage_store
-
+@pytest.mark.parametrize("busy", ["facts", "packs", "packs_sql", "packs_sql_cached"])
+def test_real_contention_never_waits_and_discovery_defers_without_recording(root, monkeypatch, busy):
+    """The server's look never waits on a held store (it defers the spawn); in the child,
+    discovery under contention defers too and records nothing, so the job stays due."""
     _task(root, "candidate", blobs=1)
     with packs.open_index(root):
         pass
@@ -133,31 +136,46 @@ def test_real_contention_defers_discovery_without_waiting_or_spawning(root, monk
         with packs.open_index(root):
             pass
         assert str(packs.packs_dir(root) / packs.INDEX_NAME) in packs._VALIDATED
-    if busy == "money":
-        with usage_store.hold(root, write=True):
-            pass
     spawns = []
-    report = json.dumps({"status": "completed", **dict.fromkeys(packer._COUNTERS, 0)}).encode()
-    monkeypatch.setattr(packer, "spawn_maintenance_job", lambda *a: spawns.append(a) or _FakeChild(report))
-    unit = packer.EvidencePacker()
-    assert not unit.tick(root, REPO)
-    if busy in {"facts", "packs_sql", "packs_sql_cached", "money"}:
-        path = {"facts": root / "state/current.sqlite", "money": root / usage_store.STORE_REL,
-                "packs_sql": packs.packs_dir(root) / packs.INDEX_NAME}[busy.removesuffix("_cached")]
-        conn = sqlite3.connect(path, timeout=0)
-        conn.execute("BEGIN EXCLUSIVE")
-        try:
+    monkeypatch.setattr(maintenance, "spawn_maintenance_job", lambda *a: spawns.append(a) or _FakeChild(_QUIET))
+    unit = maintenance.MaintenanceChild()
+
+    def held():
+        if busy in {"facts", "packs_sql", "packs_sql_cached"}:
+            path = {"facts": root / "state/current.sqlite",
+                    "packs_sql": packs.packs_dir(root) / packs.INDEX_NAME}[busy.removesuffix("_cached")]
+            return exclusive_hold(path)  # reads busy too, under WAL as under the rollback journal
+        return None
+
+    conn = held()
+    try:
+        context = store.name_lock(root, packs.INDEX_LOCK_NAME, timeout_sec=0) if conn is None else None
+        with context if context is not None else _null():
+            started = time.monotonic()
             assert unit.tick(root, REPO)
             _join(unit)
-        finally:
+            assert time.monotonic() - started < store.STORE_WAIT_SEC, "the look waited on a held store"
+            if busy == "facts":
+                assert spawns == [], "a held fact store still spawned"
+            else:
+                with pytest.raises(Exception) as caught:
+                    maintenance.run_job(root, "evidence_packing")
+                assert maintenance._contention(caught.value), caught.value
+    finally:
+        if conn is not None:
             conn.rollback()
             conn.close()
-    else:
-        with store.name_lock(root, packs.INDEX_LOCK_NAME, timeout_sec=0):
-            assert unit.tick(root, REPO)
-            _join(unit)
+    assert "evidence_packing" in maintenance.due(root), "a deferred discovery recorded a quiet fact"
     unit.stop()
-    assert not unit.live_children() and spawns == []
+    assert not unit.live_children()
+
+
+class _null:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False
 
 
 def test_stop_during_directory_discovery_does_not_read_stores(root, monkeypatch):
@@ -175,7 +193,7 @@ def test_stop_during_directory_discovery_does_not_read_stores(root, monkeypatch)
     assert not packer.packing_pending(root, stopped.is_set)
 
 
-def test_actual_exit_consumers_keep_blocked_discovery_visible_then_accept_exit(root, monkeypatch):
+def test_actual_exit_consumers_keep_a_blocked_dispatch_visible_then_accept_exit(root, monkeypatch):
     import server
     from ouroboros import body_adoption
     from tests.test_body_adoption_consumers import EXITED
@@ -195,20 +213,19 @@ def test_actual_exit_consumers_keep_blocked_discovery_visible_then_accept_exit(r
     restart_receipt(root, commit, "test maintenance exit")
     assert body_adoption.bind_restart(lambda **_: (True, "ok"), root, "test maintenance exit")()[0]
     _task(root, "candidate", blobs=1)
-    unit = packer.EvidencePacker()
+    unit = maintenance.MaintenanceChild()
     entered, release = threading.Event(), threading.Event()
-    original = packer._stamp
+    original = maintenance.due
 
-    def stamp(*args, **kwargs):
+    def due(data_root):
         entered.set()
         assert release.wait(10)
-        return original(*args, **kwargs)
+        return original(data_root)
 
-    monkeypatch.setattr(packer, "_stamp", stamp)
-    monkeypatch.setattr(packer, "packer", unit)
+    monkeypatch.setattr(maintenance, "due", due)
+    monkeypatch.setattr(maintenance, "child", unit)
     spawns = []
-    report = json.dumps({"status": "completed", **dict.fromkeys(packer._COUNTERS, 0)}).encode()
-    monkeypatch.setattr(packer, "spawn_maintenance_job", lambda *a: spawns.append(a) or _FakeChild(report))
+    monkeypatch.setattr(maintenance, "spawn_maintenance_job", lambda *a: spawns.append(a) or _FakeChild(_QUIET))
     monkeypatch.setattr(server, "DATA_DIR", root)
     monkeypatch.setattr(server, "begin_owned_stop", lambda *_: None)
     monkeypatch.setattr(server, "stop_owned_work", lambda *_: {"state": "completed", "unconfirmed": []})
@@ -220,7 +237,6 @@ def test_actual_exit_consumers_keep_blocked_discovery_visible_then_accept_exit(r
     monkeypatch.setattr(server, "_restart_requested", threading.Event())
     monkeypatch.setattr(server, "_owner_restart_requested", threading.Event())
     server._restart_requested.set()
-    assert not unit.tick(root, REPO)
     assert unit.tick(root, REPO)
     try:
         assert entered.wait(5)
@@ -233,7 +249,7 @@ def test_actual_exit_consumers_keep_blocked_discovery_visible_then_accept_exit(r
     finally:
         release.set()
         _join(unit)
-    assert spawns == [], "discovery spawned after Stop"
+    assert spawns == [], "the dispatch spawned after Stop"
     handoff = body_adoption.read(root)
     handoff["restart_bound"] = True
     body_switch.write_handoff(str(body_adoption.helper_dir(root)), handoff)

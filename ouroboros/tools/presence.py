@@ -11,14 +11,13 @@ from typing import Any, List
 from ouroboros.tools.registry import ToolContext, ToolEntry
 
 PRESENCE_OUTCOMES = ("message", "silent", "tool_delivered", "deferred")
-AUTHOR_DISPOSITIONS = ("accepted", "rejected", "partial", "deferred")
 # The initiating call returns before its own operation bound ends; the turn keeps running.
 _INITIATION_MARGIN_SEC = 10.0
 
 
 def _finish_presence(ctx: ToolContext, outcome: str, message: str = "", action: str = "finish",
                      rationale: str = "", answer_sha256: str | None = None,
-                     pending_review: str | None = None, author_disposition: str = "",
+                     pending_review: str | None = None,
                      acceptance_subject: dict | None = None) -> str:
     contract = getattr(ctx, "task_contract", {})
     if not isinstance(contract, dict) or not isinstance(contract.get("capability_ceiling"), dict):
@@ -26,28 +25,16 @@ def _finish_presence(ctx: ToolContext, outcome: str, message: str = "", action: 
     selected = str(outcome or "").strip()
     if selected not in PRESENCE_OUTCOMES:
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: PRESENCE_OUTCOME_INVALID: choose message, silent, tool_delivered, or deferred.")))
-    disposition = str(author_disposition or "").strip().lower()
-    if disposition and disposition not in AUTHOR_DISPOSITIONS:
-        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(
-            "ERROR: COMPLETION_ARGUMENT: author_disposition is accepted, rejected, partial or deferred.")))
     from ouroboros.tools.control_runtime import stage_completion_request
     reply_later = not message and answer_sha256 is None and selected in {"message", "deferred"}
-    # The author's stance toward review criticism rides the existing agent decision of the
-    # completion request, exactly as task_acceptance_review stages Main's (``consume_completion_request``).
-    decision = ({"disposition": disposition, "explicit_finish": True, "author_action": action,
-                 "rationale": " ".join(str(rationale).split())[:1000], "source": "presence_finish"}
-                if disposition else None)
     result = stage_completion_request(ctx, {"action": action, "rationale": rationale, "pending_review": pending_review,
-        "acceptance_subject": acceptance_subject, "agent_decision": decision,
+        "acceptance_subject": acceptance_subject,
         **({"answer_sha256": answer_sha256} if answer_sha256 is not None else {"answer": message})},
         source="presence_finish", allow_empty=selected in {"silent", "tool_delivered"}, reply_later=reply_later)
     if not getattr(ctx, "_completion_request", None) or getattr(ctx, "_completion_conflict", False):
         return result
     from ouroboros.presence_continuation import selection_for
 
-    # A ready panel or owner message may have skipped the preceding park. Its
-    # unpublished early-release choice cannot survive a new author selection.
-    ctx._presence_release = None
     ctx._presence_completion = {
         "outcome": selected,
         "message": str(message or "").strip(),
@@ -382,16 +369,8 @@ def get_tools() -> List[ToolEntry]:
                     "properties": {
                         "outcome": {"type": "string", "enum": list(PRESENCE_OUTCOMES)},
                         "action": {"type": "string", "enum": ["finish", "stop"], "default": "finish"},
-                        "rationale": {"type": "string", "description": "Required for stop: what remains unfinished. Optional for finish, with or without author_disposition. Over an exposed local acceptance-preparation failure, state the caveat here for author_finish; without it, the host retains the preparation-failure cause, not a validation rejection. Delivery outcome is independent."},
+                        "rationale": {"type": "string", "description": "Required for stop: what remains unfinished. Optional for finish. Delivery outcome is independent."},
                         "answer_sha256": {"type": "string", "description": "Select an offered complete answer instead of message or reply-later."},
-                        "author_disposition": {
-                            "type": "string", "enum": list(AUTHOR_DISPOSITIONS),
-                            "description": "Optional stance toward the acceptance review's criticism of this answer: "
-                                           "accepted (you corrected it), rejected, partial or deferred. After exposed "
-                                           "review feedback, an explicit Advisory finish of the current answer (corrected "
-                                           "or not) ends without another panel, with or without it. Never creates a "
-                                           "reviewer PASS; Blocking still needs approval.",
-                        },
                         "acceptance_subject": {
                             "type": "object",
                             "description": "Your current subject decision when the host shows changed premises: the exact "
@@ -406,10 +385,9 @@ def get_tools() -> List[ToolEntry]:
                         },
                         "pending_review": {
                             "type": "string", "enum": ["wait", "finish"], "default": "wait",
-                            "description": "Only while an acceptance review of this answer is still running and the host "
-                                           "offers the choice: wait holds it; finish releases it now while you stay "
-                                           "responsible for the review's criticism and may still correct it. Either way "
-                                           "the conversation is free while the review runs; blocking review always waits.",
+                            "description": "Only while a review of this answer is still running and the host offers "
+                                           "the choice: wait holds it; finish delivers it now and the reviewers settle "
+                                           "later. Blocking review always waits.",
                         },
                         "message": {
                             "type": "string",
@@ -486,7 +464,7 @@ def get_tools() -> List[ToolEntry]:
                     "The cycle must use its selected transport send capability and finish with "
                     "tool_delivered for an external message to have been sent. The cycle is its own "
                     "task: this call returns its first result (status completed, or continuing while "
-                    "its result awaits review), or status running if this call's own time ends first; "
+                    "it waits on a review), or status running if this call's own time ends first; "
                     "the cycle then continues under its own controls."
                 ),
                 "parameters": {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import pathlib
@@ -36,6 +37,7 @@ from .lib.telegram_state import (
 from .lib import telegram_i18n, telegram_inbound, telegram_quiz
 from .lib.telegram_health import _collect_health, _build_menu_tasks
 from .lib.telegram_notifier import _make_notifier, _notify_enabled, _completion_text, _relay_text
+from .lib.telegram_typing import TypingCue, host_reply_preparation
 from .lib.miniapp_registration import _read_status, register as register_miniapp
 from .scripts.telegram_settings import (
     TelegramSettingsError,
@@ -175,10 +177,8 @@ def _build_menu_mind(command_mode: str, lang: str = "en", bg_enabled: bool = Fal
 
 
 def _load_recent_thoughts(api) -> str:
-    """Read the last few blocks from progress.jsonl and build a text snapshot."""
+    """Read the last few SQL progress rows and build a text snapshot."""
     progress_file = _data_dir(api) / "logs" / "progress.jsonl"
-    if not progress_file.exists():
-        return "_No thoughts log created yet._"
     try:
         entries, _prefix_omitted = _jsonl_tail(
             progress_file,
@@ -195,7 +195,7 @@ def _load_recent_thoughts(api) -> str:
             timestamp = str(elem.get("ts") or elem.get("timestamp") or elem.get("created_at") or "")
             task_id = str(elem.get("task_id") or "").strip()
             if preview != text:
-                ref = "data/logs/progress.jsonl"
+                ref = "data/state/dialog.sqlite (progress)"
                 if timestamp:
                     ref += f" @ {timestamp}"
                 if task_id:
@@ -211,7 +211,7 @@ def _load_recent_thoughts(api) -> str:
                 break
         if not recent:
             return "_Thoughts log is empty or waiting for next cycle._"
-        return "\n".join(recent) + "\n\nShowing up to 4 recent entries. Full source: data/logs/progress.jsonl"
+        return "\n".join(recent) + "\n\nShowing up to 4 recent entries. Full source: data/state/dialog.sqlite (progress)"
     except Exception as exc:
         return f"_Failed to read log: {exc}_"
 
@@ -1024,7 +1024,7 @@ def _make_poller(api):
     return lambda: _poller(api)
 
 
-def _make_outbound(api):
+def _make_outbound(api, cue: TypingCue | None = None):
     async def handle(event: Dict[str, Any]) -> None:
         try:
             local_settings = _load_settings(api)
@@ -1117,20 +1117,25 @@ def _make_outbound(api):
             silent_on = _is_silent_mode_enabled(local_settings) and event.get("role") != "system"
             tracked_msg_id = _get_silent_msg(api, chat_id) if silent_on else 0
 
-            # Silent mode: try to edit the previously tracked message in-place.
-            # editMessageText returns False on any failure (too old, deleted,
-            # identical content, parse error) so we fall back to sendMessage.
-            if silent_on and tracked_msg_id and _same_silent_episode(api, chat_id, tracked_msg_id, event):
-                edited = await client.edit_message_text(chat_id, tracked_msg_id, text, parse_mode=parse_mode)
-                if not edited and parse_mode:
-                    edited = await client.edit_message_text(chat_id, tracked_msg_id, text, parse_mode="")
-                if edited:
-                    return
-                # Edit failed (likely too old or already identical) — clear
-                # tracking and fall through to sendMessage path.
-                _clear_silent_msg(api, chat_id)
+            # An answer never lands under, or revives, the typing it ends (DESIGN §9).
+            async with _cue_message(cue, chat_id) as delivered:
+                # Silent mode: try to edit the previously tracked message in-place.
+                # editMessageText returns False on any failure (too old, deleted,
+                # identical content, parse error) so we fall back to sendMessage.
+                if silent_on and tracked_msg_id and _same_silent_episode(api, chat_id, tracked_msg_id, event):
+                    edited = await client.edit_message_text(chat_id, tracked_msg_id, text, parse_mode=parse_mode)
+                    if not edited and parse_mode:
+                        edited = await client.edit_message_text(chat_id, tracked_msg_id, text, parse_mode="")
+                    if edited:
+                        delivered()
+                        return
+                    # Edit failed (likely too old or already identical) — clear
+                    # tracking and fall through to sendMessage path.
+                    _clear_silent_msg(api, chat_id)
 
-            msg_id = await client.send_message(chat_id, text, parse_mode=parse_mode)
+                msg_id = await client.send_message(chat_id, text, parse_mode=parse_mode)
+                if msg_id:
+                    delivered()
 
             if silent_on and msg_id:
                 _set_silent_msg(api, chat_id, msg_id)
@@ -1139,17 +1144,28 @@ def _make_outbound(api):
     return handle
 
 
-def _make_typing(api):
-    async def handle(event: Dict[str, Any]) -> None:
-        try:
-            local_settings = _load_settings(api)
-            client = _telegram_client(api)
-            chat_id = _target_chat(local_settings, event)
-            if chat_id:
-                await client.send_chat_action(chat_id, "typing")
-        except Exception as exc:
-            api.log("error", f"Telegram typing error: {exc}")
+def _make_typing(cue: TypingCue):
+    async def handle(_event: Dict[str, Any]) -> None:
+        # A start or resume is a wake, never itself a cue: a helper, a wake-up or a
+        # mirrored start shows typing only if the host says a reply is prepared (DESIGN §9).
+        cue.wake()
     return handle
+
+
+def _typing_cue(api) -> TypingCue:
+    """The bridge's one typing refresher over the host's reply-preparation projection."""
+    def targets(state: Dict[str, Any]) -> set:
+        settings = _load_settings(api)
+        rows = [row for row in state.get("chats") or [] if isinstance(row, dict)]
+        return {chat for row in rows if (chat := _target_chat(settings, {"transport": row.get("transport") or {}}))}
+
+    return TypingCue(read_state=lambda: host_reply_preparation(_data_dir(api)), targets=targets,
+                     client_factory=lambda: _telegram_client(api), warn=lambda text: api.log("warning", text))
+
+
+def _cue_message(cue: TypingCue | None, chat_id: int):
+    """The cue's bracket around one message to ``chat_id`` (an empty one without a cue)."""
+    return cue.message(chat_id) if cue is not None else contextlib.nullcontext(lambda: None)
 
 
 def _make_photo(api):
@@ -1321,7 +1337,7 @@ def _make_links(api):
     return handle
 
 
-def _make_quiz(api):
+def _make_quiz(api, cue: TypingCue | None = None):
     async def handle(event: Dict[str, Any]) -> None:
         try:
             local_settings = _load_settings(api)
@@ -1364,12 +1380,13 @@ def _make_quiz(api):
             # arrives as plain parts followed by the compact keyboard message.
             # Creation holds the card's lock so a lifecycle fact cannot edit (or
             # miss) a card mid-send.
-            async with telegram_quiz.card_lock(token):
+            async with telegram_quiz.card_lock(token), _cue_message(cue, chat_id) as delivered:
                 message_id, overflowed = await telegram_quiz.send_quiz_card(
                     client, chat_id, body=body, compact=compact,
                     hint_text=telegram_quiz.hint(lang) if labels else telegram_quiz.hint_open(lang),
                     keyboard=telegram_quiz.quiz_keyboard(token, labels),
                 )
+                delivered()
                 if overflowed:
                     settled_text = compact
                 elif wait_for_answer:
@@ -1403,15 +1420,17 @@ def _make_quiz_state(api):
 
 def register(api):
     telegram_i18n.configure(_data_dir(api))
+    cue = _typing_cue(api)  # Telegram failures stay inside it, so they never spend restart budget
     api.register_supervised_task("poller", _make_poller(api), restart_policy="on_failure", max_restarts=10)
     api.register_supervised_task("notifier", _make_notifier(api, trust_env=_HONOR_ENV_PROXIES), restart_policy="on_failure", max_restarts=10)
-    api.subscribe_event("chat.outbound", _make_outbound(api))
-    api.subscribe_event("chat.typing", _make_typing(api))
+    api.register_supervised_task("typing_cue", cue.run, restart_policy="on_failure", max_restarts=10)
+    api.subscribe_event("chat.outbound", _make_outbound(api, cue))
+    api.subscribe_event("chat.typing", _make_typing(cue))
     api.subscribe_event("chat.photo", _make_photo(api))
     api.subscribe_event("chat.video", _make_video(api))
     api.subscribe_event("chat.document", _make_document(api))
     api.subscribe_event("chat.links", _make_links(api))
-    api.subscribe_event("chat.quiz", _make_quiz(api))
+    api.subscribe_event("chat.quiz", _make_quiz(api, cue))
     api.subscribe_event("chat.quiz_state", _make_quiz_state(api))
     # GET hydrates the declarative form with what is stored; POST saves it.
     api.register_route("settings/save", handler=_make_settings_save(api), methods=("GET", "POST"))

@@ -31,6 +31,7 @@ _FILES = {"review_ledger": "state/review_ledger/{id}.json", "advisory_review": "
           "skill_state": "state/skills/{id}/{state_file}.json",
           "run": "task_drives/{child}/delegated_runs/{id}.json",
           "verification_receipts": "task_results/artifacts/{id}/verification_receipts.jsonl",
+          "storage": "state/storage_measurement.json",  # the last two finished storage counts (installation-wide)
           **{name + "_log": f"logs/{name}.jsonl" for name in ("supervisor", "events", "tools", "chat")}}
 _ID_KINDS = {"task_result", "run", "review_ledger", "skill_state", "verification_receipts"}
 _STATES = ("review", "review_job", "health", "enabled", "deps", "grants")
@@ -242,6 +243,8 @@ def _query_data(ctx: ToolContext, *, op: str, db="current", query="", kind="", i
             raise ValueError("source parameters do not belong to this operation")
         if op != "jsonl" and tail != 100 or kind != "skill_state" and state_file != "review_job":
             raise ValueError("tail is JSONL-only; state_file is skill_state-only")
+        if kind == "storage" and child_task_id:
+            raise ValueError("storage is installation-wide; it has no child selector")
         native = (ctx.task_metadata or {}).get("native_data_root")
         canonical, owner = Path(native or canonical_data_root(ctx)).resolve(), "native_pin" if native else "canonical"
         caller = root = Path(ctx.drive_root).resolve()
@@ -312,6 +315,9 @@ def _query_data(ctx: ToolContext, *, op: str, db="current", query="", kind="", i
                 root, plane = canonical, owner
             elif kind in {"queue_snapshot", "queue_dispatch"} and not child_task_id:
                 # The installation queue lives with its owner; child_task_id keeps child-local meaning.
+                root, plane = canonical, owner
+                _plane_path(ctx, plane, root, _FILES[kind], caller)
+            elif kind == "storage":
                 root, plane = canonical, owner
                 _plane_path(ctx, plane, root, _FILES[kind], caller)
             values, remaining, retained = {}, sql.MAX_BYTES, 0

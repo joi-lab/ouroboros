@@ -291,8 +291,12 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         assert card_visual_state(parent) == parent_visual_before_child_failure
         assert "error" not in child.get_attribute("class").split()
 
+        # The room says the server's room (DESIGN "Room work status"). These
+        # frames exist only on the test socket, so the server holds no work
+        # here: the room stays Online while the cards say each outcome, and a
+        # child's failure never turns it to Attention.
         page.wait_for_function(
-            "selector => document.querySelector(selector)?.textContent === 'Working'",
+            "selector => document.querySelector(selector)?.textContent === 'Online'",
             arg=status_selector,
             timeout=30_000,
         )
@@ -300,10 +304,10 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         assert page.locator("#toast-stack .toast").count() == 0
         assert page.locator('[data-nav-page="chat"] .unread-badge').count() == 0
 
-        child_summary = child.locator(":scope > [data-live-summary-button]")
+        child_disclosure = child.locator(":scope > [data-live-summary-button] [data-live-disclosure]")
         assert child.get_attribute("data-expanded") == "0"
-        child_summary.focus()
-        child_summary.press("Enter")
+        child_disclosure.focus()
+        child_disclosure.press("Enter")
         assert child.get_attribute("data-expanded") == "1"
         child_line_toggle = child.locator(
             ":scope > [data-live-timeline] [data-live-line-toggle]"
@@ -315,9 +319,9 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         child_timeline = child.locator(":scope > [data-live-timeline]").inner_text()
         assert "The selected tool route was unavailable; the parent can continue." in child_timeline
         assert "Reason:" not in child_timeline
-        assert "delegated_route_unavailable" not in child_summary.inner_text()
+        assert "delegated_route_unavailable" not in child.locator(":scope > [data-live-summary-button]").inner_text()
         child_line_toggle.press("Space")
-        child_summary.press("Space")
+        child_disclosure.press("Space")
         assert child.get_attribute("data-expanded") == "0"
 
         emit_task_done(page, chat_id, continuing_root, "completed")
@@ -462,7 +466,9 @@ def test_task_status_stays_factual_in_main_and_project_chat(
 
                 assert page.locator("#toast-stack .toast").count() == 0
                 assert page.locator('[data-nav-page="chat"] .unread-badge').count() == 0
-                assert project_row.locator(".nav-unread-dot").count() == 0
+                # A card update creates no unread: neither the row's unread fact nor a crimson status mark.
+                assert project_row.get_attribute("data-unread") is None
+                assert project_row.locator('.status-mark[data-hue="unread"]').count() == 0
             finally:
                 browser.close()
     except PlaywrightError as exc:

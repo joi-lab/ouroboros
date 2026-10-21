@@ -235,6 +235,7 @@ def test_current_store_hold_stays_within_half_the_writers_wait(ctx, tmp_path, mo
     def source(root, db, seconds):
         seen.append(("source", seconds))
         with real_source(root, db, seconds) as tier:
+            assert tier == store.TIER_ENFORCED
             yield tier
 
     monkeypatch.setattr(sql, "_connection", connection)
@@ -252,10 +253,12 @@ def test_current_store_hold_stays_within_half_the_writers_wait(ctx, tmp_path, mo
 
 def test_name_tier_uses_the_store_lock(tmp_path, monkeypatch):
     from ouroboros import platform_layer
-    monkeypatch.setattr(platform_layer, "kernel_file_locks_enforced", lambda _: False)
+    monkeypatch.setattr(platform_layer, "kernel_file_locks_enforced", lambda _, **_kw: False)
     store_import.ensure_current_store(tmp_path, with_children=False)
     store.update_task(tmp_path, "caller", lambda _: {"status": "completed"})
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="caller")
+    with sql._source(tmp_path, "current", 1) as tier:
+        assert tier == store.TIER_NAME
     assert run(ctx, "SELECT task_id FROM tasks")["data"]["rows"] == [["caller"]]
     with store.name_lock(tmp_path, store.LOCK_NAME, timeout_sec=1):
         result = run(ctx, "SELECT 1", timeout_sec=0.05)
@@ -292,7 +295,7 @@ def test_parent_deadline_reaps_child_and_removes_scratch(ctx, monkeypatch):
 @pytest.mark.parametrize("db,lock_name", [("money", "usage_attempts.lock"), ("packs", "packs_index.lock")])
 def test_name_tier_money_and_index_reads_share_writer_locks(tmp_path, monkeypatch, db, lock_name):
     from ouroboros import platform_layer
-    monkeypatch.setattr(platform_layer, "kernel_file_locks_enforced", lambda _: False)
+    monkeypatch.setattr(platform_layer, "kernel_file_locks_enforced", lambda _, **_kw: False)
     store_import.ensure_current_store(tmp_path, with_children=False)
     if db == "money":
         usage_store.migrate_from_journal(tmp_path)

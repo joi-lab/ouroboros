@@ -13,6 +13,8 @@ No test calls a model or the network.
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import ast
 import json
 import pathlib
@@ -61,7 +63,7 @@ def facts_row(scratch: pathlib.Path, tid: str, n: int, **usage) -> dict:
     (root / "logs").mkdir(parents=True)
     _record_task_facts(types.SimpleNamespace(drive_root=root), {"id": tid, "chat_id": 1},
                        {"rounds": 1, **usage}, {}, root / "logs")
-    return {**json.loads((root / "logs" / "chat.jsonl").read_text(encoding="utf-8")), "ts": ts(n)}
+    return {**json.loads(dialogue_test.log_text(root / "logs" / "chat.jsonl")), "ts": ts(n)}
 
 
 def original_host_stamp(root, task_ids, *, rows=()):

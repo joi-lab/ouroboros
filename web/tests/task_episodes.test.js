@@ -36,6 +36,8 @@ test('one attempt\'s facts: when it started, when and how it ended, its cause in
     assert.equal(episode.ended, '2026-10-10T18:15:00Z');
     assert.equal(episode.phase, 'error');
     assert.ok(episode.cause, 'a failed episode names its cause');
+    assert.equal(noteEpisodeFacts(episode, { suggested_name: 'Check totals' }).name, 'Check totals');
+    assert.equal(noteEpisodeFacts({ name: 'Retained name' }, {}).name, 'Retained name');
 });
 
 test('an episode\'s time reads as the chat clock does', () => {
@@ -61,11 +63,18 @@ test('one episode is not a chain; several are one meta line each, the current on
         { started: new Date(2026, 9, 10, 19, 42).getTime(), ended: '' },
     ]), true);
     assert.equal(el.hidden, false);
-    assert.match(el.innerHTML, /Episode 1<\/span> · <span class="chat-live-episode-span">17:33–18:15<\/span> · <span class="chat-live-episode-outcome" data-tone="error">Failed<\/span><span class="chat-live-episode-cause">: The model provider failed<\/span>/);
+    assert.match(el.innerHTML, /Episode 1<\/span> · <span class="chat-live-episode-span">17:33–18:15<\/span> · <span class="chat-live-episode-outcome" data-tone="failed">Failed<\/span><span class="chat-live-episode-cause">: The model provider failed<\/span>/);
     assert.match(el.innerHTML, /data-episode="2" data-current="1"><span class="chat-live-episode-label">Episode 2<\/span> · <span class="chat-live-episode-span">since 19:42<\/span><\/div>/,
         'the current episode shows only its time: the chip is its');
     renderEpisodes(el, [{ started: 0, phase: 'error', cause: '<b>x</b>' }, {}]);
     assert.doesNotMatch(el.innerHTML, /<b>/, 'words are text, never markup');
+    renderEpisodes(el, [{ name: '<b>old</b>' }, { name: 'Continue: check totals' }]);
+    assert.match(el.innerHTML, /&lt;b&gt;old&lt;\/b&gt;/);
+    assert.match(el.innerHTML, /chat-live-episode-name">Continue: check totals/);
+    // An earlier episode's outcome takes the chips' tones: warnings succeed, a stop is neutral, a failure red.
+    renderEpisodes(el, [{ phase: 'warn' }, { phase: 'cancelled' }, { phase: 'timeout' }, {}]);
+    assert.deepEqual([...el.innerHTML.matchAll(/episode-outcome" data-tone="(\w+)">([^<]+)</g)].map((m) => `${m[2]}:${m[1]}`),
+        ['Done with warnings:ok', 'Stopped:neutral', 'Failed:failed']);
 });
 
 function card(id, ts, name) {
@@ -94,8 +103,26 @@ test('the successor\'s card takes the work\'s first place and name; the predeces
         assert.deepEqual(moves.at(-1), ['t-2', 1000], 'the card stands where the work began');
         assert.equal(next.episodesEl.hidden, false);
         assert.match(next.episodesEl.innerHTML, /Episode 1.*Episode 2/s);
+        assert.match(next.episodesEl.innerHTML, /chat-live-episode-name">Continue: Audit the projects/,
+            'the successor keeps its own physical name separately from the work heading');
         assert.equal(episodes.sync({ groupId: 'other', isSubagent: false, root: { dataset: {} } }), false, 'not in a chain');
     }
+});
+
+test('an unnamed successor never takes the work\'s borrowed heading as its own episode name', () => {
+    const records = new Map();
+    const episodes = createTaskEpisodes({ records, reanchor: () => false, activity: () => null });
+    const first = card('t-1', 1000, 'Audit the projects');
+    const next = card('t-2', 5000, '');
+    for (const record of [first, next]) { records.set(record.groupId, record); episodes.sync(record); }
+    episodes.note(first, { status: 'failed', continued_by: { state: 'admitted', successor_task_id: 't-2' } });
+    episodes.sync(next);  // a later sync reads the suggestedName the first one lent
+    const own = () => next.episodesEl.innerHTML.split('data-episode="2"')[1];
+    assert.equal(next.titleEl.textContent, 'Audit the projects', 'the work keeps its heading');
+    assert.doesNotMatch(own(), /chat-live-episode-name/, 'the successor has no name of its own yet');
+    episodes.rename(next, 'Continue: Audit the projects');
+    assert.match(own(), /chat-live-episode-name">Continue: Audit the projects/);
+    assert.equal(next.titleEl.textContent, 'Audit the projects');
 });
 
 test('a successor with no card here is handed on once admitted; a bound claim hands on and folds nothing', () => {

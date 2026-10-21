@@ -1,5 +1,4 @@
 import { bindTabStrip, renderPageHeader, renderTabStrip } from './page_header.js';
-import { PAGE_ICONS } from './page_icons.js';
 
 // By importance and expected use (docs/DESIGN.md §5): the log first and by default, then what
 // runs now and what it costs, then updates, the owner-measured Storage and Evolution (off by default).
@@ -22,9 +21,7 @@ export function initDashboard({ state }) {
     page.className = 'page app-page-glass';
     page.innerHTML = `
         ${renderPageHeader({
-            title: 'Dashboard',
-            icon: PAGE_ICONS.dashboard,
-            description: 'Monitor logs, activity, costs, updates, storage, and evolution from one view.',
+            page: 'dashboard',
             tabsHtml: renderTabStrip({
                 items: DASHBOARD_TABS.map((tab) => ({
                     ...tab,

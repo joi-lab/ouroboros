@@ -159,6 +159,13 @@ def test_timeout_retry_stamps_the_handoff_and_folds_newer_quota_facts(pool, monk
     assert waiter.executed_seconds(now=time.monotonic()) == pytest.approx(execution_elapsed_seconds(running, now), abs=2)
 
 
+def _stored_progress(root):
+    """The progress rows the handler stored (the dialogue store holds them, not a chain file)."""
+    from tests import _dialogue as dialogue_test
+
+    return dialogue_test.log_rows(root / "logs" / "progress.jsonl")
+
+
 def test_a_reviewer_wait_never_moves_the_author_clock(tmp_path):
     """Unit level: two hand-built owners (the production pair is the next test)."""
     from supervisor.task_model_wait import handle_task_model_wait
@@ -186,7 +193,7 @@ def test_a_reviewer_wait_never_moves_the_author_clock(tmp_path):
         handle_task_model_wait(review_events.get_nowait(), ctx)
     assert meta["model_wait_quota_clock"] == author_clock
     assert meta["task"]["model_waits"]["r-wait"]["state"] == "resolved"  # still visible and custodied
-    assert any(row.get("wait_id") == "r-wait" for row in logged) and pushed
+    assert any(row.get("wait_id") == "r-wait" for row in _stored_progress(tmp_path)) and pushed
 
 
 def test_a_review_operations_own_wait_owner_never_moves_the_author_clock(tmp_path):
@@ -227,7 +234,7 @@ def test_a_review_operations_own_wait_owner_never_moves_the_author_clock(tmp_pat
             handle_task_model_wait(events.get_nowait(), supervisor)
     assert meta["model_wait_quota_clock"] == author_clock
     assert meta["task"]["model_waits"]["r-wait"]["model_wait_owner_id"] == review.owner_id  # still visible
-    assert any(row.get("wait_id") == "r-wait" for row in logged) and pushed
+    assert any(row.get("wait_id") == "r-wait" for row in _stored_progress(tmp_path)) and pushed
 
 
 def test_child_inherits_the_remaining_allowance_with_its_own_queue_excluded(tmp_path, monkeypatch):

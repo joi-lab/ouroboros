@@ -157,8 +157,10 @@ def test_claudexor_quota_view_has_separate_required_contract():
     assert set(hints) == {
         "view", "profiles", "quota", "quota_absences", "unified_accounts",
         "reads", "read_errors", "timings_ms",
+        "resources", "availability_scope",
     }
-    assert ClaudexorQuotaResponse.__total__ and not _notrequired_fields(ClaudexorQuotaResponse)
+    assert ClaudexorQuotaResponse.__total__
+    assert _notrequired_fields(ClaudexorQuotaResponse) == {"resources", "availability_scope"}
     assert get_args(hints["view"]) == ("quota",)
     assert hints["reads"] is ClaudexorStatusReads
     assert hints["unified_accounts"] is bool
@@ -179,10 +181,22 @@ def test_claudexor_quota_view_has_separate_required_contract():
         ("boolean", "unified_accounts"), ("ClaudexorStatusReads", "reads"),
         ("Object<'discovery'|'accounts'|'quota', ClaudexorPassiveReadError>", "read_errors"),
         ("Object<string, number>", "timings_ms"),
+        ("Array<Object>=", "resources"),
+        ("Object=", "availability_scope"),
     }
     assert _js_typedef_properties(text, "ClaudexorPassiveReadError") == {
         ("string", "code"), ("number=", "status_code"),
     }
+
+
+def test_full_claudexor_status_scope_has_optional_typed_and_js_parity():
+    hints = get_type_hints(ClaudexorStatusResponse, include_extras=True)
+    assert get_origin(hints["availability_scope"]) is dict
+    assert not ClaudexorStatusResponse.__total__
+    text = (pathlib.Path(__file__).resolve().parent.parent
+            / "web" / "modules" / "api_types.js").read_text(encoding="utf-8")
+    assert "availability_scope" in _js_typedef_fields(text, "ClaudexorStatusResponse")
+    assert _js_typedef_fields(text, "ClaudexorStatusResponse") == set(hints)
 
 
 def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
@@ -709,7 +723,7 @@ def test_decision_comment_limit_and_optional_index_pinned_across_python_and_js()
         if (getattr(annotation, "__forward_arg__", None) or str(annotation)).startswith("NotRequired[")
     }
     assert optional == {"option_index", "comment", "reason", "revision", "action", "auto_continue",
-                        "model", "credential_profile_id", "use_local", "persist_role"}
+                        "model", "credential_profile_id", "use_local", "persist_role", "values"}
     decisions = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "decision_types.js").read_text(
         encoding="utf-8"
     )
@@ -717,6 +731,7 @@ def test_decision_comment_limit_and_optional_index_pinned_across_python_and_js()
     assert request_decl
     assert "@property {number=} option_index" in request_decl.group(1)
     assert "@property {string=} comment" in request_decl.group(1)
+    assert "@property {Object=} values" in request_decl.group(1)  # a card press's optional form values
 
     # The settled quiz card replayed from history carries the recorded answer:
     # the chosen index when there was one, and the owner's verbatim words —

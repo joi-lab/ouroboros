@@ -10,6 +10,8 @@ turn's context, both times after downtime, and never a model task.
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import json
 import types
@@ -48,9 +50,7 @@ def _note(queue, schedule_id="note-1", *, text="Call mother", trigger=None, sour
 
 def _chat_rows(root):
     path = root / "logs" / "chat.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return dialogue_test.log_rows(path)
 
 
 def _row(queue, root, schedule_id="note-1"):
@@ -108,6 +108,7 @@ def test_an_overdue_note_reaches_extension_subscribers_on_a_provider_boot(host, 
     _patch_lifespan_for_drive_root_test(monkeypatch, srv, {})
     monkeypatch.setattr(srv, "has_startup_ready_provider", lambda _settings: True)
     monkeypatch.setattr(srv, "_boot_managed_update_tasks", lambda: None)
+    monkeypatch.setattr(srv, "_open_dialogue", lambda *_a, **_k: None)  # this fixture's bus and bridge stay
     delivered = []
     first_tick_finished = threading.Event()
 

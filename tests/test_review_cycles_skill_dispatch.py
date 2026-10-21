@@ -54,7 +54,6 @@ def _wire_skill_wave(monkeypatch, tmp_path, *, content_hash, passes):
     monkeypatch.setattr(skill_review, "_run_deterministic_preflight", lambda *a, **k: None)
     monkeypatch.setattr(skill_review, "reviewer_slot_config_error", lambda: "")
     monkeypatch.setattr(skill_review, "_build_skill_file_packs", lambda *a, **k: ["pack"])
-    monkeypatch.setattr(skill_review, "_official_hub_review_profile", lambda s: "")
     monkeypatch.setattr(skill_review, "_review_wave_budget_block", lambda *a, **k: None)
     monkeypatch.setattr(skill_review, "emit_review_model_error_events", lambda *a, **k: None)
     monkeypatch.setattr(skill_review, "save_review_state", lambda *a, **k: None)

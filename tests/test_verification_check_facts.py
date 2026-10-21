@@ -5,8 +5,8 @@ receipt write it publishes the recorded verdict (``verification``) beside the ca
 own classification, which stays the legacy adapter's (a handled FAIL is a completed,
 ``ok`` call). These tests drive the real registry and the real loop wrapper and read
 every consumer: the durable tools.jsonl row and trace payload, the live frames, the
-model's compact facts, the llm trace and acceptance trajectory, history replay, and
-the reflection/error readers that must NOT treat a failed criterion as a failed call.
+model's compact facts, the llm trace, history replay, and the reflection/error
+readers that must NOT treat a failed criterion as a failed call.
 """
 from __future__ import annotations
 
@@ -215,7 +215,6 @@ def test_failed_check_reaches_every_consumer_as_one_completed_call(process_conte
     from ouroboros.outcomes import _classify_tool_errors
     from ouroboros.post_task_synthesis import task_tool_metrics
     from ouroboros.reflection import _trace_call_errored
-    from ouroboros.review_evidence_sections import _accept_trajectory
     from ouroboros.tool_call_log import replay_evidence
     from ouroboros.tool_result_record import TOOL_RESULT_RECORD_KEY
 
@@ -245,9 +244,6 @@ def test_failed_check_reaches_every_consumer_as_one_completed_call(process_conte
     assert (facts["status"], facts["is_error"], facts["exit_code"]) == ("ok", False, 0)
     [row] = llm_trace["tool_calls"]
     assert row["verification"] == verdict and row["status"] == "ok"
-    # Acceptance packet: the trajectory row keeps both facts.
-    [step], _omitted, _unresolved = _accept_trajectory(llm_trace["tool_calls"], data, ctx.task_id)
-    assert (step["status"], step["is_error"], step["verification"]) == ("ok", False, facts["verification"])
     # No error bucket and no error in the task-facts census, for a handled criterion failure.
     assert not _trace_call_errored(row) and task_tool_metrics(llm_trace)["tool_errors"] == 0
     assert not any(_classify_tool_errors(llm_trace).values())

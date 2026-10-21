@@ -71,13 +71,9 @@ from ouroboros.llm_fallback import (
 from ouroboros.llm_gigachat import (
     _GigaChatLaneMixin,  # noqa: F401
 )
+from ouroboros.context_budget import estimate_message_chars as _estimate_message_chars  # noqa: F401 -- the historical private name
 from ouroboros.llm_local import (
-    _compact_local_text,  # noqa: F401
-    _compact_markdown_sections,  # noqa: F401
-    _estimate_message_chars,  # noqa: F401
-    _LOCAL_COMPACTION_MODES,  # noqa: F401
     _LocalLaneMixin,  # noqa: F401
-    _split_markdown_sections,  # noqa: F401
     LocalContextTooLargeError,  # noqa: F401
 )
 from ouroboros.llm_messages import (
@@ -231,7 +227,7 @@ class LLMClient(
                 local_kwargs = {"timeout": timeout}
                 if reasoning_effort is not None:
                     local_kwargs["reasoning_effort"] = reasoning_effort
-                if processing_preference:
+                if processing_preference is not None:
                     local_kwargs["processing_preference"] = processing_preference
                 message, usage = self._chat_local(
                     messages, tools, max_tokens, tool_choice, **local_kwargs,
@@ -307,7 +303,7 @@ class LLMClient(
                 local_kwargs = {"timeout": timeout}
                 if reasoning_effort is not None:
                     local_kwargs["reasoning_effort"] = reasoning_effort
-                if processing_preference:
+                if processing_preference is not None:
                     local_kwargs["processing_preference"] = processing_preference
                 result = self._chat_local(messages, tools, max_tokens, tool_choice, **local_kwargs)
                 return result, last_physical_attempt_capture()

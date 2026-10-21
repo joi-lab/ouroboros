@@ -20,13 +20,14 @@ import re
 
 import pytest
 
-from ouroboros import chat_chain
+from ouroboros import chat_chain, dialogue_store
 from ouroboros.chronicle_store import ChronicleStore
 from ouroboros.tool_capabilities import tool_result_limit
 from ouroboros.tools.chronicle import (
     _chronicle_write, _memory_mark, _memory_read, check_quotes, host_stamp, page_covers,
 )
 from ouroboros.tools.registry import ToolContext
+from tests import _dialogue as dialogue_test
 from tests._store_shared import result_exists, seed_result
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -45,11 +46,20 @@ def ts(n: int) -> str:
 
 
 def chat(root: pathlib.Path, rows) -> list:
-    path = root / "logs" / "chat.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    """Rows the dialogue writers would have stored: the canonical store, in chain order."""
+    for row in rows:
+        dialogue_store.append(root, "chat", row)
+    return list(rows)
+
+
+def chat_bulk(root: pathlib.Path, rows) -> list:
+    """The same canonical rows for a root that holds no dialogue yet, stored in one pass: their
+    chain file cut over by the explicit import. ``chat`` commits a synchronous transaction per row;
+    10 002 of them outlasted the 300-s test bound on a Windows runner, whose timeout then ended the
+    whole xdist worker."""
+    assert not dialogue_store.present(root)
+    dialogue_test.seed(root, live={"chat": rows})
+    dialogue_test.import_all(root)
     return list(rows)
 
 
@@ -135,6 +145,7 @@ def test_task_page_takes_task_rows_and_bound_owner_words_and_leaves_an_interleav
          "parent_task_id": "taskA001", "subagent_task_id": "kidA0001", "text": "Child report."},
     ])
     annotations = tmp_path / "logs" / "chat_annotations.jsonl"
+    annotations.parent.mkdir(parents=True, exist_ok=True)
     annotations.write_text(json.dumps({"ts": ts(2), "type": "chat_annotation", "client_message_id": "mB",
                                        "action": "promote_chat_to_task", "target": "taskB001",
                                        "status": "scheduled"}) + "\n", encoding="utf-8")
@@ -451,7 +462,7 @@ def test_every_read_mode_stays_within_the_limit_names_its_continuation_and_write
     side = project_chat(tmp_path, "giant-room")
     giant = {"chat_id": side, "direction": "out", "ts": ts(1), "text": "G" * (LIMIT * 2 + 17)}
     after_giant = {"chat_id": side, "direction": "in", "ts": ts(2), "text": "after the giant"}
-    chat(tmp_path, [*room, giant, after_giant])
+    chat_bulk(tmp_path, [*room, giant, after_giant])
     store = ChronicleStore(tmp_path)
     sizes = [61_000, 47_500, 33_000, 21_000, 12_310, 9_000, 4_000, 2_000, 1_000]  # 190 810 chars of Main
     for block, size in enumerate(sizes):
@@ -536,9 +547,13 @@ def test_reading_on_a_fresh_install_activates_once_then_reads_write_nothing(tmp_
 
 
 def _legacy_install(root):
-    """Legacy dialogue memory the old writer left: two chat rows, one block over both, its cursor."""
-    rows = chat(root, [{"chat_id": 1, "direction": "in", "ts": ts(1), "text": "Never push on Fridays."},
-                       {"chat_id": 1, "direction": "out", "ts": ts(2), "task_id": "taskA001", "text": "Understood."}])
+    """Legacy dialogue memory the old writer left: two chat rows in the old live chain file, one block
+    over both, its cursor signed by that file; the chain is imported into the store as the upgrade does."""
+    from ouroboros.utils import jsonl_generation_signature
+
+    rows = [{"chat_id": 1, "direction": "in", "ts": ts(1), "text": "Never push on Fridays."},
+            {"chat_id": 1, "direction": "out", "ts": ts(2), "task_id": "taskA001", "text": "Understood."}]
+    dialogue_test.seed(root, live={"chat": rows})
     (root / "memory").mkdir(parents=True, exist_ok=True)
     (root / "memory" / "dialogue_blocks.json").write_text(json.dumps([{
         "ts": ts(3), "type": "summary", "range": "r", "message_count": 2,
@@ -546,7 +561,8 @@ def _legacy_install(root):
         "content": "I learned the Friday rule."}]), encoding="utf-8")
     (root / "memory" / "dialogue_meta.json").write_text(json.dumps({
         "last_consolidated_offset": 2,
-        "chat_log_signature": chat_chain._chat_log_signature(root / "logs" / "chat.jsonl")}), encoding="utf-8")
+        "chat_log_signature": jsonl_generation_signature(root / "logs" / "chat.jsonl")}), encoding="utf-8")
+    dialogue_test.import_all(root)
     return rows
 
 

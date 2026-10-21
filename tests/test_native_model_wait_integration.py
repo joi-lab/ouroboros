@@ -28,6 +28,7 @@ def test_native_wait_controls_and_manual_restart_address_all_registered_actors(t
     monkeypatch.setattr(task_queue, "PENDING", [])
     monkeypatch.setattr(delegate_custody, "reconcile_orphaned_runs", lambda *a, **kw: [])
     monkeypatch.setattr(server_restart, "_stop_owned_daemon", lambda *a: None)
+    monkeypatch.setattr(server_restart, "_OWNER_STOP_BEGAN", threading.Event())  # this Restart's own fact
     monkeypatch.setattr(server_restart, "_managed_update_pending_kwargs", lambda: {})
     events, published, cancelled = queue.Queue(), [], []
     context = SimpleNamespace(

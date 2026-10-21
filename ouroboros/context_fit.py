@@ -15,7 +15,10 @@ import math
 import pathlib
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Mapping, Optional, Tuple
+
+if TYPE_CHECKING:
+    from ouroboros.context_anchor import InputAnchor
 
 from ouroboros.context_layout import reference_doc_sections
 from ouroboros.reference_books import ReferenceBook
@@ -96,12 +99,21 @@ class MainFitMeasurement:
     # The reply allowance Main PLANS for this candidate (``context_budget.reply_allowance_tokens``);
     # the send finalizer computes the sent value on the sealed candidate with the same rule.
     reply_allowance_tokens: int = 0
+    # Provenance of the estimate (``InputAnchor``): the provider-reported input of the last request this
+    # model accepted in this conversation and its round, or None for a cold chars/4 estimate.
+    anchor_input_tokens: Optional[int] = None
+    anchor_round: Optional[int] = None
+    anchor_rewritten: bool = False
+    # The largest input this model accepted in this task; a stated window below it is no window
+    # (``capacity_total_tokens`` is then None and ``window_reading_tokens`` keeps the stated number).
+    accepted_input_tokens: Optional[int] = None
+    window_reading_tokens: Optional[int] = None
 
 
 @dataclass(frozen=True)
 class MainFitDisposition:
     measurement: MainFitMeasurement
-    action: Literal["send", "reclaim_once", "send_target_miss"]
+    action: Literal["send", "send_target_miss"]
     automatic_pass_used: bool
     predicted_capacity_miss: bool
 
@@ -502,7 +514,7 @@ def estimate_context_prompt_tokens(
         context_custody_proxy,
         custody_private_key,
     )
-    from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY, IMAGE_BLOCK_CHAR_EQUIVALENT
+    from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY, HOST_TEXT_SHA_KEY, IMAGE_BLOCK_CHAR_EQUIVALENT
     from ouroboros.openai_chat_dispatch import direct_openai_context_projections
 
     def project(value: Any) -> Any:
@@ -528,7 +540,8 @@ def estimate_context_prompt_tokens(
 
     # These top-level host receipts remain canonical but are absent from sends.
     # Do not strip same-named keys inside native payloads or user/tool arguments.
-    hidden = {HOST_CONTEXT_KIND_KEY, REVIEW_HISTORY_MESSAGE_KEY, REVIEW_CONTEXT_INDEX_KEY, TOOL_RESULT_RECORD_KEY}
+    hidden = {HOST_CONTEXT_KIND_KEY, HOST_TEXT_SHA_KEY, REVIEW_HISTORY_MESSAGE_KEY, REVIEW_CONTEXT_INDEX_KEY,
+              TOOL_RESULT_RECORD_KEY}
     messages = [{key: value for key, value in message.items() if key not in hidden} for message in messages]
     projections = direct_openai_context_projections(
         messages, tools, provider=provider, reasoning_effort=reasoning_effort,
@@ -587,34 +600,31 @@ def measure_main_fit(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]],
     *,
-    drive_root: Optional[pathlib.Path] = None,
     profile: ContextProfile,
     rendered_mode: Literal["max", "low", "nano"],
     round_id: str,
     automatic_pass_used: bool = False,
     reasoning_effort: str = "",
+    anchor: Optional[InputAnchor] = None,
+    accepted_input_tokens: Optional[int] = None,
 ) -> MainFitDisposition:
     """Measure one sealed Main candidate against owner target T and route W.
 
-    ``drive_root=None`` reads density from the canonical host evidence root
-    (one observation store) — a child task's own drive must not be consulted.
-    A positive deficit triggers at most one reclaim pass per route+round; the
-    requested goal is deficit + ``reclaim_low_water_margin`` so the pass lands
-    below the boundary instead of exactly at it (``RECLAIM_LOW_WATER_DIVISOR``).
-    Both deficits count the reply floor the fit leaves (Nano: ``min(8192, C)``);
-    the reply the candidate will actually get is ``reply_allowance_tokens``.
+    The estimate is this conversation's own: ``anchor`` (``context_anchor.main_input_anchor``) scales the raw
+    estimate by the last accepted request of this model, and without one it is the cold raw
+    estimate. A stated window below ``accepted_input_tokens`` is no window (unknown). The deficits,
+    the reclaim goal (deficit + ``reclaim_low_water_margin``) and the reply allowance are facts for
+    the round and for refusal recovery; a prediction never starts a pass by itself (owner 7A).
+    Both deficits count the reply floor the fit leaves (Nano: ``min(8192, C)``); the reply the
+    candidate will actually get is ``reply_allowance_tokens``.
     """
-    from ouroboros.capability_evidence import (
-        canonical_evidence_root, is_known, resolve_main_token_density,
-    )
+    from ouroboros.capability_evidence import is_known
     from ouroboros.context_budget import (
         OWNER_LOW_TARGET_TOKENS, OWNER_NANO_TARGET_TOKENS, NANO_MIN_HEADROOM_TOKENS, reply_allowance_tokens,
     )
 
-    if drive_root is None:
-        drive_root = canonical_evidence_root()
-    density, basis = resolve_main_token_density(drive_root, plan.route_fp, plan.model)
-    density = float(density)
+    density = float(anchor.density) if anchor is not None else 1.0
+    basis: MeasurementBasis = "fresh_route_usage" if anchor is not None else "cold_estimate"
     raw_input = int(estimate_context_prompt_tokens(messages, tools, provider=plan.provider, reasoning_effort=reasoning_effort))
     estimated_input = int(math.ceil(raw_input * density))
     ceiling = int(plan.output_reserve_tokens or 0)
@@ -623,7 +633,11 @@ def measure_main_fit(
     total = estimated_input + reserve
     target = (OWNER_NANO_TARGET_TOKENS if profile == "owner_nano"
               else OWNER_LOW_TARGET_TOKENS if profile == "owner_low" else None)
-    capacity = int(plan.window_tokens or 0) if is_known(plan, require_fresh=True) else None
+    from ouroboros.context_anchor import floored_window
+
+    reading = int(plan.window_tokens or 0) if is_known(plan, require_fresh=True) else None
+    floored, known = floored_window(reading, reading is not None, accepted_input_tokens)
+    capacity = floored if known else None
     target_deficit = max(0, total - target) if target is not None else None
     capacity_deficit = max(0, total - capacity) if capacity is not None else None
     deficit = max(
@@ -651,13 +665,14 @@ def measure_main_fit(
         reply_allowance_tokens=reply_allowance_tokens(
             caller_max_tokens=ceiling, nano=nano, owner_nano=profile == "owner_nano",
             input_tokens=estimated_input, raw_input_tokens=raw_input, window_tokens=capacity),
+        anchor_input_tokens=anchor.input_tokens if anchor is not None else None,
+        anchor_round=anchor.round if anchor is not None else None,
+        anchor_rewritten=bool(anchor is not None and anchor.rewritten),
+        accepted_input_tokens=accepted_input_tokens,
+        window_reading_tokens=reading,
     )
-    if goal > 0 and not automatic_pass_used:
-        action: Literal["send", "reclaim_once", "send_target_miss"] = "reclaim_once"
-    elif target_deficit and target_deficit > 0:
-        action = "send_target_miss"
-    else:
-        action = "send"
+    action: Literal["send", "send_target_miss"] = (
+        "send_target_miss" if target_deficit and target_deficit > 0 else "send")
     return MainFitDisposition(
         measurement=measurement,
         action=action,

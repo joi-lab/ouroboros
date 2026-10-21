@@ -62,10 +62,9 @@ from ouroboros.gateway.owner_settings import (
     settings_document_mutation,
     unsaved_error,
 )
-from ouroboros.server_runtime import (
-    apply_runtime_provider_defaults,
-    has_startup_ready_provider,
-)
+from ouroboros.gateway._helpers import request_drive_root
+from ouroboros.server_runtime import apply_runtime_provider_defaults, has_startup_ready_provider
+from ouroboros.skill_starter import after_onboarding, onboarding_skill_choices
 from ouroboros.settings_setup_contract import (
     ONBOARDING_COMPLETED_KEY,
     parse_subscription_intent,
@@ -642,6 +641,10 @@ def _prepared_settings(
     if error:
         return old_settings, {}, str(error)
     normalized, _changed, _keys = apply_runtime_provider_defaults(prepared)
+    try:  # the wizard's starter and hub-trust choices join the same one write
+        normalized.update(onboarding_skill_choices(body, normalized))
+    except ValueError as exc:
+        return old_settings, {}, str(exc)
     connected, skipped = parse_subscription_intent(body)
     if not has_startup_ready_provider(normalized) and not (connected and not skipped):
         return old_settings, {}, (
@@ -966,6 +969,7 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
             "preset_harnesses": list(preset.connected) if preset else [],
             "subscriptions_connected": subscriptions_connected,
         })
+        after_onboarding(request_drive_root(request), body.get("starter_skills"))  # once, in the background
         payload: Dict[str, Any] = {
             "ok": True,
             "status": "saved",
@@ -988,13 +992,7 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
 
 
 __all__ = [
-    "PRESET_UNVERIFIED_MESSAGE",
-    "PresetFailure",
-    "api_onboarding_complete",
-    "api_onboarding_subagents_preview",
-    "install_is_unconfigured",
-    "preset_eligible",
-    "resolve_install_preset",
-    "subscription_routable_harnesses",
+    "PRESET_UNVERIFIED_MESSAGE", "PresetFailure", "api_onboarding_complete", "api_onboarding_subagents_preview",
+    "install_is_unconfigured", "preset_eligible", "resolve_install_preset", "subscription_routable_harnesses",
     "verified_harness_discoveries",
 ]

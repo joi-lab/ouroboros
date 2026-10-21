@@ -25,7 +25,12 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
     // A child's lifecycle is one evolving status, just as it is live. Its
     // authored progress keeps every source record, even when text and time match;
     // so does each delegated observation (`activity`), projected per seq at render.
-    const evolving = summary.terminal || String(summary.dedupeKey || '').startsWith('subagent-lifecycle:')
+    // The task's outcome (`task_done|`) is one line too, as live: a read inside the
+    // post-task window projects it still finalizing, which is that line Working,
+    // never a line of work, and a finished card takes nothing from it (live: closedPhase).
+    const outcome = String(summary.dedupeKey || '').startsWith('task_done|');
+    if (outcome && !summary.terminal && record.finished) return false;
+    const evolving = summary.terminal || outcome || String(summary.dedupeKey || '').startsWith('subagent-lifecycle:')
         || String(summary.dedupeKey || '').startsWith('cardrow|');
     const activity = summary.activity ? { activity: summary.activity } : {};
     const key = evolving ? summary.dedupeKey : `history:${identity}`;

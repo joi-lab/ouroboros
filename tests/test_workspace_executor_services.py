@@ -14,8 +14,10 @@ Whole-file serial suite: it spawns real processes, so ``tests/conftest.py`` tags
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +26,58 @@ import pytest
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 
 from tests._workspace_executor_shared import _init_repo, fake_docker_cli
+
+
+@pytest.mark.parametrize("executor_kind", [None, "local"])
+@pytest.mark.parametrize("other_worker", [False, True])
+def test_quiet_service_log_stays_while_owned_and_archives_after_exit(tmp_path, monkeypatch, executor_kind, other_worker):
+    from ouroboros import workspace_executor as executor
+    from ouroboros.task_results import write_task_result
+    from ouroboros.tools import services
+
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    release = workspace / "release"
+    script = workspace / "quiet.py"
+    script.write_text("import pathlib, sys, time\nprint('READY', flush=True)\n"
+                      "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(0.02)\n"
+                      "print('AFTER_RETENTION', flush=True)\n", encoding="utf-8")
+    ctx = ToolContext(repo_dir=tmp_path / "system", drive_root=tmp_path / "data", task_id="quiet-task",
+                      workspace_root=workspace, workspace_mode="external")
+    if executor_kind:
+        ctx.executor_ref = {"type": "local", "workspace_host_path": str(workspace),
+                            "workspace_backend_path": "/workspace"}
+    records, lock = (executor._SERVICES, executor._STATE_LOCK) if executor_kind else (services._SERVICES, services._LOCK)
+    key, record = "quiet-task:quiet", None
+    try:
+        started = json.loads(services._start_service(ctx, name="quiet", cmd=[sys.executable, str(script), str(release)],
+                             cwd=str(workspace), keep_alive=True, readiness={"log_contains": "READY", "timeout_sec": 15}))
+        assert started["ready"] and started["state"] == "running"
+        with lock:
+            record = records[key]
+            if other_worker:
+                records.pop(key)  # maintenance sees durable custody, not this worker's local map
+        proc = record.local_proc if executor_kind else record.proc
+        path = Path(record.backend_log_path) if executor_kind else record.log_path
+        write_task_result(ctx.drive_root, ctx.task_id, "completed")  # a kept service outlives its task
+        old = time.time() - 30 * 86400
+        os.utime(path, (old, old))
+        report = services.prune_service_logs(ctx.drive_root, retention_days=7)
+        assert path.is_file() and proc.poll() is None
+        assert report["archived_files"] == report["deleted_files"] == 0
+        release.touch()
+        assert proc.wait(timeout=15) == 0
+        assert "AFTER_RETENTION" in path.read_text()
+        os.utime(path, (old, old))
+        report = services.prune_service_logs(ctx.drive_root, retention_days=7)
+        assert report["archived_files"] == report["deleted_files"] == 1 and not path.exists()
+    finally:
+        if record is not None:
+            with lock:
+                records[key] = record
+        services._stop_service(ctx, "quiet")
 
 
 @pytest.mark.parametrize("executor_kind", [None, "local"])
@@ -675,3 +729,22 @@ def test_executor_terminal_payload_clears_readiness(tmp_path):
     assert payload["state"] == "exited"
     assert payload["ready"] is False
     assert record.ready is False
+
+
+@pytest.mark.parametrize("unknown_from", ["service", "custody"])
+def test_service_log_waits_for_unknown_writer_custody(tmp_path, monkeypatch, unknown_from):
+    from ouroboros import body_candidate
+    from ouroboros.tools import services
+
+    path = tmp_path / "services" / "unknown-task" / "quiet.log"
+    path.parent.mkdir(parents=True)
+    path.write_text("kept until proven stopped\n")
+    os.utime(path, (1, 1))
+    monkeypatch.setattr(services, "service_execution_facts",
+                        lambda _key: {"state": "unknown"} if unknown_from == "service" else None)
+    monkeypatch.setattr(body_candidate, "live_lineage_processes",
+                        lambda *_args: [-1] if unknown_from == "custody" else [])
+    assert services.prune_service_logs(tmp_path, retention_days=0)["retained_files"] == 1 and path.exists()
+    monkeypatch.setattr(services, "service_execution_facts", lambda _key: {"state": "exited"})
+    monkeypatch.setattr(body_candidate, "live_lineage_processes", lambda *_args: [])
+    assert services.prune_service_logs(tmp_path, retention_days=0)["archived_files"] == 1 and not path.exists()

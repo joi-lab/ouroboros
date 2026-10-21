@@ -3,10 +3,10 @@
 A paid review that settles after its author can no longer receive it is advice for Ouroboros,
 never a decision, a veto or a wake (owner decision on late review delivery, 2026-10-11, #1738):
 it waits in the next ordinary turn of the room the work came from, and consciousness reads it
-when that room stays quiet. Its record writer (a late acceptance settlement, a plan council
-reply that settled after its task ended, a left change or commit review) persists the full
-source first, then calls ``publish_late_review`` once per settled publication with immutable
-facts: no live context, no clock.
+when that room stays quiet. Its record writer (a plan council reply that settled after its task
+ended, a left change, result or commit review; marks of the deleted acceptance panel stay as
+history) persists the full source first, then calls ``publish_late_review`` once per settled
+publication with immutable facts: no live context, no clock.
 
 The publication becomes ONE chronicle ``mark`` signed by the host (``LATE_REVIEW_OPERATION``)
 in the room the memory view reads for that work: the room ``dialogue_evidence.own_room_chat``
@@ -51,8 +51,8 @@ from ouroboros.utils import truncate_within_limit
 log = logging.getLogger(__name__)
 
 # The review a mark names, by its writer's surface; another surface is named as recorded.
-SURFACE_NAMES = {"task_acceptance": "result review", "plan_review": "plan review", "commit_gate": "commit review",
-                 "multi_model_review": "change review", "change": "change review"}
+SURFACE_NAMES = {"task_acceptance": "result review", "result": "result review", "plan_review": "plan review",
+                 "commit_gate": "commit review", "multi_model_review": "change review", "change": "change review"}
 LINE_LIMIT = 800  # one line of the writer's words
 TEXT_LIMIT = 4000  # the whole mark: the view never degrades a mark, so the bound is set here
 OWED_SET = "late_review_marks"  # owner-held rows: id -> {record | left_review, after_end?}

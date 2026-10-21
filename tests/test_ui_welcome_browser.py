@@ -244,10 +244,10 @@ def test_empty_main_greeting_contract(direct_server_with_data, engine):
             for script in (_CAPTURE_TEST_SOCKET, _HOLD_MAIN_HISTORY, _WATCH_WELCOME):
                 late.add_init_script(f"({script})()")
             held = "() => window.__historyHeld.length > 0"
-            # The failed read's own chrome: Retry on the feed edge, its note in Main's header.
+            # The failed read's own chrome: Retry on the feed edge, its note hanging under Main's header bar (#1998).
             failure = """() => document.querySelector('#chat-messages .chat-load-older-btn')
                 ?.textContent === 'Retry loading messages'
-                && document.querySelector('#page-chat .chat-page-header .chat-history-status')
+                && document.querySelector('#page-chat .chat-page-note .chat-history-status')
                 ?.textContent.includes('could not be loaded') === true"""
             # A held read over a feed of chrome only: its loading state, never an old greeting.
             loading = """() => window.__historyHeld.length > 0

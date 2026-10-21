@@ -314,10 +314,11 @@ def serve_task_source(drive_root: Any, stores: List[pathlib.Path], result: Dict[
     basename is ``name`` qualifies, read from the task's own stores (canonical first)
     through the confined descent and verified against the digest its name carries. Any
     other path must be a source the task result publishes, returned as its verified JSON,
-    or this author's own host acceptance record named by its digest: a late notice keeps
-    linking the record it was sent with after a newer publication replaced its panel's
-    ref (#1369), resolved by the same membership ``get_task_result(review_source_sha256=)``
-    verifies (``task_finalization.host_acceptance_source``).
+    or this author's own host acceptance record (history: the retired task acceptance
+    wrote it) named by its digest: an old late notice keeps linking the record it was
+    sent with after a newer publication replaced its panel's ref (#1369), resolved by
+    the same membership ``get_task_result(review_source_sha256=)`` verifies
+    (``task_finalization.host_acceptance_source``).
     """
     match = _DELEGATED_SOURCE_RE.fullmatch(str(source or ""))
     if match:

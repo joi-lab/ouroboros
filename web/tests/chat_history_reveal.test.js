@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createChatHistoryPager } from '../modules/chat_history.js';
 import { createHistoryReveal } from '../modules/chat_history_reveal.js';
+import { installDomDouble } from './dom_double.js';
 
 const recent = { messages: [{ history_id: 'chat:900', text: 'now' }], page_cursor: 'replay:recent', next_cursor: 'before:899',
     has_more: true, after_cursor: 'after:1', window: { complete: false } };
@@ -156,4 +157,59 @@ test('a landing is the task’s card, else its own row, and nothing when the pag
     assert.equal(await reveal.revisit('replay:here', () => true), false, 'a read that failed for now: try again');
     result = { status: 'error', error: { status: 409 } };
     assert.equal(await reveal.revisit('replay:here', () => true), 'gone', 'the room changed: that page is no longer there');
+});
+
+test('an exact reference cannot fall back to a task, portal, retained origin or folded repeat', async () => {
+    const env = installDomDouble();
+    try {
+        const address = 'row:1@then#aaaaaaaaaaaa';
+        const feed = env.el('div');
+        env.doc.body.append(feed);
+        const card = env.el('div', { className: 'chat-live-card', dataset: { taskId: 't-card' } });
+        const retained = env.el('div', { dataset: { rowAddress: address, originProjected: '1' } });
+        const portal = env.el('div', { dataset: { portal: '1' } }, env.el('div', { dataset: { historyId: 'chat:100' } }));
+        feed.append(card, retained, portal);
+        const records = new Map([['t-card', { root: card, items: [{ historyId: 'chat:100' }] }]]);
+        let mounted = false;
+        const reveal = createHistoryReveal({ feed, records, present: () => true,
+            reading: { claim: () => () => true },
+            pager: { around: async () => ({ status: 'applied', anchor: { state: 'found', row_address: address, history_id: 'chat:100' } }) },
+            expand(record) {
+                if (mounted && record) card.append(env.el('div', { dataset: { historyId: 'chat:100' }, text: 'Exact line' }));
+            } });
+        assert.equal(reveal.exact(address), null);
+        assert.deepEqual(await reveal.reference(address, () => true), { state: 'unavailable', left: true },
+            'its page was drawn: the reader is no longer where they were');
+        mounted = true;
+        const answer = await reveal.reference(address, () => true);
+        assert.equal(answer.target.dataset.historyId, 'chat:100');
+        assert.equal(answer.target.textContent, 'Exact line');
+        assert.equal(await reveal.reference(address, () => false), null);
+    } finally { env.restore(); }
+});
+
+test('a destination page prepared before switching joins the same pager without a second read', async () => {
+    const h = harness(() => { throw new Error('a prepared page must not refetch'); });
+    const data = around({ state: 'found', row_address: 'row:1@then#aaaaaaaaaaaa', chat_id: 1, history_id: 'chat:100' });
+    assert.equal((await h.pager.around(data.anchor.row_address, () => true, data)).status, 'applied');
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.pager.getState().away, true);
+    assert.equal(h.pager.pageOf('chat:100'), 'replay:around');
+});
+
+test('an exact reference that could not be read passes the typed failure on, never a guess at its cause', async () => {
+    const env = installDomDouble();
+    try {
+        const feed = env.el('div');
+        env.doc.body.append(feed);
+        const failure = Object.assign(new Error('HTTP 503'), { status: 503, body: { reason_code: 'history_source_unavailable' } });
+        let read = { status: 'error', error: failure };
+        const reveal = createHistoryReveal({ feed, records: new Map(), present: () => true, reading: { claim: () => () => true },
+            pager: { around: async () => read } });
+        assert.deepEqual(await reveal.reference('row:1@then#aaaaaaaaaaaa', () => true), { state: 'unknown', error: failure });
+        read = { status: 'busy' };
+        assert.deepEqual(await reveal.reference('row:1@then#aaaaaaaaaaaa', () => true), { state: 'unknown' });
+        read = { status: 'anchor', anchor: { state: 'moved', task_id: 'work-1' } };
+        assert.deepEqual(await reveal.reference('task:work-1', () => true), { state: 'moved', task_id: 'work-1' });
+    } finally { env.restore(); }
 });

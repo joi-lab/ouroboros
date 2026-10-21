@@ -461,7 +461,7 @@ def _complete_exact_budget_pause_after_death(job: dict, root: pathlib.Path, task
             if grant.get("consumed_at"):
                 return False, fenced  # the loop consumed it and ran on: ordinary custody
             from supervisor.budget_resume import revoke_exact_budget_resume
-            from supervisor.events_budget import BUDGET_HOLD_KEY
+            from supervisor.events_budget import BUDGET_HOLD_KEY, HOLD_GRANT_CONSUMED_STALE_ROW
             from ouroboros.budget_pause import exact_pause_marker
 
             task.setdefault("_budget_pause_resume", {
@@ -469,7 +469,7 @@ def _complete_exact_budget_pause_after_death(job: dict, root: pathlib.Path, task
                 "pause": exact_pause_marker(row, default_root=str(task.get("root_task_id") or task_id)),
             })
             if not revoke_exact_budget_resume(task, "worker_death_before_consumption"):
-                if task.get("_budget_pause_consumed"):
+                if (task.get(BUDGET_HOLD_KEY) or {}).get("reason") == HOLD_GRANT_CONSUMED_STALE_ROW:
                     return False, fenced  # a concurrent consumption keeps crash custody, never re-arms
                 # Revocation failure is a nonterminal hold, never a crash retry
                 # or terminal. Preserve exact source and grant identity even if

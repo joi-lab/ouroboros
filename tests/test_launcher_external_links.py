@@ -35,7 +35,7 @@ def test_setup_and_main_bridge_share_the_bounded_external_opener(monkeypatch, se
     node = next(node for node in ast.walk(ast.parse(source))
                 if isinstance(node, ast.ClassDef) and node.name == "MainApi")
     namespace = {"_open_external_url": launcher._open_external_url, "DesktopApi": launcher.DesktopApi,
-                 "background": None}
+                 "_shell_facts": launcher._shell_facts, "background": None}
     exec(compile(ast.Module(body=[node], type_ignores=[]), "MainApi", "exec"), namespace)
     assert "open_external_url=_open_external_url" in source
     for api in (created["js_api"], namespace["MainApi"]()):
@@ -78,6 +78,7 @@ def test_main_bridge_request_attention_delegates_to_the_background_policy(monkey
     namespace = {
         "_open_external_url": launcher._open_external_url,
         "DesktopApi": launcher.DesktopApi,  # the alert half lives in launcher_background
+        "_shell_facts": launcher._shell_facts,
         "background": type("Background", (), {
             "attention": lambda self, *args: seen.append(args) or {"ok": True}})(),
     }

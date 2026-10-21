@@ -5,7 +5,7 @@
 and it now answers "malformed" the way they do: absent stays an ordinary empty
 registry, malformed refuses the mutation, keeps the bytes and discloses one
 typed ``subagent_worktree_registry_corrupt`` event. Pre-fix a live snapshot
-read as missing, the startup GC reported a clean sweep, and the next
+read as missing, the GC at boot reported a clean sweep, and the next
 reconciliation overwrote the malformed bytes with a valid empty registry —
 stranding the checkout and the ``refs/ouroboros/delegated/*`` ref that pins its
 baseline with nothing left naming them.

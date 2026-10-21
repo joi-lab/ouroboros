@@ -77,8 +77,10 @@ def mind_tool_entries() -> list:
     }, _continue_in_background),
         ToolEntry("pause_task", _control_schema("pause_task",
              "Request Pause of a listed work through the owner's tree-pause control. "
-             "The record names you. Started reviews may finish while the task pauses. Self-pause is refused: "
-             "sleep with await_messages or escalate. The outcome arrives in your task mailbox."), _pause_task),
+             "The owner reads your reason under the work's name: say plainly, in one short sentence without ids, "
+             "why you paused it and whose decision it was. Started reviews may finish while the task pauses. "
+             "Self-pause is refused: sleep with await_messages or escalate. The outcome arrives in your task mailbox."),
+             _pause_task),
         ToolEntry("resume_task", _control_schema("resume_task",
              "Request Resume of listed paused work through the owner's existing grants. "
              "It preserves spent money, clocks and review history; capacity and holds still apply. "

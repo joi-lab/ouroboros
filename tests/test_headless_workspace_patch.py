@@ -482,3 +482,28 @@ def test_workspace_patch_fails_when_acting_base_sha_head_changed(tmp_path):
     assert manifest["errors"][-1]["expected_head"] == base_head
     assert manifest["errors"][-1]["current_head"] == moved_head
     assert not any(item["kind"] == "workspace_patch" for item in artifacts)
+
+
+def test_an_untracked_symlink_loop_never_fails_the_capture(tmp_path):
+    """A link left pointing at itself (a test's ``snapshot.json -> snapshot.json``) cannot be
+    resolved. Only a declared scratch path is resolved, and an unresolvable link is no scratch
+    file, so the capture goes on and Git keeps the link as a link."""
+    import os
+
+    from ouroboros.workspace_patch_capture import SCRATCH_MANIFEST_NAME
+
+    repo = tmp_path / "repo"
+    _init_repo_with_file(repo)
+    (repo / "kept.txt").write_text("kept\n", encoding="utf-8")
+    for folder in (repo, repo / ".review-evidence"):
+        folder.mkdir(exist_ok=True)
+        os.symlink("snapshot.json", folder / "snapshot.json")
+    for name, scratch in (("plain", None), ("scratch", {str(tmp_path / "elsewhere.txt"): "0" * 64})):
+        artifacts = tmp_path / name
+        if scratch is not None:
+            artifacts.mkdir()
+            (artifacts / SCRATCH_MANIFEST_NAME).write_text(json.dumps({"scratch": scratch}), encoding="utf-8")
+        _, manifest = write_workspace_patch_artifacts(repo, artifacts, task={})
+        assert manifest["status"] == ARTIFACT_STATUS_READY_WITH_CHANGES, (name, manifest.get("errors"))
+        patch = (artifacts / "workspace.patch").read_text(encoding="utf-8")
+        assert "kept.txt" in patch and "new file mode 120000" in patch, name

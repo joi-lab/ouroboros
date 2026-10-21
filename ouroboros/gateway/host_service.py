@@ -552,8 +552,12 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
                         "ok": True, "response": str(state.get("text") or ""),
                         "status": state["status"], "rejoined": True, **correlated,
                     })
-                # Proven never dispatched by THIS process: the named ingress below hands it over, once.
-                rejoined = state.get("reason") != "acceptance_write_failed"
+                # A dispatch still owed (the acceptor died before the handoff): the named ingress below
+                # hands it over, once; anything else rejoins.
+                from supervisor.message_ingress import dispatch_facts
+
+                facts = dispatch_facts(inbound, ctx.data_dir)
+                rejoined = facts is None or facts["state"] != "pending"
         metadata: dict[str, Any] = {}
         inline, image_mime = "", ""
         if not rejoined:
@@ -812,6 +816,9 @@ async def _api_presence_delivery(request: Request) -> JSONResponse:
         return _presence_error(str(exc), 409, "presence_receipt_conflict", "rejected")
     except (ValueError, TypeError) as exc:
         return _presence_error(str(exc), 400, "presence_receipt_invalid", "rejected")
+    except store.StoreMigrating:  # the receipt's earlier rows are in saved history that is still being upgraded
+        return _presence_error("presence delivery history is still importing; retry the same receipt", 503,
+                               "presence_history_importing", "retry")
     except Exception:
         log.warning("Presence delivery history write failed for skill %s", skill_name, exc_info=True)
         return _presence_error("presence delivery history write failed; retry the same receipt", 503,
@@ -1017,7 +1024,7 @@ def _presence_work_view(
                      "code": "presence_work_not_found", "disposition": "rejected"}
     from ouroboros.presence_recovery import retained_work_view
 
-    return retained_work_view(stored, work_ref)
+    return retained_work_view(stored, work_ref, ctx.data_dir)
 
 
 async def _api_presence_work(request: Request) -> JSONResponse:
@@ -1215,12 +1222,11 @@ def _parse_operation_ref(value: Any) -> tuple[int, str]:
 
 
 def _chat_rows(ctx: HostServiceContext, chat_id: int) -> list:
-    """Read retained canonical sources; a display tail cannot prove absence."""
-    from ouroboros.utils import iter_jsonl_objects, jsonl_chain_handles
+    """The chat's retained canonical rows (the dialogue store's room probe, oldest first)."""
+    from ouroboros import dialogue_store
 
-    with jsonl_chain_handles(ctx.data_dir / "logs" / "chat.jsonl", strict=True) as handles:
-        return [row for path, handle in handles for row in iter_jsonl_objects(path, _handle=handle)
-                if row.get("chat_id") == chat_id]
+    found = dialogue_store.probe_rows(ctx.data_dir, "chat", [("chat_id", int(chat_id))], limit=10_000)
+    return [row.row for row in reversed(found)]
 
 
 def _inbound_row(rows: list, client_message_id: str) -> Optional[Dict[str, Any]]:
@@ -1327,16 +1333,15 @@ def _operation_state(ctx: HostServiceContext, rows: list, inbound: Dict[str, Any
         if row.get("direction") in {"out", "system"} and terminal in SETTLED_STATUSES and owns(row):
             state.update({"status": terminal, "text": str(row.get("text") or "")})
             return state
-    from supervisor.message_ingress import accepted_here, acceptance_undispatched
+    from supervisor.message_ingress import dispatch_lost, dispatch_taken_over_here
 
-    if acceptance_undispatched(chat_id, client_message_id):  # its write raised; nothing was queued
-        state.update({"status": "lost", "reason": "acceptance_write_failed"})
-        return state
     accepted_session = str(inbound.get("session_id") or "")
     live_session = str((read_json_dict(ctx.data_dir / "state" / "state.json") or {}).get("session_id") or "")
-    # A crash keeps the session: the row's process stamp names the ended process (and its queue).
-    ended = bool(inbound.get("ingress_process")) and not accepted_here(inbound)
-    if ended or (accepted_session and live_session and accepted_session != live_session):
+    # A crash keeps the session: the dispatch fact names the ended process (and its queue). A dispatch
+    # THIS process took over after the restart (an owed one, by a retry or the recovery) is live.
+    ended = dispatch_lost(inbound, ctx.data_dir)
+    restarted = accepted_session and live_session and accepted_session != live_session
+    if ended or (restarted and not dispatch_taken_over_here(inbound, ctx.data_dir)):
         state.update({"status": "lost", "reason": "host_restarted_before_answer"})
     return state
 

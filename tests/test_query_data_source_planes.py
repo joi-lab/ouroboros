@@ -149,6 +149,37 @@ def test_presence_ceiling_narrows_the_canonical_plane_like_read_file(planes, mon
             assert "data" not in result and "canonical bytes" not in json.dumps(result)
 
 
+def test_storage_uses_the_installation_or_native_pin_with_existing_read_authority(planes):
+    relative = "state/storage_measurement.json"
+    target = planes["canonical"] / relative
+    target.write_text('{"plane":"installation"}', encoding="utf-8")
+    (planes["helper"] / relative).write_text('{"plane":"helper"}', encoding="utf-8")
+    ctx = _contexts(planes)["helper"]
+    helper = _registry(ctx)
+    assert _read_admitted(helper, target)
+    status, result = _query(helper, op="json", kind="storage")
+    assert status == "ok" and result["data"] == {"plane": "installation"}
+    assert result["source"]["plane"] == "canonical"
+
+    ctx.task_contract = {"resource_policy": {"protected_artifacts": [
+        {"paths": [str(target)], "role": "black_box_reference"}]}}
+    restricted = _registry(ctx)
+    assert not _read_admitted(restricted, target)
+    status, refused = _query(restricted, op="json", kind="storage")
+    assert status == "blocked" and refused["plane"] == "canonical" and "data" not in refused
+
+    pin = planes["pin"] / relative
+    pin.write_text('{"plane":"retained"}', encoding="utf-8")
+    native = _registry(ToolContext(repo_dir=planes["repo"], drive_root=planes["pin"], task_id="native",
+                                  budget_drive_root=str(planes["canonical"]),
+                                  task_metadata={"native_data_root": str(planes["pin"])}))
+    status, result = _query(native, op="json", kind="storage")
+    assert status == "ok" and result["source"]["plane"] == "native_pin" and result["data"] == {"plane": "retained"}
+    pin.unlink()
+    status, missing = _query(native, op="json", kind="storage")
+    assert status == "unavailable" and missing["plane"] == "native_pin" and "data" not in missing
+
+
 def test_explicit_child_queue_logs_and_sql_keep_their_local_planes(planes, monkeypatch):
     monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
     contexts = _contexts(planes)

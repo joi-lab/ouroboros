@@ -348,13 +348,19 @@ function bindCardEvents(card) {
         const index = mcpServers.indexOf(rowServer);
         if (index >= 0) mcpServers.splice(index, 1);
         renderAll();
+        revealAfterRemove(index);
         notifyChanged();
     });
 
     card.querySelector('[data-mcp-test]')?.addEventListener('click', async () => {
         const server = rowServer;
         const errors = validateHeaderFields(card, server, saved?.identity);
-        if (errors.length) { setCardMessage(server, errors[0].message, 'danger'); errors[0].input.focus(); return; }
+        if (errors.length) {
+            setCardMessage(server, errors[0].message, 'danger');
+            if (errors[0].input.hidden) resetSecretReveals(card); // a shown value stands in for its input
+            errors[0].input.focus();
+            return;
+        }
         const generation = draftGenerations.get(server) || 0;
         setPending(server, 'test', true);
         setCardMessage(server, 'Testing connection...', 'muted', 'test');
@@ -426,9 +432,18 @@ function renderAll() {
         : `<article class="mcp-server-card" data-mcp-invalid="${idx}"><span class="ui-field-help">MCP entry ${idx + 1} is malformed and retained unchanged. Remove it explicitly to discard it.</span><button type="button" class="btn btn-default" data-mcp-invalid-remove>Remove</button></article>`).join('');
     host.querySelectorAll('[data-mcp-card]').forEach((card) => bindCardEvents(card));
     host.querySelectorAll('[data-mcp-invalid-remove]').forEach((button) => button.addEventListener('click', () => {
-        mcpServers.splice(Number(button.closest('[data-mcp-invalid]').dataset.mcpInvalid), 1);
-        renderAll(); notifyChanged();
+        const index = Number(button.closest('[data-mcp-invalid]').dataset.mcpInvalid);
+        mcpServers.splice(index, 1);
+        renderAll(); revealAfterRemove(index); notifyChanged();
     }));
+}
+
+// After a Remove the caret goes to the entry now in that place, else to Add (DESIGN "List editors");
+// a malformed entry has no field, only its own Remove.
+function revealAfterRemove(index) {
+    const card = document.getElementById('mcp-servers-list')?.children[Math.min(index, mcpServers.length - 1)];
+    if (card) revealNewRow(card, card.querySelector('[data-mcp-field="id"]') || card.querySelector('button'));
+    else document.getElementById('btn-mcp-add-server')?.focus();
 }
 
 function renderEnvelopeStatus() {

@@ -86,19 +86,20 @@ def test_smoke_retry_preserves_original_wave_and_requires_settlement(tmp_path, m
     elif case == "nested_pending":
         records = [{"raw_results": [{"operation_state": "in_flight"}]}]
     path = review_history_path(tmp_path, name)
-    if case != "missing_history":
-        assert append_history_once(tmp_path, name, {"job_id": "original-wave", "status": status,
-            "content_hash": "old-hash" if case == "wrong_hash" else "current-hash",
-            "raw_actor_records": records, "paid": True})
-    before = path.read_bytes() if path.exists() else None
-    observed = []
+    before, observed = None, []
 
     def flow(slug, skill):
+        nonlocal before
         observed.append((slug, skill))
-        assert (path.read_bytes() if path.exists() else None) == before
-        if len(observed) == 1:
+        if len(observed) == 1:  # the first attempt records the original wave, as review_skill does
+            if case != "missing_history":
+                assert append_history_once(tmp_path, name, {"job_id": "original-wave", "status": status,
+                    "content_hash": "old-hash" if case == "wrong_hash" else "current-hash",
+                    "raw_actor_records": records, "paid": True})
+            before = path.read_bytes() if path.exists() else None
             return status, "" if status in {"clean", "blockers"} else "first failure", (
                 "failed" if case == "deps_failed" else "installed"), {}
+        assert (path.read_bytes() if path.exists() else None) == before  # the retry keeps the original wave
         return "clean", "", "installed", {}
 
     monkeypatch.setattr(smoke, "_run_review_flow", flow)

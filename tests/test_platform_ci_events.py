@@ -96,7 +96,7 @@ def test_ordinary_matrix_requires_admitted_manual_or_tag_event(event, ref, base,
     if admitted:
         actual += [row["os"] for row in job["strategy"]["matrix"]["include"]]
     assert sorted(set(actual)) == sorted(platforms)
-    assert actual.count("windows-latest") == (4 if "windows-latest" in platforms else 0)
+    assert actual.count("windows-latest") == (8 if "windows-latest" in platforms else 0)
     assert all(actual.count(os) == 1 for os in platforms if os != "windows-latest")
     assert job["strategy"]["fail-fast"] is False
     assert job["runs-on"] == "$" + "{{ matrix.os }}"
@@ -283,8 +283,24 @@ def test_the_windows_leg_runs_its_browser_modules_and_refuses_a_skip(tmp_path, r
         return
     # The sizing evidence reaches the artifact: safe_test keeps the evidence root, the step fails
     # without the geometry it wrote, and the upload takes that root whatever the test's outcome.
-    safe_test = (ROOT / "scripts/safe_test.py").read_text(encoding="utf-8")
-    assert '"OUROBOROS_UI_EVIDENCE_DIR"' in safe_test.split("keep=(", 1)[1].split("))", 1)[0]
+    # Exercise the launcher rather than pinning a duplicated keep-list literal:
+    # the shared diagnostic-key vocabulary may supply it through a splat.
+    import os
+    destination = tmp_path / "selected-composer-evidence"
+    probe = ("import os,pathlib; p=pathlib.Path(os.environ['OUROBOROS_UI_EVIDENCE_DIR']); "
+             "p.mkdir(parents=True); (p/'geometry.json').write_text('[]'); "
+             "assert 'OPENAI_API_KEY' not in os.environ; print(p)")
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", str(ROOT / "scripts/safe_test.py"),
+         "--temp-parent", str(tmp_path), "--evidence-dir", str(tmp_path / "launcher-evidence"),
+         "--", sys.executable, "-c", probe], cwd=ROOT,
+        env={**os.environ, "OUROBOROS_UI_EVIDENCE_DIR": str(destination),
+             "OPENAI_API_KEY": "synthetic-must-be-scrubbed"},
+        capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert str(destination) in result.stdout
+    assert (destination / "geometry.json").read_text() == "[]"
+    assert "SAFE_TEST_RELEASED " in result.stderr
     root = run["env"]["OUROBOROS_UI_EVIDENCE_DIR"]
     assert root == "${{ runner.temp }}/ci-evidence/composer"
     [written] = evidence

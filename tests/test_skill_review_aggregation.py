@@ -44,7 +44,7 @@ def test_extract_actor_findings_reads_flat_text_field():
         ]
     }
     findings, responded = _extract_actor_findings(result_json)
-    assert len(findings) == 32
+    assert len(findings) == 34
     assert responded == [
         "openai/gpt-5.5#1",
         "google/gemini-3.5-flash#2",
@@ -109,7 +109,7 @@ def test_extract_actor_findings_counts_duplicate_models_by_slot():
 
     findings, responded = _extract_actor_findings(result_json)
 
-    assert len(findings) == 32
+    assert len(findings) == 34
     assert responded == [
         "anthropic/claude-opus-4.6#1",
         "anthropic/claude-opus-4.6#2",

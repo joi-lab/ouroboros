@@ -301,7 +301,7 @@ def test_untrusted_executable_bit_stays_out_of_the_snapshot_diff(tmp_path, indep
 @pytest.mark.parametrize("failure", ["copy_error", "source_changed"])
 @pytest.mark.parametrize("independent", [False, True], ids=["worktree", "clone"])
 def test_regular_input_copy_failure_cleans_snapshot_without_rewriting_target(tmp_path, monkeypatch, failure, independent):
-    from ouroboros import artifacts
+    from ouroboros import subagent_worktrees
 
     target = target_tree(tmp_path)
     # Unchanged CRLF bytes compare clean under the source's conversion; new content never does.
@@ -310,17 +310,17 @@ def test_regular_input_copy_failure_cleans_snapshot_without_rewriting_target(tmp
     before_index = git(target, "ls-files", "--stage", "-z").stdout
     before_head = git(target, "rev-parse", "HEAD").stdout
     before_bytes = (target / "code.txt").read_bytes()
-    original = artifacts.copy_artifact_file
+    original = subagent_worktrees._fill_private_copy
     newer = b"concurrent owner edit\r\n"
 
-    def copy(source, destination, **kwargs):
+    def copy(source, destination, copy_root):
         if Path(source) == target / "code.txt":
             if failure == "copy_error":
                 raise OSError("source changed during copy")
             Path(source).write_bytes(newer)
-        return original(source, destination, **kwargs)
+        return original(source, destination, copy_root)
 
-    monkeypatch.setattr(artifacts, "copy_artifact_file", copy)
+    monkeypatch.setattr(subagent_worktrees, "_fill_private_copy", copy)
     expected = OSError if failure == "copy_error" else subprocess.CalledProcessError
     with pytest.raises(expected):
         snapshot(tmp_path, target, independent=independent)
@@ -333,7 +333,7 @@ def test_regular_input_copy_failure_cleans_snapshot_without_rewriting_target(tmp
 
 
 def test_snapshot_keeps_git_link_entries_out_of_regular_file_copy(tmp_path, monkeypatch):
-    from ouroboros import artifacts
+    from ouroboros import subagent_worktrees
 
     target = target_tree(tmp_path)
     # Git's portable symlink checkout is a regular file containing the target;
@@ -347,13 +347,13 @@ def test_snapshot_keeps_git_link_entries_out_of_regular_file_copy(tmp_path, monk
     git(target, "-c", "user.name=Fixture", "-c", "user.email=f@invalid", "commit", "-m", "link entries")
     (target / "nested").mkdir()  # An uninitialized gitlink stays Git-owned.
     before_index = git(target, "ls-files", "--stage", "-z").stdout
-    original = artifacts.copy_artifact_file
+    original = subagent_worktrees._fill_private_copy
 
-    def copy(source, destination, **kwargs):
+    def copy(source, destination, copy_root):
         assert Path(source).name not in {"link", "nested"}
-        return original(source, destination, **kwargs)
+        return original(source, destination, copy_root)
 
-    monkeypatch.setattr(artifacts, "copy_artifact_file", copy)
+    monkeypatch.setattr(subagent_worktrees, "_fill_private_copy", copy)
     handle = snapshot(tmp_path, target)
     execution = Path(handle.path)
     assert (execution / "link").read_bytes() == b"code.txt"

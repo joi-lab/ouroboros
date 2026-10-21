@@ -678,7 +678,7 @@ def _run_retrieving_review(
         route=ReviewRouteKind.AGENT_SESSION if row.is_session else ReviewRouteKind.API_CHAT,
         session_target=row.session_target, session_profile=row.profile_id,
         session_access=row.access if row.is_session else "",
-        subagent_id=row.subagent_id,
+        subagent_id=row.subagent_id, processing_preference=row.processing_preference,
     )
     from ouroboros.review_checking import wave_checking_source
     from ouroboros.observability import new_call_id

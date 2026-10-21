@@ -146,6 +146,34 @@ def quiz_delivery_due(block: Any, *, now: Optional[str] = None) -> bool:
         return True  # a corrupt retry stamp cannot erase the underlying obligation
 
 
+def question_waits(document: Any, *, now: str) -> tuple:
+    """What a task's retained questions wait on when none is due at NOW: ``(waits, due_at)``.
+
+    ``owner_answer`` for a current question (open or ``expired_terminal``: only the owner's
+    answer or closure moves it, В17a=A), an owed delivery's own typed reason (``delivery_retry``
+    without one), and the earliest persisted retry instant that alone keeps a debt from being due.
+    """
+    waits, due = set(), []
+    quizzes = document.get("owner_quiz") if isinstance(document, dict) else None
+    for block in quizzes.values() if isinstance(quizzes, dict) else ():
+        if not quiz_needs_retention(block):
+            continue
+        if current_question(block):
+            waits.add("owner_answer")
+        delivery = block.get("delivery") if isinstance(block.get("delivery"), dict) else {}
+        if delivery and not question_delivery_settled(block) and not delivery_dismissed(block):
+            waits.add(str(delivery.get("reason_code") or "delivery_retry"))
+            when = str(delivery.get("next_retry_at") or "")
+            if when and quiz_delivery_due(block, now=when):
+                due.append(when)
+    return sorted(waits) or ["nothing_owed"], min(due, key=_utc) if due else None
+
+
+def _utc(value: str) -> datetime.datetime:
+    stamp = datetime.datetime.fromisoformat(value)
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=datetime.timezone.utc)
+
+
 def claim_quiz_delivery(drive_root: Any, task_id: str, quiz_id: str, *, force: bool = False) -> Dict[str, Any]:
     """Persist a bounded retry window BEFORE effects, also surviving a worker crash.
 

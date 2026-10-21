@@ -369,3 +369,72 @@ def test_relay_quotes_the_owners_words_and_files_above_the_note_verbatim(bridge)
     asyncio.run(bridge.plugin._make_outbound(bridge.api)({**event, "relay": {"relay_id": "r2", "text": "", "quotes": []}}))
     [(_method, plain)] = bridge.calls
     assert plain["text"] == "Apply this constraint.", "a relay without quoted words is just its note"
+
+
+_MAP_FAULTS = [("write_text", 28), ("write_text", 13), ("replace", 28), ("replace", 13)]  # ENOSPC, EACCES
+
+
+def _fail_reference_map(monkeypatch, operation, code):
+    original = getattr(Path, operation)
+
+    def fail(path, *args, **kwargs):
+        if path.name == "message_refs.tmp":
+            raise OSError(code, "injected derived-map failure")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, operation, fail)
+
+
+@pytest.mark.parametrize("operation,code", _MAP_FAULTS)
+def test_owner_message_reaches_host_when_reference_map_cannot_be_saved(bridge, monkeypatch, operation, code):
+    posts = _host_posts(bridge, monkeypatch)
+    _fail_reference_map(monkeypatch, operation, code)
+    _receive(bridge, _owner(text="Deliver my actual request"))
+    [(path, payload)] = posts
+    assert path == "/chat/inject" and payload["text"] == "Deliver my actual request"
+    assert payload["client_message_id"] == "tg:42:50"
+    assert bridge.api.logs and all(level == "warning" and "test-token" not in line
+                                   and str(bridge.api.state_dir) not in line for level, line in bridge.api.logs)
+
+
+@pytest.mark.parametrize("operation,code", _MAP_FAULTS)
+def test_every_outbound_chunk_is_sent_when_reference_map_cannot_be_saved(bridge, monkeypatch, operation, code):
+    text = "All words must reach the owner. " * 700
+    expected = bridge.transport._chunk_raw_text(text.strip())  # the bridge strips before chunking
+    assert len(expected) > 2
+    _fail_reference_map(monkeypatch, operation, code)
+    asyncio.run(bridge.plugin._make_outbound(bridge.api)({"text": text, "chat_id": 1, "task_id": "reply-work",
+                "markdown": False, "row_address": "row:1@2026-10-17T08:00:00Z#123456789abc"}))
+    assert [data["text"] for method, data in bridge.calls if method == "sendMessage"] == expected
+    assert len(bridge.api.logs) == len(expected) and {level for level, _ in bridge.api.logs} == {"warning"}
+    assert _state(bridge.plugin)._reply_reference(bridge.api, 42, 101) == ""
+
+
+@pytest.mark.parametrize("notify,salvage", [("on", ""), ("off", "Preserved draft")])
+def test_project_status_reply_names_work_not_the_unshown_main_answer(bridge, monkeypatch, notify, salvage):
+    from ouroboros.chat_references import resolve_reply
+    from ouroboros.task_results import write_task_result
+    from ouroboros.chat_chain import format_address, row_address
+    from supervisor import message_bus
+    from tests.test_chat_attachments import _web_bridge
+
+    b = bridge
+    root = b.api.state_dir / "data"
+    _web_bridge(root, monkeypatch)
+    write_task_result(root, "finished-work", "completed", title="The finished work")
+    row = message_bus.log_chat("system", 1, 0, "Project / Done", record_type="project_completion_summary",
+                              message_meta={"task_id": "finished-work", "completion_answer": "AUTHOR ANSWER NOT SENT TO TELEGRAM"})
+    address = format_address(row_address(row))
+    b.plugin.merge_settings(b.api.state_dir, {"TELEGRAM_NOTIFY_TASKS": notify})
+    event = {"role": "system", "system_type": "project_completion_summary", "kind": "project_completion_summary",
+             "chat_id": 1, "task_id": "finished-work", "row_address": address, "text": "Project / Done",
+             "completion_answer": row["completion_answer"],
+             "completion_notice": {"neutral": True, "detail": "", "salvage": salvage}}
+    asyncio.run(b.plugin._make_outbound(b.api)(event))
+    assert len(b.calls) == 1 and "AUTHOR ANSWER" not in b.calls[0][1]["text"]
+    posts = _host_posts(b, monkeypatch)
+    _receive(b, _owner(reply=101))
+    assert posts[0][0] == "/chat/inject" and posts[0][1]["reply_to"] == "task:finished-work"
+    assert "task_id" not in posts[0][1]  # a reference, never a routing request
+    assert resolve_reply(root, posts[0][1]["reply_to"])["kind"] == "work_card"
+    assert resolve_reply(root, address)["snippet"] == row["completion_answer"]  # Main's separate visible answer

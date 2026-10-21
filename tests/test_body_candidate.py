@@ -570,11 +570,11 @@ def _expire_all():
 def test_gc_removes_only_candidates_without_unique_work(body):
     serving, data = body
     clean = body_candidate.prepare(make_ctx(serving, data, "gc-clean"))
-    junk = body_candidate.prepare(make_ctx(serving, data, "gc-junk"))
+    junk_ctx = make_ctx(serving, data, "gc-junk")
+    junk = body_candidate.prepare(junk_ctx)
     (pathlib.Path(junk["path"]) / "ouroboros/__pycache__").mkdir()
     (pathlib.Path(junk["path"]) / "ouroboros/__pycache__/mod_a.cpython-311.pyc").write_bytes(b"\0cache")
-    env_root = pathlib.Path(junk["path"]).with_name(pathlib.Path(junk["path"]).name + ".env")
-    (env_root / "data").mkdir(parents=True)
+    env_root = pathlib.Path(body_candidate.process_environment(junk_ctx, junk_ctx.repo_dir)["HOME"]).parent
 
     kept_fresh = subagent_worktrees.prune_orphans(retention_days=30)
     assert kept_fresh["removed"] == 0 and pathlib.Path(clean["path"]).is_dir()

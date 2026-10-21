@@ -125,22 +125,38 @@ def readmit_placement(drive_root: Any, task: dict, *, repo_dir: Any, running: An
     if not candidate_is_leasable(task, running_project_ids(running.values()),
                                 cold_holders=cold_project_holders(pending)):
         return False
-    # Placement pins room identity; readmission consumes its current folder/generation.
+    # Placement changes the room's default, never a separately selected resource: an explicit
+    # folder or opt-out, or the candidate of body work. The registry holds that candidate when a
+    # restart dropped a direct actor's binding, or before a Continue inherits it (prepare).
+    from ouroboros.body_candidate import continuation_predecessor, find
+
+    metadata = task.setdefault("metadata", {})
+    kind = (metadata.get("resource_intent") or {}).get("kind")
+    owner = str(metadata.get("root_task_id") or task.get("root_task_id") or task.get("id") or "")
+    body = kind in (None, "", "system_repo") and any(
+        find(lineage, drive_root, strict=True) for lineage in (owner, continuation_predecessor(task)) if lineage)
+    pinned = body or kind in {"explicit_resource", "explicit_none"}
+    # Placement pins room identity; readmission consumes its current generation.
     with project_admission_guard(drive_root, {**binding["placement_admission"], "frozen": True}) as project:
-        folder = validate_workspace_root(project.get("working_dir"), system_repo_dir=repo_dir, drive_root=drive_root)
+        workspace = {"root": str(task.get("workspace_root") or ""), "mode": str(task.get("workspace_mode") or "")}
+        if not pinned:
+            folder = validate_workspace_root(project.get("working_dir"), system_repo_dir=repo_dir, drive_root=drive_root)
+            workspace = {"root": str(folder or ""), "mode": "external" if folder else ""}
         task.update(project_id=binding["project_id"], chat_id=project.get("chat_id"),
-                    workspace_root=str(folder or ""), workspace_mode="external" if folder else "",
+                    workspace_root=workspace["root"], workspace_mode=workspace["mode"],
                     _project_admission=project_admission_basis(binding["project_id"], project, frozen=True),
                     placement_applied_at=binding["bound_at"])
         task.pop("_project_scope_none", None)
-        metadata = task.setdefault("metadata", {})
         contract = task.get("task_contract") or metadata.get("task_contract")
         if isinstance(contract, dict):
-            task["task_contract"] = {**contract, "workspace": {"root": str(folder or ""),
-                                                               "mode": "external" if folder else ""}}
+            task["task_contract"] = {**contract, "workspace": workspace}
         metadata["placement_applied_at"] = binding["bound_at"]
         if isinstance(metadata.get("task_contract"), dict):
             metadata["task_contract"] = task["task_contract"]
+        if body and not kind and not workspace["root"]:
+            # Recorded where every default resolver reads it: no room lens or scratch replaces the body.
+            # A kept folder is never relabelled system_repo; children and follow-ups inherit the label.
+            metadata["resource_intent"] = {"kind": "system_repo"}
         metadata.pop("_project_room_dir", None)
         metadata.pop("_project_room_note", None)
     return True
@@ -155,16 +171,23 @@ def append_placement_notice(ctx: Any, messages: list) -> bool:
         binding = project_binding_for_task(canonical_data_root(ctx), str(ctx.task_id or ""), strict=True) or {}
         if not binding.get("placement_admission"):
             return False
-        marker = f"[PROJECT_PLACEMENT {binding['bound_at']}]"
+        applied = (getattr(ctx, "task_metadata", None) or {}).get("placement_applied_at") == binding["bound_at"]
+        marker = f"[PROJECT_{'EXECUTION' if applied else 'PLACEMENT'} {binding['bound_at']}]"
         if getattr(ctx, "_seen_project_placement", "") == marker:
             return False
         if not any(marker in str(message.get("content") or "") for message in messages):
             project = get_project(canonical_data_root(ctx), binding["project_id"], strict=True) or {}
+            if applied:
+                active = getattr(ctx, "active_repo_dir", None)
+                folder = active() if callable(active) else getattr(ctx, "workspace_root", None) or getattr(ctx, "repo_dir", None)
+                resources = f"Readmission has completed. This execution's working folder is {folder}. "
+            else:
+                resources = ("The current execution keeps its folder and writer lease; readmission at the next "
+                             "execution boundary selects the room's default unless an explicit resource or code candidate is retained. ")
             messages.append({"role": "user", "content": (
                 f"{marker} This work ({ctx.task_id}) now lives in {project.get('name') or binding['project_id']} "
                 f"(project_id={binding['project_id']}). Routing, journal and knowledge use this room now. "
-                "The current execution keeps its folder and writer lease; they change at the next "
-                "execution boundary after readmission. Knowledge is not automatically reloaded.")})
+                f"{resources}Knowledge is not automatically reloaded.")})
         ctx._seen_project_placement = marker
         return True
     except Exception:

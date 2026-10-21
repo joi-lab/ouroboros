@@ -1,5 +1,7 @@
-"""Positive browser acceptance over real retained JSONL history and its gateway.
+"""Positive browser acceptance over real retained history and its gateway.
 
+The history is the server's dialogue store: rows stored as the server stores them,
+and the frozen JSONL archive of an older install imported as the upgrade imports it.
 Only the request transport can be held/failed; every successful page and cursor
 comes from the real history endpoint. The shared server uses its local mock LLM.
 """
@@ -8,11 +10,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import os
 from pathlib import Path
 
 import pytest
 
+from ouroboros import dialogue_store
+from tests import _dialogue as dialogue_test
+from tests._shared import producer_evidence_dir
 from tests._store_shared import seed_result
 from tests.test_ui_smoke_playwright import direct_server_with_data as direct_server_with_data
 from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET, _SETTLE_RESTORE_FRAMES, _emit_ws_frame
@@ -54,9 +58,10 @@ _OBSERVE_HISTORY = """() => {
 }"""
 
 
-def _write(path, rows):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+def _append(root, stream, rows):
+    """Rows the running server would have stored, appended to its own dialogue store."""
+    for row in rows:
+        dialogue_store.append(root, stream, row)
 
 
 def _result(root, task_id, **fields):
@@ -77,13 +82,13 @@ def _progress(index, chat_id=1, **extra):
 
 
 def _bulk_history(root):
+    """An older install's chains: five archive segments of each stream and the live files, imported."""
+    archives = {}
     for segment in range(5):
-        _write(root / "archive" / f"chat_20260901T00000{segment}.jsonl",
-               [_human(segment * 360 + index) for index in range(360)])
-        _write(root / "archive" / f"progress_20260901T00000{segment}.jsonl",
-               [_progress(segment * 145 + index) for index in range(145)])
-    _write(root / "logs" / "chat.jsonl", [_human(1800)])
-    _write(root / "logs" / "progress.jsonl", [_progress(725)])
+        archives[f"chat_20260901T00000{segment}.jsonl"] = [_human(segment * 360 + index) for index in range(360)]
+        archives[f"progress_20260901T00000{segment}.jsonl"] = [_progress(segment * 145 + index) for index in range(145)]
+    dialogue_test.seed(root, archives=archives, live={"chat": [_human(1800)], "progress": [_progress(725)]})
+    dialogue_test.import_all(root)
     for index in range(6):
         _result(root, f"history-task-{index}")
 
@@ -93,16 +98,14 @@ def _sparse_history(root):
 
     project = create_project(root, "history-sparse", name="Sparse archive room")
     foreign = create_project(root, "history-foreign", name="Other archive room")
-    _write(root / "archive" / "chat_20260801T000000.jsonl", [
+    # Stored after the archive navigation's history: the room's first message, five
+    # archives' worth of another room's rows, then the room's latest message.
+    _append(root, "chat", [
         _human(0, project["chat_id"], text="SPARSE_FIRST_SAVED_MESSAGE"),
+        *[_human(index, foreign["chat_id"], text="OTHER_ROOM_ONLY " + "x" * 2000)
+          for _segment in range(5) for index in range(350)],
+        _human(1, project["chat_id"], text="SPARSE_LATEST_MESSAGE"),
     ])
-    for segment in range(5):
-        _write(root / "archive" / f"chat_20260902T00000{segment}.jsonl", [
-            _human(index, foreign["chat_id"], text="OTHER_ROOM_ONLY " + "x" * 2000)
-            for index in range(350)
-        ])
-    with (root / "logs" / "chat.jsonl").open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(_human(1, project["chat_id"], text="SPARSE_LATEST_MESSAGE")) + "\n")
     return project
 
 
@@ -175,9 +178,18 @@ def _open_project(page, project):
     return feed
 
 
+def _evidence_dir(tmp_path):
+    """One destination for this file's screenshots, DOM dumps and HTML receipts.
+
+    The DOM and terminal-child writers resolved HISTORY_UI_EVIDENCE_DIR privately and fell
+    back into tmp_path, so a released scratch kept the migrated screenshot and took them.
+    """
+    return producer_evidence_dir(tmp_path / "history-ui-evidence", "history-ui",
+                                 env="HISTORY_UI_EVIDENCE_DIR")
+
+
 def _screenshot(page, tmp_path, name):
-    root = Path(os.environ.get("HISTORY_UI_EVIDENCE_DIR") or tmp_path / "history-ui-evidence")
-    root.mkdir(parents=True, exist_ok=True)
+    root = _evidence_dir(tmp_path)
     page.screenshot(path=str(root / f"{name}.png"), full_page=False, animations="disabled")
 
 
@@ -260,7 +272,7 @@ def _assert_main_beginning_visible(page):
 
 
 @pytest.mark.parametrize("browser_engine", ["chromium", "webkit"])
-def test_history_archive_navigation_rotation_retry_and_sparse_project(
+def test_history_archive_navigation_arrival_retry_and_sparse_project(
     direct_server_with_data, browser_engine, tmp_path,
 ):
     from playwright.sync_api import sync_playwright
@@ -270,7 +282,7 @@ def test_history_archive_navigation_rotation_retry_and_sparse_project(
     with sync_playwright() as pw:
         browser = getattr(pw, browser_engine).launch(headless=True)
         try:
-            for viewport_index, (width, height, mobile) in enumerate([(1280, 850, False), (390, 844, True)]):
+            for width, height, mobile in [(1280, 850, False), (390, 844, True)]:
                 context = browser.new_context(viewport={"width": width, "height": height},
                                               is_mobile=mobile, has_touch=mobile)
                 page = context.new_page()
@@ -293,14 +305,10 @@ def test_history_archive_navigation_rotation_retry_and_sparse_project(
                     page.locator(f"{MAIN} .chat-load-older button").evaluate("node => node.click()")
                     page.wait_for_function("() => Boolean(window.__heldHistory)")
                     live_text = f"LIVE_DURING_HISTORY_{browser_engine}_{width}"
-                    for source in ("chat", "progress"):
-                        source_path = root / "logs" / f"{source}.jsonl"
-                        destination = root / "archive" / f"{source}_20260913T{viewport_index + 1:06d}.jsonl"
-                        os.replace(source_path, destination)
-                        _write(source_path, [])
+                    # The server stores a reply while the older page is held.
                     live = _human(1900, text=live_text, direction="out", format="markdown",
                                   ts="2026-09-13T10:00:00Z")
-                    _write(root / "logs" / "chat.jsonl", [live])
+                    dialogue_store.append(root, "chat", live)
                     _emit_ws_frame(page, {"type": "chat", "role": "assistant", "chat_id": 1,
                                           "content": live_text, "ts": live["ts"]})
                     page.evaluate("() => window.__releaseHistory()")
@@ -316,8 +324,7 @@ def test_history_archive_navigation_rotation_retry_and_sparse_project(
                     assert len({row["text"] for row in records if row.get("text", "").startswith("history-progress-")}) == 726
                     mounted = page.locator(f"{MAIN} [data-history-id]").evaluate_all(
                         "nodes => nodes.map(node => node.dataset.historyId)")
-                    evidence = Path(os.environ.get("HISTORY_UI_EVIDENCE_DIR") or tmp_path / "history-ui-evidence")
-                    evidence.mkdir(parents=True, exist_ok=True)
+                    evidence = _evidence_dir(tmp_path)
                     (evidence / f"archive-dom-{browser_engine}-{width}.json").write_text(json.dumps(
                         page.locator(f"{MAIN} [data-history-id]").evaluate_all("""nodes => nodes.map(node => ({
                             id: node.dataset.historyId, tag: node.tagName, className: node.className,
@@ -400,40 +407,39 @@ def _feature_history(root):
                download_url="/api/tasks/history-media/artifacts/history-note.txt"),
         _human(4, cid, text="Routed archive message", client_message_id="routed-archive"),
     ]
-    _write(root / "archive" / "chat_20260901T000000.jsonl", old)
+    dialogue_test.seed(root, archives={"chat_20260901T000000.jsonl": old})
     # Only the conversation keeps Load more history: the narration's oldest rows
     # arrive with an older page of the conversation, before its first message.
-    _write(root / "logs" / "chat.jsonl", [
+    dialogue_test.seed(root, live={"chat": [
         _human(5, cid, text="Routed to another project", client_message_id="routed-other"),
         *[_human(index, cid) for index in range(6, 1655)],
         _human(1656, cid, direction="system", type="quiz_answer", task_id="quiz-owner", text="",
                quiz={**quiz, "state": "answered", "comment": comment}),
         *[_human(1700 + index, cid, text=f"Following dialogue {index}", ts="2026-09-12T10:00:01Z")
-          for index in range(20)]])
+          for index in range(20)]]})
     append_chat_annotation(root, "routed-archive", action="route_to_project", status="delivered",
                            target="far-parent", target_label="History detail room", project_id=project["id"], project_chat_id=cid)
     append_chat_annotation(root, "routed-other", action="route_to_project", status="delivered",
                            target_label=destination["name"], project_id=destination["id"], project_chat_id=destination["chat_id"])
     child = {"task_id": "linked-child", "delegation_role": "subagent", "subagent_task_id": "linked-child",
              "parent_task_id": "far-parent", "root_task_id": "far-parent", "subagent_role": "Archive reader"}
-    _write(root / "archive" / "progress_20260901T000000.jsonl", [
+    dialogue_test.seed(root, archives={"progress_20260901T000000.jsonl": [
         _progress(0, cid, task_id="far-parent", content="FAR_PARENT_ORIGINAL_NARRATION"),
         _progress(1, cid, **child, subagent_event="progress", content="EARLY_CHILD_NARRATION"),
-    ])
-    for index in range(5):
-        _write(root / "archive" / f"progress_20260902T00000{index}.jsonl", [
-            _progress(2 + index * 130 + offset, cid) for offset in range(130)
-        ])
+    ], **{f"progress_20260902T00000{index}.jsonl": [
+        _progress(2 + index * 130 + offset, cid) for offset in range(130)
+    ] for index in range(5)}})
     narration = "## Copyable heading\n\nParagraph after heading. " + "Reading preserved source. " * 24
     narration += "\n[Reference link](https://example.com/history-reference)"
     review = {"panels": [{"panel_id": "history-panel", "surface": "task_acceptance", "aggregate_signal": "PASS",
                            "transport_status": "success", "parse_status": "valid", "reason": "REVIEW_DETAIL_SENTINEL", "actors": []}]}
     child_result = "TERMINAL_CHILD_RESULT\n## Result heading\nResult paragraph. UNIQUE_CHILD_TAIL"
-    _write(root / "logs" / "progress.jsonl", [
+    dialogue_test.seed(root, live={"progress": [
         _progress(700, cid, **child, subagent_event="completed", status="completed", content="Child finished",
                   result=child_result),
         _progress(701, cid, task_id="focus-root", content=narration, suggested_name="Selectable history title"),
-    ])
+    ]})
+    dialogue_test.import_all(root)  # an older install's chains, as the upgrade imports them
     for task_id in ["far-parent", "linked-child", "focus-root", "history-media", "quiz-owner", *[f"history-task-{n}" for n in range(5)]]:
         _result(root, task_id, chat_id=cid, project_id=project["id"],
                 **({"review_projection": review, "suggested_name": "Selectable history title"} if task_id == "focus-root" else {}))
@@ -458,14 +464,16 @@ def test_history_details_selection_replay_and_project_reopen(direct_server_with_
                     _open(page, url)
                     feed = _open_project(page, project)
                     card = page.locator(f'{feed} .chat-live-card[data-task-id="focus-root"]')
-                    card.locator(':scope > [data-live-summary-button]').click()
+                    card.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
                     line = card.locator(':scope > [data-live-timeline] .chat-live-line.expandable').filter(has_text="Copyable heading").first
                     toggle = line.locator('[data-live-line-toggle]')
                     title = line.locator('.chat-live-line-title')
                     title.scroll_into_view_if_needed()
-                    box = title.bounding_box()
                     line_height = title.evaluate("node => parseFloat(getComputedStyle(node).lineHeight)")
-                    page.mouse.move(box["x"] + 7, box["y"] + line_height / 2)
+                    # The press starts on the title's first line once the title stands still and takes the pointer
+                    # right there (hover's actionability: stable, receives events), never on a box still moving.
+                    title.hover(position={"x": 7, "y": line_height / 2})
+                    box = title.bounding_box()
                     page.mouse.down()
                     page.mouse.move(box["x"] + min(box["width"] - 4, 100), box["y"] + line_height / 2, steps=10)
                     page.mouse.up()
@@ -474,8 +482,7 @@ def test_history_details_selection_replay_and_project_reopen(direct_server_with_
                     except AssertionError:
                         from tests.ci_evidence import output_dir
 
-                        evidence = output_dir(request.config) or Path(
-                            os.environ.get("HISTORY_UI_EVIDENCE_DIR") or tmp_path / "history-ui-evidence")
+                        evidence = output_dir(request.config) or _evidence_dir(tmp_path)
                         _capture_selection_failure(page, title, evidence, browser_engine, box, line_height)
                         raise
                     assert line.get_attribute("data-expanded") == "0", "drag selection must not activate the title"
@@ -539,12 +546,11 @@ def test_history_details_selection_replay_and_project_reopen(direct_server_with_
                     child = page.locator(f'{feed} .chat-live-card[data-task-id="linked-child"]')
                     assert child.get_attribute("data-finished") == "1"
                     if child.get_attribute("data-expanded") != "1":
-                        child.locator(':scope > [data-live-summary-button]').click()
+                        child.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
                     assert "EARLY_CHILD_NARRATION" in child.inner_text()
                     assert "TERMINAL_CHILD_RESULT" in child.inner_text()
                     assert child.locator(':scope > [data-live-summary-button] [data-live-phase]').inner_text() == "Done"
-                    evidence = Path(os.environ.get("HISTORY_UI_EVIDENCE_DIR") or tmp_path / "history-ui-evidence")
-                    evidence.mkdir(parents=True, exist_ok=True)
+                    evidence = _evidence_dir(tmp_path)
                     (evidence / f"terminal-child-{browser_engine}-{width}.html").write_text(child.evaluate("node => node.outerHTML"), encoding="utf-8")
                     _screenshot(page, tmp_path, f"terminal-child-{browser_engine}-{width}")
                     result_line = child.locator(':scope > [data-live-timeline] .chat-live-line').filter(has_text="TERMINAL_CHILD_RESULT").first
@@ -643,23 +649,24 @@ def _rooms_behind_other_traffic(root):
     at = lambda day, index: f"2026-08-{day:02d}T{10 + index // 60:02d}:{index % 60:02d}:00Z"  # noqa: E731
 
     def busy_archives(stamp):
-        for segment in range(5):
-            _write(root / "archive" / f"chat_{stamp}{segment}.jsonl", [
-                _human(index, busy["chat_id"], text="OTHER_ROOM_ONLY " + "x" * 2000) for index in range(350)])
+        dialogue_test.seed(root, archives={f"chat_{stamp}{segment}.jsonl": [
+            _human(index, busy["chat_id"], text="OTHER_ROOM_ONLY " + "x" * 2000) for index in range(350)]
+            for segment in range(5)})
 
-    _write(root / "archive" / "chat_20260801T000000.jsonl", [
+    dialogue_test.seed(root, archives={"chat_20260801T000000.jsonl": [
         _human(0, ts=asked, client_message_id="quiet-ask", text=QUIET_ASK),
         *[_human(index, quiet["chat_id"], ts=at(1, index), direction="out" if index % 2 else "in",
                  text=f"QUIET_ROW_{index:02d}") for index in range(12)],
         *[_human(index, deep["chat_id"], ts=at(2, index), text=f"DEEP_ROW_{index:04d}") for index in range(200)],
-    ])
+    ]})
     busy_archives("20260803T00000")
-    _write(root / "archive" / "chat_20260804T000000.jsonl", [
+    dialogue_test.seed(root, archives={"chat_20260804T000000.jsonl": [
         _human(index, deep["chat_id"], ts=at(4, index - 200), text=f"DEEP_ROW_{index:04d}")
-        for index in range(200, 400)])
+        for index in range(200, 400)]})
     busy_archives("20260805T00000")
-    _write(root / "logs" / "chat.jsonl", [
-        _human(index, busy["chat_id"], text=f"OTHER_ROOM_LIVE {index}") for index in range(20)])
+    dialogue_test.seed(root, live={"chat": [
+        _human(index, busy["chat_id"], text=f"OTHER_ROOM_LIVE {index}") for index in range(20)]})
+    dialogue_test.import_all(root)  # the upgrade imports the old archives
     return quiet, deep
 
 

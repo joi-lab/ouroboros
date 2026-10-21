@@ -1,7 +1,7 @@
 /* The desktop app's own facts: version, storage and system notifications.
 
-   The disclosure exists because in-app updates replace the core and this page, never
-   the frozen launcher that decides whether the WebView keeps website data. */
+   Updated source can host the window, but the installed signed executable still
+   determines its app identity and profile. Neither version proves capability. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -28,7 +28,7 @@ test('an app without shell_info is judged by the version its launcher stamped', 
     const text = shellStorageText(old);
     assert.match(text, /This desktop app \(6\.82\.0\) erases/);
     assert.match(text, /Theme and Notifications return to their defaults/);
-    assert.match(text, /updates inside Ouroboros replace its core, not the app around it/);
+    assert.match(text, /updates inside Ouroboros cannot replace the installed app/);
 
     assert.equal(describeShell({ bridge: true, appVersion: '7.1.9' }).persistentStorage, false);
     assert.equal(describeShell({ bridge: true, appVersion: 'v7.2.0-rc.1' }).persistentStorage, true,
@@ -53,6 +53,23 @@ test('a current app reports itself and its notification permission', () => {
     });
     assert.equal(shellStorageText(shell), '');
     assert.match(shellStorageText({ ...shell, persistentStorage: false }), /erases/);
+});
+
+test('loaded source and installed bundle stay distinct, and an identity loss is disclosed', () => {
+    const info = { shell_version: '8.0.0', bundle_version: '7.7.0', persistent_storage: true,
+        source_launcher: true, macos_source_entry: true, native_notifications: null };
+    const current = describeShell({ bridge: true, info });
+    assert.equal(current.version, '7.7.0');
+    assert.equal(current.loadedVersion, '8.0.0');
+    assert.equal(current.appEntry, true);
+    assert.equal(shellStorageText(current), '');
+    const plain = describeShell({ bridge: true, info: { ...info, macos_source_entry: false } });
+    assert.equal(plain.persistentStorage, true, 'persistence alone does not prove profile continuity');
+    assert.match(shellStorageText(plain), /may differ from an ordinary app launch/);
+    assert.match(shellStorageText(plain), /older Python profile is left untouched/);
+    const unknown = describeShell({ bridge: true, info: { ...info, macos_source_entry: null } });
+    assert.equal(unknown.appEntry, null);
+    assert.equal(shellStorageText(unknown), '', 'unknown app identity must not claim a profile defect');
 });
 
 test('loading prefers the app\'s own answer and never throws', async () => {

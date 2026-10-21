@@ -13,6 +13,7 @@ import pytest
 from ouroboros import openrouter_cost as cost, usage_accounting as usage, usage_store
 from ouroboros.task_results import load_task_result, write_task_result
 from scripts import reconcile_openrouter_cost as command
+from tests._store_shared import release_store_handles
 
 pytestmark = pytest.mark.serial  # Shared queue/capture globals and subprocess export consumers.
 TARGET = {"provider": "openrouter", "base_url": "https://router.example/api/v1", "api_key": "test-original-key"}
@@ -94,6 +95,7 @@ def test_default_does_not_reimport_store_removed_during_inspection(env, capsys, 
     store_path = env / usage_store.STORE_REL
     held = usage_store.hold
     def removed_before_open(root, **kwargs):
+        release_store_handles(store_path)  # another remover; this process's idle handle blocks it on Windows
         store_path.rename(store_path.with_suffix(".gone"))
         return held(root, **kwargs)
     monkeypatch.setattr(usage_store, "hold", removed_before_open)
@@ -108,6 +110,7 @@ def test_apply_does_not_reimport_store_removed_after_inspection(env, capsys, mon
     store_path = env / usage_store.STORE_REL
     locked = usage._locked
     def removed_before_apply(root, **kwargs):
+        release_store_handles(store_path)  # another remover; this process's idle handle blocks it on Windows
         store_path.rename(store_path.with_suffix(".gone"))
         return locked(root, **kwargs)
     monkeypatch.setattr(usage, "_locked", removed_before_apply)
@@ -354,7 +357,7 @@ def _real_ownership(monkeypatch):
     monkeypatch.setattr(task_queue, "task_has_live_ownership", task_has_live_ownership)
 
 
-@pytest.mark.parametrize("surface", ["skill_review", "task_acceptance"])
+@pytest.mark.parametrize("surface", ["skill_review", "multi_model_review"])
 @pytest.mark.parametrize("non_task", [False, True])
 def test_completed_review_attribution_allows_exact_price_recovery(env, capsys, monkeypatch, surface, non_task):
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
@@ -387,8 +390,10 @@ def test_completed_review_attribution_allows_exact_price_recovery(env, capsys, m
 
 
 @pytest.mark.parametrize("non_task", [False, True])
-def test_terminal_author_with_live_acceptance_operation_blocks_until_review_finishes(
+def test_terminal_author_with_live_review_operation_blocks_until_review_finishes(
         env, capsys, monkeypatch, non_task):
+    """A review operation still running after its author's terminal result (the request released its
+    author at dispatch) holds the price correction until the operation closes."""
     from ouroboros import model_wait, review_operation
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
 
@@ -402,7 +407,7 @@ def test_terminal_author_with_live_acceptance_operation_blocks_until_review_fini
                 task={"id": ctx.task_id, "_attempt": 1}, drive_root=env,
                 event_queue=queue.Queue(), worker_slot_held=False):
             run_review_request(
-                ReviewRequest(surface="task_acceptance", task_id=ctx.task_id, goal="review", subject="answer",
+                ReviewRequest(surface="multi_model_review", task_id=ctx.task_id, goal="review", subject="answer",
                               retry_key="live-price-review", drain_deadline=time.monotonic()),
                 slots=[ReviewSlot(slot_id="price-seat", model="vendor/unseen-model", timeout_sec=20)],
                 drive_root=env, usage_ctx=ctx, llm=model)
@@ -422,12 +427,14 @@ def test_terminal_author_with_live_acceptance_operation_blocks_until_review_fini
         if operation is not None:
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
-                pointer = (load_task_result(env, ctx.task_id).get("review_operations") or {}).get(operation.owner_id, {})
-                if operation.closed and pointer.get("state") in {"closed", "unpublished", "collected"}:
+                pointers = load_task_result(env, ctx.task_id).get("review_operations") or {}
+                if operation.closed and operation.owner_id not in pointers:
                     break
                 time.sleep(0.01)
             assert operation.closed
-            assert pointer.get("state") in {"closed", "unpublished", "collected"}
+            # A liveness-only pointer leaves no history after close (only the retired task
+            # acceptance kept a closed/unpublished one for its collector).
+            assert operation.owner_id not in pointers
             assert not review_operation.task_has_live_review_operation(env, ctx.task_id)
     # The same receipt becomes applicable after the operation closes, without
     # another generation or metadata GET and without losing review attribution.

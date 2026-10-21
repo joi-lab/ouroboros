@@ -186,7 +186,7 @@ def test_safe_test_refuses_a_disposable_root_inside_the_checkout(tmp_path):
 
 
 def test_safe_test_retains_its_new_root_and_keeps_the_command_status(tmp_path):
-    """Exit is no proof that descendants are gone: the launcher never deletes its tree."""
+    """Unknown command data remains even after reap; only declared scratch is released."""
     launcher = [sys.executable, "-I", "-S", str(REPO / "scripts" / "safe_test.py")]
     probe = [sys.executable, "-c", "import os, pathlib, sys; "
              "pathlib.Path(os.environ['HOME'], 'probe').write_text('kept'); "
@@ -223,6 +223,14 @@ time.sleep(600)
 _LAUNCHER = [sys.executable, "-I", "-S", str(REPO / "scripts" / "safe_test.py")]
 
 
+def _final_root(stderr):
+    """Exactly one final line names the launcher's root, and it is the last one."""
+    lines = stderr.splitlines()
+    final = [line for line in lines if line.startswith(("SAFE_TEST_RETAINED ", "SAFE_TEST_RELEASED "))]
+    assert len(final) == 1 and lines[-1] == final[0], stderr
+    return final[0].split(" ", 1)
+
+
 def _recorded_tree(path, within=30.0):
     deadline = time.monotonic() + within
     while not (path.exists() and len(path.read_text(encoding="utf-8").split()) == 2):
@@ -239,7 +247,8 @@ def test_safe_test_timeout_stops_the_whole_tree_and_exits_124(tmp_path):
     survivors = kill_survivors(_recorded_tree(pids))
     assert result.returncode == 124, result.stderr
     assert "SAFE_TEST_TIMEOUT after 3s" in result.stderr
-    assert sum(line.startswith("SAFE_TEST_RETAINED ") for line in result.stderr.splitlines()) == 1
+    # Teardown was confirmed, so the declared scratch went even on this red outcome.
+    assert _final_root(result.stderr)[0] == "SAFE_TEST_RELEASED", result.stderr
     if sys.platform != "win32":  # the graceful SIGTERM came before the SIGKILL that stopped it
         assert (tmp_path / "pids.term").read_text(encoding="utf-8") == "TERM"
     assert not survivors
@@ -249,15 +258,17 @@ def test_safe_test_timeout_keeps_a_finished_command_status(tmp_path):
     result = run_in_group(_LAUNCHER + ["--temp-parent", str(tmp_path), "--timeout", "60", "--",
                                        sys.executable, "-c", "import sys; sys.exit(7)"], cwd=REPO, timeout=120)
     assert result.returncode == 7, result.stderr
-    assert "SAFE_TEST_TIMEOUT" not in result.stderr and "SAFE_TEST_RETAINED " in result.stderr
+    assert "SAFE_TEST_TIMEOUT" not in result.stderr and _final_root(result.stderr)
     refused = run_in_group(_LAUNCHER + ["--timeout", "0", "--", sys.executable, "-c", "pass"],
                            cwd=REPO, timeout=120)
     assert refused.returncode == 2 and "positive number of seconds" in refused.stderr
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
-def test_safe_test_timeout_passes_sigterm_on_to_the_whole_tree(tmp_path):
-    """The command's own session no longer gets what stops the launcher, so the launcher passes it on."""
+@pytest.mark.parametrize("stop", ["SIGTERM", "SIGINT"])
+def test_safe_test_forwards_interrupt_then_reaps_the_whole_tree(tmp_path, stop):
+    """INT lets the root finish; TERM requests tree stop; both reap detached children."""
+    stop = getattr(signal, stop)
     pids = tmp_path / "pids"
     launcher = subprocess.Popen(_LAUNCHER + ["--temp-parent", str(tmp_path), "--timeout", "600", "--",
                                              sys.executable, "-c", _TREE, str(pids), "obedient"],
@@ -266,16 +277,20 @@ def test_safe_test_timeout_passes_sigterm_on_to_the_whole_tree(tmp_path):
     tree = []
     try:
         tree = _recorded_tree(pids)
-        os.kill(launcher.pid, signal.SIGTERM)
+        os.kill(launcher.pid, stop)
+        os.kill(launcher.pid, stop)  # a repeated signal cannot cut the teardown short
         _, stderr = launcher.communicate(timeout=60)
     finally:
         if launcher.poll() is None:
             kill_process_tree(launcher)
             launcher.wait()
         survivors = kill_survivors(tree)  # a launcher that failed to stop the tree must not leave it behind
-    assert launcher.returncode == 128 + signal.SIGTERM, stderr
-    assert "SAFE_TEST_RETAINED " in stderr
-    assert (tmp_path / "pids.term").read_text(encoding="utf-8") == "TERM"
+    assert launcher.returncode == 128 + stop, stderr
+    assert _final_root(stderr)[0] == "SAFE_TEST_RELEASED", stderr
+    if stop == signal.SIGTERM:
+        assert (tmp_path / "pids.term").read_text(encoding="utf-8") == "TERM"
+    else:
+        assert not (tmp_path / "pids.term").exists(), "Ctrl-C was incorrectly translated to TERM"
     assert not survivors
 
 

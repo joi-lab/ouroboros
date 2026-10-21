@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import queue
+import threading
 import types
 
 import pytest
@@ -80,6 +81,21 @@ def _promoted(tmp_path, monkeypatch, **promote_kwargs):
     return task, load_task_result(tmp_path, task["id"]), workers
 
 
+_POST_TASK_WAIT_SEC = 60.0  # a bound for a stubbed post-task pass, not a judgment about its speed
+
+
+def _wait_for_post_task(started):
+    """Outside a worker process a root's post-task synthesis runs on a detached thread
+    (``agent_task_pipeline``). The round this test drove started it, so the test waits for it
+    instead of leaving it to the thread-hygiene grace, which a slow runner outlasts."""
+    from tests.conftest import _DETACHED_THREAD_NAME_PREFIXES
+
+    for thread in set(threading.enumerate()) - started:
+        if not thread.name.startswith(_DETACHED_THREAD_NAME_PREFIXES):
+            thread.join(_POST_TASK_WAIT_SEC)
+            assert not thread.is_alive(), f"{thread.name} still runs {_POST_TASK_WAIT_SEC}s after the round"
+
+
 def _first_round(tmp_path, monkeypatch, task, *, wire=False):
     """Hand the ADMITTED task to the worker's real entry and loop.
 
@@ -123,7 +139,9 @@ def _first_round(tmp_path, monkeypatch, task, *, wire=False):
     repo = tmp_path / "repo"
     repo.mkdir(exist_ok=True)
     agent = agent_module.OuroborosAgent(agent_module.Env(repo_dir=repo, drive_root=tmp_path), event_queue=events)
+    started = set(threading.enumerate())
     agent._handle_task_scoped({**task, "drive_root": str(tmp_path)})
+    _wait_for_post_task(started)
     assert captured, "the real first round never reached the physical executor"
     first = captured[0]
     if not wire:

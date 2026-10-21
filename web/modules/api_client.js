@@ -76,7 +76,7 @@ export async function fetchJson(url, init = {}, options = {}) {
 export function jsonPost(url, payload = {}, options = {}) {
     return fetchJson(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...options.headers },
         body: JSON.stringify(payload),
     }, options);
 }
@@ -127,14 +127,17 @@ export function cancelHarnessMaintenance(operationId) {
 }
 
 /**
- * Run the read-only publication preflight for one selected skill. Domain
- * states, including repairable findings, remain successful JSON responses;
- * only transport/admission refusals reject through fetchJson.
+ * Run the read-only publication preflight for one selected skill and the
+ * destination the owner chose (omitted = the skill's origin, else the hub); the
+ * answer's `repository` is the one the publish task binds.
+ * Domain states, including repairable findings, remain successful JSON
+ * responses; only transport/admission refusals reject through fetchJson.
  * @param {string} skill
+ * @param {import('./skill_source_contract_types.js').SkillPublishDestinationChoice|null} [destination]
  * @returns {Promise<import('./api_types.js').SkillPublishPreflightResponse>}
  */
-export function skillPublishPreflight(skill) {
-    return jsonPost(`/api/skills/${encodeURIComponent(skill)}/publish-preflight`, {});
+export function skillPublishPreflight(skill, destination = null) {
+    return jsonPost(`/api/skills/${encodeURIComponent(skill)}/publish-preflight`, destination ? { destination } : {});
 }
 
 /**
@@ -240,8 +243,11 @@ export function hurryTask(taskId, requestId) {
 }
 
 /**
- * Owner Pause of a whole task tree (Batch4): text-free like hurry — the body is
- * ONLY the stable request_id (the same id on retry is idempotent). The answer
+ * Owner Pause of a whole task tree (Batch4): the body is the stable request_id
+ * (the same id on retry is idempotent) and this client's declaration that the
+ * owner pressed it (`actor: "owner"`, no text), which the card words as "You
+ * paused it" and which grants no power. Every shell that opens the core's own
+ * page (a browser, the desktop window, the Telegram Mini App) sends it here. The answer
  * arrives after the root's durable fence landed; its `state` is `requested`
  * while members still settle, `paused` once saved, or `released` on replay
  * after that action was resumed. A 202 `latch_pending` answer is accepted
@@ -253,7 +259,7 @@ export function hurryTask(taskId, requestId) {
 export function pauseTask(taskId, requestId) {
     return jsonPost(
         `/api/tasks/${encodeURIComponent(taskId)}/pause`,
-        { request_id: String(requestId || '') },
+        { request_id: String(requestId || ''), actor: 'owner' },
         { rejectOkFalse: true },
     );
 }
@@ -324,6 +330,68 @@ export function extensionRoutePath(skill, route, params = null) {
     return `${extensionRoutePrefix(skill)}${cleanRoute}${query}`;
 }
 
+/**
+ * Skill sources and their catalogs (one lifecycle for every source kind). The
+ * catalog is served from the host's per-source cache and never waits for the
+ * network; `refresh` asks the host to re-read its sources in the background.
+ * Shapes: skill_source_contract_types.js (fixtures: web/tests/fixtures/skills_v4/).
+ */
+const sourcePath = (id) => `/api/skill-sources/${encodeURIComponent(id)}`;
+// Writes answer {ok:false, code, error} on refusal; the callers read that as a thrown error
+// whose `body` keeps the typed refusal.
+const STRICT = { rejectOkFalse: true };
+/** @typedef {import('./skill_source_contract_types.js').SkillSourceChangeResponse} SkillSourceChangeResponse */
+export const skillSourcesApi = {
+    /** @returns {Promise<import('./skill_source_contract_types.js').SkillSourcesResponse>} */
+    list: () => fetchJson('/api/skill-sources', { cache: 'no-store' }),
+    /**
+     * @param {import('./skill_source_contract_types.js').SkillSourceProbeRequest} target
+     * @returns {Promise<import('./skill_source_contract_types.js').SkillSourceProbeResponse>}
+     */
+    probe: (target) => jsonPost('/api/skill-sources/probe', target),
+    /**
+     * @param {import('./skill_source_contract_types.js').SkillSourceAddRequest} source
+     * @returns {Promise<SkillSourceChangeResponse>}
+     */
+    add: (source) => jsonPost('/api/skill-sources', source, STRICT),
+    /** Create or connect the owner's private GitHub repository (only on an explicit click). */
+    mySkills: () => jsonPost('/api/skill-sources/my-skills', {}, STRICT),
+    /**
+     * @param {string} id
+     * @param {import('./skill_source_contract_types.js').SkillSourceChangeRequest} changes
+     * @returns {Promise<SkillSourceChangeResponse>}
+     */
+    update: (id, changes) => jsonPost(sourcePath(id), changes, STRICT),
+    /** @returns {Promise<SkillSourceChangeResponse>} */
+    remove: (id) => jsonPost(`${sourcePath(id)}/remove`, {}, STRICT),
+    /** @returns {Promise<SkillSourceChangeResponse>} */
+    refresh: (id) => jsonPost(`${sourcePath(id)}/refresh`, {}, STRICT),
+    /** @returns {Promise<import('./skill_source_contract_types.js').SkillCatalogResponse>} */
+    catalog: ({ refresh = false } = {}) => fetchJson(`/api/skill-catalog${refresh ? '?refresh=1' : ''}`, { cache: 'no-store' }),
+    /** @returns {Promise<import('./skill_source_contract_types.js').SkillCatalogSearchResponse>} */
+    search: ({ q = '', source = '' } = {}, init = {}) => fetchJson(`/api/skill-catalog/search?${new URLSearchParams({ q, ...(source ? { source } : {}) })}`, { cache: 'no-store', ...init }),
+    /** @returns {Promise<import('./skill_source_contract_types.js').SkillCatalogItemDetailResponse>} */
+    item: (sourceId, name, init = {}) => fetchJson(`/api/skill-catalog/item/${encodeURIComponent(sourceId)}/${encodeURIComponent(name)}`, { cache: 'no-store', ...init }),
+    /**
+     * `replace` confirms replacing the other skill of the same name.
+     * @returns {Promise<import('./skill_source_contract_types.js').SkillCatalogInstallResponse>}
+     */
+    install: (id, { turnOnWhenReady = true, replace = false } = {}) => jsonPost('/api/skill-catalog/install',
+        { id, turn_on_when_ready: turnOnWhenReady, ...(replace ? { replace: true } : {}) }, STRICT),
+    /**
+     * The exact candidate the owner saw (`digest`) against the local revision it was shown with
+     * (`localDigest`): either one changing makes the host refuse instead of acting on a stale dialog.
+     * @param {'replace'|'keep'|'merge'} mode
+     * @returns {Promise<import('./skill_source_contract_types.js').SkillUpdateResponse>}
+     */
+    updateSkill: (name, mode, digest, localDigest = '', { skipReview = false } = {}) => jsonPost(`/api/skills/${encodeURIComponent(name)}/update`,
+        { mode, digest, ...(localDigest ? { local_digest: localDigest } : {}), ...(skipReview ? { skip_review: true } : {}) }, STRICT),
+    /** @returns {Promise<import('./skill_source_contract_types.js').SkillUninstallResponse>} */
+    uninstallSkill: (name) => jsonPost(`/api/skills/${encodeURIComponent(name)}/uninstall`, {}, STRICT),
+    /** @returns {Promise<import('./skill_source_contract_types.js').StarterSkillsResponse>} */
+    starterSkills: () => fetchJson('/api/onboarding/starter-skills', { cache: 'no-store' }),
+};
+
 export function updateStrategyForPlan(plan = {}) {
     if (!plan.available) return '';
     const kind = String(plan.kind || '');
@@ -336,12 +404,12 @@ export const apiClient = {
     startHarnessMaintenance,
     harnessMaintenanceOperation,
     cancelHarnessMaintenance,
-    /** Read a recent window, replay one opaque, room-bound history page, or read the page around one task. */
+    /** Read a recent window, replay a room-bound page, or read around a task or exact row address. */
     chatHistory: ({ chatId = 1, cursor = null, around = null, signal } = {}) => {
         const params = new URLSearchParams();
         if (chatId !== 1) params.set('chat_id', String(chatId));
         if (cursor) params.set('cursor', cursor);
-        if (around) params.set('around', around);  // `task:<id>`: the page around that task
+        if (around) params.set('around', around);  // `task:<id>` or canonical `row:…`
         const query = params.toString();
         return fetchJson(`/api/chat/history${query ? `?${query}` : ''}`, { cache: 'no-store', signal });
     },
@@ -368,6 +436,8 @@ export const apiClient = {
     /** @returns {Promise<import('./api_types.js').UiPreferencesResponse>} */
     uiPreferences: (init = {}) => fetchJson('/api/ui/preferences', { cache: 'no-store', ...init }),
     saveUiPreferences: (payload) => jsonPost('/api/ui/preferences', payload),
+    /** Live skill contributions (CLIENT_CONTRACT §11). @returns {Promise<import('./api_types.js').UiContributionsResponse>} */
+    uiContributions: (init = {}) => fetchJson('/api/ui/contributions', { cache: 'no-store', ...init }),
     /** @returns {Promise<import('./ui_i18n_types.js').UiI18nResponse>} */
     uiI18n: () => fetchJson('/api/ui/i18n', { cache: 'no-store' }),
     /** @param {string|import('./ui_i18n_types.js').UiI18nLanguageRequest} payload */
@@ -438,10 +508,11 @@ export const apiClient = {
     deleteSkill: (skill, payloadRoot, expectedContentHash = '') => jsonPost(`/api/skills/${encodeURIComponent(skill)}/delete`, {
         payload_root: payloadRoot,
         ...(expectedContentHash ? { expected_content_hash: expectedContentHash } : {}),
-    }),
-    skillGrants: (skill, items, expectedContentHash = '') => jsonPost(`/api/skills/${encodeURIComponent(skill)}/grants`, {
+    }, { headers: { Prefer: 'respond-async' } }),
+    skillGrants: (skill, items, expectedContentHash = '', enableAfterGrant = false) => jsonPost(`/api/skills/${encodeURIComponent(skill)}/grants`, {
         items, ...(expectedContentHash ? { expected_content_hash: expectedContentHash } : {}),
-    }),
+        ...(enableAfterGrant ? { enable_after_grant: true } : {}),
+    }, { headers: { Prefer: 'respond-async' } }),
     /**
      * @param {string} skill
      * @param {import('./api_types.js').OwnerSkillPresenceRuntimeRequest} payload
@@ -454,21 +525,47 @@ export const apiClient = {
     projectFromTask: (taskId, id, name) => jsonPost('/api/projects/from-task', { task_id: taskId, id, name }),
     /** @param {import('./api_types.js').ProjectCreateRequest} payload */
     projectCreate: (payload) => jsonPost('/api/projects', payload),
-    projectUpdate: (projectId, name) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/update`, { name }),
+    projectUpdate: (projectId, update) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/update`,
+        typeof update === 'string' ? { name: update } : update),
     /** @returns {Promise<import('./api_types.js').ProjectDeleteResponse>} */
     projectDelete: (projectId) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/delete`, {}),
     /** @returns {Promise<import('./api_types.js').FsDirsResponse>} */
     fsDirs: (path = '') => fetchJson(`/api/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`, { cache: 'no-store' }),
     /**
-     * Dashboard storage: the server's last measurement, read passively (no walk, no write).
+     * Dashboard storage: the saved count, the running count's progress and fresh free space, read
+     * passively (no walk, no write); `count` names the finished count this client already holds.
      * @returns {Promise<import('./storage_types.js').StorageResponse>}
      */
-    storage: (init = {}) => fetchJson('/api/storage', { cache: 'no-store', ...init }),
+    storage: ({ count = '', ...init } = {}) => fetchJson(
+        `/api/storage${count ? `?count=${encodeURIComponent(count)}` : ''}`, { cache: 'no-store', ...init },
+    ),
     /**
-     * Start one bounded measurement, or join the running one (202 either way).
+     * Start one complete count in the server's child, or join the running one (202 either way).
      * @returns {Promise<import('./storage_types.js').StorageResponse>}
      */
     measureStorage: () => jsonPost('/api/storage/measure', {}),
+    /**
+     * Stop the running count; the saved count stays.
+     * @returns {Promise<import('./storage_types.js').StorageResponse>}
+     */
+    cancelStorageMeasure: () => jsonPost('/api/storage/measure/cancel', {}),
+    /**
+     * List, without side effects, the finished work the app's own retirers would remove now (202; a second
+     * preview joins the running one).
+     * @returns {Promise<import('./storage_types.js').StorageResponse>}
+     */
+    previewStorageFree: () => jsonPost('/api/storage/free/preview', {}),
+    /**
+     * Free exactly the previewed items of the chosen groups under the named plan (202; `started` and
+     * `reason` say whether it ran).
+     * @returns {Promise<import('./storage_types.js').StorageResponse>}
+     */
+    freeStorage: (plan, groups) => jsonPost('/api/storage/free', { plan, groups }),
+    /**
+     * Stop the listing or the run; what was freed stays freed.
+     * @returns {Promise<import('./storage_types.js').StorageResponse>}
+     */
+    cancelStorageFree: () => jsonPost('/api/storage/free/cancel', {}),
     /** @returns {Promise<import('./management_contract_types.js').UpdateStatusResponse>} */
     updateStatus: () => fetchJson('/api/update/status', { cache: 'no-store' }),
     /** @returns {Promise<import('./management_contract_types.js').UpdateStatusResponse>} */

@@ -68,9 +68,13 @@ class Node extends Events {
 }
 function environment() {
     const doc = new Events();
+    class Observer { observe() {} disconnect() {} }
     doc.defaultView = Object.assign(new Events(), {
         innerWidth: 320, innerHeight: 240,
-        getComputedStyle: (node) => ({ visibility: node.visibility || 'visible' }),
+        ResizeObserver: Observer, MutationObserver: Observer,
+        requestAnimationFrame: () => 1, cancelAnimationFrame() {},
+        getComputedStyle: (node) => ({ visibility: node.visibility || 'visible',
+            scrollPaddingInlineStart: node.scrollPadding || '0px', scrollPaddingInlineEnd: node.scrollPadding || '0px' }),
     });
     doc.body = new Node(doc, 'body');
     doc.activeElement = doc.body;
@@ -191,6 +195,16 @@ test('restored/offscreen tab scrolls only its strip, and hidden-page resize obse
     resize();
     assert.equal(strip.scrollLeft, 150);
     assert.equal(disconnected, true);
+});
+
+test('revealed tabs keep the strip padding clear of the edge fade', () => {
+    const { strip, tabs, controller } = tabFixture();
+    strip.clientWidth = 200; strip.clientLeft = 0; strip.scrollLeft = 0;
+    strip.scrollPadding = '16px'; strip.rect = {left: 20, right: 220};
+    tabs[2].rect = {left: 300, right: 370};
+    controller.select('three');
+    assert.equal(strip.scrollLeft, 166);
+    controller.destroy();
 });
 
 function dialogFixture() {

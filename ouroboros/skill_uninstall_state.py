@@ -11,6 +11,8 @@ the sweep sees a live payload and retires the tombstone instead of sweeping.
 
 Explicit local deletion also lives here. Unlike marketplace uninstall, it
 removes the entire state directory under the owner's specific delete action.
+``removal_action`` is the one rule both removers admit by; the listing serializes it
+as ``removal`` and the Skills card renders exactly that, never its own derivation.
 """
 
 from __future__ import annotations
@@ -33,11 +35,28 @@ UNINSTALL_TOMBSTONE_FILENAME = "uninstalled.json"
 _SWEEP_KEEP = frozenset({UNINSTALL_TOMBSTONE_FILENAME, "grants.json", PUBLICATION_FILENAME})
 
 
+def removal_action(loaded: Any, record: Any) -> str:
+    """Which removal the host offers one installed skill: ``uninstall`` (``uninstall_installed``:
+    installed from a source, or bundled, with or without an install record), ``delete``
+    (``delete_local_skill``: made on this computer under ``skills/external/``) or ``""`` (a name
+    collision, the owner's own skills folder, or a sourced payload that lost its record)."""
+    if loaded is None or getattr(loaded, "identity_collision", False):
+        return ""
+    location = str(getattr(loaded, "location", "") or "")
+    if location == "user_repo":
+        return ""
+    if location == "external" and record is None:
+        return "delete" if str(getattr(loaded, "source", "") or "") in {"self_authored", "external"} else ""
+    return "uninstall"
+
+
 def delete_local_skill(
     drive_root: pathlib.Path, loaded: Any, *, payload_root: str = "", repo_path: str = "",
 ) -> Dict[str, Any]:
-    """Delete the exact local external payload after host action admission."""
+    """Delete the exact local external payload after host action admission; the path, symlink
+    and same-name checks are rmtree safety, not eligibility (``removal_action`` is)."""
     from ouroboros import extension_loader
+    from ouroboros.skill_install_record import read_install_record
     from ouroboros.skill_loader import discover_skills
 
     def refuse(error: str, status: int = 403) -> Dict[str, Any]:
@@ -55,11 +74,12 @@ def delete_local_skill(
         return refuse("local skill delete refuses symlinked data/skills/external payloads")
     if pathlib.Path(loaded.skill_dir).absolute() != payload_dir:
         return refuse("selected skill payload does not match the requested delete path", 409)
-    if loaded.source not in {"self_authored", "external"}:
-        return refuse("local skill delete is limited to self-authored/external skills")
     skills = discover_skills(drive, repo_path=repo_path)
-    if any(item.name == loaded.name and pathlib.Path(item.skill_dir).absolute() != payload_dir for item in skills):
+    if getattr(loaded, "identity_collision", False) or any(
+            item.name == loaded.name and pathlib.Path(item.skill_dir).absolute() != payload_dir for item in skills):
         return refuse("refusing to delete while another skill uses the same sanitized name; rename one first", 409)
+    if removal_action(loaded, read_install_record(drive, loaded.name)) != "delete":
+        return refuse("local skill delete is limited to self-authored/external skills")
     state_root = (drive / "state" / "skills").absolute()
     state_dir = state_root / loaded.name
     if state_root.is_symlink() or state_dir.is_symlink() or not state_dir.is_relative_to(state_root):
@@ -155,6 +175,7 @@ def sweep_uninstalled_skill_state(drive_root: pathlib.Path) -> Dict[str, Any]:
 __all__ = [
     "UNINSTALL_TOMBSTONE_FILENAME",
     "delete_local_skill",
+    "removal_action",
     "sweep_uninstalled_skill_state",
     "write_uninstall_tombstone",
 ]

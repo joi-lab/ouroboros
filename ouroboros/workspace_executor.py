@@ -35,6 +35,7 @@ from ouroboros.platform_layer import (
     scrub_repo_from_pythonpath, subprocess_new_group_kwargs,
 )
 from ouroboros.tool_access import path_is_relative_to
+from ouroboros.tool_custody import invocation_binding
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
 @dataclass(frozen=True)
@@ -254,6 +255,7 @@ def execute(
     executor = executor_ref_from_ctx(ctx)
     if executor is None:
         raise ValueError("no executor_ref configured")
+    drive_root = _custody_drive_root(getattr(ctx, "drive_root", None))
     bootstrap_process_path()
     cwd_path = pathlib.Path(cwd).resolve(strict=False)
     backend_cwd = map_host_path(executor, cwd_path)
@@ -262,10 +264,10 @@ def execute(
     if executor.kind == "local":
         return _execute_local(
             executor, cmd, cwd_path, timeout_sec,
-            drive_root=_drive_root_from_ctx(ctx), local_env=candidate_env,
+            drive_root=drive_root, local_env=candidate_env,
             env_overlay=env_overlay, **({"target_env": target_env} if target_env else {}),
         )
-    return _execute_docker(executor, cmd, backend_cwd, timeout_sec, drive_root=_drive_root_from_ctx(ctx),
+    return _execute_docker(executor, cmd, backend_cwd, timeout_sec, drive_root=drive_root,
                            **({"target_env": overlay_env(candidate_env or {}, target_env), "replace_env": True}
                               if candidate_env is not None else {"target_env": target_env} if target_env else {}))
 
@@ -334,13 +336,13 @@ def _execute_local(
     target_env: "dict[str, str] | None" = None,
     local_env: "dict[str, str] | None" = None,
 ) -> ExecutorResult:
+    drive_root = _custody_drive_root(drive_root)
     if _panic_requested:
         raise RuntimeError("Emergency Stop has retired executor admission")
     started = time.monotonic()
     from ouroboros.settings_integrity import runtime_environ
 
     from ouroboros.process_scope import record_task_group, scoped_child_env, task_launch_target
-    from ouroboros.tool_custody import invocation_binding
 
     base_env = local_env if local_env is not None else scrub_repo_from_pythonpath(runtime_environ(), _system_repo_dir())
     process_env = overlay_env(overlay_env(base_env, target_env), env_overlay)
@@ -408,6 +410,7 @@ def _execute_docker(
     target_env: "dict[str, str] | None" = None,
     replace_env: bool = False,
 ) -> ExecutorResult:
+    drive_root = _custody_drive_root(drive_root)
     if _panic_requested:
         raise RuntimeError("Emergency Stop has retired executor admission")
     if executor.network == "none":
@@ -598,20 +601,18 @@ def _kill_docker_record(record: dict[str, Any], *, wait: bool = True) -> bool:
     except Exception:
         return False
 
-def _drive_root_from_ctx(ctx: Any) -> pathlib.Path | None:
-    drive_root = getattr(ctx, "drive_root", None)
-    if drive_root in (None, ""):
-        return None
-    try:
-        return pathlib.Path(drive_root).resolve(strict=False)
-    except Exception:
-        return None
+def _custody_drive_root(drive_root: Any) -> pathlib.Path | None:
+    from ouroboros.install_identity import require_owned_root
+
+    root = invocation_binding().get("drive_root") or drive_root
+    return require_owned_root(root) if root not in (None, "") else None
 
 def _state_dir(drive_root: pathlib.Path | None) -> pathlib.Path | None:
+    drive_root = _custody_drive_root(drive_root)
     if drive_root is None:
         return None
     try:
-        path = pathlib.Path(drive_root).resolve(strict=False) / "state" / _PROCESS_STATE_DIR
+        path = drive_root / "state" / _PROCESS_STATE_DIR
         path.mkdir(parents=True, exist_ok=True)
         return path
     except Exception:
@@ -628,11 +629,11 @@ def _services_snapshot() -> list[_ExecutorService]:
 
 
 def _register_process(drive_root: pathlib.Path | None, payload: dict[str, Any]) -> pathlib.Path | None:
-    from ouroboros.tool_custody import invocation_binding, retain_unconfirmed_host_operation
+    from ouroboros.tool_custody import retain_unconfirmed_host_operation
 
     binding = invocation_binding()
     payload = {**{key: value for key, value in binding.items() if key != "drive_root"}, **payload}
-    state_dir = _state_dir(pathlib.Path(binding["drive_root"]) if binding.get("drive_root") else drive_root)
+    state_dir = _state_dir(drive_root)
     if state_dir is None:
         if binding.get("task_id"):
             retain_unconfirmed_host_operation("executor_custody_unavailable")
@@ -941,6 +942,7 @@ def start_service(
 ) -> dict[str, Any]:
     if _panic_requested:
         raise RuntimeError("Emergency Stop has retired executor admission")
+    drive_root = _custody_drive_root(getattr(ctx, "drive_root", None))
     env = validate_process_env(env)
     executor = executor_ref_from_ctx(ctx)
     if executor is None:
@@ -976,20 +978,19 @@ def start_service(
         readiness=dict(readiness or {}),
         env=env,
         secret_values=secret_values,
-        drive_root=_drive_root_from_ctx(ctx),
+        drive_root=drive_root,
     )
     if executor.kind == "local":
         from ouroboros.process_custody import spawn_supervised
 
         # A service inside the bound body candidate runs isolated; a refusal precedes any log.
         base_env = candidate_env if candidate_env is not None else _executor_service_env()
-        log_path = pathlib.Path(getattr(ctx, "drive_root")) / "services" / record.task_id / f"{name}.executor.log"
+        log_path = drive_root / "services" / record.task_id / f"{name}.executor.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fh = log_path.open("ab")
 
         from ouroboros.owner_pause import _member_coordinates
         from ouroboros.process_scope import record_task_group, scoped_child_env, task_launch_target
-        from ouroboros.tool_custody import invocation_binding
 
         # A task-scoped service is the task's: its launch carries the task marker and its
         # group is recorded; a keep/session service is handed to the installation and sheds
@@ -1010,7 +1011,7 @@ def start_service(
 
         try:
             spawn_supervised(
-                record.cmd, drive_root=pathlib.Path(getattr(ctx, "drive_root")),
+                record.cmd, drive_root=drive_root,
                 purpose=f"workspace_service:{name}", scope="session" if record.keep_alive else "task",
                 owner_task_id=record.task_id, on_spawn=publish_process, cwd=str(host_cwd),
                 stdout=log_fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
@@ -1053,7 +1054,7 @@ def start_service(
         record.backend_log_path = log_path
         with _STATE_LOCK:
             _SERVICES[key] = record
-    record.durable_record_path = _register_service_process(_drive_root_from_ctx(ctx), record)
+    record.durable_record_path = _register_service_process(drive_root, record)
     if executor.kind != "local" and record.durable_record_path is not None:
         proc._invocation_confirm()
     _wait_readiness(record, readiness)

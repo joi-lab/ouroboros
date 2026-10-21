@@ -270,10 +270,12 @@ def test_what_the_daemon_says_is_absent_is_closed_not_faulted_forever(tmp_path):
     for run_id, task in (("run-gone", "t-gone"), ("run-owns-a-dead-project", "t-also-gone")):
         dc.record_started(tmp_path, dc.RunCustody(
             run_id=run_id, task_id=task, route_id="r", model="m", project_id="prj-ours",
+            daemon_store_id="store-a",
             project_owned=run_id.endswith("project"), root_task_id=task, ledger_root=str(tmp_path)))
     dc._CUSTODY.clear()
 
     class _Router(_LiveRunStub):
+        store_identity = "store-a"
         def get_run(self, rid, **_kw):
             return (_NoSuchProject() if rid.endswith("project") else _NoSuchRun()).get_run(rid)
         def remove_project(self, pid): _NoSuchProject().remove_project(pid)

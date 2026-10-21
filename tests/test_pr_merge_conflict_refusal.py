@@ -185,6 +185,29 @@ def _repair(chain):
     chain.fake.pr.update(headRefOid=REPAIRED, mergeStateStatus="CLEAN")
 
 
+def test_closed_after_another_actors_queue_keeps_our_proven_refusal(chain):
+    from ouroboros.merge_receipts import card_row_text, public_block
+
+    chain.fake.pr["autoMergeRequest"] = {"enabledAt": "by another actor"}
+    chain.answers.append((1, "", refusal(DIRTY) + AUTO))
+    _merge(chain, HEAD)
+    first = _receipts(chain)[0]
+    assert first["outcome"]["status"] == "queued"
+    assert first["effect"]["failure"] == "pre_effect"
+    chain.fake.pr.update(state="CLOSED", autoMergeRequest=None)
+    output = _merge(chain, HEAD)
+    (current,) = _receipts(chain)
+    for text in (output.text, card_row_text(current), public_block(current)):
+        assert "PR now CLOSED" in text
+        assert "request refused before effect" in text
+        assert "effect unconfirmed" not in text
+    assert current["effect"] == first["effect"] and current["outcome"] == first["outcome"]
+    assert output.meta["operation_outcome"] == "unknown"
+    assert _held(chain) is True  # presentation does not release the retained queued operation
+    _merge(chain, HEAD)
+    assert len(chain.merges) == 1
+
+
 @pytest.mark.parametrize("method,stderr", [
     ("squash", refusal(DIRTY) + AUTO),
     ("merge", refusal(DIRTY) + AUTO + hint("merge")),

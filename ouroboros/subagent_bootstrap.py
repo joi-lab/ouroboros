@@ -435,8 +435,7 @@ def actor_first_unresolved_fact(
             "route_available": bootstrap.get("route_available"),
         }
         if len(failure_states) > 12:
-            # Bounded but DISCLOSED (P1), same contract as the acceptance
-            # projection in delegate_evidence: never a silent truncation.
+            # Bounded but DISCLOSED (P1): never a silent truncation.
             fact["failure_states_omitted"] = len(failure_states) - 12
         return fact
     if str(bootstrap.get("zero_run_evidence_status") or "") == "unknown":
@@ -778,7 +777,7 @@ def append_startup_receipt(
             "The exact configured leaf run is LIVE — the receipt carries its id. "
             "Waiting is your decision: call delegate_wait when you want its facts, "
             "or use this round for parallel judgment first (schedule auxiliary "
-            "children, prepare acceptance). Never rebuild its work on metered "
+            "children, prepare how you will verify its result). Never rebuild its work on metered "
             "tokens and never start a duplicate leaf; a replacement start is legal "
             "only after cancellation and terminal settlement are verified."
         )

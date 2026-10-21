@@ -22,7 +22,8 @@ from ouroboros.delegate_custody import RunCustody as _RunCustody
 # ONE refusal author for the whole delegate surface: the neutral leaf
 # `delegate_shared` (phase B's facade split), never a local twin that could drift.
 from ouroboros.delegate_registration_policy import (
-    INVESTIGATION_AUTHORITY, no_write_authority, record_persistent as _record_persistent)
+    INVESTIGATION_AUTHORITY, INVESTIGATION_NOTE, evidence_only, no_write_authority,
+    record_persistent as _record_persistent)
 from ouroboros.delegate_shared import _fail, lock_busy_facts
 from ouroboros.delegate_start_claims import (
     PAYLOAD_CUSTODY_UNREADABLE as _UNREADABLE_HOLDER, payload_busy_detail,
@@ -395,7 +396,8 @@ def _provision_snapshot(ctx: ToolContext, drive: pathlib.Path, target_root: str,
             "delegated run executes only in its own snapshot, never in the shared tree.",
             target_root=target_root, definitely_unrun=True, **lock_busy_facts(exc))
     if folder.parts and not (pathlib.Path(handle.path) / folder).is_dir():
-        try:  # unclaimed: nothing else names it, and the startup GC reconciles a failed release
+        # Unclaimed; custody GC retries a failed release once the owning task is proven over.
+        try:
             remove_execution_snapshot(handle.snapshot_id)
         except Exception:
             log.warning("Failed to release snapshot %s without its starting folder", handle.snapshot_id, exc_info=True)
@@ -519,6 +521,10 @@ def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
         # A failed manifest's own typed note (unreviewable_metadata_change,
         # non-UTF-8, …) is the actionable fact — never hide it in boilerplate.
         block["note"] = str(manifest.get("note") or "") or block["note"]
+    elif evidence_only(entry):  # evidence owes no apply/reject, on every read (#1969)
+        block["note"] = INVESTIGATION_NOTE
+        if getattr(entry, "patch_disposed", "") == custody.EVIDENCE_RETAINED:
+            block["disposition"] = custody.EVIDENCE_RETAINED
     current_head = str(manifest.get("current_head") or "")
     if current_head and entry.baseline_sha and current_head != entry.baseline_sha:
         # Single-writer snapshot: a moved HEAD can only mean the run itself committed.
@@ -725,12 +731,14 @@ from ouroboros.tool_access import (
 
 
 def payload_content_hash(payload_root: Any) -> str:
-    """The whole-payload CAS hash — the existing skill-loader inventory hash.
-    One definition for snapshot baseline, capture result, and apply-time CAS;
-    raises ``SkillPayloadUnreadable`` (fail-closed) exactly like the loader."""
-    from ouroboros.skill_loader import compute_content_hash
+    """The whole-payload CAS hash over the skill-loader inventory, the bucket's
+    per-install notes included: the snapshot copy sits outside data/skills/<bucket>/,
+    so it and the live folder hash the same bytes. One definition for snapshot
+    baseline, capture result, and apply-time CAS; raises ``SkillPayloadUnreadable``
+    (fail-closed) exactly like the loader."""
+    from ouroboros.skill_identity import payload_digest
 
-    return compute_content_hash(pathlib.Path(str(payload_root)))
+    return payload_digest(pathlib.Path(str(payload_root)), bucket="")
 
 
 def _payload_delegation_busy(drive: pathlib.Path, target: pathlib.Path) -> str:
@@ -800,12 +808,12 @@ def _payload_selector_refusal(selector_root: str, retry_of: Any, bucket: Any,
 def payload_host_instructions(text: str, skill_name: str) -> str:
     """The payload-run variant of the host instructions (gate fix 3).
 
-    The generic text bans touching the host's "skills" — for a payload run that
+    The generic text bans modifying the host's skills — for a payload run that
     blanket ban would contradict the assignment itself, so it is narrowed and an
     explicit, truthful permission block is appended.
     """
     adjusted = text.replace(
-        "do not touch the host's runtime controls, skills, or memory",
+        "do not touch the host's runtime controls or memory, or modify its skills",
         "do not touch the host's runtime controls or memory")
     return adjusted + (
         "\nPAYLOAD ASSIGNMENT: this working tree is a PRIVATE standalone copy of "

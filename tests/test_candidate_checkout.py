@@ -111,6 +111,7 @@ def test_git_input_is_file_backed_with_identical_bytes_and_failure_semantics(sou
 def test_unproven_process_or_inner_marker_retains_the_copy_in_place(source, tmp_path):
     """Deletion needs a proven-gone holder; retention is marked for enclosing layers."""
     from ouroboros.test_environment import RETENTION_MARKER, retain_tree
+    from tests._shared import retire_synthetic_retention
 
     proven = tmp_path / "proven"
     with candidate.candidate_checkout(source, proven) as copy:
@@ -118,30 +119,37 @@ def test_unproven_process_or_inner_marker_retains_the_copy_in_place(source, tmp_
         copy.release()  # The holder proved its process tree gone.
     assert not proven.exists()
 
-    held = tmp_path / "held"
-    with pytest.raises(candidate.CandidateError, match="CANDIDATE_RETAINED.*never proven gone"):
-        with candidate.candidate_checkout(source, held) as copy:
-            copy.hold()  # Started, never proven gone: an ordinary exit is no proof.
-    assert "never proven gone" in (held / RETENTION_MARKER).read_text(encoding="utf-8")
+    held, failing, nested = tmp_path / "held", tmp_path / "failing", (tmp_path / "nested").resolve()
+    unproven = "1 process tree(s) started from this checkout were never proven gone"
+    try:
+        with pytest.raises(candidate.CandidateError, match="CANDIDATE_RETAINED.*never proven gone"):
+            with candidate.candidate_checkout(source, held) as copy:
+                copy.hold()  # Started, never proven gone: an ordinary exit is no proof.
+        assert "never proven gone" in (held / RETENTION_MARKER).read_text(encoding="utf-8")
 
-    failing = tmp_path / "failing"
-    with pytest.raises(RuntimeError, match="reap failed"):
-        with candidate.candidate_checkout(source, failing) as copy:
-            copy.hold()
-            raise RuntimeError("reap failed")  # The original failure stays the error.
-    assert (failing / RETENTION_MARKER).is_file()
+        with pytest.raises(RuntimeError, match="reap failed"):
+            with candidate.candidate_checkout(source, failing) as copy:
+                copy.hold()
+                raise RuntimeError("reap failed")  # The original failure stays the error.
+        assert (failing / RETENTION_MARKER).is_file()
 
-    nested = tmp_path / "nested"
-    with pytest.raises(candidate.CandidateError, match="retention marker"):
-        with candidate.candidate_checkout(source, nested) as copy:
-            (nested / "server-data").mkdir()
-            retain_tree(nested / "server-data", "inner layer could not prove its tree gone")
-    assert (nested / "server-data" / RETENTION_MARKER).is_file()
+        with pytest.raises(candidate.CandidateError, match="retention marker"):
+            with candidate.candidate_checkout(source, nested) as copy:
+                (nested / "server-data").mkdir()
+                retain_tree(nested / "server-data", "inner layer could not prove its tree gone")
+        assert (nested / "server-data" / RETENTION_MARKER).is_file()
 
-    with candidate.candidate_checkout(source, tmp_path / "unmatched") as copy:
-        with pytest.raises(candidate.CandidateError, match="release without a matching hold"):
-            copy.release()
-    assert not (tmp_path / "unmatched").exists()
+        with candidate.candidate_checkout(source, tmp_path / "unmatched") as copy:
+            with pytest.raises(candidate.CandidateError, match="release without a matching hold"):
+                copy.release()
+        assert not (tmp_path / "unmatched").exists()
+    finally:
+        # Every hold above was synthetic: no process was started from these copies.
+        retire_synthetic_retention(held, unproven)
+        retire_synthetic_retention(failing, unproven)
+        retire_synthetic_retention(nested / "server-data", "inner layer could not prove its tree gone")
+        retire_synthetic_retention(nested, "retention marker(s) beneath: "
+                                   + str(nested / "server-data" / RETENTION_MARKER))
 
 
 def test_staged_unstaged_new_binary_deleted_and_executable_bytes_survive(source, tmp_path):

@@ -12,7 +12,7 @@ import pytest
 
 from ouroboros import budget_pause, delegate_recovery, owner_pause, owner_wait
 from ouroboros.artifacts import read_actor_source_bytes
-from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
+from ouroboros.task_results import STATUS_RUNNING, STATUS_SCHEDULED, load_task_result, write_task_result
 from supervisor import restart_retention
 from supervisor.events_budget import budget_hold_fact
 from tests._budget_pause_exact_helpers import _install_queue, _loop_ctx
@@ -182,6 +182,73 @@ def test_retained_warm_pause_resumes_without_replaying_effects(tmp_path, monkeyp
     assert budget_pause.budget_pause_row(tmp_path, "saved-warm")["grant"]["consumed_at"]
     with pytest.raises(ValueError):
         budget_pause.load_budget_pause(ctx, task["_budget_pause_resume"])
+
+
+@pytest.mark.parametrize("ack", [False, True])
+@pytest.mark.parametrize("reason", ["owner_pause", "sleep"])
+def test_a_resumed_owner_pause_returns_at_the_next_stop_from_its_newer_work(tmp_path, monkeypatch, ack, reason):
+    """19.10.2026: an owner Pause landed while the task's own review ran, the update's stop
+    retained that warm wait into an exact pause, and Resume continued the SAME attempt. The
+    next update's stop promised to return the task, but restore read the old ``retained``
+    wait as a live park, refused the newer working state and cancelled the task. The Resume
+    ended that park: the task returns under its own id from the work it did after it."""
+    from ouroboros import working_checkpoint
+    from ouroboros.cancel_intents import has_active_intent
+    from tests.test_restart_retention import _supervisor_rows
+
+    queue, state, workers = _install_queue(tmp_path, monkeypatch)
+    _pool_events(workers, monkeypatch)
+    ctx, limit, wait, _ = _park(tmp_path, workers, reason)
+    task = _stop_boot(queue, workers, _handoff(tmp_path, workers, wait, legacy=True))
+    assert load_task_result(tmp_path, "saved-warm")["owner_wait"]["state"] == "retained"
+    monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_k: 5.0)
+    assert queue.resume_budget_paused_task("saved-warm")["ok"]
+    ctx.budget_pause_resume = task["_budget_pause_resume"]
+    monkeypatch.setattr(owner_wait, "rebind_restored_route", lambda *_a, **_k: (None, "max"))
+    messages, trace, usage, seen = [], {}, {}, set()
+    budget_pause.resume_paused_loop(SimpleNamespace(_ctx=ctx), budget_pause.load_budget_pause(ctx),
+                                    messages, trace, usage, seen, budget_remaining_usd=5.0)
+    assert budget_pause.budget_pause_row(tmp_path, "saved-warm")["state"] == budget_pause.STATE_RESUMED
+    # The dispatched attempt works on and saves its newer state; then the next update stops it.
+    workers.PENDING.remove(task)
+    workers.RUNNING["saved-warm"] = {"task": task, "worker_id": 0, "attempt": 1}
+    limit.messages = messages + [{"role": "user", "content": "[owner] work after the Resume"}]
+    working_checkpoint.save_round(limit, "ready")
+    returns = restart_retention.prepare_restart_returns(tmp_path, workers.RUNNING, workers.PENDING,
+                                                        transaction_id="restart-twice")
+    assert returns == {"saved-warm"}
+    if ack:
+        transaction = delegate_recovery._read_restart_transaction(tmp_path, "restart-twice")
+        delegate_recovery._write_restart_transaction(tmp_path, {
+            **transaction, "status": "normal_exit_acknowledged", "exit_code": 42})
+    returned = _stop_boot(queue, workers, set())
+    assert not has_active_intent(tmp_path, "saved-warm", strict=True)
+    assert load_task_result(tmp_path, "saved-warm")["status"] == STATUS_SCHEDULED, "queued again, not cancelled"
+    assert returned["_attempt"] == 2
+    source = returned["_working_recovery"]
+    assert source["source_kind"] == working_checkpoint.SOURCE_WORKING
+    frozen = json.loads(read_actor_source_bytes(tmp_path, "saved-warm", source["source_ref"]))
+    assert frozen["messages"][-1]["content"] == "[owner] work after the Resume"
+    hold = budget_hold_fact(returned)
+    assert hold is None if ack else hold["reason"] == "saved_work_hold"
+    assert not [row for row in _supervisor_rows(tmp_path) if row.get("type") == "restart_return_refused"]
+
+
+def test_a_promised_return_that_cannot_come_back_says_why(tmp_path, monkeypatch):
+    """The other direction: a returned id with nothing saved keeps the ordinary interrupted
+    path, and the refusal is a typed supervisor fact, not silence."""
+    from tests.test_restart_retention import _supervisor_rows
+
+    _install_queue(tmp_path, monkeypatch)
+    write_task_result(tmp_path, "nothing-saved", STATUS_RUNNING, chat_id=0)
+    row = {"task": {"id": "nothing-saved", "type": "task", "chat_id": 0, "_attempt": 1}, "attempt": 1}
+    assert restart_retention.recover_saved_running(
+        [row], tmp_path, transaction={"return_ids": ["nothing-saved"]}, cause="app_stop") == []
+    [refused] = [r for r in _supervisor_rows(tmp_path) if r.get("type") == "restart_return_refused"]
+    assert refused["refused"] == {"nothing-saved": "no_usable_recovery_source"} and refused["cause"] == "app_stop"
+    assert restart_retention.recover_saved_running([row], tmp_path, transaction={}, cause="app_stop") == []
+    assert len([r for r in _supervisor_rows(tmp_path) if r.get("type") == "restart_return_refused"]) == 1, \
+        "a row nothing promised to return is the ordinary path, not a refusal"
 
 
 @pytest.mark.parametrize("reason", ["orphaned_running_after_worker_restart", "interrupted_retry_lost"])

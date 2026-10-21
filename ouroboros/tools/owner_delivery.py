@@ -1,7 +1,7 @@
 """Live-first delivery of owner-directed chat events from a running task.
 
 One seam for the send family (``send_user_message`` / ``send_photo`` /
-``send_video`` / ``send_file`` / ``send_links``): try the live worker event
+``send_video`` / ``send_file`` / ``send_links`` / ``show_card``): try the live worker event
 queue first so the owner sees the frame while the task is still RUNNING, and
 fall back to ``ctx.pending_events`` (the end-of-task drain) when live
 transport is unavailable. The transport contract mirrors
@@ -70,7 +70,7 @@ def _retain_dialogue(ctx: Any, evt: dict, mode: str) -> None:
     kind = evt.get("type")
     fields = {"send_message": ("text",), "send_photo": ("caption",),
               "send_video": ("caption",), "send_document": ("caption",),
-              "send_links": ("title", "actions"),
+              "send_links": ("title", "actions"), "send_card": ("title", "fallback_text"),
               "send_quiz": ("question", "options", "stake", "assumption")}.get(kind, ())
     words = {key: evt[key] for key in fields if evt.get(key) not in (None, "", [])}
     if not words:

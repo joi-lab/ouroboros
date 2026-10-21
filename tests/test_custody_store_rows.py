@@ -324,3 +324,77 @@ def test_the_import_folds_a_legacy_chain_into_the_custody_tables_once(tmp_path, 
     # the chain is left as it was: the forensic read and the rows agree
     assert {row["run_id"] for row in c.custody_rows(tmp_path) if row.get("run_id")} == {"run-a", "run-d", "run-x"}
     assert vars(c.replay(tmp_path, rows=list(c.custody_rows(tmp_path)))["run-a"]) == vars(runs["run-a"])
+
+
+@pytest.mark.parametrize("journal", ["PERSIST", "WAL"])
+def test_task_snapshot_materializes_only_own_runs_and_pending_requests(tmp_path, monkeypatch, journal):
+    from ouroboros import delegate_pending, delegate_terminal
+    from ouroboros.task_finalization import prepare_terminal_send_event
+    from tests._store_journal_shared import use_journal
+
+    use_journal(monkeypatch, journal)
+    with store.open_store(tmp_path, write=True) as txn:
+        for index in range(1000):
+            tid = f"other-{index}"
+            txn.put_custody(tid, {"run_id": tid, "task_id": tid, "model": "x" * 1000}, state=current.HELD)
+            txn.put_row("custody_open", f"invocation:{tid}", {"request": {
+                "type": c.START_REQUESTED, "task_id": tid, "invocation_id": tid,
+                "request_ref": {"sha256": tid},
+            }})
+        for rid, fields in (("own-open", {}), ("own-closed", {"settled": True, "terminal_state": "failed"}),
+                            ("own-review", {"source": "review_substrate"})):
+            txn.put_custody(rid, {"run_id": rid, "task_id": "own", **fields},
+                            state=current.CLOSED if fields.get("settled") else current.HELD)
+        for iid, source in (("own-pending", "delegated_subagent"), ("review-pending", "review_substrate")):
+            txn.put_row("custody_open", f"invocation:{iid}", {"request": {
+                "type": c.START_REQUESTED, "task_id": "own", "root_task_id": "tree-root",
+                "invocation_id": iid, "source": source, "request_ref": {"sha256": iid},
+            }})
+
+    decoded, hydrated, writes = [], [], []
+    decode, body, opened = current._decode, delegate_pending.request_body, store.open_store
+
+    def owned_decode(raw):
+        decoded.append(raw["run_id"])
+        assert raw["task_id"] == "own"
+        return decode(raw)
+
+    def owned_request(root, row):
+        hydrated.append(row["invocation_id"])
+        assert row["task_id"] == "own"
+        return body(root, row)  # unreadable own source is still a pending identity
+
+    @contextmanager
+    def observed_open(root, **kwargs):
+        if kwargs.get("write"):
+            writes.append(root)
+        with opened(root, **kwargs) as txn:
+            yield txn
+
+    monkeypatch.setattr(current, "_decode", owned_decode)
+    monkeypatch.setattr(delegate_pending, "request_body", owned_request)
+    monkeypatch.setattr(store, "open_store", observed_open)
+    monkeypatch.setattr(store.Txn, "set_rows", lambda *a: pytest.fail("delivery read an entire obligation set"))
+    usage = {}
+    event = prepare_terminal_send_event(tmp_path, {"id": "own"}, "Answer", usage,
+                                        {"text": "Answer"}, presence=False)
+    audit = usage["delegate_terminal_reconciliation"]
+    assert audit["audit_status"] == "ok" and not writes
+    assert sorted(decoded) == ["own-closed", "own-open", "own-review"]
+    assert sorted(hydrated) == ["own-pending", "review-pending"]
+    assert audit["open_run_ids"] == ["own-open"]
+    assert audit["pending_invocation_ids"] == ["own-pending"]
+    assert [row["run_id"] for row in audit["terminal_runs"]] == ["own-closed"]
+    assert "own-open" in event["terminal_custody_notice"] and "own-pending" in event["terminal_custody_notice"]
+    assert "review" not in event["terminal_custody_notice"] and "other-" not in event["terminal_custody_notice"]
+    assert delegate_terminal.terminal_custody_disclosure(tmp_path, "absent")["unreconciled"] == []
+
+
+def test_task_snapshot_keeps_a_legacy_numeric_request_task_identity(tmp_path):
+    with store.open_store(tmp_path, write=True) as txn:
+        txn.put_row("custody_open", "invocation:legacy", {"request": {
+            "type": c.START_REQUESTED, "task_id": 17, "invocation_id": "legacy",
+            "request": {"prompt": "work"},
+        }})
+    assert [row["invocation_id"] for row in current.task_snapshot(tmp_path, "17")["pending"]] == ["legacy"]
+    assert current.task_snapshot(tmp_path, "18")["pending"] == []

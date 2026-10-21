@@ -37,6 +37,7 @@ from ouroboros.contracts.skill_manifest import (
 )
 from ouroboros.contracts.plugin_api import ExtensionRegistrationError
 from ouroboros.extension_ui_validation import (
+    validate_contributions,
     validate_settings_schema,
     validate_ui_render,
 )
@@ -529,6 +530,11 @@ def _widget_entry_exists_finding(
 
 def _widget_schema_findings(skill_dir: pathlib.Path, manifest: Optional[SkillManifest]) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
+    if manifest is not None and manifest.contributes:
+        _, problems = validate_contributions(manifest, skill_dir=skill_dir)
+        findings.append({"item": "contributions_schema", "source": "manifest.contributes",
+                         "ok": not problems, "verified": True,
+                         "detail": "; ".join(problems) if problems else "valid contributions"})
     if manifest is not None and isinstance(manifest.ui_tab, dict):
         render = manifest.ui_tab.get("render")
         schema_row = _validate_widget_render(render, source="manifest.ui_tab.render")

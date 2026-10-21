@@ -205,7 +205,7 @@ def test_review_lifecycle_enablement_and_job_state_follow_binding_state_root(
         )
 
     monkeypatch.setattr(
-        runner, "_reconcile_deps_after_pass_review",
+        "ouroboros.skill_dependencies.ensure_skill_dependencies",
         lambda *_args, **_kwargs: ("not_required", ""),
     )
     monkeypatch.setattr(

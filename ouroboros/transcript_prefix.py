@@ -28,10 +28,20 @@ CHECKPOINT_KIND = "prompt_prefix_break"
 #: One-shot attribute a sanctioned rewrite leaves on the slot for the next observation.
 SANCTION_ATTR = "_transcript_rewrite_sanctioned"
 
+#: Count of sanctioned rewrites on this execution slot: a size measured before a
+#: rewrite is labelled as such afterwards (``context_fit.InputAnchor.rewritten``).
+REWRITE_EPOCH_ATTR = "_transcript_rewrite_epoch"
+
 
 def sanction_rewrite(slot: Any, by: str = "compaction") -> None:
     """Name the rewrite the next ``observe_send`` should attribute (one-shot)."""
     setattr(slot, SANCTION_ATTR, by)
+    setattr(slot, REWRITE_EPOCH_ATTR, rewrite_epoch(slot) + 1)
+
+
+def rewrite_epoch(slot: Any) -> int:
+    """Sanctioned rewrites so far on this execution slot (0 without a slot)."""
+    return int(getattr(slot, REWRITE_EPOCH_ATTR, 0) or 0) if slot is not None else 0
 
 
 def _plain_text(content: Any) -> str:

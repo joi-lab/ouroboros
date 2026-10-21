@@ -9,9 +9,14 @@ from pathlib import Path
 from threading import Thread
 
 import pytest
+from tests._shared import producer_evidence_dir
 
 pytestmark = [pytest.mark.ui_browser]
 WEB = Path(__file__).resolve().parents[1] / "web"
+
+
+def _evidence_dir(tmp_path):
+    return producer_evidence_dir(tmp_path / "evidence", "quiz-response", env="QUIZ_BROWSER_EVIDENCE")
 
 BOOT = """async ({id, theme}) => {
     document.documentElement.className='ouro-ui'; document.documentElement.dataset.theme=theme;
@@ -50,8 +55,7 @@ def test_quiz_pending_persistent_profile_recovery_and_keyboard(tmp_path, engine,
     thread.start()
     origin = f"http://127.0.0.1:{server.server_port}"
     profile = tmp_path / "browser-profile"
-    evidence = Path(os.environ.get("QUIZ_BROWSER_EVIDENCE", str(tmp_path / "evidence")))
-    evidence.mkdir(parents=True, exist_ok=True)
+    evidence = _evidence_dir(tmp_path)
     context = None
     pw = None
     observations = {}

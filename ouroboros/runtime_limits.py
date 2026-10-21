@@ -1,7 +1,7 @@
 """Ouroboros — the numeric runtime knobs and their clamps.
 
-Worker count, task liveness windows, per-call ceilings, reviewer and acceptance
-budgets, subagent caps and delegation windows, plus fixed process and transport
+Worker count, task liveness windows, per-call ceilings, reviewer budgets,
+subagent caps and delegation windows, plus fixed process and transport
 bounds. Environment-or-default getters clamp into documented bands, so a typo
 falls back to the shipped value instead of disabling a rail.
 """
@@ -28,6 +28,8 @@ CLAUDEXOR_STOP_EXIT_WAIT_SEC = 5.0
 # Phone-native source compilation exceeds ten minutes; one contained platform
 # preparation may run for an hour, independently of ordinary tool/harness calls.
 EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC = 3600.0
+# Transport bound for one optional ditto process; expiry leaves the original patch intact.
+ARTIFACT_COMPRESSION_TIMEOUT_SEC = 120.0
 
 
 EXTENSION_STREAM_CHUNK_BYTES = 64 * 1024
@@ -39,6 +41,10 @@ EXTENSION_CHILD_CLEANUP_GRACE_SEC = 2
 # budget, not two knobs: raise the drain only with the launcher wait (which ships with a release).
 LAUNCHER_STOP_GRACE_SEC = 10.0
 SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC = 3.0
+# A process-ending stop waits at most this long for launches and Resumes already writing their marks to hand
+# over to the still-running pool before it names returns and retires the pool (``pause_admission``). On Quit
+# it follows the supervisor join and precedes the custody write: at most this much more of the launcher wait above.
+STOP_ADMISSION_DRAIN_SEC = 2.0
 # A direct Restart's spawned successor (Windows, POSIX exec fallback) starts while its parent still
 # holds the data root: admission waits the same handoff the old port gets (find_free_port), no longer.
 SERVER_ADMISSION_WAIT_SEC = 10.0
@@ -241,16 +247,6 @@ def get_llm_transport_read_timeout_sec() -> float:
     return _clamped_number_setting("OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC", low=60.0, high=7200.0)
 
 
-def get_acceptance_review_est_sec() -> float:
-    """The configurable acceptance admission floor, clamped to >=200 s by task_pacing."""
-    return _clamped_number_setting("OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC", low=10.0, high=3600.0)
-
-
-def get_acceptance_reserve_pct() -> int:
-    """Default finalization-reserve percentage of the total budget (v6.54.4)."""
-    return _clamped_number_setting("OUROBOROS_ACCEPTANCE_RESERVE_PCT", low=0, high=50, cast=int)
-
-
 def get_plan_task_deadline_min_sec() -> float:
     """Minimum useful deadline-scaled planning-swarm window (v6.54.3, 1.5)."""
     return _clamped_number_setting("OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC", low=30.0, high=3600.0)
@@ -279,7 +275,8 @@ def get_direct_turn_stop_wait_sec() -> float:
     return _clamped_number_setting("OUROBOROS_DIRECT_TURN_STOP_WAIT_SEC", low=0, high=10, cast=float)
 
 
-# How long a pooled worker waits for ONE answer to an acceptance-fence request; it re-sends
+# How long a pooled worker waits for ONE answer to a root-admission-seal request (the
+# ``acceptance_fence`` event of its historical name); it re-sends
 # the same request once and waits this long again, then the outcome is a typed unknown. Short
 # by design: the idle rail does not count heartbeats as progress, so this wait is never
 # lengthened to ride out a stalled supervisor. Structural, not a settings key.

@@ -752,7 +752,7 @@ def test_s21_chat_lineage_cancel_delivers_receipt_to_outbox_and_chat(
             chat_row = chat_rows[-1]
             assert chat_row.get("direction") == "system", chat_row
             assert int(chat_row.get("chat_id") or 0) == lineage_chat, chat_row
-            assert f"Task {task_id} was cancelled" in str(chat_row.get("text") or ""), chat_row
+            assert f"Task {task_id} was stopped" in str(chat_row.get("text") or ""), chat_row
 
             # (b) The details-panel block on the durable result (the W2-F1 fact
             # a chatless task never gets).
@@ -762,7 +762,7 @@ def test_s21_chat_lineage_cancel_delivers_receipt_to_outbox_and_chat(
                          else None), 90)
             assert receipt, oracle.task_result(task_id)
             assert receipt.get("settled_status") == "cancelled", receipt
-            assert receipt.get("outcome") == "cancelled", receipt
+            assert receipt.get("outcome") == "stopped", receipt
             assert receipt.get("delivery_id") == delivery_id, receipt
             assert isinstance(receipt.get("salvage"), dict), receipt
 
@@ -826,7 +826,8 @@ S22_SCRIPT = [
 
 
 @pytest.mark.parametrize("status", ["reviewing", "reviewed", "failed"])
-def test_s22_script_collects_feedback_before_an_explicit_author_decision(status):
+def test_scripted_s22_author_collects_feedback_before_an_explicit_decision(status):
+    """A default-lane check of S22's scripted author; ``test_s<N>_`` names are server scenarios."""
     reference = {"surface": "commit", "task_id": "s22", "attempt": 1}
     feedback = {"review_reference": reference,
                 "review_outcome": {"status": status, "phase": "review_only"}}
@@ -901,6 +902,15 @@ def test_s22_absorb_kill_recovery_absorbs_once_and_never_twice(
     # writes are separate atomic files, so the scenario shapes that state
     # deterministically by removing the marker after the kill.
     monkeypatch.setenv("OUROBOROS_EVOLUTION_AUTO_RESTART", "false")
+    # Evolution forces the full post-commit test battery even under skip_tests (tools/git.py:
+    # evolution publication requires a full run), and the cycle settles only after the commit
+    # tool returns. S22's subject is the absorb crash window, not qualification, so the
+    # product's own lane budget ends that battery red at once on every host: a red post-commit
+    # run withholds only the push and keeps the commit and the open transaction. Unbounded, the
+    # settle wait below held only while the battery's Node lane failed fast (CI, 18 Oct: three
+    # date-bound Node tests, red after 125 s); once the Node suite passed, the pytest lanes
+    # started and the 300 s wait ran out with the battery still running (CI, 19 Oct).
+    monkeypatch.setenv("OUROBOROS_PREFLIGHT_TIMEOUT_SEC", "5")
 
     settings_kwargs = dict(
         OUROBOROS_RUNTIME_MODE="cyber_pro",  # explicit in-place authoring is Cyber Pro only (#1620)

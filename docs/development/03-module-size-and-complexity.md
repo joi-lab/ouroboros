@@ -73,34 +73,36 @@ coupling `implicit_contracts` item.
 
 ### Invariant: Projection over replay (hot readers of growing stores)
 
-Apply ARCHITECTURE §10 invariant 10 to current-state readers; review and growth checks follow.
+Apply ARCHITECTURE §10 invariant 10 to current-state readers. A new fact belongs in its
+transition's transaction; legacy derivation is a named durable job under sequence/source CAS, a
+process-local flag never proves an installation migration, and passive control readers fall
+back only for underived rows. The census snapshots controls/phases in one short transaction per
+addressed store, outside queue locks, released before display consumers; unavailable stays
+unknown for that request (`tests/test_hot_facts*.py` fix Stop/custody results while settled
+history grows 20→2,000 rows). Main batches question display views and warms lineage by
+generation, keeping strict per-member gaps if a batch fails (`tests/test_main_decisions_reads.py`);
+B3/B3w in `tests/test_cost_contract.py` fix visible questions while delivered history grows.
 
-- **Evaluate the whole operation as the project grows:** history, object count, nested
-  repetition, cold caches, shared-resource contention. Where growth can hurt
-  responsiveness, use existing spans and test spies on real readers for scale evidence;
-  telemetry adds no steady-state writes or history reads. Remove redundant work or
-  reuse a validated view before adding a projection or cache. Unknown never means empty. This reasoning sets
-  no universal time limit, mandatory benchmark or extra approval gate.
-- **Passive GET.** Read handlers perform no new steady-state durable writes.
-  `ouroboros/usage_store.py::read` may initialize an empty store when nothing awaits
-  import; display reads leave pending imports to startup and report unavailable data.
-  Enforced by `tests/test_usage_store.py`; the read path never starts a history import.
-- **House precedents, reuse these shapes:** archive-aware chat log rotation
-  (`supervisor/state.py::rotate_chat_log_if_needed`); current rows reduced by the writing
-  transaction beside an unbounded event log (`ouroboros/delegate_custody_current.py`); the
-  bounded filtered tail (`ouroboros/jsonl_tail.py`); per-archive room summaries
-  (`ouroboros/gateway/history_segments.py`); summary rows kept by the writing
-  transaction (`ouroboros/usage_store.py`, `store.py`); indexed selects
-  (`task_store.py`); the task-event SSE v2 cursor (ARCHITECTURE §3 "Chat and
-  Projects").
+- **Measure the growing operation:** history, object count, nesting, cold caches and
+  contention. Where responsiveness suffers, use existing spans and real-reader spies;
+  telemetry adds no steady-state writes/history reads. Remove redundant work or reuse
+  a validated view before adding a projection/cache. Unknown is never empty. This sets
+  no universal time limit, mandatory benchmark or approval gate.
+- **Passive GET:** no new steady-state durable writes. `usage_store.py::read` may
+  initialize an empty store with no pending import; otherwise display reads report
+  unavailable data and leave import to startup (`tests/test_usage_store.py`).
+- **Reuse precedents:** a writer seam whose transaction also writes the facts readers
+  address (`dialogue_store.py::append`); current rows reduced by the writing transaction
+  (`delegate_custody_current.py`); bounded filtered tail (`jsonl_tail.py`);
+  transactional summaries (`usage_store.py`, `store.py`);
+  indexed selects (`task_store.py`); task-event SSE v2 cursor (ARCHITECTURE §3).
 
-Enforcement: CHECKLISTS item 9 `perf_lifecycle` (advisory) fires on diffs that change
-data readers, startup/shutdown or batch operations, or an endpoint, poller,
-subscription or timer. The runtime tripwire is
-`agent_startup_checks.py::hot_store_growth_notes` (thresholds in
-`ouroboros/context_budget.py`); a change adding an append-only store read on an
-interactive path enrolls that store there, with a justified constant, in the same
-commit, because an unenrolled hot store is invisible to the tripwire.
+CHECKLISTS item 9 `perf_lifecycle` covers changed readers, startup/shutdown, batches, endpoints, pollers, subscriptions and timers. Runtime `storage` supplies the last count; `query_data(kind="storage")` its detail. The mind judges growth (P5). New growing stores name their `storage.PLACES` entry and PERSISTENCE retirer.
+
+`tests/test_store_boot.py` fixes `prepare_startup_state` at 50/500 frozen results and 20/200
+child stores (a clean boot is one read transaction, no history access or writes);
+`tests/test_store_legacy_reconcile.py` covers both detector outcomes, cursor resume and the
+foreground CLI, and the import/switch suites keep downgrade semantics.
 
 ### Invariant: Source-complete decision pipeline
 
@@ -116,8 +118,8 @@ Every new or changed continuity surface is reviewed as one narrow chain:
   not permission to infer missing material. Every over-limit tool result persists its
   exact source, with no per-tool exemption; only `source_unavailable` (no
   actor-resolvable source at all) is an unresolved partial that withholds dispatch.
-- An `api_chat` acceptance reviewer has no tools to resolve `repo_diff_source_ref`;
-  a criterion depending on the unseen diff remains at most `partial`.
+- An `api_chat` result reviewer cannot open the produced files; a judgement on their
+  content stays at most `partial`.
 - A consumer that can authorize PASS, a destructive rewrite or replacement of a full
   contract materializes the named source first; a known `partial` marker and an
   unverified claim that some host might retrieve more are not equivalent.
@@ -147,16 +149,13 @@ cost copy (ARCHITECTURE §3 "Chat and Projects"). Enforcement:
 
 #### Context and growth matrix
 
-The canonical continuity map is ARCHITECTURE §10 "Continuity data-flow map", which
-carries the source, projection and retention rule of chat and biography, plan/review
-authority and execution evidence. Record a new hot store there, add its growth proof
-here, and enroll it in `hot_store_growth_notes` in the same change.
+ARCHITECTURE §10 "Continuity data-flow map" owns sources, projections and retention for chat/biography, plan/review and execution. Add new hot stores there and their growth proof here together.
 
 | Store / surface | Complete source → interactive projection | Growth and retention proof |
 |---|---|---|
-| Chat and biography | `logs/chat.jsonl` with its rotated generations and `memory/chronicle/records.jsonl` → the memory view (`memory_view.py`) and archive-aware `chat_history` | Rotation and archive readers carry generation/gap coverage; pages and parts compress the horizon, never delete it; the journal warns at `CHRONICLE_JOURNAL_WARN_BYTES` |
+| Chat and biography | `state/dialog.sqlite` (`dialogue_store.py`; the frozen archive imported once) and `memory/chronicle/records.jsonl` → the memory view (`memory_view.py`) and `chat_history` | Reads cost the page, never another room's history; import coverage is disclosed; pages and parts compress the horizon, never delete it; size appears in the storage count |
 | Plan/review evidence | ARCHITECTURE §10.1, "Plan/review authority" | Source and retention rules live in that row |
-| Skill-review root tasks | Per-skill `state/skills/<name>/review_history.jsonl`; `skill_review_runner._append_terminal_history` projects terminal identities to `state/skill_review_root_tasks.jsonl` → `skill_readiness._skill_names_from_review_history` reads a bounded newest-first suffix | Append-only and idempotent by root/task/outcome identity; warns at `SKILL_REVIEW_ROOT_TASKS_WARN_BYTES` |
+| Skill-review root tasks | Per-skill `state/skills/<name>/review_history.jsonl`; `skill_review_runner._append_terminal_history` projects terminal identities to `state/skill_review_root_tasks.jsonl` → `skill_readiness._skill_names_from_review_history` reads a bounded newest-first suffix | Append-only and idempotent by root/task/outcome identity; size appears under App state |
 | Task/project execution | ARCHITECTURE §10.1, "Execution evidence" | Promotion and retention rules live in that row |
 
 ### Invariant: Continuation authority and bounded role projections
@@ -167,14 +166,15 @@ defensive projection of a predecessor's authority, never a raw head/tail slice, 
 summary or a canonical-result mutation (ARCHITECTURE §1 "CLI / Headless Boundary"); the
 optional exact read is `get_task_result(include_authority=True)`.
 
-The root startup injection is a bounded envelope, not a body copy, from the one producer
-`contracts.task_contract.bounded_continuation_envelope`: each field is whole-or-pointer
-under its serialized budget (previews carry `full_chars` and a `source_ref`;
-`previous_task_id` keeps the chain walkable), durable `task_results` bodies stay the SSOT,
-and no hop cap exists: depth belongs to the mind, the floor only keeps bodies off the wire.
-Children and external work orders receive the pure, idempotent brief
-`main_context_authority.project_helper_predecessor_authority`; a brief never stands in
-for the omitted evidence. Enforcement: `tests/test_continuation_context_authority.py`.
+Every predecessor consumer (the successor's start, children, external work orders) gets
+the same pure, idempotent brief `main_context_authority.project_helper_predecessor_authority`
+of the one envelope producer `contracts.task_contract.bounded_continuation_envelope` (fields
+whole-or-pointer under the serialized budget; previews carry `full_chars` and a
+`source_ref`). Durable `task_results` bodies stay the SSOT; the brief names each omitted
+field and size and never stands in for it. No hop cap, no chain walk: a successor reads its
+predecessor through `get_task_result(include_authority=True)`, and the predecessor mind's
+notes follow the assignment as one foldable row. Enforcement:
+`tests/test_continuation_context_authority.py`, `tests/test_helper_predecessor_history.py`.
 
 ### Invariant: notifications ring for live events only
 

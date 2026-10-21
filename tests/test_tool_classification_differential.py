@@ -38,6 +38,7 @@ from tests.tool_classification_corpus import (
     harvest_producers,
     typed_result,
 )
+from tests.test_skill_install_checks import registry_release  # noqa: F401  (fixtures)
 
 GOLDEN_PATH = pathlib.Path(__file__).resolve().parent / "fixtures" / "legacy_tool_classification_0f715831.json"
 
@@ -270,7 +271,6 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     "shape:followup_objective_required": Delta(False, "ok", True, "argument_error", "A.22", "an empty objective scheduled nothing"),
     "shape:followup_text_too_long": Delta(False, "ok", True, "argument_error", "A.22", "an over-limit objective or context is refused whole — never truncated, never scheduled"),
     "shape:followup_data_root_unresolved": Delta(False, "ok", True, "error", "A.22", "a drive root that could not be resolved wrote no record"),
-    "shape:followup_cap_reached": Delta(False, "ok", True, "resource_constraint_blocked", "A.22", "a follow-up beyond the per-task cap was never registered; the cap is the constraint"),
     "shape:followup_persist_failed": Delta(False, "ok", True, "error", "A.22", "a follow-up the table refused to store does not exist"),
     # A.23 — F6 rolling upstream sync (drift b9f7597f..8d13373b). Upstream's #440
     # fix-forward added both browser markers to its failure-prefix table; the
@@ -414,6 +414,12 @@ CURRENT_PRODUCER_CONTRACTS = {
     # tools/vision.py `_no_image_route`: no configured model could take the image at all,
     # told apart from VLM_NO_VISION_MODEL (every candidate confirmed unable); same VLM family answer.
     "VLM_NO_MODEL": (True, "vlm_error"),
+    # Foreign-install refusals (copied data folder, owner Q3): a parent escalation keeps its
+    # approved plain delta and a forward names the foreign mailbox; both publish ACCESS_BLOCKED.
+    "ESCALATE_UNWRITTEN": (True, "error"),
+    "native:ACCESS_BLOCKED:ESCALATE_UNWRITTEN": (True, "blocked"),
+    "TASK_FOREIGN_INSTALL": (False, "ok"),
+    "native:ACCESS_BLOCKED:TASK_FOREIGN_INSTALL": (True, "blocked"),
     # imagegen.py adds its typed markers after the retired golden source.
     # Same contract shape as the VLM family: rate limit is a soft window
     # (text lane unaffected), unknown outcome and provider failure are errors.
@@ -439,6 +445,9 @@ CURRENT_PRODUCER_CONTRACTS = {
     # An evidence-only investigation's capture is never integrated (#1609): its
     # refusal changes nothing and is its peers' answer, asserted live.
     "INTEGRATE_DELEGATED_INVESTIGATION_EVIDENCE": (True, "integration_blocked"),
+    # #1969: an apply that had to prepare the capture returns it for inspection;
+    # nothing is applied, recorded or released, so it is its peers' answer.
+    "INTEGRATE_DELEGATED_INSPECT_CAPTURE": (True, "integration_blocked"),
     # A reject request cannot undo direct effects already in the folder.
     # The refusal belongs to this disposition, not to the earlier write.
     "INTEGRATE_DIRECTORY_ALREADY_APPLIED": (True, "integration_blocked"),
@@ -506,6 +515,25 @@ CURRENT_PRODUCER_CONTRACTS = {
     "SEARCH_NOT_FOUND": (False, "ok"),
     "FILE_NOT_FOUND": (False, "ok"),
     "native:LEGACY_WARNING:FILE_NOT_FOUND": (False, "ok"),
+    # Skills v4 sources are new producers, absent from the retired oracle. Plain
+    # *_ERROR markers are legacy errors; *_REFUSED markers are legacy warnings.
+    # The live tools publish argument errors or host failures explicitly, including
+    # bad-check arguments returned by the installer. Keep the old golden intact.
+    "SKILL_INSTALL_ERROR": (True, "error"),
+    "SKILL_INSTALL_REFUSED": (False, "ok"),
+    "SKILL_SOURCES_ERROR": (True, "error"),
+    "SKILL_SOURCES_REFUSED": (False, "ok"),
+    "SKILL_UPDATE_ERROR": (True, "error"),
+    "SKILL_UPDATE_REFUSED": (False, "ok"),
+    "native:TOOL_ARG_ERROR:SKILL_INSTALL_ERROR": (True, "argument_error"),
+    "native:TOOL_ARG_ERROR:SKILL_INSTALL_REFUSED": (True, "argument_error"),
+    "native:TOOL_ARG_ERROR:SKILL_SOURCES_ERROR": (True, "argument_error"),
+    "native:TOOL_ARG_ERROR:SKILL_UPDATE_ERROR": (True, "argument_error"),
+    "native:TOOL_ARG_ERROR:SKILL_UPDATE_REFUSED": (True, "argument_error"),
+    "native:TOOL_ERROR:SKILL_INSTALL_REFUSED": (True, "error"),
+    "native:TOOL_ERROR:SKILL_SOURCES_ERROR": (True, "error"),
+    "native:TOOL_ERROR:SKILL_SOURCES_REFUSED": (True, "error"),
+    "native:TOOL_ERROR:SKILL_UPDATE_REFUSED": (True, "error"),
     # Owner decision (PR #1636): an exact edit that leaves .py/.json unparsable is
     # applied and reported, never refused; the warning is a successful call.
     "SYNTAX_WARNING": (False, "ok"),
@@ -526,6 +554,44 @@ def test_current_producer_contracts_have_explicit_live_answers(subject, detail):
     identifier = subject.rsplit(":", 1)[-1]
     case = Case("current:" + subject, subject, "read_file", "⚠️ " + identifier + detail, code)
     assert _live_answer(case) == CURRENT_PRODUCER_CONTRACTS[subject]
+
+
+@pytest.mark.parametrize("tool", ["skill_install", "skill_update"])
+@pytest.mark.parametrize("failure", ["staged_hash", "landing", "bad_check", "empty_notes"])
+def test_registry_failures_keep_the_current_producer_contract(registry_release, monkeypatch, tool, failure):  # noqa: F811
+    from ouroboros.skill_install_record import read_install_record
+    from ouroboros.tools.registry import ToolContext
+    from tests.test_skill_source_tools import _typed_call
+
+    drive, storage, registry = registry_release
+    registry["latest"] = "2.0.0"
+    if tool == "skill_install":
+        drive = drive.parent / "fresh-install"
+    previous = read_install_record(drive, "demo")
+
+    def fail(*args, **kwargs):
+        raise OSError("injected registry disk failure")
+
+    arguments = {"id": "clawhub/demo", "reason": "r"} if tool == "skill_install" else {
+        "name": "demo", "mode": "replace"}
+    bad_arguments = failure in {"bad_check", "empty_notes"}
+    if bad_arguments:
+        arguments.update(check="unknown" if failure == "bad_check" else "self", check_notes="")
+    else:
+        monkeypatch.setattr(storage, "_registry_install_record" if failure == "staged_hash"
+                            else "_land_staged_into_data_plane", fail)
+    result = _typed_call(tool, ToolContext(repo_dir=drive.parent, drive_root=drive), **arguments)
+    expected_code = "TOOL_ARG_ERROR" if bad_arguments else "TOOL_ERROR"
+    assert (result.status, result.code) == ("error", expected_code)
+    if bad_arguments:
+        assert '"code": "bad_check"' in result.text
+    else:
+        assert "injected registry disk failure" in result.text
+    is_error = _typed_execution_failure(True, result)
+    actual = (is_error, _typed_result_metadata(tool, result.text, is_error, result)["status"])
+    assert actual == CURRENT_PRODUCER_CONTRACTS[f"native:{expected_code}:{tool.upper()}_REFUSED"]
+    current = read_install_record(drive, "demo")
+    assert (current or {}).get("release") == (previous or {}).get("release")
 
 
 def test_spent_execution_budget_publishes_the_actual_scheduling_refusal(tmp_path, monkeypatch):

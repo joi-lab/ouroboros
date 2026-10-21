@@ -61,9 +61,9 @@ LIVE_ROOMS = ("none", "lines", "lines_with_words")
 MARKS = ("all", "room_and_global", "none")
 LEGACY_FILE = "memory/dialogue_blocks.json"
 # A task's typed host facts its lane-2 line names by type and address, never by text or JSON:
-# the late review the owner did not see, a failed or uncertain send, a cancel receipt (it may
-# carry an unreviewed model draft), a custody notice and a terminal incident (the old passive
-# view showed each of them).
+# the late review the owner did not see (old task-acceptance rows only; nothing writes them
+# now), a failed or uncertain send, a cancel receipt (it may carry an unreviewed model draft),
+# a custody notice and a terminal incident (the old passive view showed each of them).
 TYPED_HOST_FACTS: Mapping[str, str] = MappingProxyType({
     "acceptance_late_settlement": "late review evidence", "presence_delivery": "delivery",
     "cancel_receipt": "cancel receipt", "custody_notice": "custody notice", "terminal_incident": "terminal incident"})
@@ -433,30 +433,13 @@ Entry = Tuple[Dict[str, Any], Dict[str, Any], int]
 
 
 def _row_texts(root: pathlib.Path, entries: List[Entry]) -> Dict[str, Dict[str, Any]]:
-    """``row_sha256 -> row`` read by address: each hinted generation once, a missed hint by search."""
-    wanted: Dict[str, Dict[int, str]] = {}
-    for address, _meta, _pos in entries:
-        hint = _mapping(address.get("hint"))
-        if type(hint.get("line")) is int:
-            wanted.setdefault(str(hint.get("gen") or ""), {})[hint["line"]] = address["row_sha256"]
-    paths = {sig: path for path, sig in chat_chain.generation_signatures(root)}
-    rows: Dict[str, Dict[str, Any]] = {}
-    for gen, lines, last in ((gen, lines, max(lines)) for gen, lines in wanted.items()):  # max once, not per line
-        if gen not in paths:
-            continue
-        with paths[gen].open("rb") as handle:
-            for number, raw in enumerate(handle, 1):
-                sha = lines.get(number)
-                row = chat_chain._decoded(raw) if sha else None
-                if row is not None and chat_chain.source_row_id(row) == sha:
-                    rows[sha] = row
-                if number >= last:
-                    break
+    """Read exactly the selected row identities from the dialogue store."""
+    rows = {}
     for address, _meta, _pos in entries:
         if address["row_sha256"] not in rows:
-            found, _status = chat_chain.resolve_row(root, address)
-            if found is not None:
-                rows[address["row_sha256"]] = found
+            row, _status = chat_chain.resolve_row(root, address)
+            if row is not None:
+                rows[address["row_sha256"]] = row
     return rows
 
 

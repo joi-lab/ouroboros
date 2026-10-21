@@ -74,7 +74,9 @@ def test_manager_event_bus_accepts_real_spawn_child_after_generation_setup(
     child = ctx.Process(target=_child_put, args=(queue, {"type": "probe", "value": 7}))
     try:
         child.start()
-        child.join(10)
+        # A spawn child starts an interpreter and imports this module and the supervisor before it
+        # puts: seconds on an idle machine, over ten on a loaded Windows runner. A transport bound only.
+        child.join(60)
         assert child.exitcode == 0
         assert queue.get(timeout=2) == {"type": "probe", "value": 7}
         ledger = [

@@ -505,7 +505,18 @@ def finalize_contributor_outcome(
     Nothing about WHICH files the proposal touches is consulted: the lane always
     executes the installed body's review flow and rules, never the proposal's
     copy (D31), so there is no per-proposal trust downgrade left to apply.
+
+    Drift fails an otherwise-passing run closed. A run that is already blocked
+    keeps its own cause, message and exit code as the headline — a stop before
+    or during dispatch always leaves seats without receipts, a symptom of that
+    cause — and carries the mismatches beside it (#1568).
     """
+    if mismatches and outcome.get("status") == "blocked" and str(outcome.get("block_reason") or ""):
+        note = (f"{len(mismatches)} execution-receipt mismatch(es) are recorded beside this "
+                "result (execution_receipt_mismatches).")
+        message = str(outcome.get("message") or "")
+        return exit_code or 3, {**outcome, "message": f"{message} {note}" if message else note,
+                                "execution_receipt_mismatches": mismatches}
     if mismatches:
         original_block_reason = str(outcome.get("block_reason") or "")
         original_message = str(outcome.get("message") or "")

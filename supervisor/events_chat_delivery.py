@@ -9,12 +9,18 @@ the live queue and the buffered return.
 
 from __future__ import annotations
 
+import functools
 import logging
+import pathlib
+import threading
 import time
 from collections import deque
+from types import SimpleNamespace
 from typing import Any, Dict
 from ouroboros.utils import utc_now_iso
 from ouroboros.observability import emit_finalization_timing, timed_phase
+from ouroboros.store import acquisition_budget
+from ouroboros._usage_wait import ACQUISITION_SLICE_SEC
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +39,15 @@ from ouroboros.subagent_messages import delegated_activity_meta, executor_observ
 
 
 HOST_NARRATION = "host_narration"
+
+
+def _on_consumer(handler):
+    """A consumer handler writes under the acquisition slice; the shared writers keep callers' waits."""
+    @functools.wraps(handler)
+    def run(evt: Dict[str, Any], ctx: Any) -> Any:
+        with acquisition_budget(ACQUISITION_SLICE_SEC):
+            return handler(evt, ctx)
+    return run
 
 
 def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
@@ -118,37 +133,101 @@ def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
         pass
 
 
-_DELIVERED_MESSAGE_IDS: "deque[str]" = deque(maxlen=256)
+_DELIVERED_MESSAGE_IDS: deque = deque(maxlen=256)  # (id/token, actual destination facts); text stays in the outbox
+_DELIVERY_LOCK = threading.Lock()
+_ACTIVE_DELIVERIES: set = set()  # physical handler ownership, released only after send/receipt returns
+_DEFERRED_DELIVERIES: set = set()  # wake hints only; payload authority remains terminal_deliveries.json
 
 
-def _register_delivered(ctx: Any, delivery_id: str, emitted: "Dict[str, Any] | None" = None, *, task_id: str = '') -> None:
+def _delivery_key(root: Any, event: dict) -> tuple:
+    return str(pathlib.Path(root).resolve()) if root else "", str(event.get("delivery_id") or "")
+
+
+def _defer_delivery(ctx: Any, event: dict) -> None:
+    from ouroboros.dialogue_retry import request_drain
+    from supervisor.terminal_delivery import register_pending_delivery
+
+    if event.get("delivery_id") and getattr(ctx, "DRIVE_ROOT", None):
+        with _DELIVERY_LOCK:
+            _DEFERRED_DELIVERIES.add(_delivery_key(ctx.DRIVE_ROOT, event))
+        register_pending_delivery(ctx.DRIVE_ROOT, {**event, "delivery_deferred": True})
+        request_drain()
+
+
+def replay_deferred_deliveries(root: Any, rows: list, *, event_queue: Any = None) -> list:
+    """The existing duty continues failed handlers here, never through control events.
+
+    Bus membership protects queued originals. The handler's physical claim also
+    protects direct continuations from duplicate handlers and concurrent sweeps.
+    Volatile hints cover a busy registry write; durable deferred/sent facts survive restart.
+    """
+    from supervisor import message_bus, queue, workers, terminal_delivery as td
+    from supervisor.event_observation import delivery_outstanding
+    from ouroboros.utils import append_jsonl
+
+    event_queue = event_queue if event_queue is not None else workers.get_event_q(create=False)
+    ctx = SimpleNamespace(DRIVE_ROOT=pathlib.Path(root), RUNNING=queue.RUNNING, EVENT_Q=event_queue,
+                          send_with_budget=message_bus.send_with_budget, append_jsonl=append_jsonl)
+    continued = []
+    with _DELIVERY_LOCK:
+        present = {_delivery_key(root, row) for row in rows}
+        _DEFERRED_DELIVERIES.difference_update(
+            key for key in _DEFERRED_DELIVERIES - present if key[0] == str(pathlib.Path(root).resolve()))
+        hinted = set(_DEFERRED_DELIVERIES)
+    for row in rows:
+        key = _delivery_key(root, row)
+        if not row.get("delivery_deferred") and key not in hinted:
+            continue
+        if row.get("transport_failed") and row.get("terminal_projection_token"):
+            row["delivery_deferred"] = False  # canonical Main retains its own transport retry clock
+            with _DELIVERY_LOCK:
+                _DEFERRED_DELIVERIES.discard(key)
+            continue
+        row["delivery_deferred"] = True  # also excludes the hint from ordinary aged queue replay
+        if delivery_outstanding(event_queue, key[1]) is not False:
+            continue
+        if row.get("transport_failed"):
+            if not td._replay_due(row):
+                continue
+            if td._replay_attempts(row) >= td._PENDING_MAX_REPLAYS:
+                td._retire_exhausted(root, [row])
+                continue
+        if _handle_send_message({**row, "type": "send_message", "_delivery_replay": True}, ctx):
+            continued.append(key[1])
+    return continued
+
+
+def _register_delivered(ctx: Any, delivery_id: str, emitted: "Dict[str, Any] | None" = None, *, task_id: str = '') -> bool:
     """Atomically mark one id delivered and clear its pending-outbox row.
 
     ``emitted`` is what THIS handler just sent (exact text, routed chat, task):
     a terminal answer's receipt of its bytes, never inferred elsewhere.
     """
+    if not getattr(ctx, "DRIVE_ROOT", None):
+        return True  # rootless transports retain their historical send-only contract
     try:
-        from supervisor.terminal_delivery import register_delivery
+        from supervisor.terminal_delivery import register_delivery, record_cancel_receipt_delivery
 
-        register_delivery(ctx.DRIVE_ROOT, delivery_id, emitted=emitted)
+        if emitted and emitted.get("system_type") == "cancel_receipt":
+            record_cancel_receipt_delivery(ctx.DRIVE_ROOT, str(emitted.get("task_id") or ""),
+                                           delivery_id, emitted["chat_id"], strict=True)
+        register_delivery(ctx.DRIVE_ROOT, delivery_id, emitted=emitted, strict=True)
         _handoff_delivered_review(ctx, task_id or str((emitted or {}).get('task_id') or ''), delivery_id)
+        with _DELIVERY_LOCK:
+            _DEFERRED_DELIVERIES.discard(_delivery_key(ctx.DRIVE_ROOT, {"delivery_id": delivery_id}))
+        return True
     except Exception:
         log.debug("durable delivery registration failed", exc_info=True)
+        return False
 
 
 def _handoff_delivered_review(ctx: Any, task_id: str, delivery_id: str) -> None:
     """After a delivery is registered (a real send, or a copy suppressed as already delivered):
-    the late-acceptance join, then settle-on-ack — the Done card held behind this very debt
-    follows the answer now (owner Fork 2). ``prepare=False``: readiness is task_done's to mint,
-    so an ack that lands before the row is terminal settles nothing and task_done retries."""
+    settle-on-ack — the Done card held behind this very debt follows the answer now (owner
+    Fork 2). ``prepare=False``: readiness is task_done's to mint, so an ack that lands before
+    the row is terminal settles nothing and task_done settles it."""
     if not task_id:
         return
-    try:
-        from ouroboros.acceptance_late import handoff_delivered_acceptance
-
-        handoff_delivered_acceptance(ctx, task_id, delivery_id)
-    except Exception:
-        log.debug('historical acceptance remains owed before operation handoff', exc_info=True)
     try:
         from ouroboros.terminal_projection import settle_terminal_projection
 
@@ -157,7 +236,25 @@ def _handoff_delivered_review(ctx: Any, task_id: str, delivery_id: str) -> None:
         log.debug("terminal projection settlement after delivery deferred", exc_info=True)
 
 
-def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
+def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> bool:
+    """Own this physical send until it returns; contention leaves the exact outbox debt."""
+    key = _delivery_key(getattr(ctx, "DRIVE_ROOT", None), evt)
+    claimed = bool(key[1]) and not evt.get("terminal_custody_notice")
+    with _DELIVERY_LOCK:
+        if claimed and key in _ACTIVE_DELIVERIES:
+            return False
+        if claimed:
+            _ACTIVE_DELIVERIES.add(key)
+    try:
+        with acquisition_budget(0 if evt.get("is_progress") and not key[1] else ACQUISITION_SLICE_SEC):
+            return _send_message(evt, ctx) is not False
+    finally:
+        if claimed:
+            with _DELIVERY_LOCK:
+                _ACTIVE_DELIVERIES.discard(key)
+
+
+def _send_message(evt: Dict[str, Any], ctx: Any) -> Any:
     try:
         if evt.get("terminal_custody_notice"):
             from supervisor.terminal_delivery import register_pending_delivery
@@ -208,19 +305,47 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             _handle_send_message(row, ctx)
             return
         delivery_id = str(evt.get("delivery_id") or "")
+        if delivery_id and getattr(ctx, "DRIVE_ROOT", None):
+            from supervisor.terminal_delivery import pending_deliveries
+
+            pending = next((row for row in pending_deliveries(ctx.DRIVE_ROOT)
+                            if row["delivery_id"] == delivery_id), {})
+            evt.setdefault("ts", pending.get("ts") or utc_now_iso())
+            emitted = evt.get("emitted") or pending.get("emitted")
+            if (isinstance(emitted, dict)
+                    and emitted.get("terminal_projection_token", "") == str(evt.get("terminal_projection_token") or "")):
+                if not _register_delivered(ctx, delivery_id, emitted=emitted):
+                    _defer_delivery(ctx, {**evt, "emitted": emitted})
+                    return False
+                return True
+        if delivery_id and not evt.get("is_progress"):
+            from supervisor.terminal_delivery import TERMINAL_MESSAGE_ID
+
+            # The task's own answer (or Stop/cascade receipt) is handed off BEFORE this send
+            # and before the worker's slow result store: post-answer work stays alive but no
+            # longer prepares a reply (DESIGN §9, Telegram typing). A copy suppressed below
+            # was handed off by its first copy.
+            match = TERMINAL_MESSAGE_ID.fullmatch(delivery_id)
+            if match is not None and match.group("task") == str(evt.get("task_id") or ""):
+                from supervisor.active_activity import mark_reply_handed_off
+
+                mark_reply_handed_off(match.group("task"), getattr(ctx, "RUNNING", None))
         publication_token = str(evt.get("terminal_projection_token") or "")
         if publication_token:
             from ouroboros.terminal_projection import main_delivery_current
             if not main_delivery_current(ctx.DRIVE_ROOT, str(evt.get("task_id") or ""), publication_token):
                 return
         memory_id = f"{delivery_id}:{publication_token}" if publication_token else delivery_id
-        if delivery_id and memory_id in _DELIVERED_MESSAGE_IDS:
+        remembered = next((facts for identity, facts in _DELIVERED_MESSAGE_IDS if identity == memory_id), None)
+        if delivery_id and remembered is not None:
             log.debug("send_message suppressed as duplicate (delivery_id=%s)", delivery_id)
             # This copy is suppressed because the FIRST one was sent, so record
             # that durably: it also clears any pending-outbox row, which would
             # otherwise be replayed (and suppressed again) until it gave up.
-            _register_delivered(ctx, delivery_id, emitted=evt if publication_token else None,
-                                task_id=str(evt.get('task_id') or ''))
+            emitted = {**evt, **remembered}
+            if not _register_delivered(ctx, delivery_id, emitted=emitted, task_id=str(evt.get('task_id') or '')):
+                _defer_delivery(ctx, {**evt, "emitted": emitted})
+                return False
             return
         if delivery_id:
             try:
@@ -352,11 +477,6 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
 
         # Project lifecycle rows and a root's Main notice pin Main; others keep lineage routing.
         chat_id = int(evt["chat_id"]) if system_type in ROOM_FIXED_ROW_TYPES else bound_chat or int(evt["chat_id"])
-        if system_type == "acceptance_late_settlement":
-            from ouroboros.acceptance_late import supplement_chat
-            retained_chat = supplement_chat(ctx.DRIVE_ROOT, evt)
-            if retained_chat is not None:
-                chat_id = retained_chat
         if delivery_id:
             progress_meta = dict(progress_meta or {})
             progress_meta["delivery_id"] = delivery_id
@@ -377,20 +497,29 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             )
         # Register only after send; a failed first copy must not suppress retry.
         if delivery_id:
-            _DELIVERED_MESSAGE_IDS.append(memory_id)
-            _register_delivered(ctx, delivery_id, emitted={
+            emitted = {
                 "text": str(evt.get("text") or ""), "chat_id": chat_id, "task_id": task_id, "format": fmt,
+                "sent_at": utc_now_iso(),
                 "role": str(evt.get("role") or ""), "system_type": system_type,
                 "terminal_origin": str(evt.get("terminal_origin") or ""),
                 "terminal_projection_token": publication_token,
                 "routing": {"basis": "terminal_sender_bound_project", "intended_chat_id": int(evt["chat_id"]),
-                            "routed_chat_id": chat_id} if bound_chat == chat_id else None})
-            if system_type == "cancel_receipt":
-                from supervisor.terminal_delivery import record_cancel_receipt_delivery
-
-                record_cancel_receipt_delivery(ctx.DRIVE_ROOT, task_id, delivery_id, chat_id)
+                            "routed_chat_id": chat_id} if bound_chat == chat_id else None}
+            _DELIVERED_MESSAGE_IDS.append((memory_id, {k: v for k, v in emitted.items() if k != "text"}))
+            # Retain the physical-send fact before slower capture/ack. A failed registry
+            # write is covered by the existing bounded in-process dedupe until replay.
+            _defer_delivery(ctx, {**evt, "emitted": emitted, "transport_failed": False})
+            if not _register_delivered(ctx, delivery_id, emitted=emitted):
+                return False
         emit_finalization_timing(evt, getattr(ctx, "DRIVE_ROOT", None))
     except Exception as e:
+        from supervisor.message_bus import MessageTransportError
+
+        failed_transport = isinstance(e, MessageTransportError)
+        _defer_delivery(ctx, {**evt, "transport_failed": failed_transport})
+        if failed_transport and evt.get("_delivery_replay") and not evt.get("terminal_projection_token"):
+            from supervisor.terminal_delivery import _bump_replay_attempts
+            _bump_replay_attempts(ctx.DRIVE_ROOT, [str(evt.get("delivery_id") or "")])
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
             {
@@ -398,6 +527,7 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
                 "type": "send_message_event_error", "error": repr(e),
             },
         )
+        return False
 
 
 
@@ -422,6 +552,7 @@ def _log_error(ctx: Any, event_type: str, **fields: Any) -> None:
     )
 
 
+@_on_consumer
 def _handle_send_photo(evt: Dict[str, Any], ctx: Any) -> None:
     """Send a photo to the owner's chat."""
     import base64 as b64mod
@@ -446,6 +577,7 @@ def _handle_send_photo(evt: Dict[str, Any], ctx: Any) -> None:
         _log_error(ctx, "send_photo_event_error", error=repr(e))
 
 
+@_on_consumer
 def _handle_send_video(evt: Dict[str, Any], ctx: Any) -> None:
     """Send a video to the owner's chat."""
     import base64 as b64mod
@@ -467,6 +599,7 @@ def _handle_send_video(evt: Dict[str, Any], ctx: Any) -> None:
         _log_error(ctx, "send_video_event_error", error=repr(e))
 
 
+@_on_consumer
 def _handle_send_document(evt: Dict[str, Any], ctx: Any) -> None:
     """Send an arbitrary document/file to the owner's chat."""
     import base64 as b64mod
@@ -493,6 +626,7 @@ def _handle_send_document(evt: Dict[str, Any], ctx: Any) -> None:
         _log_error(ctx, "send_document_event_error", error=repr(e))
 
 
+@_on_consumer
 def _handle_send_links(evt: Dict[str, Any], ctx: Any) -> None:
     """Send structured HTTP(S) actions to the owner's chat."""
     try:
@@ -512,6 +646,30 @@ def _handle_send_links(evt: Dict[str, Any], ctx: Any) -> None:
         _log_error(ctx, "send_links_event_error", error=repr(e))
 
 
+@_on_consumer
+def _handle_send_card(evt: Dict[str, Any], ctx: Any) -> None:
+    """Publish a stored card: its chat row, or a ``card_state`` update for a replaced body."""
+    from ouroboros.card_store import load_card, record_publication
+    from supervisor.card_delivery import send_card, send_card_state
+
+    try:
+        chat_id = _delivery_chat_id(evt, ctx)
+        record = load_card(ctx.DRIVE_ROOT, evt.get("card_id"))
+        if chat_id is None or record is None:
+            return
+        if evt.get("replace") is True:
+            send_card_state(ctx.bridge, record)
+            return
+        record = record_publication(ctx.DRIVE_ROOT, record["card_id"], chat_id) or record
+        ok, err = send_card(ctx.bridge, record, chat_id, task_id=str(evt.get("task_id") or ""),
+                            interactive=evt.get("interactive") is True)
+        if not ok:
+            _log_error(ctx, "send_card_error", chat_id=chat_id, error=err)
+    except Exception as e:
+        _log_error(ctx, "send_card_event_error", error=repr(e))
+
+
+@_on_consumer
 def _handle_send_quiz(evt: Dict[str, Any], ctx: Any) -> None:
     """Attempt the canonical publication debt with its persisted retry clock."""
     from ouroboros.owner_quiz import claim_quiz_delivery, quiz_states, record_quiz_delivery_failure
@@ -560,6 +718,7 @@ def _handle_send_quiz(evt: Dict[str, Any], ctx: Any) -> None:
         _log_error(ctx, "send_quiz_event_error", error=repr(exc))
 
 
+@_on_consumer
 def _handle_send_quiz_state(evt: Dict[str, Any], ctx: Any) -> None:
     """An explicit closure discharges only after its reason reaches durable history."""
     from ouroboros.gateway.task_decision import _late_answer_destination
@@ -636,6 +795,7 @@ EVENT_HANDLERS = {
     "send_video": _handle_send_video,
     "send_document": _handle_send_document,
     "send_links": _handle_send_links,
+    "send_card": _handle_send_card,
     "send_quiz": _handle_send_quiz,
     "send_quiz_state": _handle_send_quiz_state,
 }

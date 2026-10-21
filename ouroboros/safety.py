@@ -45,6 +45,7 @@ DEFAULT_POLICY = POLICY_CHECK
 TOOL_POLICY: Dict[str, str] = {
     # Typed host maintenance enforces existing actor/resource/Pause authority.
     "inspect_harness": POLICY_SKIP,
+    "inspect_subagent": POLICY_SKIP,
     "maintain_harness": POLICY_SKIP,
     # Read-only / trivially safe.
     "read_file": POLICY_SKIP,
@@ -83,7 +84,6 @@ TOOL_POLICY: Dict[str, str] = {
     "list_github_issues": POLICY_SKIP,
     "get_github_issue": POLICY_SKIP,
     "plan_task": POLICY_SKIP,
-    "task_acceptance_review": POLICY_SKIP,
     "finish_task": POLICY_SKIP,
     "review_status": POLICY_SKIP,
     "get_task_result": POLICY_SKIP,
@@ -187,9 +187,9 @@ TOOL_POLICY: Dict[str, str] = {
 
     # External skill surface.
     "list_skills": POLICY_SKIP,
-    # Review mutates durable skill state but executes no skill subprocess.
+    # Review records a verdict and prepares declared packages for executable skills.
     "skill_review": POLICY_SKIP,
-    # Toggle only writes private enabled.json state.
+    # Enable prepares admitted declared packages, then writes private enabled.json.
     "toggle_skill": POLICY_SKIP,
     # skill_exec enforces fresh executable review/enabled/hash; recheck per call.
     "skill_exec": POLICY_CHECK,

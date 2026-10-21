@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from tests import test_subscription_setup_browser as setup_browser
+from tests._work_projection_shared import work_fields
 
 subscription_ui = setup_browser.subscription_ui
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
@@ -32,7 +33,7 @@ ROOM_FACTS = """(scope) => {
     const trigger = root?.querySelector('.rw-trigger');
     const surface = root?.querySelector('.rw-surface');
     const text = (el) => (el?.textContent || '').replace(/\\s+/g, ' ').trim();
-    const shown = (el) => Boolean(el) && !el.hidden;
+    const shown = (el) => Boolean(el) && !el.hidden, markOf = (el) => (shown(el) ? `${el.dataset.shape} ${el.dataset.hue}` : '');
     const rows = [...(surface?.querySelectorAll('.rw-row') || [])].map((row) => {
         const main = row.querySelector('.rw-main');
         const detail = row.querySelector('.rw-detail');
@@ -47,8 +48,7 @@ ROOM_FACTS = """(scope) => {
             question: Boolean(row.querySelector('.rw-pill-question')), resume: Boolean(row.querySelector('.rw-pill-resume')),
             more: Boolean(row.querySelector('.rw-more')), moreId: row.querySelector('.rw-more')?.dataset.id || '',
             moreLabel: row.querySelector('.rw-more')?.getAttribute('aria-label') || '',
-            dots: shown(row.querySelector('.rw-row-dots')), lead: shown(row.querySelector('.rw-lead')),
-            detail: shown(detail) ? text(detail) : '',
+            mark: markOf(row.querySelector('.status-mark')), detail: shown(detail) ? text(detail) : '',
         };
     });
     const back = root?.querySelector('.rw-back');
@@ -58,10 +58,10 @@ ROOM_FACTS = """(scope) => {
     return {
         exists: Boolean(trigger), tone: trigger?.dataset.tone || '', disabled: Boolean(trigger?.disabled),
         hidden: Boolean(trigger?.hidden), expanded: trigger?.getAttribute('aria-expanded') || '',
-        badge: text(trigger?.querySelector('.status-badge')), amber: trigger?.dataset.wait === '1',
-        markColor: (() => { const dots = trigger?.querySelector('.rw-dots'), one = trigger?.querySelector('.rw-mark');
-            const mark = dots && !dots.hidden ? dots.querySelector('span') : one;
-            return mark ? getComputedStyle(mark).backgroundColor : ''; })(),
+        badge: text(trigger?.querySelector('.status-badge')), mark: markOf(trigger?.querySelector('.status-mark')),
+        markColor: trigger ? getComputedStyle(trigger.querySelector('.status-mark')).color : '', ownerColor: (() => {
+            const probe = document.body.appendChild(document.createElement('i')); probe.style.color = 'var(--mark-owner)';
+            const color = getComputedStyle(probe).color; probe.remove(); return color; })(),
         waitNote: shown(trigger?.querySelector('.rw-sr')), surfaceHidden: surface ? surface.hidden : null,
         rows, groups: [...(surface?.querySelectorAll('.rw-group') || [])].map(text),
         note: shown(note) ? text(note) : '', back: shown(back) ? text(back) : '',
@@ -74,7 +74,24 @@ ROOM_FACTS = """(scope) => {
 
 _SETTLE_FRAMES = "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
 
-# Every frame for a while: one row's word and settledness, its ⋯ and any open shared menu.
+# A row's ⋯: its rectangle at the next click, and a reader of its rectangle now.
+_ANCHOR_AT_CLICK = """(id) => {
+    const more = document.querySelector(`#page-chat .rw-row[data-id="${id}"] .rw-more`);
+    const rect = () => { const r = more.getBoundingClientRect(); return [Math.round(r.top), Math.round(r.bottom)]; };
+    window.__rwAnchor = { now: rect };
+    document.addEventListener('click', () => { window.__rwAnchor.click = rect(); }, { capture: true, once: true });
+}"""
+
+# Rows' rectangles at a press and at the click its release makes.
+_PRESS_RECORDER = """(ids) => {
+    const rects = () => ids.map((id) => { const r = document.querySelector(`#page-chat .rw-row[data-id="${id}"] .rw-main`)
+        .getBoundingClientRect(); return [Math.round(r.top), Math.round(r.bottom)]; });
+    window.__rwPress = {};
+    for (const type of ['pointerdown', 'click'])
+        document.addEventListener(type, () => { window.__rwPress[type] = rects(); }, { capture: true, once: true });
+}"""
+
+# Every frame for a while: one row's word, the reason beside it and settledness, its ⋯ and any open shared menu.
 _FRAME_RECORDER = """([selector, ms]) => {
     window.__rwFrames = [];
     const start = performance.now();
@@ -82,7 +99,8 @@ _FRAME_RECORDER = """([selector, ms]) => {
         const row = document.querySelector(selector);
         const menu = document.querySelector('body > .task-control-menu');
         window.__rwFrames.push({ t: Math.round(performance.now() - start),
-            word: row?.querySelector('.rw-word')?.textContent || '', settled: row?.dataset.settled || '',
+            word: row?.querySelector('.rw-word')?.textContent || '',
+            secondary: row?.querySelector('.rw-secondary')?.textContent || '', settled: row?.dataset.settled || '',
             more: Boolean(row?.querySelector('.rw-more')),
             menu: menu ? [...menu.querySelectorAll('.task-control-item')].map((item) => item.dataset.taskControl) : null });
         if (performance.now() - start < ms) requestAnimationFrame(tick);
@@ -166,6 +184,10 @@ class Transport:
         self.history = history or {1: []}
         self.details = dict(details or {})
         self.projects = list(projects)
+        # What the projection reads besides the census rows: queue facts, stored results and owner fences.
+        self.raw: dict = {}
+        self.results: dict = {}
+        self.fences: dict = {}
         self.hold = set()
         self.held: list = []
         self.sockets: list = []
@@ -190,12 +212,17 @@ class Transport:
         self.sockets.append(ws)
         ws.send(json.dumps({"type": "heartbeat"}))
 
+    def body(self, *, ready=True):
+        """The ``/api/state`` body for the current census, with the server's own work projection of the same rows."""
+        rows = json.loads(json.dumps(self.activities))
+        return {"sha": "room-work-fixture", "supervisor_ready": ready, "active_chat_activities": rows,
+                "active_chat_activities_complete": self.complete, "projects": self.projects,
+                "project_chat_ids": [p["chat_id"] for p in self.projects],
+                **work_fields(rows, self.raw, results=self.results, fences=self.fences, complete=self.complete)}
+
     def _state(self, route):
         self.state_reads += 1
-        route.fulfill(json={"sha": "room-work-fixture", "supervisor_ready": True,
-                            "active_chat_activities": json.loads(json.dumps(self.activities)),
-                            "active_chat_activities_complete": self.complete, "projects": self.projects,
-                            "project_chat_ids": [p["chat_id"] for p in self.projects]})
+        route.fulfill(json=self.body())
 
     def _history(self, route):
         query = parse_qs(urlparse(route.request.url).query)
@@ -388,11 +415,14 @@ def test_main_rows_say_each_census_state_with_its_own_tone_and_controls(room_ui)
             activity("rw-queued", "queued"),
             activity("rw-ask", kind="direct_chat", client_message_id="cm-ask", **waited("q-main")),
         ])
+    # The live work's own focus line (update_focus), which the row shows quieter under its state.
+    focus_text = "Cited pages · 3 of 5 compared · two left"
+    transport.raw["rw-live"] = {"focus": {"text": focus_text, "at": "2026-10-19T09:00:00Z"}}
     page = open_app(room_ui, transport)
     closed = wait_facts(page, "main", lambda f: f["tone"] == "live" and not f["disabled"], "a live control")
-    # Moving work with something waiting keeps its live word and turns its one mark amber, said in words too.
-    assert closed["amber"] and closed["waitNote"], closed
-    assert closed["markColor"] == "rgb(245, 158, 11)", closed  # the same mark is painted amber, not a second dot
+    # Moving work with something waiting keeps its live word; the owner's amber dot takes its mark's place, in words too.
+    assert closed["mark"] == "dot owner" and closed["waitNote"], closed
+    assert closed["markColor"] == closed["ownerColor"], closed  # the one mark is painted in the owner's token
     assert closed["surfaceHidden"] and closed["expanded"] == "false"
     trigger(page).click()
     opened = wait_facts(page, "main", lambda f: len(f["rows"]) == 7 and row(f, "rw-unknown")["name"]
@@ -403,17 +433,24 @@ def test_main_rows_say_each_census_state_with_its_own_tone_and_controls(room_ui)
     assert ids[:2] == ["rw-ask", "rw-live"], "the owner's turn first, then moving work"
     assert ids[-1] == "rw-unknown", "unknown work goes last"
     by = {item["id"]: item for item in opened["rows"]}
+    # Each row says its work's word and the reason beside it, from the server's projection of these rows.
     expect = {
         "rw-live": ("Working", "", "live"),
-        "rw-access": ("Waiting for access", "", "wait"),
-        "rw-pausing": ("Pausing… · owner pause", "", "wait"),
+        # A model wait no one has to act on continues by itself: Waiting, with its reason, and nothing amber.
+        "rw-access": ("Waiting", "Waiting for the model to become available", "held"),
+        # A Pause still settling: neutral ink. Its press declared nobody (this transport records no author), so its
+        # line names nobody either; the word never carries a who.
+        "rw-pausing": ("Pausing…", "", "held"),
         "rw-failfin": ("Failed", "Finalizing…", "failed"),
         "rw-unknown": ("Activity unconfirmed", "", "unknown"),
-        "rw-queued": ("Queued", "", "queued"),
+        "rw-queued": ("Queued", "Waiting for a free worker", "queued"),
         "rw-ask": ("Waiting for your answer", "", "wait"),
     }
     for task_id, (word, secondary, tone) in expect.items():
         assert (by[task_id]["word"], by[task_id]["secondary"], by[task_id]["tone"]) == (word, secondary, tone), by[task_id]
+    focus_lines = page.evaluate("""() => Object.fromEntries([...document.querySelectorAll('#page-chat .rw-row')]
+        .map(r => [r.dataset.id, (r.querySelector('.rw-focus:not([hidden])')?.textContent || '').trim()]))""")
+    assert focus_lines["rw-live"] == focus_text and focus_lines["rw-queued"] == "", focus_lines
     # An access wait is not an answer wait: only the waited question offers View question.
     assert [item["id"] for item in opened["rows"] if item["question"]] == ["rw-ask"]
     assert by["rw-ask"]["name"].startswith("Reply to “Please check which evidence"), by["rw-ask"]
@@ -428,8 +465,9 @@ def test_main_rows_say_each_census_state_with_its_own_tone_and_controls(room_ui)
     assert by["rw-unknown"]["state"].startswith("Activity unconfirmed")
     assert page.locator("#page-chat .rw-place").count() == 0
     assert by["rw-queued"]["name"].startswith("Task"), by["rw-queued"]
-    # Three dots are work (moving only for confirmed motion); one dot is a single fact.
-    assert by["rw-live"]["dots"] and by["rw-queued"]["dots"] and not by["rw-access"]["dots"]
+    # One mark per row, its work's shape; an outcome's dot beside its word; the owner's amber dot where a question waits.
+    assert [by[key]["mark"] for key in ("rw-live", "rw-pausing", "rw-queued", "rw-access", "rw-unknown", "rw-failfin",
+            "rw-ask")] == ["moving ink", "moving ink", "still ink", "still ink", "ring ink", "dot failed", "dot owner"], by
     for task_id in ("rw-live", "rw-unknown", "rw-queued", "rw-ask"):
         assert by[task_id]["more"] and by[task_id]["moreId"] == task_id, by[task_id]
 
@@ -448,8 +486,15 @@ def test_main_rows_say_each_census_state_with_its_own_tone_and_controls(room_ui)
 
     # A card-less row asks the room's history on an explicit press, never a hover, and says what it found:
     # here the saved history holds no message of it, so it opens its details (finished work included later).
+    # The press comes while the long row above holds keyboard focus and its whole name, and blurs it. Nothing may
+    # move under the pointer: a fold at mouse-down moved the pressed row up from under it (36 px with wider fonts)
+    # and the click landed on the list. A press folds nothing.
+    page.evaluate(_PRESS_RECORDER, ["rw-live", "rw-unknown"])
     row_main(page, "rw-unknown").click()
     detail = wait_facts(page, "main", lambda f: "No message" in row(f, "rw-unknown")["detail"], "an unloaded row's lookup")
+    press = page.evaluate("() => window.__rwPress")
+    assert press["pointerdown"] == press["click"], press
+    assert row(detail, "rw-live")["reading"] == row(focused, "rw-live")["reading"], "a press leaves the long row as it was"
     assert transport.around_reads == ["task:rw-unknown"]
     assert row(detail, "rw-unknown")["expanded"] == "true" and row(detail, "rw-unknown")["open"]
     assert row(detail, "rw-unknown")["detail"].startswith("WhereNo message yet.")
@@ -458,6 +503,35 @@ def test_main_rows_say_each_census_state_with_its_own_tone_and_controls(room_ui)
     assert row(detail, "rw-unknown")["detail"].endswith("WhatA task"), "label and words (textContent joins them)"
     assert not detail["surfaceHidden"]
     assert transport.decision_posts() == [] and transport.posts == []
+    if room_ui["engine"] == "chromium":  # keyboard reading needs :focus-visible, engine-specific after a focus()
+        # Keyboard focus reading another row folds the long one; the list never holds two grown names.
+        page.keyboard.press("ArrowUp")
+        moved = wait_facts(page, "main", lambda f: f["active"]["row"] not in ("rw-unknown", "rw-live"),
+                           "keyboard focus on the row above")
+        assert row(moved, "rw-live")["reading"] == "0", moved
+        # A ⋯ pressed while a name is grown opens its menu on a button that stays where it was pressed.
+        row_main(page, "rw-ask").focus()
+        page.keyboard.press("ArrowDown")
+        wait_facts(page, "main", lambda f: row(f, "rw-live")["reading"] == "1", "the long row grown again")
+        page.evaluate(_ANCHOR_AT_CLICK, "rw-unknown")
+        page.locator("#page-chat .rw-row[data-id='rw-unknown'] .rw-more").click()
+        menu = page.locator("body > .task-control-menu")
+        menu.wait_for(state="visible")
+        page.evaluate(_SETTLE_FRAMES)
+        anchor = page.evaluate("() => ({ click: window.__rwAnchor.click, now: window.__rwAnchor.now() })")
+        assert anchor["click"] == anchor["now"] and menu.is_visible(), anchor
+        # Pressing the grown row itself near its bottom edge, with that menu still open: the menu closes and hands
+        # focus back to its ⋯ a moment later, inside a press a person holds; the row stays whole until the click
+        # goes to its card.
+        page.evaluate(_PRESS_RECORDER, ["rw-live"])
+        box = row_main(page, "rw-live").bounding_box()
+        page.mouse.move(box["x"] + 12, box["y"] + box["height"] - 4)
+        page.mouse.down()
+        page.wait_for_timeout(150)
+        page.mouse.up()
+        wait_facts(page, "main", lambda f: f["surfaceHidden"], "the grown row's press went to its card")
+        press = page.evaluate("() => window.__rwPress")
+        assert press["pointerdown"] == press["click"], press
     evidence("main-states-console", transport.console)
 
 
@@ -496,11 +570,15 @@ def test_controls_follow_the_exact_attempt_partial_census_disconnect_and_finish(
     assert transport.posts[0][1].get("request_id"), transport.posts
     transport.set("rw-live", phase="budget_pausing", pause_cause="owner")
     transport.refresh()
-    wait_facts(page, "main", lambda f: row(f, "rw-live")["word"] == "Pausing… · owner pause", "Pausing in place")
+    # The row says the work's word; a press this transport records no author for names nobody beside it, and a
+    # Pause is never amber.
+    wait_facts(page, "main", lambda f: (row(f, "rw-live")["word"], row(f, "rw-live")["secondary"]) == ("Pausing…", ""),
+               "Pausing in place")
     transport.set("rw-live", phase="budget_paused")
     transport.refresh()
     paused = wait_facts(page, "main", lambda f: row(f, "rw-live")["resume"], "Resume on the paused row")
-    assert row(paused, "rw-live")["word"] == "Paused · owner pause" and row(paused, "rw-live")["tone"] == "wait"
+    assert (row(paused, "rw-live")["word"], row(paused, "rw-live")["secondary"], row(paused, "rw-live")["tone"]) == (
+        "Paused", "", "held"), row(paused, "rw-live")
     page.locator("#page-chat .rw-row[data-id='rw-live'] .rw-pill-resume").click()
     page.wait_for_function("() => [...document.querySelectorAll('.toast')].some(t => t.textContent.includes('Resuming'))")
     assert [path for path, _ in transport.posts] == ["/api/tasks/rw-live/pause", "/api/tasks/rw-live/resume"]
@@ -574,9 +652,8 @@ FULL_MENU = ["finalize", "hurry", "pause", "stop_now"]
 @pytest.mark.parametrize("ending", ["finished", "offline"])
 @pytest.mark.parametrize("subject", ["card", "cardless"])
 def test_open_task_menu_never_outlives_its_census_state(room_ui, subject, ending):
-    """The shared menu opened from a row is for that row's state when it opened. Pausing keeps the same
-    actions; Paused offers only Stop now (Resume is the row's own button); a finished or offline row
-    offers nothing. A stale menu must go (or match) by the frame the row says its new state, and a
+    """The shared menu opened from a row is for that row's state when it opened. Pausing and Paused offer
+    only Stop now (Resume is the row's own button); a finished or offline row offers nothing. A stale menu must go (or match) by the frame the row says its new state, and a
     stale Pause or Hurry pressed in it must post nothing (the menu calls them before any caller guard)."""
     task_id = "rw-live" if subject == "card" else "rw-far"
     history = {1: [*reading(6), *([progress("rw-live", "Comparing the cited pages.", 30,
@@ -632,12 +709,16 @@ def test_open_task_menu_never_outlives_its_census_state(room_ui, subject, ending
 
     try:
         assert open_menu() == FULL_MENU
-        first, last = transition("pausing", lambda f: f["word"] == "Pausing… · owner pause",
+        # Pausing: the work's controls are Stop alone, so the menu opened for Working must go or match.
+        first, last = transition("pausing", lambda f: (f["word"], f["secondary"]) == ("Pausing…", ""),
                                  census(phase="budget_pausing", pause_cause="owner"))
-        if last["menu"] not in (None, FULL_MENU):
-            problems.append(f"pausing: menu {last['menu']}")
+        if first["menu"] not in (None, ["stop_now"]) or last["menu"] not in (None, ["stop_now"]):
+            problems.append(f"pausing: a stale menu outlived Working → Pausing (first frame {first['menu']}, "
+                            f"after {last['t']} ms {last['menu']})")
+        press_stale("pausing", facts(page)["menu"])
         # Paused: a fresh open offers only Stop now (Resume is the row's own button); the old menu must go or match.
-        first, last = transition("paused", lambda f: f["word"] == "Paused · owner pause", census(phase="budget_paused"))
+        first, last = transition("paused", lambda f: (f["word"], f["secondary"]) == ("Paused", ""),
+                                 census(phase="budget_paused"))
         if first["menu"] not in (None, ["stop_now"]) or last["menu"] not in (None, ["stop_now"]):
             problems.append(f"paused: a stale menu outlived Pausing → Paused (first frame {first['menu']}, "
                             f"after {last['t']} ms {last['menu']})")
@@ -895,7 +976,8 @@ def test_project_shade_hold_outside_press_switch_and_latest_root(room_ui):
                        and row(f, "p-hold")["name"] == "Verify the archive folder", "the held row")
     evidence("project-shade", {"closed": closed, "open": shade})
     held = row(shade, "p-hold")
-    assert (held["word"], held["tone"]) == ("Waiting for Project access", "wait"), held
+    # The room waits for the host's verification: the row says Waiting, and the hold's own label beside it.
+    assert (held["word"], held["secondary"], held["tone"]) == ("Waiting", "Waiting for Project access", "held"), held
     settle_unfold(page, "project")
     geometry = page.evaluate("""() => { const box = s => document.querySelector(s).getBoundingClientRect();
         const bar = box('#project-panel .project-panel-bar'), shade = box('#project-panel .rw-shade'), panel = box('#project-panel');
@@ -993,11 +1075,12 @@ def test_keyboard_focus_escape_and_independent_controls(room_ui):
     bubble.locator(".chat-message-copy").click()
     assert page.evaluate("() => window.__copied") == ["The copyable answer stays independent of the list."]
     assert facts(page)["surfaceHidden"]
-    # Files: the composer's attach opens its chooser with the list open.
+    # Files: the composer's "+" → Attach file opens its chooser with the list open.
     control.click()
     wait_facts(page, "main", lambda f: not f["surfaceHidden"], "open for Files")
     with page.expect_file_chooser(timeout=5_000):
-        page.locator("#chat-attach").click()
+        page.locator("#chat-plus").click()
+        page.locator(".chat-plus-menu [data-plus-item='attach']").click()
     assert facts(page)["surfaceHidden"]
     assert transport.posts == []
 
@@ -1023,7 +1106,7 @@ _BAR_GEOMETRY = """(scope) => {
         const r = el.getBoundingClientRect(); const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
         return Boolean(hit) && (hit === el || el.contains(hit)); });
     return { bar: box(bar), title: box(title), trigger: box(trigger), neighbours, word: badge.textContent.trim(),
-             clipped: badge.scrollWidth > badge.clientWidth + 0.5, amber: trigger.dataset.wait === '1',
+             clipped: badge.scrollWidth > badge.clientWidth + 0.5, note: !trigger.querySelector('.rw-sr').hidden,
              shade: shade && !shade.hidden ? box(shade) : null, shadeAlpha: shade ? alpha(getComputedStyle(shade).backgroundColor) : null,
              reachable, vw: innerWidth, vh: innerHeight, overflow: document.documentElement.scrollWidth - innerWidth };
 }"""
@@ -1053,17 +1136,16 @@ def header_states(room):
                                                              **waited("q-geo2"), **where)]),
     ]
     if room == "project":
-        # The host's longest current hold label (ouroboros/project_admission.py) stays whole in a Project's bar.
+        # A Project hold (ouroboros/project_admission.py): the room waits; the hold's label is its row's reason.
         states.append(("hold", [activity("g-hold", "queued", project_admission_hold={
             "label": "Waiting for task scope verification"}, **where)]))
     return states
 
 
-# The words the producer gives each named state (the access wait has no card here, so it may read as work).
-HEADER_WORDS = {"idle": "Online", "live": "Working", "queued": "Queued", "finalizing": "Finalizing…",
-                "answer": "Waiting for your answer", "pausing": "Pausing…", "paused": "Paused · owner pause",
-                "unknown": "Activity unconfirmed", "live+answer": "Working",
-                "hold": "Waiting for task scope verification"}
+# The room words the header says for each named state; a reason is said on the room's rows, never here.
+HEADER_WORDS = {"idle": "Online", "live": "Working", "queued": "Queued", "finalizing": "Finalizing…", "access": "Waiting",
+                "answer": "Waiting for your answer", "pausing": "Pausing…", "paused": "Paused",
+                "unknown": "Activity unconfirmed", "live+answer": "Working", "hold": "Waiting"}
 
 
 def settle_unfold(page, room):
@@ -1116,12 +1198,12 @@ def assert_word_never_moves_the_bar(page, transport, room, tag):
         assert not moved, ("a word never moves a neighbouring control", name, sample["word"], moved)
         assert not sample["clipped"], ("the status word stays whole; the title ellipsizes first", name, sample)
         assert sample["overflow"] <= 0, (name, sample)
-    # The amber mark says only that a question waits beside another word, never beside its own.
-    assert samples["live+answer"]["amber"] and samples["live+answer"]["word"] == samples["live"]["word"], samples
-    assert samples["answer"]["word"] == "Waiting for your answer" and not samples["answer"]["amber"], samples["answer"]
-    assert not any(sample["amber"] for name, sample in samples.items() if name != "live+answer"), samples
+    # What waits for the owner is said in words beside another word only, never beside its own (the marks of every
+    # state: tests/test_status_marks_room_browser.py).
+    assert [name for name, sample in samples.items() if sample["note"]] == ["live+answer"], samples
+    assert samples["live+answer"]["word"] == samples["live"]["word"], samples
     if room == "project":
-        assert samples["hold"]["word"] == "Waiting for task scope verification", samples["hold"]
+        assert samples["hold"]["word"] == "Waiting", samples["hold"]
 
 
 @pytest.mark.parametrize("width,height", [(390, 844), (1040, 720), (1440, 860)])

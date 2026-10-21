@@ -1,6 +1,6 @@
 """Model- and owner-facing texts name the review panel and the review pool (V-D4-07).
 
-Commit, plan, skill and task-acceptance review all run on one review pool, so "triad + scope", a
+Commit, plan, skill and result review all run on one review pool, so "triad + scope", a
 "reviewer-slot configuration" or a "configured triad row" describes lanes that no longer exist.
 Comments are out of scope.
 """
@@ -23,8 +23,11 @@ def test_the_gates_malformed_pool_refusals_name_the_review_pool():
     from pathlib import Path
 
     source = Path(REPO, "ouroboros/tools/review.py").read_text(encoding="utf-8")
-    assert source.count("invalid review pool configuration") == 3
+    assert source.count("invalid review pool configuration") == 2
     assert "reviewer-slot configuration" not in source
+    # The result review reads the same pool and refuses a malformed one in the same words.
+    result = Path(REPO, "ouroboros/tools/review_result.py").read_text(encoding="utf-8")
+    assert result.count("invalid review pool configuration") == 1
 
 
 def test_review_status_explains_the_pool_gate_codes_in_the_gates_words():
@@ -49,4 +52,15 @@ def test_review_status_explains_the_pool_gate_codes_in_the_gates_words():
         assert f"({code})" in rendered and phrase in rendered and "NOT_PERFORMED" in rendered
         # The bare token is never the whole explanation.
         assert rendered.count(code) == 1
-    assert set(NOT_PERFORMED_PHRASES) == {"coupling_not_performed", "change_unanswered", "review_late_result_pending"}
+    assert set(NOT_PERFORMED_PHRASES) == {"coupling_not_performed", "change_unanswered", "review_late_result_pending",
+                                          "result_unanswered"}
+    result = _review_status_message({
+        "selected_attempt": SimpleNamespace(status="blocked", block_reason="result_unanswered", tool_name="review_result"),
+        "effective_status": "stale", "open_debts": []})
+    assert result.startswith("Last result review BLOCKED (result_unanswered)"), result
+    for code in ("critical_findings", "review_late_result_pending"):  # a result is delivered again, never committed
+        rendered = _review_status_message({
+            "selected_attempt": SimpleNamespace(status="blocked", block_reason=code, tool_name="review_result"),
+            "effective_status": "stale", "open_debts": []})
+        assert "commit" not in rendered.split("|")[0].replace("Last result review", ""), rendered
+        assert "commit" in line(code).split("|")[0].replace("Last commit", ""), line(code)

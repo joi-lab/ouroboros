@@ -1,7 +1,8 @@
 # tests/test_skill_smoke_official.py — official OuroborosHub skill install smoke.
 #
-# The `skill_smoke` lane: real-network install of the nine pinned official
-# skills + preflight/deps/command probes + the Tier 6 review→grant→
+# The `skill_smoke` lane: real-network install of the pinned official skills
+# through the hub's git source (one live fetch of the hub repository) +
+# preflight/deps/command probes + the Tier 6 review→grant→
 # enable-persistence flow (CI review step only). Canonical lane description (purpose,
 # triggers, red-means-investigate posture): docs/DEVELOPMENT.md "Pytest marker
 # lanes". No fallback-skip on network failure (owner directive); bounded
@@ -21,7 +22,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import http.client
 import importlib.util
@@ -35,11 +35,10 @@ from typing import Any, Dict
 import pytest
 
 from ouroboros import config
-from ouroboros.config import DATA_DIR, get_ouroboroshub_skills_dir
+from ouroboros.config import DATA_DIR
 from ouroboros.contracts.skill_manifest import parse_skill_manifest_text
 from ouroboros.extension_isolated_deps import isolated_site_dirs_scope
-from ouroboros.gateway.marketplace import _apply_hub_review_and_deps
-from ouroboros.marketplace import ouroboroshub
+from ouroboros.marketplace.install import _run_skill_review
 from ouroboros.marketplace.install_specs import install_specs_hash
 from ouroboros.marketplace.isolated_deps import (
     install_isolated_dependencies,
@@ -47,6 +46,7 @@ from ouroboros.marketplace.isolated_deps import (
     read_deps_state,
 )
 from ouroboros.review_records import review_slot_awaiting, review_slot_unresolved
+from ouroboros.settings_defaults import SETTINGS_DEFAULTS
 from ouroboros.skill_dependencies import auto_install_specs_for_skill
 from ouroboros.skill_loader import (
     _sanitize_skill_name,
@@ -61,6 +61,7 @@ from ouroboros.skill_review_history import load_history
 from ouroboros.skill_review_status import normalize_skill_review_status
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tools.skill_preflight import _handle_skill_preflight
+from tests.conftest import _THREAD_LEAK_GRACE_SEC
 from tests.review_pool_rosters import pool_roster, pool_seat, set_review_pool
 
 pytestmark = pytest.mark.skill_smoke
@@ -87,24 +88,12 @@ DEPS_IMPORT_CHECK = {
 
 _TRANSIENT_RETRY_SLEEP_SEC = 10
 
-# Deterministic install() failure markers — never retried. Each literal is
-# owned by ouroboros/marketplace/ouroboroshub.py (sha mismatch :210, missing
-# sha :205, unsafe/opaque paths in _safe_rel, staging escape :215, missing
-# SKILL.md :219, unknown slug :265, already-installed :287); a rewording there
-# must update this tuple or the affected error gains one wasted retry.
-_DETERMINISTIC_INSTALL_ERRORS = (
-    "sha256 mismatch",
-    "missing sha256",
-    "unsafe catalog file path",
-    "review-opaque dependency directory",
-    "generated or binary artifact",
-    "escapes staging dir",
-    "did not include SKILL.md",
-    "skill not found",
-    "already installed",
-    "has no files",
-    "is not an object",
-)
+# Deterministic install refusals (SkillInstallError codes) — never retried: a digest
+# mismatch is hub corruption, an unknown or withdrawn entry is a catalog fact.
+_DETERMINISTIC_INSTALL_CODES = frozenset({
+    "digest_mismatch", "not_found", "withdrawn", "no_release", "payload_refused", "payload_unreadable",
+    "name_taken", "update_instead",
+})
 
 # urllib transport errors are OSError subclasses; http.client raises its own
 # transient shapes (IncompleteRead/BadStatusLine) outside that hierarchy.
@@ -133,64 +122,81 @@ def _retry_transient(fn, *, describe: str, attempts: int = 2):
 # ---------------------------------------------------------------------------
 
 
+def _hub_rows():
+    from ouroboros.skill_sources import load_sources
+
+    return [row for row in load_sources() if row["kind"] == "hub"]
+
+
 @pytest.fixture(scope="session")
 def hub_catalog():
-    """Fetch the LIVE catalog exactly once, then serve every install from a cache.
+    """Fetch the LIVE hub repository exactly once through its git source.
 
-    The single real load_catalog() exercises _fetch_bytes + the host allowlist +
-    raw_base_url derivation. The digest/version log line makes a red run
-    reconstructible against the exact catalog revision that was tested.
+    The fetch exercises the real transport (shallow clone, snapshot). The v1
+    ``catalog.json`` the hub keeps for older clients carries per-file hashes,
+    which Tier 1 re-verifies on disk; its digest line makes a red run
+    reconstructible against the exact hub commit that was tested.
     """
-    catalog = _retry_transient(ouroboroshub.load_catalog, describe="load_catalog")
-    digest = hashlib.sha256(
-        json.dumps(catalog, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
+    from ouroboros.skill_source_catalog import refresh_source
+    from ouroboros.skill_source_git import clone_dir
+
+    rows = _hub_rows()
+    assert rows, "no hub source is connected"
+    meta = {}
+    for attempt in (1, 2):
+        meta = refresh_source(DATA_DIR, rows[0])
+        if not meta.get("error"):
+            break
+        print(f"hub fetch attempt {attempt} failed ({meta.get('error')}); retrying once")
+        time.sleep(_TRANSIENT_RETRY_SLEEP_SEC)
+    assert not meta.get("error"), f"hub fetch failed: {meta.get('error')}"
+    catalog = json.loads((clone_dir(DATA_DIR, rows[0]) / "catalog.json").read_text(encoding="utf-8"))
     slugs = {
         str(item.get("slug") or ""): str(item.get("version") or "")
         for item in catalog.get("skills") or []
         if isinstance(item, dict)
     }
-    # "normalized": hashed over the client-parsed dict (incl. the injected
-    # raw_base_url), not the raw catalog.json bytes — do not compare to
-    # `sha256sum catalog.json`.
-    print(f"OuroborosHub normalized-catalog digest sha256={digest}")
+    print(f"OuroborosHub commit={meta.get('commit')}")
     print("catalog versions: " + ", ".join(f"{s}={slugs.get(s, '?')}" for s in OFFICIAL_SKILLS))
     missing = [slug for slug in OFFICIAL_SKILLS if slug not in slugs]
-    assert not missing, f"official catalog is missing expected skills: {missing}"
-
-    patch = pytest.MonkeyPatch()
-    cached = catalog
-
-    def _cached_catalog() -> Dict[str, Any]:
-        return json.loads(json.dumps(cached))
-
-    patch.setattr(ouroboroshub, "load_catalog", _cached_catalog)
-    try:
-        yield cached
-    finally:
-        patch.undo()
+    assert not missing, f"hub catalog is missing expected skills: {missing}"
+    yield catalog
 
 
 @pytest.fixture(scope="session")
 def install_skill(hub_catalog):
-    """Memoizing installer: each slug is installed at most once per session.
+    """Memoizing installer through the shared source lifecycle: each slug at most once per session.
 
-    Only a fully successful atomic install is cached (landing is atomic via
-    land_staged_tree; a failed attempt removes its own staging). A transient
-    failure gets one retry; a sha256 mismatch is deterministic hub corruption
-    and is never retried.
+    The item comes from whichever hub row offers it (Official or Community). A transient fetch failure
+    gets one retry; deterministic refusals (a digest mismatch first) are never retried.
     """
-    results: Dict[str, ouroboroshub.HubInstallResult] = {}
+    from ouroboros.skill_source_install import SkillInstallError, install_item
 
-    def _ensure(slug: str) -> ouroboroshub.HubInstallResult:
+    results: Dict[str, Dict[str, Any]] = {}
+
+    def _install(slug: str) -> Dict[str, Any]:
+        last: Exception | None = None
+        for row in _hub_rows():
+            try:
+                return install_item(DATA_DIR, f"{row['id']}/{slug}", turn_on_when_ready=False)
+            except SkillInstallError as exc:
+                if exc.code != "not_found":
+                    raise
+                last = exc
+        raise AssertionError(f"{slug} is offered by no hub row: {last}")
+
+    def _ensure(slug: str) -> Dict[str, Any]:
         if slug in results:
             return results[slug]
-        result = ouroboroshub.install(slug)
-        if not result.ok and not any(m in result.error for m in _DETERMINISTIC_INSTALL_ERRORS):
-            print(f"install({slug}): non-deterministic failure ({result.error}); retrying once")
+        try:
+            result = _install(slug)
+        except SkillInstallError as exc:
+            if exc.code in _DETERMINISTIC_INSTALL_CODES:
+                raise AssertionError(f"install({slug}) refused: {exc.code}: {exc}") from exc
+            print(f"install({slug}): transient failure ({exc}); retrying once")
             time.sleep(_TRANSIENT_RETRY_SLEEP_SEC)
-            result = ouroboroshub.install(slug)
-        assert result.ok, f"install({slug}) failed: {result.error}"
+            result = _install(slug)
+        assert result["ok"], f"install({slug}) failed: {result}"
         results[slug] = result
         return result
 
@@ -237,7 +243,7 @@ def _catalog_entry(hub_catalog: Dict[str, Any], slug: str) -> Dict[str, Any]:
 
 
 def _skill_dir(slug: str) -> pathlib.Path:
-    return get_ouroboroshub_skills_dir() / _sanitize_skill_name(slug)
+    return DATA_DIR / "skills" / "ouroboroshub" / _sanitize_skill_name(slug)
 
 
 def _load_manifest(slug: str):
@@ -253,10 +259,13 @@ def _load_manifest(slug: str):
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("slug", OFFICIAL_SKILLS)
 def test_install_lands_payload_with_verified_provenance(slug, hub_catalog, install_skill):
+    from ouroboros.skill_identity import is_release_digest
+    from ouroboros.skill_install_record import read_install_record
+
     result = install_skill(slug)
     sanitized = _sanitize_skill_name(slug)
     target = _skill_dir(slug)
-    assert result.target_dir == target and target.is_dir()
+    assert result["name"] == sanitized and target.is_dir()
     assert (target / "SKILL.md").is_file()
 
     entry = _catalog_entry(hub_catalog, slug)
@@ -268,24 +277,25 @@ def test_install_lands_payload_with_verified_provenance(slug, hub_catalog, insta
         actual_sha = hashlib.sha256(on_disk.read_bytes()).hexdigest()
         assert actual_sha == expected_sha, f"{slug}: sha256 mismatch for {rel}"
 
-    provenance = json.loads((target / ".ouroboroshub.json").read_text(encoding="utf-8"))
-    assert provenance["schema_version"] == 1
-    assert provenance["source"] == "ouroboroshub"
-    assert provenance["slug"] == slug
-    assert provenance["sanitized_name"] == sanitized
-    assert provenance["version"] == str(entry.get("version") or "")
-    assert provenance["files"] == entry.get("files")
+    # The install record replaces the payload sidecar: nothing per-install lands in the payload.
+    assert not (target / ".ouroboroshub.json").exists()
+    record = read_install_record(DATA_DIR, sanitized)
+    assert record is not None and record["entry"] == slug
+    assert record["release"]["version"] == str(entry.get("version") or "")
+    assert is_release_digest(record["release"]["digest"]) and record["release"]["commit"]
+    assert record["basis"] in {"trusted", "review"}
+    loaded = find_skill(DATA_DIR, sanitized)
+    declared = auto_install_specs_for_skill(DATA_DIR, loaded)
     if slug in DEPS_SKILLS:
-        specs = provenance.get("install_specs") or {}
-        assert specs.get("auto"), f"{slug}: expected auto install specs in provenance"
+        assert declared, f"{slug}: expected auto install specs declared by its manifest"
     else:
-        assert not (provenance.get("install_specs") or {}).get("auto"), (
+        assert not declared, (
             f"{slug}: unexpected auto install specs — the smoke lane's deps coverage "
-            f"(DEPS_SKILLS) no longer matches the catalog"
+            f"(DEPS_SKILLS) no longer matches the hub"
         )
 
-    staging = get_ouroboroshub_skills_dir() / ".staging"
-    leftovers = [p.name for p in staging.glob("ouroboroshub_skill_*")] if staging.is_dir() else []
+    staging = DATA_DIR / "skills" / "ouroboroshub" / ".staging"
+    leftovers = [p.name for p in staging.iterdir()] if staging.is_dir() else []
     assert not leftovers, f"install left staging directories behind: {leftovers}"
 
 
@@ -529,9 +539,8 @@ def test_backlog_manager_summary_offline(install_skill, tmp_path):
 # Tier 6 as two separate pytest invocations and only the Tier 6 step carries
 # the secret. Missing key = hard red, not a skip (owner directive).
 #
-# Review call goes through the production gateway wrapper
-# `_apply_hub_review_and_deps` (review first, dependency install only after
-# an executable review — the production ordering; auto-grant runs inside
+# Review call follows the production ordering (review first, dependency
+# install only after an executable review; auto-grant runs inside
 # review_skill). Enforcement is pinned to `blocking` so auto-grant can only
 # happen on a clean/warnings verdict — under the production default
 # `advisory` even a `blockers` verdict is executable and would auto-grant
@@ -540,8 +549,17 @@ def test_backlog_manager_summary_offline(install_skill, tmp_path):
 # skill_readiness_for_execution), NOT live extension loading —
 # reconcile_extension is server runtime, consistent with the Tier 5 posture.
 #
-# Cost (measured 2026-07-17, flash x1 low effort): ~$0.29/skill ≈ $1.15 per
-# CI run for the 4-skill subset on one OS; a verdict retry doubles at most.
+# Deadlines are the PRODUCT's own: the review runs with no
+# OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC, so its one native reviewer episode reads
+# the skill in several tool rounds inside the slot window the product resolves
+# (``_REVIEW_WINDOW_SEC``). A narrower test-side window only cut healthy
+# episodes into unsettled, unretryable reds. The test owns the by-design late
+# worker a timed-out slot leaves behind (``owned_review_workers``).
+#
+# Cost (measured 2026-10-17/18, gemini-3.5-flash, one native reviewer at low
+# effort): about $11 per review (the median; single reviews reported from
+# $0.77 to $12.24), so about $33 per CI run for the three skills; retries (the
+# settled one, an outage waited out) add at most two more waves per skill.
 # ---------------------------------------------------------------------------
 
 # Owner-picked subset: a2a (mandated) + duckduckgo (core keyless search;
@@ -552,6 +570,22 @@ def test_backlog_manager_summary_offline(install_skill, tmp_path):
 # token, so that tier is unexercised here.
 REVIEW_SKILLS = ("a2a", "duckduckgo", "perplexity")
 _REVIEW_MODEL = "google/gemini-3.5-flash"
+# The slot window the product resolves for this review: with no explicit
+# OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC and no task deadline, an API reviewer
+# slot's logical window is the shipped LLM transport bound
+# (deadline_utils.review_operation_timeout_sec -> llm_transport_timeout_sec),
+# and a native episode bounds every round's send by what is left of it.
+# review_env removes any override, so this shipped default is what governs.
+_REVIEW_WINDOW_SEC = float(SETTINGS_DEFAULTS["OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC"])
+# Waves one skill's review may send: the first, then the one settled retry or
+# provider outages waited out (_review_with_one_settled_retry).
+_REVIEW_WAVES = 3
+# The test's own outer bound covers the longest legitimate product timeline:
+# each wave settling at its window, and the drain of a late worker whose send
+# runs to that bound (owned_review_workers), plus the outage waits, the catalog
+# install, pack building and the cold a2a dependency install that only follows
+# a passing review. The CI job budget sits above it.
+_REVIEW_TEST_TIMEOUT_SEC = int((_REVIEW_WAVES + 1) * _REVIEW_WINDOW_SEC + 900)
 # Expected auto-granted settings keys per skill (grants are request-keyed,
 # not value-keyed; empty values grant fine and only bite at runtime).
 _REVIEW_EXPECTED_KEYS = {
@@ -559,16 +593,6 @@ _REVIEW_EXPECTED_KEYS = {
     "duckduckgo": set(),
     "perplexity": {"OPENROUTER_API_KEY"},
 }
-
-
-class _ProgressStub:
-    """Duck-typed JobProgressTarget: records progress lines for diagnostics."""
-
-    def __init__(self) -> None:
-        self.lines: list[str] = []
-
-    def set(self, text: str) -> None:
-        self.lines.append(str(text))
 
 
 # Session scope on purpose: session fixtures instantiate before any
@@ -595,12 +619,91 @@ def review_env(monkeypatch, tmp_path):
     set_review_pool(monkeypatch, pool_roster(pool_seat(
         "skill-smoke-reviewer", _REVIEW_MODEL, delivery="native", effort="low")))
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
-    monkeypatch.setenv("OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC", "300")
+    # The product's own deadlines: no test-side review window, and the shipped
+    # transport bound the window and this test's budget derive from.
+    monkeypatch.delenv("OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC", raising=False)
+    monkeypatch.delenv("OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC", raising=False)
     monkeypatch.setenv("OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS", "true")
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", str(_REVIEW_WAVES))  # each wave is a paid cycle
     # get_auto_grant_enabled reads the settings FILE first; point the module
     # at a missing path so the env value above is authoritative (the pattern
     # tests/test_skill_review.py uses).
     monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "missing-settings.json")
+
+
+def active_review_attempts() -> Dict[str, Dict[str, Any]]:
+    """``{attempt key: {"operation_id", "late"}}`` of every reviewer worker review custody holds now.
+
+    ``late``: its caller already took the typed in-flight answer (the slot's window ended, the
+    roster was released early or the author detached), the one kind of worker meant to outlive
+    the review it served.
+    """
+    from ouroboros import review_custody
+
+    with review_custody._ACTIVE_LOCK:
+        return {key: {"operation_id": entry.operation_id,
+                      "late": bool(entry.timed_out or entry.released_early or entry.detached)}
+                for key, entry in review_custody._ACTIVE.items()}
+
+
+def wait_for_review_workers(started_before, bound_sec: float, poll_sec: float = 0.5) -> Dict[str, str]:
+    """Wait until every reviewer worker started after ``started_before`` has retired.
+
+    Review custody retires an attempt from ``_ACTIVE`` in the same worker that
+    publishes its settlement, right before the thread ends (its model-send
+    executor is already shut down), so an empty difference means the workers
+    are finishing. Returns ``{key: operation id}`` of what is still active at
+    ``bound_sec`` (``{}`` once drained).
+    """
+    deadline = time.monotonic() + bound_sec
+    while True:
+        active = {key: row["operation_id"] for key, row in active_review_attempts().items()
+                  if key not in started_before}
+        if not active or time.monotonic() >= deadline:
+            return active
+        time.sleep(poll_sec)
+
+
+# The session thread-leak check's own grace: all an attempt that is not late may take to retire
+# after its review returned.
+_SETTLED_ATTEMPT_GRACE_SEC = _THREAD_LEAK_GRACE_SEC
+
+
+def settle_review_workers(started_before) -> str:
+    """Why reviewer workers started after ``started_before`` are still running, or ``""``.
+
+    Only a late worker is waited for, bounded by the product's own transport bound, which
+    also bounds its send; it exists only when a slot's window ran out mid-call, so its
+    review is unsettled and the test is red anyway. Any other attempt still registered is a
+    custody leak and gets just the thread-leak check's grace, so a regression that keeps a
+    settled attempt alive after a passing review cannot hide behind the late worker's wait.
+    """
+    late = {key for key, row in active_review_attempts().items() if row["late"] and key not in started_before}
+    lingering = wait_for_review_workers(set(started_before) | late, _SETTLED_ATTEMPT_GRACE_SEC, poll_sec=0.1)
+    bound = _REVIEW_WINDOW_SEC + 60
+    # A late worker is drained beside a leak too: the environment is never restored under it.
+    still = wait_for_review_workers(set(started_before) | set(lingering), bound) if late else {}
+    return "; ".join(filter(None, (
+        lingering and f"reviewer attempts still registered after the test, none of them late: {sorted(lingering.values())}",
+        still and f"late reviewer workers still active {bound:.0f}s after the test: {sorted(still.values())}")))
+
+
+@pytest.fixture()
+def owned_review_workers(review_env):
+    """The test owns every reviewer worker it starts, the by-design late one included.
+
+    A slot whose logical window ends hands its caller a typed in-flight actor
+    while the physical worker keeps running until its send settles
+    (review_custody's late-result worker). That worker belongs to this test:
+    wait for it here (``settle_review_workers``), before monkeypatch restores the
+    environment it runs under (this fixture is torn down before ``review_env``) and
+    before the session's thread-leak check, never by widening that check's thread
+    names and never by cutting the provider socket.
+    """
+    before = set(active_review_attempts())
+    yield
+    problem = settle_review_workers(before)
+    assert not problem, problem
 
 
 def _skill_state_dir(name: str) -> pathlib.Path:
@@ -608,18 +711,16 @@ def _skill_state_dir(name: str) -> pathlib.Path:
 
 
 def _run_review_flow(slug: str, name: str) -> tuple[str, str, str, Dict[str, Any]]:
-    payload: Dict[str, Any] = {}
-    status, error, deps_status = asyncio.run(
-        _apply_hub_review_and_deps(
-            payload,
-            drive_root=DATA_DIR,
-            repo_dir=REPO_ROOT,
-            skill_name=name,
-            progress=_ProgressStub(),
-            review_log_label=f"skill_smoke review {slug}",
-            deps_log_label=f"skill_smoke deps {slug}",
-        )
-    )
+    """Review first, dependencies only after an executable review (the production ordering)."""
+    from ouroboros.skill_dependencies import ensure_skill_dependencies
+    from ouroboros.skill_loader import review_status_allows_execution
+
+    status, findings, error = _run_skill_review(DATA_DIR, REPO_ROOT, name)
+    payload: Dict[str, Any] = {"review_status": status, "review_findings": findings, "review_error": error}
+    deps_status = "not_required"
+    if review_status_allows_execution(status) and not error:
+        deps_status, deps_error = ensure_skill_dependencies(DATA_DIR, find_skill(DATA_DIR, name))
+        payload.update({"deps_status": deps_status, "deps_error": deps_error})
     return str(status), str(error or ""), str(deps_status), payload
 
 
@@ -674,29 +775,87 @@ def _smoke_retry_refusal(name: str, status: str) -> str:
     return ""
 
 
+# A wave the provider refuses at the HTTP layer (a 429 or 5xx on every reviewer's record) is an outage of
+# the live route, not a verdict: the model may have read part of the skill, but its review never finished.
+# It is waited out on the provider's clock. A wave the model answered, parseable or not, keeps the one
+# settled retry, and a retry that records no wave of its own (a crash before any send, a local refusal)
+# ends the test red, as does any attempt whose review raised, wave or not: a crash in the review path is
+# never waited out. Every wave is a paid review cycle, a refused one included (_REVIEW_WAVES).
+_OUTAGE_BACKOFF_SEC = 90.0
+# marketplace.install._run_skill_review's error when review_skill itself raised (it answers "pending").
+_REVIEW_RAISED = "review_skill raised:"
+
+
+def _provider_refused(record: Any) -> bool:
+    """The provider refused this reviewer at the HTTP layer, a 429 or a 5xx. The transport label alone
+    is no proof: a native episode the model answered with malformed calls is labelled the same way."""
+    code = record.get("http_status") if isinstance(record, dict) else None
+    try:
+        code = int(code) if not isinstance(code, bool) else 0
+    except (TypeError, ValueError):
+        return False
+    return (record.get("status") == "error" and record.get("transport_status") == "provider_transport_error"
+            and (code == 429 or 500 <= code <= 599))
+
+
+def _refused_by_provider(wave: Any) -> bool:
+    """The provider refused every reviewer of this recorded wave (a 429 or 5xx): no model answered it."""
+    records = wave.get("raw_actor_records") if isinstance(wave, dict) else None
+    return isinstance(records, list) and bool(records) and all(_provider_refused(record) for record in records)
+
+
+def _latest_wave(name: str) -> Any:
+    history = load_history(DATA_DIR, name, limit=1)
+    return history[-1] if history else None
+
+
 def _review_with_one_settled_retry(slug: str, name: str):
+    retried_on = _latest_wave(name)  # an older row (a reused data dir) never stands in for this attempt's
     status, error, deps_status, payload = _run_review_flow(slug, name)
-    failed = status not in ("clean", "warnings") or error or (slug in DEPS_SKILLS and deps_status != "installed")
-    if not failed:
-        return status, error, deps_status, payload, ""
-    refusal = _smoke_retry_refusal(name, status)
-    note = f" (not retried: {refusal})" if refusal else " after one settled retry"
-    print(f"{slug}: first attempt not OK; original state kept{note}\n"
-          + _review_diag(name, status, error, payload))
-    if refusal:
-        return status, error, deps_status, payload, note
-    return (*_run_review_flow(slug, name), note)
+    waves, outages, settled, stop = 1, 0, False, ""
+    while (status not in ("clean", "warnings") or error or (slug in DEPS_SKILLS and deps_status != "installed")):
+        wave = _latest_wave(name)
+        if waves >= _REVIEW_WAVES:
+            stop = f"all {_REVIEW_WAVES} waves are spent"
+        elif error.startswith(_REVIEW_RAISED):
+            stop = "the review itself raised"
+        elif wave == retried_on:
+            stop = "the attempt recorded no wave of its own"
+        else:
+            stop = _smoke_retry_refusal(name, status)
+            if not stop and not _refused_by_provider(wave) and settled:
+                stop = "its one settled retry is spent"
+        if stop:
+            break
+        if _refused_by_provider(wave):
+            outages += 1
+            print(f"{slug}: the provider refused every reviewer (outage {outages}); original state kept, "
+                  f"retrying in {_OUTAGE_BACKOFF_SEC:.0f}s\n" + _review_diag(name, status, error, payload))
+            time.sleep(_OUTAGE_BACKOFF_SEC)
+        else:
+            settled = True
+            print(f"{slug}: attempt not OK; original state kept, one settled retry\n"
+                  + _review_diag(name, status, error, payload))
+        retried_on = wave
+        status, error, deps_status, payload = _run_review_flow(slug, name)
+        waves += 1
+    note = (f" after {outages} provider outage(s)" if outages else "") + (" after one settled retry" if settled else "")
+    if stop:
+        note += f" (not retried: {stop})"
+        print(f"{slug}: attempt not OK{note}\n" + _review_diag(name, status, error, payload))
+    return status, error, deps_status, payload, note
 
 
-# 2100s: review (300s model timeout + pack build), at most one settled retry,
-# and cold a2a venv+pip. The unchanged production path owns free verdict replay
-# and the paid-cycle cap. Pending work stays red; its state is never erased.
-@pytest.mark.timeout(2100)
+# _REVIEW_TEST_TIMEOUT_SEC: up to three review waves under the product's own
+# window (the one settled retry, provider outages waited out), the late
+# worker's drain and cold a2a venv+pip. The unchanged production path owns
+# free verdict replay. Pending work stays red; its state is never erased.
+@pytest.mark.timeout(_REVIEW_TEST_TIMEOUT_SEC)
 # review_secret (session) is listed before install_skill (session): among
 # same-scope fixtures signature order wins, so a fork without the secret reds
 # on one crisp message before the live catalog fetch.
 @pytest.mark.parametrize("slug", REVIEW_SKILLS)
-def test_review_grants_and_enable(slug, review_secret, install_skill, review_env):
+def test_review_grants_and_enable(slug, review_secret, install_skill, owned_review_workers):
     install_skill(slug)
     name = _sanitize_skill_name(slug)
     started = time.time()
@@ -725,10 +884,9 @@ def test_review_grants_and_enable(slug, review_secret, install_skill, review_env
     # by the shared review substrate, while the model id remains the contract.
     model_id = models[0].split(" [", 1)[0].rsplit("#", 1)[0]
     assert model_id == _REVIEW_MODEL, models
-    # Hash-verified official payloads get the official_hub profile (the
-    # severity-downgrade that stabilizes verdicts); losing it silently would
-    # change what this lane proves.
-    assert review.get("review_profile") == "official_hub", review.get("review_profile")
+    # The official_hub reduced-noise profile is retired: Official is the trusted
+    # source row's install basis now, so an explicit review is an ordinary one.
+    assert review.get("review_profile") in (None, ""), review.get("review_profile")
 
     # Auto-grant ran inside review_skill (blocking enforcement ⇒ only on
     # clean/warnings). Grants are request-keyed: a requested key grants with an

@@ -31,7 +31,7 @@
  * @property {boolean=} cancelable
  * @property {string=} pause_cause  // budget | owner | authority | restart | sleep | unknown; display only
  * @property {boolean=} finishing_reviews  // review work an owner Pause lets finish runs on; display only, no count
- * @property {Object=} late_work  // answered root with an open late phase (D10): title, answered_at; display only
+ * @property {Object=} late_work  // answered root whose late work remains: title, answered_at; display only
  * @property {Object=} required_question  // read-only pointer to the current required Project quiz
  * @property {boolean=} required_question_unavailable  // a recorded owner-question wait whose detail could not be read: possibly blocked, never "no question"
  * @property {Object.<string,{requires_owner_action?:boolean,revision:number,task_attempt:number}>=} model_waits Current owner facts; missing action evidence is unavailable.
@@ -61,6 +61,12 @@
  * @property {string} criterion_source  // task_stated | agent_defined
  * @property {string} receipt_ts  // the receipt's own timestamp; no separate receipt id exists
  * @property {string=} detail  // the producer's sentence for a timeout or a bytes_equal comparison
+ */
+/**
+ * @typedef {Object} TaskPauseRequest
+ * @property {string} request_id
+ * @property {('owner'|'ouroboros')=} actor
+ * @property {string=} reason
  */
 /**
  * @typedef {Object} TaskPauseResponse

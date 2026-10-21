@@ -158,9 +158,11 @@ def test_review_block_states_an_unanswerable_coupling_part_and_keeps_it_above_fo
 
     five = _catalog(*[_api(f"packet-{index}", f"openai/model-{index}", packet=True) for index in range(5)])
     block = _review_block(monkeypatch, five)
-    assert block["omitted"] == {"rows": 5}
-    assert all(set(row) == {"seat_id", "model"} for row in block["pool"]), "the rows shrank"
-    assert block["coupling_unanswerable"] is True, "the shrink must not lose the fact"
+    assert block["omitted"] == {"rows": 0}
+    assert [row["seat_id"] for row in block["pool"]] == [f"packet-{index}" for index in range(5)]
+    assert all({"seat_id", "model", "effort", "delivery", "cost_hint", "cost_usd", "cost_kind", "last_review"}
+               <= row.keys() and row["delivery"] == "packet" for row in block["pool"])
+    assert block["coupling_unanswerable"] is True, "larger pools must keep the coupling fact and full rows"
 
 
 @pytest.mark.parametrize("catalog", [*READING.values(), _catalog(_api("helper", "x-ai/grok-4.6", marked=False))],

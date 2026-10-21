@@ -245,33 +245,21 @@ def _memory_health_lines(env: Any) -> List[str]:
 
 
 def _unread_output_line(custody_root: Any, run: Any, task_id: str) -> str:
-    """The D7 NEVER-READ line for one settled, complete, unread staged output.
+    """The D7 NEVER-READ line for one settled, complete, unread staged output of the reader's own run.
 
-    The instruction clause is ownership-aware: only the owner (or its confirmed
-    retry) can earn the read acknowledgement, so telling a foreign task to read
-    a legacy task-drive staging mints an obligation it structurally cannot
-    discharge. A retained (#1573) output names its exact canonical read address,
-    which other readers may open without earning a receipt; a legacy row keeps
-    its task-drive wording byte for byte.
+    Another task's runs fold into ``_foreign_work_line``; an unattributed reader (empty ``task_id``)
+    may be the owner and reads this line too. A retained (#1573) output names its exact canonical read
+    address; a legacy row keeps its task-drive wording byte for byte.
     """
     from ouroboros.delegate_output import staged_output_address
 
     address = staged_output_address(custody_root, run) if run.output_source else {}
-    if task_id and run.task_id and task_id != run.task_id:
-        action = (
-            "Reading permission alone grants no acknowledgement; only the owner or its confirmed retry "
-            "can record full consumption."
-        ) if address else (
-            f"Only its owner task {run.task_id} can read and acknowledge it; "
-            f"note the gap honestly instead of attempting the read here."
-        )
-    else:
-        how = f"root='{address['root']}' at that path" if address else "root='task_drive'"
-        action = (
-            f"Read it with read_file {how} until the artifact is "
-            "covered end to end, or say plainly that the result was not "
-            "collected."
-        )
+    how = f"root='{address['root']}' at that path" if address else "root='task_drive'"
+    action = (
+        f"Read it with read_file {how} until the artifact is "
+        "covered end to end, or say plainly that the result was not "
+        "collected."
+    )
     if getattr(run, "terminal_source", None) and not run.unread_disclosed:
         return (f"INFO: DELEGATED RESULT AVAILABLE — run {run.run_id or '?'} has retained full output at "
                 f"{address.get('path') or run.output_artifact}, not yet read by its owner. "
@@ -279,6 +267,34 @@ def _unread_output_line(custody_root: Any, run: Any, task_id: str) -> str:
     return (f"WARNING: DELEGATED RESULT NEVER READ — run {run.run_id or '?'} settled "
             f"with its full output staged at {address.get('path') or run.output_artifact} and never read to "
             f"EOF (owner task {run.task_id or '?'}). {action}")
+
+
+def _foreign_owner(run: Any, task_id: str) -> str:
+    """The run's owner task when this reader is ANOTHER task, else "" (its own run or an unattributed reader)."""
+    return str(run.task_id) if task_id and run.task_id and task_id != run.task_id else ""
+
+
+def _foreign_work_line(owner: str, work: Dict[str, List[str]]) -> str:
+    """Another task's delegated obligations as ONE line (owner decision Q3=A, 18.10.2026).
+
+    D7 keeps them visible to every reader, but only their owner reads and acknowledges its results, and
+    decides its patches while it lives; a copy of every run's line in every task's context was most of
+    the Health section (17.10: 223 lines, ~110k characters, nearly all about other tasks). The reader
+    sees each owner once: the counts, the run ids, the authority rule and the owner's record, which
+    any task can read (a run's own reader resolves only in its owner's lineage).
+    """
+    parts = [f"{label}: {', '.join(work[key])}" for key, label in (
+        ("unread", "results not read to EOF"), ("patches", "patches awaiting apply/reject")) if work[key]]
+    line = (f"{'WARNING' if work['patches'] else 'INFO'}: ANOTHER TASK'S DELEGATED WORK — owner task {owner}: "
+            + "; ".join(parts) + ". Only the owner reads and acknowledges its results and decides its patches "
+            "while it lives; once it is terminal, a live top-level task may reject them from any root or apply "
+            "them from the recorded target or a fresh payload binding (integrate_delegated_patch; the disposition "
+            f"row records who acted). The owner's record: query_data(op='json', kind='task_result', ids=['{owner}']).")
+    if work["yours"]:
+        run_id = work["yours"][0] if len(work["yours"]) == 1 else "<run_id>"
+        line += (f" Your active root matches the target of {', '.join(work['yours'])}: once the owner is terminal, "
+                 f"integrate_delegated_patch(run_id='{run_id}', decision='apply'|'reject').")
+    return line
 
 
 # One line per own settled run, bounded like ``terminal_custody_notice``.
@@ -345,21 +361,20 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
     Called once when a task's context is built (a task-start snapshot, not
     refreshed per round).
 
-    ``task_id`` names the READING task so delegated-run obligations can shape
-    their instruction clause by ownership: the obligations stay globally
-    visible (owner doctrine — a preserved-and-invisible result is how work
-    rots on disk), but only the OWNER task receives the call-shaped
-    instruction. A non-owner told to call ``integrate_delegated_patch`` gets
-    a structural ``run_not_owned`` refusal and an obligation it can never
-    discharge. Empty ``task_id`` (legacy callers)
-    keeps the call-shaped wording — an unattributed reader may be the owner.
+    ``task_id`` names the READING task so delegated-run obligations follow
+    ownership: they stay globally visible (owner doctrine D7 — a
+    preserved-and-invisible result is how work rots on disk), the OWNER task
+    receives each run's line with its call-shaped instruction, and another
+    task's runs fold into ONE line per owner task with their run ids, the
+    authority rule and a run's exact reader (owner decision Q3=A, 18.10.2026).
+    Empty ``task_id`` (legacy callers) keeps every line call-shaped — an
+    unattributed reader may be the owner.
 
     ``active_root`` names that reader's own active Git root, which this module
     cannot look up (it has no ``ctx``) and the caller already holds. One
-    comparison through the apply gate's own predicate then names the concrete
-    call for a FOREIGN obligation the reader's root already satisfies, instead
-    of leaving sixteen identical abstract rows. Empty keeps the static wording
-    byte-for-byte.
+    comparison through the apply gate's own predicate then names, inside the
+    owner's line, the concrete call for another task's patches the reader's
+    root already satisfies.
 
     ``attempt_key`` is the reader's actual task attempt, normalized exactly as the
     supervision acknowledgement records it; with ``task_id`` it names the reader's
@@ -497,6 +512,11 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
     except Exception:
         custody_state = None
 
+    foreign: Dict[str, Dict[str, List[str]]] = {}  # another task's obligations, one line per owner (Q3=A)
+
+    def foreign_work(owner: str) -> Dict[str, List[str]]:
+        return foreign.setdefault(owner, {"unread": [], "patches": [], "yours": []})
+
     try:
         from ouroboros.delegate_custody import settled_unread_outputs
 
@@ -506,7 +526,11 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
             # nothing is live and nothing is mutating — but it stays visible until the
             # read happens, which is the whole difference between a disclosure and a fact
             # someone acts on. It clears itself the moment the acknowledgement lands.
-            checks.append(_unread_output_line(custody_root, run, task_id))
+            owner = _foreign_owner(run, task_id)
+            if owner:
+                foreign_work(owner)["unread"].append(str(run.run_id or "?"))
+            else:
+                checks.append(_unread_output_line(custody_root, run, task_id))
     except Exception:
         pass
 
@@ -539,39 +563,24 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
                 state_clause = (
                     f"settled with its work preserved in its private snapshot of "
                     f"{run.target_root or '?'} (no patch captured yet — "
-                    f"integrate_delegated_patch captures it at disposition)"
+                    f"integrate_delegated_patch captures it at disposition and returns it for inspection "
+                    f"before any apply)"
                 )
                 persist_clause = "The snapshot persists until that disposition."
-            # Ownership-aware instruction: a foreign reader is told WHO must act
-            # instead of being handed a call that structurally refuses. The
-            # wording is STATIC — stating the rule costs no per-orphan
-            # task_result read, and the tool itself is the authority on whether
-            # this particular caller may dispose this particular run.
-            if task_id and run.task_id and task_id != run.task_id:
-                decide_clause = (
-                    f"Only its owner task {run.task_id} can decide it while that task "
-                    f"is live; once that task is terminal, a live top-level task may dispose it: "
-                    f"apply requires the caller's active Git root or fresh payload binding to equal "
-                    f"the run's recorded target, while reject requires only terminality and reject "
-                    f"may release it even from a different active root; the disposition row records "
-                    f"who acted (a live-owner foreign call is still refused as run_not_owned)."
-                )
-                # One comparison over the root the caller already holds, through the
-                # SAME predicate the apply gate uses: when this reader's own active
-                # root already satisfies the recorded target, the abstract rule alone
-                # left it guessing (sixteen such rows in one prompt). No per-orphan
-                # task_result read is added, and the tool re-verifies every guard.
+            # Another task's patch folds into its owner's one line (Q3=A); the predicate the apply
+            # gate uses names the runs whose recorded target this reader's own active root already
+            # satisfies, so the line can carry the concrete call (no per-orphan task_result read;
+            # the tool re-verifies every guard).
+            owner = _foreign_owner(run, task_id)
+            if owner:
+                foreign_work(owner)["patches"].append(str(run.run_id or "?"))
                 if active_root and orphan_apply_target_ok(run.target_root, active_root):
-                    decide_clause += (
-                        f" Your own active root already satisfies that target, so once the owner "
-                        f"is terminal the call is integrate_delegated_patch(run_id='{run.run_id}', "
-                        f"decision='apply'|'reject')."
-                    )
-            else:
-                decide_clause = (
-                    f"decide with integrate_delegated_patch(run_id='{run.run_id}', "
-                    f"decision='apply'|'reject')."
-                )
+                    foreign_work(owner)["yours"].append(str(run.run_id))
+                continue
+            decide_clause = (
+                f"decide with integrate_delegated_patch(run_id='{run.run_id}', "
+                f"decision='apply'|'reject')."
+            )
             checks.append(
                 f"WARNING: DELEGATED PATCH AWAITS DISPOSITION — run {run.run_id or '?'} "
                 f"(owner task {run.task_id or '?'}) {state_clause} and no apply/reject "
@@ -580,6 +589,7 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
             )
     except Exception:
         pass
+    checks.extend(_foreign_work_line(owner, work) for owner, work in foreign.items())
 
     try:
         from ouroboros.delegate_custody import open_containment_faults
@@ -601,16 +611,6 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
         stray_note = _stray_server_note(env)
         if stray_note:
             checks.append(stray_note)
-    except Exception:
-        pass
-
-    try:
-        # Probe body lives beside the other live-reused startup checks
-        # (the check_stray_server_processes pattern); thresholds are the
-        # justified constants in ouroboros/context_budget.py.
-        from ouroboros.agent_startup_checks import hot_store_growth_notes
-
-        checks.extend(hot_store_growth_notes(env))
     except Exception:
         pass
 

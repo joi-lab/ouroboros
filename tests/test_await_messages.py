@@ -81,7 +81,11 @@ def test_pending_mail_returns_immediately_without_delivering_or_acknowledging(tm
     # Nothing delivered, nothing acknowledged, the loop's seen-set untouched.
     assert acknowledged_task_message_ids(tmp_path, "waiter", attempt_key=1) == set()
     assert ctx._loop_mailbox_seen_ids == set()
-    assert ctx.event_queue.empty()
+    frames = [ctx.event_queue.get_nowait() for _ in range(ctx.event_queue.qsize())]
+    # Only the typed in-slot wait lease and the task's re-announcement (DESIGN §9 typing): no delivery.
+    assert [(frame["type"], frame.get("kind"), frame.get("phase")) for frame in frames] == [
+        ("cognitive_operation", "in_slot_wait", "started"), ("cognitive_operation", "in_slot_wait", "finished"),
+        ("typing_start", None, "thinking")]
 
 
 def test_empty_mailbox_times_out_after_the_ceiling_bounded_window(tmp_path, monkeypatch):

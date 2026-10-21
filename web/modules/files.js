@@ -1,5 +1,4 @@
 import { renderPageHeader } from './page_header.js';
-import { PAGE_ICONS } from './page_icons.js';
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
 import { fetchJson, jsonPost } from './api_client.js';
 import { openConfirmDialog } from './confirm_dialog.js';
@@ -32,8 +31,7 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
     page.className = 'page app-page-glass';
     page.innerHTML = `
         ${renderPageHeader({
-            title: 'Files',
-            icon: PAGE_ICONS.files,
+            page: 'files',
             actionsHtml: '<button class="btn btn-default" id="files-refresh">Refresh</button>',
         })}
         <div class="files-layout">

@@ -1,6 +1,6 @@
 """Owner-local UI preference endpoints, stored in ``state/ui_preferences.json``.
 
-Keys: ``widget_order``, ``widget_size``, ``widget_start_mode`` (values from
+Keys: ``voice`` (``stt``, ``tts``, ``tts_voice``), ``contributions``, ``widget_order``, ``widget_size``, ``widget_start_mode`` (values from
 ``extension_ui_validation.WIDGET_START_MODES``), ``nested_subagents_expanded``, the
 empty-Main ``welcome`` copy, the two side-section widths and ``project_seen_revision``.
 A POST may carry any subset of keys; an unknown key answers 400.
@@ -8,6 +8,7 @@ A POST may carry any subset of keys; an unknown key answers 400.
 from __future__ import annotations
 
 import pathlib
+import copy
 from contextlib import contextmanager
 from typing import Any
 
@@ -20,6 +21,10 @@ from ouroboros.utils import atomic_write_json, read_json_dict
 
 DEFAULT_UI_PREFERENCES: dict[str, Any] = {
     "widget_order": [],
+    # Engine choices are contribution keys; tts_voice is the chosen provider's voice id
+    # (empty = the provider's own pick, a voice on this device).
+    "voice": {"stt": "", "tts": "", "tts_voice": ""},
+    "contributions": {"hidden": [], "order": []},
     # Owner override of a widget card's launch policy, keyed "<skill>:<tab_id>" with a
     # value from the validator's WIDGET_START_MODES. Bounds only: keys are never
     # checked against live widgets, so a temporarily disabled or removed skill keeps
@@ -43,6 +48,10 @@ DEFAULT_UI_PREFERENCES: dict[str, Any] = {
     # unknown-key 400, a stored legacy key is ignored on read and dropped on
     # the next write (``project_seen_revision`` is the replacement).
     "project_seen_revision": {},
+    # Main's read cursor, the same monotonic, server-clamped kind against the dialogue store's
+    # room revision of chat 1. None until a client first sets it to what Main holds then, as the
+    # per-window count this replaced started at zero (DESIGN "Unread").
+    "main_seen_revision": None,
     # Main's empty-state copy, a hidden install-wide preference (no Settings control):
     # never a model reply or a chat-history row.
     "welcome": {"mode": "default", "text": ""},
@@ -110,9 +119,32 @@ def _normalize_preferences(
     *,
     fill_defaults: bool = True,
 ) -> dict[str, Any]:
-    prefs = dict(DEFAULT_UI_PREFERENCES) if fill_defaults else {}
+    prefs = copy.deepcopy(DEFAULT_UI_PREFERENCES) if fill_defaults else {}
     if not isinstance(raw, dict):
         return prefs
+    for group, keys in (("voice", ("stt", "tts", "tts_voice")), ("contributions", ("hidden", "order"))):
+        if group not in raw:
+            continue
+        value = raw[group]
+        if not isinstance(value, dict) or any(key not in keys for key in value):
+            raise ValueError(f"{group} must be an object using only {', '.join(keys)}")
+        cleaned = dict(prefs.get(group, {}))
+        for key, item in value.items():
+            if group == "contributions":
+                if not isinstance(item, list) or len(item) > 64:
+                    raise ValueError(f"{group}.{key} must be a list of at most 64 keys")
+                values = item
+            else:
+                values = [item]
+            if any(not isinstance(v, str) or len(v) > 120 for v in values):
+                raise ValueError(f"{group}.{key} keys must be strings of at most 120 characters")
+            try:
+                for v in values:
+                    v.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError(f"{group}.{key} keys must be valid Unicode") from None
+            cleaned[key] = list(dict.fromkeys(values)) if group == "contributions" else item
+        prefs[group] = cleaned
     if "widget_order" in raw:
         value = raw.get("widget_order")
         if value is None:
@@ -180,6 +212,11 @@ def _normalize_preferences(
                 except (TypeError, ValueError):
                     raise ValueError("project_seen_revision values must be integers")
             prefs["project_seen_revision"] = cleaned
+    if "main_seen_revision" in raw:
+        value = raw.get("main_seen_revision")
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError("main_seen_revision must be an integer or null")
+        prefs["main_seen_revision"] = None if value is None else max(0, value)
     if "welcome" in raw:
         value = raw["welcome"]
         if not isinstance(value, dict) or set(value) != {"mode", "text"}:
@@ -199,6 +236,16 @@ def _normalize_preferences(
             raise ValueError("welcome text must be valid Unicode") from None
         prefs["welcome"] = {"mode": mode, "text": text}
     return prefs
+
+
+def main_room_revision(drive_root: Any) -> int | None:
+    """Main's room revision in the dialogue store (its standalone messages), None while unreadable."""
+    try:
+        from ouroboros import dialogue_store
+
+        return max(0, int((dialogue_store.room(drive_root, 1) or {}).get("revision") or 0))
+    except Exception:
+        return None
 
 
 def _stored_preferences(path: pathlib.Path) -> dict[str, Any]:
@@ -237,6 +284,9 @@ async def api_ui_preferences_post(request: Request) -> JSONResponse:
         with _preferences_lock(path):
             prefs = _stored_preferences(path)
             incoming = _normalize_preferences(body, fill_defaults=False)
+            for group in ("voice", "contributions"):
+                if group in incoming:
+                    prefs[group] = {**prefs[group], **incoming.pop(group)}
             if "project_seen_revision" in incoming:
                 from ouroboros.projects_registry import get_project
 
@@ -253,6 +303,13 @@ async def api_ui_preferences_post(request: Request) -> JSONResponse:
                     # ensure tombstones/unknown ids are not newly admitted here.
                     merged = dict(list(merged.items())[-_MAX_PROJECT_CURSORS:])
                 prefs["project_seen_revision"] = merged
+            if "main_seen_revision" in incoming:
+                requested = incoming.pop("main_seen_revision")
+                current = main_room_revision(drive_root) if requested is not None else None
+                if current is not None:
+                    # Never past what Main holds, never backwards; an unreadable store moves nothing.
+                    stored = prefs.get("main_seen_revision")
+                    prefs["main_seen_revision"] = max(int(stored or 0), min(requested, current))
             if "widget_size" in incoming:
                 # Merge by card: a write names only the cards it changes, a null value
                 # deletes one, a null map clears them all. A changed key moves last,
@@ -278,4 +335,5 @@ __all__ = [
     "DEFAULT_UI_PREFERENCES",
     "api_ui_preferences_get",
     "api_ui_preferences_post",
+    "main_room_revision",
 ]

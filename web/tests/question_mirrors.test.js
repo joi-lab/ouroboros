@@ -227,10 +227,12 @@ test('an unknown source keeps what is known; otherwise the copy is a safe record
         fx.add({ ...ROW, quiz_state: 'unknown', source_status: 'unavailable', question: '', options: [] });
         const [known] = fx.cards();
         assert.deepEqual([known.dataset.state, text(known, 'chat-quiz-status-text')], ['open', 'Waiting for your answer']);
+        assert.equal(known.querySelector('.chat-quiz-mark').dataset.hue, 'owner', 'the copy carries the owner\'s dot too');
         assert.equal(options(known)[0].disabled, false, 'an unavailable read never disables a known question');
         fx.add({ ...ROW, quiz_id: 'cold', quiz_state: 'unknown', source_status: 'unavailable' });
         const cold = fx.cards()[1];
         assert.deepEqual([cold.dataset.state, text(cold, 'chat-quiz-status-text')], ['unknown', 'Status unavailable']);
+        assert.equal(cold.querySelector('.chat-quiz-mark').dataset.hue, 'neutral', 'an unreadable source claims no move');
         assert.ok(options(cold).every((button) => button.disabled) && !cold.querySelector('.chat-quiz-comment'),
             'no invented invitation to answer');
         // The source becomes readable: the whole answerable form mounts where the record was.

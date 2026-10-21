@@ -3,6 +3,22 @@ import { apiFetch } from './api_client.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { applyChartTheme, chartChrome, onThemeChange } from './theme_palette.js';
 import { tr } from './i18n.js';
+import { showToast } from './toast.js';
+
+// The statuses that wait for the owner: a first conversation, or the owner's chat.
+const NEEDS_OWNER = ['waiting_for_first_conversation', 'waiting_for_owner_chat'];
+
+/**
+ * A runtime pill's tone (docs/DESIGN.md "Status and chips"): green while it runs or rests ready; amber only while it
+ * needs the owner (a first conversation, the owner's chat, or a spending limit that stopped it); red for a failure; and the
+ * plain pill (`offline`) for everything that goes on by itself (a wait, a pause, a restart check, an unknown) or is off.
+ */
+export function runtimePillTone(status) {
+    if (['running', 'queued', 'idle_ready', 'thinking', 'sleeping'].includes(status)) return 'online';
+    if ([...NEEDS_OWNER, 'budget_blocked', 'budget_stopped'].includes(status)) return 'owner';
+    if (['paused_failures', 'error_backoff', 'allowance_exhausted', 'allowance_unknown', 'wake_failed', 'wake_rejected'].includes(status)) return 'error';
+    return 'offline';
+}
 
 /**
  * Ask for the evolution-campaign objective (pure decision helper, node-tested
@@ -69,6 +85,8 @@ export function initEvolution({ ws, state, mount }) {
     let loadSequence = 0;
     let chartLoaded = false;
     let disposed = false;
+    let lightMode = false;
+    let commandPending = false;
     const refreshBtn = document.getElementById('evo-refresh');
     const startBtn = document.getElementById('evo-start');
     const stopBtn = document.getElementById('evo-stop');
@@ -116,20 +134,13 @@ export function initEvolution({ ws, state, mount }) {
         });
     }
 
-    function pillTone(status) {
-        if (['running', 'queued', 'idle_ready', 'thinking', 'sleeping'].includes(status)) return 'online';
-        if (['waiting_for_idle', 'waiting_for_owner_chat', 'waiting_for_first_conversation', 'waiting_for_restart_verify', 'paused', 'starting', 'state_unknown', 'unknown', 'wake_paused', 'wake_outcome_unknown'].includes(status)) return 'starting';
-        if (['budget_blocked', 'budget_stopped', 'paused_failures', 'error_backoff', 'allowance_exhausted', 'allowance_unknown', 'wake_failed', 'wake_rejected'].includes(status)) return 'error';
-        return 'offline';
-    }
-
     function shortStatusLabel(status, fallback = 'off') {
         if (status === 'wake_paused') return tr('consciousness.wake_paused', 'paused');
         if (status === 'wake_outcome_unknown') return tr('consciousness.wake_outcome_unknown', 'unknown');
         if (status === 'state_unknown' || status === 'unknown') return 'unknown';  // a null control is never "off"
         if (status === 'thinking') return 'thinking';
         if (status === 'sleeping') return 'sleeping';
-        if (status === 'waiting_for_first_conversation') return 'needs owner';
+        if (NEEDS_OWNER.includes(status)) return 'needs owner';
         if (status === 'allowance_exhausted' || status === 'allowance_unknown') return 'allowance';
         if (status === 'wake_failed') return 'failed';
         if (status === 'wake_rejected') return 'refused';
@@ -137,7 +148,6 @@ export function initEvolution({ ws, state, mount }) {
         if (status === 'queued') return 'queued';
         if (status === 'idle_ready') return 'idle';
         if (status === 'waiting_for_idle') return 'waiting';
-        if (status === 'waiting_for_owner_chat') return 'needs owner';
         if (status === 'waiting_for_restart_verify') return 'restart verify';
         if (status === 'paused' || status === 'paused_failures') return 'paused';
         if (status === 'budget_blocked' || status === 'budget_stopped') return 'budget';
@@ -160,10 +170,10 @@ export function initEvolution({ ws, state, mount }) {
         const consciousnessStatus = consciousness.status || (runtime.bg_consciousness_enabled === null ? 'unknown'
             : runtime.bg_consciousness_enabled ? 'sleeping' : 'disabled');
 
-        evolutionPill.className = `evo-runtime-pill ${pillTone(evolutionStatus)}`;
+        evolutionPill.className = `evo-runtime-pill ${runtimePillTone(evolutionStatus)}`;
         evolutionPill.textContent = `Evolution ${shortStatusLabel(evolutionStatus, 'off')}`;
 
-        consciousnessPill.className = `evo-runtime-pill ${pillTone(consciousnessStatus)}`;
+        consciousnessPill.className = `evo-runtime-pill ${runtimePillTone(consciousnessStatus)}`;
         consciousnessPill.textContent = `Consciousness ${shortStatusLabel(consciousnessStatus, 'off')}`;
 
         const lines = [];
@@ -192,13 +202,18 @@ export function initEvolution({ ws, state, mount }) {
             campaignDetail.textContent = [objective ? `Objective: ${objective}` : '', progress ? `Progress: ${progress}` : ''].filter(Boolean).join(' ');
         }
         // Evolution is self-modification work, so it is hard-blocked in light mode.
-        const isLightMode = String(runtime.runtime_mode || '') === 'light';
+        lightMode = String(runtime.runtime_mode || '') === 'light';
+        paintCommandControls();
         if (startBtn) {
-            startBtn.disabled = isLightMode;
-            startBtn.title = isLightMode
+            startBtn.title = lightMode
                 ? "Evolution campaigns need runtime mode 'advanced' or 'pro' (currently 'light')."
                 : '';
         }
+    }
+
+    function paintCommandControls() {
+        if (startBtn) startBtn.disabled = lightMode || commandPending;
+        if (stopBtn) stopBtn.disabled = commandPending;
     }
 
     function renderEmptyState(message) {
@@ -406,25 +421,42 @@ export function initEvolution({ ws, state, mount }) {
     refreshBtn.addEventListener('click', () => {
         loadEvolution(true);
     });
+    // One command at a time: Start and Pause stay disabled until the gateway answers
+    // (the objective dialog is modal, so it needs no extra gate). The command's own
+    // outcome arrives in chat: a refusal here means only that it was never sent.
+    async function sendCommand(cmd, button) {
+        commandPending = true;
+        paintCommandControls();
+        try {
+            const resp = await apiFetch('/api/command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ cmd }),
+            });
+            if (!resp.ok) {
+                const body = await resp.json().catch(() => ({}));
+                throw new Error(body?.error || `HTTP ${resp.status}`);
+            }
+        } catch (error) {
+            showToast(`Could not send ${cmd.split(' ', 2).join(' ')}: ${error?.message || error}`, 'error');
+        } finally {
+            commandPending = false;
+            paintCommandControls();
+            // Disabling the pressed button dropped keyboard focus to the page; give it back.
+            if (document.activeElement === document.body && !button.disabled) button.focus({ preventScroll: true });
+        }
+        loadEvolution(true);
+    }
     startBtn?.addEventListener('click', async () => {
+        if (commandPending) return;
         const asked = await promptCampaignObjective();
         // Cancel = no campaign start (semantic fix, owner-approved Б1-8: the
         // old `prompt() || ''` started a paid campaign even on Cancel/null).
-        if (!asked.confirmed) return;
-        await apiFetch('/api/command', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ cmd: `/evolve on${asked.objective ? ` ${asked.objective}` : ''}` }),
-        });
-        loadEvolution(true);
+        if (!asked.confirmed || commandPending) return;
+        await sendCommand(`/evolve on${asked.objective ? ` ${asked.objective}` : ''}`, startBtn);
     });
-    stopBtn?.addEventListener('click', async () => {
-        await apiFetch('/api/command', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ cmd: '/evolve off' }),
-        });
-        loadEvolution(true);
+    stopBtn?.addEventListener('click', () => {
+        if (!commandPending) sendCommand('/evolve off', stopBtn);
     });
 
     const unsubscribeOpen = ws.on('open', () => {

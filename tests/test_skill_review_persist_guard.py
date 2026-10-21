@@ -58,6 +58,7 @@ def _pass_actor(model: str):
         {"item": "integration_preflight", "verdict": "PASS", "severity": "advisory", "reason": "ok"},
         {"item": "bug_hunting", "verdict": "PASS", "severity": "advisory", "reason": "ok"},
         {"item": "completion_notification", "verdict": "PASS", "severity": "advisory", "reason": "n/a"},
+        {"item": "context_snapshot_discipline", "verdict": "PASS", "severity": "advisory", "reason": "n/a"},
     ]
     return {
         "model": model,

@@ -1808,6 +1808,85 @@ test('a staged update does not claim the engine is serving when nothing answered
     assert.match(daemonStatusLine(broken, {}).text, /[Aa]gent accounts were not read/);
 });
 
+test('a lower pin under a newer engine is never promised to activate', () => {
+    // Planned restarts keep a newer engine on a lower pin (server_restart), so
+    // "will activate after the daemon next restarts" would be false: the line
+    // names what serves, what is pinned, and which stops expose the older pin.
+    const runtime = { state: 'newer_serving', target_version: '4.3.0', staged_version: '' };
+    const read = { daemon: { state: 'running', engine_version: '4.3.1', runtime },
+                   reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } };
+    const line = daemonStatusLine(read, {});
+    assert.equal(line.tone, 'warn');
+    assert.match(line.text, /^Engine 4\.3\.1 keeps serving; this Ouroboros version pins older Claudexor 4\.3\.0\./);
+    assert.match(line.text, /After a Restart, Panic or engine exit, 4\.3\.0 may refuse data a newer engine served\./);
+    assert.ok(!/activate|staged|ready/.test(line.text), line.text);
+    // A facet gap: the serving claim yields to the facets; the pin fact stays.
+    const gap = daemonStatusLine({ ...read, reads: { catalog: 'ok', accounts: 'failed', quota: 'ok' } }, {});
+    assert.ok(!/keeps serving/.test(gap.text), gap.text);
+    assert.match(gap.text, /[Aa]gent accounts were not read/);
+    assert.match(gap.text, /pins older Claudexor 4\.3\.0/);
+    // Recovery-only facts still ride the line, which never turns green; the action stays plain Connect.
+    const recovering = daemonStatusLine({ ...read, daemon: { ...read.daemon, servingMode: 'recovery_only' } }, {});
+    assert.equal(recovering.tone, 'warn');
+    assert.match(recovering.text, /Recovery only; product work is not admitted/);
+    assert.equal(runtimeActionLabel(read), 'Connect');
+});
+
+test('the displayed lower-pin banner keeps the warning beside failed facets', async () => {
+    const daemon = { state: 'running', engine_version: '4.3.1',
+        runtime: { state: 'newer_serving', target_version: '4.3.0' } };
+    const cases = [
+        { catalog: 'ok', accounts: 'failed', quota: 'ok' },
+        { catalog: 'failed', accounts: 'failed', quota: 'failed' },
+        { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' },
+    ];
+    for (const reads of cases) {
+        const store = storeWithReads(reads, { daemon });
+        await store.refresh();
+        try {
+            const line = serviceBannerLine(store);
+            assert.match(line.text, /pins older Claudexor 4\.3\.0/);
+            assert.match(line.text, /4\.3\.0 may refuse data a newer engine served/);
+            assert.match(line.text, /Last observed engine 4\.3\.1/);
+            assert.doesNotMatch(line.text, /keeps serving|activate|Claudexor ready/);
+            assert.equal(line.text.match(/pins older Claudexor/g)?.length, 1);
+            if (Object.values(reads).includes('failed')) assert.match(line.text, /could not be read/);
+            assert.notEqual(line.tone, 'ok');
+        } finally { store.dispose(); }
+    }
+});
+
+test('a failed request keeps the last observed lower-pin warning without claiming service', async () => {
+    let reject = false;
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => {
+            if (reject) throw new Error('network unavailable');
+            return { ok: true, status: 200, json: async () => ({
+                daemon: { state: 'running', engine_version: '4.3.1',
+                    runtime: { state: 'newer_serving', target_version: '4.3.0' } },
+                reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+                harnesses: [{ id: 'codex' }],
+                profiles: { harnessAccounts: [], profiles: [] }, quota: [],
+            }) };
+        },
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    try {
+        await store.refresh();
+        assert.match(serviceBannerLine(store).text, /keeps serving/);
+        reject = true;
+        await store.refresh();
+        const line = serviceBannerLine(store);
+        assert.match(line.text, /Could not read/);
+        assert.match(line.text, /network unavailable/);
+        assert.match(line.text, /Last observed engine 4\.3\.1/);
+        assert.match(line.text, /pins older Claudexor 4\.3\.0/);
+        assert.match(line.text, /may refuse data a newer engine served/);
+        assert.doesNotMatch(line.text, /keeps serving|activate|Claudexor ready/);
+        assert.equal(line.tone, 'error');
+    } finally { store.dispose(); }
+});
+
 test('a facet that failed without the aggregate hearing it is still reported', () => {
     // An envelope in the wrong shape is a FAILED read, not an exception, so the
     // daemon goes on reporting `running`. A status line that trusted the

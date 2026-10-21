@@ -242,7 +242,8 @@ def test_schedule_followup_notify_leaves_a_note_in_the_one_table(tmp_path):
     assert record["followup_origin"]["task_id"] == "root-1"
     assert "text" not in record["task"], "a note has no future task objective"
     assert _followup(ctx, notify=True, objective="Second").startswith("FOLLOWUP_SCHEDULED")
-    assert "FOLLOWUP_CAP_REACHED" in _followup(ctx, objective="Third"), "notes and wake-ups share the cap"
+    third = _followup(ctx, objective="Third")
+    assert third.startswith("FOLLOWUP_SCHEDULED") and "for this task: 3." in third, "notes and wake-ups share the count"
 
 
 @pytest.mark.parametrize(("metadata", "contract", "chat_id"), [
@@ -434,23 +435,21 @@ def test_schedule_followup_requires_exactly_one_valid_trigger(tmp_path):
     assert len(list_scheduled_tasks(tmp_path / "data")["tasks"]) == 1
 
 
-def test_schedule_followup_cap_refusal_is_typed_and_disclosed(tmp_path):
+def test_schedule_followup_count_is_reported_never_a_cap(tmp_path):
+    """How many follow-ups a task registers is the agent's judgment: each one lands and the
+    reply states this task's pending total (Station: twelve meal posts registered up front)."""
     ctx = _ctx(tmp_path)
-    assert _followup(ctx).startswith("FOLLOWUP_SCHEDULED")
-    assert _followup(ctx, run_at="2030-02-01T00:00:00+00:00").startswith("FOLLOWUP_SCHEDULED")
-    third = _followup(ctx, run_at="2030-03-01T00:00:00+00:00")
-    assert third.startswith("ERROR: FOLLOWUP_CAP_REACHED")
-    assert "2 pending" in third  # discloses the pending records, never silent
-    # another task keeps its own budget
-    assert _followup(_ctx(tmp_path, task_id="root-2")).startswith("FOLLOWUP_SCHEDULED")
+    replies = [_followup(ctx, run_at=f"2030-{month:02d}-01T00:00:00+00:00") for month in range(1, 13)]
+    assert all(reply.startswith("FOLLOWUP_SCHEDULED") for reply in replies), replies
+    assert "for this task: 12." in replies[-1]
+    # another task's count is its own
+    other = _followup(_ctx(tmp_path, task_id="root-2"))
+    assert other.startswith("FOLLOWUP_SCHEDULED") and "for this task: 1." in other
 
 
-def test_schedule_followup_counts_the_cap_inside_the_write_it_is_about_to_make(tmp_path, monkeypatch):
-    """The cap read and the write share ONE hold on the schedule table.
-
-    Two tasks registering at the same instant would otherwise each read the same
-    under-cap count and both land, so the cap would be advisory rather than real.
-    """
+def test_schedule_followup_counts_inside_the_write_it_is_about_to_make(tmp_path, monkeypatch):
+    """The pending count and the write share ONE hold on the schedule table, so the
+    total a reply states is the table it wrote."""
     from supervisor import queue_schedules
 
     ctx = _ctx(tmp_path)
@@ -462,11 +461,10 @@ def test_schedule_followup_counts_the_cap_inside_the_write_it_is_about_to_make(t
     assert _followup(ctx).startswith("FOLLOWUP_SCHEDULED")
     assert len(acquisitions) == 1, acquisitions
     assert acquisitions[0].endswith("scheduled_tasks.json.lock")
-    # The refused call takes the same single hold and writes nothing.
+    # Every later registration takes the same single hold for its count and its write.
     acquisitions.clear()
-    assert _followup(ctx, run_at="2030-02-01T00:00:00+00:00").startswith("FOLLOWUP_SCHEDULED")
-    acquisitions.clear()
-    assert _followup(ctx, run_at="2030-03-01T00:00:00+00:00").startswith("ERROR: FOLLOWUP_CAP_REACHED")
+    second = _followup(ctx, run_at="2030-02-01T00:00:00+00:00")
+    assert second.startswith("FOLLOWUP_SCHEDULED") and "for this task: 2." in second
     assert len(acquisitions) == 1
     from supervisor.queue import list_scheduled_tasks
 
@@ -488,7 +486,7 @@ def test_schedule_followup_reports_a_missed_table_lock_as_a_typed_refusal(tmp_pa
 
 
 def test_schedule_followup_surfaces_a_corrupt_store_as_the_typed_refusal(tmp_path):
-    """The lenient cap read tolerates a corrupt table, the strict upsert refuses
+    """The lenient pending read tolerates a corrupt table, the strict upsert refuses
     it; that refusal must reach the caller typed, not as FOLLOWUP_PERSIST_FAILED."""
     from supervisor.queue import list_scheduled_tasks
 

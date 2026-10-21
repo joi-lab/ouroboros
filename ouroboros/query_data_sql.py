@@ -41,7 +41,7 @@ def _source(root, db, seconds):
         with store.open_store(root, write=False, wait_sec=seconds) as txn:
             if txn.phase() != store.PUBLISHED:
                 raise store.StoreRetired("current store is not published")
-            yield txn.meta("lock_tier") or store.TIER_ENFORCED
+            yield store.probe(root)[1]  # the owner's header protocol; metadata also carries mount identity
     elif db == "money":
         from ouroboros import usage_store
         with usage_store.hold(root, write=False, migrate=False, timeout_sec=seconds):

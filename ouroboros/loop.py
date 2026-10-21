@@ -19,7 +19,7 @@ from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage  # no
 from ouroboros import task_pacing  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 from ouroboros.review_cycles import REASON_REVIEW_CYCLES_EXHAUSTED  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
-from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, REASON_OWNER_REQUESTED_FINALIZATION, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
+from ouroboros.outcomes import REASON_DELIVERY_CONTROL_DEGRADED, REASON_OWNER_REQUESTED_FINALIZATION, RESULT_INFRA_FAILED, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 from ouroboros.observability import new_execution_id  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 from ouroboros.observability import task_timing_scope, timed_phase
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
@@ -54,7 +54,6 @@ from ouroboros.loop_tool_execution import (
     StatefulToolExecutor,
     handle_tool_calls,
     prune_reclaim_trace_refs,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
-    reclaim_negative_memo,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
     reclaim_trace_refs,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 )
 from ouroboros.loop_llm_call import TRANSPORT_DEATHS_KEY, call_llm_with_retry, emit_llm_usage_event, forced_response_is_incomplete, forced_response_parts, provider_no_call_source  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
@@ -108,8 +107,8 @@ def _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, *, after_
     ctx = tools._ctx
     if resume_candidate:
         content = ctx._delivery_candidate.full_text
-    if resume_candidate and _task_acceptance_owner_generation_changed(ctx):
-        _supersede_task_acceptance_for_owner_followup(ctx, limit_ctx.llm_trace)
+    if resume_candidate and _owner_generation_changed(ctx):
+        _release_for_owner_followup(ctx, limit_ctx.llm_trace)
         ctx._delivery_candidate.finalization_control = "owner_revision_required"
         if ctx._delivery_candidate.control_episode_seen:
             _arm_delivery_control(tools, limit_ctx, limit_ctx.llm_trace, control="owner_revision_required")
@@ -126,7 +125,6 @@ def _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, *, after_
             _arm_delivery_control(tools, limit_ctx, limit_ctx.llm_trace, control="owner_revision_required")
             return None
         content = ctx._delivery_candidate.full_text
-    before = transcript_growth_signature(limit_ctx.messages)
     response_start = len(limit_ctx.messages)
     ctx._completion_pair_appended = False
     result = _no_tool_final_answer(
@@ -140,12 +138,10 @@ def _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, *, after_
         ctx._presence_completion = None
         candidate = getattr(ctx, "_delivery_candidate", None)
         plain_followup = candidate is not None and candidate.finalization_control == "owner_revision_required" and not candidate.control_episode_seen
-        unchanged = transcript_growth_signature(limit_ctx.messages) == before
         if not plain_followup and candidate is not None:
             candidate.control_episode_seen = True
             ctx._delivery_control_required = True
-        can_park = unchanged and bool(getattr(ctx, "_task_acceptance_pending", ""))
-        if not plain_followup and not (selected and can_park):
+        if not plain_followup:
             # The resolver already supplied the exact assistant+host pair on a held prose round.
             if not ctx._completion_pair_appended:
                 hold_completion_response(content, tools, limit_ctx, limit_ctx.llm_trace,
@@ -157,9 +153,6 @@ def _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, *, after_
                 if row == {"role": "assistant", "content": content}:
                     row.update({key: assistant_message[key] for key in ("reasoning_details", "reasoning_content")
                                 if key in assistant_message})
-        if can_park:
-            wait_for_acceptance_feedback(tools, limit_ctx, limit_ctx.llm_trace,
-                                         limit_ctx.tool_schemas, limit_ctx.owner_msg_seen)
     return result
 
 
@@ -168,17 +161,6 @@ def _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, *, after_
 # and the pacing refresh covers only deadline-less tasks — such a round pays
 # ONE tree projection read. Final-call affordability separately observes the
 # live shared wallet once per priced phase; other roots may spend between rounds.
-
-
-# Closed set of typed acceptance reasons (v6.78.0): every value is a fact
-# the host already computed or the exit branch's name; none derives from model
-# prose. `unspecified` is only the fail-closed fallback for a forgotten reason.
-
-
-# The host-forced acceptance-review checklist (module constant for the size
-# gate). v6.60.0 adds the explicit SCOPE-CUT question — a silent/unjustified
-# narrowing is a high-severity finding, which under blocking enforcement
-# becomes a typed obligation.
 
 
 # D18a: `context_fit` owns the transcript seal; re-exported here because the
@@ -403,7 +385,7 @@ def _measure_tool_result_batch(ctx, messages, schemas, *, round_id):
     return _measure_main_context_view(
         getattr(ctx, "context_fit_plan", None), messages, schemas,
         getattr(ctx, "active_context_mode", "max"),
-        getattr(ctx, "active_effort", "medium"), round_id)
+        getattr(ctx, "active_effort", "medium"), round_id, usage=getattr(ctx, "_accumulated_usage", None))
 
 
 def _reset_turn_state(ctx: Any) -> None:
@@ -415,6 +397,8 @@ def _reset_turn_state(ctx: Any) -> None:
     ctx._presence_forced_declaration = ctx._presence_forced_pending = None
     ctx._completion_request = ctx._completion_selected = ctx._completion_observation = None
     ctx._completion_conflict, ctx._completion_held_sha256, ctx._acceptance_pending_review_choice = False, "", ""
+    ctx._result_review_pending, ctx._result_review_shown, ctx._result_review_refused = "", set(), {}  # this turn's result review step
+    ctx._result_review_request_asked = set()
     ctx._owner_reply_revision = None  # no live reply of an earlier turn answers this turn's owner rows
     ctx._delivery_candidate, ctx._delivery_candidate_revision, ctx._delivery_control_required = None, 0, False
     ctx._delivery_evidence_revision, ctx._delivery_evidence_fingerprint = 0, ""
@@ -651,7 +635,7 @@ def run_llm_loop(
                         event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
                         budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling, active_use_local=active_use_local)
 
-                    messages, _compaction_usage = _run_round_compaction(
+                    messages = _run_round_compaction(
                         messages,
                         _CompactionRoundContext(
                             tools=tools, drive_root=drive_root, drive_logs=drive_logs,
@@ -659,10 +643,8 @@ def run_llm_loop(
                             event_queue=event_queue, emit_progress=emit_progress, tool_schemas=tool_schemas))
                     tools._ctx.messages = messages
                     limit_ctx.messages = messages  # WA2: provider-death finalize must salvage the COMPACTED transcript
-                    if _compaction_usage:
-                        _account_compaction_usage(accumulated_usage, _compaction_usage, event_queue, task_id)
 
-                    prepare_acceptance_observation(ctx, llm_trace, incoming_messages, messages, tool_schemas)
+                    prepare_acceptance_observation(ctx, llm_trace, incoming_messages, messages)
                     seal_task_transcript(messages)
                     working_checkpoint.save_ready(limit_ctx)  # then the content mail it holds is ACKed
 
@@ -709,12 +691,9 @@ def run_llm_loop(
             ctx.context_fit_plan, ctx.active_context_mode = context_fit_plan, active_context_mode
             if (msg is None and str(accumulated_usage.get("_last_llm_error_kind") or "") == "llm_output_exhausted"
                     and not provider_no_call_source(accumulated_usage, False)[0]):
-                # Output exhaustion is no outage, the primary's (no route walk) or a configured
-                # candidate's (the walk keeps its kind): no wait, no provider terminal. One host fact,
-                # then the next ordinary round decides under the existing round, time and money
-                # limits. A round still holding an unresolved attempt may start no new generation,
-                # so it keeps the recovery below (provider_no_call_source decides). The provider
-                # answered, so the recovery above already ended any wait episode.
+                # Output exhaustion is no outage (primary or configured candidate): no wait, no provider
+                # terminal; one host fact, then the next round decides under the round, time and money
+                # limits. A round holding an unresolved attempt keeps the recovery below (provider_no_call_source).
                 _append_or_merge_user_message(
                     messages, _output_exhausted_notice(accumulated_usage.get("_last_llm_output_exhausted")))
                 pending_no_tool_budget = True  # an unfinished no-tool round keeps the same budget tail (#1223)
@@ -725,6 +704,9 @@ def run_llm_loop(
                 drive_root=drive_root, drive_logs=drive_logs, task_id=task_id, model=active_model,
                 emit_progress=emit_progress, incoming_messages=incoming_messages, owner_msg_seen=_owner_msg_seen):
                 free_redial = True
+                continue
+            from ouroboros.context_renewal import renew_after_refusal
+            if msg is None and renew_after_refusal(limit_ctx, tools):  # owner Q1=A: the same task in a fresh view
                 continue
             if msg is None:
                 # Exact actor routes skip generic substitution and fail as infrastructure.
@@ -768,13 +750,11 @@ def run_llm_loop(
                 fit_candidate=functools.partial(_measure_tool_result_batch, ctx,
                     round_id=f"{accumulated_usage.setdefault('execution_id', new_execution_id())}:round:{round_idx}")
             )
-            working_checkpoint.save_or_log(limit_ctx, "post_batch")  # BEFORE any acceptance/owner-wait park
+            working_checkpoint.save_or_log(limit_ctx, "post_batch")  # BEFORE any owner-wait park
             from ouroboros.loop_delivery import finish_completed_stop
             stopped = finish_completed_stop(tools, limit_ctx, emit_progress, budget_remaining_usd, cost_ceiling)
             if stopped is not None:
                 return stopped
-            advance_explicit_acceptance(tools, limit_ctx, llm_trace, incoming_messages,
-                                        _owner_msg_seen, emit_progress)
             wait_after_tools(ctx, messages, llm_trace, accumulated_usage,
                              round_idx, tool_schemas, _owner_msg_seen)
             # Every completed batch rejoins one control/budget tail, warm or cold.
@@ -791,7 +771,9 @@ def run_llm_loop(
         # A budget-pause HOLD ended by control rejoins the model-wait rails; else re-raise with evidence.
         return _loop_exit_after_exception(exc, limit_ctx, exit_ctx, llm_trace, transport_wait)
     finally:
-        with timed_phase("cleanup"):
+        from ouroboros.delegate_custody_reconcile import defer_loop_exit_audit
+
+        with timed_phase("cleanup"), defer_loop_exit_audit(accumulated_usage):
             working_checkpoint.save_terminal(limit_ctx)  # a returned result's drained mail: saved, then ACKed
             _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id, detail="loop_exit")
             _cleanup_loop_resources(stateful_executor, exit_ctx)
@@ -812,69 +794,23 @@ from ouroboros.loop_messages import (  # noqa: E402, F401 -- intentional public 
     _emit_round_progress,
     transcript_growth_signature,
 )
-from ouroboros.loop_acceptance import (  # noqa: E402, F401 -- intentional public re-exports
-    _task_acceptance_eligible,
+from ouroboros.loop_messages import (  # noqa: E402, F401 -- intentional public re-exports
+    _latch_final_answer_marker,
+    prepare_acceptance_observation,
+)
+from ouroboros.delivery_seal import (  # noqa: E402, F401 -- intentional public re-exports
+    FenceOutcome,
     _begin_task_acceptance_fence,
     _end_task_acceptance_fence,
-    _supersede_delivery_acceptance_binding,
-    _supersede_task_acceptance_for_owner_followup,
-    _task_acceptance_owner_generation_changed,
-    _supersede_task_acceptance_for_evidence_change,
-    _task_acceptance_subtree_snapshot,
-    _mark_root_acceptance_checkpoint,
-    _latch_final_answer_marker,
-    _server_web_allowed_by_task,
-    ACCEPTANCE_REASON_UNSPECIFIED,
-    ACCEPTANCE_DECISION_REASONS,
-    _set_acceptance_decision,
-    _collect_acceptance_obligations,
-    _reopen_obligation_row,
-    _open_acceptance_obligations,
-    _dispose_obligations_on_clean_pass,
-    _format_obligations_clause,
-    _record_forced_acceptance_bypass,
-    terminalize_dangling_revision,
-)
-from ouroboros.loop_acceptance_review import (  # noqa: E402, F401 -- intentional public re-exports
-    wait_for_acceptance_feedback,
-    prepare_acceptance_observation,
-    advance_explicit_acceptance,
-    _ACCEPTANCE_REVIEW_CHECKLIST,
-    _TaskAcceptanceContext,
-    _acceptance_dialogue_quorum,
-    _attach_dialogue_to_host_run,
-    _mark_agent_acceptance_runs_advisory,
-    _latest_agent_acceptance_evidence,
-    _build_host_acceptance_evidence,
-    _execute_task_acceptance_panel,
-    _record_host_acceptance_run,
-    _set_applied_host_acceptance_impact,
-    _apply_task_acceptance_result,
-    _record_acceptance_infra_failure,
-    _prior_acceptance_run,
-    _direct_context_fence_state,
-    _disposition_reason_sha256,
-    _refuse_identical_acceptance,
-    _run_task_acceptance_review_once,
-    _total_paid_acceptance_cycles,
-    _RETRIEVING_ACCESS_DISCLOSURE,
-    _acceptance_delivery_slots,
-    _retrieving_packet_projection,
-    _skip_task_acceptance_for_launch_reason,
-    acceptance_retrieving_work_order,
-    acceptance_dialogue_history,
-    acceptance_paid_identity,
-    bind_acceptance_paid_identity,
+    _owner_generation_changed,
+    _release_for_owner_followup,
 )
 from ouroboros.loop_round_limits import (  # noqa: E402, F401 -- intentional public re-exports
     _CompactionRoundContext,
     _drain_incoming_messages,
-    _context_reclaim_passes,
-    _context_reclaim_materializations,
     _context_overflow_retries,
     _run_round_compaction,
     _RoundLimitContext,
-    _account_compaction_usage,
     _handle_round_limit,
     _handle_forced_finalization,
     _handle_owner_stop_finalization,
@@ -916,8 +852,6 @@ from ouroboros.loop_model_call import (  # noqa: E402, F401 -- intentional publi
     _measure_main_context_view,
     _physical_context_for_fit,
     _dispatch_round_model,
-    _run_main_reclaim,
-    _measure_after_reclaim,
     _reproject_actual_overflow_low,
     _failed_capture_is_comparable,
     _strict_context_shrink_predicate,
@@ -925,6 +859,7 @@ from ouroboros.loop_model_call import (  # noqa: E402, F401 -- intentional publi
     _call_round_model,
 )
 from ouroboros.loop_budget import (  # noqa: E402, F401 -- intentional public re-exports
+    _server_web_allowed_by_task,
     _finish_no_tool_round_budget,
     _finish_tool_round_budget,
     _check_budget_limits,
@@ -949,7 +884,6 @@ from ouroboros.loop_delivery import (  # noqa: E402, F401 -- intentional public 
     _compute_subagent_handoff,
     _delivery_evidence_state,
     _unaccepted_delivery_binding,
-    _delivery_acceptance_binding,
     _publish_delivery_candidate,
     _replace_delivery_candidate,
     _ensure_explicit_acceptance_binding,

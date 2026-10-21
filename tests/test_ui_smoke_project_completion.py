@@ -7,6 +7,14 @@ import pytest
 from tests.test_ui_smoke_playwright import direct_server_with_data  # noqa: F401
 
 
+def _store(root, stream, row):
+    """A row the running server would have stored: its own dialogue store (#1982), never a log file written after
+    it started."""
+    from ouroboros import dialogue_store
+
+    dialogue_store.append(root, stream, row)
+
+
 def _wait_status(page, expected, timeout=10_000):
     page.wait_for_function(
         """(expected) => {
@@ -27,36 +35,33 @@ def test_ui_project_completion_pointer_keeps_project_history_scoped(direct_serve
 
     from ouroboros.project_dialogue import append_chat_annotation
     from ouroboros.projects_registry import create_project
-    from ouroboros.utils import append_jsonl
 
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
     project = create_project(data_dir, "tower-defence", name="Tower Defence")
     project_chat = int(project["chat_id"])
-    logs = data_dir / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
     target_label = "Tower Defence › Fix nested delegation"
     task_id = "tower-root-1"
-    append_jsonl(logs / "chat.jsonl", {
+    _store(data_dir, "chat", {
         "ts": "2026-08-22T10:00:00+00:00", "direction": "out", "chat_id": 1,
-        "user_id": 1, "text": f"{target_label} · Completed\nOpen the Project for details.",
+        "user_id": 1, "text": f"{target_label} · Completed",
         "type": "project_completion_summary", "task_id": task_id,
         "project_id": project["id"], "project_name": project["name"],
         "target_label": target_label, "status": "completed",
     })
-    append_jsonl(logs / "chat.jsonl", {
+    _store(data_dir, "chat", {
         "ts": "2026-08-22T09:58:00+00:00", "direction": "in", "chat_id": 1,
         "user_id": 1, "text": "Continue the Tower Defence task",
         "client_message_id": "route-to-tower",
     })
     append_chat_annotation(data_dir, "route-to-tower", action="route_to_project",
                            target=project["id"], target_label=target_label, status="delivered")
-    append_jsonl(logs / "progress.jsonl", {
+    _store(data_dir, "progress", {
         "ts": "2026-08-22T09:59:00+00:00", "type": "send_message", "direction": "out",
         "chat_id": project_chat, "task_id": task_id, "is_progress": True,
         "content": "Project progress: nested delegation is running.",
     })
-    append_jsonl(logs / "chat.jsonl", {
+    _store(data_dir, "chat", {
         "ts": "2026-08-22T10:00:01+00:00", "direction": "system", "chat_id": project_chat,
         "user_id": 1, "text": "Project task summary", "type": "task_summary",
         "task_id": task_id, "tool_calls": 1, "rounds": 2, "status": "completed",
@@ -73,9 +78,9 @@ def test_ui_project_completion_pointer_keeps_project_history_scoped(direct_serve
                 summary.wait_for(state="visible", timeout=30_000)
                 summary_text = summary.inner_text()
                 assert target_label in summary_text
-                # The Main row is a pointer: one status word and the shared cause sentence,
-                # never the answer excerpt (owner Q5=A); the answer stays in the Project.
-                assert "Open the Project for details." in summary_text
+                # The Main row is a pointer: one status line (and a cause sentence when there is one),
+                # never the answer excerpt (owner Q5=A) and no invitation: its Project reference is the door.
+                assert summary.locator(".message").inner_text().strip() == f"{target_label} · Completed"
                 assert "Release shipped." not in summary_text
                 # The row points at its Project with the one reference: the Project's name, never a
                 # button of its own and never the raw id.
@@ -100,7 +105,7 @@ def test_ui_project_completion_pointer_keeps_project_history_scoped(direct_serve
                 task_card = panel.locator(f'.chat-live-card[data-task-id="{task_id}"]')
                 task_card.wait_for(state="visible", timeout=10_000)
                 assert task_card.locator(".chat-live-phase").inner_text().strip() == "Done"
-                task_card.locator("[data-live-summary-button]").click()
+                task_card.locator("[data-live-disclosure]").click()
                 task_card.get_by_text(
                     "Project progress: nested delegation is running.",
                     exact=False,
@@ -132,26 +137,23 @@ def test_ui_project_completion_mirror_is_an_ordinary_folded_message(direct_serve
     from playwright.sync_api import sync_playwright
 
     from ouroboros.projects_registry import create_project
-    from ouroboros.utils import append_jsonl
 
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
     project = create_project(data_dir, f"mirror-{engine}-{width}", name="A rather long Project name that must yield on a phone")
-    logs = data_dir / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
     base = {"direction": "system", "chat_id": 1, "user_id": 1, "type": "project_completion_summary",
             "project_id": project["id"], "project_name": project["name"], "status": "completed"}
-    append_jsonl(logs / "chat.jsonl", {
+    _store(data_dir, "chat", {
         **base, "ts": "2026-08-22T10:00:00+00:00", "task_id": "root-long",
-        "text": "P › Long · Done\nOpen the Project for details.", "target_label": "P › Long",
+        "text": "P › Long · Done", "target_label": "P › Long",
         "completion_answer": _LONG_ANSWER})
-    append_jsonl(logs / "chat.jsonl", {
+    _store(data_dir, "chat", {
         **base, "ts": "2026-08-22T10:01:00+00:00", "task_id": "root-short",
-        "text": "P › Short · Done\nOpen the Project for details.", "target_label": "P › Short",
+        "text": "P › Short · Done", "target_label": "P › Short",
         "completion_answer": "All good, nothing to report."})
-    append_jsonl(logs / "chat.jsonl", {
+    _store(data_dir, "chat", {
         **base, "ts": "2026-08-22T10:02:00+00:00", "task_id": "root-pointer", "status": "failed",
-        "text": "P › Broken · Failed\nOpen the Project for details.", "target_label": "P › Broken"})
+        "text": "P › Broken · Failed", "target_label": "P › Broken"})
 
     try:
         with sync_playwright() as pw:
@@ -189,7 +191,7 @@ def test_ui_project_completion_mirror_is_an_ordinary_folded_message(direct_serve
                 # The ending without an answer is still the System pointer, and it points at the
                 # Project with the SAME control as the answered ones: a row's voice never picks it.
                 assert "system" in pointer.get_attribute("class").split()
-                assert "Open the Project for details." in pointer.inner_text()
+                assert pointer.locator(".message").inner_text().strip() == "P › Broken · Failed"
                 shapes = [row.locator('[data-intent="open-project"]').evaluate(
                     "n => [n.className, n.getAttribute('aria-label'), [...n.children].map(c => c.className).join(' ')]")
                     for row in (long_row, pointer)]
@@ -218,18 +220,15 @@ def test_ui_project_completion_mirror_folds_after_mounting_on_a_hidden_page(dire
     from playwright.sync_api import sync_playwright
 
     from ouroboros.projects_registry import create_project
-    from ouroboros.utils import append_jsonl
 
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
     project = create_project(data_dir, f"hidden-{engine}", name="Hidden mount")
-    logs = data_dir / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    append_jsonl(logs / "chat.jsonl", {
+    _store(data_dir, "chat", {
         "direction": "system", "chat_id": 1, "user_id": 1, "type": "project_completion_summary",
         "project_id": project["id"], "project_name": project["name"], "status": "completed",
         "ts": "2026-08-22T11:00:00+00:00", "task_id": f"root-hidden-{engine}",
-        "text": "Hidden mount › Long · Done\nOpen the Project for details.",
+        "text": "Hidden mount › Long · Done",
         "target_label": "Hidden mount › Long", "completion_answer": _LONG_ANSWER})
 
     try:
@@ -270,18 +269,17 @@ def test_ui_project_completion_mirror_has_one_project_door(direct_server_with_da
     from pathlib import Path
     from playwright.sync_api import expect, sync_playwright
     from ouroboros.projects_registry import create_project
-    from ouroboros.utils import append_jsonl
 
     evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR") or direct_server_with_data["data_dir"] / "evidence") / f"mirror-{engine}-{width}"
     evidence.mkdir(parents=True, exist_ok=True)
     root = direct_server_with_data["data_dir"]
     project = create_project(root, f"mirror-door-{engine}-{width}", name="Long report")
     answer = _LONG_ANSWER + "\n\nThe [deep link](https://example.com/deep) and `TAIL_MARKER` end it."
-    append_jsonl(root / "logs" / "chat.jsonl", {
+    _store(root, "chat", {
         "direction": "system", "chat_id": 1, "user_id": 1, "type": "project_completion_summary",
         "project_id": project["id"], "project_name": project["name"], "status": "completed",
         "ts": "2026-08-22T12:00:00+00:00", "task_id": "mirror-door",
-        "text": "Long report · Done with warnings\nOpen the Project for details.",
+        "text": "Long report · Done with warnings",
         "completion_answer": answer, "completion_reason": "Windows verification was not performed.",
         "terminal_time": {"v": 1, "source": "executor_terminal", "occurred_at": "2026-08-22T11:59:00Z"}})
     tab = "Alt+Tab" if engine == "webkit" else "Tab"
@@ -305,8 +303,11 @@ def test_ui_project_completion_mirror_has_one_project_door(direct_server_with_da
                 assert message.locator('[data-fold-stop]').count() == 1
                 assert message.locator('a').evaluate_all('ns => ns.every(n => n.tabIndex === -1)')
                 expect(row.locator('.project-answer-limitation')).to_have_text('Windows verification was not performed.')
-                assert row.locator(':scope > .msg-provenance').count() == 2
-                assert row.locator('.msg-time').inner_text()
+                # The caveat is the one note; the row's own time is its one compact time line (owner 17.10, Q7 A):
+                # it ended a minute before it was added, so both facts, the full instants in its title.
+                assert row.locator(':scope > .msg-provenance').count() == 1
+                assert re.fullmatch(r'Ended .+ · added .+', row.locator('.msg-time [aria-hidden="true"]').inner_text())
+                assert (row.locator('.msg-time').get_attribute('title') or '').startswith('Task ended ')
                 assert row.locator('.system-message-actions').locator('button').count() == 1
                 row.screenshot(path=str(evidence / f'{stage}.png'))
                 if stage == 'history':
@@ -343,7 +344,6 @@ def test_ui_folded_completion_excludes_late_table_focus(direct_server_with_data,
     from pathlib import Path
     from playwright.sync_api import expect, sync_playwright
     from ouroboros.projects_registry import create_project
-    from ouroboros.utils import append_jsonl
 
     root = direct_server_with_data["data_dir"]
     project = create_project(root, f"table-focus-{engine}", name="Table report")
@@ -351,12 +351,12 @@ def test_ui_folded_completion_excludes_late_table_focus(direct_server_with_data,
              + "| " + " | ".join("---" for _ in range(8)) + " |\n"
              + "\n".join("| " + " | ".join("wide-cell-" + "X" * 70 for _ in range(8)) + " |" for _ in range(4)))
     answer = _LONG_ANSWER + "\n\n" + table + "\n\nTABLE_FOCUS_TAIL"
-    append_jsonl(root / "logs" / "chat.jsonl", {
+    _store(root, "chat", {
         "direction": "system", "chat_id": 1, "user_id": 1, "type": "project_completion_summary",
         "project_id": project["id"], "project_name": project["name"], "status": "completed",
         "ts": "2026-08-22T12:00:00+00:00", "task_id": "table-focus",
         "text": "Table report · Done", "completion_answer": answer})
-    append_jsonl(root / "logs" / "chat.jsonl", {
+    _store(root, "chat", {
         "direction": "out", "chat_id": int(project["chat_id"]), "user_id": 1,
         "ts": "2026-08-22T11:59:00+00:00", "task_id": "table-focus", "text": answer})
     evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR") or root / "evidence") / f"table-focus-{engine}"
@@ -460,19 +460,18 @@ def test_ui_folded_completion_excludes_delayed_diagram_fallback(direct_server_wi
     import re
     from playwright.sync_api import expect, sync_playwright
     from ouroboros.projects_registry import create_project
-    from ouroboros.utils import append_jsonl
 
     root = direct_server_with_data["data_dir"]
     project = create_project(root, f"late-diagram-{engine}", name="Diagram report")
     # The fallback is also an implicitly keyboard-focusable overflowing code box.
     diagram_source = 'graph TD; A-->B\n%% ' + 'X' * 250
     answer = _LONG_ANSWER + '\n\n```mermaid\n' + diagram_source + '\n```'
-    append_jsonl(root / "logs" / "chat.jsonl", {
+    _store(root, "chat", {
         "direction": "system", "chat_id": 1, "user_id": 1, "type": "project_completion_summary",
         "project_id": project["id"], "project_name": project["name"], "status": "completed",
         "ts": "2026-08-22T12:00:00+00:00", "task_id": "late-diagram",
         "text": "Diagram report · Done", "completion_answer": answer})
-    append_jsonl(root / "logs" / "chat.jsonl", {
+    _store(root, "chat", {
         "direction": "out", "chat_id": int(project["chat_id"]), "user_id": 1,
         "ts": "2026-08-22T11:59:00+00:00", "task_id": "late-diagram", "text": answer})
     tab = "Alt+Tab" if engine == "webkit" else "Tab"

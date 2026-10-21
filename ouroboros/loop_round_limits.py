@@ -1,8 +1,7 @@
 """Round-limit and terminal-drain handling for the main loop: owner-stop drain
-and its window, incoming-message drain, round compaction and its usage
-accounting, the round-limit context, and the limit/forced/owner-stop/
-provider-unavailable/deadline handlers. Extracted from loop.py (v7 L-B split);
-loop.py re-exports every name."""
+and its window, incoming-message drain, the round's authored context view, the
+round-limit context, and the limit/forced/owner-stop/provider-unavailable/deadline
+handlers. Extracted from loop.py (v7 L-B split); loop.py re-exports every name."""
 
 from __future__ import annotations
 
@@ -16,15 +15,14 @@ import queue
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from ouroboros import task_pacing
-from ouroboros.config import get_light_model
 from ouroboros.context import build_incoming_user_content
+from ouroboros.context_budget import OWNER_WORDS_KIND, WHOLE_CATEGORY
 from ouroboros.deadline_utils import parse_deadline_ts
-from ouroboros.llm import LLMClient, add_usage
-from ouroboros.loop_llm_call import TRANSPORT_DEATHS_KEY, emit_llm_usage_event
-from ouroboros.loop_tool_execution import prune_reclaim_trace_refs, reclaim_negative_memo, reclaim_trace_refs
+from ouroboros.llm import LLMClient
+from ouroboros.loop_llm_call import TRANSPORT_DEATHS_KEY
+from ouroboros.loop_tool_execution import prune_reclaim_trace_refs, reclaim_trace_refs
 from ouroboros.loop_transport import TransportWaitEpisode, finalize_now_transport_terminal as _finalize_now_transport_terminal
 from ouroboros.outcomes import REASON_OWNER_REQUESTED_FINALIZATION
-from ouroboros.pricing import estimate_cost_optional
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.transcript_prefix import sanction_rewrite
 from ouroboros.usage_accounting import invalidate_task_cache_splits
@@ -157,7 +155,7 @@ def _drain_incoming_messages(
                     ts=str(injected.get("ts") or ""),
                 )
                 _loop()._append_or_merge_user_content(
-                    messages, _loop()._owner_marked_content(owner_content), slot=owner_ctx,
+                    messages, _loop()._owner_marked_content(owner_content), slot=owner_ctx, kind=OWNER_WORDS_KIND,
                 )
             else:
                 _loop()._record_owner_directive(
@@ -167,13 +165,13 @@ def _drain_incoming_messages(
                     owner_ctx, msg_id="", client_message_id="", text=str(injected), ts="",
                 )
                 _loop()._append_or_merge_user_message(
-                    messages, _loop()._owner_marked_content(injected), slot=owner_ctx,
+                    messages, _loop()._owner_marked_content(injected), slot=owner_ctx, kind=OWNER_WORDS_KIND,
                 )
         except queue.Empty:
             break
 
     if drive_root is not None and task_id:
-        from ouroboros.owner_mailbox import CONTEXT_ONLY_TASK_PROVENANCES, KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_PAUSE, KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_QUIZ_CLOSED, KIND_TASK_MESSAGE, acknowledge_transcript_entry, deliver_quiz_answer, deliver_task_message, drain_owner_entries
+        from ouroboros.owner_mailbox import CONTEXT_ONLY_TASK_PROVENANCES, KIND_CARD_INPUT, KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_PAUSE, KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_QUIZ_CLOSED, KIND_TASK_MESSAGE, acknowledge_transcript_entry, deliver_quiz_answer, deliver_task_message, drain_owner_entries
 
         if owner_ctx:
             owner_ctx._loop_mailbox_seen_ids = _owner_msg_seen
@@ -226,18 +224,19 @@ def _drain_incoming_messages(
                         origin={"source_task_id": str(entry.get("source_task_id") or ""),
                                 "relayed_from_task_id": str(entry.get("relayed_from_task_id") or "")},
                     )
+                words = OWNER_WORDS_KIND if provenance not in CONTEXT_ONLY_TASK_PROVENANCES else ""
                 deliver_task_message(
                     entry, task_id, event_queue,
-                    lambda text: _loop()._append_or_merge_user_message(messages, text, slot=owner_ctx),
+                    lambda text: _loop()._append_or_merge_user_message(messages, text, slot=owner_ctx, kind=words),
                 )
                 if provenance == "system" and isinstance(entry.get("review_feedback"), dict) and messages:
                     messages[-1].setdefault("review_feedback", []).append(dict(entry["review_feedback"]))
                 ack_content(entry)
                 continue
-            if kind == KIND_QUIZ_CLOSED:
+            if kind in (KIND_QUIZ_CLOSED, KIND_CARD_INPUT):  # host frames around the owner's own act
                 _loop()._record_owner_directive(owner_ctx, source="owner_mailbox",
                     content=dmsg, msg_id=str(entry.get("msg_id") or ""))
-                _loop()._append_or_merge_user_message(messages, dmsg, slot=owner_ctx)
+                _loop()._append_or_merge_user_message(messages, dmsg, slot=owner_ctx, kind=OWNER_WORDS_KIND)
                 ack_content(entry)
                 continue
             if kind == KIND_QUIZ_ANSWER:
@@ -253,7 +252,8 @@ def _drain_incoming_messages(
                 )
                 deliver_quiz_answer(
                     entry, task_id, event_queue,
-                    lambda text: _loop()._append_or_merge_user_message(messages, text, slot=owner_ctx),
+                    lambda text: _loop()._append_or_merge_user_message(messages, text, slot=owner_ctx,
+                                                                       kind=OWNER_WORDS_KIND),
                 )
                 ack_content(entry)
                 continue
@@ -291,7 +291,7 @@ def _drain_incoming_messages(
                 owner_content = noted_owner_text(owner_ctx, entry, owner_content)
             _loop()._append_or_merge_user_content(
                 messages, _loop()._owner_marked_content(owner_content),
-                slot=owner_ctx,
+                slot=owner_ctx, kind=OWNER_WORDS_KIND,
             )
             ack_content(entry)
             if event_queue is not None:
@@ -312,24 +312,8 @@ def _drain_incoming_messages(
     return controls
 
 
-def _context_reclaim_passes(tool_ctx: Any) -> set[Tuple[str, str]]:
-    passes = getattr(tool_ctx, "_context_reclaim_passes", None)
-    if not isinstance(passes, set):
-        passes = set()
-        tool_ctx._context_reclaim_passes = passes
-    return passes
-
-
-def _context_reclaim_materializations(tool_ctx: Any) -> set[Tuple[str, str]]:
-    materialized = getattr(tool_ctx, "_context_reclaim_materializations", None)
-    if not isinstance(materialized, set):
-        materialized = set()
-        tool_ctx._context_reclaim_materializations = materialized
-    return materialized
-
-
-def _context_overflow_retries(tool_ctx: Any) -> set[Tuple[str, str, str]]:
-    """Per-task ``(route_fp, round_id, rung)`` latch of the refusal ladder (``OVERFLOW_RUNGS``)."""
+def _context_overflow_retries(tool_ctx: Any) -> set[Tuple[str, str]]:
+    """Per-task ``(round_id, pass)`` record of the refusal passes (``REFUSAL_PASSES``): once per round, any route."""
     retries = getattr(tool_ctx, "_context_overflow_retries", None)
     if not isinstance(retries, set):
         retries = set()
@@ -340,54 +324,25 @@ def _context_overflow_retries(tool_ctx: Any) -> set[Tuple[str, str, str]]:
 def _run_round_compaction(
     messages: List[Dict[str, Any]],
     ctx: _CompactionRoundContext,
-) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """The round's transcript maintenance before the send: an explicit manual
-    reclaim (Main fit owns automatic decisions), then -- on the transcript that
-    will actually go out -- the host roster of independent roots as a TAIL row
-    when it changed (owner 6C). The note follows any reclaim so it is never
-    folded into a rewrite, and precedes the acceptance observation and the seal."""
+) -> List[Dict[str, Any]]:
+    """The round's transcript maintenance before the send: the mind's pending authored
+    view (Main fit owns every automatic decision), then -- on the transcript that will
+    actually go out -- the host roster of independent roots as a TAIL row when it changed
+    (owner 6C). The note follows any view so it is never folded into a rewrite, and precedes
+    the acceptance observation and the seal."""
     from ouroboros.peer_roster import maybe_append_roster_note
     from ouroboros.tools.owner_delivery import publish_pending_owner_dialogue
 
     publish_pending_owner_dialogue(ctx.tools._ctx, messages)
-    # Only an explicit manual reclaim runs here; Main fit owns automatic decisions.
-    usage: Optional[Dict[str, Any]] = None
     pending = getattr(ctx.tools._ctx, "_pending_compaction", None)
     selected_names = getattr(ctx.tools._ctx, "_pending_tool_schema_names", None)
-    if pending is None and selected_names is None:
-        pass
-    elif isinstance(pending, dict) or pending is None:
+    if isinstance(pending, dict) or (pending is None and selected_names is not None):
         messages = _run_authored_context_view(messages, ctx, pending, selected_names)
-    else:
-        from ouroboros._usage_wait import receiver_abandonable
-
-        with receiver_abandonable():
-            messages, receipt, usage = _loop().compact_tool_history_llm(
-                messages,
-                keep_recent=max(0, int(pending)),
-                drive_root=ctx.drive_root or pathlib.Path(ctx.drive_logs).parent,
-                task_id=ctx.task_id,
-                negative_memo=reclaim_negative_memo(ctx.tools._ctx),
-                trace_refs_by_tool_call_id=reclaim_trace_refs(ctx.tools._ctx),
-                exposed_units=(getattr(ctx.tools._ctx, "_last_context_observation", {}) or {}).get("exposed_units", []),
-            )
-        ctx.tools._ctx._pending_compaction = None  # an interrupted request survives the pause
-        _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
-            "checkpoint_kind": "context_reclaim_manual",
-            "round": ctx.round_idx,
-            "status": receipt.status,
-            "reclaimed_tokens": receipt.reclaimed_tokens,
-            "goal_reached": receipt.goal_reached,
-            "checkpoint_ref": receipt.checkpoint_ref,
-        })
-        if receipt.status in {"checkpoint_failed", "summarizer_failed", "binding_mismatch"}:
-            ctx.emit_progress(
-                f"⚠️ Context compaction kept the transcript unchanged ({receipt.status})."
-            )
-        if receipt.status == "applied":
-            invalidate_task_cache_splits(ctx.task_id)
-            prune_reclaim_trace_refs(ctx.tools._ctx, messages)
-            sanction_rewrite(ctx.tools._ctx, "compaction")
+    elif pending is not None:
+        # A count-only request saved by an earlier version named a helper summarizer that no longer exists.
+        ctx.tools._ctx._pending_compaction = None
+        ctx.emit_progress("Context view kept unchanged: a saved count-only reclaim named a retired helper; "
+                          "fold with compact_context(working_note=...).")
     # Normally consumed by process_tool_results before any owner-wait park. This
     # also covers a typed producer notification published outside a tool batch.
     if getattr(ctx.tools._ctx, "_pending_review_context", None):
@@ -396,7 +351,9 @@ def _run_round_compaction(
         messages = [*messages, *updates]
         ctx.tools._ctx._pending_review_context = {}
     maybe_append_roster_note(ctx.tools._ctx, messages, ctx.drive_root)
-    return messages, usage
+    from ouroboros.skill_context_snapshot import maybe_append_skill_snapshots
+    maybe_append_skill_snapshots(ctx.tools._ctx, messages, ctx.drive_root)
+    return messages
 
 
 def _run_authored_context_view(messages, ctx, pending, selected_names):
@@ -404,7 +361,6 @@ def _run_authored_context_view(messages, ctx, pending, selected_names):
     from ouroboros.context_budget import ContextReclaimRequest
     from ouroboros.context_compaction import compact_tool_history_llm, context_reclaim_transcript_sha256
     from ouroboros.tool_policy import request_tool_schema_selection, select_tool_schemas
-    from ouroboros.tools.compact_context import owner_protected_texts
 
     tool_ctx = ctx.tools._ctx
     mode = getattr(tool_ctx, "active_context_mode", "") or "max"
@@ -427,7 +383,8 @@ def _run_authored_context_view(messages, ctx, pending, selected_names):
         # after a wait or fallback; do not carry a second routing snapshot here.
         fit_candidate = lambda candidate, selected: _loop()._measure_main_context_view(
             getattr(tool_ctx, "context_fit_plan", None), candidate, selected,
-            mode, getattr(tool_ctx, "active_effort", "medium"), str(ctx.round_idx))
+            mode, getattr(tool_ctx, "active_effort", "medium"), str(ctx.round_idx),
+            usage=getattr(tool_ctx, "_accumulated_usage", None))
     if pending is None:
         # Schema-only enablement uses the same candidate fit/publication. It
         # does not fabricate an authored note or rewrite existing history.
@@ -451,15 +408,12 @@ def _run_authored_context_view(messages, ctx, pending, selected_names):
             measurement_basis="cold_estimate", measurement_density=1.0, reclaim_goal_tokens=0,
             **{key: proposal[key] for key in ("working_note", "expected_view_revision", "keep_unit_ids", "restore_unit_refs", "schema_names")},
         )
-        candidate, result, _ = compact_tool_history_llm(
+        candidate, result = compact_tool_history_llm(
             messages, request=request, observed_messages=observed["messages"],
             observed_tool_schemas=observed["tool_schemas"], tool_schemas=schemas,
             fit_candidate=fit_candidate, drive_root=ctx.drive_root or pathlib.Path(ctx.drive_logs).parent,
             task_id=ctx.task_id, trace_refs_by_tool_call_id=reclaim_trace_refs(tool_ctx),
             exposed_units=observed.get("exposed_units"),
-            # Typed provenance, not role=user: the owner's words (direct, mailbox, late
-            # answers, quiz frames, principal task messages) stay whole in an authored view.
-            protected_texts=owner_protected_texts(tool_ctx),
         )
         receipt = asdict(result)
         if receipt["status"] == "no_op" and (proposal.get("review_transfers") or proposal.get("review_notes")):
@@ -531,6 +485,9 @@ def _run_authored_context_view(messages, ctx, pending, selected_names):
             ctx.emit_progress("Context view kept unchanged: the review selection was not durably published.")
     if receipt["status"] == "applied":
         receipt["view_revision"] = receipt["after_transcript_sha256"] = context_reclaim_transcript_sha256(candidate)
+        from ouroboros.main_context_authority import publish_working_notes
+
+        publish_working_notes(tool_ctx, candidate)  # a successor's notes row, review history or not
         source_append = bool(receipt.get("restored_unit_refs")) and not receipt.get("selection_fingerprint") and schemas == current_tools
         current_tools[:] = schemas
         if not source_append:
@@ -579,35 +536,6 @@ class _RoundLimitContext:
     # provider prefix as the working round instead of rebuilding it tool-less.
     # LAST field: existing positional construction (tests included) stays valid.
     tool_schemas: Optional[List[Dict[str, Any]]] = None
-
-
-def _account_compaction_usage(
-    accumulated_usage: Dict[str, Any],
-    compaction_usage: Dict[str, Any],
-    event_queue: Optional[queue.Queue],
-    task_id: str,
-) -> None:
-    """Fold a compaction pass's usage into the loop totals and emit its llm_usage
-    event (light-model lane). Extracted verbatim from ``run_llm_loop`` for the
-    300-line function gate; behavior unchanged."""
-    add_usage(accumulated_usage, compaction_usage)
-    _cm = get_light_model()
-    _cc = (
-        float(compaction_usage["cost"])
-        if compaction_usage.get("cost") is not None
-        else estimate_cost_optional(
-            _cm,
-            int(compaction_usage.get("prompt_tokens") or 0),
-            int(compaction_usage.get("completion_tokens") or 0),
-            cache_usage={
-                "cached_tokens": int(compaction_usage.get("cached_tokens") or 0),
-                "cache_write_tokens": int(compaction_usage.get("cache_write_tokens") or 0),
-                "prompt_cache_ttl": compaction_usage.get("prompt_cache_ttl"),
-            },
-            provider=str(compaction_usage.get("provider") or "openrouter"),
-        )
-    )
-    emit_llm_usage_event(event_queue, task_id, _cm, compaction_usage, _cc, "compaction")
 
 
 def _handle_round_limit(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
@@ -1048,21 +976,25 @@ def _finalize_limit_ctx(
 # ---------------------------------------------------------------------------
 
 
-def _publish_reclaimed_transcript(ctx: Any, rebuilt: list) -> None:
-    """Publish a reclaim candidate as the live transcript (the same seams every pass uses)."""
+def _publish_reclaimed_transcript(ctx: Any, rebuilt: list, *, by: str = "compaction") -> None:
+    """Publish a reclaim candidate as the live transcript (the same seams every pass uses).
+
+    ``by`` names the rewrite for the next send's prefix record: a refusal pass or a renewal is no fold."""
     invalidate_task_cache_splits(ctx.task_id)
     ctx.messages[:] = rebuilt
-    sanction_rewrite(ctx.tools._ctx, "compaction")
+    sanction_rewrite(ctx.tools._ctx, by)
     ctx.tools._ctx.messages = ctx.messages
     _loop().seal_task_transcript(ctx.messages)
     prune_reclaim_trace_refs(ctx.tools._ctx, ctx.messages)
 
 
-def _run_emergency_address_pass(ctx: Any, disposition: Any, *, rung: str) -> Any:
-    """Publish a model-free source view, measuring the sealed candidate with its next facts line."""
+def _run_emergency_address_pass(ctx: Any, disposition: Any, *, rung: str, goal_tokens: Optional[int] = None) -> Any:
+    """Publish a model-free source view, measuring the sealed candidate with its next facts line.
+
+    ``goal_tokens`` is the refusal's measured target (``loop_model_call._refusal_target``); without
+    one the pass takes its whole category, never one unit sized by a missing number."""
     from ouroboros.context_budget import ContextReclaimRequest
     from ouroboros.context_compaction import context_reclaim_transcript_sha256, emergency_address_view
-    from ouroboros.tools.compact_context import owner_protected_texts
     from ouroboros.loop_messages import append_context_facts
 
     measurement = disposition.measurement
@@ -1088,18 +1020,17 @@ def _run_emergency_address_pass(ctx: Any, disposition: Any, *, rung: str) -> Any
         route_fp=measurement.route_fp, round_id=measurement.round_id,
         transcript_sha256=context_reclaim_transcript_sha256(ctx.messages),
         measurement_basis=measurement.measurement_basis, measurement_density=measurement.measurement_density,
-        reclaim_goal_tokens=max(1, int(measurement.reclaim_goal_tokens)), allow_partial_shrink=True,
+        reclaim_goal_tokens=int(goal_tokens) if goal_tokens else WHOLE_CATEGORY, allow_partial_shrink=True,
     )
     rebuilt, receipt = emergency_address_view(
         ctx.messages, request, rung=rung,
-        protected_texts=owner_protected_texts(tool_ctx),
         observation=getattr(tool_ctx, "_last_context_observation", {}) or {},
         measure_candidate=measure_candidate,
         trace_refs_by_tool_call_id=reclaim_trace_refs(tool_ctx),
         drive_root=pathlib.Path(ctx.drive_root or ctx.drive_logs.parent), task_id=ctx.task_id,
     )
     if receipt.status == "applied":
-        _publish_reclaimed_transcript(ctx, rebuilt)
+        _publish_reclaimed_transcript(ctx, rebuilt, by=f"refusal_pass:{rung}")
     _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
         "type": "context_reclaim", "checkpoint_kind": "context_reclaim_emergency", "rung": rung,
         "round": ctx.round_idx, "route_fp": measurement.route_fp, "round_id": measurement.round_id,
@@ -1109,23 +1040,25 @@ def _run_emergency_address_pass(ctx: Any, disposition: Any, *, rung: str) -> Any
     return receipt
 
 
-def _coarsen_memory_view(ctx: Any, fit: Any) -> bool:
+def _coarsen_memory_view(ctx: Any, fit: Any, *, saving: Optional[int] = None) -> bool:
     """Narrow memory beside the actual transcript without inventing a smaller route window.
 
-    The refusal is the evidence: the view saves at least the measured capacity deficit, and at
-    least one element when the estimate still fits, from the level it shows (no target or
-    working margin reapplied, nothing addressed unfolds)."""
+    The refusal is the evidence: the view saves the refusal's measured ``saving`` (else the capacity
+    deficit, else at least one element) from the level it shows (no target or working margin
+    reapplied, nothing addressed unfolds)."""
     plan = ctx.context_fit_plan
     measurement = fit.measurement
-    if plan is None or measurement.capacity_total_tokens is None or getattr(plan, "core", None) is None:
+    if plan is None or getattr(plan, "core", None) is None:
         return False
     mode = str(ctx.active_context_mode or "max")
     before = plan.projection(mode).system_content_json
+    capacity = measurement.capacity_total_tokens
     rebound = plan.reproject_for_route(
-        window_tokens=int(measurement.capacity_total_tokens), known_window=True,
+        window_tokens=int(capacity or 0), known_window=capacity is not None,
         ratio=float(plan.projection(mode).calibration_ratio or 1.0),
         output_reserve=int(plan.output_reserve_tokens), tool_schemas=ctx.tool_schemas, start_mode=mode,
-        current_messages=ctx.messages, refused_tokens=max(1, int(measurement.capacity_deficit_tokens or 0)),
+        current_messages=ctx.messages,
+        refused_tokens=max(1, int(saving or measurement.capacity_deficit_tokens or 0)),
     )
     if rebound.projection(mode).system_content_json == before:
         return False

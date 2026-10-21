@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from ouroboros.test_evidence import diagnostic_directory
+
 from tests._store_shared import seed_result
 
 pytest_plugins = ("tests.test_ui_smoke_playwright",)
@@ -111,6 +113,8 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
         "text": "Normal final answer after the terminal progress anchor.",
         "format": "markdown",
     }
+    # The dialogue store imports a live log file only at boot: seed while no server runs.
+    direct_server_with_data["stop_server"]()
     (logs_dir / "chat.jsonl").write_text(
         json.dumps(summary) + "\n" + json.dumps(ordinary_final) + "\n",
         encoding="utf-8",
@@ -165,6 +169,7 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
         "review_projection": projection,
         "plan_review_state": plan_state,
     })
+    direct_server_with_data["start_server"]()
 
     try:
         with sync_playwright() as pw:
@@ -196,7 +201,7 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
                 # The Plan review group is hydrated from the task detail once the card opens; the helper
                 # opens the FIRST group, so open the card here and let the Plan group arrive (first)
                 # before the helper walks the section.
-                no_summary.locator(":scope > [data-live-summary-button]").click()
+                no_summary.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
                 no_summary.locator('[data-review-group^="plan:"]').wait_for(state="attached", timeout=30_000)
                 _open_review_checkpoint(no_summary, open_card=False)
                 assert no_summary.locator('[data-live-phase]').first.get_attribute("data-phase") == "warn"
@@ -216,7 +221,7 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
                 page.wait_for_timeout(900)  # cover the routine background history sync
                 assert no_summary.locator('.chat-live-line-repeat:not([hidden])').count() == 0
                 assert card.locator('.chat-live-line-repeat:not([hidden])').count() == 0
-                page.screenshot(path=str(data_dir.parent / "review-truth-chat.png"), full_page=True)
+                page.screenshot(path=str(diagnostic_directory(data_dir.parent, "review-checkpoint") / "review-truth-chat.png"), full_page=True)
 
                 page.click('[data-nav-page="dashboard"]')
                 page.click('[data-dashboard-tab="logs"]')
@@ -234,7 +239,7 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
                 assert "Reviewer fable findings omitted: 1" in log_text
                 assert log_card.locator('[data-task-phase]').inner_text() == "warn"
                 review.scroll_into_view_if_needed()
-                review.screenshot(path=str(data_dir.parent / "review-truth-logs.png"))
+                review.screenshot(path=str(diagnostic_directory(data_dir.parent, "review-checkpoint") / "review-truth-logs.png"))
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -245,42 +250,50 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
 
 @pytest.mark.ui_browser
 @pytest.mark.serial
-def test_ui_smoke_action_only_author_finish_keeps_the_reviewer_fail(direct_server_with_data, tmp_path, monkeypatch):
-    """TZ-2 C4 in the real review renderer: Main's final response after a FAIL panel is an
-    action-only finish (no stance). The record comes from the real acceptance loop (only the
-    model and the panel are substituted); the card shows the author's act and rationale beside
-    the independent reviewer FAIL and never an invented accepted/partial/solved."""
+def test_ui_smoke_action_only_author_finish_keeps_the_reviewer_fail(direct_server_with_data):
+    """TZ-2 C4 in the real review renderer: Main's final response after a FAIL panel was an
+    action-only finish (no stance). The retired acceptance loop stored that decision on the
+    task's outcome axes beside the panel; nothing writes one now, so the record is stored here
+    in its shape. The card shows the author's act and rationale beside the independent
+    reviewer FAIL and never an invented accepted/partial/solved."""
     import re
 
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
 
-    from ouroboros.outcomes import derive_loop_outcome
-    from ouroboros.review_substrate import compact_review_projection
-    from tests.test_acceptance_author_stop import _finish_tool_call, _run_stop_loop
+    from ouroboros.review_projection import compact_review_projection
+    from ouroboros.review_records import build_author_disposition
 
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "cyber_pro")
-    (tmp_path / "producer").mkdir()
-    # Produced evidence makes the Required panel run on the first answer; the author's next turn is the
-    # action-only `finish_task` (no stance), the shape the loop's finish front door now takes.
-    run = _run_stop_loop(tmp_path / "producer", monkeypatch,
-                         ["The export endpoint ships.", *[_finish_tool_call("The export endpoint ships.")] * 3],
-                         stop_services=False, produced=True)
-    axes = derive_loop_outcome(run.result, run.usage, run.trace)["outcome_axes"]
-    decision = axes["review"]["acceptance_decision"]
-    assert decision["reason"] == "author_finish" and decision["author_disposition"]["disposition"] == ""
-    projection = compact_review_projection(run.trace["review_runs"])
+    task_id = "c4-action-only"
+    # An action-only finish carries no rationale of its own: the record's default is the stated act.
+    author = build_author_disposition(disposition="", action="finish", rationale="Explicit completion selection.",
+                                      subject_hash="a" * 64, reviewer_signal="FAIL", enforcement="advisory",
+                                      source="finish_task")
+    axes = {"lifecycle": {"status": "completed"}, "execution": {"status": "ok"},
+            "objective": {"status": "best_effort"}, "artifacts": {"status": "ready"},
+            "review": {"status": "fail", "acceptance_decision": {
+                "status": "finalized_unaccepted", "reason": "author_finish", "source": "task_acceptance_review",
+                "author_disposition": author, "review_pending": False}}}
+    finding = {"severity": "high", "item": "No test covers the export endpoint", "recommendation": "Add an endpoint test"}
+    projection = compact_review_projection([{
+        "request": {"surface": "task_acceptance", "task_id": task_id}, "authority": "host_root",
+        "panel_id": "panel_1", "aggregate_signal": "FAIL", "parsed_findings": [finding],
+        "actors": [{"slot_id": "s1", "model": "fixture/reviewer", "signal": "FAIL", "status": "ok",
+                    "operation_state": "settled",
+                    "parsed": {"verdict": "FAIL", "summary": "The export endpoint is untested.", "findings": [finding]}}]}])
     data_dir = direct_server_with_data["data_dir"]
     (data_dir / "logs").mkdir(parents=True, exist_ok=True)
-    task_id = "c4-action-only"
+    # The dialogue store imports a live log file only at boot: seed while no server runs.
+    direct_server_with_data["stop_server"]()
     (data_dir / "logs" / "chat.jsonl").write_text(json.dumps({
         "ts": "2026-09-26T10:00:00+00:00", "direction": "system", "type": "task_summary", "task_id": task_id,
         "chat_id": 1, "status": "completed", "text": "", "tool_calls": 0, "rounds": 1,
         "outcome_axes": axes, "review_projection": projection}) + "\n", encoding="utf-8")
     seed_result(data_dir, task_id, {
         "_schema_version": 1, "task_id": task_id, "status": "completed", "reason_code": "final_message",
-        "result": run.result, "outcome_axes": axes, "review_projection": projection})
+        "result": "The export endpoint ships.", "outcome_axes": axes, "review_projection": projection})
+    direct_server_with_data["start_server"]()
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
@@ -303,7 +316,7 @@ def test_ui_smoke_action_only_author_finish_keeps_the_reviewer_fail(direct_serve
                 assert "FAIL" in group.locator("[data-review-attempt] .chat-review-attempt-meta").first.inner_text()
                 assert not re.search(r"\bsolved\b", card.inner_text(), re.I)
                 card.scroll_into_view_if_needed()
-                card.screenshot(path=str(data_dir.parent / "c4-action-only-author-finish.png"))
+                card.screenshot(path=str(diagnostic_directory(data_dir.parent, "review-checkpoint") / "c4-action-only-author-finish.png"))
             finally:
                 browser.close()
     except PlaywrightError as exc:

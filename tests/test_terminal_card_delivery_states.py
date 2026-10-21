@@ -11,6 +11,8 @@ and the registration sees "not yet", never a card without the answer.
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import json
 import pathlib
 import queue as stdqueue
@@ -56,9 +58,7 @@ def _ctx(root, sent):
 
 def _chat_rows(root):
     path = root / "logs" / "chat.jsonl"
-    if not path.exists():
-        return []
-    return [row for row in map(json.loads, filter(str.strip, path.read_text(encoding="utf-8").splitlines()))]
+    return [row for row in map(json.loads, filter(str.strip, dialogue_test.log_text(path).splitlines()))]
 
 
 def _terminal_rows(root, tid):

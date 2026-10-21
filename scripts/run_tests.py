@@ -16,9 +16,11 @@ overlap the parallel tests instead of waiting for them; `--sequential` keeps the
 `ouroboros.preflight_runner` and `.github/workflows/ci.yml` in two passes.
 The reviewed-commit gate and CI stay the authority: this script is feedback.
 
-The marker exclusions and xdist flags are imported from the gate's SSOT
-(`LANE_EXCLUSION_EXPR`, `PARALLEL_PASS_FLAGS`), never restated here. Data-root
-isolation is `tests/conftest.py`'s job and is not repeated either.
+Re-executes through safe_test: isolated HOME/data, owner/provider env scrubbed,
+durable logs/source/diagnostics in <checkout>/../.test-evidence by default.
+Ctrl-C reaches each phase's runner, allowing pytest JUnit/results export before escalation.
+Marker exclusions/xdist flags come from the gate's SSOT
+(`LANE_EXCLUSION_EXPR`, `PARALLEL_PASS_FLAGS`); conftest isolates test roots.
 """
 from __future__ import annotations
 
@@ -38,6 +40,7 @@ if str(REPO) not in sys.path:
 
 _MAX_SERIAL_SHARDS = 4
 _PYTEST_EXIT_NO_TESTS = 5
+_INTERRUPT_EXPORT_SEC, _INTERRUPT_TERM_SEC = 7, 2  # busy xdist workers already spend ~5 s in teardown
 
 
 def _workers() -> int:
@@ -88,18 +91,21 @@ def _run(label: str, argv: list[str], cwd: pathlib.Path) -> int:
     from ouroboros.process_containment import ProcessContainer
     from ouroboros.test_parallelism import NESTED_WORKERS_ENV, bounded_test_command
 
-    print(f"\n=== {label}: {shlex.join(argv[2:] if argv[0] == sys.executable else argv)}", flush=True)
     started = time.monotonic()
     env = node_environment(os.environ)
     env["PYTEST_XDIST_AUTO_NUM_WORKERS"] = str(_workers())
     env[NESTED_WORKERS_ENV] = env["PYTEST_XDIST_AUTO_NUM_WORKERS"]
+    argv = bounded_test_command(argv, env)
+    print(f"\n=== {label}: {shlex.join(argv[2:] if argv[0] == sys.executable else argv)}", flush=True)
     container = ProcessContainer(lifeline=True, overload=True)
     proc = None
     try:
-        proc = container.spawn(bounded_test_command(argv, env), cwd=str(cwd), env=env)
+        proc = container.spawn(argv, cwd=str(cwd), env=env)
         code = proc.wait()
     except KeyboardInterrupt:
         code = 130
+        if proc is not None:
+            _stop_interrupted(container, proc)
     finally:
         try:
             diagnostic = container.reap()
@@ -116,6 +122,22 @@ def _run(label: str, argv: list[str], cwd: pathlib.Path) -> int:
         code = 1
     print(f"=== {label}: exit {code} in {time.monotonic() - started:.0f}s", flush=True)
     return code
+
+
+def _stop_interrupted(container, proc) -> None:
+    """Pass the INT safe_test forwarded here on to the runner, whose own session hides it.
+
+    The export wait and the TERM grace are allotted inside safe_test's INT window for
+    this process (its `_GRACE_SEC`); the following reap has its own deadline, so that
+    window, not this allotment, bounds the whole. On overrun safe_test stops and reaps
+    the tree itself: still 130, but this runner's own report may be incomplete.
+    """
+    if container.interrupt_root():
+        try:
+            proc.wait(timeout=_INTERRUPT_EXPORT_SEC)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            pass  # A slow export or a repeated INT only ends this wait; the tree is still stopped.
+    container.terminate_tree(_INTERRUPT_TERM_SEC)
 
 
 def _node_lane() -> int:
@@ -203,7 +225,7 @@ def _selected(args, evidence) -> int:
 
 
 def _defer_full(selection):
-    """A full escalation this leg cannot finish (Windows runs full in four landed shards).
+    """A full escalation this leg cannot finish (Windows runs full in eight landed shards).
 
     The leg still runs the PR minimum, the contract floor and the Node lane, and says
     what it left to the landed matrix.
@@ -238,6 +260,9 @@ def main(argv: list[str] | None = None) -> int:
                         metavar="DIR")
     args, pytest_args = parser.parse_known_args(argv)
     evidence = args.evidence_dir.resolve() if args.evidence_dir is not None else None
+    explicit_pytest_evidence = any(arg.split("=", 1)[0] == "--ci-evidence-dir" for arg in pytest_args)
+    if evidence is None and not explicit_pytest_evidence and os.environ.get("OUROBOROS_TEST_EVIDENCE_ROOT"):
+        evidence = pathlib.Path(os.environ["OUROBOROS_TEST_EVIDENCE_ROOT"]) / "pytest"
     if not (REPO / "tests" / "conftest.py").is_file():
         print(f"{REPO} is not an Ouroboros checkout (no tests/conftest.py)", file=sys.stderr)
         return 2
@@ -280,4 +305,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # CLI execution always acquires a real outer owner. A merely present temp
+    # variable cannot prove one exists; in-process main() remains a plain helper.
+    bootstrap = "import runpy,sys; raise SystemExit(runpy.run_path(sys.argv[1])['main'](sys.argv[2:]))"
+    owner = [sys.executable, "-I", "-S", str(REPO / "scripts/safe_test.py"), "--",
+             sys.executable, "-c", bootstrap, str(pathlib.Path(__file__).resolve()), *sys.argv[1:]]
+    if os.name == "nt":
+        sys.exit(subprocess.call(owner))  # Windows exec is a new process; keep the waiting parent.
+    os.execv(sys.executable, owner)  # POSIX: the signalled PID is the owner itself.

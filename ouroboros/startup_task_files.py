@@ -42,7 +42,27 @@ def startup_tree_exclusions(root):
     return protected
 
 
+def _drive_stamps(root, task_id):
+    """Each own child drive of TASK_ID with its store's identity (the database file and the commits
+    its WAL log still holds, ``store.log_identity``): what a resting recovery waits on."""
+    from ouroboros.store import log_identity
+    from ouroboros.task_custody import own_child_drives
+
+    stamps = []
+    for drive in own_child_drives(root, task_id):
+        database = drive / "state" / "current.sqlite"
+        try:
+            info = database.stat()
+            stamps.append([str(drive), info.st_ino, info.st_size, info.st_mtime_ns, log_identity(database)])
+        except OSError:
+            stamps.append([str(drive)])
+    return stamps
+
+
 def recover_terminal_task_files(drive_root, protected):
+    """Recover terminal files of addressed ``pending_drives``. A settled member whose last pass found only
+    facts a restart cannot change -- no own drive left, or a child whose result never settled -- rests
+    (``obligations.DutyRest``) on its row and its drives' store identities, reported as it was found."""
     from ouroboros import obligations as o
     from ouroboros.cancel_intents import cancel_pending
     from ouroboros.headless import prepare_terminal_task_files, terminal_task_files_ready
@@ -59,7 +79,19 @@ def recover_terminal_task_files(drive_root, protected):
         report["errors"].append(str(exc))
         report["unresolved"].append("*")
         return report
+    stamps = {}
+    for task_id in candidates:
+        try:
+            stamps[task_id] = {"drives": _drive_stamps(root, validate_task_id(task_id))}
+        except (OSError, ValueError):
+            continue  # examined below, which reports why
+    rest = o.DutyRest(root, "drive_recovery", stamps)
     for task_id in sorted(candidates.keys() - protected):
+        if task_id in rest.resting:
+            if (rest.resting[task_id].get("report") or {}).get("unresolved"):
+                report["unresolved"].append(task_id)
+            continue
+        acted, waits, unresolved = False, set(), len(report["unresolved"])
         try:
             validate_task_id(task_id)
             current = load_task_result(root, task_id, strict=True) or {}
@@ -71,9 +103,11 @@ def recover_terminal_task_files(drive_root, protected):
                 pending = _has_pending_ref_promotion(current.get("child_ref_promotion"))
                 if ready:
                     o.drive_finished(root, task, current)
+                    acted = True
                     continue
                 source = load_task_result(child_root, task_id, strict=True) or {}
                 if source.get("status") not in SETTLED_STATUSES:
+                    waits.add("child_result_unsettled")
                     if (current.get("status") == "scheduled" and source.get("status") == "running"
                             and source.get("started_at") and not source.get("_is_direct_chat")
                             and not cancel_pending(root, task_id, strict=True)):
@@ -84,10 +118,12 @@ def recover_terminal_task_files(drive_root, protected):
                                 budget_drive_root=str(root), started_at=source["started_at"],
                                 ts=source.get("ts") or source["started_at"])
                             report.setdefault("rebound", []).append(task_id)
+                            acted = True
                     if pending or current.get("status") == "completed":
                         report["unresolved"].append(task_id)
                     continue
                 task = {**source, **current, "id": task_id, "drive_root": str(child_root)}
+                acted = True
                 prepared = prepare_terminal_task_files(root, task)
                 settled = prepared.get("result")
                 if prepared["error"] or not terminal_task_files_ready(root, task, settled):
@@ -96,7 +132,11 @@ def recover_terminal_task_files(drive_root, protected):
                     report["recovered"].append(task_id)
             if current and terminal_task_files_ready(root, {**current, "id": task_id}, current):
                 o.drive_finished(root, {**current, "id": task_id}, current)
+            elif not acted and current.get("status") in SETTLED_STATUSES:
+                rest.wait(task_id, *(waits or {"child_drive_absent"}),
+                          report={"unresolved": len(report["unresolved"]) > unresolved})
         except Exception as exc:
             report["unresolved"].append(task_id)
             report["errors"].append(f"{task_id}: {type(exc).__name__}: {exc}")
+    rest.commit()
     return report

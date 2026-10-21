@@ -243,11 +243,14 @@ export function createChatHistoryPager({
     // `stillWanted` marks an explicit navigation to one place: a newer one supersedes it while it
     // loads, it waits out a window read rather than replacing it, and its failure is its own, never
     // the window's Retry.
-    function request(direction, index, cursor, newChain = false, { query = null, stillWanted = null } = {}) {
+    function request(direction, index, cursor, newChain = false, { query = null, stillWanted = null, prepared = null } = {}) {
         if (!alive()) return Promise.resolve({ status: 'disposed' });
+        const newest = stillWanted && newestInFlight();
+        if (newest) return newest.then(() => stillWanted()
+            ? request(direction, index, cursor, newChain, { query, stillWanted, prepared }) : { status: 'superseded' });
         if (pending && stillWanted && pending.stillWanted) { pending.abort.abort(); pending = null; }
         if (pending && stillWanted) return pending.promise.then(() => (stillWanted()
-            ? request(direction, index, cursor, newChain, { query, stillWanted }) : { status: 'superseded' }));
+            ? request(direction, index, cursor, newChain, { query, stillWanted, prepared }) : { status: 'superseded' }));
         if (pending) return pending.direction === direction
             ? pending.promise : Promise.resolve({ status: 'busy' });
         const operation = { direction, index, cursor, newChain, stillWanted, abort: new AbortController(), landed: landedArrivals };
@@ -255,7 +258,7 @@ export function createChatHistoryPager({
         pending = operation;
         operation.promise = Promise.resolve()
             .then(() => alive() && pending === operation
-                ? fetchPage(cursor, { signal: operation.abort.signal, ...query }) : null)
+                ? prepared || fetchPage(cursor, { signal: operation.abort.signal, ...query }) : null)
             .then(data => {
                 if (!alive() || pending !== operation) return { status: 'disposed' };
                 const result = land(data, operation);
@@ -398,7 +401,9 @@ export function createChatHistoryPager({
         // One explicit navigation to one place, as a new chain: the page around `address`
         // (`task:<id>`, DESIGN "Room work status"), or a page the reader left read again by its
         // `page_cursor` (`revisit`). Dropped before it applies once `stillWanted()` says no.
-        around: (address, stillWanted) => request('around', 0, null, true, { query: { around: address }, stillWanted }),
+        // app may have read the destination before switching rooms, so a failed read leaves the old view intact.
+        around: (address, stillWanted, prepared = null) => request('around', 0, null, true,
+            { query: { around: address }, stillWanted, prepared }),
         revisit: (cursor, stillWanted) => request('revisit', 0, cursor, true, { stillWanted }),
         // The `page_cursor` of this chain's page that holds a row, if one does: where a return reads it again.
         pageOf: id => pages.find(page => pageRows.get(page.id)?.has(id))?.requestCursor ?? null,

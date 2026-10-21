@@ -18,7 +18,7 @@ from ouroboros.composer_cognition import ensure_project_cognition, main_cognitio
 from ouroboros.contracts.schema_versions import with_schema_version
 from ouroboros.project_facts import sanitize_project_id
 from ouroboros.store import open_store
-from ouroboros.utils import atomic_write_json, iter_jsonl_objects, read_json_dict, utc_now_iso, strip_markdown
+from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso, strip_markdown
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +111,7 @@ def _load(drive_root: Any, *, strict: bool = False,
         except (TypeError, ValueError):
             row["visible_revision"] = 0
         row["delete_error"] = str(row.get("delete_error") or "")
+        row["pinned"] = row.get("pinned") is True
     return data
 
 
@@ -734,7 +735,7 @@ def project_chat_for_task_tree(
 
 
 def list_reserved_projects(drive_root: Any, *, strict: bool = False) -> List[Dict[str, Any]]:
-    """All Project ids, including deleting/tombstoned history reservations."""
+    """Raw registry reservations, including frozen pre-cutover revisions for the importer."""
     with _LOCK:
         projects = _load(drive_root, strict=strict)["projects"]
     return sorted(
@@ -746,10 +747,15 @@ def list_reserved_projects(drive_root: Any, *, strict: bool = False) -> List[Dic
 
 def list_projects(drive_root: Any, *, strict: bool = False) -> List[Dict[str, Any]]:
     """Active, routable Projects (most recently active first)."""
-    return [
+    from ouroboros import dialogue_store as ds
+
+    projects = [
         project for project in list_reserved_projects(drive_root, strict=strict)
         if project.get("lifecycle") == PROJECT_ACTIVE
     ]
+    facts = {room["chat_id"]: room for room in ds.rooms(drive_root)} if projects else {}
+    return sorted((_with_dialogue_facts(project, facts.get(project["chat_id"])) for project in projects),
+                  key=lambda project: project["last_active_at"], reverse=True)
 
 
 def list_sidebar_projects(drive_root: Any) -> List[Dict[str, Any]]:
@@ -830,7 +836,11 @@ def stamp_project_thread(drive_root: Any, payload: Dict[str, Any]) -> None:
 
 def get_project(drive_root: Any, project_id: str, *, strict: bool = False) -> Optional[Dict[str, Any]]:
     project = get_reserved_project(drive_root, project_id, strict=strict)
-    return project if project and project.get("lifecycle") == PROJECT_ACTIVE else None
+    if not project or project.get("lifecycle") != PROJECT_ACTIVE:
+        return None
+    from ouroboros import dialogue_store as ds
+
+    return _with_dialogue_facts(project, ds.room(drive_root, project["chat_id"]))
 
 
 def get_reserved_project(drive_root: Any, project_id: str, *, strict: bool = False) -> Optional[Dict[str, Any]]:
@@ -983,6 +993,7 @@ def create_project(
             "routing_generation": 0,
             "routing_incarnation": uuid.uuid4().hex,
             "visible_revision": 0,
+            "pinned": False,
             "delete_error": "",
         }
         data["projects"].append(entry)
@@ -1006,9 +1017,8 @@ def update_project(
     if not pid:
         return None
     allowed = {
-        "name", "working_dir", "last_active_at", "provenance", "clone_url", "trusted_at",
-        # Write-once legacy-activity fact seeded by the boot-reconcile backfill
-        # (_backfill_thread_activity); read by projects_summary's derivation.
+        "name", "pinned", "working_dir", "last_active_at", "provenance", "clone_url", "trusted_at",
+        # Retained legacy activity fact; current activity comes from dialogue rooms.
         "thread_activity_seen",
         # Durable pointer to the project's newest finalized task result
         # (stamped by record_task_finalization; read first by
@@ -1028,6 +1038,8 @@ def update_project(
                     continue
                 if key == "name":
                     value = _validated_name(value, str(entry.get("id") or ""))
+                if key == "pinned" and type(value) is not bool:
+                    raise ValueError("pinned must be a boolean")
                 if key == "working_dir" and value != entry.get(key):
                     entry["routing_generation"] = int(entry.get("routing_generation") or 0) + 1
                 entry[key] = value
@@ -1121,38 +1133,6 @@ def delete_project(drive_root: Any, project_id: str) -> bool:
         raise RuntimeError("live Project deletion requires cancellation/quiescence first")
     complete_project_deletion(drive_root, project_id)
     return True
-
-
-def increment_project_visible_revision(
-    drive_root: Any,
-    *,
-    project_id: str = "",
-    chat_id: Any = 0,
-) -> Optional[Dict[str, Any]]:
-    """Advance unread state for one newly-appended owner-visible canonical row."""
-    pid = sanitize_project_id(project_id)
-    try:
-        cid = int(chat_id or 0)
-    except (TypeError, ValueError):
-        cid = 0
-    if not pid and not cid:
-        return None
-    with _file_write_lock(_registry_path(drive_root)):
-        data = _load(drive_root, strict=True, project_id="")
-        for entry in data["projects"]:
-            matches_chat = cid and entry.get("chat_id", project_chat_id(entry["id"])) == cid
-            if (pid and entry.get("id") == pid) or matches_chat:
-                selected = _routing_row(entry)
-                if selected["lifecycle"] != PROJECT_ACTIVE:
-                    continue
-                try:
-                    revision = max(0, int(entry.get("visible_revision") or 0))
-                except (TypeError, ValueError):
-                    revision = 0
-                entry["visible_revision"] = revision + 1
-                _save(drive_root, data)
-                return {**selected, **entry}
-    return None
 
 
 def touch_project(drive_root: Any, project_id: str) -> None:
@@ -1304,103 +1284,7 @@ def reconcile_projects(drive_root: Any) -> int:
                     log.info("Project registry reconcile: %d store(s) registered", added)
     except Exception:
         log.warning("Project registry reconcile failed", exc_info=True)
-    _backfill_thread_activity(drive_root)
     return added
-
-
-# Drive roots whose legacy thread-activity backfill already ran in this process.
-# The scan is a boot-reconcile concern: once per process per root is enough,
-# because everything AFTER the backfill is covered by the registry-facts
-# derivation in projects_summary (visible_revision/bindings/origin).
-_ACTIVITY_BACKFILL_DONE: set = set()
-
-
-def _backfill_thread_activity(drive_root: Any) -> int:
-    """One-time archive-aware seeding of the durable ``thread_activity_seen`` flag.
-
-    ``projects_summary`` derives thread activity from registry facts alone
-    (origin, bindings, ``visible_revision``) — but a legacy project whose
-    activity predates the ``visible_revision`` counter would read inactive
-    forever. So the boot reconcile scans live + archived chat/progress logs
-    ONCE per process for a row carrying each such project's chat_id, and
-    persists a write-once flag through the registry's own write path
-    (``update_project``). This never runs on the GET path, never removes the
-    flag, and a scan that finds nothing simply leaves the project inactive.
-    The done-marker is set only AFTER a successful scan/write pass, so a
-    transiently failed backfill retries on the next reconcile tick instead of
-    silently waiting for a process restart.
-    """
-    key = str(pathlib.Path(drive_root).resolve(strict=False))
-    if key in _ACTIVITY_BACKFILL_DONE:
-        return 0
-    flagged = 0
-    try:
-        bindings = _load_bindings(drive_root).get("bindings", {})
-        bound_pids = {
-            str(row.get("project_id") or "")
-            for row in bindings.values()
-            if isinstance(row, dict)
-        }
-        candidates: Dict[int, str] = {}
-        with _LOCK:
-            projects = _load(drive_root)["projects"]
-        for project in projects:
-            # update_project persists only ACTIVE rows; deleting/tombstoned
-            # projects keep deriving from origin/bindings/visible_revision.
-            if project.get("lifecycle") != PROJECT_ACTIVE:
-                continue
-            if project.get("thread_activity_seen"):
-                continue
-            pid = str(project.get("id") or "")
-            if (
-                not pid
-                or str(project.get("origin") or "") == "owner_ui"
-                or int(project.get("visible_revision") or 0) > 0
-                or pid in bound_pids
-            ):
-                continue  # already active by derivation — no flag needed
-            try:
-                cid = int(project.get("chat_id") or 0)
-            except (TypeError, ValueError):
-                cid = 0
-            if cid:
-                candidates[cid] = pid
-        if not candidates:
-            _ACTIVITY_BACKFILL_DONE.add(key)
-            return 0
-        logs_dir = pathlib.Path(drive_root) / "logs"
-        archive_dir = pathlib.Path(drive_root) / "archive"
-        paths = [logs_dir / "chat.jsonl", logs_dir / "progress.jsonl"]
-        if archive_dir.is_dir():
-            paths.extend(sorted(archive_dir.glob("chat_*.jsonl"), reverse=True))
-            paths.extend(sorted(archive_dir.glob("progress_*.jsonl"), reverse=True))
-        seen: set = set()
-        for path in paths:
-            if len(seen) == len(candidates):
-                break
-            if not path.is_file():
-                continue
-            try:
-                for row in iter_jsonl_objects(path):
-                    try:
-                        cid = int(row.get("chat_id") or 1)
-                    except (TypeError, ValueError):
-                        continue
-                    if cid in candidates and cid not in seen:
-                        seen.add(cid)
-                        if len(seen) == len(candidates):
-                            break
-            except Exception:
-                log.debug("thread-activity backfill scan failed for %s", path, exc_info=True)
-        for cid in sorted(seen):
-            if update_project(drive_root, candidates[cid], thread_activity_seen=True) is not None:
-                flagged += 1
-        if flagged:
-            log.info("Thread-activity backfill: %d legacy project(s) flagged", flagged)
-        _ACTIVITY_BACKFILL_DONE.add(key)
-    except Exception:
-        log.warning("Thread-activity backfill failed", exc_info=True)
-    return flagged
 
 
 def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any,
@@ -1430,42 +1314,70 @@ def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any,
     return str((entry or {}).get("working_dir") or "")
 
 
-def projects_summary(drive_root: Any, *, limit: int = 50, chat_id: Any = None) -> List[Dict[str, Any]]:
-    """Sidebar list or strict addressed room, independent of sidebar caps/activity.
-    Missing/inactive yields no room; unreadable/ambiguous authority raises."""
+def _with_dialogue_facts(project: Dict[str, Any], room: Optional[dict]) -> Dict[str, Any]:
+    facts = room or {}
+    return {**project, "visible_revision": int(facts.get("revision") or 0),
+            "last_active_at": max(str(project.get("last_active_at") or ""), str(facts.get("activity_at") or ""))}
+
+
+def projects_summary(drive_root: Any, *, limit: int = 50, chat_id: Any = None,
+                     include_pinned: bool = False) -> List[Dict[str, Any]]:
+    """Sidebar or strict addressed room, with unread/activity from dialogue room facts.
+
+    Registry reads retain lifecycle and binding authority. An unproved inactive room
+    requires complete import; a pending, failed or invalid interval is never inactivity.
+    """
+    from ouroboros import dialogue_store as ds
+
     out: List[Dict[str, Any]] = []
     cognition = main_cognition()
     bindings = _load_bindings(drive_root).get("bindings", {})
+    bound = {str(row.get("project_id") or "") for row in bindings.values() if isinstance(row, dict)}
     if chat_id is not None:
         address = int(chat_id)
         projects = [row for row in list_reserved_projects(drive_root, strict=True)
                     if row.get("chat_id") == address and row.get("lifecycle") == PROJECT_ACTIVE]
         if len(projects) > 1:
             raise ValueError("Project chat identity is ambiguous")
+        facts = {address: ds.room(drive_root, address)} if projects else {}
     else:
-        projects = list_sidebar_projects(drive_root)[: max(1, int(limit))]
-
-    def _has_thread_activity(project: Dict[str, Any]) -> bool:
-        # Registry facts only: GET never scans logs or writes. Telemetry-only
-        # rooms (no visible canonical row or binding) remain inactive until a
-        # visible row arrives, hiding junk rooms. Boot reconcile's write-once
-        # thread_activity_seen covers activity predating visible_revision.
-        pid = str(project.get("id") or "")
-        # v6.59.0: a project the OWNER explicitly created in the UI is always shown —
-        # the activity filter exists to hide junk reconcile rows, not a fresh project
-        # the owner just made (which has no chat rows yet by definition).
-        if str(project.get("origin") or "") == "owner_ui":
-            return True
-        if any(isinstance(row, dict) and row.get("project_id") == pid for row in bindings.values()):
-            return True
-        if int(project.get("visible_revision") or 0) > 0:
-            return True
-        return bool(project.get("thread_activity_seen"))
-
+        projects = list_sidebar_projects(drive_root)
+        facts = {room["chat_id"]: room for room in ds.rooms(drive_root)} if projects else {}
+    projects = [_with_dialogue_facts(project, facts.get(project["chat_id"])) for project in projects]
+    projects.sort(key=lambda project: str(project.get("last_active_at") or ""), reverse=True)
+    if chat_id is None and include_pinned:
+        # Pins remain reachable without starving the ordinary recent-room slice.
+        projects = ([p for p in projects if p.get("pinned") is True]
+                    + [p for p in projects if p.get("pinned") is not True][:max(1, int(limit))])
+    elif chat_id is None:
+        projects = projects[:max(1, int(limit))]
+    absence_covered = False
     for project in projects:
+        room = facts.get(project["chat_id"]) or {}
+        active = bool(project.get("origin") == "owner_ui" or project["id"] in bound
+                      or project.get("thread_activity_seen") or room.get("revision")
+                      or room.get("activity_at") or room.get("last_seq") is not None)
+        if not active and room:
+            # A progress row without a timestamp still proves activity. A bare read
+            # marker can create an empty room too, so presence of the room alone cannot.
+            active = bool(ds.probe_rows(drive_root, "progress", [("chat_id", project["chat_id"])], limit=1))
+        if not active and absence_covered is False:  # None: already unknown for this request
+            try:
+                for stream in ("chat", "progress"):
+                    ds.require_imported(drive_root, stream)
+                    if ds.range_coverage(drive_root, stream)["gaps"]:
+                        raise ds.StoreError("dialogue history has gaps; room activity is unknown")
+                absence_covered = True
+            except (ds.StoreMigrating, ds.StoreError):
+                if chat_id is not None:
+                    raise  # the addressed room answers its typed outcome
+                # The sidebar keeps every room while the archive imports: an unproved room reads as
+                # not yet active (as before the import found its rows), never as a missing project.
+                absence_covered = None
         out.append({
             "id": project.get("id"),
             "name": project.get("name"),
+            "pinned": project.get("pinned") is True,
             "chat_id": project.get("chat_id"),
             "working_dir": project.get("working_dir") or "",
             "cognition": project_cognition(project, cognition),
@@ -1475,7 +1387,7 @@ def projects_summary(drive_root: Any, *, limit: int = 50, chat_id: Any = None) -
             "routing_generation": int(project.get("routing_generation") or 0),
             "visible_revision": int(project.get("visible_revision") or 0),
             "delete_error": project.get("delete_error") or "",
-            "has_thread_activity": _has_thread_activity(project),
+            "has_thread_activity": active,
         })
     return out
 
@@ -1495,7 +1407,6 @@ __all__ = [
     "fail_project_deletion",
     "get_project",
     "get_reserved_project",
-    "increment_project_visible_revision",
     "list_projects",
     "list_reserved_projects",
     "list_sidebar_projects",

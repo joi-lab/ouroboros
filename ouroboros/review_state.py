@@ -123,7 +123,7 @@ def _commit_attempt_from_dict(d: Dict[str, Any]) -> CommitAttemptRecord:
 
 _ATTEMPT_AUTHORITY_STRING_FIELDS = frozenset({
     "ts", "status", "phase", "started_ts", "updated_ts", "finished_ts",
-    "task_id", "repo_key", "tool_name", "review_retry_key",
+    "task_id", "repo_key", "tool_name", "review_retry_key", "review_budget_repo_key",
     "review_contract_fingerprint", "block_reason", "review_owner_session_id",
 })
 _ATTEMPT_AUTHORITY_BOOL_FIELDS = frozenset({
@@ -392,15 +392,15 @@ def save_state(drive_root: pathlib.Path, state: AdvisoryReviewState) -> None:
 
 def update_state(
     drive_root: pathlib.Path,
-    mutator: Callable[[AdvisoryReviewState], Any],
+    mutator: Callable[[AdvisoryReviewState], Any], *, lock_timeout_sec: float = 4.0,
 ) -> Any:
     """Locked RMW; only explicit ReviewStateMutation no-ops can skip a save.
 
-    The complete prepared payload must still equal the strict load. Ordinary
-    mutators always save; None still returns the prepared state.
+    The complete prepared payload must still equal the strict load. Ordinary mutators always save;
+    None still returns the prepared state. ``lock_timeout_sec`` bounds the wait for a busy lock.
     """
     outcome: Dict[str, Any] = {}
-    lock_fd = acquire_review_state_lock(drive_root, outcome=outcome)
+    lock_fd = acquire_review_state_lock(drive_root, lock_timeout_sec, outcome=outcome)
     if lock_fd is None:
         raise ReviewStateLockError(drive_root / _LOCK_RELPATH, outcome)
     try:
@@ -838,9 +838,9 @@ from ouroboros.review_state_model import (  # noqa: E402, F401 -- intentional pu
 )
 
 from ouroboros.review_state_custody import (  # noqa: E402, F401 -- intentional public re-exports
+    ReservedReviewSlotRefused,
     _ACTIVE_REVIEW_OPERATION_STATES,
-    _STRIPPED_DETAILS_LIMIT,
-    _STRIPPED_MESSAGE_LIMIT,
+    _STRIPPED_DETAILS_LIMIT, _STRIPPED_MESSAGE_LIMIT,
     _attempt_has_active_review_custody,
     _attempt_history_evictable,
     _attempt_review_roster_rows,

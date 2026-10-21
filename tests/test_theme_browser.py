@@ -194,8 +194,12 @@ def test_light_contrast_and_mounted_views_follow_the_theme(subscription_ui):
     before = page.evaluate(
         "() => globalThis.Chart.getChart(document.querySelector('#mounted-views canvas')).data.datasets[0].data")
     open_appearance(page).locator('[data-theme-choice="dark"]').click()
+    page.wait_for_function("() => document.documentElement.dataset.theme === 'dark'")
+    dark_primary = page.evaluate(
+        "() => getComputedStyle(document.documentElement).getPropertyValue('--diagram-primary').trim().toLowerCase()")
+    assert dark_primary.startswith('#') and dark_primary != '#f3e8ec', dark_primary
     page.wait_for_function(
-        "() => document.querySelector('#mounted-views').innerHTML.toLowerCase().includes('#25222c')")
+        "(ink) => document.querySelector('#mounted-views').innerHTML.toLowerCase().includes(ink)", arg=dark_primary)
     after = page.evaluate("""() => {
         const c = globalThis.Chart.getChart(document.querySelector('#mounted-views canvas'));
         return { data: c.data.datasets[0].data, color: c.options.color };

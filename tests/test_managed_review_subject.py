@@ -727,7 +727,8 @@ def test_an_oversize_drop_never_promotes_an_added_critic_into_the_quorum(tmp_pat
         pool_seat("reading", "anthropic/claude-opus-4.1", delivery="native"),
         pool_seat("extra", "google/gemini-2.5-pro", delivery="native", marked=not additional),
     ))
-    panel = compose_panel(ReviewChangeRequest(root="system_repo", subject="index", reviewers=("extra",)), adds_only=True)
+    panel = compose_panel(ReviewChangeRequest(root="system_repo", subject="index", reviewers=("extra",)),
+                          body=True, strictness="blocking")
     with slots.composed_review_pool(panel.seats):
         plan = slots.commit_triad_delivery()
     assert plan["additional"] == [False, False, additional]

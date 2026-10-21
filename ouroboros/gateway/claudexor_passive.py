@@ -66,23 +66,10 @@ def _roster_valid(value: Any) -> bool:
                for row in value["harnessAccounts"])
 
 
-# Opt-in projection: older engines ignore the selector or explicitly refuse it.
-# Neither case needs an operations/diagnostics discovery barrier.
-_QUOTA_VIEW = "constraint_freshness"
-_CONSTRAINT_FRESHNESS = ("fresh", "stale", "unknown")
-
-
 def _quota_valid(value: Any) -> bool:
-    if not _object_lists(value, ("snapshots",), ("absences",)):
-        return False
-    groups = [snapshot.get("constraints", []) for snapshot in value["snapshots"]]
-    constraints = [row for group in groups if isinstance(group, list) for row in group]
-    if not any(isinstance(row, dict) and "freshness" in row for row in constraints):
-        return True  # Legacy envelope: snapshot freshness stays the conservative fact.
-    # Complete and exact, or malformed: a partial projection never passes for
-    # independent per-constraint freshness.
-    return all(isinstance(group, list) for group in groups) and all(
-        isinstance(row, dict) and row.get("freshness") in _CONSTRAINT_FRESHNESS for row in constraints)
+    from ouroboros.claudexor_observations import quota_envelope_valid
+
+    return quota_envelope_valid(value)
 
 
 def _read_facet(reader: Callable, valid: Callable) -> tuple:
@@ -95,19 +82,14 @@ def _read_facet(reader: Callable, valid: Callable) -> tuple:
         return None, _read_error(exc), _elapsed_ms(start)
 
 
-def _quota_read(gateway: Any) -> dict[str, Any]:
-    """One legacy GET after an explicit HTTP 400, never after unknown transport."""
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+def _quota_read(gateway: Any, *, model: str | None = None, request_kind: str = "text") -> dict[str, Any]:
+    """Legacy view negotiation after definite 400 only, never unknown transport."""
+    from ouroboros.claudexor_observations import read_quota
 
-    try:
-        return gateway.quota_state(view=_QUOTA_VIEW)
-    except ClaudexorUnavailable as exc:
-        if exc.status_code != 400:
-            raise
-        return gateway.quota_state()
+    return read_quota(gateway, model=model, request_kind=request_kind)
 
 
-def _quota_payload() -> dict[str, Any]:
+def _quota_payload(*, model: str | None = None, request_kind: str = "text") -> dict[str, Any]:
     """Owned-only authenticated GETs; no handshake, diagnosis, refresh or wake.
 
     The existing transport still sends the protocol-major header and enforces
@@ -139,7 +121,7 @@ def _quota_payload() -> dict[str, Any]:
             with ThreadPoolExecutor(max_workers=2) as pool:
                 accounts_call = pool.submit(_read_facet, gateway.credential_profiles, _roster_valid)
                 quota_call = pool.submit(
-                    _read_facet, lambda: _quota_read(gateway), _quota_valid,
+                    _read_facet, lambda: _quota_read(gateway, model=model, request_kind=request_kind), _quota_valid,
                 )
             for facet, call in (("accounts", accounts_call), ("quota", quota_call)):
                 value, error, elapsed = call.result()
@@ -159,6 +141,9 @@ def _quota_payload() -> dict[str, Any]:
                 else:
                     payload["quota"] = value["snapshots"]
                     payload["quota_absences"] = value.get("absences", [])
+                    for key in ("resources", "availability_scope"):
+                        if key in value:
+                            payload[key] = value[key]
     if "discovery" not in payload["timings_ms"]:
         payload["timings_ms"]["discovery"] = _elapsed_ms(discovery_start)
     payload["timings_ms"]["total"] = _elapsed_ms(start)

@@ -15,6 +15,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, TypeAlias
 
 from ouroboros.contracts.skill_manifest import canonical_skill_name
+from ouroboros.contracts.task_contract import canonical_tool_name
 from ouroboros.contracts.skill_payload_policy import PRESENCE_PROFILE_STATE_FILENAME
 from ouroboros.presence_profile import (
     PresenceCapabilityRequest,
@@ -607,7 +608,10 @@ def _target_from_payload(value: Any, *, field_name: str) -> PresenceTarget:
     target_type = raw.get("type")
     if target_type == "tool":
         _require_exact_fields(raw, _TOOL_TARGET_FIELDS, field_name=field_name)
-        return PresenceToolTarget(raw["kind"], raw["name"], raw["provider"])
+        name = raw["name"]
+        if raw["kind"] == "builtin" and isinstance(name, str):
+            name = canonical_tool_name(name)  # a renamed builtin's saved spelling; a non-string fails typed below
+        return PresenceToolTarget(raw["kind"], name, raw["provider"])
     if target_type == "script":
         _require_exact_fields(raw, _SCRIPT_TARGET_FIELDS, field_name=field_name)
         return PresenceScriptTarget(skill=raw["skill"], script=raw["script"])

@@ -15,6 +15,8 @@ from functools import partial
 from types import SimpleNamespace
 
 import pytest
+from ouroboros.dialogue_import import export_for_older_body
+from tests._dialogue import progress_rows
 
 from ouroboros.agent import OuroborosAgent
 from ouroboros.gateway.history import make_chat_history_endpoint
@@ -162,8 +164,8 @@ def test_voice_rides_the_live_frame_the_stored_row_and_the_replay(tmp_path, monk
     for frame in frames:
         events_chat_delivery._handle_send_message(frame, delivery)
 
-    stored = [json.loads(line) for line
-              in (tmp_path / "logs" / "progress.jsonl").read_text(encoding="utf-8").splitlines()]
+    stored = progress_rows(tmp_path)
+    export_for_older_body(tmp_path)  # transition: the history reader (unit Q1b) still reads the chain files
     response = asyncio.run(make_chat_history_endpoint(tmp_path)(
         SimpleNamespace(query_params={"limit": "10"})))
     replay = [row for row in json.loads(response.body)["messages"] if row.get("is_progress")]

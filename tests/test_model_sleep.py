@@ -166,7 +166,8 @@ def test_the_pooled_park_excludes_the_sleep_live_and_the_grant_folds_it(tmp_path
     meta["sleep_parked_at"] -= 30.0
     parked_at = meta["sleep_parked_at"]
     meta["owner_wait_resume_requested"] = True
-    monkeypatch.setattr(worker_owner_wait, "_resume_allowed", lambda *_a: True)
+    monkeypatch.setattr(worker_owner_wait, "_resume_memory_allowed", lambda *_a: True)
+    monkeypatch.setattr(worker_owner_wait, "_resume_authority_allowed", lambda *_a: True)
     before_grant = time.time()
     assert worker_owner_wait._grant_resume("sleeper", meta, worker) is True
     after_grant = time.time()
@@ -288,7 +289,7 @@ def test_an_ordinary_restart_restores_a_cold_sleep_that_wakes_itself(tmp_path, m
 
 @pytest.mark.parametrize("source", ["mail", "task", "runs"])
 def test_read_errors_do_not_hide_a_selected_time_or_become_a_wake(tmp_path, monkeypatch, source):
-    from ouroboros import delegate_custody_current, model_sleep, owner_wait, task_results
+    from ouroboros import delegate_custody_current, model_sleep, owner_wait, task_store
     from supervisor.sleep_wake import _readiness
 
     ctx = _ctx(tmp_path)
@@ -301,9 +302,9 @@ def test_read_errors_do_not_hide_a_selected_time_or_become_a_wake(tmp_path, monk
     monkeypatch.setattr(model_sleep, "_owned_runs", lambda *_a, **_k: {})
     monkeypatch.setattr(delegate_custody_current, "run", lambda *_a: None)
     monkeypatch.setattr(model_sleep, "_service_wake", lambda _pin: "")
-    # The real fail-soft task reader still propagates store-open failures.
+    # The typed task reader propagates store-open failures.
     # The service reader instead turns its own read failure into an unknown wake.
-    reader = {"mail": (owner_wait, "_wait_entries"), "task": (task_results, "read_document"),
+    reader = {"mail": (owner_wait, "_wait_entries"), "task": (task_store, "task_versions"),
               "runs": (model_sleep, "_owned_runs")}[source]
     monkeypatch.setattr(*reader, broken)
     chosen = {"tasks": ["selected"], "runs": ["run-one"], "body_runs": [["run-one", "inv"]],
@@ -418,3 +419,67 @@ def test_cold_clock_is_recorded_after_read_failure_but_owner_pause_still_vetoes(
     assert outcome[0]["veto"] == "owner_pause" and not outcome[0]["ok"]
     row = budget_pause_row(tmp_path, "sleeper")
     assert row["sleep_ready"]["reason"] == "timeout" and not row.get("grant")
+
+
+@pytest.mark.parametrize("status,expected", [("running", ""), ("completed", "task:selected:completed")])
+def test_selected_status_poll_never_reads_task_bodies(tmp_path, monkeypatch, status, expected):
+    import sqlite3
+    from contextlib import contextmanager
+    from ouroboros import model_sleep, owner_wait, task_store
+    from supervisor.sleep_wake import _readiness
+
+    _result(tmp_path, "selected", status, result="large evidence" * 10000)
+    _result(tmp_path, "other", "running")
+    original = task_store.open_store
+    reads = []
+
+    @contextmanager
+    def observed(*args, **kwargs):
+        with original(*args, **kwargs) as txn:
+            def authorize(action, table, column, _db, _trigger):
+                if action == sqlite3.SQLITE_READ:
+                    assert table != "task_bodies", "readiness needs status, never evidence"
+                    reads.append((table, column))
+                return sqlite3.SQLITE_OK
+            txn.conn.set_authorizer(authorize)
+            try:
+                yield txn
+            finally:
+                txn.conn.set_authorizer(lambda *_args: sqlite3.SQLITE_OK)
+
+    monkeypatch.setattr(task_store, "open_store", observed)
+    chosen = {"tasks": ["other", "selected"]}
+    ctx = _ctx(tmp_path)
+    assert model_sleep.wake_reason(ctx, chosen) == expected
+    assert owner_wait._sleep_wake(ctx, {"sleep": chosen}) == expected
+    assert _readiness(SimpleNamespace(DRIVE_ROOT=tmp_path), {"id": "sleeper"}, {"sleep": chosen}) == expected
+    assert ("tasks", "status") in reads
+
+
+def test_busy_sleep_poll_logs_one_traceback_then_counts_and_resets(tmp_path, monkeypatch, caplog):
+    from ouroboros import owner_wait, task_store
+    from ouroboros.store import StoreBusy
+
+    ctx = _ctx(tmp_path)
+    checkpoint = {"wait_id": "one", "sleep": {"tasks": ["selected"]}}
+    busy = True
+
+    def read(*_args):
+        if busy:
+            raise StoreBusy("locked")
+        return {"selected": (1, "running", False)}
+
+    monkeypatch.setattr(task_store, "task_versions", read)
+    for _ in range(3):
+        assert owner_wait._sleep_wake(ctx, checkpoint) == ""
+    records = [r for r in caplog.records if r.name == "ouroboros.owner_wait"]
+    assert [bool(r.exc_info) for r in records] == [True, False, False]
+    assert [r.args[-1] for r in records] == [1, 2, 3]
+    busy = False
+    assert owner_wait._sleep_wake(ctx, checkpoint) == ""
+    busy = True
+    assert owner_wait._sleep_wake(ctx, checkpoint) == ""
+    assert caplog.records[-1].exc_info and caplog.records[-1].args[-1] == 1
+    checkpoint = {**checkpoint, "wait_id": "two"}
+    assert owner_wait._sleep_wake(ctx, checkpoint) == ""
+    assert caplog.records[-1].exc_info and caplog.records[-1].args[-1] == 1

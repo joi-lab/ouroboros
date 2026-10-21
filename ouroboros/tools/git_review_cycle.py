@@ -30,21 +30,22 @@ def _git():
     return git
 
 
-def _review_custody_pending(ctx: ToolContext) -> bool:
-    """Keep the prepared candidate while the panel's physical review custody is unresolved.
-    A preflight never holds it: its wave froze its own tree and keeps its custody on its own
-    ``review_change`` rows, so cleaning the commit's index cannot strand it."""
-    if bool(getattr(ctx, "_review_custody_lost", False)):
-        return True
+def _review_custody_pending(ctx: ToolContext, *, counted_only: bool = False) -> bool:
+    """Retain physical custody, or judge only counted seats when deciding a hold."""
     triad = list(getattr(ctx, "_last_triad_raw_results", []) or [])
     scope_raw = getattr(ctx, "_last_scope_raw_result", {}) or {}
     scope_rows = list(scope_raw.get("raw_results") or [scope_raw]) if isinstance(scope_raw, dict) else []
-    return any(
-        bool(row.get("late_result_pending"))
-        or str(row.get("operation_state") or "") in {"in_flight", "custody_lost"}
-        for row in [*triad, *scope_rows]
-        if isinstance(row, dict)
-    )
+    if counted_only:
+        from ouroboros.review_ledger import build_rows, counted_pending
+
+        structured = getattr(ctx, "_last_review_structured", {}) or {}
+        rows = build_rows({"triad_raw": triad, "structured": structured})
+        return counted_pending(rows if structured.get("rows") else [*rows, *scope_rows],
+                               pending=bool(getattr(ctx, "_review_custody_lost", False)))
+    if bool(getattr(ctx, "_review_custody_lost", False)):
+        return True
+    return any(row.get("late_result_pending") or row.get("operation_state") in {"in_flight", "custody_lost"}
+               for row in [*triad, *scope_rows] if isinstance(row, dict))
 
 
 def _release_review_evidence_if_settled(ctx: ToolContext) -> None:
@@ -805,7 +806,7 @@ def _reviewed_stage_cycle(
     # pending too, before Git; the review-only cycle keeps Advisory's material handback; Blocking keeps authority.
     ordinary_advisory = get_review_enforcement() == "advisory" and review_enforcement_blocks("blocking")
     hand_back_all = not review_only and not review_enforcement_blocks(get_review_enforcement())
-    if author_source is None and _git()._review_custody_pending(ctx) and (pending_message := _git()._finalize_pending_review(
+    if author_source is None and _git()._review_custody_pending(ctx, counted_only=True) and (pending_message := _git()._finalize_pending_review(
             ctx, commit_message, commit_start,
             pre_fingerprint=pre_fingerprint, post_fingerprint=post_fingerprint)):
         custody_lost = bool(getattr(ctx, "_review_custody_lost", False))

@@ -133,6 +133,63 @@ def test_public_wait_still_reads_engine_when_full_local_source_is_unavailable(tm
     assert result["output_delivery"]["complete"]
 
 
+@pytest.mark.parametrize("kind", ["review", "ordinary", "retained_review"])
+def test_registered_wait_preserves_collection_outcome(tmp_path, monkeypatch, money, kind):  # noqa: F811
+    """The public string ABI must keep the native failure, not just wake the model."""
+    from ouroboros import delegate_supervision
+    from ouroboros.gateways import claudexor
+    from ouroboros.tools import delegate
+    from ouroboros.tools.tool_result import (
+        _install_tool_result_sidecar, _published_tool_result, _restore_tool_result_sidecar,
+    )
+
+    entry = started(tmp_path, source="review_substrate_commit" if kind != "ordinary" else "")
+    if kind == "retained_review":
+        assert body.collect_terminal(tmp_path, entry.run_id, detail=terminal(), allow_review=True)["status"] == "collected"
+    calls, closed = [], []
+
+    class Gateway:
+        engine_version = "99.0.0"
+        def agent_capabilities(self, **kwargs):
+            return {"harnesses": [{"id": "test", "liveInput": "none"}]}
+        def get_run(self, rid, **kwargs):
+            assert not calls, "the terminal collection result was silently retried"
+            calls.append(rid)
+            return terminal(rid)
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(claudexor, "ClaudexorGateway", Gateway)
+    monkeypatch.setattr(delegate_supervision, "_TICK_SEC", 0)
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id=entry.task_id)
+    tool = next(item for item in delegate.get_tools() if item.name == "delegate_wait")
+    sentinel = object()
+    token = _install_tool_result_sidecar(ctx, sentinel)
+    try:
+        text = tool.handler(ctx, run_id=entry.run_id)
+        native = _published_tool_result(ctx, sentinel)
+    finally:
+        _restore_tool_result_sidecar(token)
+    assert native is not None and native.text == text
+    payload = json.loads(text)
+    fresh = current.run(tmp_path, entry.run_id)
+    assert not fresh.output_consumed and not fresh.patch_captured and not fresh.patch_disposed
+    assert fresh.review_owned == (kind != "ordinary")
+    assert calls == ([] if kind == "retained_review" else [entry.run_id])
+    assert bool(closed) == bool(calls)
+    if kind == "review":
+        assert native.code == "TOOL_REPORTED_FAILURE" and str(native.status) == "error"
+        assert payload["status"] == "refused" and payload["ok"] is False
+        assert payload["reason"] == "collection_owner_mismatch"
+        assert payload["collection"]["status"] == "unavailable"
+        assert "review" in payload["detail"].lower()
+        assert not money and not fresh.ledger_recorded and not fresh.output_source
+    else:
+        assert native.code == "OK"
+        assert payload["status"] == "terminal" and payload["primary_output"]["text"] == "complete answer"
+        assert payload["output_delivery"]["complete"] and len(money) == 1
+
+
 def test_ready_local_result_does_not_override_owner_control_or_foreign_authority(tmp_path, monkeypatch, money):  # noqa: F811
     from ouroboros import delegate_supervision
     from ouroboros.tools.delegate_terminal_evidence import retained_terminal_result

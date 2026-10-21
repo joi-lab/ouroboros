@@ -139,6 +139,21 @@ def _service_output_binding(
     )
 
 
+def _baseline_gap_note(outputs, before_outputs) -> str:
+    """The start baseline holds every admitted output, absent ones included; none at all
+    means it could not be taken (disclosed at start), so the stop result says so too."""
+    if not outputs or before_outputs:
+        return ""
+    return "\n- output baseline was unavailable at start: a registered output may predate this service"
+
+
+def _working_tree_changes(cwd: str) -> set[str]:
+    """Git changes at stop, the fact run_command uses to accept a generated repo output."""
+    from ouroboros.tools.shell import _resolve_git_root, _status_snapshot
+
+    return set(_status_snapshot(_resolve_git_root(pathlib.Path(cwd))))
+
+
 def _executor_can_run_cwd(ctx: ToolContext, workdir: pathlib.Path) -> bool:
     # Keep the service keyword spelling while sharing shell's reachability rule.
     from ouroboros.tools.shell_process import _executor_can_run_cwd as reachable
@@ -491,14 +506,15 @@ def _start_service(
         if advice:
             ctx.emit_progress_fn(advice)
     declared_outputs = [str(item) for item in (outputs or []) if str(item or "").strip()]
-    try:
-        from ouroboros.tools.shell import _snapshot_declared_outputs
+    from ouroboros.tools.shell_outputs import _declared_output_baseline, _declared_output_refusal
 
-        before_outputs = _snapshot_declared_outputs(
-            ctx, declared_outputs, workdir, cwd_root=cwd_root, binding=binding,
-        )
-    except Exception:
-        before_outputs = {}
+    # A known refusal stops the start; only a baseline that could not be taken lets it proceed, disclosed.
+    output_refusal = _declared_output_refusal(ctx, declared_outputs, workdir, cwd_root=cwd_root, binding=binding)
+    if output_refusal:
+        return _refused_before_start(ctx, output_refusal)
+    before_outputs, baseline_problem = _declared_output_baseline(
+        ctx, declared_outputs, workdir, cwd_root=cwd_root, binding=binding)
+    baseline_note = {"output_baseline_unavailable": baseline_problem} if baseline_problem else {}
     # Resolve the effective keep BEFORE choosing a backend: a task-level
     # service_teardown='keep' must reach the executor path too, else an
     # executor-backed service is recorded task-scoped and the custody reaper
@@ -530,7 +546,7 @@ def _start_service(
                 env=env,
                 secret_values=secret_values,
             )
-            return json.dumps(payload, ensure_ascii=False, indent=2)
+            return json.dumps({**payload, **baseline_note}, ensure_ascii=False, indent=2)
         except OwnerPauseRefused as exc:
             return _publish_tool_result(ctx, launch_refusal_result(exc))
         except body_candidate.CandidateRefused:
@@ -650,7 +666,7 @@ def _start_service(
         if proc.poll() is not None:
             break
         time.sleep(0.2)
-    return json.dumps(_status_payload(record), ensure_ascii=False, indent=2)
+    return json.dumps({**_status_payload(record), **baseline_note}, ensure_ascii=False, indent=2)
 
 
 def _status_payload(record: ServiceRecord) -> Dict[str, Any]:
@@ -802,9 +818,11 @@ def _stop_service(ctx: ToolContext, name: str = "service") -> str:
                     record.outputs,
                     pathlib.Path(record.cwd),
                     cwd_root=record.cwd_root,
+                    changed_paths=_working_tree_changes(record.cwd),
                     before_outputs=record.before_outputs,
                     binding=output_binding,
                 )
+                artifact_note += _baseline_gap_note(record.outputs, record.before_outputs)
             except Exception as exc:
                 artifact_note = f"\n\n⚠️ ARTIFACT_OUTPUT_ERROR:\n- service output finalization failed: {type(exc).__name__}: {exc}"
                 artifact_failed = True
@@ -864,9 +882,11 @@ def _stop_service(ctx: ToolContext, name: str = "service") -> str:
                     [str(item) for item in (payload.get("outputs") or [])],
                     pathlib.Path(str(payload.get("host_cwd") or ".")),
                     cwd_root=str(payload.get("cwd_root") or ""),
+                    changed_paths=_working_tree_changes(str(payload.get("host_cwd") or ".")),
                     before_outputs=before_outputs if isinstance(before_outputs, dict) else None,
                     binding=output_binding,
                 )
+                artifact_note += _baseline_gap_note(payload.get("outputs"), before_outputs)
             except Exception as exc:
                 artifact_note = f"\n\n⚠️ ARTIFACT_OUTPUT_ERROR:\n- executor service output finalization failed: {type(exc).__name__}: {exc}"
                 artifact_failed = True
@@ -1032,6 +1052,8 @@ def prune_service_logs(
     *,
     now: float | None = None,
 ) -> Dict[str, Any]:
+    """Archive old logs only after local and durable process custody release their writers."""
+    from ouroboros import body_candidate
     from ouroboros.retention import age_cutoff, get_gc_retention_days
 
     # Explicit overrides are honored as-is (age_cutoff floors at 0 => explicit 0
@@ -1066,6 +1088,14 @@ def prune_service_logs(
                 except OSError:
                     continue
                 if stat.S_ISREG(child_stat.st_mode) and child_stat.st_mtime < cutoff:
+                    facts = service_execution_facts(f"{task_dir.name}:{child.stem}")
+                    if facts is None and child.stem.endswith(".executor"):
+                        facts = service_execution_facts(f"{task_dir.name}:{child.stem.removesuffix('.executor')}")
+                    # A kept service can outlive its task or live in another worker's registry.
+                    if (facts is not None and facts.get("state") != "exited") or body_candidate.live_lineage_processes(
+                            drive_root, task_dir.name):
+                        report["retained_files"] += 1
+                        continue
                     archive_result = _archive_stale_service_log(pathlib.Path(drive_root), child)
                     if archive_result.get("archived"):
                         report["archived_files"] += 1
@@ -1101,7 +1131,7 @@ def get_tools() -> List[ToolEntry]:
                 "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Ordinary literal environment overrides, passed unchanged on local and Docker executors over the minimal host baseline. Use env_from_settings for secrets."},
                 "env_from_settings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Root tasks and Cyber acting tasks: environment name to saved setting key. References override literal env; Settings-classified secrets are masked in diagnostics. Explicit read-only tasks retain their existing limits."},
                 "readiness": {"type": "object", "default": {}, "description": "Optional {log_contains|stdout_contains, timeout_sec} readiness probe."},
-                "outputs": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Files generated by the service to copy into the task artifact store when the service stops."},
+                "outputs": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Files generated by the service to copy into the task artifact store when the service stops. A declaration whose location is refused stops the start before the service launches. Only outputs accept a relative '../' spelling, judged by its resolved location like an absolute one; cwd and file-tool path rules are unchanged."},
                 "keep_alive": {"type": "boolean", "default": False, "description": "Leave this service running after the task ends (e.g. a dev server the user or an external verifier still needs). It stays custody-ledgered and dies with the server session or panic."},
             }, "required": ["cmd"]},
         }, _start_service, is_code_tool=True, timeout_sec=30, mutates_worktree=True),

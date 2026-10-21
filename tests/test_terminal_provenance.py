@@ -241,10 +241,9 @@ def test_project_completion_host_salvage_labels_its_bytes_and_points(tmp_path, m
     assert (f"The task could not get a usable model answer, so it could not finish. "
             f"{SALVAGE_EXCERPT_LABEL}: RAW PATCH") in text
     assert "provider_unavailable." not in text
-    # The excerpt form keeps the pointer too: this writer has no other one.
-    assert text.endswith(" Open the Project for details.")
+    # The way back to the full copy is the row's Project reference (drawn from `project_id`), never a sentence.
+    assert "Open the Project" not in text
     labelled = text.split(f"{SALVAGE_EXCERPT_LABEL}: ", 1)[1]
-    labelled = labelled[: -len(" Open the Project for details.")]
     assert len(labelled) <= 240 and labelled.endswith("…")
 
 

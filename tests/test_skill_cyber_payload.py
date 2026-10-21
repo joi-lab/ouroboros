@@ -35,11 +35,12 @@ def test_sensitive_named_inert_resource_is_hashed_and_read_in_cyber(tmp_path, ac
         with pytest.raises(SkillPayloadUnreadable, match="credential filename"):
             compute_content_hash(skill)
         return
-    expected = hashlib.sha256()
-    for path in sorted(skill.iterdir()):
-        expected.update(path.name.encode() + b"\0" + hashlib.sha256(path.read_bytes()).digest())
+    from ouroboros.skill_identity import release_digest_from_file_digests
+
+    expected = release_digest_from_file_digests(
+        (path.name, hashlib.sha256(path.read_bytes()).digest()) for path in skill.iterdir())
     content_hash = compute_content_hash(skill)
-    assert content_hash == expected.hexdigest()
+    assert content_hash == expected
     pack = "\n".join(_build_skill_file_packs(skill, expected_content_hash=content_hash))
     assert f"### {name}\n" in pack and payload.decode() in pack
     assert not load_skill(skill, tmp_path / "data").load_error

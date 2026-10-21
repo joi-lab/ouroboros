@@ -315,7 +315,7 @@ class ChatUploadDeleteResponse(TypedDict):
 
 class ProjectListResponse(TypedDict):
     """``GET /api/projects``: active and deleting projects, at most 200, most recently active first.
-    Rows are the compact projection ``GET /api/state`` also carries: id, name, chat_id, working_dir,
+    Rows are the compact projection ``GET /api/state`` also carries: id, name, pinned, chat_id, working_dir,
     provenance, last_active_at, lifecycle, routing_generation, visible_revision, delete_error and
     has_thread_activity."""
 
@@ -333,10 +333,11 @@ class ProjectCreateResponse(TypedDict):
     init_git_skipped: NotRequired[List[str]]
 
 
-class ProjectUpdateRequest(TypedDict):
-    """``POST /api/projects/{project_id}/update``: rename, the one mutable field."""
+class ProjectUpdateRequest(TypedDict, total=False):
+    """``POST /api/projects/{project_id}/update``: name and/or pin; at least one."""
 
     name: str  # 1 to 80 characters
+    pinned: bool
 
 
 class ProjectUpdateResponse(TypedDict):

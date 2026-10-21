@@ -17,9 +17,12 @@ def _apply(evt: dict) -> dict:
         return {"ok": False, "error": "control_call_identity_missing"}
     if action == "pause_task" and actor == task_id:
         return {"ok": False, "error": "self_pause_refused"}
-    with mind_control(actor, str(evt.get("reason") or "")):
+    reason = str(evt.get("reason") or "")
+    with mind_control(actor, reason):
         if action == "pause_task":
-            return request_owner_pause(task_id, request_id=nonce)
+            # The owner reads this declared author and sentence; like ``mind_control``, it grants no power.
+            return request_owner_pause(task_id, request_id=nonce,
+                                       by={"actor": "ouroboros", "text": reason.strip(), "at": utc_now_iso()})
         if action == "resume_task":
             return resume_budget_paused_task(task_id)
         if action == "continue_task":

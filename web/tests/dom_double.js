@@ -2,13 +2,24 @@
 // geometry, and the selector grammar those modules use — tags, classes, attributes ([a], [a="v"], [a^="v"]),
 // :not(…), :disabled, :scope, the descendant and child combinators and selector lists. Real engines, hit
 // testing and layout are checked in the browser lane.
+// A passive listener cannot cancel its event, as in a browser: its preventDefault() does nothing.
+function call(listener, event, passive) {
+    if (!passive) return listener(event);
+    const prevent = event.preventDefault;
+    event.preventDefault = () => {};
+    try { return listener(event); } finally { event.preventDefault = prevent; }
+}
+
 class Events {
     listeners = new Map();
-    addEventListener(type, listener) {
+    passive = new Map();  // type → the listeners added with { passive: true }
+    addEventListener(type, listener, options) {
         if (!this.listeners.has(type)) this.listeners.set(type, new Set());
         this.listeners.get(type).add(listener);
+        if (!this.passive.has(type)) this.passive.set(type, new Set());
+        if (options?.passive) this.passive.get(type).add(listener); else this.passive.get(type).delete(listener);
     }
-    removeEventListener(type, listener) { this.listeners.get(type)?.delete(listener); }
+    removeEventListener(type, listener) { this.listeners.get(type)?.delete(listener); this.passive.get(type)?.delete(listener); }
     listenerCount() { return [...this.listeners.values()].reduce((n, set) => n + set.size, 0); }
     emit(type, event = {}) {
         event.type = type;
@@ -20,7 +31,8 @@ class Events {
         if (doc && this !== doc) for (const listener of [...(doc.captures.get(type) || [])]) listener(event);
         if (event.stopped) return event;
         for (let node = this; node && !event.stopped; node = node.parent || (node !== doc ? doc : null)) {
-            for (const listener of [...(node.listeners.get(type) || [])]) listener(event);
+            const passive = node.passive.get(type);
+            for (const listener of [...(node.listeners.get(type) || [])]) call(listener, event, passive?.has(listener));
             if (node === doc) break;
         }
         return event;
@@ -60,7 +72,8 @@ class Node extends Events {
             toggle: (n, on = !this.classes.has(n)) => (on ? this.classes.add(n) : this.classes.delete(n), on),
         };
         this.css = new Map();
-        this.style = { setProperty: (key, value) => this.css.set(key, value) };
+        this.style = { setProperty: (key, value) => this.css.set(key, value), removeProperty: (key) => this.css.delete(key),
+            getPropertyValue: (key) => this.css.get(key) ?? '' };
         this.rect = { left: 0, top: 0, right: 100, bottom: 30, width: 100, height: 30 };
     }
     get parentElement() { return this.parent; }
@@ -165,15 +178,16 @@ export function domDouble() {
     const doc = new Events();
     doc.captures = new Map();
     const bubble = doc.addEventListener.bind(doc);
-    doc.addEventListener = (type, listener, capture) => {
-        if (!capture) return bubble(type, listener);
+    doc.addEventListener = (type, listener, options) => {
+        const capture = typeof options === 'object' ? Boolean(options?.capture) : Boolean(options);
+        if (!capture) return bubble(type, listener, options);
         if (!doc.captures.has(type)) doc.captures.set(type, new Set());
         doc.captures.get(type).add(listener);
         return undefined;
     };
     const unbubble = doc.removeEventListener.bind(doc);
-    doc.removeEventListener = (type, listener, capture) => (capture ? doc.captures.get(type)?.delete(listener)
-        : unbubble(type, listener));
+    doc.removeEventListener = (type, listener, options) => ((typeof options === 'object' ? options?.capture : options)
+        ? doc.captures.get(type)?.delete(listener) : unbubble(type, listener));
     doc.ownerDocument = doc;
     doc.defaultView = Object.assign(new Events(), {
         innerWidth: 1024, innerHeight: 768,
@@ -183,6 +197,7 @@ export function domDouble() {
     doc.getSelection = () => doc.selection;
     doc.createElement = (tag) => new Node(doc, tag);
     doc.body = new Node(doc, 'body');
+    doc.getElementById = (id) => doc.body.descendants().find((node) => node.id === id) || null;
     doc.activeElement = doc.body;
     return { doc, el: (tag = 'div', { className = '', attrs = {}, dataset = {}, text = '' } = {}, ...children) => {
         const node = new Node(doc, tag, attrs);

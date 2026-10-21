@@ -196,13 +196,15 @@ def test_one_exhausted_credential_profile_does_not_take_the_harness_offline():
         if applies is not None:
             constraint["applies_to_models"] = applies
         return {"subject": {"harness": harness, "subject_id": profile},
-                "freshness": freshness, "constraints": [constraint]}
+                "freshness": freshness, "constraints": [constraint],
+                "availability": {"state": "exhausted" if spent else "available", "resets_at": reset if spent else None}}
 
     class _Quota:
         def __init__(self, snaps, absences=None):
             self._snaps, self._absences = snaps, absences
-        def quota_snapshots(self): return self._snaps
-        def quota_absences(self): return self._absences or []
+        def quota_state(self, **_scope):
+            return {"snapshots": self._snaps, "absences": self._absences or [],
+                    "availability_scope": {"model": None, "requestKind": "text", "basis": "quota_block"}}
 
     # ONE of two profiles spent: the harness is still usable, so no blocker at all.
     mixed = _Quota([_snap("acct-a", spent=True, reset="2099-08-03T10:00:00Z"),
@@ -216,7 +218,8 @@ def test_one_exhausted_credential_profile_does_not_take_the_harness_offline():
 
     # A single-profile harness (no profile field at all) behaves exactly as before.
     single = _Quota([{"subject": {"harness": "some-route"}, "freshness": "fresh",
-                      "constraints": [{"used_ratio": 1.0, "resets_at": "2099-08-03T09:00:00Z"}]}])
+                      "constraints": [{"used_ratio": 1.0, "resets_at": "2099-08-03T09:00:00Z"}],
+                      "availability": {"state": "exhausted", "resets_at": "2099-08-03T09:00:00Z"}}])
     assert _exhausted_window(single, "some-route") == (True, "2099-08-03T09:00:00Z")
 
     # Another harness's exhaustion is not ours, and a STALE snapshot never blocks.
@@ -249,10 +252,21 @@ def test_a_model_scoped_window_does_not_block_a_route_pinned_to_another_model():
     class _Quota:
         def __init__(self, snaps, absences=None):
             self._snaps, self._absences = snaps, absences
-        def quota_snapshots(self): return self._snaps
-        def quota_absences(self): return self._absences or []
+        def quota_state(self, **_scope):
+            return {"snapshots": self._snaps, "absences": self._absences or [],
+                    "availability_scope": {"model": None, "requestKind": "text", "basis": "quota_block"}}
 
     quota = _Quota([fable_scoped])
+    def projection(*, model=None, **_scope):
+        # The engine, not the host, supplies the exact-model answer. Both alias
+        # spellings are independently sent and echoed; no local family matcher.
+        spent = model in (None, "fable", "claude-fable-5")
+        row = {**fable_scoped, "availability": {
+            "state": "exhausted" if spent else "available",
+            "resets_at": "2099-08-11T00:00:00Z" if spent else None}}
+        return {"snapshots": [row], "absences": [],
+                "availability_scope": {"model": model, "requestKind": "text", "basis": "quota_block"}}
+    quota.quota_state = projection
     # Pinned to opus: the Fable weekly window does not apply, the route is usable.
     assert _exhausted_window(quota, "some-route", "opus") == (False, "")
     # Pinned to fable (either alias direction): the scoped window DOES apply, and the
@@ -321,7 +335,8 @@ def test_an_unreadable_profile_keeps_the_route_usable():
 
     spent = {"subject": {"harness": "some-route", "subject_id": "acct-a"},
              "freshness": "fresh",
-             "constraints": [{"used_ratio": 1.0, "resets_at": "2099-08-11T00:00:00Z"}]}
+             "constraints": [{"used_ratio": 1.0, "resets_at": "2099-08-11T00:00:00Z"}],
+             "availability": {"state": "exhausted", "resets_at": "2099-08-11T00:00:00Z"}}
     absence = {"subject": {"harness": "some-route", "subject_id": "acct-b"},
                "reason": "refresh_failed", "detail": "oauth/usage responded 429"}
     foreign_absence = {"subject": {"harness": "other-route", "subject_id": "acct-x"},
@@ -330,8 +345,9 @@ def test_an_unreadable_profile_keeps_the_route_usable():
     class _Quota:
         def __init__(self, snaps, absences=None):
             self._snaps, self._absences = snaps, absences
-        def quota_snapshots(self): return self._snaps
-        def quota_absences(self): return self._absences or []
+        def quota_state(self, **_scope):
+            return {"snapshots": self._snaps, "absences": self._absences or [],
+                    "availability_scope": {"model": None, "requestKind": "text", "basis": "quota_block"}}
 
     # An absence on THIS route fail-opens it; a foreign route's absence changes nothing.
     assert _exhausted_window(_Quota([spent], [absence]), "some-route") == (False, "")
@@ -339,14 +355,13 @@ def test_an_unreadable_profile_keeps_the_route_usable():
         _Quota([spent], [foreign_absence]), "some-route"
     ) == (True, "2099-08-11T00:00:00Z")
 
-    # A gateway with no absence reader at all (test stubs, older fakes) keeps the
-    # plain positive-evidence answer.
+    # A legacy split-only reader cannot prove scoped engine availability.
     class _NoAbsences:
         def __init__(self, snaps): self._snaps = snaps
         def quota_snapshots(self): return self._snaps
 
     assert _exhausted_window(
-        _NoAbsences([spent]), "some-route") == (True, "2099-08-11T00:00:00Z")
+        _NoAbsences([spent]), "some-route") == (False, "")
 
 
 def test_dispatch_row_auto_without_a_route_runs_native(monkeypatch):

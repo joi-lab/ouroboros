@@ -5,7 +5,7 @@ issuing chat's own standalone System row: counted, the newest arrival, never the
 child's words or result. A child's own typed words are lines of its card: never
 counted, never its final, one line each, the same words said again included. Only
 the child's final concludes it, and a photo it delivers stands alone (DESIGN
-"Project unread dot"; the origin-addressed routing notices stay ordinary rows).
+"Unread"; the origin-addressed routing notices stay ordinary rows).
 
 Every row comes from a real producer on its allowed branch: an acting child under
 Cyber Pro (the only access that grants a child ``send_user_message``/``send_photo``;
@@ -84,12 +84,12 @@ def room(tmp_path, monkeypatch):
         return json.loads(response.body)
 
     def row_id(text: str) -> str:
-        offset = 0
-        for line in (tmp_path / "logs" / "chat.jsonl").read_bytes().splitlines(keepends=True):
-            row = json.loads(line)
+        from ouroboros import dialogue_store as ds
+
+        for entry in ds.iter_rows(tmp_path, "chat"):
+            row = entry.row
             if text in str(row.get("text") or row.get("caption") or ""):
-                return f"chat:{offset}"
-            offset += len(line)
+                return entry.history_id
         raise AssertionError(f"no stored row {text!r}")
 
     return SimpleNamespace(chat_id=chat_id, host=host, frames=frames, root=tmp_path, read=read, row_id=row_id,

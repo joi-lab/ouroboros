@@ -13,6 +13,7 @@ from ouroboros import budget_pause, store, task_results
 from ouroboros.artifacts import read_actor_source_bytes
 from supervisor import queue_snapshot
 from tests._budget_pause_exact_helpers import _install_queue, _pause
+from tests._store_journal_shared import exclusive_hold
 from tests._store_shared import unreadable_result
 from tests.test_owner_wait_restart import restart_case  # noqa: F401
 
@@ -39,28 +40,33 @@ def _result_gap(root, monkeypatch, kind, *, task_id="saved"):
         else:
             # Only this result observation is contended. Cancellation authority
             # and the snapshot remain readable, as in the real pending failure.
-            original = task_results.load_task_result
+            # The observation is the row's document and its typed control columns alike
+            # (``store_hot_facts.read`` serves the pause row without decoding the document).
+            from ouroboros import store_hot_facts
+
             calls = []
 
-            def busy_read(drive, tid, **kwargs):
-                if str(tid) != task_id:
-                    return original(drive, tid, **kwargs)
-                temporary_root = Path(os.environ.get("OUROBOROS_TEST_TEMP_ROOT") or tempfile.gettempdir())
-                assert root.resolve().is_relative_to(temporary_root.resolve())
-                conn = store.connect(store.store_path(root), store.TIER_ENFORCED)
-                try:
-                    conn.execute("BEGIN EXCLUSIVE")
-                    with store.acquisition_budget(0):
+            def contended(original):
+                def busy_read(drive, tid, **kwargs):
+                    if str(tid) != task_id:
                         return original(drive, tid, **kwargs)
-                except store.StoreBusy as exc:
-                    assert exc.reason == "contention" and exc.rollback_confirmed
-                    calls.append(exc)
-                    raise
-                finally:
-                    conn.execute("ROLLBACK")
-                    conn.close()
+                    temporary_root = Path(os.environ.get("OUROBOROS_TEST_TEMP_ROOT") or tempfile.gettempdir())
+                    assert root.resolve().is_relative_to(temporary_root.resolve())
+                    conn = exclusive_hold(store.store_path(root))  # under WAL too, the read is busy
+                    try:
+                        with store.acquisition_budget(0):
+                            return original(drive, tid, **kwargs)
+                    except store.StoreBusy as exc:
+                        assert exc.reason == "contention" and exc.rollback_confirmed
+                        calls.append(exc)
+                        raise
+                    finally:
+                        conn.execute("ROLLBACK")
+                        conn.close()
+                return busy_read
 
-            patch.setattr(task_results, "load_task_result", busy_read)
+            patch.setattr(task_results, "load_task_result", contended(task_results.load_task_result))
+            patch.setattr(store_hot_facts, "read", contended(store_hot_facts.read))
         yield
         if kind == "busy":
             assert calls, "the consumer must actually encounter SQLite contention"

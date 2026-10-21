@@ -272,10 +272,11 @@ def test_run_child_cleanup_exception_over_a_marked_one_stays_marked(tmp_path, mo
     )
     monkeypatch.setattr(extension_process_runner, "_kill_process_group", lambda _p: None)
 
-    def _rmtree_boom(*_a, **_k):
-        raise OSError("cleanup exploded")
+    class _ExplodingSet(set):  # the per-call import tree is gone; the census discard is a cleanup step
+        def discard(self, _item):
+            raise OSError("cleanup exploded")
 
-    monkeypatch.setattr(extension_process_runner.shutil, "rmtree", _rmtree_boom)
+    monkeypatch.setattr(extension_process_runner, "_active_subprocesses", _ExplodingSet())
     try:
         extension_process_runner._run_child(
             {"skill_name": "marker-clean"}, skill_dir=tmp_path, drive_root=tmp_path,

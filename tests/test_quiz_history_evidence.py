@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import json
 import threading
@@ -45,6 +47,15 @@ def runtime(tmp_path, monkeypatch):
     return SimpleNamespace(root=tmp_path, bridge=bridge, frames=frames, task=task)
 
 
+def _readable_by_the_chain_reader(root):
+    """Transition (unit Q1b migrates the chat readers onto the dialogue store): the readers still
+    read the chain files, so the rows the store holds are exported to them first -- the exact
+    bytes an older body reads. Drop this call when the readers read the store."""
+    from ouroboros.dialogue_import import export_for_older_body
+
+    export_for_older_body(root)
+
+
 def _ask(runtime, quiz_id, *, chat_id=1):
     block = record_asked(
         runtime.root, runtime.task["id"], quiz_id=quiz_id, chat_id=chat_id,
@@ -70,9 +81,9 @@ def _answer(runtime, quiz_id, *, request_id, index=0, comment=""):
 
 
 def _facts(runtime):
-    rows, coverage = Memory(runtime.root).read_chat_generations()
-    assert coverage["snapshot_stable"] and not coverage["gaps"]
-    return [row for row in rows if row.get("type") == "quiz_answer"]
+    from tests._dialogue import chat_rows
+
+    return [row for row in chat_rows(runtime.root) if row.get("type") == "quiz_answer"]
 
 
 def _read(runtime, quiz_id):
@@ -172,6 +183,7 @@ def test_a_late_answer_keeps_its_evidence_row_and_also_enters_dialogue(runtime, 
     # the owner's words; no path re-injects the frame into the bubble.
     from ouroboros.gateway.history import make_chat_history_endpoint
 
+    _readable_by_the_chain_reader(runtime.root)
     response = asyncio.run(make_chat_history_endpoint(runtime.root)(
         SimpleNamespace(query_params={"n_human": "100", "thread": "1"})))
     messages = json.loads(response.body)["messages"]
@@ -236,6 +248,7 @@ def test_competing_answers_preserve_only_the_recorded_winner(runtime, monkeypatc
     [fact] = [row for row in source["rows"] if row.get("type") == "quiz_answer"]
     assert decision(fact["quiz"]) == decision(winner)
     assert fact["quiz"]["comment"] == f"Owner choice {winner['answered_index']}"
+    _readable_by_the_chain_reader(runtime.root)
     response = asyncio.run(make_chat_history_endpoint(runtime.root)(
         SimpleNamespace(query_params={"n_human": "100", "thread": "1"})))
     messages = json.loads(response.body)["messages"]
@@ -282,7 +295,7 @@ def test_answer_history_uses_canonical_root_and_project_binding(runtime):
     assert _answer(runtime, "project", request_id="project-answer", comment="Keep the room")[0] == 200
     [fact] = _facts(runtime)
     assert fact["chat_id"] == project["chat_id"]
-    assert not (child / "logs" / "chat.jsonl").exists()
+    assert not dialogue_test.log_rows(child / "logs" / "chat.jsonl")
     [mailbox] = drain_owner_entries(child, runtime.task["id"], include_acknowledged=True)
     assert mailbox["text"] == fact["text"]
 
@@ -298,6 +311,7 @@ def test_history_recovers_evicted_answer_without_an_extra_bubble(runtime):
         _read(runtime, qid)  # only settled answers can leave the projection
     assert "history-0" not in quiz_states(runtime.root, runtime.task["id"])  # history must recover it
     cleanup_task_mailbox(runtime.root, runtime.task["id"])
+    _readable_by_the_chain_reader(runtime.root)
     response = asyncio.run(make_chat_history_endpoint(runtime.root)(
         SimpleNamespace(query_params={"n_human": "100", "thread": "1"})))
     messages = json.loads(response.body)["messages"]

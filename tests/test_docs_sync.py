@@ -148,13 +148,13 @@ def _change_review_items() -> dict:
 
 
 def test_checklist_item_numbers_cited_outside_the_checklist_name_the_current_items():
-    """The change-review checklist was renumbered (core 1-9, body layer 10-27).
+    """The change-review checklist was renumbered (core 1-9, body layer 10-28).
     Every place that cites an item BY NUMBER AND NAME — the engineering chapters,
     the architecture book, runtime comments, test docstrings — must agree with the
     live table; a number that names the wrong item sends a reviewer to the wrong
     rule. The standing archive keeps its historical numbers by its own note."""
     items = _change_review_items()
-    assert items[7] == "capability_regression" and items[11] == "development_compliance" and len(items) == 27
+    assert items[7] == "capability_regression" and items[11] == "development_compliance" and len(items) == 28
     names = "|".join(sorted(items.values(), key=len, reverse=True))
     forms = (
         # "item 17 (`subagent_isolation`)", "item 21 `source_completeness`", "item 15 (self_consistency)", "item 27, `gateway_parity`"

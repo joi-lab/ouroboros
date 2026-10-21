@@ -524,7 +524,7 @@ def _pool_world(monkeypatch, *, records=None):
     monkeypatch.setattr(reviewer_slot_config, "reviewer_slot_last_executions", lambda: {
         "api-critic": {"surface": "commit_gate", "observed_model": "openai/gpt-5.6-luna", "record_id": "rec-1"}})
     monkeypatch.setattr(server_maintenance, "review_pool_migration_records", lambda: records or {})
-    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items, env: {
+    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items: {
         "api-critic": {"usd_per_review": 0.12, "basis": "route_tariff"},
         "session-critic": {"usd_per_review": None, "basis": "subscription_seat"},
         "helper": {"usd_per_review": None, "basis": "unknown"}})
@@ -668,7 +668,7 @@ def test_review_pool_payload_carries_the_migration_outcome_that_decides_the_docu
     from ouroboros.gateway import settings as settings_mod
 
     monkeypatch.setattr(reviewer_slot_config, "reviewer_slot_last_executions", lambda: {})
-    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items, env: {})
+    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items: {})
 
     loaded, body = _served(settings_mod, {"OUROBOROS_REVIEWER_SLOTS": _AUTHORED_LANES, "OPENROUTER_API_KEY": "present"})
     (snapshot,) = sorted((pool_root / "state" / "review_migrations").glob("*-slots-to-pool.json"))
@@ -691,7 +691,7 @@ def test_review_pool_payload_names_the_reason_a_broken_lanes_key_was_retained(po
     from ouroboros.gateway import settings as settings_mod
 
     monkeypatch.setattr(reviewer_slot_config, "reviewer_slot_last_executions", lambda: {})
-    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items, env: {})
+    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items: {})
 
     loaded, body = _served(settings_mod, {"OUROBOROS_REVIEWER_SLOTS": _BROKEN_LANES, "OPENROUTER_API_KEY": "present"})
     assert loaded["OUROBOROS_REVIEWER_SLOTS"] == _BROKEN_LANES, "retained for the owner's catalog save"
@@ -721,7 +721,7 @@ def test_the_live_handler_judges_the_receipt_by_the_document_on_disk_not_the_pro
     from ouroboros.gateway import settings as settings_mod
     from tests.test_review_pool_migration import N1_DOC, _served_from_disk
 
-    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items, env: {})
+    monkeypatch.setattr(settings_mod, "_review_pool_costs", lambda items: {})
     monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
     loaded = _served_from_disk(pool_root, monkeypatch, {"OUROBOROS_REVIEWER_SLOTS": _BROKEN_LANES} if refused
                                else dict(N1_DOC))

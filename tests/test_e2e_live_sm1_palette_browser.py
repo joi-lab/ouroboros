@@ -24,8 +24,12 @@ def test_shared_palette_reaches_both_documents_and_rejects_divergence(subscripti
     page = ui["page"]
     shared = scenarios.css_with_accent((setup_browser.WEB / "ui.css").read_text(), scenarios.SM1_NEW_ACCENT)
     # A visible fixture-only palette change. The paid model/review still chooses its own
-    # coherent derivation; this tests that real consumers follow the shared roles.
-    shared = shared.replace("201, 53, 69", "47, 125, 225").replace("#f07a86", "#8fc0ff")
+    # coherent derivation; this tests that real consumers follow the shared roles. A primary
+    # action and the chosen place wear the accent's solid tone and its ink, the current step its
+    # soft tone (#1924). The dark seed's own crimson values move with the ladder.
+    shared = shared.replace("201, 53, 69", "47, 125, 225").replace("#ff756e", "#8fc0ff")
+    shared = shared.replace("#d32d43", "#2f7de1").replace("211, 45, 67", "47, 125, 225").replace("#c32a3f", "#2a6fc9")
+    shared = shared.replace("#872236", "#1d4f8f").replace("#ffdfe1", "#dbe9ff").replace("#b52b3b", "#2f7de1")
     page.route("**/static/ui.css", lambda route: route.fulfill(content_type="text/css", body=shared))
     if fault == "wizard-missing-link":
         html = (setup_browser.WEB / "onboarding_template.html").read_text()
@@ -52,8 +56,13 @@ def test_shared_palette_reaches_both_documents_and_rejects_divergence(subscripti
     assert not ctx.ui_reason and len(ctx.screenshots) == 2
     setup_browser.capture(page, f"sm1-palette-{fault}")
     if fault == "none":
-        assert probe.computed_property("#next-btn", "color") == "rgb(143, 192, 255)"
-        assert probe.computed_property(".wizard-step.active", "background-color") == "rgba(47, 125, 225, 0.08)"
+        assert probe.computed_property("#next-btn", "background-color") == "rgb(47, 125, 225)"
+        assert probe.computed_property("#next-btn", "color") == "rgb(255, 255, 255)"
+        assert probe.computed_property(".wizard-step.active", "background-color") == "rgb(29, 79, 143)"
+        assert probe.computed_property(".wizard-step.active .wizard-step-index", "color") == "rgb(219, 233, 255)"
         probe.goto("/")
-        assert probe.computed_property(".nav-row-main.active", "color") == "rgb(47, 125, 225)"
+        # The chosen row takes its tone through a transition: read the color it settles on.
+        page.wait_for_function("() => document.querySelector('.nav-row-main.active')?.getAnimations().length === 0")
+        assert probe.computed_property(".nav-row-main.active", "background-color") == "rgb(47, 125, 225)"
+        assert probe.computed_property(".nav-row-main.active", "color") == "rgb(255, 255, 255)"
     ctx.close_ui()

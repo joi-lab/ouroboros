@@ -27,6 +27,7 @@ def test_bound_direct_task_header_and_review_cost_survive_reopen(
     from playwright.sync_api import expect, sync_playwright
 
     import supervisor.queue as queue_mod
+    from ouroboros import dialogue_store
     from ouroboros.gateway.state import _chat_activities_snapshot_safe
     from ouroboros.projects_registry import bind_task_to_project, create_project
     from ouroboros.task_results import STATUS_COMPLETED, STATUS_RUNNING, write_task_result
@@ -41,8 +42,6 @@ def test_bound_direct_task_header_and_review_cost_survive_reopen(
         data_dir, task_id, STATUS_RUNNING, chat_id=1, project_id="",
         suggested_name="Analyze greeting context", _is_direct_chat=True,
     )
-    progress = data_dir / "logs" / "progress.jsonl"
-    progress.parent.mkdir(parents=True, exist_ok=True)
     rows = [{
         "task_id": task_id, "chat_id": 1, "direction": "out", "is_progress": True,
         "content": text, "ts": f"2026-09-15T11:05:0{index}+00:00", "cancelable": True,
@@ -58,7 +57,9 @@ def test_bound_direct_task_header_and_review_cost_survive_reopen(
         "cost_accounting_status": "available", "cost_final": False,
         "accounted_upper_bound_usd_with_children": 2.75,
     }
-    progress.write_text("".join(json.dumps(row) + "\n" for row in [*rows, reference]), encoding="utf-8")
+    # The running server reads its dialogue store; a log file written after boot is never imported.
+    for row in [*rows, reference]:
+        dialogue_store.append(data_dir, "progress", row)
 
     # No live global queue or registry is consulted by the fixture fragment.
     monkeypatch.setattr(queue_mod, "PENDING", [])
@@ -121,9 +122,9 @@ def test_bound_direct_task_header_and_review_cost_survive_reopen(
                 expect(card.locator("[data-live-phase]")).to_have_text("Thinking")
                 expect(card.locator("[data-live-title]")).to_have_text("Analyze greeting context")
                 expect(card.locator("[data-turn-into-project]")).to_have_count(0)
-                # The chip's own dot is the running indicator (the three typing dots are hidden in cards).
-                expect(card.locator("[data-live-phase]")).to_have_attribute("data-motion", "1")
-                expect(card.locator("[data-live-typing]")).not_to_be_visible()
+                # The chip's own status mark is the running indicator: the live word with moving dots.
+                expect(card.locator("[data-live-phase] > .status-mark")).to_have_attribute("data-shape", "moving")
+                expect(card.locator("[data-live-phase]")).to_have_attribute("data-chip-tone", "live")
                 expect(card.locator("[data-live-meta]")).not_to_contain_text("Activity unconfirmed")
                 expect(card.locator("[data-live-meta]")).to_contain_text(f"up to ${amount}")
                 expect(card).to_have_attribute("data-finished", "0")
@@ -137,8 +138,7 @@ def test_bound_direct_task_header_and_review_cost_survive_reopen(
             # hydration is deduplicated. A reference does not add an activity note.
             updated = {**reference, "chat_id": chat_id, "ts": "2026-09-15T11:05:04+00:00",
                        "accounted_upper_bound_usd_with_children": 3.50}
-            with progress.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(updated) + "\n")
+            dialogue_store.append(data_dir, "progress", updated)
             page.evaluate(
                 "row => window.__ouroWs.emit('log', {chat_id: row.chat_id, data: row})", updated,
             )
@@ -165,8 +165,8 @@ def test_bound_direct_task_header_and_review_cost_survive_reopen(
             expect(card.locator("[data-live-phase]")).to_have_attribute("data-phase", "done")
             expect(card.locator("[data-live-phase]")).to_be_visible()
             expect(card.locator("[data-live-phase]")).to_have_text("Done")
-            expect(card.locator("[data-live-phase]")).to_have_attribute("data-motion", "0")
-            expect(card.locator("[data-live-typing]")).not_to_be_visible()
+            expect(card.locator("[data-live-phase] > .status-mark")).to_have_attribute("data-shape", "dot")
+            expect(card.locator("[data-live-phase]")).to_have_attribute("data-chip-tone", "ok")
             page.evaluate(
                 "row => window.__ouroWs.emit('log', {chat_id: row.chat_id, data: row})",
                 {**terminal, "type": "task_done", "chat_id": chat_id},

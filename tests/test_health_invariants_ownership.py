@@ -1,13 +1,14 @@
-"""Delegated-run health obligations shape their instruction by ownership.
+"""Delegated-run health obligations follow ownership.
 
-The warnings stay globally visible (a preserved-and-invisible result is how
-work rots on disk), but only the OWNER task receives the call-shaped
-instruction: ``integrate_delegated_patch`` refuses a non-owner with
+The obligations stay globally visible (a preserved-and-invisible result is how
+work rots on disk), but only the OWNER task receives each run's line with its
+call-shaped instruction: ``integrate_delegated_patch`` refuses a non-owner with
 ``run_not_owned`` while the owner task is LIVE, and the read acknowledgement
-only credits the owner, so a foreign reader must be told WHO can act, never
-handed a ready-to-paste call that structurally refuses. Once the owner task is
-terminal, apply needs matching target authority but reject does not, so the
-clause states that split without minting a callable shape.
+only credits the owner. Another task's runs fold into ONE line per owner task
+(owner decision Q3=A, 18.10.2026: 223 such lines, ~110k characters, filled one
+task's Health section), with the run ids, the authority rule (once the owner is
+terminal, reject from any root, apply from the recorded target) and a run's
+exact reader.
 """
 
 import types
@@ -42,23 +43,39 @@ def _foreign_runs(monkeypatch):
         custody, "undisposed_patches", lambda root, state=None: [patch])
 
 
-def test_non_owner_gets_no_call_shaped_instruction(tmp_path, monkeypatch):
+def test_non_owner_sees_one_line_per_owner_task_and_no_call_shaped_instruction(tmp_path, monkeypatch):
     _foreign_runs(monkeypatch)
     text = context_health.build_health_invariants(_env(tmp_path), task_id="task-other")
-    assert "DELEGATED RESULT NEVER READ" in text
-    assert "DELEGATED PATCH AWAITS DISPOSITION" in text
-    assert "owner task task-owner" in text.lower() or "task-owner" in text
-    # The obligation is visible; the DIRECTLY CALLABLE shape is not. The clause
-    # names the tool only inside the conditional rule (a terminal owner's orphan
-    # has distinct apply/reject authority), never as a
-    # ready-to-paste call this foreign reader could make against a LIVE owner.
+    rows = [line for line in text.splitlines() if "task-owner" in line]
+    assert len(rows) == 1 and "ANOTHER TASK'S DELEGATED WORK — owner task task-owner" in rows[0]
+    assert "results not read to EOF: run-u" in rows[0] and "patches awaiting apply/reject: run-p" in rows[0]
+    assert "DELEGATED RESULT NEVER READ" not in text and "DELEGATED PATCH AWAITS DISPOSITION" not in text
+    # The obligation is visible with its rule and reader; the DIRECTLY CALLABLE shape is not.
     assert "integrate_delegated_patch(run_id='run-p'" not in text
-    assert "once that task is terminal" in text
-    assert "apply requires the caller's active Git root or fresh payload binding" in text
-    assert "reject may release it even from a different active root" in text
-    assert "disposition row records who acted" in text
+    assert "once it is terminal, a live top-level task may reject them from any root" in rows[0]
+    assert "apply them from the recorded target" in rows[0] and "disposition row records who acted" in rows[0]
+    assert "query_data(op='json', kind='task_result', ids=['task-owner'])" in rows[0]  # readable from any task
+    assert "or a fresh payload binding" in rows[0]
     assert "read_file" not in text
-    assert "run_not_owned" in text
+
+
+def test_each_owner_task_gets_one_line_and_own_runs_keep_theirs(tmp_path, monkeypatch):
+    import ouroboros.delegate_custody as custody
+    from ouroboros.delegate_custody import RunCustody
+
+    def unread(run_id, task):
+        run = RunCustody(run_id=run_id, task_id=task)
+        run.output_artifact = f"delegated/{run_id}.out"
+        return run
+
+    runs = [unread(f"run-a{i}", "task-a") for i in range(12)] + [unread("run-b0", "task-b"), unread("run-own", "me")]
+    monkeypatch.setattr(custody, "settled_unread_outputs", lambda root, state=None: runs)
+    monkeypatch.setattr(custody, "undisposed_patches", lambda root, state=None: [])
+    text = context_health.build_health_invariants(_env(tmp_path), task_id="me")
+    folded = [line for line in text.splitlines() if "ANOTHER TASK'S DELEGATED WORK" in line]
+    assert [line.split("owner task ")[1].split(":")[0] for line in folded] == ["task-a", "task-b"]
+    assert all(f"run-a{i}" in folded[0] for i in range(12))
+    assert "DELEGATED RESULT NEVER READ — run run-own" in text and "run-own" not in "".join(folded)
 
 
 def test_architecture_states_the_terminal_owner_apply_reject_authority_split():
@@ -134,7 +151,7 @@ def _foreign_patch_targeting(monkeypatch, target_root):
 
 def _patch_row(text):
     return next(line for line in text.splitlines()
-                if "DELEGATED PATCH AWAITS DISPOSITION" in line)
+                if "ANOTHER TASK'S DELEGATED WORK" in line and "patches awaiting apply/reject" in line)
 
 
 def test_reader_whose_active_root_is_the_target_gets_the_concrete_call(tmp_path, monkeypatch):
@@ -143,8 +160,8 @@ def test_reader_whose_active_root_is_the_target_gets_the_concrete_call(tmp_path,
     text = context_health.build_health_invariants(
         _env(tmp_path), task_id="task-other", active_root=str(target))
     # The static rule still leads; the call FOLLOWS it.
-    assert "apply requires the caller's active Git root or fresh payload binding" in text
-    assert "Your own active root already satisfies that target" in text
+    assert "apply them from the recorded target" in text
+    assert "Your active root matches the target of run-p" in text
     assert "integrate_delegated_patch(run_id='run-p', decision='apply'|'reject')" in text
 
 

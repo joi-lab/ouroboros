@@ -82,7 +82,7 @@ function fixture(history = []) {
         meta: (id = TASK) => card(id)?.querySelector('[data-live-meta]')?.innerHTML || '',
         phase: (id = TASK) => card(id)?.querySelector('[data-live-phase]')?.textContent,
         open: (id = TASK) => {
-            if (card(id) && card(id).dataset.expanded !== '1') card(id).querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+            if (card(id) && card(id).dataset.expanded !== '1') card(id).querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
         },
         emit: (type, row) => handlers.get(type)({ chat_id: 1, ts: TS, ...row }),
         log: (row) => handlers.get('log')({ chat_id: 1, data: { task_id: TASK, ts: TS, ...row } }),
@@ -196,7 +196,7 @@ test('expand shows the check, criterion and the call preview', () => {
         f.emit('chat', { task_id: TASK, role: 'assistant', is_progress: true, narration: true, content: 'Checking' });
         for (const frame of settledFrames('inv-1', verdict())) f.log(frame);
         const card = f.card();
-        if (card.dataset.expanded !== '1') card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+        if (card.dataset.expanded !== '1') card.querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
         const row = f.checks()[0];
         assert.match(row.innerHTML, /The check ran successfully \(exit 0\); its criterion was not met\. Check: pytest -q tests\/test_report.py · Criterion: C1/);
         // Expandable like every diagnostic row; the expanded body (check, criterion, the
@@ -221,7 +221,7 @@ test('reload draws the same row from replayed evidence, and a live duplicate sta
     try {
         await f.instance.refreshHistory({ revision: 1 });
         const card = f.card();
-        if (card.dataset.expanded !== '1') card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+        if (card.dataset.expanded !== '1') card.querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
         assert.equal(f.checks().length, 1);
         assert.match(f.checks()[0].innerHTML, /Check did not pass: expected text not found/);
         assert.match(f.text() + f.meta(), /2 tool calls/);
@@ -243,7 +243,7 @@ test('a check settled after the terminal row still gets its row, without reopeni
         for (const frame of settledFrames('inv-1', verdict({ matched: undefined, detail: 'check timed out after 300s' }),
             { timed_out: true, exit_code: undefined })) f.log(frame);
         const card = f.card();
-        if (card.dataset.expanded !== '1') card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+        if (card.dataset.expanded !== '1') card.querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
         assert.equal(f.checks().length, 1);
         assert.match(f.checks()[0].innerHTML, /Check did not pass: timed out/);
         // Late success settlement retires the provisional wait notice; no error is resurrected.

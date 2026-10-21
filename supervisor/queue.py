@@ -6,13 +6,14 @@ import contextlib
 import contextvars
 import logging
 import math
+import os
 import pathlib
 import queue as _stdqueue  # noqa: F401 — re-exported for the test suite's reap-queue isolation
-import threading
 import time  # noqa: F401 -- facade name tests read (queue.time)
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from supervisor.loop_load import MeasuredRLock
 from supervisor.state import (
     load_state,
     append_jsonl,  # noqa: F401 -- queue_snapshot leaf reads it via the _queue() handle
@@ -77,15 +78,31 @@ OBJECTIVE_REPEAT_CAP: int = 3
 
 # Whether THIS process owns the supervisor's live maps (``init`` ran): a process that merely
 # imports the module sees empty maps, which prove nothing (``task_settlement_liveness``).
+# OWNER_PID names that process: a child forked after ``init`` inherits INITIALIZED, not the pid.
 INITIALIZED = False
+OWNER_PID: Optional[int] = None
 QUEUE_PUBLICATION = None  # Structural documents and their successfully published generation.
 
 
+def owns_live_queue(drive_root: Any) -> bool:
+    """Whether THIS process holds the live queue of ``drive_root``: a process fact, never an
+    actor's flag. A worker never does (its maps are empty or a forked copy), so it asks over the
+    bus, where only the current RUNNING attempt may open a fence (#1183)."""
+    from ouroboros.utils import in_worker_process
+
+    if in_worker_process() or not INITIALIZED or OWNER_PID != os.getpid():
+        return False  # a worker, never initialized here, or a child forked with a copy of the maps
+    try:
+        return pathlib.Path(DRIVE_ROOT).resolve() == pathlib.Path(drive_root).resolve()
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def init(drive_root: pathlib.Path) -> None:
-    global DRIVE_ROOT, FINALIZATION_GRACE_SEC, INITIALIZED, QUEUE_SNAPSHOT_PATH, QUEUE_PUBLICATION
+    global DRIVE_ROOT, FINALIZATION_GRACE_SEC, INITIALIZED, OWNER_PID, QUEUE_SNAPSHOT_PATH, QUEUE_PUBLICATION
     QUEUE_PUBLICATION = None
     DRIVE_ROOT = drive_root
-    INITIALIZED = True
+    INITIALIZED, OWNER_PID = True, os.getpid()
     QUEUE_SNAPSHOT_PATH = drive_root / "state" / "queue_snapshot.json"
     FINALIZATION_GRACE_SEC = get_finalization_grace_sec()
     BUDGET_ROOT_FENCES.clear()
@@ -129,8 +146,9 @@ ADMISSION_RESERVATIONS: Dict[str, str] = {}
 # Those doors always exit; the next generation's ``init_queue_refs`` starts open.
 RETURNS_NAMED: Dict[str, str] = {}
 
-# Guards PENDING/RUNNING mutations across main loop, direct chat, watchdog.
-_queue_lock = threading.RLock()
+# Guards PENDING/RUNNING mutations across main loop, direct chat, watchdog. An RLock that
+# times its outermost waits and holds for the per-minute supervisor_load row.
+_queue_lock = MeasuredRLock()
 
 
 def name_queue_returns(pending: List[Dict[str, Any]], door: str) -> List[Dict[str, Any]]:
@@ -141,10 +159,13 @@ def name_queue_returns(pending: List[Dict[str, Any]], door: str) -> List[Dict[st
 
 
 def reopen_queue_returns(door: str) -> None:
-    """That door's stop raised before its exit: this generation goes on admitting."""
+    """That door's stop raised before its exit: this generation goes on admitting, its admission lane too."""
+    from supervisor.workspace_preparation import resume_admission
+
     with _queue_lock:
         if RETURNS_NAMED.get("door") == door:
             RETURNS_NAMED.clear()
+    resume_admission()
 from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
     coerce_queue_order, enqueue_with_admission_receipt, prefer_terminalization_retry_rows,
     reject_invalid_task_depth, release_task_admission, restore_invalid_depth_admission,

@@ -4,8 +4,8 @@
 # Deliberately NOT wired to `schedule`: the owner decision adds no browser cron,
 # and the existing manual/tag checks stay exactly as they were.
 #
-# The complete lane runs as four shards on four runners. Every shard collects and
-# guards the WHOLE lane, then executes every fourth node of the sorted node ids;
+# The complete lane runs as eight shards on eight runners. Every shard collects and
+# guards the WHOLE lane, then executes every eighth node of the sorted node ids;
 # `ui-manifest` collects the lane once with no shard option, and the `ui-smoke`
 # aggregator fails unless the shards' evidence proves that each manifest node ran
 # in exactly the shard it belongs to. A node no shard executed is named there.
@@ -51,7 +51,7 @@ jobs:
           fi
 
   ui-shard:
-    name: ui-shard (${{ matrix.shard }}/4)
+    name: ui-shard (${{ matrix.shard }}/8)
     needs: scope
     if: ${{ needs.scope.outputs.run_browser == 'true' }}
     runs-on: ubuntu-latest
@@ -61,13 +61,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - uses: ./.github/actions/setup-python-env
         with:
+          interpreter: shipped  # the SQLite and journal mode fresh installs run
           install-project: 'false'
         id: setup_python
       # tests/test_separate_ui_browser.py runs the interface behind a real Caddy. The official
@@ -116,7 +117,7 @@ jobs:
           SEPARATE_UI_CADDY: ${{ steps.install_caddy.outputs.path }}
         run: >-
           python -I -S scripts/safe_test.py -- python -m pytest tests/ -m ui_browser --require-ui-browser -vv --tb=short
-          --ui-browser-shard=${{ matrix.shard }}/4 --session-timeout=4500
+          --ui-browser-shard=${{ matrix.shard }}/8 --session-timeout=4500
           --junitxml="${{ runner.temp }}/ci-private/ui/host.xml"
           --ci-evidence-dir="${{ runner.temp }}/ci-evidence/ui/host"
       - name: Run browser tools Chromium/WebKit smoke
@@ -160,7 +161,7 @@ jobs:
           --evidence-dir "${{ runner.temp }}/ci-evidence/ui/host"
           --producer-outcome "$PRODUCER_OUTCOME" --scope full
           --artifact-outcome "$ARTIFACT_OUTCOME" --artifact-url "$ARTIFACT_URL"
-          --summary "$GITHUB_STEP_SUMMARY" --label "shard ${{ matrix.shard }}/4"
+          --summary "$GITHUB_STEP_SUMMARY" --label "shard ${{ matrix.shard }}/8"
       - name: Summarize browser tools results
         id: tools_summary
         if: ${{ !cancelled() && steps.browser_tools.outcome != 'skipped' }}
@@ -209,6 +210,7 @@ jobs:
           fetch-depth: 0
       - uses: ./.github/actions/setup-python-env
         with:
+          interpreter: shipped  # the SQLite and journal mode fresh installs run
           install-project: 'false'
       - name: Collect the complete host UI lane as the shard manifest
         id: ui_manifest
@@ -300,5 +302,5 @@ jobs:
           python3 -I -S tests/ci_evidence.py reconcile-shards
           --manifest "${{ runner.temp }}/ui-proof/manifest"
           --shards "${{ runner.temp }}/ui-proof/shards"
-          --count 4 --sha "${{ github.sha }}" --run-id "${{ github.run_id }}"
+          --count 8 --sha "${{ github.sha }}" --run-id "${{ github.run_id }}"
           --summary "$GITHUB_STEP_SUMMARY"

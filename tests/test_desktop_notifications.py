@@ -206,19 +206,24 @@ def test_one_adapter_per_platform(monkeypatch, platform, kind):
 # ------------------------------------------------------------------------------------- macOS ---
 
 class Settings:
-    def __init__(self, status):
-        self.status = status
+    def __init__(self, status, sound):
+        self.status, self.sound = status, sound
 
     def authorizationStatus(self):
         return self.status
 
+    def soundSetting(self):
+        return self.sound
+
 
 class Center:
-    def __init__(self, status=0, grant=True, error=None):
+    def __init__(self, status=0, grant=True, error=None, sound=2):
         self.status, self.grant, self.error, self.asked, self.added = status, grant, error, [], []
+        self.sound, self.reads = sound, 0
 
     def getNotificationSettingsWithCompletionHandler_(self, handler):
-        handler(Settings(self.status))
+        self.reads += 1
+        handler(Settings(self.status, self.sound))
 
     def requestAuthorizationWithOptions_completionHandler_(self, options, handler):
         self.asked.append(options)
@@ -227,7 +232,11 @@ class Center:
 
     def addNotificationRequest_withCompletionHandler_(self, request, handler):
         self.added.append(request)
-        handler(self.error)
+        error = self.error
+        if error is None and self.status != 2:
+            error = SimpleNamespace(domain=lambda: "UNErrorDomain", code=lambda: 1,
+                                    localizedDescription=lambda: "Notifications are not allowed")
+        handler(error)
 
 
 class Content:
@@ -269,6 +278,24 @@ def test_macos_reads_the_permission_without_asking(monkeypatch):
         assert center.asked == []
 
 
+@pytest.mark.parametrize("value,expected", [(2, "enabled"), (1, "disabled"), (0, "unknown"), (99, "unknown")])
+def test_macos_sound_setting_is_independent_of_authorization(monkeypatch, value, expected):
+    center = Center(status=2, sound=value)
+    notifier, _ = mac(monkeypatch, center)
+    info = bridge(notifier).shell_info()["native_notifications"]
+    assert info["status"] == "authorized" and info["sound_setting"] == expected
+    center.sound = 1 if value == 2 else 2
+    assert notifier.status()["sound_setting"] == ("disabled" if value == 2 else "enabled")
+    assert center.reads == 2 and center.asked == [], "every read returns current OS facts"
+
+
+def test_macos_unreadable_sound_is_unknown(monkeypatch):
+    center = Center(status=2)
+    monkeypatch.setattr(Settings, "soundSetting", lambda self: (_ for _ in ()).throw(AttributeError("missing")))
+    notifier, _ = mac(monkeypatch, center)
+    assert notifier.status()["sound_setting"] == "unknown"
+
+
 def test_macos_asks_once_for_alert_and_sound_never_a_badge(monkeypatch):
     center = Center(status=0)
     notifier, _ = mac(monkeypatch, center)
@@ -294,23 +321,35 @@ def test_macos_delivers_with_the_system_sound_and_the_pages_token(monkeypatch):
 def test_macos_denial_and_errors_are_typed_fallbacks(monkeypatch):
     denied = Center(status=1)
     notifier, _ = mac(monkeypatch, denied)
-    assert notifier.notify("t", "", True, "n1-a") == {"ok": False, "status": "denied", "platform": "macos",
-                                                       "reason": ""}
-    assert denied.added == []
+    assert notifier.notify("t", "", True, "n1-a")["status"] == "denied"
+    assert len(denied.added) == 1 and denied.reads == 1, "the OS enforces permission; only its refusal is read after"
 
-    error = SimpleNamespace(localizedDescription=lambda: "Notifications are not allowed")
+    error = SimpleNamespace(domain=lambda: "OtherDomain", code=lambda: 1,
+                            localizedDescription=lambda: "Notifications are not allowed")
+    failing = Center(status=2, error=error)
+    notifier, _ = mac(monkeypatch, failing)
+    answer = notifier.notify("t", "", True, "n1-a")
+    assert answer["status"] == "failed" and answer["reason"].startswith("OtherDomain 1:")
+    assert failing.reads == 0, "a failure is not a permission refusal: nothing to read"
+
+
+@pytest.mark.parametrize("domain,code,expected", [("UNErrorDomain", 1, "denied"),
+                                                ("UNErrorDomain", 2, "failed"), ("Other", 1, "failed")])
+def test_macos_denial_uses_domain_and_code_not_translated_text(monkeypatch, domain, code, expected):
+    error = SimpleNamespace(domain=lambda: domain, code=lambda: code,
+                            localizedDescription=lambda: "Разрешения изменены")
     notifier, _ = mac(monkeypatch, Center(status=2, error=error))
-    assert notifier.notify("t", "", True, "n1-a")["reason"] == "Notifications are not allowed"
+    assert notifier.notify("t", "", True, "n1-a")["status"] == expected
 
 
 def test_macos_an_alert_never_asks_for_permission(monkeypatch):
-    """Only the owner's gesture asks (switching on, Test: ``ask``); an alert that finds the question unasked
-    falls back, even when an older page left notifications switched on."""
+    """Only a gesture asks. Even a caller bypassing the page's precheck cannot ask through delivery, and the
+    system's "not allowed" for an unasked question stays unasked rather than becoming the owner's denial."""
     unasked = Center(status=0)
     notifier, _ = mac(monkeypatch, unasked)
     assert notifier.notify("t", "", True, "n1-a") == {"ok": False, "status": "not_determined", "platform": "macos",
-                                                       "reason": ""}
-    assert unasked.asked == [] and unasked.added == []
+                                                      "reason": ""}
+    assert unasked.asked == [] and len(unasked.added) == 1 and unasked.reads == 1
     assert notifier.ask()["status"] == "authorized" and unasked.asked == [2 | 4], "the gesture asks, once"
     assert notifier.notify("t", "", True, "n2-a")["status"] == "submitted"
 
@@ -327,14 +366,32 @@ def test_macos_an_authorization_error_is_typed_never_a_denial(monkeypatch):
     reason = "authorization_error: UNErrorDomain 1: Notifications are not allowed"
     center = Refusing(status=0)
     notifier, _ = mac(monkeypatch, center)
-    assert notifier.ask() == {"available": False, "status": "unavailable", "platform": "macos", "reason": reason}
+    assert notifier.ask() == {"available": False, "status": "unavailable", "platform": "macos", "reason": reason,
+                              "sound_setting": "unknown"}
     assert notifier.status()["status"] == "not_determined", "the system's own setting is reported as it is"
     assert notifier.notify("t", "", True, "n1-a") == {"ok": False, "status": "not_determined", "platform": "macos",
-                                                       "reason": reason}
-    assert center.added == []
+                                                      "reason": reason}
     # The owner's own refusal, with no error, is still a denial.
     notifier, _ = mac(monkeypatch, Center(status=0, grant=False))
-    assert notifier.ask() == {"available": False, "status": "denied", "platform": "macos", "reason": ""}
+    assert notifier.ask() == {"available": False, "status": "denied", "platform": "macos", "reason": "",
+                              "sound_setting": "enabled"}
+
+
+@pytest.mark.parametrize("read", ["unanswered", "broken"])
+def test_macos_a_refusal_whose_permission_cannot_be_read_stays_a_denial(monkeypatch, read):
+    """The one read after a definite refusal can only narrow it to unasked; without an answer it stays denied."""
+    class Unreadable(Center):
+        def getNotificationSettingsWithCompletionHandler_(self, handler):
+            self.reads += 1
+            if read == "broken":
+                raise RuntimeError("settings unavailable")  # "unanswered": the completion never comes
+
+    monkeypatch.setattr(dn, "_REPLY_WAIT", 0.05)
+    center = Unreadable(status=0)
+    notifier, _ = mac(monkeypatch, center)
+    answer = notifier.notify("t", "", True, "n1-a")
+    assert answer["status"] == "denied" and answer["reason"].startswith("UNErrorDomain 1:")
+    assert center.reads == 1 and center.asked == [] and len(center.added) == 1
 
 
 def test_macos_an_unanswered_question_stays_not_determined(monkeypatch):
@@ -344,7 +401,8 @@ def test_macos_an_unanswered_question_stays_not_determined(monkeypatch):
 
     monkeypatch.setattr(dn, "_ASK_WAIT", 0.05)
     notifier, _ = mac(monkeypatch, Ignored(status=0))
-    assert notifier.ask() == {"available": True, "status": "not_determined", "platform": "macos", "reason": ""}
+    assert notifier.ask() == {"available": True, "status": "not_determined", "platform": "macos", "reason": "",
+                              "sound_setting": "unknown"}
 
 
 def test_macos_an_added_request_without_an_answer_is_unknown_and_keeps_its_click(monkeypatch):
@@ -364,7 +422,7 @@ def test_macos_an_added_request_without_an_answer_is_unknown_and_keeps_its_click
     assert center.added[0][0] == "n1-late", "the system's click hands back this token whenever it comes"
 
 
-def test_macos_an_unanswered_permission_read_is_a_failure_before_anything_was_sent(monkeypatch):
+def test_macos_submission_has_no_second_permission_wait(monkeypatch):
     class Mute(Center):
         def getNotificationSettingsWithCompletionHandler_(self, handler):
             pass
@@ -372,9 +430,28 @@ def test_macos_an_unanswered_permission_read_is_a_failure_before_anything_was_se
     monkeypatch.setattr(dn, "_REPLY_WAIT", 0.05)
     center = Mute(status=2)
     notifier, _ = mac(monkeypatch, center)
-    answer = notifier.notify("t", "", True, "n1-a")
-    assert answer["status"] == "failed" and answer["reason"].startswith("TimeoutError")
-    assert center.added == [], "nothing was handed over, so the page's fallback is the only alert"
+    assert notifier.status()["sound_setting"] == "unknown"
+    answer = notifier.notify("t", "", False, "n1-a")
+    assert answer["status"] == "submitted" and answer["sound"] == "off"
+    assert len(center.added) == 1, "delivery submits directly after the page's final preference check"
+
+
+def test_macos_nil_completion_is_submission_not_permission_proof(monkeypatch):
+    """Native QA P9: usernoted accepts requests with nil error even after revocation.
+
+    The page must prepare before its last mute check. The adapter must neither
+    insert a later permission wait nor relabel an accepted request as unsent.
+    """
+    class Revoked(Center):
+        def addNotificationRequest_withCompletionHandler_(self, request, handler):
+            self.added.append(request)
+            handler(None)
+
+    center = Revoked(status=1)
+    notifier, _ = mac(monkeypatch, center)
+    assert notifier.status()["status"] == "denied"
+    assert notifier.notify("t", "", False, "n1-a")["status"] == "submitted"
+    assert center.reads == 1 and center.asked == [] and len(center.added) == 1
 
 
 def test_macos_outside_an_app_bundle_is_unavailable_once(monkeypatch):
@@ -387,7 +464,7 @@ def test_macos_outside_an_app_bundle_is_unavailable_once(monkeypatch):
     monkeypatch.setattr(dn, "_mac_center", no_bundle)
     notifier = dn.MacNotifier(lambda token: None)
     assert notifier.status() == {"available": False, "status": "unavailable", "platform": "macos",
-                                 "reason": "not_an_app_bundle"}
+                                 "reason": "not_an_app_bundle", "sound_setting": "unknown"}
     assert notifier.notify("t", "", True, "n1-a")["status"] == "unavailable"
     assert attempts == [1], "no retry storm against a missing identity"
 

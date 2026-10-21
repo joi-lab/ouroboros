@@ -120,8 +120,16 @@ def _over_every_row(fn, *args, **kwargs):
         return fn(*args, **kwargs)
 
 
+_FOLDED = {"NEVER READ": "results not read to EOF: ", "AWAITS DISPOSITION": "patches awaiting apply/reject: "}
+
+
 def _named(lines, marker):
-    return {line.split("— run ")[1].split()[0] for line in lines if marker in line}
+    """Run ids a marker names: each own run's line, or another task's one folded line (Q3=A)."""
+    named = {line.split("— run ")[1].split()[0] for line in lines if marker in line and "— run " in line}
+    for line in lines:
+        if "ANOTHER TASK'S DELEGATED WORK" in line and _FOLDED.get(marker, "\0") in line:
+            named |= set(line.split(_FOLDED[marker])[1].split(";")[0].split(".")[0].split(", "))
+    return named
 
 
 # --- health: one selected read, equal lines, the shared full-read fallback -------------

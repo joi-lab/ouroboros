@@ -301,16 +301,24 @@ def test_reviewer_rule_name_then_pin_then_order_clamped_then_the_range_top(monke
 
 
 def test_a_wave_order_discloses_the_effective_weaker_level_not_the_raw_order(monkeypatch):
-    from types import SimpleNamespace
+    from ouroboros import config
+    from ouroboros.tools.review_change import compose_panel, parse_request
+    from tests.review_pool_rosters import pool_roster, pool_seat, set_review_pool
 
-    from ouroboros.tools.review_change import _effort_facts
-
-    seats = [(SimpleNamespace(slot_id="auto", effort="low", declared_effort="none"), (), False),
-             (SimpleNamespace(slot_id="pinned", effort="xhigh", declared_effort=""), (), False)]
-    facts = _effort_facts("none", seats, {"auto": "high", "pinned": "xhigh"})
+    _env(monkeypatch, OUROBOROS_EFFORT_MIN="low", OUROBOROS_EFFORT_TASK="medium", OUROBOROS_EFFORT_MAX="high")
+    monkeypatch.setattr(config, "_BOOT_RUNTIME_MODE", "pro")
+    set_review_pool(monkeypatch, pool_roster(pool_seat("auto", "openai/gpt-5.6-terra"),
+                                          pool_seat("pinned", "openai/gpt-5.6-sol", effort="xhigh")))
+    panel = compose_panel(parse_request({"root": "system_repo", "subject": "index", "reviewer_effort": "none"}),
+                          body=True, strictness="blocking")
+    assert [(seat.slot.slot_id, seat.slot.effort) for seat in panel.seats] == [("auto", "low"), ("pinned", "xhigh")]
+    facts = panel.facts["reviewer_effort"]
     assert facts == {"order": "none", "applied": ["auto"], "not_applied": ["pinned"], "weaker_than_configured": ["auto"]}
-    seats = [(SimpleNamespace(slot_id="auto", effort="high", declared_effort="ultra"), (), False)]
-    assert _effort_facts("ultra", seats, {"auto": "high"})["weaker_than_configured"] == []
+    panel = compose_panel(parse_request({"root": "system_repo", "subject": "index", "reviewer_effort": "ultra"}),
+                          body=True, strictness="blocking")
+    assert [(seat.slot.slot_id, seat.slot.effort) for seat in panel.seats] == [("auto", "high"), ("pinned", "xhigh")]
+    assert panel.facts["reviewer_effort"] == {
+        "order": "ultra", "applied": ["auto"], "not_applied": ["pinned"], "weaker_than_configured": []}
 
 
 # --- children: the request, the decision, the carrier to the first start, the disclosure -----

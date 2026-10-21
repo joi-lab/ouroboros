@@ -24,6 +24,7 @@ import threading
 from hashlib import sha256
 from typing import Any, BinaryIO, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from ouroboros.artifact_storage import compress_in_place
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.headless_status import (
     ARTIFACT_STATUS_FAILED,
@@ -76,6 +77,8 @@ def write_workspace_patch_artifacts(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Stream workspace patch and manifest artifacts into ``artifact_dir``."""
 
+    from ouroboros.artifacts import stream_artifact_file
+
     root = pathlib.Path(workspace_root).resolve(strict=False)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     patch_path = artifact_dir / "workspace.patch"
@@ -114,6 +117,11 @@ def write_workspace_patch_artifacts(
         root,
         errors,
     )
+    # A tracked WAL index (committed beside its database, or staged in a copy) is shared memory as an
+    # untracked one is: never diffed, and never named for an integration to stage over the target's own.
+    wal_indexes = {rel: reason for rel in changed_tracked if (reason := _wal_index_reason(root, rel))}
+    tracked_excluded.extend({"path": rel, "reason": reason} for rel, reason in wal_indexes.items())
+    changed_tracked = [rel for rel in changed_tracked if rel not in wal_indexes]
     diffstat = ""
     untracked = _git_path_list(["git", "ls-files", "-z", "--others", "--exclude-standard"], root, errors)
     # Copied inputs were deliberately never Git additions. Their exact baseline
@@ -121,43 +129,20 @@ def write_workspace_patch_artifacts(
     untracked = [rel for rel in untracked if rel not in file_baseline]
     # v6.52.2: exclude declared ephemeral scratch (run_command/run_script `scratch=[...]`) so a
     # throwaway verification file the agent forgot to delete never leaks into the workspace patch.
-    # The manifest stores {abs_path: sha256}; a file is excluded ONLY while its CURRENT content
-    # still matches the recorded scratch sha — so a LATER real file written to the same path
-    # (different content) is NOT dropped. Empty/absent/mismatched => included (no regression).
-    scratch_sha_by_rel: dict = {}
-    scratch_sha_by_abs: dict = {}
-    try:
-        _scratch_map = json.loads((artifact_dir / SCRATCH_MANIFEST_NAME).read_text(encoding="utf-8")).get("scratch")
-        if isinstance(_scratch_map, dict):
-            for _abs, _sha in _scratch_map.items():
-                try:
-                    _resolved = pathlib.Path(str(_abs)).resolve(strict=False)
-                    scratch_sha_by_abs[os.path.normcase(str(_resolved))] = str(_sha)
-                    scratch_sha_by_rel[_resolved.relative_to(root).as_posix()] = str(_sha)
-                except Exception:
-                    continue
-    except Exception:
-        scratch_sha_by_rel = {}
-        scratch_sha_by_abs = {}
+    scratch = _declared_scratch(artifact_dir, root)
     # git's binary verdict for the whole inventory in one process (two when empty
     # files need their attribute verdict; #1241); the loop below keeps its per-file
     # order and reads the verdict instead of spawning ``git diff --numstat`` per file.
     binary_verdicts = untracked_binary_verdicts(root, binary_verdict_candidates(root, untracked), warnings=diagnostics)
     for rel in untracked:
-        _want_sha = scratch_sha_by_rel.get(rel) or scratch_sha_by_abs.get(os.path.normcase(str((root / rel).resolve(strict=False))))
-        if _want_sha:
-            try:
-                _cur_sha = sha256((root / rel).read_bytes()).hexdigest()
-            except OSError:
-                _cur_sha = None
-            if _cur_sha == _want_sha:
-                excluded.append({"path": rel, "reason": "declared ephemeral scratch (v6.52.2)"})
-                continue
+        if _is_declared_scratch(root, rel, *scratch):
+            excluded.append({"path": rel, "reason": "declared ephemeral scratch (v6.52.2)"})
+            continue
         sensitive_reason = _sensitive_untracked_reason(rel)
         if sensitive_reason:
             sensitive.append({"path": rel, "reason": sensitive_reason})
             continue
-        reason = _patch_exclude_reason(rel)
+        reason = _patch_exclude_reason(rel) or _wal_index_reason(root, rel)
         if reason:
             excluded.append({"path": rel, "reason": reason})
             continue
@@ -238,14 +223,14 @@ def write_workspace_patch_artifacts(
             )
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             errors.append({"type": "file_capture_failed", "message": f"{type(exc).__name__}: {exc}"})
-    hasher = sha256()
     total_size = 0
     with patch_path.open("wb") as fh:
         if not errors:
             tracked_lock_excludes = sorted(set(changed_tracked) & incidental_lock_excludes)
             tracked_pathspec = ["--"]
-            if tracked_lock_excludes or large_tracked or file_baseline:
-                tracked_pathspec += ["."] + [f":(exclude,literal){rel}" for rel in [*tracked_lock_excludes, *large_tracked, *file_baseline]]
+            if tracked_lock_excludes or large_tracked or file_baseline or wal_indexes:
+                tracked_pathspec += ["."] + [f":(exclude,literal){rel}" for rel in
+                                             [*tracked_lock_excludes, *large_tracked, *file_baseline, *wal_indexes]]
             for rel in tracked_lock_excludes:
                 tracked_excluded.append({"path": rel, "reason": "incidental lockfile without sibling manifest change"})
             diffstat = _git_stdout(
@@ -258,24 +243,21 @@ def write_workspace_patch_artifacts(
                 ["git", "diff", "--binary", "--no-ext-diff", "--no-color", base_ref, *tracked_pathspec],
                 root,
                 fh,
-                hasher,
                 allow_rc={0},
                 errors=errors,
                 diagnostics=diagnostics,
             )
             for rel in included_untracked:
                 if total_size:
-                    total_size += _write_patch_separator(fh, hasher)
+                    total_size += _write_patch_separator(fh)
                 total_size += _append_git_output(
                     ["git", "diff", "--no-index", "--binary", "--no-ext-diff", "--no-color", "--", os.devnull, rel],
                     root,
                     fh,
-                    hasher,
                     allow_rc={0, 1},
                     errors=errors,
                     diagnostics=diagnostics,
                 )
-    digest = hasher.hexdigest()
     head_errors: List[Dict[str, Any]] = []
     current_head = _git_stdout(["git", "rev-parse", "--verify", "HEAD"], root, allow_rc={0}, errors=head_errors).strip()
     # Only isolated copies keep HEAD fixed to their provisioned baseline.
@@ -305,6 +287,10 @@ def write_workspace_patch_artifacts(
         except OSError:
             pass
         digest = ""
+    else:
+        compress_in_place(patch_path)
+        measured = stream_artifact_file(patch_path)
+        total_size, digest = measured["size"], measured["sha256"]
     manifest = {
         "schema_version": 1,
         "created_at": utc_now_iso(),
@@ -345,12 +331,14 @@ def write_workspace_patch_artifacts(
         "errors": errors,
     }
     atomic_write_json(manifest_path, manifest, trailing_newline=True)
+
+    # Published with its measured identity, like the patch beside it (#1969).
     artifacts = [
         {
             "kind": "workspace_patch_manifest",
             "name": "workspace_patch.json",
             "path": str(manifest_path),
-            "size": manifest_path.stat().st_size if manifest_path.exists() else 0,
+            **stream_artifact_file(manifest_path),
             "workspace_root": str(root),
         }
     ]
@@ -364,6 +352,46 @@ def write_workspace_patch_artifacts(
             "workspace_root": str(root),
         })
     return [*artifacts, *file_outputs], manifest
+
+
+def _declared_scratch(artifact_dir: pathlib.Path, root: pathlib.Path) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """The declared scratch of ``artifact_dir``'s manifest as ``({rel: sha256}, {normcased abs: sha256})``.
+
+    The manifest stores {abs_path: sha256}; a file is excluded ONLY while its CURRENT content
+    still matches the recorded scratch sha — so a LATER real file written to the same path
+    (different content) is NOT dropped. Empty/absent/mismatched => included (no regression).
+    """
+    by_rel: Dict[str, str] = {}
+    by_abs: Dict[str, str] = {}
+    try:
+        scratch_map = json.loads((artifact_dir / SCRATCH_MANIFEST_NAME).read_text(encoding="utf-8")).get("scratch")
+        if isinstance(scratch_map, dict):
+            for raw_abs, sha in scratch_map.items():
+                try:
+                    resolved = pathlib.Path(str(raw_abs)).resolve(strict=False)
+                    by_abs[os.path.normcase(str(resolved))] = str(sha)
+                    by_rel[resolved.relative_to(root).as_posix()] = str(sha)
+                except Exception:
+                    continue
+    except Exception:
+        return {}, {}
+    return by_rel, by_abs
+
+
+def _is_declared_scratch(root: pathlib.Path, rel: str, by_rel: Dict[str, str], by_abs: Dict[str, str]) -> bool:
+    """Whether untracked ``rel`` is declared scratch whose current content still has its recorded sha."""
+    want_sha = by_rel.get(rel)
+    if not want_sha and by_abs:  # resolved only to match a declared scratch path
+        try:
+            want_sha = by_abs.get(os.path.normcase(str((root / rel).resolve(strict=False))))
+        except (OSError, RuntimeError):  # a link that cannot be resolved (a loop) is no scratch file
+            want_sha = None
+    if not want_sha:
+        return False
+    try:
+        return sha256((root / rel).read_bytes()).hexdigest() == want_sha
+    except OSError:
+        return False
 
 
 def _git_stdout(
@@ -537,7 +565,6 @@ def _append_git_output(
     cmd: Sequence[str],
     cwd: pathlib.Path,
     fh: BinaryIO,
-    hasher: Any,
     *,
     allow_rc: set[int],
     errors: List[Dict[str, Any]],
@@ -562,7 +589,6 @@ def _append_git_output(
                         if not chunk:
                             break
                         fh.write(chunk)
-                        hasher.update(chunk)
                         written_box["value"] += len(chunk)
                 except Exception as exc:
                     read_errors.append(f"{type(exc).__name__}: {exc}")
@@ -614,10 +640,9 @@ def _append_git_output(
     return written
 
 
-def _write_patch_separator(fh: BinaryIO, hasher: Any) -> int:
+def _write_patch_separator(fh: BinaryIO) -> int:
     data = b"\n"
     fh.write(data)
-    hasher.update(data)
     return len(data)
 
 
@@ -659,6 +684,15 @@ def pem_capture_refusal(root: pathlib.Path, rel: str, *, warnings=None) -> str:
             logging.getLogger(__name__).warning("PEM capture finding retained as advisory: %s", finding)
         return ""
     return reason
+
+
+def _wal_index_reason(root: pathlib.Path, rel: str) -> str:
+    """A SQLite WAL index never enters a capture: no raw reader opens it (``store.is_wal_index``:
+    its bytes are shared memory under the holders' locks), and a copy of its database rebuilds its
+    own from the log at the first open. It is excluded before any read, the PEM head included."""
+    from ouroboros.store import is_wal_index
+
+    return "SQLite WAL index (shared memory a database copy rebuilds from its log)" if is_wal_index(root / rel) else ""
 
 
 def _untracked_blob_exclude_reason(root: pathlib.Path, rel: str, *, file_outputs: Optional[List[str]] = None,
@@ -715,7 +749,8 @@ def binary_verdict_candidates(root: pathlib.Path, rels: Sequence[str]) -> List[s
     unrestricted = mode_has_unrestricted_agency(get_runtime_mode())
     out: List[str] = []
     for rel in rels:
-        if not rel or _sensitive_untracked_reason(rel) or _patch_exclude_reason(rel):
+        if (not rel or _sensitive_untracked_reason(rel) or _patch_exclude_reason(rel)
+                or _wal_index_reason(root, rel)):
             continue
         try:
             info = os.lstat(root / rel)
@@ -824,7 +859,7 @@ def untracked_capture_veto_reason(root: pathlib.Path, rel: str, *, file_outputs:
     reason = _sensitive_untracked_reason(rel)
     if reason:
         return reason
-    reason = _patch_exclude_reason(rel)
+    reason = _patch_exclude_reason(rel) or _wal_index_reason(root, rel)
     if reason:
         return reason
     return _untracked_blob_exclude_reason(root, rel, file_outputs=file_outputs, warnings=warnings,

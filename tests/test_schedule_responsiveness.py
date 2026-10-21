@@ -13,7 +13,6 @@ import contextlib
 import copy
 import json
 import pathlib
-import sqlite3
 import threading
 import time
 
@@ -21,6 +20,7 @@ import pytest
 
 from ouroboros import store
 from ouroboros.task_results import load_task_result, write_task_result
+from tests._store_journal_shared import exclusive_hold
 from tests.test_g1_followup_policy import world as _world
 from tests.test_schedule_occurrence import _row, _rows, q as _q
 
@@ -33,11 +33,11 @@ q, world = _q, _world
 
 @contextlib.contextmanager
 def held_store(root):
-    """A real independent SQLite connection holding the task store EXCLUSIVE (it must exist:
-    a connection to an absent path would create an empty, foreign file)."""
+    """A real independent SQLite connection holding the task store EXCLUSIVE, its reads busy too
+    under WAL (``exclusive_hold``; it must exist: a connection to an absent path would create an
+    empty, foreign file)."""
     assert store.store_path(root).exists()
-    holder = sqlite3.connect(store.store_path(root), isolation_level=None, check_same_thread=False)
-    holder.execute("BEGIN EXCLUSIVE")
+    holder = exclusive_hold(store.store_path(root))
     try:
         yield
     finally:

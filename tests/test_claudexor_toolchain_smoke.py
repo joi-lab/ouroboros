@@ -224,10 +224,13 @@ def _node_entry(toolchain: pathlib.Path, *, string_bin=False, name="codex.js") -
     return entry
 
 
-def test_the_receipt_must_name_the_release_verified_native_image_in_the_disposable_home(tmp_path):
+def test_the_receipt_must_name_the_exact_native_image_in_the_disposable_home(tmp_path):
     toolchain = tmp_path / "home" / ".claudexor" / "node"
     image = _image(toolchain)
-    assert witness.verify_install_receipt(_receipt(image), "codex", toolchain, windows=True) == image
+    # The baseline or the newer exact npm release a fresh install selects (Claudexor 4.4.0).
+    for verification in ("release_verified", "deterministic_only"):
+        receipt = _receipt(image, verification=verification)
+        assert witness.verify_install_receipt(receipt, "codex", toolchain, windows=True) == image
 
     shim = _image(toolchain, "codex.cmd")
     outside = tmp_path / "operator" / "codex.exe"
@@ -236,7 +239,8 @@ def test_the_receipt_must_name_the_release_verified_native_image_in_the_disposab
     for receipt, windows in (
         (_receipt(shim), True),  # an npm shim is never the launcher on Windows
         (_receipt(outside), True),  # never the owner's (or any other) home
-        (_receipt(image, verification="deterministic_only"), True),
+        (_receipt(image, verification="unattended_unpinned", pinnedVersion=None), True),
+        (_receipt(image, verification="human_observed"), True),
         (_receipt(image, installedVersion="1.2.4"), True),
         (_receipt(toolchain / "missing.exe"), True),
         (_receipt(image, harness="claude"), True),  # the production contract itself

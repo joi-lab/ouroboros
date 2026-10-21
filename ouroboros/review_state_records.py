@@ -168,7 +168,7 @@ _DEBT_STR_DEFAULTS = {"debt_id": "", "category": "", "summary": "", "severity": 
 _RUN_STR_DEFAULTS = {"snapshot_hash": "", "commit_message": "", "status": "stale", "snapshot_summary": "", "raw_result": "", "reason_kind": "", "bypass_reason": "", "bypassed_by_task": "", "repo_key": _LEGACY_CURRENT_REPO_KEY, "tool_name": _DEFAULT_ADVISORY_TOOL_NAME, "phase": "advisory", "model_used": "", "session_id": "", "review_rebuttal": ""}
 
 
-_ATTEMPT_STR_DEFAULTS = {"commit_message": "", "snapshot_hash": "", "block_reason": "", "block_details": "", "task_id": "", "repo_key": _LEGACY_CURRENT_REPO_KEY, "tool_name": _DEFAULT_TOOL_NAME, "pre_review_fingerprint": "", "post_review_fingerprint": "", "fingerprint_status": "", "scope_model": "", "block_class": "", "rebuttal_sha256": "", "review_contract_fingerprint": "", "review_retry_key": "", "root_task_id": "", "review_owner_session_id": "", "review_record_id": ""}
+_ATTEMPT_STR_DEFAULTS = {"commit_message": "", "snapshot_hash": "", "block_reason": "", "block_details": "", "task_id": "", "repo_key": _LEGACY_CURRENT_REPO_KEY, "tool_name": _DEFAULT_TOOL_NAME, "pre_review_fingerprint": "", "post_review_fingerprint": "", "fingerprint_status": "", "scope_model": "", "block_class": "", "rebuttal_sha256": "", "review_contract_fingerprint": "", "review_retry_key": "", "root_task_id": "", "review_owner_session_id": "", "review_record_id": "", "review_budget_repo_key": ""}
 
 
 _ATTEMPT_MERGE_INCOMING_FIRST = ("ts", "commit_message", "status", "snapshot_hash", "block_reason", "block_details", "duration_sec", "task_id", "repo_key", "tool_name", "phase", "pre_review_fingerprint", "post_review_fingerprint", "fingerprint_status", "scope_model", "block_class", "rebuttal_sha256", "review_contract_fingerprint", "review_retry_key", "root_task_id", "review_owner_session_id", "review_record_id")
@@ -362,6 +362,9 @@ class CommitAttemptRecord:
     review_contract_fingerprint: str = ""
     review_retry_key: str = ""
     root_task_id: str = ""
+    # Accounting owner of review_change only. The physical repo_key/retry/source
+    # remain exact; this host-proven copy source survives execution-root GC.
+    review_budget_repo_key: str = ""
     # Existing process-custody identity for the process that owns every
     # process-local reviewer thread in this paid attempt. A sibling worker boot
     # shares the session but has another pid; neither fact alone proves loss.
@@ -462,6 +465,7 @@ def _merge_attempt(existing: CommitAttemptRecord, incoming: CommitAttemptRecord)
         # Once an attempt physically dispatched a paid triad/scope wave the fact is
         # durable: a later terminal update on the same row must never launder it.
         paid=bool(getattr(incoming, "paid", False) or getattr(existing, "paid", False)),
+        review_budget_repo_key=existing.review_budget_repo_key or incoming.review_budget_repo_key,
         review_owner_pid=int(
             getattr(incoming, "review_owner_pid", 0)
             or getattr(existing, "review_owner_pid", 0)

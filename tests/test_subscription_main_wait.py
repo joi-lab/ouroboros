@@ -62,7 +62,6 @@ def main_call(live_wait, monkeypatch):
     from ouroboros import context
     monkeypatch.setattr(context, "_context_fit_route", route_evidence)
     monkeypatch.setattr(loop, "_server_web_allowed_by_task", lambda _ctx: False)
-    monkeypatch.setattr(loop, "_run_main_reclaim", lambda *_a, **_kw: pytest.fail("No completed work may be replayed"))
     return ctx, gateway, controller, events, decide, observations
 
 
@@ -175,7 +174,7 @@ def test_wait_reprepares_vision_from_canonical_images(main_call, monkeypatch, im
 
 
 def test_main_authored_checkpoint_after_a_real_projected_image_wait(main_call, monkeypatch, tmp_path):
-    from ouroboros import context_compaction, vision_routing
+    from ouroboros import vision_routing
     from ouroboros.artifacts import read_actor_source_bytes
     from ouroboros.tools.registry import ToolRegistry
     from tests.test_main_authored_context import call
@@ -186,7 +185,6 @@ def test_main_authored_checkpoint_after_a_real_projected_image_wait(main_call, m
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
     monkeypatch.setenv("MCP_ENABLED", "false")
     monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_a: False)
-    monkeypatch.setattr(context_compaction, "_call_summarizer", lambda *a, **kw: pytest.fail("No authored helper"))
     monkeypatch.setattr(vision_routing, "get_image_input_mode", lambda: "off")
     registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=ctx.drive_root)
     registry._ctx.repo_dir.mkdir()

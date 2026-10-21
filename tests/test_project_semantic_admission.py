@@ -4,6 +4,9 @@ Run through scripts/safe_test.py; every root and file below is synthetic.
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+from tests._dialogue import advance_room_revision
+
 import json
 import threading
 from types import SimpleNamespace
@@ -37,7 +40,7 @@ def test_activity_is_not_a_routing_change(room, activity):
     if activity.endswith("touch"):
         registry.touch_project(room.root, "target" if activity == "own_touch" else "other")
     elif activity == "visible":
-        registry.increment_project_visible_revision(room.root, project_id="target")
+        advance_room_revision(room.root, project_id="target")
     elif activity == "result":
         registry.update_project(room.root, "other", last_task_result_id="finished")
     admitted = room.queue.enqueue_task(task(), project_admission=basis)
@@ -385,7 +388,7 @@ def test_never_admitted_refusal_is_durable_but_not_a_late_project_completion(roo
     monkeypatch.setattr("supervisor.terminal_delivery.enqueue_terminal_delivery", lambda *a, **kw: queued.append(a) or True)
     assert reconcile_terminal_projections(room.root) == 0
     assert not queued
-    assert not (room.root / "logs" / "chat.jsonl").exists()
+    assert not dialogue_test.log_rows(room.root / "logs" / "chat.jsonl")
     # A failure lacking this POSITIVE producer fact remains ordinary terminal debt.
     write_task_result(room.root, "executed", "failed", project_id="target", chat_id=1,
                       root_task_id="executed", started_at="2026-01-01T00:00:00Z", result="Actual failure")
@@ -557,7 +560,7 @@ def test_registry_writers_preserve_unrelated_raw_rows(room, operation):
         changed = registry.bind_task_to_project(room.root, "bound", "target", origin={"absent": "system"})
         assert changed["project_id"] == "target"
     elif operation.startswith("visible"):
-        changed = registry.increment_project_visible_revision(room.root, **(
+        changed = advance_room_revision(room.root, **(
             {"project_id": "target"} if operation == "visible_id"
             else {"chat_id": registry.project_admission_view(room.root, "target")["project"]["chat_id"]}))
         assert changed["visible_revision"] == 1

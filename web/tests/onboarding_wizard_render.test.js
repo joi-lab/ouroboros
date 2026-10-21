@@ -26,6 +26,8 @@ import test from 'node:test';
 const BOOTSTRAP = JSON.parse(readFileSync(
     new URL('./fixtures/onboarding_bootstrap.json', import.meta.url), 'utf8',
 ));
+// Reads that write nothing: the language list and the Summary's starter skills list.
+const PASSIVE_READS = new Set(['GET /api/ui/i18n', 'GET /api/onboarding/starter-skills']);
 
 function inertElement() {
     const listeners = new Map();
@@ -87,8 +89,9 @@ function inertDocument() {
 // Import the wizard once under the stand-ins (cache-busting query on the
 // import URL — an ES module is evaluated once per URL) and keep them installed
 // while `body` drives it; the exact prior descriptors are restored afterwards.
-async function withWizard(bootstrap, query, body, { fetch, location } = {}) {
+async function withWizard(bootstrap, query, body, { fetch, location, prepare } = {}) {
     const doc = inertDocument();
+    prepare?.(doc);  // stand-ins a step binds at import time (its choice buttons, a held note)
     const listeners = new Map();
     const win = new Proxy({
         document: doc,
@@ -168,6 +171,55 @@ test('the setup contract renders Cyber Pro beside the independent Blocking choic
         assert.match(html, /data-runtime-mode="cyber_pro"[\s\S]*Cyber Pro/);
         assert.match(html, /data-review-mode="blocking"[\s\S]*Blocking/);
     });
+});
+
+// IMPL_SPEC §5, verbatim: what a Reviewer tick means per strictness (Cyber Pro outranks enforcement).
+const TICK = {
+    blocking: 'Counts toward review: every ticked reviewer checks each change Ouroboros makes to itself, each skill and each required result; a critical finding stops it.',
+    advisory: 'Counts when chosen: for each check Ouroboros asks one, several or all ticked reviewers and writes why; it never skips a check that is owed.',
+    cyber_pro: 'Trusted to judge: Ouroboros decides whom to ask, if anyone; reviews inform and never block.',
+};
+
+test('the Review step says what a Reviewer tick means under the chosen mode, repainted in place', async () => {
+    const reviewIndex = BOOTSTRAP.stepOrder.indexOf('review_mode');
+    const bootstrap = {
+        ...BOOTSTRAP,
+        stepOrder: [...BOOTSTRAP.stepOrder.slice(reviewIndex), ...BOOTSTRAP.stepOrder.slice(0, reviewIndex)],
+        initialState: {
+            ...BOOTSTRAP.initialState, reviewEnforcement: 'advisory', runtimeMode: 'advanced',
+            availableSubagents: { enabled: true, items: [{ subagent_id: 'reviewer_one', review_eligible: true,
+                recommended_use: 'Reviews changes.', route: { kind: 'api_model', target_id: 'openai/gpt-5.6-luna' } }] },
+        },
+    };
+    const note = { textContent: '' };  // the held node: a choice never rebuilds the step
+    const choices = (attribute, values) => values.map((value) => {
+        const button = inertElement();
+        button.getAttribute = (key) => (key === attribute ? value : null);
+        return button;
+    });
+    const [advisory, blocking] = choices('data-review-mode', ['advisory', 'blocking']);
+    const access = choices('data-runtime-mode', ['light', 'advanced', 'pro', 'cyber_pro']);
+    const lead = 'Reviewers: 1 — the rows marked Reviewer under Models → Available subagents. ';
+    const prepare = (doc) => {
+        const root = doc.getElementById('root');
+        const others = root.querySelectorAll;
+        root.querySelector = (selector) => (selector === '[data-reviewers-note]' ? note : inertElement());
+        root.querySelectorAll = (selector) => ({ '[data-review-mode]': [advisory, blocking], '[data-runtime-mode]': access }[selector]
+            || others(selector));
+    };
+    await withWizard(bootstrap, 'reviewers-note', async ({ doc }) => {
+        const html = doc.getElementById('root').innerHTML;
+        assert.ok(html.includes(`data-reviewers-note>${lead}${TICK.advisory}</div>`), html.match(/data-reviewers-note>[^<]*/)?.[0]);
+        assert.doesNotMatch(html, /each of them reviews every change|composes the panel from them/);
+        blocking.fire('click');
+        assert.equal(note.textContent, lead + TICK.blocking);
+        access[3].fire('click');  // Cyber Pro Access: findings never block, whatever the enforcement kept
+        assert.equal(note.textContent, lead + TICK.cyber_pro);
+        advisory.fire('click');
+        assert.equal(note.textContent, lead + TICK.cyber_pro);
+        access[1].fire('click');
+        assert.equal(note.textContent, lead + TICK.advisory);
+    }, { prepare });
 });
 
 test('wizard renders and submits the edited owner draft on Finish', { timeout: 3000 }, async () => {
@@ -272,7 +324,8 @@ test('a 503 settings_save_timeout keeps the wizard open with "Check status", whi
     // page; settings_language.test.js pins that). This test is about the completion write, so the
     // memory read is left out of the request list it asserts.
     const calls = { filter: (fn) => requests.filter(fn) };
-    Object.defineProperty(calls, 'list', { get: () => requests.filter((call) => call !== 'GET /api/ui/i18n') });
+    // The two passive reads the summary makes for itself (language, starter skills) are not the completion story.
+    Object.defineProperty(calls, 'list', { get: () => requests.filter((call) => !PASSIVE_READS.has(call)) });
     const fetch = async (url, init = {}) => {
         requests.push(`${init.method || 'GET'} ${String(url)}`);
         if (String(url) === '/api/onboarding/complete') {
@@ -368,7 +421,7 @@ test('a staged language whose writer is still busy keeps the wizard open; the ne
     ];
     const fetch = async (url, init = {}) => {
         const call = `${init.method || 'GET'} ${String(url)}`;
-        if (call !== 'GET /api/ui/i18n') requests.push(call);
+        if (!PASSIVE_READS.has(call)) requests.push(call);
         if (String(url) === '/api/onboarding/complete') {
             return { ok: false, status: 503, text: async () => '', json: async () => ({ error: 'still running', code: 'settings_save_timeout', saved: null }) };
         }
@@ -420,7 +473,7 @@ test('a staged language the gateway refuses for good does not hold the finished 
     const requests = [];
     const fetch = async (url, init = {}) => {
         const call = `${init.method || 'GET'} ${String(url)}`;
-        if (call !== 'GET /api/ui/i18n') requests.push(call);
+        if (!PASSIVE_READS.has(call)) requests.push(call);
         if (String(url) === '/api/onboarding/complete') {
             return { ok: false, status: 503, text: async () => '', json: async () => ({ error: 'still running', code: 'settings_save_timeout', saved: null }) };
         }

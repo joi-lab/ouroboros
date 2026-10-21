@@ -10,6 +10,8 @@ a turn thread that never started, another event) still runs, and a real terminal
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import hashlib
 import json
@@ -22,6 +24,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from ouroboros import agent_task_pipeline as pipeline
+from ouroboros import dialogue_store
 from ouroboros.gateway import host_service
 from ouroboros.gateway.host_service import create_host_service_app
 from ouroboros.outcomes import infra_failed_axes
@@ -209,7 +212,7 @@ def _answering_agent(calls, reply, drive_root, *, during=None, lost=False):
 
 def _chat_rows(drive_root):
     chat = drive_root / "logs" / "chat.jsonl"
-    return [json.loads(line) for line in chat.read_text(encoding="utf-8").splitlines()] if chat.exists() else []
+    return dialogue_test.log_rows(chat)
 
 
 def _attempt_body(row):
@@ -583,7 +586,7 @@ def _lose_attempt(tmp_path, monkeypatch, kind):
     calls: list = []
 
     def confirmed_send(task):
-        append_jsonl(tmp_path / "logs" / "chat.jsonl", {
+        dialogue_store.append(tmp_path, "chat", {
             "type": "presence_delivery", "direction": "out", "chat_id": task["chat_id"], "text": "Early part",
             "task_id": task["id"], "transport": {"conversation_key": _event().conversation_key, "delivery": {
                 "state": "delivered", "delivery_id": "send:early", "part_id": "0"}}})
@@ -754,7 +757,7 @@ def test_an_attempt_that_died_before_its_running_write_still_logs_the_message_on
         run_presence_turn(**{**kwargs, "agent_factory": factory})
     first = run_presence_turn(**{**kwargs, "agent_factory": factory})
     assert first.text == "Real answer" and "previous_attempt" not in calls[0]["metadata"]["presence"]
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     assert [row["direction"] for row in rows if row.get("task_id") == first.task_id].count("in") == 1
 
 
@@ -835,17 +838,23 @@ def test_reconciler_settles_nothing_when_the_row_was_requeued_after_the_decision
 
 def test_an_unwritable_inbound_row_fails_the_turn_before_the_model_runs(tmp_path, monkeypatch):
     """The no-re-log rule assumes the inbound row landed; a failed append is a failed turn, then a retry logs it."""
-    from ouroboros import presence_runner
-
     calls: list = []
     kwargs = _v1_kwargs(tmp_path, calls)
-    real_append = presence_runner.append_jsonl
-    monkeypatch.setattr(presence_runner, "append_jsonl", lambda path, obj=None, **_kw: False)
+    from ouroboros.store import StoreBusy
+
+    real_append = dialogue_store.append  # the inbound row is a required write: a store failure raises
+
+    def unwritable_inbound(root, stream, row, **kw):
+        if stream == "chat" and row.get("direction") == "in":
+            raise StoreBusy("held by another writer")
+        return real_append(root, stream, row, **kw)
+
+    monkeypatch.setattr(dialogue_store, "append", unwritable_inbound)
     with pytest.raises(PresenceTurnError) as raised:
         run_presence_turn(**kwargs)
     assert raised.value.code == "chat_log_unwritable" and calls == []
     assert load_task_result(tmp_path, _task_id(_admission(), kwargs["event"])) is None  # no lost attempt to inherit
-    monkeypatch.setattr(presence_runner, "append_jsonl", real_append)
+    monkeypatch.setattr(dialogue_store, "append", real_append)
     first = run_presence_turn(**kwargs)
     rows = [r for r in _chat_rows(tmp_path) if r.get("task_id") == first.task_id]
     # The retry logged the inbound row once and spoke nothing itself; the root's free host-facts
@@ -855,16 +864,13 @@ def test_an_unwritable_inbound_row_fails_the_turn_before_the_model_runs(tmp_path
     assert rows[0]["source"] == "presence:telegram" and all(r["direction"] == "system" and r["text"] == "" for r in facts)
 
 
-def _sending_agent(calls, reply, drive_root, *, part, rotate_first=False):
+def _sending_agent(calls, reply, drive_root, *, part):
     """A real-pipeline agent whose turn records one delivered receipt for this conversation mid-turn."""
     def send(task):
-        chat = drive_root / "logs" / "chat.jsonl"
-        if rotate_first:  # the live generation rotates while the turn runs
-            (drive_root / "archive").mkdir(exist_ok=True)
-            chat.rename(drive_root / "archive" / "chat_20260528T000200.jsonl")
-        append_jsonl(chat, {"type": "presence_delivery", "direction": "out", "chat_id": task["chat_id"], "text": part,
-                            "task_id": task["id"], "transport": {"conversation_key": _event().conversation_key,
-                                                                 "delivery": {"state": "delivered", "delivery_id": f"send:{part}", "part_id": "0"}}})
+        dialogue_store.append(drive_root, "chat", {
+            "type": "presence_delivery", "direction": "out", "chat_id": task["chat_id"], "text": part,
+            "task_id": task["id"], "transport": {"conversation_key": _event().conversation_key,
+                                                 "delivery": {"state": "delivered", "delivery_id": f"send:{part}", "part_id": "0"}}})
     return _answering_agent(calls, reply, drive_root, during=send)
 
 
@@ -882,15 +888,6 @@ def test_a_refused_retry_after_a_rotation_claims_no_sends_of_its_own(tmp_path):
     _refused(kwargs)
     assert calls == [] and _chat_rows(tmp_path) == _recovery_rows(tmp_path, task_id)
     assert _read_previous_turn(tmp_path, _event().conversation_key) is None and _prior_sends(tmp_path, task_id) == (None, 0)
-
-
-def test_a_rotation_during_the_turn_leaves_its_sends_unknown(tmp_path):
-    calls: list = []
-    kwargs = _v1_kwargs(tmp_path, calls)
-    run_presence_turn(**{**kwargs, "agent_factory": lambda **_kw: _sending_agent(
-        calls, "Real answer", tmp_path, part="Mid part", rotate_first=True)})
-    pointer = _read_previous_turn(tmp_path, kwargs["event"].conversation_key)
-    assert (pointer["transport_sends"], pointer["delivery"]) == ([], "unknown")
 
 
 def test_a_presence_placeholder_owes_no_terminal_projection_even_when_its_retry_is_refused(tmp_path, monkeypatch):

@@ -63,9 +63,11 @@ CONTROLS = """() => [...document.querySelectorAll('a[href], button, input, selec
 LAYOUT = """() => {
     const sidebar = document.getElementById('primary-sidebar');
     const first = document.querySelector('[data-nav-page="chat"]').getBoundingClientRect();
-    const toggle = document.querySelector('.chat-page-header .mobile-nav-toggle');
+    const toggle = document.querySelector('#page-chat [data-mobile-nav-toggle]');  // a room's ☰: its composer's first control
     const handle = document.querySelector('.resize-handle');
-    return { sidebar_position: getComputedStyle(sidebar).position, sidebar_padding_top: getComputedStyle(sidebar).paddingTop,
+    // The sidebar's top inset lives on its pinned head (#1998: three zones), the band adds to it.
+    return { sidebar_position: getComputedStyle(sidebar).position,
+             sidebar_padding_top: getComputedStyle(sidebar.querySelector('.sidebar-head')).paddingTop,
              sidebar_width: sidebar.getBoundingClientRect().width, first_row: { x: first.x, y: first.y, width: first.width, height: first.height },
              drawer_toggle: toggle ? getComputedStyle(toggle).display : 'absent',
              resize_handle: handle ? getComputedStyle(handle).display : 'absent' };
@@ -177,7 +179,7 @@ def test_the_spa_declares_and_reserves_only_the_measured_band(subscription_ui):
     assert declared[0]["chrome"] == INTEGRATED
     assert (declared[0]["choice"], declared[0]["theme"]) == (
         page.locator("html").get_attribute("data-theme-choice"), page.locator("html").get_attribute("data-theme"))
-    sidebar_top = page.evaluate("getComputedStyle(document.getElementById('primary-sidebar')).paddingTop")
+    sidebar_top = page.evaluate("getComputedStyle(document.querySelector('#primary-sidebar .sidebar-head')).paddingTop")
     assert sidebar_top == "16px" and page.locator("html").get_attribute("data-window-chrome") is None
 
     apply(page)
@@ -195,7 +197,7 @@ def test_the_spa_declares_and_reserves_only_the_measured_band(subscription_ui):
 
     apply(page, top=0, start=0)  # full screen or the ordinary bar
     assert page.locator("html").get_attribute("data-window-chrome") is None
-    assert page.evaluate("getComputedStyle(document.getElementById('primary-sidebar')).paddingTop") == "16px"
+    assert page.evaluate("getComputedStyle(document.querySelector('#primary-sidebar .sidebar-head')).paddingTop") == "16px"
     page.mouse.click(150, TOP / 2)
     assert drags(page) == ["drag", "drag", "double-click"]
 
@@ -204,8 +206,12 @@ def test_narrow_layouts_start_past_the_traffic_lights(subscription_ui):
     ui = subscription_ui
     page = shell_page(ui, 600)  # the drawer layout
     apply(page)
-    toggle = box(page, ".chat-page-header .mobile-nav-toggle")
-    assert toggle and clear_of_lights(toggle) and toggle["x"] >= START
+    # A room's ☰ is its composer's first control, far below the band; the header's first item, the title, starts
+    # past the lights.
+    toggle = box(page, "#page-chat .chat-toolbar-row .mobile-nav-toggle")
+    assert toggle and toggle["y"] >= TOP
+    title = box(page, ".chat-page-header .app-page-title")
+    assert title and clear_of_lights(title) and title["x"] >= START
     capture(page, "window-chrome-integrated-drawer")
     bar = page.evaluate("getComputedStyle(document.querySelector('.project-panel-bar')).paddingLeft")
     assert float(bar.removesuffix("px")) >= START, "a full-width project panel starts past the lights too"
@@ -221,7 +227,7 @@ def test_a_browser_without_the_shell_reserves_nothing(subscription_ui):
     page.goto(subscription_ui["url"])
     page.wait_for_selector("#chat-input")
     assert page.locator("html").get_attribute("data-window-chrome") is None
-    assert page.evaluate("getComputedStyle(document.getElementById('primary-sidebar')).paddingTop") == "16px"
+    assert page.evaluate("getComputedStyle(document.querySelector('#primary-sidebar .sidebar-head')).paddingTop") == "16px"
     assert page.evaluate("window.__shellMessages") is None
 
 

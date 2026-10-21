@@ -7,6 +7,8 @@ import os
 
 import pytest
 
+from ouroboros.test_evidence import diagnostic_directory
+
 from tests.test_ui_smoke_playwright import direct_server_with_data as direct_server_with_data
 
 
@@ -71,7 +73,7 @@ def test_schedule_delete_reports_retained_work_and_real_removal(direct_server_wi
                     expect(toast).to_contain_text(result["detail"])
                     expect(toast).to_have_css("opacity", "1")
                     expect(retained).to_be_visible()
-                    shot = root.parent / f"schedule-delete-{name}.png"
+                    shot = diagnostic_directory(root.parent, "schedule-delete") / f"schedule-delete-{name}.png"
                     page.screenshot(path=str(shot), full_page=True, animations="disabled")
                     print(f"SCHEDULE_DELETE_SCREENSHOT {shot}")
                     removable = section.locator(f'[data-act="schedule-delete"][data-id="{clean_id}"]')

@@ -3,18 +3,19 @@
 :root {
     --native-color-scheme: dark;
     --neutral-rgb: 255, 255, 255;
-    --shell-rgb: 13, 11, 15;
-    --composer-rgb: 26, 21, 32;
-    --composer-hover-rgb: 38, 25, 34;
-    --modal-rgb: 18, 20, 26;
-    --menu-rgb: 12, 14, 18;
-    --media-rgb: 6, 7, 10;
-    --wizard-panel-rgb: 20, 18, 28;
-    --wizard-rgb: 11, 9, 16;
-    --code-bg: #121016;
+    --shell-rgb: 15, 15, 17;
+    --composer-rgb: 26, 27, 28;
+    --composer-hover-rgb: 31, 31, 33;
+    --modal-rgb: 20, 21, 22;
+    --menu-rgb: 17, 18, 19;
+    --media-rgb: 9, 9, 10;
+    --wizard-panel-rgb: 21, 22, 23;
+    --wizard-rgb: 9, 9, 10;
+    --code-bg: #0b0b0c;
     --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-    --bg-primary: #0d0b0f;
-    --bg-secondary: #1a1520;
+    --control-disabled-opacity: 0.55;
+    --bg-primary: #0f0f11;
+    --bg-secondary: #1a1b1c;
     --bg-card: rgba(var(--neutral-rgb), 0.06);
     --bg-hover: rgba(var(--neutral-rgb), 0.08);
     /* Type scale + foreground semantics: docs/DESIGN.md. Four sizes, no fifth. */
@@ -29,13 +30,13 @@
     --line-meta: 1.35;
     --line-body: 1.5;
     --line-title: 1.3;
-    --text-primary: #e2e8f0;
-    --text-secondary: rgba(var(--neutral-rgb), 0.54);
-    --text-meta: rgba(var(--neutral-rgb), 0.68);
-    --text-disabled: rgba(var(--neutral-rgb), 0.38);
+    --text-primary: #efeff2;
+    --text-secondary: rgba(var(--neutral-rgb), 0.58);
+    --text-meta: rgba(var(--neutral-rgb), 0.7);
+    --text-disabled: rgba(var(--neutral-rgb), 0.46);
     --text-muted: var(--text-disabled);  /* legacy alias */
-    --accent: #c93545;
-    --accent-light: #f07a86;
+    --accent: #f45152;
+    --accent-light: #ff756e;
     --accent-dim: rgba(201, 53, 69, 0.15);
     /* Accent alpha tokens; keep future tweaks off hardcoded rgba literals. */
     --accent-04: rgba(201, 53, 69, 0.04);
@@ -50,42 +51,43 @@
     --accent-35: rgba(201, 53, 69, 0.35);
     --accent-45: rgba(201, 53, 69, 0.45);
     --accent-55: rgba(201, 53, 69, 0.55);
-    --accent-65: rgba(201, 53, 69, 0.65);
     /* Project identity (vivid fuchsia): a converted task card, its sidebar marker,
        and the project panel header share this so "this is a project" reads as a
        deliberate state — never the red task accent (looked like an error, P3) and
        never the blue owner voice. The old calm-indigo sat next to the user-message
        blue and the two blurred together; fuchsia is unmistakably its own role.
-       Base is legible-on-dark fuchsia-400; every tint shares the SAME hue (C7.3). */
-    --project: #e879f9;
-    --project-08: rgba(232, 121, 249, 0.08);
-    --project-12: rgba(232, 121, 249, 0.12);
-    --project-18: rgba(232, 121, 249, 0.18);
+       Base is a light fuchsia that reads on the room and under its veil on a garnet or sapphire voice; in light
+       every tint shares the SAME hue (C7.3), in dark the fills are neutral veils carrying the fuchsia ink (a dark
+       fuchsia tint reads as mauve). */
+    --project: #ee90fa;
+    --project-08: rgba(255, 255, 255, 0.07);
+    --project-12: rgba(255, 255, 255, 0.1);
+    --project-18: rgba(255, 255, 255, 0.14);
     /* User / owner voice: the owner's chat bubble + sender accents. Tokenized so
        the hue lives in one place and stays clear of the project fuchsia (C7.2). */
-    --user-bubble-from: rgba(80, 120, 190, 0.14);
-    --user-bubble-to: rgba(55, 85, 155, 0.12);
+    --user-bubble-from: rgba(71, 128, 210, 0.24);
+    --user-bubble-to: rgba(71, 128, 210, 0.18);
     --user-border: rgba(110, 150, 210, 0.18);
     --user-glow: rgba(160, 190, 245, 0.04);
-    --user-sender: rgba(155, 185, 240, 0.95);
-    --user-text: rgba(215, 230, 255, 0.96);
-    /* System / owner-control voice: amber notices (system bubble + sender). Same
-       hue as the system role, tokenized so it tracks one source (C7.2). */
-    --system-bubble-bg: rgba(245, 158, 11, 0.12);
-    --system-border: rgba(245, 158, 11, 0.45);
-    --system-sender: rgba(245, 158, 11, 0.9);
-    --system-text: rgba(255, 240, 210, 0.78);
+    --user-sender: #a0c6ff;
+    --user-text: #efeff2;
+    /* System / owner-control voice (system bubble + sender), tokenized so it tracks one source (C7.2): in dark a
+       neutral body with a yellow rail and name, since yellow goes olive as a dark fill; in light an amber tint. */
+    --system-bubble-bg: rgba(255, 255, 255, 0.055);
+    --system-border: #f2d441;
+    --system-sender: #f2d441;
+    --system-text: #efeff2;
     /* Assistant / agent voice: the assistant bubble's sender + body tints,
        tokenized like the user/system voices above (C7.2). */
-    --assistant-sender: rgba(250, 125, 125, 0.95);
-    --assistant-text: rgba(255, 235, 238, 0.96);
+    --assistant-sender: #ff756e;
+    --assistant-text: #efeff2;
     --blue: #3b82f6;
-    --amber: #f59e0b;
-    --amber-dim: rgba(245, 158, 11, 0.15);
+    --amber: #f2d441;
+    --amber-dim: rgba(255, 255, 255, 0.07);
     --green: #22c55e;
-    --green-dim: rgba(34, 197, 94, 0.15);
+    --green-dim: rgba(255, 255, 255, 0.07);
     --red: #ef4444;
-    --red-dim: rgba(239, 68, 68, 0.15);
+    --red-dim: rgba(255, 255, 255, 0.07);
     --divider: rgba(var(--neutral-rgb), 0.06);
     --surface-border: rgba(var(--neutral-rgb), 0.08);
     --surface-border-soft: rgba(var(--neutral-rgb), 0.06);
@@ -96,45 +98,52 @@
        and cannot read CSS, so these tokens are the SSOT that theme_palette.js
        copies into every mounted instance — the canvas twin of --diagram-*. */
     --chart-grid: rgba(var(--neutral-rgb), 0.10);
-    --chart-text: #a8b0bd;
+    --chart-text: #a4a4a4;
     /* The native select arrow is a data-URI, so its stroke cannot read a token
        at paint time; the whole image is the token instead. Painting a near-white
        arrow on the light surface is what made the arrows look washed out. */
-    --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14'%3E%3Cpath d='M3 5l4 4 4-4' fill='none' stroke='%23e2e8f0' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14'%3E%3Cpath d='M3 5l4 4 4-4' fill='none' stroke='%23efeff2' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
     --diagram-font: Inter, system-ui, sans-serif;
-    --diagram-bg: #151318;
-    --diagram-primary: #25222c;
-    --diagram-primary-text: #f4eef7;
-    --diagram-border: #6f6678;
-    --diagram-line: #9b90a6;
-    --diagram-secondary: #302b39;
-    --diagram-tertiary: #19171d;
+    --diagram-bg: #131415;
+    --diagram-primary: #212223;
+    --diagram-primary-text: #efeff2;
+    --diagram-border: #717171;
+    --diagram-line: #989898;
+    --diagram-secondary: #28292a;
+    --diagram-tertiary: #151617;
     --ui-card-bg: var(--surface-card);
     --ui-card-bg-soft: var(--surface-card-soft);
     --ui-card-border: var(--surface-border);
     --ui-modal-bg: rgba(var(--modal-rgb), 0.98);
     /* A live task card's lift off the transcript: soft in light (a near-black shadow that suits the
-       dark shell reads as grime on white), unchanged in dark. */
-    --live-card-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(var(--neutral-rgb), 0.03);
+       dark shell reads as grime on white), one plain shadow in dark (no light along the edge). */
+    --live-card-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
     /* Status triples: fg/bg/border named together, never derived
        (docs/DESIGN.md "Status and chips"). The fg tints are readable at 12px on
-       near-black; the saturated --green/--amber/--red stay for dots, tracks and
-       other large indicators. */
-    --status-ok-fg: #6ee7b7;
-    --status-ok-bg: var(--green-dim);
-    --status-ok-border: rgba(34, 197, 94, 0.28);
-    --status-warn-fg: #fcd34d;
-    --status-warn-bg: var(--amber-dim);
-    --status-warn-border: rgba(245, 158, 11, 0.30);
-    --status-error-fg: #fca5a5;
-    --status-error-bg: var(--red-dim);
-    --status-error-border: rgba(239, 68, 68, 0.30);
-    --status-info-fg: #93c5fd;
+       the dark room and under a status veil on either voice; there a status body is a neutral veil carrying the
+       hue's ink (a dark tint of green, amber or red goes olive or brown), and the red ink is lighter than the
+       crimson word so a failure reads on a garnet card too; the saturated --green/--amber/--red stay for dots,
+       tracks and other large indicators. */
+    --status-ok-fg: #82eab9;
+    --status-ok-bg: rgba(255, 255, 255, 0.08);
+    --status-ok-border: rgba(255, 255, 255, 0.1);
+    --status-warn-fg: #f2d441;
+    --status-warn-bg: rgba(255, 255, 255, 0.08);
+    --status-warn-border: rgba(255, 255, 255, 0.1);
+    --status-error-fg: #ff8882;
+    --status-error-bg: rgba(255, 255, 255, 0.08);
+    --status-error-border: rgba(255, 255, 255, 0.1);
+    --status-info-fg: #a0c6ff;
+    /* A warning or a failure on a row whose body cannot show it: on dark the body stays a neutral veil, so the row's
+       words (a field: its hairline) take the hue's ink. The light block unsets both: there the tinted body says it,
+       and each reader falls back to its own ink. */
+    --status-warn-word: var(--status-warn-fg);
+    --status-error-word: var(--status-error-fg);
     --status-neutral-fg: var(--text-meta);
     --status-neutral-bg: rgba(var(--neutral-rgb), 0.06);
     --status-neutral-border: rgba(var(--neutral-rgb), 0.12);
-    --focus-accent-border: rgba(201, 53, 69, 0.4);
-    --focus-accent-ring: var(--accent-10);
+    --focus-accent-border: #ff756e;
+    --focus-accent-ring: rgba(211, 45, 67, 0.28);
     --radius-xs: 3px;
     --radius-sm: 8px;
     /* In-between radius used by chips, counters, and fade rules. */
@@ -160,43 +169,57 @@
     --chrome-navigation-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
     --chrome-inset: calc(var(--space-1) + 1px);
     /* Airy dopamine seed (DESIGN.md design bible): the dark values; the light theme's follow in its block. One set of
-       recipes reads them in both themes. The dark theme keeps its own materials: a near-black violet room, the voices
-       as crimson and blue glass, controls as glass over what scrolls under them. */
-    --elev-rest: 0 1px 2px rgba(0, 0, 0, 0.5), 0 8px 24px rgba(0, 0, 0, 0.35);
-    --elev-float: 0 2px 8px rgba(0, 0, 0, 0.55), 0 20px 50px rgba(0, 0, 0, 0.6);
+       recipes reads them in both themes. The dark theme draws the same roles its own way: a deep graphite room, each
+       neutral height a white veil over what lies under it, the voices as deep opaque sapphire and garnet (a tint over
+       black turns brown), yellow only as a rail and a word, controls as glass over what scrolls under them. */
+    --elev-rest: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 20px rgba(0, 0, 0, 0.28);
+    --elev-float: 0 2px 8px rgba(0, 0, 0, 0.45), 0 18px 44px rgba(0, 0, 0, 0.5);
+    --row-lift-dim: rgba(0, 0, 0, 0.45);  /* the feed under a row lifted by a long press */
     --chrome-shade-shadow: var(--elev-float);
     --radius-object: 18px;
     --radius-inner: 12px;
     --radius-sheet: 24px;
-    --surface-object: rgba(255, 255, 255, 0.035);
-    --surface-capsule: rgba(44, 34, 52, 0.62);
-    --surface-capsule-hover: rgba(60, 46, 70, 0.72);
-    --surface-float: rgba(38, 31, 46, 0.94);
-    --surface-tray: rgba(var(--neutral-rgb), 0.035);
-    --surface-side: #0d0b0f;
+    --surface-object: rgba(255, 255, 255, 0.055);
+    --surface-capsule: rgba(255, 255, 255, 0.09);
+    --surface-capsule-hover: rgba(255, 255, 255, 0.135);
+    --surface-float: rgba(32, 32, 34, 0.92);
+    --surface-tray: rgba(var(--neutral-rgb), 0.045);
+    --surface-side: #0f0f11;
     --glass: blur(18px);
-    --voice-owner: linear-gradient(135deg, rgba(80, 120, 190, 0.16), rgba(55, 85, 155, 0.13));
-    --voice-ouroboros: linear-gradient(135deg, rgba(201, 53, 69, 0.20), rgba(120, 24, 36, 0.20));
-    --voice-ouroboros-card: rgba(201, 53, 69, 0.06);
-    --tone-crimson: rgba(240, 90, 106, 0.18);
-    --tone-crimson-hover: rgba(240, 90, 106, 0.24);
-    /* A tonal capsule's crimson ink: on a dark fill the accent text is too dark for 4.5:1, so it steps lighter. */
-    --tone-crimson-ink: #ffa0aa;
-    --tone-green: rgba(34, 197, 94, 0.16);
-    --tone-green-hover: rgba(34, 197, 94, 0.24);
-    --tone-red: rgba(239, 68, 68, 0.16);
-    --tone-red-hover: rgba(239, 68, 68, 0.24);
-    --tone-amber: rgba(245, 158, 11, 0.16);
-    --tone-amber-hover: rgba(245, 158, 11, 0.24);
-    --tone-quiet-hover: rgba(var(--neutral-rgb), 0.07);
+    --voice-owner: #103364;
+    --voice-ouroboros: #5c172a;
+    --voice-ouroboros-card: #5c172a;
+    --tone-crimson: #d32d43;
+    --tone-crimson-hover: #c32a3f;
+    /* The crimson tone's ink: white on the solid crimson. Its hover deepens rather than lightens, and so does its
+       press (--press-solid), so the white keeps 4.5:1 at rest, on hover and pressed. */
+    --tone-crimson-ink: #ffffff;
+    /* The soft crimson: a chosen option or card (a filter, a segment, a switched-on capsule, the current step of
+       setup), Material 3's tonal step below the filled crimson of the primary action, the chosen place and a count. */
+    --tone-crimson-soft: #872236;
+    --tone-crimson-soft-ink: #ffdfe1;
+    /* The crimson tone without its fill, for a chosen control that has no body (Read aloud while it speaks, the
+       Official mark): on dark that is the crimson word, since the tone's own ink is white. */
+    --tone-crimson-word: var(--accent-light);
+    /* The chosen place's left mark: on the solid crimson it is the fill's white ink (the accent would vanish into
+       the fill). */
+    --place-mark: var(--tone-crimson-ink);
+    --tone-green: rgba(255, 255, 255, 0.16);
+    --tone-green-hover: rgba(255, 255, 255, 0.2);
+    --tone-red: rgba(255, 255, 255, 0.09);
+    --tone-red-hover: rgba(255, 255, 255, 0.135);
+    --tone-amber: rgba(255, 255, 255, 0.09);
+    --tone-amber-hover: rgba(255, 255, 255, 0.135);
+    --tone-quiet-hover: rgba(var(--neutral-rgb), 0.08);
     /* A state changes colour, never height: hover and press deepen a capsule's own fill (a press lightens on dark). */
     --press: brightness(1.12);
+    /* A press on a solid fill under white ink (the primary action, the chosen tab) deepens instead. */
+    --press-solid: brightness(0.9);
     --motion-tone: background 0.12s ease, box-shadow 0.12s ease, color 0.12s ease, filter 0.12s ease;
     --widget-fault-status-max-width: min(240px, 35vw);
     /* App shell: persistent desktop sidebar + optional project detail pane. */
     --sidebar-width: 280px;
     --project-panel-width: clamp(340px, 36vw, 440px);
-    --nav-item-radius: 10px;
     /* One hover fill for an item in a popup menu or a picker list. Six menus
        used five different fills (0.04 / 0.06 / 0.08 / an accent tint / an
        undeclared --surface-2), so the same gesture looked like a different
@@ -220,7 +243,6 @@
        share of the visual viewport height below, so the navigation column keeps
        its height whatever the project count. Distinct from the fixed Updates
        window above: one is a page-local list, this one follows the viewport. */
-    --nav-projects-list-max-height: calc(var(--vvh) * 0.38);
     /* Chat media (DESIGN "Chat attachments"): a whole single photo keeps its own
        ratio up to this height, a bubble carrying several media stops at this
        width, and a staged composer file shows a thumbnail of this size. */
@@ -230,9 +252,38 @@
     --chat-photo-min-box: calc(var(--touch-target-min) + 14px);
     --chat-media-bubble-max: 520px;
     --chat-attach-thumb-size: 28px;
-    /* The smallest comfortable touch target for a coarse pointer (a phone). */
+    /* The smallest comfortable touch target; a coarse pointer (a phone) raises it to a finger's 44px (below). */
     --touch-target-min: 36px;
+    /* The hit extension's inset (the recipe below): out only on the sides that fall short of the touch minimum. The
+       percentage resolves where it is used, against the control's own box. */
+    --ui-hit-inset: min(0px, calc((100% - var(--touch-target-min)) / 2));
     --vvh: 100dvh;
+    /* The shell's insets (DESIGN "Shell"): the system's safe area, reported by the browser as env() and inside
+       Telegram as --tg-safe-area-inset-* (the SDK writes them inline; host_telegram.js mirrors its object; the same
+       inset, so the larger wins, never the sum), plus Telegram's own controls over the content
+       (--tg-content-safe-area-inset-*). Outside Telegram the Telegram tokens rest at 0. */
+    --tg-safe-area-inset-top: 0px;
+    --tg-safe-area-inset-bottom: 0px;
+    --tg-content-safe-area-inset-top: 0px;
+    --tg-content-safe-area-inset-bottom: 0px;
+    --inset-top: calc(max(env(safe-area-inset-top, 0px), var(--tg-safe-area-inset-top)) + var(--tg-content-safe-area-inset-top));
+    --inset-bottom: calc(max(env(safe-area-inset-bottom, 0px), var(--tg-safe-area-inset-bottom)) + var(--tg-content-safe-area-inset-bottom));
+    /* The shell's stacking order (DESIGN "Shell"), lowest first: Main's floating header, the sidebar column (on a
+       phone the drawer, which lies under the room), the room (on a phone the card the drawer pushes aside), the
+       sidebar's resize handle, the Project panel over the content area (its scrim beneath it; the stack layout's
+       full-width Project a step above), the reply mark of a message being swiped, the drawer's way back (its clear
+       scrim over the room's visible quarter), the chat header's menu; popovers (.ui-popup) stay the top of everything. */
+    --z-page-header: 5;
+    --z-sidebar: 10;
+    --z-room: 15;
+    --z-resize-handle: 20;
+    --z-project-scrim: 55;
+    --z-project-panel: 58;
+    --z-project-layer: 60;
+    --z-row-reply-mark: 62;
+    --z-drawer-scrim: 68;
+    --z-header-menu: 90;
+    --z-popover: 1200;
     /* Quote panel glass (DESIGN "Replies"): the shell colour at one alpha, so a quote reads lighter than the bubble it sits in. */
     --quote-glass: rgba(var(--shell-rgb), 0.7);
 }
@@ -282,6 +333,7 @@
     /* Airy dopamine seed, light values (the dark ones are in :root): white objects and capsules on two soft shadows. */
     --elev-rest: 0 1px 2px rgba(28, 33, 51, 0.05), 0 6px 18px rgba(28, 33, 51, 0.06);
     --elev-float: 0 2px 6px rgba(28, 33, 51, 0.06), 0 18px 44px rgba(28, 33, 51, 0.11);
+    --row-lift-dim: rgba(16, 18, 28, 0.24);
     --surface-object: #ffffff;
     --surface-capsule: #ffffff;
     --surface-capsule-hover: #f5f6f8;
@@ -297,6 +349,11 @@
     --tone-crimson-hover: var(--accent-14);
     /* One step deeper than the accent text, so a tonal capsule keeps 4.5:1 on a voice-tinted backing too. */
     --tone-crimson-ink: #b52b3b;
+    /* One pale crimson for both strengths: on white a tint is already quiet. */
+    --tone-crimson-soft: var(--tone-crimson);
+    --tone-crimson-soft-ink: var(--tone-crimson-ink);
+    --tone-crimson-word: var(--tone-crimson-ink);
+    --place-mark: var(--accent);
     --tone-green: rgba(34, 197, 94, 0.14);
     --tone-green-hover: rgba(34, 197, 94, 0.22);
     --tone-red: rgba(239, 68, 68, 0.10);
@@ -305,6 +362,30 @@
     --tone-amber-hover: rgba(245, 158, 11, 0.26);
     --tone-quiet-hover: rgba(28, 33, 51, 0.06);
     --press: brightness(0.95);
+    --press-solid: var(--press);
+    /* The light theme's own values of tokens the dark seed in :root sets differently (hues, status triples, the
+       System voice, the owner's quote tint, the Project's tints). */
+    --user-bubble-from: rgba(80, 120, 190, 0.14);
+    --user-bubble-to: rgba(55, 85, 155, 0.12);
+    --system-bubble-bg: rgba(245, 158, 11, 0.12);
+    --system-border: rgba(245, 158, 11, 0.45);
+    --accent: #c93545;
+    --focus-accent-ring: var(--accent-10);
+    --amber: #f59e0b;
+    --amber-dim: rgba(245, 158, 11, 0.15);
+    --status-warn-bg: var(--amber-dim);
+    --status-warn-border: rgba(245, 158, 11, 0.30);
+    --red-dim: rgba(239, 68, 68, 0.15);
+    --status-error-bg: var(--red-dim);
+    --status-error-border: rgba(239, 68, 68, 0.30);
+    --green-dim: rgba(34, 197, 94, 0.15);
+    --status-ok-bg: var(--green-dim);
+    --status-ok-border: rgba(34, 197, 94, 0.28);
+    --status-warn-word: initial;
+    --status-error-word: initial;
+    --project-08: rgba(232, 121, 249, 0.08);
+    --project-12: rgba(232, 121, 249, 0.12);
+    --project-18: rgba(232, 121, 249, 0.18);
 }
 
 .ouro-ui { font-family: var(--font-sans); color-scheme: var(--native-color-scheme); }
@@ -385,7 +466,7 @@
 
 .btn:disabled {
     cursor: not-allowed;
-    opacity: 0.55;
+    opacity: var(--control-disabled-opacity);
     transform: none;
     box-shadow: none;
 }
@@ -444,7 +525,7 @@
 
 
 .ui-chip,
-:where(.status-badge, .skills-status-chip, .mcp-server-status, .evo-runtime-pill, .evo-runtime-chip) {
+:where(.status-badge, .mcp-server-status, .evo-runtime-pill, .evo-runtime-chip) {
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -459,7 +540,7 @@
 }
 
 .ui-status,
-:where(.settings-inline-status, .marketplace-status, .wizard-runtime-status) {
+:where(.settings-inline-status, .wizard-runtime-status) {
     color: var(--text-secondary);
     font-size: var(--type-meta);
     line-height: var(--line-meta);
@@ -474,8 +555,8 @@
        and make the loudest thing on the panel the one that says "connected".
      - `.ui-chip[data-tone]` — a status CHIP: the full triple, because the chip
        itself is the status and has nothing else to carry it.
-   Tone is a STATE and must outrank the `.muted` utility: `#mp-status` carries
-   both classes, so a :where()-wrapped tone (specificity 0) would lose to it. */
+   Tone is a STATE and must outrank the `.muted` utility: a status that carries
+   both classes would lose to it under a :where()-wrapped tone (specificity 0). */
 .ui-chip[data-tone="ok"] {
     color: var(--status-ok-fg);
     background: var(--status-ok-bg);
@@ -501,40 +582,45 @@
 
 .ui-status[data-tone="ok"],
 .settings-inline-status[data-tone="ok"],
-.settings-test-result[data-tone="ok"],
-.marketplace-status[data-tone="ok"] { color: var(--status-ok-fg); }
+.settings-test-result[data-tone="ok"] { color: var(--status-ok-fg); }
 .ui-status[data-tone="warn"],
 .settings-inline-status[data-tone="warn"],
-.settings-test-result[data-tone="warn"],
-.marketplace-status[data-tone="warn"] { color: var(--status-warn-fg); }
+.settings-test-result[data-tone="warn"] { color: var(--status-warn-fg); }
 .ui-status[data-tone="danger"],
 .ui-status[data-tone="error"],
 .settings-inline-status[data-tone="danger"],
 .settings-inline-status[data-tone="error"],
 .settings-test-result[data-tone="danger"],
-.settings-test-result[data-tone="error"],
-.marketplace-status[data-tone="danger"] { color: var(--status-error-fg); }
+.settings-test-result[data-tone="error"] { color: var(--status-error-fg); }
 /* `muted` is a tone the code emits but no rule named. */
 .ui-status[data-tone="neutral"],
 .ui-status[data-tone="muted"],
 .settings-inline-status[data-tone="neutral"],
-.settings-inline-status[data-tone="muted"],
-.marketplace-status[data-tone="muted"] { color: var(--status-neutral-fg); }
+.settings-inline-status[data-tone="muted"] { color: var(--status-neutral-fg); }
 
-/* Status sentences share one dot anatomy in every consumer. */
+/* A status sentence's own dot, one anatomy in every consumer (docs/DESIGN.md "Status marks"). CSS draws it, not
+   status_mark.js, because ui.css and ui_primitives.js reach skill authors on their own; it takes the marks' fact
+   size and the saturated hues (ok green, warn amber, error red, any other tone the neutral meta ink) while the
+   sentence keeps its word tone. */
 .ui-status[data-tone]:not(:empty)::before,
-.settings-inline-status[data-tone]:not(:empty)::before {
+.settings-inline-status[data-tone]:not(:empty)::before,
+.wizard-runtime-status[data-tone]:not(:empty)::before {
     content: "";
     display: inline-block;
     flex: 0 0 auto;
-    width: 6px;
-    height: 6px;
+    width: var(--mark-fact);
+    height: var(--mark-fact);
     margin-right: 7px;
     border-radius: 999px;
-    background: currentColor;
+    background: var(--text-meta);
     vertical-align: middle;
     position: relative;
     top: -1px;
+}
+:is(.ui-status, .settings-inline-status, .wizard-runtime-status)[data-tone="ok"]:not(:empty)::before { background: var(--green); }
+:is(.ui-status, .settings-inline-status, .wizard-runtime-status)[data-tone="warn"]:not(:empty)::before { background: var(--amber); }
+:is(.ui-status, .settings-inline-status, .wizard-runtime-status):is([data-tone="danger"], [data-tone="error"]):not(:empty)::before {
+    background: var(--red);
 }
 
 
@@ -619,7 +705,7 @@ textarea.ui-control { resize: vertical; }
     max-height: var(--ui-popup-max-height);
     overflow-y: auto;
     overscroll-behavior: contain;
-    z-index: 1200;
+    z-index: var(--z-popover);
 }
 .ui-model-chooser { display: block; min-width: 0; }
 .ui-model-chooser > .ui-control { width: 100%; }
@@ -685,7 +771,7 @@ textarea.ui-control { resize: vertical; }
 .ui-popup [role^="menuitem"][aria-disabled="true"] { color: var(--text-disabled); background: transparent; cursor: default; }
 .ui-popup [role^="menuitem"]:is(.danger, .files-context-item-danger) { color: var(--status-error-fg); }
 
-.ui-control[aria-invalid="true"] { border-color: var(--status-error-border); }
+.ui-control[aria-invalid="true"] { border-color: var(--status-error-word, var(--status-error-border)); }
 .ui-field-help[data-tone="error"] { color: var(--status-error-fg); }
 
 .ui-control-code {
@@ -703,9 +789,24 @@ textarea.ui-control { resize: vertical; }
    backing (Main: `.chat-page-header::before`), and what a bar discloses unfolds from the bar's bottom edge as one
    Shade (room_work.css), never as a box glued to one control or one group. */
 @media (pointer: coarse) {
-    /* A coarse pointer (a phone) raises the whole family together to the shared touch minimum. */
-    :root { --chrome-control-h: var(--touch-target-min); }
+    /* A coarse pointer (a phone) raises the shared touch minimum to a finger's 44px, and the whole family with it. */
+    :root { --touch-target-min: 44px; --chrome-control-h: var(--touch-target-min); }
 }
+/* ---- Touch hit extension ----------------------------------------------------------------------------------------
+   A small control keeps its look and, under a finger, gains an invisible hit area centred on it and at least the
+   touch minimum each way: the pseudo-element reaches out only on the sides that fall short (a 32px-tall capsule
+   gains 6px above and below, nothing sideways). Composition keeps at least that overshoot between neighbouring
+   controls, so hit areas never overlap (the composer rows part by --space-2). The one recipe, inset by the one
+   --ui-hit-inset; controls add the class, and style.css gives a page's links the same extension. */
+.ui-hit-area { position: relative; }
+@media (pointer: coarse) {
+    .ui-hit-area::after {
+        content: "";
+        position: absolute;
+        inset: var(--ui-hit-inset);
+    }
+}
+
 .ui-chrome-group {
     position: relative;
     box-sizing: border-box;
@@ -733,9 +834,10 @@ textarea.ui-control { resize: vertical; }
 
 /* ---- One control, three tones (DESIGN.md design bible) ---------------------------------------------------------
    Everything pressable with a body is a capsule standing on the rest shadow, in every state and either theme:
-   neutral (the capsule surface), tonal (its hue's tint and ink: crimson for the primary action and the chosen tab or
-   place, green for save, red for danger, amber for the owner's turn). A quiet control (ghost, link, filter) has no
-   body and no shadow. A state changes colour, never height: hover deepens the fill a step, a press deepens it again
+   neutral (the capsule surface), tonal (its hue's fill and that fill's ink: the crimson for the primary action, the
+   chosen tab or place and a count, the soft crimson for a chosen option or card, green for save, red for danger, amber
+   for the owner's turn). A quiet control (ghost, link, filter) has no body and no shadow. A state changes colour,
+   never height: hover deepens the fill a step, a press deepens it again
    (--press), a chosen one takes its tone; what cannot be pressed now loses its shadow. `.ui-chrome-control` stays
    geometry only (a floating control's own tone is its page's): page styles map their controls onto these tones and
    add no fourth recipe and no outline. These recipes are the product documents' own (their root is `.ouro-ui`);
@@ -755,14 +857,77 @@ textarea.ui-control { resize: vertical; }
 :root[data-theme]:where(.ouro-ui) .btn-danger:not(:disabled):hover { border-color: transparent; background: var(--tone-red-hover); }
 :root[data-theme]:where(.ouro-ui) .btn:hover { transform: none; }
 :root[data-theme]:where(.ouro-ui) :is(.btn, .theme-choice):not(:disabled):active { transform: none; filter: var(--press); }
+:root[data-theme]:where(.ouro-ui) .btn-primary { --press: var(--press-solid); }
 :root[data-theme]:where(.ouro-ui) .btn-ghost:not(:disabled):active { box-shadow: none; }
 :root[data-theme]:where(.ouro-ui) .btn:disabled { box-shadow: none; }
 /* The Appearance choice is one control in both documents (the SPA and the served setup page load only this sheet
-   in common): neutral capsules, the chosen one in the crimson tone, all standing. */
+   in common): neutral capsules, the chosen one in the soft crimson, all standing. */
 :root[data-theme]:where(.ouro-ui) .theme-choice {
     border-color: transparent; border-radius: var(--pill-radius); background: var(--surface-capsule); box-shadow: var(--elev-rest);
     transition: var(--motion-tone);
 }
 :root[data-theme]:where(.ouro-ui) .theme-choice:hover { border-color: transparent; background: var(--surface-capsule-hover); }
-:root[data-theme]:where(.ouro-ui) .theme-choice[aria-checked="true"] { border-color: transparent; background: var(--tone-crimson); color: var(--tone-crimson-ink); }
+:root[data-theme]:where(.ouro-ui) .theme-choice[aria-checked="true"] { border-color: transparent; background: var(--tone-crimson-soft); color: var(--tone-crimson-soft-ink); }
 :root[data-theme]:where(.ouro-ui) :is(.ui-chip, .status-badge) { border-color: transparent; }
+
+/* ---- Status marks (docs/DESIGN.md "Status marks") --------------------------------------------------------------
+   One small family for every surface, created and painted by web/modules/status_mark.js and drawn only here. The
+   shape says what the work does (three moving dots, the same dots still, the pause's two bars, a faint ring, one dot);
+   the hue says whether there is something for the owner. Dots are 4px, a single fact 7px; no halos, shadows or glyphs.
+   Only the moving dots animate. The ink hue is the surface's own ink (a chosen row's selection colour included);
+   --mark-ink is the one hook a surface sets to give its marks another ink. */
+:root {
+    --mark-dot: 4px;
+    --mark-gap: 3px;
+    --mark-fact: 7px;
+    --mark-ink: currentColor;
+    --mark-unread: var(--accent-light);
+    --mark-owner: var(--amber);
+}
+:root[data-theme="light"] { --mark-unread: var(--accent); }
+.status-mark {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    gap: var(--mark-gap);
+    min-height: var(--mark-fact);
+    color: var(--mark-ink);
+    line-height: 0;
+    pointer-events: none;
+}
+.status-mark[hidden] { display: none; }
+.status-mark > i {
+    display: block;
+    flex: none;
+    width: var(--mark-dot);
+    height: var(--mark-dot);
+    border-radius: 50%;
+    background: currentColor;
+}
+.status-mark[data-shape="moving"] > i { animation: status-mark-bounce 1.4s ease-in-out infinite; }
+.status-mark[data-shape="moving"] > i:nth-child(2) { animation-delay: 0.2s; }
+.status-mark[data-shape="moving"] > i:nth-child(3) { animation-delay: 0.4s; }
+.status-mark[data-shape="still"] { opacity: 0.4; }
+.status-mark[data-shape="still"][data-hue="unread"] { opacity: 0.6; }
+.status-mark[data-shape="pause"] { opacity: 0.7; }
+.status-mark[data-shape="pause"][data-hue="unread"] { opacity: 1; }
+.status-mark[data-shape="ring"] { opacity: 0.55; }
+.status-mark[data-shape="ring"][data-hue="unread"] { opacity: 0.6; }
+.status-mark[data-shape="pause"] > i { width: 2px; height: 8px; border-radius: 1px; }
+.status-mark:is([data-shape="pause"], [data-shape="ring"], [data-shape="dot"]) > i:nth-child(3),
+.status-mark:is([data-shape="ring"], [data-shape="dot"]) > i:nth-child(2) { display: none; }
+.status-mark:is([data-shape="ring"], [data-shape="dot"]) > i { width: var(--mark-fact); height: var(--mark-fact); }
+.status-mark[data-shape="ring"] > i { box-sizing: border-box; background: transparent; border: 1px solid currentColor; }
+.status-mark[data-hue="unread"] { color: var(--mark-unread); }
+.status-mark[data-hue="owner"] { color: var(--mark-owner); }
+.status-mark[data-hue="ok"] { color: var(--green); }
+.status-mark[data-hue="failed"] { color: var(--red); }
+.status-mark[data-hue="neutral"] { color: var(--text-meta); }
+@keyframes status-mark-bounce {
+    0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+    30% { transform: translateY(-6px); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .status-mark[data-shape="moving"] > i { animation: none; }
+}

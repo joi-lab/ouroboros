@@ -93,15 +93,15 @@ def test_the_select_arrow_is_a_theme_token_not_a_baked_colour():
         assert not baked, f"{rel}: inline SVG carries a fixed colour: {baked}"
 
 
-def test_selected_advisory_uses_the_themed_warn_foreground():
+def test_selected_advisory_reads_like_every_other_setting_value():
+    """A setting's value is never amber: the selected Advisory takes the shared selected look of a chosen option,
+    the themed soft crimson pair, so the old ~2:1 amber wash on the light surface cannot come back."""
     css = _read("web/settings.css")
-    rule = re.search(
-        r'\[data-enforcement-group\][^{]*advisory"\]\.active[^{]*\{([^}]*)\}', css)
-    assert rule, "the selected-Advisory rule is gone; the contrast defect can return"
-    body = rule.group(1)
-    # --amber (#f59e0b) over the 12% amber wash is ~2:1 on the light surface.
-    assert "--status-warn-fg" in body
-    assert "var(--amber)" not in body
+    assert not re.search(r'advisory"\][^{]*\{', css), "Advisory has a look of its own again"
+    selected = re.search(r':root\[data-theme\] \.settings-effort-btn\.active,?[^{]*\{([^}]*)\}', css)
+    assert selected, "the shared selected-value rule is gone"
+    assert "var(--tone-crimson-soft)" in selected.group(1) and "var(--tone-crimson-soft-ink)" in selected.group(1)
+    assert ".wizard-choice.advisory" not in _read("web/onboarding.css")
 
 
 def test_appearance_is_a_named_destination_that_never_reaches_the_server():

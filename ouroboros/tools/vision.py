@@ -296,8 +296,11 @@ def _vlm_failure(ctx: Any, label: str, error: BaseException, model: str, images:
         "provider_code": str(getattr(capture, "provider_code", "") or ""),
         "provider_error": str(getattr(capture, "provider_error", "") or "")[:500],
     }
+    # The typed error's own sanitized projection (provider_code, parameter) when it has one.
+    display = getattr(error, "display_message", None)
     return _publish_tool_result(ctx, ToolResult(
-        status="error", code="VLM_ERROR", text=f"⚠️ {label}: {error}",
+        status="error", code="VLM_ERROR",
+        text=f"⚠️ {label}: {display if isinstance(display, str) and display else error}",
         meta={key: value for key, value in meta.items() if value not in (None, "")},
     ))
 

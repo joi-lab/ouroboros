@@ -25,7 +25,7 @@ _NOT_MODIFIED_PREFIX = "bad request: message is not modified"
 
 def _u16len(value: str) -> int:
     """Return Telegram's text length: UTF-16 code units, not code points."""
-    return sum(2 if ord(char) > 0xFFFF else 1 for char in value)
+    return len(value.encode("utf-16-le", "surrogatepass")) // 2
 
 
 def _take_u16_prefix(value: str, budget: int) -> tuple[str, str]:

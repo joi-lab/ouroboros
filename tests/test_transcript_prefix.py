@@ -5,18 +5,89 @@ previous request only when it is a byte-prefix of the next, so a transient
 trailing message or an in-place rewrite of an already-sent message discards
 the whole conversation cache (issue #906, measured 2026-09-14).  The unit
 cases pin the recorder; the loop case pins the invariant on the real
-``run_llm_loop`` with the acceptance observation actually injected.
+``run_llm_loop`` with the host's completion control and owner-source
+observation actually injected.
 """
 from __future__ import annotations
 
 import copy
+import json
+import queue
 from types import SimpleNamespace
+
+import pytest
 
 from ouroboros import loop, transcript_prefix
 from ouroboros.transcript_prefix import CHECKPOINT_KIND, message_digest, observe_send, sanction_rewrite
 
-# The heaviest real harness that injects the per-round acceptance observation.
-from tests.test_acceptance_async_loop import ANSWER, call, full_loop, keep  # noqa: F401
+ANSWER = "The complete report includes the requested budget."
+
+
+def call(name, arguments, identifier):
+    return {"id": identifier, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}
+
+
+@pytest.fixture
+def full_loop(tmp_path, monkeypatch):
+    """The real ``run_llm_loop`` with real tools and a scripted Main; ``model_inputs`` keeps
+    every send. A completion selected beside an effect Main has not read is held: the host
+    retains the answer, appends its completion control and the owner-source observation."""
+    from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from ouroboros.tools.registry import ToolRegistry
+
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_MAX_ROUNDS", "12")
+    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("MCP_ENABLED", "false")
+    monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_args: False)
+    registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+    registry._ctx.repo_dir.mkdir()
+    ctx = registry._ctx
+    task_id = "prefix-loop-root"
+    # The production pre-loop canonical RUNNING admission of a root.
+    contract = build_task_contract({"id": task_id, "root_task_id": task_id, "delegation_role": "root"})
+    write_task_result(ctx.drive_root, task_id, STATUS_RUNNING, root_task_id=task_id, delegation_role="root",
+                      task_contract=contract, result="Task is running.")
+    ctx.task_id = ctx.root_task_id = task_id
+    ctx.delegation_role = "root"
+    ctx.task_metadata = {"root_task_id": task_id, "budget_drive_root": str(ctx.drive_root)}
+    ctx.task_contract = contract
+    ctx.task_attempt, ctx.current_chat_id, ctx.is_direct_chat = 1, 1, False
+    fixture = SimpleNamespace(tools=registry, ctx=ctx, events=queue.Queue(), model_inputs=[], model_step=0,
+                              progress=[])
+    fixture.run_args = dict(
+        messages=[{"role": "system", "content": "Complete the owner task."},
+                  {"role": "user", "content": "Prepare the complete report including its budget."}],
+        tools=registry, llm=SimpleNamespace(default_model=lambda: "fixture/main"),
+        drive_logs=ctx.drive_root / "logs", emit_progress=lambda text, **_kw: fixture.progress.append(text),
+        incoming_messages=queue.Queue(), task_id=task_id, drive_root=ctx.drive_root, event_queue=fixture.events,
+    )
+
+    def run():
+        # The scripted Main replaces the transport, including its actual-context
+        # observer. Observe only the request whose response is being returned.
+        model = loop.call_llm_with_retry
+
+        def observed(*args, **kwargs):
+            result = model(*args, **kwargs)
+            observer = kwargs.get("model_context_observer")
+            if result[0] is not None and callable(observer):
+                observer(args[1])
+            return result
+        with monkeypatch.context() as patcher:
+            patcher.setattr(loop, "call_llm_with_retry", observed)
+            return loop.run_llm_loop(**fixture.run_args)
+    fixture.run = run
+    return fixture
+
+
+def select_completion(f, **selected):
+    """Main selects a completion, acknowledging the owner-source facts the host observed."""
+    subject = {"owner_source_sha256": f.ctx._acceptance_observation["owner_source_sha256"]}
+    arguments = {"action": "finish", **selected, "acceptance_subject": subject}
+    return {"content": None, "tool_calls": [call("finish_task", arguments, f"finish-{f.model_step}")]}
+
 
 # ---------------------------------------------------------------------------
 # message_digest: content identity, not envelope shape
@@ -165,28 +236,28 @@ def _prefix_breaks(events):
 
 
 def _four_tool_rounds(f):
-    """Script: nominate + one effect, then a read per round, then finalize."""
+    """Script: a completion beside one unread effect (held), then a read per round, then
+    selecting the retained answer."""
     def main(_llm, messages, *_args, **_kwargs):
         f.model_inputs.append(copy.deepcopy(messages))
         f.model_step += 1
         if f.model_step == 1:
-            return {"content": "The report is ready; requesting its review.", "tool_calls": [
-                call("task_acceptance_review", {"claim": ANSWER}, "nominate"),
+            completion = select_completion(f, answer=ANSWER)
+            return {"content": "The report is ready.", "tool_calls": [
+                *completion["tool_calls"],
                 call("write_file", {"root": "task_drive", "path": "proof.txt",
                                     "content": "effect"}, "seed"),
             ]}, 0.0
         if f.model_step in (2, 3, 4):
-            if f.model_step == 2:
-                assert f.entered.wait(5), f.progress
             return {"content": "", "tool_calls": [
                 call("read_file", {"root": "task_drive", "path": "proof.txt"},
                      f"read-{f.model_step}")]}, 0.0
         assert f.model_step < 9, f.progress
-        return keep(f), 0.0
+        return select_completion(f, answer_sha256=f.ctx._delivery_candidate.content_sha256), 0.0
     return main
 
 
-def test_every_send_of_one_execution_extends_the_previous_send(full_loop, monkeypatch):  # noqa: F811 -- imported pytest fixture
+def test_every_send_of_one_execution_extends_the_previous_send(full_loop, monkeypatch):
     f = full_loop
     monkeypatch.setattr(loop, "call_llm_with_retry", _four_tool_rounds(f))
 
@@ -194,6 +265,9 @@ def test_every_send_of_one_execution_extends_the_previous_send(full_loop, monkey
 
     assert result == ANSWER, (result, f.progress)
     assert len(f.model_inputs) >= 5, f.model_inputs
+    # The held completion left its control and the owner-source observation in the next send.
+    held = json.dumps(f.model_inputs[1], ensure_ascii=False)
+    assert "[DELIVERY_FINALIZATION_CONTROL]" in held and "[ACCEPTANCE_SUBJECT_OBSERVATION]" in held
     _assert_prefix_chain(f.model_inputs)
     assert _prefix_breaks(f.events) == []
     assert "prompt_prefix_breaks" not in usage
@@ -230,7 +304,7 @@ def test_a_sent_tail_row_is_never_merged_into_whatever_produced_it():
         assert len(plain) == 4 and plain[2] is tail
 
 
-def test_the_roster_note_rides_the_real_loop_as_an_append(full_loop, monkeypatch):  # noqa: F811 -- imported pytest fixture
+def test_the_roster_note_rides_the_real_loop_as_an_append(full_loop, monkeypatch):
     """A host-listed independent root appears once, as a fresh tail row, and the
     transcript stays a prefix chain across every send (no tail_replaced)."""
     from ouroboros.utils import atomic_write_json, utc_now_iso
@@ -256,18 +330,6 @@ def test_the_roster_note_rides_the_real_loop_as_an_append(full_loop, monkeypatch
     assert "prompt_prefix_breaks" not in usage
 
 
-def _fake_compaction(messages, *_args, **_kwargs):
-    """Stand in for the summarizer behind both compaction seams: rewrite the
-    first tool result in place and report the pass as applied."""
-    rebuilt = list(messages)
-    for index, message in enumerate(rebuilt):
-        if message.get("role") == "tool":
-            rebuilt[index] = {**message, "content": "[compacted tool result]"}
-            break
-    receipt = SimpleNamespace(status="applied", checkpoint_ref="ckpt-1", reclaimed_tokens=10, goal_reached=True, fit=None)
-    return rebuilt, receipt, {"prompt_tokens": 1, "completion_tokens": 1}
-
-
 def _after_step(f, step, hook):
     """Run ``hook`` once the scripted model has answered round ``step``."""
     inner = _four_tool_rounds(f)
@@ -290,12 +352,13 @@ def _assert_one_sanctioned_rewrite_at_round_three(f, usage):
     _assert_prefix_chain(f.model_inputs[2:])
 
 
-def test_manual_compaction_is_recorded_as_a_sanctioned_break_on_its_round(full_loop, monkeypatch):  # noqa: F811 -- imported pytest fixture
+def test_authored_compaction_is_recorded_as_a_sanctioned_break_on_its_round(full_loop, monkeypatch):
+    from ouroboros.tools.compact_context import _compact_context
+
     f = full_loop
-    monkeypatch.setattr(loop, "compact_tool_history_llm", _fake_compaction)
-    # The owner-requested reclaim is picked up by _run_round_compaction at the top of round 3.
+    # The mind's own view, bound to its last observed send, is applied by _run_round_compaction at the top of round 3.
     monkeypatch.setattr(loop, "call_llm_with_retry", _after_step(
-        f, 2, lambda: setattr(f.ctx, "_pending_compaction", 1)))
+        f, 2, lambda: _compact_context(f.ctx, working_note="The first reads are folded.", keep_unit_ids=[])))
 
     result, usage, _trace = f.run()
 
@@ -303,7 +366,7 @@ def test_manual_compaction_is_recorded_as_a_sanctioned_break_on_its_round(full_l
     _assert_one_sanctioned_rewrite_at_round_three(f, usage)
 
 
-def test_predicted_pressure_keeps_the_append_only_prefix_without_automatic_reclaim(full_loop, monkeypatch):  # noqa: F811 -- imported pytest fixture
+def test_predicted_pressure_keeps_the_append_only_prefix_without_automatic_reclaim(full_loop, monkeypatch):
     f = full_loop
     monkeypatch.setattr(loop, "call_llm_with_retry", _four_tool_rounds(f))
     def no_automatic_summary(*args, **kwargs):

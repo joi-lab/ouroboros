@@ -37,13 +37,13 @@
     {
       "name": "owner Restart has a readable cause without changing its typed identity",
       "record": {"status": "cancelled", "reason_code": "owner_restart", "cancel_origin": {"source": "owner_restart", "reason": "Owner restart"}},
-      "phase": "cancelled", "headline": "Cancelled",
+      "phase": "cancelled", "headline": "Stopped",
       "acceptance_clause": "Stopped by the Restart command."
     },
     {
       "name": "shutdown has its own cause, never invented owner intent",
       "record": {"status": "cancelled", "reason_code": "server_shutdown", "cancel_origin": {"source": "server_shutdown", "reason": "Server shutdown"}},
-      "phase": "cancelled", "headline": "Cancelled",
+      "phase": "cancelled", "headline": "Stopped",
       "acceptance_clause": "Server shutdown."
     },
     {
@@ -108,14 +108,14 @@
         "outcome_axes": {"lifecycle": {"status": "cancelled"}, "artifacts": {"status": "missing"}}
       },
       "phase": "cancelled",
-      "headline": "Cancelled",
+      "headline": "Stopped",
       "acceptance_clause": "Some result files are missing or could not be preserved."
     },
     {
       "name": "legacy cancel_requested event spelling",
       "record": {"status": "cancel_requested"},
       "phase": "cancelled",
-      "headline": "Cancelled",
+      "headline": "Stopped",
       "acceptance_clause": ""
     },
     {
@@ -886,6 +886,6 @@
     },
     {"name": "generic unfinished stop states its own rationale without an acceptance decision", "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "ok", "task_completion": {"action": "stop", "rationale": "The **export** still fails on empty input."}}, "objective": {"status": "fail", "source": "task_completion", "reason": "author_stop"}, "review": {"status": "skipped"}}}, "phase": "error", "headline": "Failed", "acceptance_clause": "Ouroboros stopped with unfinished work; no review approval was granted · The export still fails on empty input."},
     {"name": "a generic stop preserves a stronger failure", "record": {"status": "failed", "reason_code": "provider_failure", "outcome_axes": {"execution": {"status": "infra_failed", "task_completion": {"action": "stop", "rationale": "The **export** still fails on empty input."}}, "objective": {"status": "fail", "source": "task_completion", "reason": "author_stop"}, "review": {"status": "skipped"}}}, "phase": "error", "headline": "Failed", "acceptance_clause": "The model provider failed to answer, so the task could not finish · The export still fails on empty input."},
-    {"name": "a generic stop preserves a stronger cancellation", "record": {"status": "cancelled", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "cancelled", "task_completion": {"action": "stop", "rationale": "The **export** still fails on empty input."}}, "objective": {"status": "fail", "source": "task_completion", "reason": "author_stop"}, "review": {"status": "skipped"}}}, "phase": "cancelled", "headline": "Cancelled", "acceptance_clause": "The export still fails on empty input."}
+    {"name": "a generic stop preserves a stronger cancellation", "record": {"status": "cancelled", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "cancelled", "task_completion": {"action": "stop", "rationale": "The **export** still fails on empty input."}}, "objective": {"status": "fail", "source": "task_completion", "reason": "author_stop"}, "review": {"status": "skipped"}}}, "phase": "cancelled", "headline": "Stopped", "acceptance_clause": "The export still fails on empty input."}
   ]
 }

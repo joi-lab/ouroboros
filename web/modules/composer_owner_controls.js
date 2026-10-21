@@ -5,6 +5,9 @@ import { fmt } from './i18n.js';
 import {
     EFFORT_OPTIONS, EFFORT_RANGE_DEFAULT, OWNER_TIERS, effortText, normalizeEffortRange, ownerLevelIndex,
 } from './effort_levels.js';
+import { beginMorph, stopMorph } from './capsule_morph.js';
+import { haptic } from './haptics.js';
+import { createComposerFold } from './composer_fold.js';
 
 const N = OWNER_TIERS.length - 1;
 const HANDLES = ['min', 'rec', 'max'];
@@ -90,7 +93,7 @@ function ringArc(a0, a1) {
 }
 
 /* A capsule's head: the ring, the setting's name and its value (the value gives way to the strip). */
-const capsuleHead = (glyph, name, headClass, valueAttrs = '') => `<button type="button" class="chat-capsule-head ${headClass}" aria-expanded="false">`
+const capsuleHead = (glyph, name, headClass, valueAttrs = '') => `<button type="button" class="chat-capsule-head ui-hit-area ${headClass}" aria-expanded="false">`
     + `<span class="chat-capsule-glyph" aria-hidden="true"><svg viewBox="0 0 184 184">${glyph}</svg></span>`
     + `<span class="chat-capsule-name">${name}</span><span class="chat-capsule-value"${valueAttrs}></span></button>`;
 
@@ -366,6 +369,7 @@ function createCapsule({
         if (state.open === open && !focus) return;
         if (open && !state.open) api.peer?.snapClosed();
         const flips = state.open !== open;
+        const morph = flips && el.dataset.snap !== 'true' ? beginMorph({ el, row, win }) : null;  // alone, it grows in place
         const collapses = !open && state.open && el.dataset.fit === 'inline' && el.dataset.snap !== 'true';
         state.open = open;
         clearTimeout(settleTimer);
@@ -394,9 +398,11 @@ function createCapsule({
         if (open && focus) focusTarget()?.focus({ preventScroll: true });
         onLayout();
         if (!open && !collapses) settled();
+        morph?.play(open);
     }
     // Closed at once, a running collapse included: the other capsule is opening and measures this one.
     function snapClosed() {
+        stopMorph(el);  // its own strip, still growing or folding, goes too
         el.dataset.snap = 'true';
         setOpen(false);
         void el.offsetWidth;
@@ -421,7 +427,8 @@ function createCapsule({
     };
     const onDocKeyDown = (event) => {
         keyboardFocus = true;
-        if (event.key !== 'Escape' || !state.open) return;
+        if (event.key !== 'Escape' || !state.open || event.defaultPrevented) return;
+        event.preventDefault();  // the capsule took this Escape: the Project room under it stays open
         state.pinned = false;
         setOpen(false);
         head.focus({ preventScroll: true });
@@ -481,6 +488,7 @@ function createCapsule({
         setOpen, snapClosed, closeSoon, onStripScroll, reveal, measureName, isRtl, relayout,
         destroy() {
             state.destroyed = true;
+            stopMorph(el);
             clearTimeout(hoverTimer);
             clearTimeout(leaveTimer);
             clearTimeout(settleTimer);
@@ -712,8 +720,11 @@ export function createEffortRangeControl({
         let start;
         if (handleEl) { which = handleEl.dataset.handle; start = state.shown[which]; }
         else ({ which, start } = pick(event));
+        let at = state.shown[which];  // each level the finger reaches ticks once (haptics.js), a press on another too
+        const reach = () => { const now = snapRange(state.view)[which]; if (now !== at) { at = now; haptic('tick'); } };
         beginDrag(which);
         if (!handleEl) dragTo(which, start);
+        reach();
         const grab = valueAt(event, which) - state.view[which];
         handles[which].focus({ preventScroll: true, focusVisible: false });  // no keyboard ring after a mouse press
         try { strip.setPointerCapture(event.pointerId); } catch { /* a synthetic event */ }
@@ -721,6 +732,7 @@ export function createEffortRangeControl({
             if (ev.pointerId !== event.pointerId || !state.drag) return;
             state.drag.moved = true;  // a press that stays put is a tap: its marks still animate
             dragTo(which, valueAt(ev, which) - grab);
+            reach();
         };
         const release = (ev) => {
             if (ev.pointerId !== event.pointerId) return;
@@ -840,7 +852,9 @@ function createContextModeControl({ el, row, saveContextMode, showToast, refresh
     }
     const onChoose = (event) => {
         const seg = event.target?.closest?.('.chat-seg');
-        return seg ? choose(seg.dataset.mode) : undefined;
+        const started = seg ? choose(seg.dataset.mode) : undefined;
+        if (started) haptic('tick');  // another mode, chosen by a press (haptics.js)
+        return started;
     };
     // A strip that scrolls (long translated words on a phone) keeps the chosen or focused mode whole.
     const revealMode = (seg) => { if (seg) capsule.reveal(Number(seg.offsetLeft), Number(seg.offsetLeft) + Number(seg.offsetWidth)); };
@@ -898,8 +912,9 @@ function createContextModeControl({ el, row, saveContextMode, showToast, refresh
  * @param {(force?: boolean) => Promise<void>|void} deps.refreshState  a forced `/api/state` re-read
  * @param {() => void} [deps.onLayout]  a strip opened or closed on its own line
  * @param {HTMLElement} [deps.box]  independently sized page the composer docks inside
+ * @param {() => boolean} [deps.readingBack]  the owner's own gesture took the room off its newest row (composer_fold.js)
  */
-export function createComposerOwnerControls({ row, byId, apiFetch, saveEffortRange, showToast, refreshState, onLayout, projectId = '', box = null, win = globalThis.window, doc = globalThis.document }) {
+export function createComposerOwnerControls({ row, byId, apiFetch, saveEffortRange, showToast, refreshState, onLayout, projectId = '', box = null, win = globalThis.window, doc = globalThis.document, readingBack }) {
     let destroyed = false;
     const scoped = body => projectId ? { ...body, project_id: projectId } : body;
     const readback = reply => {
@@ -918,10 +933,14 @@ export function createComposerOwnerControls({ row, byId, apiFetch, saveEffortRan
     const capsules = [];
     // Measure the settled, closed row synchronously: keep names while it fits, else rings and
     // values. If long translated values still wrap, cap the widest with an ellipsis; accessible
-    // names and open strips keep full words. The closed names never flicker between fits.
-    const shownKids = () => Array.from(row.children || []).filter((kid) => widthOf(kid) > 0);
+    // names and open strips keep full words. The closed names never flicker between fits. Contributed chips take
+    // only the room the capsules leave (composer_chips.js), so their slot is never part of the fit.
+    const shownKids = () => Array.from(row.children || [])
+        .filter((kid) => widthOf(kid) > 0 && !kid.hasAttribute?.('data-composer-chips'));
+    // A phone's ☰ leads the line and never wraps, so it is not what the line is read by: while the row folds it goes
+    // down beside the field (composer_fold.js) and the line it left still holds the capsules.
     function wraps() {
-        const kids = shownKids();
+        const kids = shownKids().filter((kid) => !kid.classList?.contains?.('composer-menu'));
         const first = kids[0]?.getBoundingClientRect?.();
         return Boolean(first) && kids.some((kid) => kid.getBoundingClientRect().top >= first.bottom);
     }
@@ -970,6 +989,9 @@ export function createComposerOwnerControls({ row, byId, apiFetch, saveEffortRan
     const onText = (records) => { if (records?.length && records.every(ownValue)) fitNames(); else relayout(); };
     const textObserver = row && typeof win?.MutationObserver === 'function' ? new win.MutationObserver(onText) : null;
     textObserver?.observe(row, { childList: true, characterData: true, subtree: true });
+    // On a phone the row folds away while the owner reads back through the room's history (composer_fold.js).
+    const fold = box ? createComposerFold({ feed: box.querySelector('#chat-messages, .chat-messages'),
+        wrap: row?.closest?.('.chat-input-wrap'), row, win, doc, readingBack }) : null;
 
     return {
         context,
@@ -990,6 +1012,7 @@ export function createComposerOwnerControls({ row, byId, apiFetch, saveEffortRan
             textObserver?.disconnect();
             context?.destroy();
             effort?.destroy();
+            fold?.destroy();
             if (row?.dataset) delete row.dataset.ownerCompact;
             row?.style?.setProperty?.('--capsule-value-cap', '');
         },

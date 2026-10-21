@@ -94,10 +94,7 @@ class BranchTransport(rw.Transport):
             self.state_failures += 1
             route.abort("connectionreset")
             return
-        route.fulfill(json={"sha": "room-work-fixture", "supervisor_ready": self.ready,
-                            "active_chat_activities": json.loads(json.dumps(self.activities)),
-                            "active_chat_activities_complete": self.complete, "projects": self.projects,
-                            "project_chat_ids": [p["chat_id"] for p in self.projects]})
+        route.fulfill(json=self.body(ready=self.ready))
 
     def _i18n(self, route):
         if self.i18n is None:
@@ -187,9 +184,14 @@ def _unescape(text):
 
 def pseudo_memory():
     """An install language whose memory knows every literal ``tr`` code and ``fmt`` template in
-    web/modules and the chrome strings room_work.js writes as plain text. Each translation is the
+    web/modules, the chrome strings room_work.js writes as plain text, and the server's reason
+    sentences the web reads by their code (gateway/work_status.py REASON_TEXT; a reason whose text
+    is the host's own words, a Project hold's label, stays host text). Each translation is the
     English wrapped in ‹…›, so any chrome still in plain English is a string no seam translated."""
-    entries = {}
+    from ouroboros.gateway.work_status import REASON_TEXT
+
+    entries = {f"code:work.because.{code}": {"text": MARK.format(phrase)} for code, phrase in REASON_TEXT.items()
+               if isinstance(phrase, str) and code not in {"project_admission", "held"}}
     for path in sorted((REPO / "web" / "modules").glob("*.js")):
         source = path.read_text(encoding="utf-8")
         for match in _TR.finditer(source):
@@ -750,7 +752,8 @@ def test_subagent_and_reusable_ids_get_no_row_or_no_controls(branch_ui):
     transport = BranchTransport(page, history=history, projects=[rw.PROJECT], details={
         "p-root": {"task_id": "p-root", "status": "completed", "suggested_name": "Archive pass"},
         "p-sub": {"task_id": "p-sub", "status": "completed", "delegation_role": "subagent", "parent_task_id": "p-root"}},
-        activities=[rw.activity("rw-root"), rw.activity("rw-sub"),
+        # The census names a child with its lineage, as the server's census does: it is a member of its root's work.
+        activities=[rw.activity("rw-root"), rw.activity("rw-sub", parent_task_id="rw-root", root_task_id="rw-root"),
                     rw.activity("active", kind="direct_chat", client_message_id="cm-active")])
     rw.open_app(branch_ui, transport)
     cards = page.evaluate("""() => [...document.querySelectorAll('#chat-messages .chat-live-card')].map((c) => ({

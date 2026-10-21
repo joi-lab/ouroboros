@@ -1,7 +1,7 @@
-"""Continuation of a settled delegated run: ``delegate_start(continue_from=<run_id>)``.
+"""Continuation of a finished delegated run: ``delegate_start(continue_from=<run_id>)``.
 
-Four floor invariants gate it (own task line, settled, no pending-ambiguous
-apply, authority does not widen); every other fact — any settled cause, an
+Four floor invariants gate it (own task line, observed terminal, no pending-ambiguous
+apply, authority does not widen); every other fact — any terminal cause, an
 unread result, another actor, a changed or partial work order — is ADVICE in
 the continuing child's prompt and a fact in the parent's started payload. The
 engine continues the stopped work (``continueFrom``); a writing continuation

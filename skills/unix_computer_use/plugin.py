@@ -18,7 +18,7 @@ is NOT probed — ``screencapture``/``cliclick`` exit 0 even when permission is
 denied (capturing only the wallpaper, or dropping synthetic input), so callers
 must ensure the host has granted these. Wayland support depends on ydotool
 (input) and grim/gnome-screenshot (capture); X11 uses xdotool/scrot. Windows
-support is deferred to a separate skill.
+desktops use the separate windows_computer_use skill.
 """
 
 from __future__ import annotations
@@ -850,7 +850,7 @@ class _ComputerUse:
                 "+ grim or gnome-screenshot (capture). xdotool does NOT work on Wayland.",
                 "Input coordinates default to the LAST screenshot's image space (auto-remapped); "
                 "pass raw=true for native input coordinates.",
-                "Windows support is deferred to a separate skill.",
+                "Windows desktops use the separate windows_computer_use skill.",
             ],
             "permission_state_verified": False,
         }

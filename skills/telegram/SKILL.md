@@ -1,7 +1,7 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.3.0
+version: 1.3.4
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -31,7 +31,11 @@ and the optional Mini App. The first positive private Telegram chat binds as
 the sole owner. Text, photos and files (documents, video, audio and voice notes within
 this integration's 10 MiB download cap) can be sent to Ouroboros, with or without a
 caption; replies, photos, videos, documents, typing state, subagent cards, quiz
-cards, and opt-in notifications are mirrored back to that owner. A quiz card is
+cards, and opt-in notifications are mirrored back to that owner. Telegram's typing
+indicator stays on while a reply you asked for, mirrored to this chat, is actively
+being prepared by Ouroboros or a working helper; it stops for Pause, Stop now and
+after the answer, and a question waiting for you, a model-access wait or background work
+never keep it on (DESIGN §9). A quiz card is
 answered by tapping an option or by replying to the card with a free-form
 answer; both reach the same host decision ingress as the web UI. The bridge speaks
 the install's interface language (Settings → Appearance → Language, or `/language`
@@ -51,6 +55,13 @@ failure arrives as one line. A relayed row quotes the owner's words verbatim as
 plain text, under where he wrote them and with the file names, above the note.
 Quiz buttons and replies keep their decision path; earlier parts of a long
 question carry ordinary references.
+
+Version 1.3.2 warns when the derived reference map cannot be saved, without
+blocking an owner message or later outbound parts. Completion notifications
+reference their work, not an authored answer shown only in Main.
+Version 1.3.3 gives a finished root task's notice the task card's cost words for
+its whole tree: `$3.42` when final, `up to $3.42` while costs may still arrive,
+`Tracked:` when some step has no price; an unknown cost adds nothing.
 
 Version 1.2.1 marks questions that wait for an owner answer and clears the
 waiting line after an answer submitted through Telegram.

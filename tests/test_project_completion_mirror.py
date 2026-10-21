@@ -9,6 +9,8 @@ unchanged text, and the key's survival live -> durable row -> history replay.
 
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 import asyncio
 import json
 import types
@@ -85,9 +87,9 @@ def test_the_row_carries_the_answer_and_its_text_does_not_change(tmp_path, monke
     assert "reply_to" not in mirrored["progress_meta"]  # system-origin work has no invented owner quote
     assert mirrored["role"] == "system"
     assert mirrored["system_type"] == "project_completion_summary"
-    # Telegram, the model's own context and older clients read `text` alone:
-    # the answer never leaks into it, and the pointer sentence stays.
-    assert mirrored["text"] == "Launch › Ship release · Done\nOpen the Project for details."
+    # Telegram, the model's own context and older clients read `text` alone: the answer never leaks into it,
+    # and it invites nothing, since the row's Project reference is its door (owner 17.10, Q2 C).
+    assert mirrored["text"] == "Launch › Ship release · Done"
     assert "PR #7" not in mirrored["text"]
     # Without a model-authored answer the key is ABSENT, not empty.
     assert "completion_answer" not in pointer["progress_meta"]
@@ -100,7 +102,6 @@ def test_the_answer_survives_live_frame_durable_row_and_history_replay(monkeypat
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
     monkeypatch.setattr(message_bus, "load_state", lambda: {"session_id": "s", "owner_id": 7})
-    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat_id: None)
     monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
     from ouroboros.chat_chain import format_address, row_address
     from ouroboros.project_dialogue import build_owner_message_ref
@@ -115,7 +116,7 @@ def test_the_answer_survives_live_frame_durable_row_and_history_replay(monkeypat
     assert facts["reply_to"]["address"] == format_address(row_address(origin))
     assert facts["reply_to"]["snippet"] == "Ship the release"
     message_bus.send_with_budget(
-        1, "Launch › Ship release · Done\nOpen the Project for details.",
+        1, "Launch › Ship release · Done",
         task_id="root-project", role="system", system_type="project_completion_summary",
         progress_meta={**facts, "project_id": "launch", "project_name": "Launch",
                        "target_label": "Launch › Ship release", "status": "completed",
@@ -129,11 +130,10 @@ def test_the_answer_survives_live_frame_durable_row_and_history_replay(monkeypat
     assert live["completion_answer"] == ANSWER
     assert live["role"] == "system"   # the wire voice is unchanged: one ending, one ring
 
-    durable = [json.loads(line) for line in
-               (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    durable = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     stored = next(row for row in durable if row.get("type") == "project_completion_summary")
     assert stored["completion_answer"] == ANSWER
-    assert stored["text"] == "Launch › Ship release · Done\nOpen the Project for details."
+    assert stored["text"] == "Launch › Ship release · Done"
 
     from ouroboros.gateway.history import make_chat_history_endpoint
 

@@ -25,8 +25,12 @@ test('sender labels and the reconnect banner are words', () => {
 });
 
 test('fixed warning decoration is gone while the tone and words stay', () => {
-    const skills = read('modules/skill_card_renderer.js');
-    assert.match(skills, /class="skills-menu-item skills-attest-review skills-attest-warn"[^>]*>Skip review<\/button>/);
+    // Skip review keeps its warning as a stroke glyph beside the words, never an emoji.
+    const skills = read('modules/skill_presentation.js');
+    assert.match(skills, /class="btn btn-default btn-sm skills-skip-btn"/);
+    assert.match(skills, /<span class="skills-skip-glyph" aria-hidden="true">\$\{WARNING_GLYPH\}<\/span>\$\{escapeHtml\(label\)\}<\/button>/);
+    assert.match(skills, /export const WARNING_GLYPH = strokeIcon\(WARNING_PATH, 14\);/);
+    assert.doesNotMatch(skills, /\u26a0/);
     const warningState = /statusMsg \+= '\. Warnings: ' \+ data\.warnings\.join\(' \| '\);\r?\n\s*statusType = 'warn';/;
     for (const eol of ['\n', '\r\n']) {
         const source = read('modules/settings.js').replace(/\r?\n/g, eol);

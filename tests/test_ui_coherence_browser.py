@@ -55,16 +55,15 @@ def test_chat_header_decoration_does_not_clip_menu_and_system_actions_keep_gap(s
     actions = page.locator("#chat-messages .system-message-actions")
     assert actions.count() == 2
     for action in actions.all():
-        # A completion row's terminal-time note sits between its prose and the actions.
+        # The actions follow the prose: a completion row's one time line is its own time below them (owner 17.10, Q7 A).
         metrics = action.evaluate("""el => {
-            const note = el.previousElementSibling, prose = note.previousElementSibling;
-            return {previous:note.className, prose:prose.classList.contains('message'), nested:!!el.closest('.message'),
-                note:note.getBoundingClientRect().top - prose.getBoundingClientRect().bottom,
-                gap:el.querySelector('button').getBoundingClientRect().top - note.getBoundingClientRect().bottom,
+            const prose = el.previousElementSibling, time = el.parentElement.querySelector(':scope > .msg-time');
+            return {prose:prose.classList.contains('message'), nested:!!el.closest('.message'),
+                time:!!time && Boolean(el.compareDocumentPosition(time) & Node.DOCUMENT_POSITION_FOLLOWING),
+                gap:el.querySelector('button').getBoundingClientRect().top - prose.getBoundingClientRect().bottom,
                 below:el.getBoundingClientRect().bottom - el.querySelector('button').getBoundingClientRect().bottom};
         }""")
-        assert metrics["previous"] == "msg-provenance" and metrics["prose"] and not metrics["nested"], metrics
-        assert metrics["note"] == pytest.approx(8, abs=0.5), metrics
+        assert metrics["prose"] and not metrics["nested"] and metrics["time"], metrics
         assert metrics["gap"] == pytest.approx(12, abs=0.5), metrics
         assert metrics["below"] == pytest.approx(12, abs=0.5), metrics
     header = page.locator(".chat-page-header")
@@ -204,7 +203,7 @@ def test_settings_footer_controls_are_reachable_at_content_breakpoints(subscript
     for width in [640, 641, 760, 768, 980, 981]:
         page.set_viewport_size({"width": width, "height": 600})
         if width <= 640:
-            page.wait_for_function("document.querySelector('#primary-sidebar').getBoundingClientRect().right<=1")
+            setup_browser.wait_drawer_closed(page)
         for sidebar in [220, 280]:
             page.evaluate("value => document.documentElement.style.setProperty('--sidebar-width',value+'px')", sidebar)
             for name, message, busy, restart in states:
@@ -244,22 +243,38 @@ def test_short_sidebar_bounds_projects_list_and_cost_cards_keep_local_table_over
     open_app(ui)
     page.wait_for_selector(".nav-project-row")
     sidebar = page.locator("#primary-sidebar")
-    scrolling = sidebar.evaluate("""el => [...el.querySelectorAll('*')].filter(e =>
-        ['auto','scroll'].includes(getComputedStyle(e).overflowY) && e.scrollHeight>e.clientHeight+1).map(e=>e.className)""")
-    # The projects list carries its own bounded window, so the column itself
-    # stays the same height whatever the project count.
-    assert set(scrolling) == {"sidebar-scroll", "nav-projects-list"}, scrolling
+    scrollers = """el => [...el.querySelectorAll('*')].filter(e =>
+        ['auto','scroll'].includes(getComputedStyle(e).overflowY) && e.scrollHeight>e.clientHeight+1).map(e=>e.className)"""
+    main_top = lambda: page.locator(".nav-row-main").evaluate("el => el.getBoundingClientRect().top")
+    # Three zones (DESIGN "Shell"): a window this short cannot hold the pinned zones, so the column itself is the
+    # ONE scroller with Main sticky at its top, and the Projects list shows every row in flow (no inner scroller).
+    assert set(sidebar.evaluate(scrollers)) == set(), sidebar.evaluate(scrollers)
+    assert sidebar.evaluate("el => el.scrollHeight > el.clientHeight + 1"), "the column is the fallback scroller"
+    top_before = main_top()
+    sidebar.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    page.wait_for_timeout(100)
+    assert abs(main_top() - top_before) <= 1, "Main stays pinned while the column scrolls"
     nav = page.locator('[data-nav-page="settings"]')
-    nav.scroll_into_view_if_needed()
     assert hit_box(nav)["reachable"]
     setup_browser.capture(page, "shell-sidebar-short-bottom")
+    # A window tall enough for the zones: the Projects list is the ONE scroller and the column does not scroll.
+    page.set_viewport_size({"width": 1280, "height": 720})
+    page.wait_for_timeout(200)
+    assert set(sidebar.evaluate(scrollers)) == {"nav-projects-list"}, sidebar.evaluate(scrollers)
+    assert not sidebar.evaluate("el => el.scrollHeight > el.clientHeight + 1")
+    top_before = main_top()
+    page.locator("#nav-projects-list").evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    page.wait_for_timeout(100)
+    assert abs(main_top() - top_before) <= 1, "Main never scrolls away"
+    assert hit_box(page.locator('[data-nav-page="settings"]'))["reachable"]
+    page.set_viewport_size({"width": 844, "height": 320})
     page.locator('[data-nav-page="dashboard"]').click()
     page.locator('[data-dashboard-tab="costs"]').click()
     page.wait_for_function("document.querySelector('#cost-confirmed').textContent==='$25.00'")
     for width in [390, 641, 768, 981]:
         page.set_viewport_size({"width": width, "height": 600})
         if width <= 640:
-            page.wait_for_function("document.querySelector('#primary-sidebar').getBoundingClientRect().right<=1")
+            setup_browser.wait_drawer_closed(page)
         for card in page.locator(".costs-stats-grid > .stat-card").all():
             card.scroll_into_view_if_needed()
             box = hit_box(card)
@@ -538,12 +553,17 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
             taskListStyle: getComputedStyle(taskList).listStyleType,
             codeOverflow: getComputedStyle(code).overflowX,
             codeReachable: code.scrollWidth <= code.clientWidth || getComputedStyle(code).overflowX === 'auto',
-            sizes: [...new Set(cards.flatMap(el => [el.querySelector('.chat-quiz-status'), el.querySelector('.chat-quiz-project')])
-                .map(el => getComputedStyle(el).fontSize))]};
+            sizes: [...new Set(cards.map(el => getComputedStyle(el.querySelector('.chat-quiz-status')).fontSize))],
+            capsule: [...new Set(cards.map(el => el.querySelector('.chat-quiz-project')).map(el => JSON.stringify([
+                getComputedStyle(el).fontSize, getComputedStyle(el).borderTopWidth, getComputedStyle(el).borderRadius,
+                box(el).height >= parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--touch-target-min'))])))]};
     }""")
     print(json.dumps({'question_mirror_geometry': geometry, 'viewport': [width, height]}))
     assert geometry['overflow'] <= 1 and geometry['page'] <= 0 and geometry['right'] <= width, geometry
+    # The head's status is meta; its Project reference is the ONE inline capsule (owner 17.10, Q2 C): reading size,
+    # no outline, a capsule's radius and a full target, the same as under a System row or on a receipt line.
     assert geometry['chipInside'] and geometry['sizes'] == ['12px'], geometry
+    assert [json.loads(shape) for shape in geometry['capsule']] == [['14px', '0px', '999px', True]], geometry
     assert geometry['richHost'] and geometry['listPadding'] == '24px', geometry
     assert geometry['listTextOffset'] >= 20 and geometry['taskListStyle'] == 'none', geometry
     assert geometry['codeHasOverflow'] and geometry['codeReachable'] and geometry['codeOverflow'] == 'auto', geometry
@@ -898,3 +918,83 @@ def test_short_question_and_routing_cards_keep_their_width_floor(subscription_ui
     assert metrics['overflow'] <= 1, metrics
     assert all(card['width'] >= card['minimum'] - 1 and card['inside'] for card in metrics['cards']), metrics
     setup_browser.capture(page, f'question-routing-width-{width}')
+
+
+@pytest.mark.parametrize('width', [1440, 390])
+def test_shared_dialog_head_wraps_a_long_title_and_keeps_close_inside(subscription_ui, width):
+    """A long unbroken skill name wraps in the shared modal head; Close keeps its size inside the dialog."""
+    page = subscription_ui['page']
+    page.set_viewport_size({'width': width, 'height': 844})
+    open_app(subscription_ui)
+    for title in ('Grant access to weather', 'Grant access to publication_grant_access_with_a_very_long_skill_name'):
+        page.evaluate("""async title => { (await import('/static/modules/confirm_dialog.js'))
+            .openConfirmDialog({ title, body: 'Grant access?', confirmLabel: 'Grant access' }); }""", title)
+        box = page.locator('.confirm-dialog').evaluate("""dialog => {
+            const d = dialog.getBoundingClientRect(), h = dialog.querySelector('h3').getBoundingClientRect();
+            const c = dialog.querySelector('.marketplace-modal-head [data-confirm-cancel]').getBoundingClientRect();
+            return {inside: h.left >= d.left && h.right <= c.left && c.right <= d.right + 0.5,
+                close: c.width, overflow: document.documentElement.scrollWidth - innerWidth};
+        }""")
+        assert box['inside'] and box['close'] > 50 and box['overflow'] <= 0, (title, box)
+        setup_browser.capture(page, f'dialog-head-{width}-{len(title)}')
+        page.keyboard.press('Escape')
+        page.wait_for_selector('.confirm-dialog', state='detached')
+
+
+def test_quiz_dot_and_evolution_facts_keep_their_shape_in_narrow_columns(subscription_ui):
+    """The quiz status dot stays round in a 320px column; a long Evolution fact wraps inside its card."""
+    page = subscription_ui['page']
+    page.set_viewport_size({'width': 390, 'height': 844})
+    page.route('**/api/state', lambda route: route.fulfill(json={
+        'supervisor_ready': True, 'active_chat_activities': [], 'projects': [], 'runtime_mode': 'advanced',
+        'bg_consciousness_enabled': True, 'bg_consciousness_state': {'status': 'sleeping', 'spent_24h_usd': 1.25,
+                                                                     'daily_usd': 10, 'unknown_unmetered': 1, 'integrity_degraded': True}}))
+    open_app(subscription_ui)
+    page.evaluate("""async () => {
+        const { createChatDecision } = await import('/static/modules/chat_decision.js');
+        const { createChatMedia } = await import('/static/modules/chat_media.js');
+        const { mountChatMarkdown } = await import('/static/modules/chat_markdown.js');
+        const media = createChatMedia({ chatSessionId: 'dot', formatMsgTime: () => null,
+            stampNodeTimestamp: () => {}, senderLabel: () => 'You' });
+        const decision = createChatDecision({ apiFetch: () => {}, showToast: () => {},
+            frameNode: media.bubbleFrameNode, mountMarkdown: mountChatMarkdown });
+        const column = document.querySelector('#chat-messages');
+        column.style.maxWidth = '320px';
+        column.append(decision.buildQuizCard({ type: 'quiz', task_id: 'dot', quiz_id: 'expired', state: 'expired_terminal',
+            question: 'How broadly should the next step change the interface?', options: ['Keep scope', 'Broaden scope'] }));
+    }""")
+    dot = page.locator('.chat-quiz-mark').bounding_box()  # the shared status mark's 7px fact dot
+    assert dot['width'] == pytest.approx(7, abs=0.5) and dot['height'] == pytest.approx(7, abs=0.5), dot
+    page.locator('#page-chat [data-mobile-nav-toggle]').click()  # a phone keeps navigation behind its menu
+    page.click('[data-nav-page="dashboard"]')
+    page.locator('[data-dashboard-tab="evolution"]').click()
+    chip = page.locator('.evo-runtime-chip', has_text='ledger integrity degraded')
+    chip.wait_for()
+    metrics = page.locator('#evo-chart-content').evaluate("""box => {
+        const card = box.querySelector('.evo-runtime-card').getBoundingClientRect();
+        return {scroll: box.scrollWidth - box.clientWidth,
+            outside: [...box.querySelectorAll('.evo-runtime-chip')].filter(c => c.getBoundingClientRect().right > card.right + 0.5).length};
+    }""")
+    assert metrics == {'scroll': 0, 'outside': 0}, metrics
+    chip.scroll_into_view_if_needed()
+    setup_browser.capture(page, 'evolution-facts-390')
+
+
+def test_evolution_start_says_a_refused_send_and_returns_focus(subscription_ui):
+    """Start campaign through its objective dialog: a gateway refusal is a visible error, the
+    button waits for the answer and keyboard focus comes back to it."""
+    page, held = subscription_ui['page'], []
+    page.route('**/api/command', lambda route: held.append(route))
+    open_app(subscription_ui, '/#dashboard')
+    page.locator('[data-dashboard-tab="evolution"]').click()
+    page.locator('#evo-start').focus()
+    page.keyboard.press('Enter')
+    page.locator('.confirm-dialog [data-confirm-ok]').click()
+    page.wait_for_function('() => document.getElementById("evo-start").disabled')
+    assert page.evaluate('() => document.getElementById("evo-stop").disabled') and len(held) == 1
+    held[0].fulfill(status=409, json={'error': 'Complete provider setup before sending this command.'})
+    toast = page.locator('.toast', has_text='Could not send /evolve on: Complete provider setup')
+    toast.wait_for()
+    page.wait_for_function('() => document.activeElement === document.getElementById("evo-start")')
+    assert held[0].request.post_data_json == {'cmd': '/evolve on'}
+    setup_browser.capture(page, 'evolution-start-refused')

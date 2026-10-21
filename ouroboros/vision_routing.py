@@ -969,9 +969,6 @@ def retry_refused_image_round(ctx: Any, failed: Any) -> Optional[Tuple[Any, Any]
     sent, retry = True, None
     try:
         fit = loop._measure_round_main_fit(ctx, automatic_pass_used=False)
-        if fit is not None and (fit.measurement.route_fp, fit.measurement.round_id) in loop._context_reclaim_passes(
-                ctx.tools._ctx):  # this round already reclaimed: measure its result, never reclaim again
-            fit = loop._measure_after_reclaim(ctx)
         msg, cost = loop._dispatch_round_model(
             ctx, fit, attempt_cap=1, candidate_predicate=_without_refused_images(failed, digests),
             max_tokens=int(getattr(failed, "max_completion_tokens", 0) or 0) or None)

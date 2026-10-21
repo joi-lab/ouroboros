@@ -5,6 +5,8 @@ the model is scripted; retaining a source does not prove semantic understanding.
 """
 from __future__ import annotations
 
+from tests import _dialogue as dialogue_test
+
 from dataclasses import replace
 import json
 
@@ -49,7 +51,7 @@ def _context_ref(text):
     return json.JSONDecoder().raw_decode(text.split(prefix, 1)[1])[0]
 
 
-@pytest.mark.parametrize("packed", [False, True], ids=["loose", "archived-and-packed"])
+@pytest.mark.parametrize("packed", [False, True], ids=["loose", "packed"])
 def test_next_presence_reads_the_same_source_through_its_selected_memory_tool(tmp_path, monkeypatch, packed):
     repo, data, fork = (tmp_path / name for name in ("repo", "data", "fork"))
     for path in (repo, data, fork):
@@ -113,10 +115,7 @@ def test_next_presence_reads_the_same_source_through_its_selected_memory_tool(tm
         from ouroboros.terminal_projection import SETTLEMENT_SETTLED, settle_terminal_projection
 
         assert settle_terminal_projection(data, tasks[0]["id"], task=tasks[0]) == SETTLEMENT_SETTLED
-        archive = data / "archive" / "chat_20261015T120000.jsonl"
-        archive.parent.mkdir()
-        (data / "logs" / "chat.jsonl").rename(archive)
-        result = evidence_packer.run_pass(data)
+        result = evidence_packer.run_pass(data)  # the row stays addressable in the store; chat is never rotated
         assert result["packed"] == 1 and result["faults"] == 0, result
         source_path = task_artifact_dir_path(data, tasks[0]["id"], create=False) / source_ref["path"]
         assert not source_path.exists(), "the test must actually read through the packed-source resolver"
@@ -140,7 +139,7 @@ def test_failed_source_retention_publishes_no_address_and_runs_no_actor(tmp_path
         run_presence_turn(admission=_admission(), event=_observed_event(), repo_dir=tmp_path,
             drive_root=tmp_path, agent_factory=lambda **_kwargs: pytest.fail("actor ran before retention"),
             gate=PresenceTurnGate(1))
-    assert not (tmp_path / "logs" / "chat.jsonl").exists()
+    assert not dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
 
 
 def test_ordinary_and_outgoing_rows_do_not_gain_incoming_context_speech():

@@ -4,7 +4,7 @@ A task's local tool invocation (``launch_handoffs`` claim) and its model-answer
 receiver (``local_answer_consumer_id``) are writers only while their exact local
 owner can still act. The existing writers retire them (``tool_custody.
 retire_tool_invocations``, ``model_wait.retire_model_consumers``); this module
-gives those writers two kinds of positive evidence and one consumer:
+gives those writers two kinds of positive evidence for retirement:
 
 - A retained WITNESS: the producer that KNEW the owner ended (``worker_health``,
   ``model_wait``) but could not publish the retirement keeps one owner-held row
@@ -28,6 +28,10 @@ queue absence, task terminality, age and a mismatched fingerprint prove
 nothing here. Retirement changes local capability only: the effect stays
 ``unknown`` and never replayed; delegated runs, processes, merge and control
 receipts, patches and money keep their own custody.
+
+Separately, ``ended_unbound_model_request`` reads retained terminal HTTP failure
+facts for the passive writer census. It classifies an ended request, retires
+nothing and preserves unresolved money and late-receipt rights.
 """
 
 from __future__ import annotations
@@ -125,6 +129,27 @@ def owner_ended(pid: Any, birth: Any) -> bool:
     except Exception:
         return False
     return _different_birth(process_start_time(pid), birth)
+
+
+def ended_unbound_model_request(attempt: Dict[str, Any]) -> bool:
+    """A completed HTTP failure without a bound receiver is not a live writer.
+
+    Accounting retains these HTTP failure facts after send exits (including
+    _usage_wait's late settlement). These existing facts prove no answer remains
+    for an unbound HTTP failure, regardless of PID liveness. Money stays unresolved;
+    transport uncertainty and partial receiver bindings stay held. No writes.
+    """
+    if (attempt.get("state") != "unresolved" or attempt.get("local_answer_consumer_id")
+            or attempt.get("local_answer_owner_birth")
+            or attempt.get("local_answer_task_attempt") is not None):
+        return False
+    failure = attempt.get("physical_failure")
+    if not isinstance(failure, dict):
+        return False
+    status = failure.get("provider_status_code")
+    return (failure.get("stage") == "raised_exception" and type(status) is int
+            and 400 <= status <= 599 and "transport_cause_type" in failure
+            and failure["transport_cause_type"] is None)
 
 
 def retire_ended_owner(root: Any, task_id: str, root_task_id: str, *, pid: int, birth: str,

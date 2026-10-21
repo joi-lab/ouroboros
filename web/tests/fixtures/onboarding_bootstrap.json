@@ -451,10 +451,10 @@
   "modelDefaults": {
     "anthropic": {
       "consciousness": "",
-      "deep_self_review": "anthropic::claude-opus-5",
+      "deep_self_review": "anthropic::claude-opus-5-5",
       "fallback": "anthropic::claude-sonnet-5",
       "light": "anthropic::claude-sonnet-5",
-      "main": "anthropic::claude-opus-5",
+      "main": "anthropic::claude-opus-5-5",
       "vision": ""
     },
     "cloudru": {
@@ -538,6 +538,7 @@
     "anthropic/claude-sonnet-5",
     "anthropic/claude-opus-5",
     "anthropic::claude-sonnet-5",
+    "anthropic::claude-opus-5-5",
     "anthropic::claude-opus-5",
     "anthropic::claude-opus-4-6",
     "deepseek/deepseek-v4-pro",

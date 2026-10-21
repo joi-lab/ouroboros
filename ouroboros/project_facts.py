@@ -219,7 +219,7 @@ def resolve_project_id(task: Dict[str, Any]) -> str:
 def project_store_access_block(rel_path: Any) -> "str | None":
     """Deny message if ``rel_path`` targets the per-project store (``projects/<id>/``),
     else None. Generic data tools use this so the store is reachable ONLY via the
-    project-scoped knowledge tools (no cross-project peeking). The path is normalized
+    project-scoped tools (no cross-project peeking). The path is normalized
     first (collapsing ``.``/``..`` and backslashes) so traversal/`./`-prefixed forms
     cannot bypass the check."""
     import os as _os
@@ -230,9 +230,56 @@ def project_store_access_block(rel_path: Any) -> "str | None":
     first = normalized.split("/", 1)[0].casefold() if normalized else ""
     if first == "projects":
         return ("⚠️ ACCESS_DENIED: the per-project facts store (projects/<id>/) is not "
-                "reachable via generic data tools. Use knowledge_read / knowledge_write "
-                "(automatically scoped to the current project).")
+                "reachable via generic data tools. " + _project_store_reader_hint(normalized.split("/")[1:]))
     return None
+
+
+def _project_store_reader_hint(parts: list) -> str:
+    """The scoped tools whose address space holds ``projects/<parts>``, read from the
+    layout the path helpers below own (#1612). One text answers reads, writes, listings
+    and edits, so it names the exact read/write pair and never more access than those
+    tools already grant; anything they do not address is said plainly."""
+    from ouroboros.knowledge import ALWAYS_ACTIVE_TOPICS, INDEX_FILE, sanitize_topic
+
+    pid, rest = (parts[0], "/".join(parts[1:])) if parts else ("", "")
+    if rest and explicit_project_id_ok(pid):
+        own, scope = _project_store_root(pid), f"scope='project:{pid}'"
+        shelf = project_knowledge_dir(pid).relative_to(own).as_posix()
+        if rest in (shelf, f"{shelf}/{INDEX_FILE}"):
+            return f"This is a project knowledge shelf: knowledge_list({scope}) lists it."
+        if rest.startswith(shelf + "/") and rest.endswith(".md") and len(rest) > len(shelf) + 4:
+            try:  # the knowledge owner's own topic rules decide what a call would address
+                topic = sanitize_topic(rest[len(shelf) + 1:-3])
+            except ValueError:
+                return f"This file is not addressable as a knowledge topic; knowledge_list({scope}) lists the shelf."
+            if topic in ALWAYS_ACTIVE_TOPICS:
+                return (f"Topic {topic!r} is global-only: knowledge_read/knowledge_write(topic={topic!r}) read and "
+                        "replace the global note even with a project scope, never this project copy; "
+                        f"knowledge_list({scope}) may still list it.")
+            return (f"This is a project knowledge topic: knowledge_read(topic={topic!r}, {scope}) reads it and "
+                    f"knowledge_write(topic={topic!r}, {scope}, content=..., expected_revision=...) writes it; "
+                    "expected_revision is the revision knowledge_read returned, omitted only to create a missing note.")
+        part = {
+            project_workpad_path(pid).relative_to(own).as_posix(): (
+                "workpad", f"workpad_read(project_id='{pid}')",
+                f"workpad_write(project_id='{pid}', content=...) replaces it"),
+            project_journal_path(pid).relative_to(own).as_posix(): (
+                "journal", f"journal_read(project_id='{pid}')",
+                f"journal_write(project_id='{pid}', kind=..., text=...) appends to it"),
+            project_reflections_path(pid).relative_to(own).as_posix(): (
+                "reflection log", f"journal_read(project_id='{pid}', source='reflections')", ""),
+        }.get(rest)
+        if part:
+            noun, reader, writer = part
+            return (f"This is project {pid}'s {noun}: {reader} reads it" + (f" and {writer}" if writer else "")
+                    + ". Outside its own project a task reads it only as a root task"
+                    + ("; it writes it only as a root task placed in no project (such as Main)."
+                       if writer else "; no tool writes it."))
+    tools = ("knowledge_list/knowledge_read/knowledge_write (knowledge), workpad_read/workpad_write "
+             "(workpad) and journal_read/journal_write (journal; source='reflections' reads reflections)")
+    if not rest:
+        return f"Its scoped tools are {tools}."
+    return f"No scoped reader or writer addresses this path; the store's scoped tools are {tools}."
 
 
 def filter_out_project_store(base_rel: Any, names: Any) -> list:

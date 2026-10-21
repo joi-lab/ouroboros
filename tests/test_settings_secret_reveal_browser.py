@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.ui_chat_viewport_smoke import wait_drawer_closed
+
 pytest_plugins = ("tests.test_ui_smoke_playwright",)
 
 ANTHROPIC = "sk-ant-api03-SYNTHETIC-" + "0123456789abcdef" * 7 + "-END"
@@ -83,10 +85,17 @@ def test_saved_secret_show_preserves_settings_and_drafts(direct_server_with_data
             mask = field.input_value()
             assert mask == ANTHROPIC[:8] + "..."
             page.screenshot(path=str(evidence / f"secret-before-{engine}.png"))
+            masked_box = field.bounding_box()
             toggle.focus()
             toggle.press("Enter")
             expect(preview).to_have_text(ANTHROPIC)
             expect(toggle).to_have_attribute("aria-expanded", "true")
+            # The value takes the masked field's own place; the field steps aside unchanged.
+            expect(field).to_be_hidden()
+            shown_box = preview.bounding_box()
+            assert abs(shown_box["x"] - masked_box["x"]) <= 1 and abs(shown_box["y"] - masked_box["y"]) <= 1
+            # Its column, not a full-width row: the value ends before Hide (whose label resizes the column).
+            assert shown_box["x"] + shown_box["width"] <= toggle.bounding_box()["x"], (masked_box, shown_box)
             expect(field).to_have_value(mask)
             expect(field).to_have_attribute("type", "password")
             expect(page.locator("#settings-unsaved-indicator")).not_to_have_class(re.compile(r"\bis-visible\b"))
@@ -101,7 +110,7 @@ def test_saved_secret_show_preserves_settings_and_drafts(direct_server_with_data
                 if menu.is_visible():
                     if menu.get_attribute("aria-expanded") == "true":
                         menu.click()
-                    page.wait_for_function("document.getElementById('primary-sidebar').getBoundingClientRect().right <= 1")
+                    wait_drawer_closed(page)
                 preview.scroll_into_view_if_needed()
                 expect(preview).to_have_text(ANTHROPIC)
                 assert page.locator(".settings-scroll").evaluate("e => e.scrollWidth <= e.clientWidth + 1")
@@ -112,6 +121,7 @@ def test_saved_secret_show_preserves_settings_and_drafts(direct_server_with_data
             toggle.click()
             expect(preview).to_be_hidden()
             expect(preview).to_have_text("")
+            expect(field).to_be_visible()
 
             # Every top-level consumer uses the same complete view, including dynamic rows.
             page.click('[data-settings-tab="secrets"]')

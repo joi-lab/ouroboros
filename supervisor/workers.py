@@ -335,11 +335,9 @@ def _get_chat_agent():
         sys.path.insert(0, str(REPO_DIR))
     from ouroboros.agent import make_agent
     from ouroboros.owner_wait import direct_owner_wait
-    from supervisor.queue import transition_acceptance_fence
 
     agent = make_agent(repo_dir=str(REPO_DIR), drive_root=str(DRIVE_ROOT), event_queue=get_event_q())
-    agent.owner_wait_callback = direct_owner_wait
-    agent.fence_transition = transition_acceptance_fence  # in-process fence: no event, no ack file, no wait
+    agent.owner_wait_callback = direct_owner_wait  # the fence is in-process by the process fact, not a flag
     return agent
 
 
@@ -1286,12 +1284,9 @@ def kill_workers(
                 unconfirmed_pids.append(int(getattr(w.proc, "pid", 0) or 0))
                 log.debug("Cannot confirm worker %s dead", w.wid, exc_info=True)
         WORKERS.clear()
-        orphaned_ids, drained_ids, terminalization_retry_ids = [], [], []
-        # #1196: an exact mid-run budget pause survives the physical epoch. Its
-        # PENDING carrier and its durable ``paused`` row are left exactly as they
-        # are — never cancelled here, never ``pending_parent_interrupted`` — so the
-        # next boot's ``restore_pending_from_snapshot`` re-validates the durable
-        # authority and parks the same task id again (or holds it, typed).
+        orphaned_ids, drained_ids, terminalization_retry_ids, preserved_successors = [], [], [], []
+        # Exact pauses retain their queued marker and durable row across stops;
+        # restore revalidates the same task instead of cancelling it as interrupted.
         retained_paused_ids: list = []
         cleanup_ok = True
         try:
@@ -1380,6 +1375,7 @@ def kill_workers(
                     except Exception:
                         log.debug("Planned-restart retry reset failed for %s", task_id, exc_info=True)
                     PENDING.insert(0, successor)
+                    preserved_successors.append(str(task_id))
                     RUNNING.pop(str(task_id), None)
                     continue
                 if _settle_terminalization_task(
@@ -1470,7 +1466,7 @@ def kill_workers(
                     # custody, never a lost row or permission to run it again.
                     PENDING.append(_retain_killed_pending(task, reason=reason, status=status, trigger=trigger))
             if (orphaned_ids or drained_ids or terminalization_retry_ids or retained_paused_ids
-                    or retained_running_ids or retention.held_ids(PENDING)):
+                    or retained_running_ids or preserved_successors or retention.held_ids(PENDING)):
                 append_jsonl(
                     DRIVE_ROOT / "logs" / "supervisor.jsonl",
                     {
@@ -1479,6 +1475,7 @@ def kill_workers(
                         "orphaned_running": orphaned_ids,
                         "drained_pending": drained_ids,
                         "terminalization_retry": terminalization_retry_ids,
+                        **({"preserved_successors": preserved_successors} if preserved_successors else {}),
                         **({"retained_budget_paused": retained_paused_ids} if retained_paused_ids else {}),
                         **({"retained_saved_work": retained_running_ids} if retained_running_ids else {}),
                         **({"held_for_owner_restart": held} if (held := retention.held_ids(PENDING)) else {}),
@@ -1733,7 +1730,8 @@ def _settle_cancelled_pending_row(
         stored = write_task_result(
             DRIVE_ROOT, task_id, status_cancelled,
             strict_existing_dict=True,
-            result="Cancelled before start.", **cost_fields,
+            result=("Cancelled before this continuation started." if int(task.get("_attempt") or 1) > 1
+                    else "Cancelled before start."), **cost_fields,
             **intent_outcome_fields(intent),
         ) or {}
         stored_status = str(stored.get("status") or "").strip()

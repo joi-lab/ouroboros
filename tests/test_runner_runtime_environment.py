@@ -174,4 +174,4 @@ def test_safe_launcher_default_is_short_and_explicit_parent_still_wins(tmp_path,
     assert result.returncode == 0, result.stdout + result.stderr
     root = Path(json.loads(result.stdout.splitlines()[-1])["root"])
     assert root.parent == (ambient.resolve() if explicit else Path("/tmp").resolve())
-    assert root.exists() and f"SAFE_TEST_RETAINED {root}" in result.stderr
+    assert not root.exists() and f"SAFE_TEST_RELEASED {root}" in result.stderr

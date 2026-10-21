@@ -276,7 +276,9 @@ def test_native_risk_extension_abort_during_import_does_not_abort_host(tmp_path)
     assert "out-of-process catalog failure" in err
     assert "native_abort" not in extension_loader.snapshot()["extensions"]
     shared_imports = drive_root / "state" / "skills" / "native_abort" / "__extension_imports"
-    assert not shared_imports.exists() or not any(shared_imports.iterdir())
+    # Complete source bytes survive a failed import; the failed catalog is never cached.
+    assert len(list(shared_imports.glob("sha256-*/complete.json"))) == 1
+    assert not (shared_imports.parent / "extension_catalog.json").exists()
 
 
 def test_native_risk_extension_route_dispatches_out_of_process(tmp_path):
@@ -616,6 +618,8 @@ def test_parallel_isolated_extension_children_do_not_sweep_each_other_import_tre
 
     assert _payload(first.result()).endswith("True")
     assert _payload(second.result()).endswith("True")
+    imports = drive_root / "state" / "skills" / loaded.name / "__extension_imports"
+    assert len(list(imports.glob("sha256-*/complete.json"))) == 1
 
 
 def test_isolated_dependency_extension_child_inherits_runtime_mode(tmp_path, monkeypatch):

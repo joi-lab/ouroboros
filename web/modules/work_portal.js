@@ -2,7 +2,7 @@
  * One work, one card (FINAL_DESIGN D11; owner decision 16.10 Q1 = A): a Main card whose work lives in a
  * Project room is that work's PORTAL. It stays the same `.chat-live-card` node at the request's
  * position and only changes form: status chip + quiet fact, title, one latest narration line, the
- * meta line, the controls row ([Reply] [Resume] [Stop…]), and the Project reference as its footer.
+ * meta line, the controls row ([Resume] [Stop…]; Reply is the row menu's), and the Project reference as its footer.
  * The timeline, reviews and children live in the room's full card; nothing here appends rows, so Main
  * stays calm.
  *
@@ -40,12 +40,8 @@ export function bindWorkPortal(record, project = {}) {
     let changed = false;
     if (root.dataset.portal !== '1') { root.dataset.portal = '1'; changed = true; }
     if (root.dataset.projectId !== projectId) { root.dataset.projectId = projectId; changed = true; }
-    // In this form the summary is not a disclosure (the room holds what it would open), so it is not
-    // a control at all: no role, no tab stop, no expanded state. The reference below is the one door.
-    const summary = record.summaryButtonEl;
-    for (const attr of ['role', 'tabindex', 'aria-expanded', 'aria-controls']) {
-        if (summary?.hasAttribute(attr)) { summary.removeAttribute(attr); changed = true; }
-    }
+    // In this form the card discloses nothing (the room holds what it would open): its "Show details"
+    // button is hidden (style.css) and the summary stays reading content. The reference below is the one door.
     // An unnamed Project reads `Project` (the reference's own rule), never its id.
     const target = { id: projectId, name: key(project?.name) };
     if (!record.portalRefEl || !record.portalRefEl.isConnected) {

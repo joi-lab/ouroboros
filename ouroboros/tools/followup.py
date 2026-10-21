@@ -26,10 +26,10 @@ reaches the owner directly, so Presence, agent-to-agent and delegated callers ar
 refused (``control_runtime.owner_contact_refusal``).
 
 Authority is narrower than the parent's, not wider: a delegated subagent may not
-mint future root tasks (typed refusal), the objective is the agent's own plain
-text (no host template), and a task may hold at most ``_MAX_PENDING_FOLLOWUPS``
-pending follow-ups — past the cap the refusal is typed and discloses the pending
-records.
+mint future root tasks (typed refusal) and the objective is the agent's own plain
+text (no host template). How many follow-ups a task registers is the agent's
+judgment, not a host count: every registration reports this task's pending total,
+and the owner sees and controls each record on the Schedules surface.
 """
 
 from __future__ import annotations
@@ -47,7 +47,6 @@ from ouroboros.settings_scales import EFFORT_SCALE, requested_effort
 from ouroboros.tools.arg_feedback import ignored_argument_note
 from ouroboros.tools.registry import ToolContext, ToolEntry
 
-_MAX_PENDING_FOLLOWUPS = 2
 FOLLOWUP_SOURCE = "task_followup"
 _MAX_OBJECTIVE_CHARS = 4_000
 _MAX_CONTEXT_CHARS = 8_000
@@ -180,8 +179,8 @@ def get_tools() -> List[ToolEntry]:
                     "for a one-shot ISO 8601 instant (naive = UTC), or cron for a recurring "
                     "5-field expression with an optional IANA timezone. Write the objective "
                     "in your own words — it becomes each future task's text verbatim. The "
-                    "owner can disable or delete the record from the Schedules surface. A task may hold at "
-                    f"most {_MAX_PENDING_FOLLOWUPS} pending follow-ups."
+                    "owner can disable or delete the record from the Schedules surface; each registration "
+                    "reports how many follow-ups this task holds."
                 ),
                 "parameters": {
                     "type": "object",
@@ -438,9 +437,8 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
     except ValueError as exc:
         return publish_no_effect(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE",
                                     text=f"FOLLOWUP_REFUSED: {exc}"))
-    # The cap is read from the table this call is about to write, so the count
-    # and the write share ONE transaction: two tasks registering at once would
-    # otherwise each read the same under-cap count and both land.
+    # The pending count is read from the table this call is about to write, so the
+    # reported total and the write share ONE transaction.
     from supervisor.queue import ScheduleStoreUnreadable
 
     try:
@@ -472,45 +470,25 @@ def followup_resource_intent(ctx: Any, metadata: Any, project_id: str) -> Dict[s
     return {"kind": "room_default", "project_id": project_id} if project_id else {"kind": "system_repo"}
 
 
-def _pending_or_cap_refusal(ctx: ToolContext, task_id: str, drive_root: Any) -> tuple[list, str]:
-    """This task's pending follow-ups (notes included), or the typed cap refusal."""
+def _pending_for_task(task_id: str, drive_root: Any) -> list:
+    """This task's pending follow-ups (notes included): a fact for the reply, never a cap."""
     from supervisor.queue import list_scheduled_tasks
 
     records = [r for r in (list_scheduled_tasks(drive_root).get("tasks") or []) if isinstance(r, dict)]
-    pending = _pending_followups(records, task_id)
-    if len(pending) < _MAX_PENDING_FOLLOWUPS:
-        return pending, ""
-
-    def _trigger_label(record: Dict[str, Any]) -> str:
-        item = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
-        if str(item.get("type") or "") == "cron":
-            zone = str(record.get("timezone") or "").strip() or "system local time"
-            return f"cron {item.get('expr')} ({zone})"
-        return f"fires at/after {item.get('run_at')}"
-
-    listing = "; ".join(
-        f"{record.get('id')} ({_trigger_label(record)})" for record in pending
-    )
-    return pending, (
-        _publish_tool_result(ctx, ToolResult(status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED", text=(f"ERROR: FOLLOWUP_CAP_REACHED: this task already holds {len(pending)} pending "
-        f"follow-up(s) of the {_MAX_PENDING_FOLLOWUPS} allowed: {listing}. Wait for a "
-        "one-shot to fire, or the owner can disable/delete records from the Schedules surface.")))
-    )
+    return _pending_followups(records, task_id)
 
 
 def _register_note(ctx: ToolContext, task_id: str, drive_root: Any, objective: str,
                    trigger: Dict[str, Any], cron: str, timezone: str, notes: str,
                    origin: dict, relation: dict) -> str:
-    """A note: the same table, cap and lifecycle as a follow-up, but no task template.
+    """A note: the same table and lifecycle as a follow-up, but no task template.
 
     The row keeps the words and when they were written; the scheduler tick shows
     them at the trigger (``supervisor/schedule_notes.py``)."""
     from ouroboros.utils import utc_now_iso
     from supervisor.queue import ScheduleRefused, ScheduleStoreUnreadable, upsert_scheduled_task
 
-    pending, refusal = _pending_or_cap_refusal(ctx, task_id, drive_root)
-    if refusal:
-        return refusal
+    pending = _pending_for_task(task_id, drive_root)
     record = {
         "id": f"followup-{task_id}-{uuid.uuid4().hex[:6]}", "name": f"Reminder of task {task_id}",
         "description": objective, "kind": "notify", "source": FOLLOWUP_SOURCE, "enabled": True,
@@ -540,7 +518,7 @@ def _register_note(ctx: ToolContext, task_id: str, drive_root: Any, objective: s
         f"FOLLOWUP_SCHEDULED: note {stored.get('id')} registered {timing}. Nothing wakes then: the host shows "
         "your objective verbatim in the owner's chat as a System row signed with when you wrote it and when "
         "it was due (after downtime, at the next start with both times). Pending follow-ups for this task: "
-        f"{len(pending) + 1}/{_MAX_PENDING_FOLLOWUPS}; the owner can disable or delete it from the Schedules "
+        f"{len(pending) + 1}; the owner can disable or delete it from the Schedules "
         f"surface.{audit_note}{notes}"
     )
 
@@ -549,12 +527,10 @@ def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
                        objective: str, context: str, trigger: Dict[str, Any], cron: str,
                        timezone: str, timezone_note: str, origin: dict, relation: dict,
                        *, reasoning_effort: str = "") -> str:
-    """The cap read, the record build and the write — all under the schedule lock."""
+    """The pending read, the record build and the write — all under the schedule lock."""
     from supervisor.queue import upsert_scheduled_task
 
-    pending, refusal = _pending_or_cap_refusal(ctx, task_id, drive_root)
-    if refusal:
-        return refusal
+    pending = _pending_for_task(task_id, drive_root)
     metadata_src = getattr(ctx, "task_metadata", None)
     root_task_id = metadata_src.get("root_task_id") if isinstance(metadata_src, dict) else None
     project_id = str(
@@ -652,7 +628,7 @@ def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
     return (
         f"FOLLOWUP_SCHEDULED: follow-up {stored.get('id')} registered as {timing}. Future enqueue "
         "requires eligible relationship/controls and ordinary supervisor admission; "
-        f"pending follow-ups for this task: {len(pending) + 1}/{_MAX_PENDING_FOLLOWUPS}. The "
+        f"pending follow-ups for this task: {len(pending) + 1}. The "
         f"record is durable in state/scheduled_tasks.json and {lifecycle}; the owner can "
         f"disable or delete it from the Schedules surface. Relationship: {relation['kind']}; "
         f"hold: {stored.get('followup_hold') or 'none'}; wait: {stored.get('followup_wait') or 'none'}."

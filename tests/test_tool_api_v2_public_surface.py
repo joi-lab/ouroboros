@@ -56,6 +56,12 @@ def test_legacy_tool_names_are_not_public_schemas(tmp_path):
     assert registry.get_schema_by_name("run_ci_tests") is None
     assert registry.execute("run_ci_tests", {}).startswith("⚠️ Unknown tool")
 
+    # `task_acceptance_review` is retired with no alias: a task's result is reviewed as
+    # review_change(subject="result") (owner 17.10, Q2-A).
+    assert "task_acceptance_review" not in names
+    assert registry.get_schema_by_name("task_acceptance_review") is None
+    assert registry.execute("task_acceptance_review", {}).startswith("⚠️ Unknown tool")
+
     assert {
         "read_file",
         "write_file",
@@ -65,7 +71,7 @@ def test_legacy_tool_names_are_not_public_schemas(tmp_path):
         "commit_reviewed",
         "schedule_subagent",
         "skill_review",
-        "task_acceptance_review",
+        "review_change",
     } <= names
     for tool_name in ("read_file", "list_files", "write_file", "edit_text", "search_code"):
         schema = registry.get_schema_by_name(tool_name) or {}
@@ -162,6 +168,18 @@ def test_skill_payload_write_named_bible_is_not_system_protected(tmp_path, monke
 
     assert result.startswith("OK:"), result
     assert (data / "skills" / "external" / "alpha" / "BIBLE.md").read_text(encoding="utf-8") == "skill docs"
+
+
+def _assert_refused_before_launch(result, marker):
+    """#1797: a refused output declaration answers before the process starts (owner choice A)."""
+    assert result.code == "RESOURCE_POLICY_BLOCKED", result.text
+    assert result.meta.get("operation_outcome") == "completed_no_effect"
+    assert "refused before the process started; nothing ran" in result.text
+    assert "ARTIFACT_OUTPUT_ERROR" not in result.text
+    assert not marker.exists(), "the command must not have run"
+
+
+_MARK = "from pathlib import Path; Path('ran.marker').write_text('ran')"
 
 
 def _registry_under_fake_home(tmp_path, monkeypatch):
@@ -979,17 +997,17 @@ def test_run_command_outputs_block_protected_absolute_paths(tmp_path, monkeypatc
     registry, _repo, data, desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     (data / "settings.json").write_text('{"secret":"x"}', encoding="utf-8")
 
-    result = registry.execute(
+    result = registry.execute_result(
         "run_command",
         {
-            "cmd": ["python3", "-c", "print('ok')"],
+            "cmd": ["python3", "-c", _MARK],
             "cwd": str(desktop),
             "outputs": [str(data / "settings.json")],
         },
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
-    assert "protected user_files output" in result
+    _assert_refused_before_launch(result, desktop / "ran.marker")
+    assert "protected user_files output" in result.text
     assert not (data / "task_results" / "artifacts" / "task1" / "settings.json").exists()
 
 
@@ -999,13 +1017,13 @@ def test_run_command_outputs_block_protected_repo_files(tmp_path, monkeypatch):
     registry, repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     (repo / "BIBLE.md").write_text("constitutional", encoding="utf-8")
 
-    result = registry.execute(
+    result = registry.execute_result(
         "run_command",
-        {"cmd": ["python3", "-c", "print('ok')"], "cwd": str(repo), "outputs": ["BIBLE.md"]},
+        {"cmd": ["python3", "-c", _MARK], "cwd": str(repo), "outputs": ["BIBLE.md"]},
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
-    assert "protected repo output BIBLE.md" in result
+    _assert_refused_before_launch(result, repo / "ran.marker")
+    assert "protected repo output BIBLE.md" in result.text
     assert not (data / "task_results" / "artifacts" / "task1" / "BIBLE.md").exists()
 
 
@@ -1168,13 +1186,13 @@ def test_run_command_outputs_block_preexisting_dirty_repo_secret(tmp_path, monke
     registry, repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     (repo / ".env").write_text("TOKEN=x", encoding="utf-8")
 
-    result = registry.execute(
+    result = registry.execute_result(
         "run_command",
-        {"cmd": ["python3", "-c", "print('ok')"], "cwd": str(repo), "outputs": [".env"]},
+        {"cmd": ["python3", "-c", _MARK], "cwd": str(repo), "outputs": [".env"]},
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
-    assert "credential-like output .env" in result
+    _assert_refused_before_launch(result, repo / "ran.marker")
+    assert "credential-like output .env" in result.text
     assert not (data / "task_results" / "artifacts" / "task1" / ".env").exists()
 
 
@@ -1186,7 +1204,7 @@ def test_run_command_outputs_block_new_credential_like_repo_file(tmp_path, monke
     registry, repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
 
-    result = registry.execute(
+    result = registry.execute_result(
         "run_command",
         {
             "cmd": ["python3", "-c", "from pathlib import Path; Path('.env').write_text('TOKEN=x')"],
@@ -1195,8 +1213,9 @@ def test_run_command_outputs_block_new_credential_like_repo_file(tmp_path, monke
         },
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
-    assert "credential-like output .env" in result
+    # The credential-like name is known before the run: the secret is never even written.
+    _assert_refused_before_launch(result, repo / ".env")
+    assert "credential-like output .env" in result.text
     assert not (data / "task_results" / "artifacts" / "task1" / ".env").exists()
 
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -135,6 +136,36 @@ def test_a_launched_reviewer_finishes_its_episode_while_the_synchronous_author_d
         again = review_operation_run(f, model, _request(drain=False))
     assert (again.actors[0].get("parsed") or {}).get("verdict") == "PASS", again.actors[0]
     assert [label for label, _ in model.rounds] == ["first", "follow-up"], "no second purchase"
+
+
+def test_a_departed_author_leaves_at_once_and_its_launched_reviewer_still_finishes(paused_env):
+    """A Presence completion never waits for its result review: its departed author takes a PENDING row at
+    once (no owner pause and no addressed mail behind it), and the launched reviewer finishes its episode."""
+    f, model, outcome = paused_env, EpisodeModel(), {}
+
+    def run():
+        with _parent(f), review_pause.receptive_author(review_pause.departed_binding(f.ctx)):
+            outcome["result"] = review_operation_run(f, model, _request(drain=False))
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert model.first_sent.wait(10)
+        until(lambda: "result" in outcome)  # back while the reviewer still holds its first round
+        actor = outcome["result"].actors[0]
+        # The author may leave before its reviewer's first launch: that preparation still sends.
+        assert actor["operation_state"] in {"pending_dispatch", "in_flight"} and actor["late_result_pending"]
+        assert actor["usage"].get("author_left_for") == review_pause.DEPARTED_EVENT
+        assert not actor["usage"].get("owner_pause_detached")
+        assert [row["reason"] for row in f.ctx._review_detached_operations] == [review_pause.DEPARTED_EVENT]
+        [detached] = review_pause.live_detached_operations(TASK)
+    finally:
+        model.release_first.set()
+        thread.join(10)
+    until(lambda: review_pause.review_operation_state(detached["owner_id"]) == "closed")
+    assert [label for label, _at in model.rounds] == ["first", "follow-up"], "the reviewer finished its own check"
+    assert review_pause.departed_binding(SimpleNamespace(drive_root=None, task_id=TASK)) is None, \
+        "an author without a drive and task is never departed: it keeps the synchronous wait"
 
 
 @pytest.mark.parametrize("preparation_boundary", ["model_preparation", "before_episode_binding"])

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from supervisor import state, state_initialization
+from tests._store_shared import remove_store_tree
 
 
 @pytest.fixture
@@ -476,7 +477,7 @@ def test_only_a_directory_ancestor_proves_the_state_absent(root, monkeypatch, er
     assert state_initialization.supervisor_evidence(root) == ("none", "")
     assert state.init_state().quality == "current" == state.read_state().quality
     assert state_initialization.read_witness(root)[1]["phase"] == "complete"
-    shutil.rmtree(root / "state")
+    remove_store_tree(root / "state")  # the boot above opened its stores
     real_stat = os.stat
     monkeypatch.setattr(os, "stat", lambda path, *a, **k: (_ for _ in ()).throw(PermissionError(
         errno.EACCES, "denied")) if pathlib.Path(path) == root / "state" else real_stat(path, *a, **k))

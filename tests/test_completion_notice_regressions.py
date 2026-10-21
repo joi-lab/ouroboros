@@ -1,4 +1,5 @@
-"""Real producer boundaries for the review findings and Telegram's second status path."""
+"""Real producer boundaries for the review findings and Telegram's second status path; an older
+task's author closure still renders by the host trigger its record carries."""
 import asyncio
 import copy
 from types import SimpleNamespace
@@ -13,19 +14,9 @@ from tests.test_telegram_subagent_cards import _setup, _Rec
 
 @pytest.mark.parametrize("mode", ["auto", "required"])
 @pytest.mark.parametrize("advisory", [False, True])
-def test_author_closure_uses_the_real_host_trigger(mode, advisory):
-    from ouroboros.loop_acceptance_review import _observe_host_acceptance_request
-
-    tools = SimpleNamespace(_ctx=SimpleNamespace(task_id="notice", root_task_id="notice",
-        parent_task_id="", delegation_role="root", is_direct_chat=True,
-        task_contract={"expected_output": "report"}, task_metadata={}))
-    trace = {"tool_calls": [{"tool": "task_acceptance_review"}],
-             "acceptance_evidence_calls": [{"status": "deferred_to_host_acceptance", "authoritative": False}]}
-    if advisory:
-        trace["review_runs"] = [{"request": {"surface": "task_acceptance"}, "aggregate_signal": "DEGRADED"}]
-    eligible, trigger = _observe_host_acceptance_request(tools, trace, "notice", mode)
-    assert eligible
-    assert trigger == f"{mode}_agent_request_after_agent_{'advisory' if advisory else 'tool'}"
+def test_an_old_author_closure_renders_by_its_recorded_host_trigger(mode, advisory):
+    # The trigger the host acceptance request (gone with task acceptance) recorded on older review axes.
+    trigger = f"{mode}_agent_request_after_agent_{'advisory' if advisory else 'tool'}"
     record = _record("author-close")
     axes = record["outcome_axes"]
     axes["objective"] = {"status": "pass", "source": "author_acceptance"}

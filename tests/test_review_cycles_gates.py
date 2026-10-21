@@ -406,8 +406,10 @@ def test_skill_review_contract_fingerprint_preserves_legacy_and_tracks_rows(monk
     # The author-finality contract is part of the skill-review prompt contract;
     # its deliberate wording change invalidates the old fingerprint. Decision 3A
     # then removed the advisory-evidence input from the prompt builder (no
-    # advisory critic feeds the skill reviewer), which moved it once more.
-    assert legacy == "2401d2c34e3805f5ba6dcd933a2abf4d44c3af88dc5d140bddc24018cfebfca7"
+    # advisory critic feeds the skill reviewer), which moved it once more. PR #1981
+    # made context_snapshot_discipline a severity-driven item (skill_review_status),
+    # an aggregation-vocabulary change that lapses replay by design.
+    assert legacy == "ffa677071aa64ae27816aa1e1290ede58f012a7527a0ad22012583b641106cfb"
     legacy_delivery = {
         "legacy_skill_fingerprint": True,
         "models": ["m1", "m2"], "routes": ["api_chat", "api_chat"],
@@ -716,8 +718,10 @@ def test_skill_review_cycles_refusal_names_the_author_finish_where_it_is_legal(
     )
     assert outcome.status == "pending" and outcome.paid is False
     assert "REVIEW_CYCLES_EXHAUSTED" in outcome.error
-    assert "finalize and disclose" in outcome.error
-    assert "ask the owner" in outcome.error and "fresh task" in outcome.error
+    assert "finalize and disclose" in outcome.error and "fresh task" in outcome.error
+    # Where the author may finish, the mind decides whether what was reviewed is enough and the
+    # owner's ceiling is no longer offered as the way on; only Blocking keeps it (owner 17.10, Q1-A).
+    assert ("ask the owner" in outcome.error) is not author_finish
     assert ("author_disposition" in outcome.error) == author_finish
     assert ("author_rationale" in outcome.error) == author_finish
     if author_finish:
@@ -787,7 +791,6 @@ def _wire_review_skill(
                         lambda *a, **k: None)
     monkeypatch.setattr(skill_review, "reviewer_slot_config_error", lambda: "")
     monkeypatch.setattr(skill_review, "_build_skill_file_packs", lambda *a, **k: ["pack"])
-    monkeypatch.setattr(skill_review, "_official_hub_review_profile", lambda s: "")
     monkeypatch.setattr(skill_review, "_review_wave_budget_block",
                         lambda *a, **k: None)
     default_delivery = {
@@ -932,7 +935,9 @@ def test_review_skill_pipeline_order_pin():
 
     gate_source = inspect.getsource(skill_review._skill_cycles_gate)
     assert gate_source.index("free_replay_outcome(") < gate_source.index("skill_review_cycles_refusal(")
-    source = inspect.getsource(skill_review.review_skill)
+    wrapper = inspect.getsource(skill_review.review_skill)
+    assert wrapper.index("compose_review_panel(") < wrapper.index("_review_skill(")
+    source = inspect.getsource(skill_review._review_skill)
     assert source.index("_skill_cycles_gate(") < source.index("_review_wave_budget_block(")
     assert source.index("_review_wave_budget_block(") < source.index("run_skill_review_passes(")
     assert source.count("_paid_facts(") >= 5  # dispatch marks every post-panel outcome paid

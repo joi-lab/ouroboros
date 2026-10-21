@@ -60,6 +60,22 @@ def _ack(root, transaction_id):
     dr._write_restart_transaction(root, {**row, "status": "normal_exit_acknowledged", "exit_code": 42})
 
 
+@pytest.mark.parametrize("promised", ["task_ids", "return_ids", "none"])
+def test_refused_return_reports_planned_and_saved_promises(tmp_path, monkeypatch, promised):
+    from supervisor.restart_retention import recover_saved_running
+
+    _queue, _state, workers = _install_queue(tmp_path, monkeypatch)
+    _plain_run(tmp_path, workers, "unsaved")
+    assert recover_saved_running(workers.RUNNING.values(), tmp_path,
+        transaction={promised: ["unsaved"]}, cause="restart") == []
+    path = tmp_path / "logs/supervisor.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    refused = [row for row in rows if row.get("type") == "restart_return_refused"]
+    assert bool(refused) is (promised != "none")
+    if refused:
+        assert refused[-1]["refused"] == {"unsaved": "no_usable_recovery_source"}
+
+
 @pytest.mark.parametrize("age_sec", [0, 7 * 86400], ids=["fresh", "week-old"])
 def test_quit_keeps_running_work_and_all_accepted_queue_held_for_resume(tmp_path, monkeypatch, age_sec):
     queue, state, workers = _install_queue(tmp_path, monkeypatch)

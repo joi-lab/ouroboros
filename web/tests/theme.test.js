@@ -50,11 +50,17 @@ function boot({ saved = null, storage = true, systemLight = false, media = true,
         addEventListener: (key, fn) => handlers.set(`media:${key}`, fn),
         removeEventListener: (key) => handlers.delete(`media:${key}`),
     };
+    // The layout switch asks its own query (layout.test.js covers it); keep its listener apart.
+    const layoutQuery = {
+        matches: true,
+        addEventListener: (key, fn) => handlers.set(`layout:${key}`, fn),
+        removeEventListener: (key) => handlers.delete(`layout:${key}`),
+    };
     const window = {
         addEventListener: (key, fn) => handlers.set(key, fn),
         removeEventListener: (key) => handlers.delete(key),
         dispatchEvent: (event) => events.push(event),
-        ...(media ? { matchMedia: () => query } : {}),
+        ...(media ? { matchMedia: (q) => (q.includes('min-width') ? layoutQuery : query) } : {}),
         ...(bridge ? { pywebview: { api: bridge } } : {}),
         ...(clock ? { performance: clock } : {}),
     };
@@ -149,6 +155,31 @@ test('System tracks a later OS switch, a pinned choice ignores it', () => {
     pinned.handlers.get('media:change')();
     assert.equal(pinned.root.dataset.theme, 'dark');
     assert.equal(pinned.events.length, 0);
+});
+
+test('a host can stand in for the OS as the System source, and release it', () => {
+    // Telegram's colour scheme can differ from the OS's: host_telegram.js installs it through this one hook.
+    const s = boot({ saved: 'system', systemLight: true });
+    assert.equal(s.root.dataset.theme, 'light');
+    let scheme = 'dark';
+    const release = s.window.ouroTheme.setSystemSource(() => scheme);
+    assert.equal(s.root.dataset.theme, 'dark');
+    assert.equal(s.events.length, 1);
+    scheme = 'light';
+    s.window.ouroTheme.refreshSystem();
+    assert.equal(s.root.dataset.theme, 'light');
+    scheme = '';  // the host defers: the OS query answers again
+    s.query.matches = false;
+    s.window.ouroTheme.refreshSystem();
+    assert.equal(s.root.dataset.theme, 'dark');
+    release();
+    s.query.matches = true;
+    s.handlers.get('media:change')();
+    assert.equal(s.root.dataset.theme, 'light');
+    // A pinned choice ignores the host, like it ignores the OS.
+    const pinned = boot({ saved: 'light', systemLight: false });
+    pinned.window.ouroTheme.setSystemSource(() => 'dark');
+    assert.equal(pinned.root.dataset.theme, 'light');
 });
 
 test('unavailable storage stays usable and says so', () => {

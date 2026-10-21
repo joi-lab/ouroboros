@@ -592,6 +592,18 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "migrating": (False, "gateway/_helpers.py: a write door (create, Cancel, Pause, Presence) answered 503 inside the boot import window of state/current.sqlite (retry); no task attempt was truncated"),
     "budget_pausing_no_extraction": (False, "review_verdict_extraction.py: Light verdict extraction refused while the task's exact budget pause is closing dispatch (#1196); the review row stays undispatched and the attempt is paused, not truncated"),
     "owner_pause": (False, "tools/skill_publish.py: publication tool returns its completed stages after owner Pause interrupts the formatter; the task is retained for Resume, not terminalized or scored"),
+    "action_not_found": (False, "gateway/card_decision.py: a press names a control the card does not have now; HTTP 404 on the card ingress, never a task terminal"),
+    "card_action_once": (False, "gateway/card_decision.py: a once control already counted another press; HTTP 409 on the card ingress, never a task terminal"),
+    "card_app_not_found": (False, "gateway/cards.py: a card app's stored bytes are missing; HTTP 404 on a read, never a task terminal"),
+    "card_not_found": (False, "gateway/card_decision.py: a press or read names no stored card; HTTP 404, never a task terminal"),
+    "card_stale": (False, "gateway/card_decision.py: the card changed since the press was drawn; HTTP 409, nothing recorded, never a task terminal"),
+    "card_write_failed": (False, "gateway/card_decision.py: the press could not be recorded; HTTP 503 (retry), never a task terminal"),
+    "pin_write_failed": (False, "gateway/cards.py: Keep on Widgets could not be saved; HTTP 503, never a task terminal"),
+    "revision_required": (False, "gateway/card_decision.py: a press without the card revision it was drawn from; HTTP 400, never a task terminal"),
+    "values_invalid": (False, "gateway/card_decision.py: form values the card's form does not accept; HTTP 400, never a task terminal"),
+    "github_actor_unavailable": (False, "skill_publish_github.py: the GitHub account behind the token cannot be read before any publication mutation; a typed publication refusal, not a task terminal"),
+    "fork_prepare_failed": (False, "skill_publish_github.py: the account's fork could not be prepared; the publication result is partial and retryable, not a task terminal"),
+    "fork_sync_failed": (False, "skill_publish_github.py: a 422-only fork synchronization failed; the publication result is partial and retryable, not a task terminal"),
     # -- truncating: the rail stopped the attempt, so reward 0 is not a capability fact ----
     "budget_exhausted": (True, "loop.py:287 per-task USD reservation rail"),
     "round_limit": (True, "loop.py:3128 _handle_round_limit, the round cap"),
@@ -702,6 +714,11 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
         "gateway/task_hurry.py hurry ingress refusal (400, text-free contract); never a task terminal",
     ),
     "task_not_live": (False, "gateway/task_hurry.py hurry ingress refusal (404); never a task terminal"),
+    "pause_reason_invalid": (
+        False,
+        "gateway/task_pause.py refuses a declared Pause reason that is not text or exceeds 400 characters (HTTP 400); "
+        "nothing is written and no task transition happens",
+    ),
     # #Q-2b decision-ingress refusal codes — HTTP replies, never task terminals.
     "unknown_decision_family": (False, "gateway/task_decision.py ingress refusal (400)"),
     "decision_family_not_served": (False, "gateway/task_decision.py ingress refusal (501)"),

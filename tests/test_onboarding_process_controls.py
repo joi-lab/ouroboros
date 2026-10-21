@@ -1,6 +1,7 @@
 """Owner process verbs work before onboarding without an unconsumed chat bus."""
+
+from tests import _dialogue as dialogue_test
 from types import SimpleNamespace
-import json
 import threading
 
 import pytest
@@ -169,7 +170,10 @@ def test_restart_during_initialization_does_not_queue_to_published_bridge(
                 assert did_stop.wait(3), 'Restart remained behind the initializing supervisor'
         assert stopped == [{}]
         if surface == 'ws_chat_files':
-            rows = [json.loads(line) for line in (obj.data / 'logs/chat.jsonl').read_text(encoding='utf-8').splitlines()]
+            from ouroboros import dialogue_retry
+
+            dialogue_retry.drain()  # a best-effort reply that met the restart's writes lands from the retry buffer
+            rows = dialogue_test.log_rows(obj.data / 'logs/chat.jsonl')
             (row,) = [item for item in rows if item['direction'] == 'in']
             assert (row['text'], row['client_message_id']) == ('/restart', 'with-file')
             assert [ref['upload'] for ref in row['attachments']] == [staged['upload']], 'the file rides the accepted row'

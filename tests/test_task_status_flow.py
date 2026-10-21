@@ -696,9 +696,9 @@ def test_child_finalization_publishes_receipts_to_canonical_root(tmp_path):
 
     # Durability: the receipts survive child-drive pruning (retention GC / the
     # cancel path delete the drive; the canonical copy is the durable record).
-    import shutil as _shutil
+    from tests._store_shared import remove_store_tree
 
-    _shutil.rmtree(child_drive)
+    remove_store_tree(child_drive)
     rows = _receipt_rows_of(_get_task_result(SimpleNamespace(drive_root=tmp_path), tid))
     assert rows is not None and len(rows) == 3
     assert rows[0]["criterion_id"] == "claim_red"

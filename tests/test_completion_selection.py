@@ -22,6 +22,21 @@ def finish(answer=None, *, action='finish', **kw):
     }]}
 
 
+def hold_first_delivery(monkeypatch):
+    """Hold the first delivery once at the host's result-review step, then let it pass.
+
+    ``result_review_at_delivery`` is the delivery-time host step whose ``True`` holds
+    the answer for another turn; it records the content it was asked about."""
+    seen = []
+
+    def review(_ctx, content, _trace, _hold):
+        seen.append(content)
+        return len(seen) == 1
+
+    monkeypatch.setattr('ouroboros.tools.review_result.result_review_at_delivery', review)
+    return seen
+
+
 @pytest.fixture
 def turn(tmp_path, monkeypatch):
     monkeypatch.setenv('OUROBOROS_TASK_REVIEW_MODE', 'off')
@@ -51,11 +66,7 @@ def test_plain_reply_and_voluntary_selection_need_one_round(turn):
 
 def test_retained_report_interim_then_short_complete_selection(turn, monkeypatch):
     registry, calls, notes, run = turn
-    review_calls = []
-    def review(**kwargs):
-        review_calls.append(kwargs['content'])
-        return len(review_calls) == 1
-    monkeypatch.setattr(loop, '_run_task_acceptance_review_once', review)
+    review_calls = hold_first_delivery(monkeypatch)
     report = 'The retained report is intentionally much longer than the final correction.'
     text, usage, trace = run([{'content': report}, {'content': 'Checking.'},
         {'content': 'Checking.'}, finish('No.')])
@@ -69,11 +80,7 @@ def test_retained_report_interim_then_short_complete_selection(turn, monkeypatch
 
 def test_select_latest_whole_held_response_without_regeneration(turn, monkeypatch):
     registry, calls, notes, run = turn
-    seen = []
-    def review(**kwargs):
-        seen.append(kwargs['content'])
-        return len(seen) == 1
-    monkeypatch.setattr(loop, '_run_task_acceptance_review_once', review)
+    seen = hold_first_delivery(monkeypatch)
     replacement = 'Correction: yes.'
     text, _, _ = run([{'content': 'Original long report.'}, {'content': replacement},
         finish(answer_sha256=hashlib.sha256(replacement.encode()).hexdigest())])
@@ -114,7 +121,9 @@ def test_schema_bookkeeping_exempts_only_successful_results(turn, name, failure)
 
 def test_stop_avoids_reviews_nudges_and_question_parking(turn, monkeypatch):
     registry, calls, notes, run = turn
-    for name in ('_run_task_acceptance_review_once', '_maybe_inject_finalization_nudges', 'wait_after_tools', '_finish_tool_round_budget'):
+    monkeypatch.setattr('ouroboros.tools.review_result.result_review_at_delivery',
+                        lambda *a, **kw: pytest.fail('stop purchased a review'))
+    for name in ('_maybe_inject_finalization_nudges', 'wait_after_tools', '_finish_tool_round_budget'):
         monkeypatch.setattr(loop, name, lambda *a, **kw: pytest.fail('stop purchased/parked/advanced'))
     text, _, trace = run([finish('Work remains.', action='stop', rationale='The child has not answered.')])
     assert text == 'Work remains.' and len(calls) == 1
@@ -193,8 +202,7 @@ def test_reply_later_is_consumed_once_then_a_hold_needs_new_selection(turn, monk
     from tests.test_presence_runner import _admission
     registry, calls, notes, run = turn
     registry._ctx.task_contract = {'capability_ceiling': presence_ceiling_payload(_admission().capability_ceiling)}
-    checked = []
-    monkeypatch.setattr(loop, '_run_task_acceptance_review_once', lambda **kw: checked.append(kw['content']) or len(checked) == 1)
+    checked = hold_first_delivery(monkeypatch)
     text, _, _ = run([_call('message', ''), {'content': 'Chosen reply-later'},
         {'content': 'Interim, unselected'}, _call('message', 'Deliberately selected')])
     assert text == 'Deliberately selected' and checked == ['Chosen reply-later', 'Deliberately selected']
@@ -247,23 +255,18 @@ def test_child_stop_never_seals_the_parent_root(turn):
 
 
 @pytest.mark.parametrize('refusal', ['unseen_work', 'invalid_subject', 'missing_answer', 'new_owner'])
-def test_refused_completion_cannot_install_a_preparation_choice(tmp_path, monkeypatch, refusal):
-    from copy import deepcopy
-    from ouroboros import loop_acceptance
-    from ouroboros.acceptance_preparation import begin_preparation
+def test_refused_completion_keeps_the_retained_answer_unselected(tmp_path, refusal):
     from ouroboros.loop_delivery import completion_observation, consume_completion_request
+    from ouroboros.loop_messages import capture_acceptance_observation
     from ouroboros.tools.control_runtime import _finish_task
-    from tests._acceptance_preparation_helpers import _expose, _fail
     from tests.test_acceptance_preparation_loop import _delivery_ctx
 
-    monkeypatch.setenv('OUROBOROS_TASK_REVIEW_MODE', 'auto')
     trace = {'tool_calls': [], 'reasoning_notes': []}
     registry, ctx = _delivery_ctx(tmp_path, trace)
     candidate = loop._replace_delivery_candidate(registry, ctx, trace, 'Retained work', control='candidate')
-    _expose(_fail(begin_preparation(trace, registry._ctx)))
-    observed = loop_acceptance.capture_acceptance_observation(registry._ctx, trace, None)
+    observed = capture_acceptance_observation(registry._ctx, trace, None)
     registry._ctx._completion_observation = completion_observation(registry._ctx, trace)
-    _finish_task(registry._ctx, action='finish', rationale='The local preparation gap remains.',
+    _finish_task(registry._ctx, action='finish', rationale='The retained work answers the request.',
         answer_sha256='unavailable' if refusal == 'missing_answer' else candidate.content_sha256,
         acceptance_subject={'owner_source_sha256': 'wrong' if refusal == 'invalid_subject'
                             else observed['owner_source_sha256']})
@@ -271,17 +274,8 @@ def test_refused_completion_cannot_install_a_preparation_choice(tmp_path, monkey
         trace['tool_calls'].append({'tool': 'chat_history', 'result': 'New result', 'is_error': False})
     elif refusal == 'new_owner':
         registry._ctx._owner_directives = [{'source': 'owner', 'content': 'A new requirement'}]
-    prior_decision = deepcopy(trace.get('acceptance_decision'))
-    merged = []
-    merge = loop_acceptance.merge_agent_acceptance_stance
-
-    def observe_merge(*args):
-        merged.append(1)
-        return merge(*args)
-
-    monkeypatch.setattr(loop_acceptance, 'merge_agent_acceptance_stance', observe_merge)
     assert consume_completion_request(registry, ctx, trace) is False
     assert trace['completion_refusals']
-    assert merged == [] and trace.get('acceptance_decision') == prior_decision
+    assert not getattr(registry._ctx, '_completion_selected', None)
     assert registry._ctx._delivery_candidate.full_text == 'Retained work'
     assert registry._ctx._delivery_candidate.acceptance_binding['authoritative'] is False

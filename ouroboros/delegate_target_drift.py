@@ -73,7 +73,8 @@ def _target_drift_evidence(entry: Any) -> Dict[str, Any]:
         for row in excluded_rows:
             if not isinstance(row, dict) or not row.get("path"):
                 continue
-            if row.get("reason") == "nested_repository" and not isinstance(row.get("baseline"), dict):
+            unbased = row.get("reason") in ("nested_repository", "sqlite_wal_index")  # a WAL index is never read
+            if unbased and not isinstance(row.get("baseline"), dict):
                 continue
             relative, before = str(row["path"]), row.get("baseline")
             if not isinstance(before, dict):

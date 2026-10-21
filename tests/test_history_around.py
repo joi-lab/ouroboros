@@ -2,22 +2,24 @@
 
 The work list of a room names its work; a press goes to that work's message even when the
 message is far older than the loaded window (DESIGN "Room work status"). The read lands on the
-task's earliest row of the room -- reading only the archives that can hold it, never a walk of
-the chain from the present -- holds a quarter of each quota before it and the rest after it, and
-says what it found: ``found`` (and where), ``moved`` (the task belongs to another room) or ``absent``.
+task's earliest row of the room -- one indexed probe of the task's own rows in the dialogue store,
+never a walk of the room from the present -- holds a quarter of each quota before it and the rest
+after it, and says what it found: ``found`` (and where), ``moved`` (the task belongs to another
+room) or ``absent``; while the archive still imports, an unfound task is not yet known absent.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
-from datetime import datetime, timezone
 from types import SimpleNamespace
 
+from ouroboros import dialogue_store as ds
 from ouroboros.gateway import history_paging
 from ouroboros.gateway.history import make_chat_history_endpoint
-from ouroboros.utils import JsonlChainUnreadable
+from ouroboros.store import StoreError
+from tests import _dialogue as dialogue_test
+from tests.test_dialogue_addressed_readers import metered
 
 TS = "2026-10-13T{:02d}:{:02d}:{:02d}Z"
 
@@ -27,10 +29,8 @@ def _ts(index):
 
 
 def _append(root, name, rows):
-    path = root / "logs" / f"{name}.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write("".join(json.dumps(row) + "\n" for row in rows))
+    for row in rows:
+        ds.append(root, name, row)
 
 
 def _read(root, **params):
@@ -110,7 +110,7 @@ def test_a_source_that_cannot_be_read_says_so_and_the_newest_page_still_reads(tm
     _history(tmp_path)
 
     def unreadable(*_args, **_kwargs):
-        raise JsonlChainUnreadable("source ended before its captured boundary")
+        raise StoreError("dialogue store unavailable")
 
     monkeypatch.setattr(history_paging.HistorySource, "task_pivot", unreadable)
     status, body = _read(tmp_path, around="task:t-old")
@@ -164,56 +164,54 @@ def test_a_task_whose_only_row_main_hides_is_absent_never_another_room(tmp_path)
     assert _read(tmp_path, around="task:t-silent")[1]["anchor"] == {"state": "absent", "task_id": "t-silent"}
 
 
-def _archive(root, name, rows, written):
-    path = root / "archive" / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-    os.utime(path, (written, written))
-    return path
-
-
 def _said(task, index, **extra):
     return {"ts": _ts(index), "direction": "out", "chat_id": 1, "task_id": task, "text": f"{task} {index}", **extra}
 
 
-def test_archives_a_task_cannot_be_in_are_never_read(tmp_path, monkeypatch):
-    """Oldest first, an archive is read only when it was written to after the task began and its
-    summary names the task: the press costs the archives of the task's own time."""
-    began = datetime(2026, 10, 13, 12, tzinfo=timezone.utc).timestamp()
-    # Written before the task began: even a row naming it (a reused id) is not where it is.
-    _archive(tmp_path, "chat_20261013T110000.jsonl", [_said("t-x", 1)], began - 3600)
-    _archive(tmp_path, "chat_20261013T130000.jsonl", [_said("t-other", 2)], began + 3600)
-    _archive(tmp_path, "chat_20261013T140000.jsonl", [_said("t-other", 3), _said("t-x", 4)], began + 7200)
-    _append(tmp_path, "chat", [_said("t-x", 5)])
-    reader = history_paging.HistorySource(tmp_path / "logs" / "chat.jsonl", "chat")
-    reads = []
-    entries = history_paging.HistorySource._entries
-    monkeypatch.setattr(history_paging.HistorySource, "_entries",
-                        lambda self, start, end, gaps: reads.append((start, end)) or entries(self, start, end, gaps))
-    state, row = reader.task_pivot("t-x", lambda row: True, began)
-    assert (state, row["text"]) == ("found", "t-x 4")
-    assert reads == [reader.segment(2)], "only the archive of the task's time that names it"
-    reads.clear()
-    state, row = reader.task_pivot("t-x", lambda row: True)  # without a known start: the whole chain is its time
-    assert (state, row["text"], reads) == ("found", "t-x 1", [reader.segment(0)])
-    # The start comes from the task's stored facts.
-    from ouroboros.task_results import write_task_result
-
-    write_task_result(tmp_path, "t-x", "running", ts=datetime.fromtimestamp(began, timezone.utc).isoformat())
-    assert history_paging.task_began(tmp_path, "t-x") == began and history_paging.task_began(tmp_path, "t-no") is None
+def test_the_task_is_found_by_its_own_rows_whatever_the_room_holds(tmp_path, monkeypatch):
+    """The pivot is one indexed probe of the task's rows: the same SQL work with ten or four hundred
+    rows of other work around it, and the page lands on the same place."""
+    counts, landed = [], []
+    for others in (10, 400):
+        root = tmp_path / str(others)
+        _append(root, "chat", [_said("t-other", index) for index in range(others)])
+        _append(root, "chat", [_said("t-x", others), _said("t-x", others + 1)])
+        _append(root, "chat", [_said("t-later", others + 2 + index) for index in range(10)])
+        reader = history_paging.HistorySource(root, "chat", history_paging.RoomLens((("chat_id", 1),)))
+        with metered(monkeypatch) as measured:
+            state, row = reader.task_pivot("t-x", lambda row: True)
+        counts.append(dict(measured))
+        landed.append((state, row["text"]))
+    assert landed == [("found", "t-x 10"), ("found", "t-x 400")]
+    assert counts[0] == counts[1] and counts[0]["statements"] > 0, counts
 
 
 def test_the_page_after_a_task_reads_on_across_archives(tmp_path):
-    _archive(tmp_path, "chat_20261013T110000.jsonl", [_said("t-a", index) for index in range(6)] + [_said("t-x", 6)],
-             datetime(2026, 10, 13, 11, tzinfo=timezone.utc).timestamp())
-    _archive(tmp_path, "chat_20261013T120000.jsonl", [_said("t-b", index) for index in range(7, 10)],
-             datetime(2026, 10, 13, 12, tzinfo=timezone.utc).timestamp())
-    _append(tmp_path, "chat", [_said("t-c", index) for index in range(10, 30)])
+    dialogue_test.seed(tmp_path, archives={
+        "chat_20261013T110000.jsonl": [_said("t-a", index) for index in range(6)] + [_said("t-x", 6)],
+        "chat_20261013T120000.jsonl": [_said("t-b", index) for index in range(7, 10)]},
+        live={"chat": [_said("t-c", index) for index in range(10, 30)]})
+    dialogue_test.import_all(tmp_path)
     status, page = _read(tmp_path, around="task:t-x", n_human=8, n_progress=0)
     assert status == 200 and page["anchor"]["state"] == "found"
     assert _texts(page) == ["t-a 4", "t-a 5", "t-x 6", "t-b 7", "t-b 8", "t-b 9", "t-c 10", "t-c 11"]
     status, again = _read(tmp_path, cursor=page["page_cursor"], n_human=8, n_progress=0)
     assert status == 200 and _texts(again) == _texts(page)
+
+
+def test_an_unfound_task_is_still_importing_never_absent_until_the_archive_is_in(tmp_path):
+    """A task whose rows lie in an archive segment the import has not reached is not known absent:
+    the read answers 503 migrating; once imported, the same read lands on it."""
+    dialogue_test.seed(tmp_path, archives={"chat_20261013T110000.jsonl": [_said("t-x", 1)]},
+                       live={"chat": [_said("t-c", 2)]})
+    from ouroboros import dialogue_import
+    dialogue_import.cutover(tmp_path)  # the live file is in; the archive is planned, not imported yet
+    status, body = _read(tmp_path, around="task:t-x")
+    assert status == 503 and body["reason_code"] == "migrating" and body["messages"] == []
+    assert _read(tmp_path, around="task:t-c")[1]["anchor"]["state"] == "found"  # found above the frontier
+    dialogue_test.import_all(tmp_path)
+    status, page = _read(tmp_path, around="task:t-x")
+    assert status == 200 and page["anchor"]["state"] == "found" and "t-x 1" in _texts(page)
 
 
 def test_an_around_page_is_not_the_present(tmp_path, monkeypatch):

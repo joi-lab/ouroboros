@@ -273,23 +273,21 @@ def test_startup_revival_never_degrades_an_inprocess_owner(work):
         phase.release_post_task_synthesis(key)
 
 
-def test_new_pause_wins_exact_phase_cas_and_periodic_recovery_preserves_its_grant(work, monkeypatch):
+def test_newer_phase_write_wins_exact_phase_cas_and_periodic_recovery_keeps_it(work, monkeypatch):
     writer, changed = phase.write_task_result, []
-    saved = {"pause_id": "owner-pause", "payload_ref": {"sha256": "completed-work"},
-             "completed_stages": ["memory_fallback_draft", "scratchpad_consolidation"],
-             "grant": {"grant_id": "explicit-owner-grant"}}
+    stopped = {"post_task_synthesis": "degraded",
+               "post_task_stop_reason": "owner_stopped:skipped=memory_fallback_draft,scratchpad_consolidation,promotion"}
     def race(*args, **kwargs):
         if kwargs.get("root_phase_checkpoint", {}).get("post_task_synthesis") == "running" and not changed:
             changed.append(True)
-            writer(work.root, work.task["id"], "failed",
-                root_phase_checkpoint={"post_task_synthesis": "paused", "post_task_pause": saved})
+            writer(work.root, work.task["id"], "failed", root_phase_checkpoint=stopped)
         return writer(*args, **kwargs)
     monkeypatch.setattr(phase, "write_task_result", race)
     with pytest.raises(phase.PostTaskCheckpointChanged):
         run(work)
     before = copy.deepcopy(checkpoint(work))
     assert recover(work) == 0
-    assert checkpoint(work) == before and checkpoint(work)["post_task_pause"] == saved
+    assert checkpoint(work) == before and before["post_task_stop_reason"] == stopped["post_task_stop_reason"]
     assert work.calls == []
 
 

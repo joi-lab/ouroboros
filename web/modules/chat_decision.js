@@ -6,11 +6,23 @@ import { MAX_DECISION_COMMENT, MAX_QUIZ_OPTIONS } from './api_types.js';
 import { renderRoutingAnnotation, routingOptionLabel } from './routing_receipt.js';
 import { paintAttachmentOutcome } from './chat_attachments.js';
 import { nameProjectReference, projectReference } from './project_reference.js';
-import { ANSWERABLE_QUIZ_STATES, QUIZ_LIFECYCLE, questionPresentation, waitFacts, WAIT_FIELDS,
+import { ANSWERABLE_QUIZ_STATES, QUIZ_LIFECYCLE, questionMark, questionPresentation, waitFacts, WAIT_FIELDS,
     normalizeQuiz, hostFactsLine, appendRecommendedBadge, renderOwnerAnswer, questionDeliveryPending, unknownDeliveryRemovable,
     appendQuestionReplyControls } from './question_presentation.js';
 import { fmt, tr, tx } from './i18n.js';
 import { syncQuestionMaterials } from './result_files.js';
+import { createStatusMark, paintStatusMark } from './status_mark.js';
+
+// A question head's mark: its lifecycle's dot (question_presentation.questionMark), neutral while an answer is in
+// flight (Sending…, checking it, Not confirmed: the owner has moved). The one painter of it, whoever changed the card.
+const HEAD_ROWS = new WeakMap();
+function paintQuestionHead(card, row = HEAD_ROWS.get(card)) {
+    if (!card) return false;
+    if (row) HEAD_ROWS.set(card, row);
+    const inFlight = ['sending', 'unknown', 'checking'].includes(card.dataset.submission);
+    return paintStatusMark(card.querySelector('.chat-quiz-mark'),
+        inFlight ? { shape: 'dot', hue: 'neutral' } : questionMark(row || {}));
+}
 
 // What one observation of a question carries: its identity, lifecycle, recorded answer and wait facts.
 const LIFECYCLE_FIELDS = ['task_id', 'quiz_id', 'state', 'answered_index', 'comment', 'closed_reason', 'closed_at', 'closed_actor', 'closed_request_id', 'question_delivery', ...WAIT_FIELDS];
@@ -33,6 +45,9 @@ const ROUTING_STATUS_TEXT = {
     answered: 'Routed',
     superseded: 'Superseded by a newer attempt',
 };
+// Its head's dot, the question's family: the owner's move while it waits for a destination, ok once routed, the head's
+// disabled ink once superseded, neutral while the chosen route is sent.
+const ROUTING_MARK_HUES = { open: 'owner', answered: 'ok', superseded: 'ink' };
 const ROUTING_TOP_OPTIONS = 8;
 
 export function createChatDecision({
@@ -465,7 +480,7 @@ export function createChatDecision({
         });
     }
 
-    const submissions = createQuizSubmission({ apiFetch, onDomWrite, showToast,
+    const submissions = createQuizSubmission({ apiFetch, onDomWrite, showToast, paintHead: paintQuestionHead,
         canUse: card => !disposed && (!isMain || (connected && card.dataset.authorityStale !== '1')),
         readQuestion: quiz => readQuestion(quiz.taskId, quiz.quizId, quiz.projectId, { fresh: true }),
         accept(card, body) {
@@ -610,6 +625,7 @@ export function createChatDecision({
                 status.textContent = nextStatus;
                 changed = true;
             }
+            if (paintQuestionHead(card, current)) changed = true;
             // An accepted late answer whose delivery became unknown: Main's copy lets the owner
             // stop counting it as pending. Nothing is resent; the answer and its record stay.
             const removable = card.classList.contains('project-question-card') && unknownDeliveryRemovable({ ...current, state });
@@ -719,11 +735,9 @@ export function createChatDecision({
         chip.textContent = tr('quiz.chip_question', 'Question');
         const status = document.createElement('span');
         status.className = 'chat-quiz-status';
-        const dot = document.createElement('span');
-        dot.className = 'chat-quiz-dot';
         const statusLabel = document.createElement('span');
         statusLabel.className = 'chat-quiz-status-text';
-        status.append(dot, statusLabel);
+        status.append(createStatusMark(document, 'chat-quiz-mark'), statusLabel);
         // The status and the card's quiet Close end the head together, so a wrap moves both.
         const headEnd = document.createElement('span');
         headEnd.className = 'chat-quiz-head-end';
@@ -834,6 +848,8 @@ export function createChatDecision({
                 status.textContent = nextStatus;
                 changed = true;
             }
+            const view = { shape: 'dot', hue: ROUTING_MARK_HUES[state] || 'neutral' };
+            if (paintStatusMark(card.querySelector('.chat-quiz-mark'), view)) changed = true;
             card.querySelectorAll('.chat-quiz-option').forEach((btn, i) => {
                 const disabled = state !== 'open';
                 const chosen = chosenIndex !== null && i === chosenIndex;
@@ -909,11 +925,9 @@ export function createChatDecision({
         chip.textContent = tr('routing.chip_route', 'Route');
         const status = document.createElement('span');
         status.className = 'chat-quiz-status';
-        const dot = document.createElement('span');
-        dot.className = 'chat-quiz-dot';
         const statusLabel = document.createElement('span');
         statusLabel.className = 'chat-quiz-status-text';
-        status.append(dot, statusLabel);
+        status.append(createStatusMark(document, 'chat-quiz-mark'), statusLabel);
         head.append(chip, status);
         card.append(head);
 

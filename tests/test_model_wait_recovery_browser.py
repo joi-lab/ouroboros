@@ -11,6 +11,7 @@ from tests.test_llm_claudexor import setup as subscription_transport
 from tests.test_model_wait import live_wait as wait_fixture
 from tests.test_model_wait_browser import API_LANE, TASK, waiting_ui as waiting_fixture
 from tests.test_subscription_setup_browser import subscription_ui as ui_fixture, capture
+from tests._work_projection_shared import state_fields
 
 setup = subscription_transport
 live_wait = wait_fixture
@@ -133,14 +134,14 @@ def test_current_attempt_snapshot_never_reopens_old_wait_after_reload(waiting_ui
     monkeypatch.setattr(queue, "RUNNING", {TASK: meta})
     monkeypatch.setattr(queue, "PENDING", [])
     monkeypatch.setattr(queue, "BUDGET_ROOT_FENCES", {})
-    monkeypatch.setattr(state, "_direct_turns_snapshot_safe", lambda: [])
+    monkeypatch.setattr(state, "_direct_turns_snapshot_safe", lambda **_kwargs: [])
 
     def current_state(route):
-        activities = state._chat_activities_snapshot_safe(tmp_path)
-        assert activities[0]["task_attempt"] == 2
+        # The real census and the server's own work projection of it.
+        fields = state_fields(tmp_path)
+        assert fields["active_chat_activities"][0]["task_attempt"] == 2
         route.fulfill(content_type="application/json", body=json.dumps({
-            "sha": "browser-fixture", "supervisor_ready": True, "projects": [],
-            "active_chat_activities": activities}))
+            "sha": "browser-fixture", "supervisor_ready": True, "projects": [], **fields}))
 
     page.route("**/api/state", current_state)
     page.reload()

@@ -362,7 +362,7 @@ def _assert_consumers(result, code):
     from ouroboros.loop_tool_execution import _typed_execution_failure, _typed_result_metadata
     from ouroboros.reflection import _trace_call_errored
 
-    assert result.code == code
+    assert result.code == code, result.text
     failed = _typed_execution_failure(True, result)
     facts = _typed_result_metadata("census", result.text, failed, result)
     row = {"tool": "census", "result": result.text, **facts, "is_error": failed}
@@ -491,40 +491,6 @@ def test_multi_review_validation_and_execution_fault_consumers(invoke, monkeypat
     assert set(json.loads(result.text)) == {"error"}
 
 
-@pytest.mark.parametrize("case", ["pool", "slots", "selector", "nomination"])
-def test_acceptance_dispatch_refusal_and_successful_handoff(invoke, monkeypatch, case):
-    from ouroboros.tools import review
-    invoke.ctx.task_id = "root"
-    invoke.ctx.task_metadata = {"root_task_id": "root", "delegation_role": "root"}
-    monkeypatch.setattr("ouroboros.config.get_task_review_mode", lambda: "auto" if case == "nomination" else "off")
-    monkeypatch.setattr("ouroboros.review_evidence.build_task_acceptance_evidence", lambda *a, **k: {})
-    def slots(**kwargs):
-        if case == "pool": raise ValueError("invalid pool")
-        return []
-    monkeypatch.setattr("ouroboros.review_substrate.triad_delivery_slots", slots)
-    if case != "nomination":
-        # Set lineage inside the handler: this fixture exercises publication,
-        # while the escalation witness separately exercises the child allowlist.
-        # Only a child dispatches its own rows; an off-mode root buys none (#1731).
-        def handler(ctx, **kw):
-            ctx.task_id = "child"
-            ctx.task_metadata = {"root_task_id": "root", "parent_task_id": "root", "delegation_role": "subagent"}
-            return review._handle_task_acceptance_review(ctx, **kw)
-    else:
-        handler = review._handle_task_acceptance_review
-    result = invoke(handler, claim="candidate", goal="goal",
-                    reviewer_slot_id="" if case in {"pool", "slots"} else "missing")
-    _assert_consumers(result, "OK" if case == "nomination" else "TOOL_ARG_ERROR" if case == "selector" else "LEGACY_UNAVAILABLE")
-    payload = json.loads(result.text)
-    assert payload["status"] == ("deferred_to_host_acceptance" if case == "nomination" else "not_dispatched")
-    if case == "nomination":
-        assert payload["request"]["task_id"] == "root" and payload["authoritative"] is False
-    elif case == "slots":
-        assert payload["reason"] == "no_review_slots"
-    elif case == "selector":
-        assert payload["reason"] == "reviewer_slot_unknown"
-
-
 @pytest.mark.parametrize("case", ["policy", "unavailable", "reference", "disposition", "preflight"])
 def test_skill_author_finish_branch_outcomes_preserve_review_state(invoke, monkeypatch, case):
     from ouroboros.tools import skill_exec
@@ -593,7 +559,7 @@ def test_review_gate_return_boundaries_reach_consumers(invoke, monkeypatch, case
         monkeypatch.setattr(git, "_run_parallel_review", lambda *a, **k: (None, None, "", []))
         monkeypatch.setattr(git, "_reconcile_and_clear_review_roster", lambda *a: None)
         monkeypatch.setattr(git, "_aggregate_review_verdict", lambda *a: (False, "", "", [], []))
-        monkeypatch.setattr(git, "_review_custody_pending", lambda *a: False)
+        monkeypatch.setattr(git, "_review_custody_pending", lambda *a, counted_only=False: False)
         monkeypatch.setattr(git, "_subject_binding_mismatch_outcome", lambda *a: None)
         monkeypatch.setattr("ouroboros.review_custody.review_retry_cancelled", lambda *a: case == "stopped")
         monkeypatch.setattr("ouroboros.deadline_utils.owner_deadline_exhausted_for_context", lambda *a: False)

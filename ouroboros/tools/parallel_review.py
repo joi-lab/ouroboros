@@ -194,7 +194,7 @@ def _describe_review_wave(prepared, *, started_ts, retry_key, wave_refusal, exit
     """The wave as one seat list with ``parts`` plus every distinct brief by sha:
     a packet seat's brief is the assembled prompt, a retrieving seat's its own
     two-part brief (``row_plan["brief_shas"]`` / ``prepared["brief_texts"]``)."""
-    from ouroboros.review_ledger import PARTS
+    from ouroboros.review_ledger import ALL_PARTS
     from ouroboros.review_model_routes import adaptive_quorum
     from ouroboros.reviewer_slot_config import row_plan_retrieves
 
@@ -214,7 +214,7 @@ def _describe_review_wave(prepared, *, started_ts, retry_key, wave_refusal, exit
     rows = []
     for i in range(len(plan.get("slot_ids") or [])):
         retrieves = row_plan_retrieves(plan, i)
-        parts = [p for p in PARTS if p in tuple(_at("parts", i, ()) or ())] or ["change"]
+        parts = [p for p in ALL_PARTS if p in tuple(_at("parts", i, ()) or ())] or ["change"]
         rows.append({
             "slot_id": _at("slot_ids", i), "model": _at("models", i), "route": _at("routes", i),
             "effort": _at("efforts", i), "session_target": _at("session_targets", i),
@@ -309,8 +309,17 @@ def run_parallel_review(
     # ---- Phase 1 (Q25=A): prepare every seat; dispatch NOTHING yet. ----
     prepared, early, exited = None, None, True
     try:
-        prepared, early, exited = _prepare_unified_review(
-            ctx, commit_message, review_rebuttal=review_rebuttal, goal=goal, scope=scope, subject=subject)
+        if (subject is not None and str(getattr(subject.spec, "kind", "") or "") == "result"
+                and not bool(getattr(ctx, "_review_reconcile_only", False))):
+            # A result subject: the one result question for every seat (review_result); a rejoin
+            # restores its recorded plan through the gate's own reconcile path below.
+            from ouroboros.tools.review_result import prepare_result_review
+
+            prepared, early, exited = prepare_result_review(
+                ctx, subject, goal=goal, scope=scope, review_rebuttal=review_rebuttal)
+        else:
+            prepared, early, exited = _prepare_unified_review(
+                ctx, commit_message, review_rebuttal=review_rebuttal, goal=goal, scope=scope, subject=subject)
         if prepared is not None:
             prepared["retry_key"] = retry_key
     except Exception as e:

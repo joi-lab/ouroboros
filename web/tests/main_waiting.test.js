@@ -361,6 +361,27 @@ test('Resume is offered only for a resumable pause the owner did not make; the t
         ['budget', true, true], ['owner', false, true], ['blocked', false, true], ['unstated', false, true], ['restart', true, false]]);
 });
 
+test('the task control carries Resume only where the server allows it and no Resume button of its own stands', t => {
+    const main = mainPage(t);
+    const priorObserver = globalThis.IntersectionObserver;
+    globalThis.IntersectionObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
+    t.after(() => { globalThis.IntersectionObserver = priorObserver; });
+    main.waiting.snapshot(census({ actions: [action('budget'), action('owner', { pause_cause: 'owner' }),
+        action('blocked', { can_resume: false })] }));
+    const menuOf = id => {
+        const control = find(main.actionNode(id), node => node.textContent === 'Stop…');
+        for (const fn of control.listeners.get('click') || []) fn({ target: control, stopPropagation() {}, preventDefault() {} });
+        const items = [];
+        const walk = node => { if (node?.dataset?.taskControl) items.push(node.dataset.taskControl); (node?.children || []).forEach(walk); };
+        walk(main.env.mount);
+        return items;
+    };
+    // The owner's own Pause has no Resume button: the menu carries it; a standing button or a refused Resume keeps it out.
+    assert.ok(menuOf('owner').includes('resume'));
+    assert.ok(!menuOf('budget').includes('resume') && menuOf('budget').includes('stop_now'));
+    assert.ok(!menuOf('blocked').includes('resume') && menuOf('blocked').includes('stop_now'));
+});
+
 test('a complete census removes a message whose task no longer waits; an incomplete one keeps it with its controls withdrawn', t => {
     const main = mainPage(t);
     const row = action('paused');
@@ -511,4 +532,33 @@ test('the pill hides while every target is on screen, and the feed\'s own change
     arriving.getBoundingClientRect = () => box(320, 200);
     main.waiting.refresh();
     assert.equal(main.shown(), null);
+});
+
+// A task that cannot continue without the owner is one System message whose chip is the owner's move (status marks:
+// the amber body and the amber dot), whatever the move is: Resume after the spending limit, an interrupted Resume the
+// census still names, or model access only the owner can restore. Resume stays the crimson primary, Stop… neutral;
+// a closed socket proves nothing, so the chip says Activity unconfirmed with its ring and no amber.
+test('an owner-action message says its task\'s state as the owner\'s move, beside Resume and a neutral Stop…', t => {
+    const main = mainPage(t);
+    const chipOf = id => find(main.actionNode(id), node => node.classList?.contains('chat-live-phase'));
+    const look = id => {
+        const chip = chipOf(id), mark = chip.firstElementChild;
+        return [chip.textContent, chip.dataset.chipTone, mark.hidden ? 'none' : `${mark.dataset.shape}/${mark.dataset.hue}`];
+    };
+    const wait = { wait_id: 'w', revision: 1, task_attempt: 1, state: 'waiting', reason: 'auth', role: 'main',
+        model: 'codex::gpt', requires_owner_action: true };
+    main.waiting.snapshot(census({ actions: [action('limit'),
+        action('resumed', { pause_cause: 'owner', attention_reason: 'resume' }),
+        action('access', { phase: 'working', pause_cause: undefined, can_resume: false, attention_reason: 'model_access',
+            model_waits: { w: wait } })] }));
+    // The chip says its word; why it waits is the message's own sentence.
+    assert.deepEqual(look('limit'), ['Paused', 'owner', 'dot/owner']);
+    assert.deepEqual(look('resumed'), ['Paused', 'owner', 'dot/owner']);
+    assert.deepEqual(look('access'), ['Waiting for access', 'owner', 'dot/owner']);
+    const resume = find(main.actionNode('limit'), node => node.dataset?.resumeRun === '1');
+    assert.equal(resume.className, 'btn btn-sm btn-primary');
+    const stop = find(main.actionNode('limit'), node => node.tagName === 'BUTTON' && node.textContent === 'Stop…');
+    assert.equal(stop.className, 'btn btn-xs btn-default');
+    main.waiting.setConnected(false);
+    for (const id of ['limit', 'resumed', 'access']) assert.deepEqual(look(id), ['Activity unconfirmed', 'neutral', 'ring/ink'], id);
 });

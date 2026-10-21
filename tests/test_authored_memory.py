@@ -1,7 +1,7 @@
 """Authored memory: the acting mind writes its lessons, register and backlog; the host keeps facts.
 
 Every test drives a real public consumer — the knowledge tool through the registry, the
-post-task coordinator, the owner's Resume and startup recovery, the evolution chooser, the
+post-task coordinator, startup recovery and the maintenance pass, the evolution chooser, the
 context builder in each mode, ``journal_read`` — and only model transports are fixtures.
 What they pin: one writer (revision-checked, history kept) for patterns and the backlog;
 no automatic lesson, register rewrite, memory action or backlog effect after any task shape,
@@ -11,6 +11,8 @@ carry dated pointers, and late review settlements stay whole.
 """
 
 from __future__ import annotations
+
+from tests import _dialogue as dialogue_test
 
 import json
 import os
@@ -23,7 +25,9 @@ from ouroboros import knowledge as store
 from ouroboros.task_results import load_task_result
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 from tests.test_consolidator_context_fit import fit  # noqa: F401 — offline Light route/window facts
-from tests.test_late_phase_pause_resume import ANSWER, ROOT, _pause_during_read, _phase, _resume, _row, late  # noqa: F401
+from tests.test_late_phase_pause_cut import (  # noqa: F401
+    ROOT, _maintenance, _phase, _resume, _row, _saved_by_an_earlier_version, late,
+)
 
 BACKLOG = "improvement-backlog"
 LEGACY_BACKLOG = (
@@ -284,7 +288,7 @@ def test_no_task_shape_buys_a_lesson_or_writes_a_note(tmp_path, monkeypatch, sha
     assert not (tmp_path / "memory" / "knowledge").exists()
     assert not (tmp_path / "logs" / "task_reflections.jsonl").exists()
     assert memory.load_scratchpad_blocks()[0]["content"] == "Compressed working notes."
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows = dialogue_test.log_rows(tmp_path / "logs" / "chat.jsonl")
     assert [row.get("summary_kind") for row in rows if row.get("task_id") == task["id"]].count("host_task_facts") == 1
     checkpoint = pipeline.load_task_result(tmp_path, task["id"])["root_phase_checkpoint"]
     assert checkpoint["post_task_synthesis"] == "completed" and "post_task_stop_reason" not in checkpoint
@@ -330,24 +334,15 @@ def test_a_chooser_that_cannot_be_prepared_degrades_the_phase_with_its_cause_rec
 
 
 def _as_saved_by_an_earlier_version(f, *, stage, completed, remaining, marks, callback=None):
-    """Rewrite the real saved Pause into the v1 payload an earlier version wrote, nominations and all."""
-    from ouroboros.artifacts import read_actor_source_bytes, store_actor_source_bytes
-    from ouroboros.post_task_checkpoint import late_phase_pause_record, update_late_phase_pause
-
-    record = late_phase_pause_record(_row(f))
-    payload = json.loads(read_actor_source_bytes(f.root, ROOT, record["payload_ref"]))
+    """The v1 payload an earlier version wrote for its Pause, its retired reflection's nominations and all."""
     entry = {"reflection": "OLD AUTOMATIC LESSON", "memory_actions": [
         {"type": "knowledge_write", "topic": "lessons/old", "content": "OLD LESSON NOTE", "task_id": ROOT},
         {"type": "scratchpad_append", "content": "OLD SCRATCH NOTE", "task_id": ROOT},
         {"type": "identity_update_candidate", "content": "OLD TRAIT", "task_id": ROOT}],
         "backlog_candidates": [{"summary": "OLD CANDIDATE", "category": "process"}]}
-    payload.update(stage=stage, completed_stages=completed, remaining_stages=remaining, marks=marks,
-                   review_evidence={"task_id": ROOT, "has_evidence": True}, result={"reflection_entry": entry},
-                   free_actions_applied=False, reflection_callback=callback)
-    ref = store_actor_source_bytes(f.root, ROOT, category="context_checkpoints", source_id="late-phase-pause-v1",
-                                   extension="json", data=json.dumps(payload).encode("utf-8"))
-    assert update_late_phase_pause(f.root, ROOT, lambda current: {
-        **current, "stage": stage, "completed_stages": completed, "remaining_stages": remaining, "payload_ref": ref})
+    _saved_by_an_earlier_version(f, stage=stage, completed=completed, remaining=remaining, payload={
+        "marks": marks, "review_evidence": {"task_id": ROOT, "has_evidence": True},
+        "result": {"reflection_entry": entry}, "free_actions_applied": False, "reflection_callback": callback})
 
 
 def _no_saved_write_took_effect(f):
@@ -361,62 +356,49 @@ def _no_saved_write_took_effect(f):
     assert "OLD" not in json.dumps(Memory(f.root).load_scratchpad_blocks())
 
 
-def test_a_pause_saved_inside_the_retired_reflection_resumes_without_its_writes(late):  # noqa: F811
+def test_a_pause_saved_inside_the_retired_reflection_ends_without_its_writes(late):  # noqa: F811
     f = late
-    assert _pause_during_read(f)["ok"]
-    sends = len(f.light.sends)
     _as_saved_by_an_earlier_version(f, stage="reflection", completed=["memory_fallback_draft", "scratchpad_consolidation"],
                                     remaining=["reflection", "promotion"], marks=[f"backlog_appended:{f.root}"])
-    # Restart keeps it paused and runs nothing.
+    # Restart runs nothing; the maintenance pass ends it once without running any stage.
     assert f.pipeline.recover_pending_root_post_task_synthesis(f.root, f.root) == 0
-    assert _phase(f) == "paused" and len(f.light.sends) == sends
-    assert _resume(f)["ok"]
-    assert _phase(f) == "completed"
-    assert _row(f)["root_phase_checkpoint"]["post_task_stop_reason"] == "stage_retired:skipped=reflection"
-    # The retired stage bought nothing; completed stages did not rerun; promotion ran once.
-    assert len(f.light.sends) == sends and f.stages == ["promotion"]
+    assert _phase(f) == "paused"
+    assert _maintenance(f) == 1
+    checkpoint = _row(f)["root_phase_checkpoint"]
+    assert checkpoint["post_task_synthesis"] == "degraded"
+    assert checkpoint["post_task_stop_reason"] == "owner_pause:skipped=reflection,promotion"
+    assert f.light.sends == [] and f.stages == []
     _no_saved_write_took_effect(f)
     assert not _resume(f).get("ok")  # nothing left to resume
 
 
-@pytest.mark.parametrize("global_done", [False, True], ids=["global_step_open", "global_step_marked"])
-def test_a_promotion_an_earlier_version_saved_buys_only_its_open_step_and_never_its_nominations(
-        late, monkeypatch, global_done):  # noqa: F811
-    """An earlier version's split Project callback, paused inside promotion: the marked chooser
-    is not bought again; an unmarked global step runs once as today's canonical entry, on the
-    saved sealed final, never the saved reflection entry or its nominations."""
+def test_a_promotion_an_earlier_version_saved_ends_without_buying_a_step_or_its_nominations(late, monkeypatch):  # noqa: F811
+    """An earlier version's split Project callback, paused inside promotion: the maintenance
+    pass ends it; neither the chooser nor the global entry is bought, and the saved reflection
+    entry and its nominations never take effect."""
     f = late
-    assert _pause_during_read(f)["ok"]
-    sends = len(f.light.sends)
     seen = []
     monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote",
                         lambda env, task, sealed, llm: seen.append((str(env.drive_root), task, sealed)))
     callback = {"drive_root": str(f.root), "repo_dir": str(f.root), "task": {"id": ROOT, "type": "task"}}
-    marks = ["promotion:backlog", "promotion:promote", f"backlog_appended:{f.root}"] + (["promotion:global"] if global_done else [])
     _as_saved_by_an_earlier_version(
         f, stage="promotion", completed=["memory_fallback_draft", "scratchpad_consolidation", "reflection"],
-        remaining=["promotion"], marks=marks, callback=callback)
-    assert _resume(f)["ok"]
-    assert _phase(f) == "completed"
-    assert "post_task_stop_reason" not in _row(f)["root_phase_checkpoint"]
-    assert len(f.light.sends) == sends  # nothing completed is bought again
-    if global_done:
-        assert seen == []
-    else:
-        [(drive, view, sealed)] = seen
-        assert drive == str(f.root) and view["source"] == "project_scoped_global_improvement"
-        assert sealed is None or "backlog_candidates" not in sealed  # the saved sealed final, not the entry
+        remaining=["promotion"], marks=["promotion:backlog", "promotion:promote", f"backlog_appended:{f.root}"],
+        callback=callback)
+    assert _maintenance(f) == 1
+    assert _row(f)["root_phase_checkpoint"]["post_task_stop_reason"] == "owner_pause:skipped=promotion"
+    assert seen == [] and f.light.sends == []
     _no_saved_write_took_effect(f)
 
 
-def test_a_pause_inside_the_project_entry_resumes_it_once_on_the_saved_sealed_final(late, monkeypatch):  # noqa: F811
-    """Today's split Project entry paused mid-chooser: Resume rebinds the saved callback and
-    sealed final, re-thinks that one step and never repeats the project's own completed chooser."""
+def test_a_pause_inside_the_project_entry_ends_it_at_once_and_saves_nothing(late, monkeypatch):  # noqa: F811
+    """Today's split Project entry paused mid-chooser: the send on the wire finishes, the next
+    is refused, the stage ends with the skip disclosed and nothing is saved to resume."""
     import functools
 
     from ouroboros.usage_accounting import UsageScope, usage_scope
     from supervisor.owner_pause_control import request_owner_pause
-    from tests.test_late_phase_pause_resume import _join, _spawned
+    from tests.test_late_phase_pause_cut import ANSWER, _join, _spawned
 
     f = late
     calls = []
@@ -437,11 +419,11 @@ def test_a_pause_inside_the_project_entry_resumes_it_once_on_the_saved_sealed_fi
         _join(_spawned(lambda: f.pipeline._run_post_task_processing_async(
             f.env, f.task, {"rounds": 1}, {"tool_calls": []}, f.root / "logs", on_reflection=entry,
             sealed_final=sealed))[1])
-    assert _phase(f) == "paused" and calls == [(False, sealed), (True, sealed)]
-    assert _resume(f)["ok"]
-    assert _phase(f) == "completed"
-    assert calls == [(False, sealed), (True, sealed), (True, sealed)]  # the open step once more, nothing else
-    assert f.light.kinds().count("other") == 3
+    assert calls == [(False, sealed), (True, sealed)]
+    checkpoint = _row(f)["root_phase_checkpoint"]
+    assert checkpoint["post_task_synthesis"] == "degraded" and "post_task_pause" not in checkpoint
+    assert checkpoint["post_task_stop_reason"] == "owner_pause:skipped=promotion"
+    assert f.light.kinds().count("other") == 1  # the entry's second send is never bought
     assert not _resume(f).get("ok")
     _no_saved_write_took_effect(f)
 
@@ -520,54 +502,6 @@ def test_a_split_project_root_reaches_the_canonical_chooser_under_the_same_opt_i
         assert json.loads(request.read_text(encoding="utf-8"))["origin_task_id"] == "proj-root-1"
     assert _address(canonical, BACKLOG).path.read_bytes() == backlog  # authored backlog untouched
     assert not (canonical / "logs" / "task_reflections.jsonl").exists()
-
-
-@pytest.mark.parametrize("then", ["resume", "stop"])
-def test_a_retired_stage_stays_disclosed_through_a_second_pause_of_the_remainder(late, monkeypatch, then):  # noqa: F811
-    """The retired reflection is remembered by the remainder's own Pause, so whichever way the
-    phase finally settles (a second Resume or a Stop) still says it was retired, not run."""
-    f = late
-    from ouroboros.artifacts import read_actor_source_bytes
-    from ouroboros.post_task_checkpoint import late_phase_pause_record
-    from supervisor.owner_pause_control import request_owner_pause
-
-    assert _pause_during_read(f)["ok"]
-    _as_saved_by_an_earlier_version(f, stage="reflection", completed=["memory_fallback_draft", "scratchpad_consolidation"],
-                                    remaining=["reflection", "promotion"], marks=[])
-    scratch_sends = f.light.kinds().count("scratchpad")
-
-    def promotion(env, task, sealed_final, client):  # a two-call chooser, paused after its first send
-        for _ in range(2):
-            client.chat(messages=[{"role": "user", "content": "choose the current backlog"}], model_role="light")
-
-    monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", promotion)
-    f.light.hooks["other"] = [lambda: request_owner_pause(ROOT, request_id="second-pause")]
-    assert _resume(f)["ok"]
-    assert _phase(f) == "paused" and f.light.kinds().count("other") == 1
-    record = late_phase_pause_record(_row(f))
-    payload = json.loads(read_actor_source_bytes(f.root, ROOT, record["payload_ref"]))
-    assert record["remaining_stages"] == payload["remaining_stages"] == ["promotion"]
-    assert record["retired_stages"] == payload["retired_stages"] == ["reflection"]
-    assert "reflection" not in payload["completed_stages"]
-    if then == "resume":
-        assert _resume(f)["ok"]
-        checkpoint = _row(f)["root_phase_checkpoint"]
-        assert checkpoint["post_task_synthesis"] == "completed"
-        assert checkpoint["post_task_stop_reason"] == "stage_retired:skipped=reflection"
-        assert f.light.kinds().count("other") == 3  # the interrupted chooser re-thinks once; nothing else is bought
-    else:
-        from ouroboros.cancel_intents import request_cancel
-        from supervisor.task_lifecycle import cancel_task_custody
-
-        request_cancel(f.root, ROOT, reason="owner stop", source="http", requested_by="owner",
-                       requested_stop_policy="immediate", allow_settled_target=True)
-        assert cancel_task_custody(ROOT) == "cancelled"
-        checkpoint = _row(f)["root_phase_checkpoint"]
-        assert checkpoint["post_task_synthesis"] == "degraded"
-        assert checkpoint["post_task_stop_reason"] == "owner_stopped:skipped=promotion;stage_retired:skipped=reflection"
-    assert f.light.kinds().count("scratchpad") == scratch_sends  # completed stages never rerun
-    assert _row(f)["result"] == ANSWER and not _resume(f).get("ok")
-    _no_saved_write_took_effect(f)
 
 
 # --- the chooser reads the complete authored backlog -------------------------------------------

@@ -34,16 +34,11 @@ them a second time:
 - The **journal changes** since an accepted wake are the records written after its accepted
   sequence, one line of text each with the exact read of the record and of its target.
 
-Rows come from a process-local projection over the chat chain with
-``chat_chain``'s own row rule and stream positions. It starts at the generation of
-the legacy frontier (the last covered row's address and position anchor it), keeps
-row metadata without text (``row_meta``; texts are read by address), and on later
-calls reads only the bytes appended since. The live file is read up to its last
-complete line; a rotation is recognized by the generation signatures. The row sets
-of legacy units need the chain before the frontier: it is read once per process and
-cached by generation signature. Room membership is recomputed on every call
-(``rooms_of_row``, the rule of ``project_dialogue.room_membership``): a later Project
-binding moves earlier rows.
+Rows are addressed in ``state/dialog.sqlite`` by the legacy frontier's durable
+stream position. A room query selects only that room's indexed candidates and
+then applies current membership, so a later binding still moves earlier rows.
+Whole-mind inventory explicitly requests every room. No reader walks JSONL or
+rebuilds a process-local copy of the chat chain.
 
 Nothing here publishes a record or calls a model.
 """
@@ -52,8 +47,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
-import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, Iterator, List, Mapping, NamedTuple, Optional, Tuple
 
 from ouroboros import chat_chain
@@ -165,130 +159,9 @@ def rooms_of_row(meta: Mapping[str, Any], facts: MembershipFacts) -> FrozenSet[s
 
 # --- the open-row projection --------------------------------------------------------------------
 
-class _Stale(Exception):
-    """The chain no longer continues the projection (a rewrite, a missing generation)."""
-
-
-@dataclass
-class _Generation:
-    sig: str
-    consumed: int = 0  # bytes read
-    lines: int = 0  # physical lines read
-
-
-@dataclass
-class _Projection:
-    frontier_key: Tuple[Any, ...]
-    start_sig: Optional[str]  # None: the chain's first generation
-    next_pos: int
-    min_pos: int
-    generations: List[_Generation] = field(default_factory=list)
-    rows: List[Entry] = field(default_factory=list)
-
-
-_LOCK = threading.Lock()
-_PROJECTIONS: Dict[str, _Projection] = {}
-
-
-def _read_lines(path: pathlib.Path, start: int, *, live: bool) -> Tuple[List[bytes], int]:
-    """Physical lines from byte ``start`` and the bytes they span; the live file stops at its last newline."""
-    with path.open("rb") as handle:
-        handle.seek(start)
-        data = handle.read()
-    if live:
-        data = data[:data.rfind(b"\n") + 1]
-    if not data:
-        return [], 0
-    lines = data.split(b"\n")
-    if data.endswith(b"\n"):
-        lines.pop()
-    return lines, len(data)
-
-
-def _frontier_key(frontier: Mapping[str, Any]) -> Tuple[Any, ...]:
-    last = frontier.get("last_covered") if isinstance(frontier.get("last_covered"), dict) else {}
-    return (frontier.get("status"), frontier.get("pos"), last.get("row_sha256"))
-
-
-def _ingest(projection: _Projection, sig: str, lines: List[bytes], first_line: int) -> None:
-    for offset, raw in enumerate(lines):
-        row = chat_chain._decoded(raw)
-        if row is None or is_a2a_chat_id(row.get("chat_id", 1)):
-            continue  # Not a stream row: it takes no position (chat_chain's rule).
-        pos = projection.next_pos
-        projection.next_pos += 1
-        if pos >= projection.min_pos:
-            projection.rows.append((chat_chain.row_address(row, gen=sig, line=first_line + offset),
-                                    row_meta(row), pos))
-
-
-def _advance(root: pathlib.Path, projection: _Projection) -> None:
-    """Read what the chain gained since the last call: new bytes of known generations, then new ones."""
-    sigs = chat_chain.generation_signatures(root)
-    names = [sig for _path, sig in sigs]
-    if projection.start_sig is None:
-        chain = sigs
-    elif projection.start_sig in names:
-        chain = sigs[names.index(projection.start_sig):]
-    else:
-        raise _Stale
-    if len(chain) < len(projection.generations):
-        raise _Stale
-    live = root / "logs" / "chat.jsonl"
-    for index, (path, sig) in enumerate(chain):
-        if index < len(projection.generations):
-            generation = projection.generations[index]
-            if generation.sig != sig:
-                # Only an empty generation may gain its first line; anything else was rewritten.
-                if index != len(projection.generations) - 1 or generation.consumed:
-                    raise _Stale
-                generation.sig = sig
-        else:
-            generation = _Generation(sig)
-            projection.generations.append(generation)
-        size = path.stat().st_size
-        if size < generation.consumed:
-            raise _Stale
-        if size == generation.consumed:
-            continue
-        lines, used = _read_lines(path, generation.consumed, live=path == live)
-        _ingest(projection, sig, lines, generation.lines + 1)
-        generation.consumed += used
-        generation.lines += len(lines)
-
-
-def _build(root: pathlib.Path, frontier: Mapping[str, Any]) -> _Projection:
-    """A new projection, anchored at the last covered row when its address still resolves."""
-    pos = int(frontier["pos"])
-    last = frontier.get("last_covered")
-    if pos > 0 and isinstance(last, dict):
-        row, found = chat_chain.resolve_row(root, last)
-        if row is not None:
-            # The last covered row holds position pos - 1: what follows it in its generation is open.
-            path, line = root / found["path"], int(found["line"])
-            projection = _Projection(_frontier_key(frontier), found["gen"], pos, pos)
-            lines, used = _read_lines(path, 0, live=path == root / "logs" / "chat.jsonl")
-            _ingest(projection, found["gen"], lines[line:], line + 1)
-            projection.generations.append(_Generation(found["gen"], used, len(lines)))
-            return projection
-    # Nothing covered, or the anchor no longer resolves: count positions from the chain's start.
-    return _Projection(_frontier_key(frontier), None, 0, pos)
-
-
 def _projection_rows(root: Any, frontier: Mapping[str, Any]) -> List[Entry]:
-    root = pathlib.Path(root)
-    key = str(root.resolve())
-    with _LOCK:
-        projection = _PROJECTIONS.get(key)
-        if projection is None or projection.frontier_key != _frontier_key(frontier):
-            projection = _build(root, frontier)
-        try:
-            _advance(root, projection)
-        except (_Stale, OSError):
-            projection = _build(root, frontier)
-            _advance(root, projection)
-        _PROJECTIONS[key] = projection
-        return list(projection.rows)
+    lower = chat_chain.position_boundary(root, int(frontier["pos"]))
+    return [(address, row_meta(row), pos) for address, row, pos in chat_chain.iter_rows(root, lower=lower)]
 
 
 _SEALED: Dict[str, Tuple[Tuple[int, int], Dict[str, FrozenSet[str]]]] = {}
@@ -354,21 +227,24 @@ def _room_entries(root: Any, store: ChronicleStore, room: str,
     """One room's rows in append order, sealed ones included: after the frontier, or in a half-open range.
 
     ``pos_range`` is a legacy unit's ``raw_range.pos``; its rows carry the membership fields
-    (``_MEMBERSHIP_FIELDS``) as their metadata. Empty before activation.
+    (``_MEMBERSHIP_FIELDS``) as their metadata. Empty before activation, and for the room-less
+    retelling (``chronicle_import.LEGACY_ROOM_ID``): it names no chat, so no row is its own.
     """
+    if not str(room).lstrip("-").isdigit():
+        return []
     if pos_range is None:
         frontier = _active_frontier(store)
         if frontier is None:
             return []
-        facts = membership_facts(root)
-        return [entry for entry in _projection_rows(root, frontier) if room in rooms_of_row(entry[1], facts)]
-    if not store.log_path.exists():
-        return []
-    start, end = pos_range
-    _read, stream = _legacy_stream(pathlib.Path(root), end)
-    facts = membership_facts(root)
-    return [(stream[pos][0], stream[pos][1], pos) for pos in range(max(start, 0), min(end, len(stream)))
-            if room in rooms_of_row(stream[pos][1], facts)]
+        start, end = int(frontier["pos"]), None
+    else:
+        if not store.log_path.exists():
+            return []
+        start, end = pos_range
+    lower = chat_chain.position_boundary(root, start)
+    upper = chat_chain.position_boundary(root, end) if end is not None else None
+    return [(address, row_meta(row), pos) for address, row, pos in
+            chat_chain.iter_room_rows(root, room, lower=lower, upper=upper)]
 
 
 def open_room_rows(root: Any, room_id: Any) -> List[Entry]:
@@ -400,8 +276,6 @@ class LegacyUnit:
 
 
 _RowSet = Tuple[FrozenSet[str], Optional[Dict[str, Any]], int]  # row_sha256 set, time span, first position
-_LEGACY_ROWS: Dict[str, Tuple[Tuple[str, ...], int, List[Tuple[Dict[str, Any], Dict[str, Any]]]]] = {}
-_LEGACY_SETS: Dict[str, Tuple[Tuple[Any, ...], Dict[str, _RowSet]]] = {}
 _RETELLING_CHARS: Dict[str, Dict[str, int]] = {}
 _UNITS: Dict[str, Tuple[Tuple[Any, ...], List[LegacyUnit]]] = {}
 
@@ -431,56 +305,16 @@ def _exact_range(pointer: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
     return span[0], span[1]
 
 
-def _legacy_stream(root: pathlib.Path, stop: int) -> Tuple[Tuple[str, ...], List[Tuple[Dict[str, Any], Dict[str, Any]]]]:
-    """``(generations read, [(address, membership fields)] by stream position below stop)``.
-
-    One pass per process, cached by the signatures of the generations it read: archives
-    never change and a live generation only grows, so its earlier rows stay put.
-    """
-    key = str(root.resolve())
-    names = tuple(sig for _path, sig in chat_chain.generation_signatures(root))
-    cached = _LEGACY_ROWS.get(key)
-    if cached is not None and names[:len(cached[0])] == cached[0] and cached[1] >= stop:
-        return cached[0], cached[2]
-    rows: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-    read: Tuple[str, ...] = ()
-    for address, row, pos in chat_chain.iter_rows(root):
-        if pos >= stop:
-            break
-        meta = row_meta(row)
-        rows.append((address, {k: meta[k] for k in _MEMBERSHIP_FIELDS if k in meta}))
-        gen = address["hint"].get("gen")
-        if gen in names and (not read or read[-1] != gen):
-            read = names[:names.index(gen) + 1]
-    _LEGACY_ROWS[key] = (read, stop, rows)
-    return read, rows
-
-
 def _legacy_row_sets(root: pathlib.Path, ranges: Dict[str, Tuple[str, Tuple[int, int]]],
                      facts: MembershipFacts) -> Dict[str, _RowSet]:
-    """``record id -> (row_sha256 set, time span, first position)`` of each exact unit: its range's rows of its room."""
-    if not ranges:
-        return {}
-    stop = max(end for _room, (_start, end) in ranges.values())
-    read, stream = _legacy_stream(root, stop)
-    key = (read, len(stream), facts.fingerprint(),
-           hashlib.sha256(json.dumps(sorted(ranges.items())).encode("utf-8")).hexdigest())
-    cached = _LEGACY_SETS.get(str(root.resolve()))
-    if cached is not None and cached[0] == key:
-        return cached[1]
-    rooms_at: Dict[int, FrozenSet[str]] = {}
-    sets: Dict[str, _RowSet] = {}
-    for record_id, (room, (start, end)) in ranges.items():
-        members, stamps, first = set(), [], -1
-        for pos in range(max(start, 0), min(end, len(stream))):
-            if pos not in rooms_at:
-                rooms_at[pos] = rooms_of_row(stream[pos][1], facts)
-            if room in rooms_at[pos]:
-                members.add(stream[pos][0]["row_sha256"])
-                stamps.append(stream[pos][1].get("ts"))
-                first = pos if first < 0 else first
-        sets[record_id] = (frozenset(members), source_time_span(stamps) if stamps else None, first)
-    _LEGACY_SETS[str(root.resolve())] = (key, sets)
+    """Each retained unit's own room and ordinal interval, without reading the preceding chain."""
+    store = ChronicleStore(root)
+    sets = {}
+    for record_id, (room, bounds) in ranges.items():
+        entries = _room_entries(root, store, room, bounds)
+        stamps = [row.get("ts") for _addr, row, _pos in entries]
+        sets[record_id] = (frozenset(address["row_sha256"] for address, _row, _pos in entries),
+                           source_time_span(stamps) if stamps else None, entries[0][2] if entries else -1)
     return sets
 
 
@@ -504,7 +338,9 @@ def legacy_units(store: ChronicleStore, root: Any) -> List[LegacyUnit]:
         return []
     root = pathlib.Path(root)
     authority, facts = _authority(store), membership_facts(root)
-    key = (authority, facts.fingerprint(), tuple(sig for _path, sig in chat_chain.generation_signatures(root)))
+    from ouroboros import dialogue_store as ds
+    ds.require_imported(root, "chat")
+    key = (authority, facts.fingerprint(), ds.stream_end(root, "chat"))
     cached = _UNITS.get(str(root.resolve()))
     if cached is not None and cached[0] == key:
         return list(cached[1])

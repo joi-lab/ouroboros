@@ -305,7 +305,7 @@ def retry_result_status(ctx: ToolContext, drive: Any, run_id: str, *,
         return custody.UNKNOWN, None, ""
     if reader and reader == entry.task_id:
         return custody.OWNED, entry, ""
-    if (reader and entry.task_id and not entry.review_owned and entry.settled
+    if (reader and entry.task_id and not entry.review_owned  # the observed terminal, not money (#1969)
             and entry.terminal_state in custody.TERMINAL_STATES
             and _confirmed_retry_chain(drive, entry.task_id, reader)):
         return custody.OWNED, entry, entry.task_id
@@ -368,8 +368,8 @@ def orphan_disposition_status(
         if retry_status == custody.OWNED and predecessor:
             # A successor is not an orphan aggregator: keep exact target rules.
             return retry_status, retry_entry, ""
-    if (status == custody.FOREIGN and entry is not None
-            and entry.settled and not entry.patch_disposed
+    if (status == custody.FOREIGN and entry is not None and not entry.patch_disposed
+            and (entry.settled or entry.terminal_state in custody.TERMINAL_STATES)  # execution ended (#1969)
             and str(active_tool_profile(ctx)) in _TOP_LEVEL_PRINCIPAL_PROFILES
             and _task_is_terminal(drive, entry.task_id)):
         return custody.OWNED, entry, str(entry.task_id or "")

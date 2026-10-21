@@ -76,20 +76,31 @@ def resolve_web_search_route(*, backend=None, model=None, settings=None) -> dict
                 return {**result, "error": "Anthropic search requires its native model id"}
         candidates = [(source, chosen or SEARCH_MODELS[source])]
     for name, wire_model in candidates:
-        if name == "ddgs":
-            try:
-                ready = bool(sys.modules.get("ddgs")) if "ddgs" in sys.modules else importlib.util.find_spec("ddgs") is not None
-            except (ImportError, ValueError):
-                ready = False
-        else:
-            ready = bool(setting({"openai": "OPENAI_API_KEY", "openrouter": "OPENROUTER_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}[name]))
-            if name == "openai" and setting("OPENAI_BASE_URL"):
-                ready = False  # Legacy compatible credentials are not official Responses access.
+        reason = ""
+        if name != "ddgs" and not setting({"openai": "OPENAI_API_KEY", "openrouter": "OPENROUTER_API_KEY",
+                                           "anthropic": "ANTHROPIC_API_KEY"}[name]):
+            reason = "no_credentials"
+        elif name == "openai" and setting("OPENAI_BASE_URL"):
+            reason = "legacy_openai_base_url"  # Legacy compatible credentials are not official Responses access.
+        elif name in _SDK_PACKAGES and not _package_discoverable(_SDK_PACKAGES[name]):
+            reason = "package_missing"  # discoverable is not proof of a working import; dispatch still reports that
         explicit_model = (bool(selected) and name != "ddgs" and not result.get("ignored_legacy_model")
                           and not result.get("unapplied_model"))
         if source == "auto" and name == "anthropic" and prefix != "anthropic" and not legacy_anthropic:
             explicit_model = False
         leg = {"source": name, "backend": SEARCH_BACKENDS[name], "model": wire_model,
                "model_source": "selection" if explicit_model else "provider_default"}
-        result["legs" if ready else "unavailable"].append(leg)
+        result["unavailable" if reason else "legs"].append({**leg, "unavailable_reason": reason} if reason else leg)
     return result
+
+
+# The optional SDKs a leg imports itself; openai and openrouter use installed dependencies.
+_SDK_PACKAGES = {"anthropic": "anthropic", "ddgs": "ddgs"}
+
+
+def _package_discoverable(package: str) -> bool:
+    """Local discovery only: no import, network or metadata read on a settings or context read."""
+    try:
+        return bool(sys.modules.get(package)) if package in sys.modules else importlib.util.find_spec(package) is not None
+    except (ImportError, ValueError):
+        return False

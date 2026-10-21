@@ -199,7 +199,7 @@ def _reread_requested_stop(root: Any, gateway: Any, run: Any) -> Dict[str, Any]:
     """Re-READ a run whose stop this pause already issued: no second control.
 
     Only a terminal read-back (settled through the existing custody writer) or
-    the daemon answering it has no such run confirms the stop; anything else
+    the owning daemon store answering it has no such run confirms the stop; anything else
     keeps the earlier ``requested`` fact, and an unreachable read is unknown.
     """
     from ouroboros import delegate_custody as custody
@@ -208,7 +208,7 @@ def _reread_requested_stop(root: Any, gateway: Any, run: Any) -> Dict[str, Any]:
     try:
         detail = gateway.get_run(run.run_id)
     except ClaudexorUnavailable as exc:
-        if custody.daemon_says_absent(exc):
+        if custody.daemon_says_absent(exc, gateway=gateway, run=run):
             custody.close_absent_run(pathlib.Path(root), gateway, run, "get_run_absent")
             return {"outcome": custody.CANCEL_CONFIRMED, "detail": "absent"}
         return {"outcome": "unverified", "detail": f"{exc.code}: {exc}"}

@@ -1,9 +1,8 @@
 /* The desktop app around this page, as it reports itself.
 
-   In-app updates replace the core (server and this page) but never the desktop app
-   that hosts the window: its launcher is frozen into the installed bundle, and it
-   alone decides whether the WebView keeps website data and which system bridge
-   methods exist. So the page asks the app, not the core, what it can do here:
+   In-app updates replace the managed source, including the source launcher and its
+   helpers. They cannot replace the installed app's signed executables. The running
+   shell reports its capabilities; a checkout version cannot prove app identity.
 
    - a current app answers `shell_info()` with its own version, its storage and its
      system-notification permission;
@@ -45,7 +44,12 @@ export function describeShell({ bridge = false, info = null, appVersion = '' } =
         const native = info.native_notifications;
         return {
             desktop: true,
-            version: String(info.shell_version || appVersion || ''),
+            version: String(info.bundle_version || info.shell_version || appVersion || ''),
+            ...(typeof info.source_launcher === 'boolean' ? {
+                loadedVersion: String(info.shell_version || ''),
+                sourceLauncher: info.source_launcher,
+                appEntry: typeof info.macos_source_entry === 'boolean' ? info.macos_source_entry : null,
+            } : {}),
             persistentStorage: typeof info.persistent_storage === 'boolean' ? info.persistent_storage : null,
             native: native && typeof native === 'object' ? { ...native } : null,
         };
@@ -63,10 +67,16 @@ const appName = (shell) => `This desktop app${shell?.version ? ` (${shell.versio
 
 /** One line for Settings → Appearance, or '' when there is nothing to disclose. */
 export function shellStorageText(shell) {
-    if (!shell?.desktop || shell.persistentStorage !== false) return '';
+    if (!shell?.desktop) return '';
+    if (shell.sourceLauncher && shell.appEntry === false) {
+        return 'This source launcher is running without the app entry. Its saved Theme and Notifications '
+            + 'may differ from an ordinary app launch. Install the current Ouroboros app to keep the app profile '
+            + 'through updates and restarts. The older Python profile is left untouched.';
+    }
+    if (shell.persistentStorage !== false) return '';
     return `${appName(shell)} erases this window's saved data every time it starts, so Theme and `
         + 'Notifications return to their defaults after a restart. Install the current Ouroboros app to keep '
-        + 'them: updates inside Ouroboros replace its core, not the app around it.';
+        + 'them: updates inside Ouroboros cannot replace the installed app’s signed executables.';
 }
 
 async function serverAppVersion() {

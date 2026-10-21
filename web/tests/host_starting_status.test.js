@@ -6,36 +6,46 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-    computeDerivedChatStatus,
+    bootPhase,
     createStateSnapshotSequencer,
+    startingStatus,
     supervisorReady,
 } from '../modules/chat_activity.js';
 import { createChatInstance } from '../modules/chat.js';
+import { emptyWorkState, roomStatusView } from '../modules/work_status.js';
 import { installDom, restoreDom } from './chat_dom_fixture.js';
+import { projection, room, work } from './work_fixture.js';
 
-test('the reducer says Starting… only where it would say Online', () => {
-    assert.deepEqual(computeDerivedChatStatus({ supervisorStarting: true }),
-        { kind: 'starting', text: 'Starting…', tone: 'starting', showDots: false, dots: 'one' });
-    assert.equal(computeDerivedChatStatus({ supervisorStarting: false }).text, 'Online');
-    assert.equal(computeDerivedChatStatus({}).text, 'Online', 'callers that state nothing keep Online');
+test('the room says Starting… only where it would say Online', () => {
+    const idle = emptyWorkState();
+    assert.deepEqual(roomStatusView(idle, { ready: false }),
+        { kind: 'starting', text: 'Starting…', tone: 'starting', mark: 'none', owner: false, amber: '', title: '' });
+    assert.equal(roomStatusView(idle, { ready: true }).text, 'Online');
+    assert.equal(roomStatusView(idle).text, 'Online', 'callers that state nothing keep Online');
+    const inRoom = (activity, extra) => ({ ...idle, room: room(activity, extra) });
     const outranks = [
-        [{ isConnected: false }, 'Reconnecting…'],
-        [{ hasActiveLiveCard: true }, 'Working'],
-        [{ activeManagedCount: 1 }, 'Working'],
-        [{ activeDirectCount: 1 }, 'Working'],
-        [{ pendingSubmissionsCount: 1 }, 'Sending'],
-        [{ queuedManagedCount: 1 }, 'Queued'],
-        [{ waitingModelCount: 1 }, 'Waiting for access'],
-        [{ pausingManagedCount: 1 }, 'Pausing…'],
-        [{ pausedManagedCount: 1 }, 'Paused'],
+        [idle, { connected: false }, 'Reconnecting…'],
+        [inRoom('working'), {}, 'Working'],
+        [inRoom('working', { call: 'thinking' }), {}, 'Thinking'],
+        [idle, { sending: true }, 'Sending'],
+        [inRoom('queued'), {}, 'Queued'],
+        [inRoom('waiting'), {}, 'Waiting'],
+        [inRoom('working', { transition: 'pausing' }), {}, 'Pausing…'],
+        [inRoom('paused'), {}, 'Paused'],
+        [inRoom('unknown'), {}, 'Activity unconfirmed'],
     ];
-    for (const [input, text] of outranks) {
-        assert.equal(computeDerivedChatStatus({ ...input, supervisorStarting: true }).text, text,
-            `${JSON.stringify(input)} is a fact about work, not about the start`);
+    for (const [state, overlay, text] of outranks) {
+        assert.equal(roomStatusView(state, { ...overlay, ready: false }).text, text,
+            `${text} is a fact about work, not about the start`);
     }
 });
 
 const CRASH = 'Supervisor loop died after 3 consecutive crashes: boom';
+// A restored queued root in Main: its census row beside the server's room for it.
+function queuedBody() {
+    const row = { activity_id: 'q-1', chat_id: 1, kind: 'managed_task', phase: 'queued' };
+    return { active_chat_activities: [row], ...projection(1, [work(row, { activity: 'queued' })], room('queued')) };
+}
 
 test('readiness is the typed boolean alone; an error beside it changes nothing', () => {
     assert.equal(supervisorReady({ supervisor_ready: true }), true);
@@ -87,7 +97,7 @@ function mountChat({ asPanel = false, chatId = asPanel ? 7 : 1, latest = null, c
         status: () => badge()?.textContent,
         kind: () => badge()?.className,
         snapshot: (patch) => instance.hydrateStateSnapshot({
-            active_chat_activities: [], active_chat_activities_complete: true, ...patch,
+            active_chat_activities: [], active_chat_activities_complete: true, ...projection(chatId), ...patch,
         }, Infinity, ++generation),
         setConnected(value) { isConnected = value; handlers.get(value ? 'open' : 'close')?.({ previouslyConnected: true }); },
         settle: async () => { for (let i = 0; i < 8; i += 1) await new Promise((resolve) => setTimeout(resolve, 0)); },
@@ -100,15 +110,14 @@ test('Main: Starting… until supervisor_ready is true, error or not, then Onlin
     try {
         chat.snapshot({ supervisor_ready: false, supervisor_error: null });
         assert.equal(chat.status(), 'Starting…');
-        assert.equal(chat.kind(), 'status-badge starting', 'the existing amber starting tone, not the green one');
+        assert.equal(chat.kind(), 'status-badge starting', 'the starting tone, not the green one');
         chat.snapshot({ supervisor_ready: true });
         assert.equal(chat.status(), 'Online');
         assert.equal(chat.kind(), 'status-badge online');
         chat.snapshot({ supervisor_ready: false, supervisor_error: CRASH });
         assert.equal(chat.status(), 'Starting…', 'readiness went down: never Online, whatever the error says');
         assert.equal(chat.kind(), 'status-badge starting');
-        chat.snapshot({ supervisor_ready: false, supervisor_error: CRASH,
-            active_chat_activities: [{ activity_id: 'q-1', chat_id: 1, kind: 'managed_task', phase: 'queued' }] });
+        chat.snapshot({ supervisor_ready: false, supervisor_error: CRASH, ...queuedBody() });
         assert.equal(chat.status(), 'Queued', 'known work keeps its own word beside the error');
         chat.snapshot({ supervisor_ready: true, supervisor_error: CRASH });
         assert.equal(chat.status(), 'Online', 'only the typed readiness moves the pill; the error lives elsewhere');
@@ -163,8 +172,7 @@ test('Main: a disconnect forgets readiness, so a reconnect never flashes a stale
 test('Main: work during the start keeps its own word; only a ready census clears it', () => {
     const chat = mountChat();
     try {
-        chat.snapshot({ supervisor_ready: false,
-            active_chat_activities: [{ activity_id: 'q-1', chat_id: 1, kind: 'managed_task', phase: 'queued' }] });
+        chat.snapshot({ supervisor_ready: false, ...queuedBody() });
         assert.equal(chat.status(), 'Queued', 'a restored queue row is a fact about work, not the start');
         chat.snapshot({ supervisor_ready: false });
         assert.equal(chat.status(), 'Activity unconfirmed', 'an incomplete census retains the row without claiming its old phase is current');
@@ -223,5 +231,69 @@ test('Project panel: a late mount after a reconnect never seeds from the body be
         assert.equal(panel.status(), 'Starting…', 'the panel re-proves readiness after its own reconnect');
         await panel.settle();
         assert.equal(panel.status(), 'Starting…', "the reconnect's census read states no readiness");
+    } finally { panel.close(); }
+});
+
+// --- the boot phases (/api/state.boot, the same object as /api/health.boot) --------------
+
+const SERVING = { phase: 'serving', since: 't', dialogue_ready: false, tasks_ready: false, steps: [], jobs: {}, error: null };
+const CHAT_READY = { ...SERVING, dialogue_ready: true, steps: [{ name: 'extensions', state: 'running', started_at: 't', ended_at: null, error: null }] };
+const FAILED = { ...SERVING, phase: 'failed', error: 'current-facts store not published: failed' };
+const SOFT_FAILED = { ...CHAT_READY, steps: [{ name: 'extensions', state: 'failed', started_at: 't', ended_at: 't', error: 'ValueError: bad manifest' }] };
+
+test('bootPhase reads the typed object alone', () => {
+    assert.deepEqual(bootPhase({ boot: SERVING }), SERVING);
+    for (const body of [null, undefined, {}, { boot: null }, { boot: 'serving' }, { boot: { dialogue_ready: true } }]) {
+        assert.equal(bootPhase(body), null, `${JSON.stringify(body)} states no phase`);
+    }
+});
+
+test('the Starting… header follows the phase: starting, chat ready, failed', () => {
+    assert.deepEqual(startingStatus(null), { kind: 'starting', text: 'Starting…', title: '' });
+    assert.deepEqual(startingStatus(SERVING), { kind: 'starting', text: 'Starting…', title: '' });
+    assert.deepEqual(startingStatus(CHAT_READY),
+        { kind: 'starting', text: 'Chat ready, restoring background tasks', title: '' });
+    assert.deepEqual(startingStatus(FAILED),
+        { kind: 'starting', text: 'Start failed', title: 'current-facts store not published: failed' });
+    assert.deepEqual(startingStatus(SOFT_FAILED),
+        { kind: 'starting', text: 'Chat ready, restoring background tasks', title: 'extensions: ValueError: bad manifest' },
+        'a fail-soft step shows its error while the start goes on');
+    const idle = emptyWorkState();
+    assert.equal(roomStatusView(idle, { ready: false, boot: CHAT_READY }).text, 'Chat ready, restoring background tasks');
+    assert.equal(roomStatusView(idle, { ready: true, boot: FAILED }).text, 'Online',
+        'readiness outranks the phase: a ready supervisor is Online whatever the boot said');
+    assert.equal(roomStatusView({ ...idle, room: room('queued') }, { ready: false, boot: CHAT_READY }).text,
+        'Queued', 'work keeps its own word beside the phase');
+});
+
+test('Main: the header paints the phase from the snapshot and forgets it on disconnect', async () => {
+    const chat = mountChat();
+    try {
+        chat.snapshot({ supervisor_ready: false, boot: SERVING });
+        assert.equal(chat.status(), 'Starting…');
+        chat.snapshot({ supervisor_ready: false, boot: CHAT_READY });
+        assert.equal(chat.status(), 'Chat ready, restoring background tasks');
+        assert.equal(chat.kind(), 'status-badge starting', 'still the starting tone: tasks are not admitted yet');
+        chat.instance.hydrateStateSnapshot({ supervisor_ready: false }, Infinity, 50);
+        assert.equal(chat.status(), 'Chat ready, restoring background tasks', 'a body without the phase changes nothing');
+        chat.snapshot({ supervisor_ready: false, boot: FAILED });
+        assert.equal(chat.status(), 'Start failed');
+        assert.equal(globalThis.document.byId.get('chat-status').title, FAILED.error, 'the cause rides the badge title');
+        chat.snapshot({ supervisor_ready: true, boot: { ...CHAT_READY, phase: 'ready', tasks_ready: true } });
+        assert.equal(chat.status(), 'Online');
+        assert.equal(globalThis.document.byId.get('chat-status').title, '');
+        chat.setConnected(false);
+        chat.setConnected(true);
+        assert.equal(chat.status(), 'Starting…', 'the host may have restarted: the phase is proven again');
+        await chat.settle();
+    } finally { chat.close(); }
+});
+
+test('Project panel: seeds the phase from the page snapshot', () => {
+    const panel = mountChat({ asPanel: true, latest: { supervisor_ready: false, boot: CHAT_READY } });
+    try {
+        assert.equal(panel.status(), 'Chat ready, restoring background tasks');
+        panel.snapshot({ supervisor_ready: true });
+        assert.equal(panel.status(), 'Online');
     } finally { panel.close(); }
 });

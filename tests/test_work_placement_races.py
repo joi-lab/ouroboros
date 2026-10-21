@@ -13,6 +13,7 @@ from ouroboros import project_placement as placement
 from ouroboros.projects_registry import (
     begin_project_deletion, create_project, get_project, project_binding_for_task,
 )
+from tests import _dialogue as dialogue_test
 from tests.test_swarm_host_admission import host, rows  # noqa: F401
 
 pytestmark = pytest.mark.serial
@@ -75,7 +76,7 @@ def test_button_and_mind_capture_unbound_then_commit_one_placement(host, monkeyp
     assert project_binding_for_task(host.root, "one")["project_id"] == winner
     assert get_project(host.root, "mind" if winner == "owner" else "owner") is None
     assert list(host.running) == ["one"] and not host.pending and task == before
-    handoffs = [row for row in rows(host.root / "logs/chat.jsonl") if row.get("type") == "project_handoff"]
+    handoffs = [row for row in dialogue_test.log_rows(host.root / "logs/chat.jsonl") if row.get("type") == "project_handoff"]
     assert len(handoffs) <= 1 and all(row["task_id"] == "one" for row in handoffs)
 
 

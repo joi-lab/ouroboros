@@ -11,6 +11,8 @@ import json
 
 import pytest
 
+from ouroboros.test_evidence import diagnostic_directory
+
 pytest_plugins = ("tests.test_ui_smoke_playwright",)
 
 
@@ -82,7 +84,7 @@ def test_ui_smoke_update_letter_renders_below_the_action(direct_server, tmp_path
             # The rendered card is saved for the human who runs this lane: DEVELOPMENT's
             # visible-change rule is satisfied by INSPECTING it, and a stored file alone is
             # not that inspection — it is what makes the inspection possible from CI.
-            shot = tmp_path / "updates_letter.png"
+            shot = diagnostic_directory(tmp_path, "updates-letter") / "updates_letter.png"
             page.screenshot(path=str(shot), full_page=True)
             assert shot.stat().st_size > 0
             print(f"update letter card rendered for inspection: {shot}")

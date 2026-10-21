@@ -307,6 +307,19 @@ def room_chat_lens_dir(drive_root: Any, project_id: str) -> tuple[str, str]:
     return str(resolved), ""
 
 
+def room_lens_applies(task: dict) -> bool:
+    """Whether a room's folder (``room_chat_lens_dir``) is this direct turn's default.
+
+    A room default never replaces a resource the work keeps: its own workspace, or a
+    recorded ``system_repo``/``explicit_none`` intent. Ordinary direct turns record no
+    intent; readmission records ``system_repo`` for placed body work (``project_placement``).
+    """
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    intent = metadata.get("resource_intent") if isinstance(metadata.get("resource_intent"), dict) else {}
+    return (bool(task.get("_is_direct_chat")) and not str(task.get("workspace_root") or "").strip()
+            and intent.get("kind") not in {"system_repo", "explicit_none"})
+
+
 def compose_workspace_block(
     *,
     workspace_root: Any,

@@ -266,6 +266,7 @@ def triad_not_dispatched_records(
     default covers every row (the Q25-A admission block). ``slot`` keeps each
     seat's ORIGINAL 1-based position in the configured plan."""
     from ouroboros.reviewer_slot_config import row_plan_retrieves
+    from ouroboros.review_records import review_failure_facts
 
     models = list(row_plan.get("models") or [])
     routes = list(row_plan.get("routes") or [])
@@ -283,6 +284,7 @@ def triad_not_dispatched_records(
             "model_id": str(model),
             "status": "not_dispatched",
             "raw_text": str(reason),
+            **review_failure_facts({"status": "not_dispatched", "raw_text": reason}),
             "parsed_items": [],
             "tokens_in": 0,
             "tokens_out": 0,
@@ -315,7 +317,8 @@ def drop_api_rows(row_plan: dict) -> dict:
     # The per-seat brief vectors and the added-seat bit ride along when the plan
     # already carries them — by the SAME indices, so a critic the author added
     # beside the pool stays an added (uncounted) seat after the drop.
-    vectors += [key for key in ("parts", "session_tasks", "session_policies", "brief_shas", "additional")
+    vectors += [key for key in ("parts", "session_tasks", "session_policies", "brief_shas", "additional",
+                               "processing_preferences", "session_accesses")
                 if key in row_plan]
     for key in vectors:
         rows = list(row_plan.get(key) or [])
