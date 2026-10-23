@@ -230,7 +230,8 @@ export async function resumeTaskAction(taskId, { resume = resumeTask, toast = sh
         if (ack?.ok !== true) throw new Error('Resume acknowledgement is unknown; retry this action.');
         pauseRequestIds.delete(id);
         // An answered root's late work (D10) continues in place; its answer stays delivered.
-        toast(ack.late_phase ? 'Resuming: the work left after the delivered answer continues.'
+        toast(ack.tree_only ? 'Resumed. Ouroboros or you choose which helpers continue.'
+            : ack.late_phase ? 'Resuming: the work left after the delivered answer continues.'
             : 'Resuming: the task returns to the queue.', 'info');
     } catch (exc) {
         // The server names the refusal (replay_unsafe / fence missing /
@@ -239,7 +240,7 @@ export async function resumeTaskAction(taskId, { resume = resumeTask, toast = sh
         // Handled here, never rethrown: the menu callback is fire-and-forget.
         const facts = heldWorkFacts(exc?.body?.blockers);
         toast(facts ? `Resume refused: ${facts}.${exc.body.action === 'wait_or_stop_the_previous_work'
-            ? ' Wait for that work or stop it.' : ''}` : `Resume refused: ${exc?.message || exc}`, 'error');
+            ? ' Wait for that work or stop it.' : ''}` : exc?.body?.message || `Resume refused: ${exc?.message || exc}`, 'error');
     } finally {
         inFlight.delete(id);
     }

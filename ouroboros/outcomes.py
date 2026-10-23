@@ -1030,11 +1030,11 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         # host-fallback prefix table below already assigns to this exact
         # terminal text; calling it a provider failure made the two paths of
         # this one function contradict each other.
-        failure = {"kind": "runtime" if reason_code == REASON_TASK_EXCEPTION else "provider", "reason_code": reason_code}
-        # The overflow salvage keeps `llm_api_error`; a waited-out outage or the unknown
-        # no-resend fence may leave the same sticky kind behind under its own reason code,
-        # and the published projection must not contradict the terminal that chose it.
-        if reason_code == "llm_api_error" and str(usage.get("_last_llm_error_kind") or "") == "context_overflow":
+        failure = {"kind": "runtime" if reason_code in {REASON_TASK_EXCEPTION, "context_overflow"} else "provider",
+                   "reason_code": reason_code}
+        # Forecasts use context_overflow; actual/legacy provider failures keep llm_api_error.
+        # A waited-out outage or unknown outcome keeps its own terminal cause.
+        if reason_code in {"llm_api_error", "context_overflow"} and str(usage.get("_last_llm_error_kind") or "") == "context_overflow":
             failure["error_kind"] = "context_overflow"
     elif (
         usage_status == RESULT_FAILED
@@ -1206,14 +1206,17 @@ def collect_trace_refs(usage: Dict[str, Any], llm_trace: Dict[str, Any]) -> Dict
     execution_id = str(usage.get("execution_id") or "").strip()
     if execution_id:
         refs["execution_id"] = execution_id
+    for key in ("timeout_repeat", "output_recovery"):
+        if isinstance(llm_trace.get(key), dict):
+            refs[key] = copy.deepcopy(llm_trace[key])
     llm_refs = [
         {key: item.get(key) for key in (
             "llm_call_id", "execution_id", "round_id", "round", "request_ref",
             "response_ref", "model", "resolved_model", "provider",
-            "reported_model", "use_local", "usable_solve_response",
+            "reported_model", "use_local", "usable_solve_response", "manifest_ref",
         )}
         for item in usage.get("llm_call_refs") or []
-        if isinstance(item, dict) and (not item.get("failure_code") or "response_ref" in item)
+        if isinstance(item, dict) and (not item.get("failure_code") or "response_ref" in item or "manifest_ref" in item)
     ]
     if llm_refs:
         refs["llm_call_refs"] = llm_refs

@@ -371,7 +371,7 @@ class ChronicleStore:
                     db.execute("UPDATE active_marks SET body=? WHERE id=?", (_json(mark), record["target_id"]))
             elif kind == "mark_release":
                 db.execute("DELETE FROM active_marks WHERE id=?", (record["target_id"],))
-            elif kind == "page":
+            elif kind == "page" and not record.get("metadata", {}).get("candidate"):
                 db.executemany("INSERT INTO page_rows VALUES (?,?,?)",
                                [(room, record_id, str(ref)) for ref in record["covers"]["rows"]])
             elif kind == "part":
@@ -381,6 +381,11 @@ class ChronicleStore:
                 # A rejected draft stops acting: its rows are open and its members unfolded again.
                 db.execute("DELETE FROM page_rows WHERE page_id=?", (record["target_id"],))
                 db.execute("DELETE FROM folded WHERE part_id=?", (record["target_id"],))
+            elif kind == "decision" and record.get("accepted"):
+                target = self._get(db, record["target_id"])
+                if target.get("metadata", {}).get("candidate"):
+                    db.executemany("INSERT INTO page_rows VALUES (?,?,?)",
+                                   [(target["room_id"], target["id"], ref) for ref in target["covers"]["rows"]])
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"chronicle projection conflict: {exc}") from exc
 
@@ -629,6 +634,8 @@ class ChronicleStore:
         return rule(db, record) if rule else None
 
     def _rule_page(self, db, record):
+        if record.get("metadata", {}).get("candidate") and record.get("author", {}).get("kind") != "helper":
+            return _refuse("invalid", "a candidate is a signed helper draft awaiting the mind's decision")
         covers, room = record.get("covers"), record["room_id"]
         rows = covers.get("rows") if isinstance(covers, dict) else None
         if (not isinstance(rows, list) or not rows or not all(_nonblank(r) for r in rows)
@@ -662,8 +669,8 @@ class ChronicleStore:
         kinds = {m["kind"] for m in members}
         if len(kinds) != 1 or not kinds <= _FOLDABLE or any(m["room_id"] != room for m in members):
             return _refuse("invalid", "members are all pages, all legacy sections or all parts of the part's room")
-        if any(self._status(db, m) == "rejected" for m in members):
-            return _refuse("invalid", "a rejected draft does not act and cannot be folded")
+        if any(self._status(db, m) in ("rejected", "candidate") for m in members):
+            return _refuse("invalid", "a rejected or pending candidate draft does not act and cannot be folded")
         holders = {part for (part,) in db.execute(
             "SELECT part_id FROM folded WHERE member_id IN (%s)" % ",".join("?" * len(ids)), ids)}
         if holders:
@@ -704,6 +711,8 @@ class ChronicleStore:
         prior = db.execute("SELECT id FROM records WHERE target=? AND kind='decision'", (target["id"],)).fetchone()
         if prior:
             return _refuse("invalid", "the draft is already decided", conflict_ids=(prior[0],))
+        if record["accepted"] and target.get("metadata", {}).get("candidate"):
+            return self._rule_page(db, target)  # adoption must still have exclusive coverage
         holder = db.execute("SELECT part_id FROM folded WHERE member_id=?", (target["id"],)).fetchone()
         if holder and not record["accepted"]:
             # A rejected draft stops acting, so it cannot stay a member of an acting part.
@@ -848,7 +857,7 @@ class ChronicleStore:
         decision = db.execute("SELECT body FROM records WHERE target=? AND kind='decision' ORDER BY sequence DESC "
                               "LIMIT 1", (record["id"],)).fetchone()
         if not decision:
-            return "draft"
+            return "candidate" if record.get("metadata", {}).get("candidate") else "draft"
         return "accepted" if json.loads(decision[0]).get("accepted") else "rejected"
 
     def _order_key(self, db, record, cache) -> Tuple[Any, ...]:
@@ -871,7 +880,7 @@ class ChronicleStore:
             "SELECT sequence,body FROM records WHERE room=? AND kind=? AND id NOT IN (SELECT member_id FROM folded) "
             "ORDER BY sequence", (room, kind))]
         cache: Dict[str, Tuple[Any, ...]] = {}
-        effective = [r for r in rows if self._status(db, r) != "rejected"]
+        effective = [r for r in rows if self._status(db, r) not in ("rejected", "candidate")]
         return [r["id"] for r in sorted(effective, key=lambda r: self._order_key(db, r, cache))]
 
     @staticmethod
@@ -1045,7 +1054,7 @@ class ChronicleStore:
             rows = [{**json.loads(body), "sequence": seq} for seq, body in db.execute(
                 "SELECT sequence,body FROM records WHERE room=? AND sequence>? AND kind IN (%s) ORDER BY sequence"
                 % ",".join("?" * len(STORY_KINDS)), (str(room_id), int(after_seq), *STORY_KINDS))]
-            return [r for r in (self._interpret(db, row) for row in rows) if r.get("status") != "rejected"]
+            return [r for r in (self._interpret(db, row) for row in rows) if r.get("status") not in ("rejected", "candidate")]
 
     def pages_of_room(self, room_id: Any) -> List[Dict[str, Any]]:
         """Effective pages and parts of a room, interpreted, in story order."""
@@ -1054,8 +1063,15 @@ class ChronicleStore:
                 "SELECT sequence,body FROM records WHERE room=? AND kind IN ('page','part') ORDER BY sequence",
                 (str(room_id),))]
             cache: Dict[str, Tuple[Any, ...]] = {}
-            effective = [r for r in (self._interpret(db, row) for row in rows) if r.get("status") != "rejected"]
+            effective = [r for r in (self._interpret(db, row) for row in rows) if r.get("status") not in ("rejected", "candidate")]
             return sorted(effective, key=lambda r: self._order_key(db, r, cache))
+
+    def pending_candidates(self) -> List[Dict[str, Any]]:
+        """Signed drafts visible to a wake for decision, without acting coverage or story residency."""
+        with self._index() as db:
+            rows = [{**json.loads(body), "sequence": seq} for seq, body in db.execute(
+                "SELECT sequence,body FROM records WHERE kind='page' ORDER BY sequence")]
+            return [self._interpret(db, row) for row in rows if self._status(db, row) == "candidate"]
 
     def accounts(self) -> List[Dict[str, Any]]:
         """Every account, interpreted (sources with their later changes, the acting selection), in publication order."""

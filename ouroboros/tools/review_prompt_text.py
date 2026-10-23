@@ -47,7 +47,8 @@ Before marking any finding CRITICAL you MUST:
 2. Confirm this artifact actually exists in the repo context you have been given.
 3. If the concern depends on a hypothetical plugin, future integration, custom
    environment, fixture, or finalizer that does NOT appear in this repo's
-   codebase — mark it **advisory**, not critical.
+   codebase — mark it **advisory**, not critical. An extension installed through
+   the public extension API is not hypothetical (item 8).
 4. One root cause = one FAIL entry. Do NOT split one problem into multiple FAIL
    items that all require the same fix.
 5. If a previous CRITICAL finding was concretely fixed and only a broader
@@ -65,9 +66,12 @@ Before marking any finding CRITICAL you MUST:
    a crash or restart, a concurrent writer Ouroboros itself runs, a platform it
    ships on. A fault that needs someone who already holds the power (the owner
    or Ouroboros editing, planting or restoring files under its own data root) is
-   **advisory**, and disclosure is a valid fix. A remedy that adds a check,
-   re-read, proof or refusal states what it costs on the path it sits on at
-   today's history size, or what work it refuses.
+   **advisory**, and disclosure is a valid fix. Ordinary use of a supported
+   capability — installing an official or OuroborosHub skill through the public
+   extension API, choosing a supported provider or setting — is a supported-install
+   trigger, not such a power: the extension need not ship in this repo. A remedy
+   that adds a check, re-read, proof or refusal states what it costs on the path it
+   sits on at today's history size, or what work it refuses.
 
 When in doubt: use "advisory". Reserve "critical" for clear, concrete,
 repo-local, reachable defects.

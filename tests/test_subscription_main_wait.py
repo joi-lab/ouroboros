@@ -183,6 +183,7 @@ def test_main_authored_checkpoint_after_a_real_projected_image_wait(main_call, m
     monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "max")
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     monkeypatch.setenv("MCP_ENABLED", "false")
     monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_a: False)
     monkeypatch.setattr(vision_routing, "get_image_input_mode", lambda: "off")
@@ -221,6 +222,7 @@ def test_main_authored_checkpoint_after_a_real_projected_image_wait(main_call, m
 def test_reprepare_selected_vision_route_preserves_source_and_accounts_caption(main_call, monkeypatch, inline_first):
     from ouroboros import vision_routing
     from ouroboros.loop_llm_call import _prepare_main_messages
+    from ouroboros.llm_attempt import single_physical_send, single_physical_send_active
 
     ctx, _gateway, _controller, _events, _decide, _observations = main_call
     image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}}
@@ -231,7 +233,7 @@ def test_reprepare_selected_vision_route_preserves_source_and_accounts_caption(m
     captions = []
     def caption(*args, **kwargs):
         assert ua.current_physical_attempt_context() is None
-        captions.append(True)
+        captions.append(single_physical_send_active())
         return "A complete caption", {"prompt_tokens": 2, "completion_tokens": 3, "cost": 0.01}
     monkeypatch.setattr(ctx.llm, "vision_query", caption)
     sent = _prepare_main_messages(ctx.messages, model=MODEL, model_role="main", model_account_override=None,
@@ -239,13 +241,14 @@ def test_reprepare_selected_vision_route_preserves_source_and_accounts_caption(m
         task_id=ctx.task_id, event_queue=ctx.event_queue, use_local=False, task_attempt=1, deadline_ts=None)
     assert (sent[-1]["content"] == [image]) is inline_first
     physical = loop._physical_context_for_fit(loop._measure_round_main_fit(ctx, automatic_pass_used=False))
-    with ua.bind_physical_attempt_context(physical):
+    with ua.bind_physical_attempt_context(physical), single_physical_send(lambda _reservation: None):
         prepared = _reprepare_waiting_main(ctx, {"messages": sent, "model": "openai::vision-route",
                                                 "model_role": "main", "tools": []})
+        assert single_physical_send_active()  # the Main claim resumes after helper preparation
     prepared_source = _without_context_facts(prepared.kwargs["messages"])
     assert (prepared_source[-1]["content"] == [image]) is not inline_first
     assert "image caption" in str(prepared_source[-1]["content"] if inline_first else sent[-1]["content"])
-    assert _without_context_facts(ctx.messages)[-1]["content"] == [image] and captions == [True]
+    assert _without_context_facts(ctx.messages)[-1]["content"] == [image] and captions == [False]
     assert ctx.accumulated_usage["cost"] == 0.01
 
 

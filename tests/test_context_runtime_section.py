@@ -18,6 +18,25 @@ from ouroboros.context import build_runtime_section, build_user_content
 
 from tests._context_shared import _make_health_env
 
+
+@pytest.mark.parametrize("root_only", [False, True])
+def test_schedule_digest_distinguishes_unreadable_from_empty(tmp_path, root_only):
+    from types import SimpleNamespace
+    from ouroboros.context import _scheduled_tasks_digest
+
+    env = SimpleNamespace(drive_root=tmp_path) if root_only else SimpleNamespace(drive_path=lambda rel: tmp_path / rel)
+    path = tmp_path / "state" / "scheduled_tasks.json"
+    path.parent.mkdir()
+    path.write_text("{unreadable", encoding="utf-8")
+    unreadable = _scheduled_tasks_digest(env)
+    assert unreadable["unavailable"] and "standing" not in unreadable
+    assert unreadable["pointer"] == "manage_schedules(action='list')"
+    path.write_text('{"tasks": []}', encoding="utf-8")
+    empty = _scheduled_tasks_digest(env)
+    assert "unavailable" not in empty
+    assert empty["standing"] == empty["attention"] == empty["one_shots"] == []
+
+
 @pytest.mark.parametrize("enforcement", ["blocking", "advisory"])
 def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text(
     monkeypatch, enforcement,
@@ -83,7 +102,9 @@ def test_runtime_section_includes_light_runtime_mode_rule(tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize("trigger", ["once", "cron"])
-def test_runtime_keeps_the_admitted_occurrences_due_time_after_schedule_advances(tmp_path, trigger):
+@pytest.mark.parametrize("previous", [None, {"task_id": "prior", "state": "pending_observation"},
+                                     {"task_id": "prior", "state": "completed", "quiet": True, "line": ""}])
+def test_runtime_keeps_the_admitted_occurrences_due_time_after_schedule_advances(tmp_path, trigger, previous):
     env = _make_health_env(tmp_path)
     due = "2026-09-29T00:30:00+00:00"
     claimed = "2026-09-30T03:00:00+00:00"
@@ -91,18 +112,21 @@ def test_runtime_keeps_the_admitted_occurrences_due_time_after_schedule_advances
         "id": "follow-up", "enabled": trigger == "cron", "name": "Review results",
         "trigger": {"type": trigger, "run_at": due, "expr": "30 0 * * *"},
         "next_run_at": "2026-10-01T00:30:00+00:00",
+        **({"completed_at": claimed} if trigger == "once" else {}),
     }]}), encoding="utf-8")
     task = {"id": "late-run", "type": "task", "metadata": {"schedule_occurrence": {
         "schedule_id": "follow-up", "token": "occurrence-token", "due_at": due, "claimed_at": claimed,
+        **({"previous": previous} if previous is not None else {}),
     }}}
     runtime = json.loads(build_runtime_section(env, task).split("\n\n", 1)[1])
     assert runtime["task"]["schedule_occurrence"] == {
         "schedule_id": "follow-up", "due_at": due, "claimed_at": claimed,
+        **({"previous": previous} if previous is not None else {}),
     }
     if trigger == "once":
-        assert "scheduled_tasks" not in runtime  # consumed one-shot no longer appears in the digest
+        assert not any(runtime["scheduled_tasks"][group] for group in ("standing", "attention", "one_shots"))
     else:
-        assert runtime["scheduled_tasks"]["active"][0]["next_run_at"] != due
+        assert runtime["scheduled_tasks"]["standing"][0]["next_run_at"] != due
 
 
 def test_runtime_does_not_invent_a_due_time_for_legacy_or_ordinary_work(tmp_path):
@@ -467,7 +491,7 @@ def _delegation_fact(tmp_path, monkeypatch):
     return payload["capabilities"]
 
 
-def test_delegation_fact_carries_historical_rows_and_profile_evidence(tmp_path, monkeypatch):
+def test_delegation_fact_carries_historical_identities_and_profile_readers(tmp_path, monkeypatch):
     root = _delegation_data_root(tmp_path, monkeypatch)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claudexor=opus-5:high")
     (root / "state" / "reviewer_slot_last_execution.json").write_text(json.dumps({
@@ -508,34 +532,31 @@ def test_delegation_fact_carries_historical_rows_and_profile_evidence(tmp_path, 
 
     assert "configured_route" not in delegation
     rows = {row["slot"]: row for row in delegation["reviewer_slots_last"]}
-    assert rows["triad_1"]["outcome"] == "ok"
-    assert rows["triad_1"]["requested_profile"] == "requested-review-profile"
-    assert rows["triad_1"]["applied_profile"] == "applied-review-profile"
-    assert "failure_code" not in rows["triad_1"]
-    assert rows["triad_2"]["outcome"] == "failed"
-    assert rows["triad_2"]["failure_code"] == "subscription_window_exhausted"
-    assert rows["triad_2"]["reset_at"] == "2026-08-18T09:20:00+00:00"
-    # Per-row label is the timestamp only; the verbatim historical disclaimer
-    # lives ONCE in the note (review fix 12), never repeated per row.
-    assert rows["triad_1"]["observed"] == "last observed at 2026-08-18T01:02:03+00:00"
-    last = delegation["subagent_last_delegation"]
-    assert last["route"] == "claudexor"
-    assert last["applied_model"] == "claude-opus-5"
-    assert last["requested_profile"] == "requested-delegate-profile"
-    assert last["applied_profile"] == "applied-delegate-profile"
-    # Named from the record's own facts (no typed identity here: its route target).
-    assert last["selected_subagent_id"] == "claudexor=opus-5"
-    assert last["observed"] == "last observed at 2026-08-18T02:00:00+00:00"
-    assert "historical" not in rows["triad_1"]["observed"]
-    # The prompt-visible note teaches the semantics ONCE: rows are history, live
-    # facts come from plan-review waves and typed delegate refusals.
-    assert "historical, not live health" in delegation["note"]
-    assert "plan-review wave rows" in delegation["note"]
-    assert "typed" in delegation["note"] and "refusal" in delegation["note"]
-    assert "never healthy" in delegation["note"]
+    assert rows["triad_1"] == {"slot": "triad_1", "outcome": "ok", "observed": "2026-08-18T01:02:03+00:00"}
+    assert rows["triad_2"]["outcome"] == "error"
+    (last,) = delegation["subagents_last_executions"]
+    assert last["selected_subagent_id"] == "claudexor=opus-5" and last["run_id"] == "run-1"
+    assert last["observed"] == "2026-08-18T02:00:00+00:00"
+    assert "not live health" in delegation["note"]
+    assert not any(key in json.dumps(delegation) for key in
+                   ("requested_profile", "applied_profile", "failure_code", "reset_at"))
+    # The exact readers retain the account and failure evidence instead of copying it inline.
+    records = {}
+    for reader in delegation["readers"]:
+        assert reader["tool"] == "read_file" and reader["arguments"]["root"] == "runtime_data"
+        path = reader["arguments"]["path"]
+        records[path] = json.loads((root / path).read_text(encoding="utf-8"))
+    reviews = records["state/reviewer_slot_last_execution.json"]
+    assert reviews["triad_1"]["requested"]["profile_id"] == "requested-review-profile"
+    assert reviews["triad_1"]["effective"]["profile_id"] == "applied-review-profile"
+    assert reviews["triad_2"]["failure_code"] == "subscription_window_exhausted"
+    assert reviews["triad_2"]["reset_at"] == "2026-08-18T09:20:00+00:00"
+    saved = records["state/subagent_last_delegation.json"]
+    assert saved["requested_profile"] == "requested-delegate-profile"
+    assert saved["applied_profile"] == "applied-delegate-profile" and saved["applied_model"] == "claude-opus-5"
 
 
-def test_delegation_fact_undated_window_code_surfaces_without_reset(tmp_path, monkeypatch):
+def test_delegation_fact_addresses_undated_window_code_without_inventing_reset(tmp_path, monkeypatch):
     root = _delegation_data_root(tmp_path, monkeypatch)
     monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
     (root / "state" / "reviewer_slot_last_execution.json").write_text(json.dumps({
@@ -549,9 +570,11 @@ def test_delegation_fact_undated_window_code_surfaces_without_reset(tmp_path, mo
     delegation = _delegation_fact(tmp_path, monkeypatch)["delegation"]
 
     (row,) = delegation["reviewer_slots_last"]
-    assert row["failure_code"] == "credential_pool_exhausted"
-    assert "reset_at" not in row
-    assert row["outcome"] == "failed"
+    assert "failure_code" not in row and "reset_at" not in row
+    assert row["outcome"] == "error"
+    reader = delegation["readers"][0]
+    stored = json.loads((root / reader["arguments"]["path"]).read_text(encoding="utf-8"))["scope"]
+    assert stored["failure_code"] == "credential_pool_exhausted" and "reset_at" not in stored
 
 
 def test_delegation_fact_absent_files_mean_absent_observations_not_health(tmp_path, monkeypatch):

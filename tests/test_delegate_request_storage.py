@@ -213,7 +213,7 @@ def test_lost_ack_keeps_the_original_start_claim_when_its_body_is_unreadable(tmp
             keys.append(idempotency_key)
             if len(keys) == 1:
                 raise gateway.ClaudexorUnavailable("daemon_unreachable", "fixture accepted start then lost reply")
-            return {"runId": "original-run"}
+            return {"runId": f"run-{len(keys)}"}
 
     stub = LostAcknowledgment()
     _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
@@ -233,14 +233,15 @@ def test_lost_ack_keeps_the_original_start_claim_when_its_body_is_unreadable(tmp
     _audit_task_custody(tmp_path, "owner", audit, emit_evidence=False)
     assert audit["pending_invocation_ids"] == [token]
     assert audit["unreconciled"] == [f"invocation:{token}"]
-    fresh = json.loads(delegate._delegate_start(ctx, "Inspect fixture files.").text)
-    assert fresh["reason"] == "replacement_requires_settlement" and keys == [token]
+    fresh = json.loads(delegate._delegate_start(ctx, "Inspect other fixture files.").text)
+    assert fresh["status"] == "started" and keys[0] == token and keys[1] != token
+    new_token = keys[1]
     retry = json.loads(delegate._delegate_start(ctx, "Inspect fixture files.", retry_of=token).text)
     if damage:
-        assert retry["reason"] == "invocation_request_unrecorded" and keys == [token]
+        assert retry["reason"] == "invocation_request_unrecorded" and keys == [token, new_token]
         assert "Start a new run" not in retry["detail"]
     else:
-        assert retry["status"] == "started" and keys == [token, token]
+        assert retry["status"] == "started" and keys == [token, new_token, token]
 
 
 @pytest.mark.parametrize("damage", ["missing", "corrupt"])

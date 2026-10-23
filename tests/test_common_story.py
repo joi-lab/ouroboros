@@ -3,8 +3,8 @@
 An account is my own text over exact source versions of several rooms; it is provenance, never
 ownership: publishing it seals no row, folds nothing, moves no head and leaves every source free
 to inform another account or to be folded locally. Selection is a separate act: it shows the
-account in the story in place of the records it names, whose count, period and composition reader stay visible and
-keep their detail on their room's page. A later correction, rejection or fold of a source is
+account in the story in place of the records it names, whose count, period and composition reader stay visible;
+their detail remains at exact source readers. A later correction, rejection or fold of a source is
 visible as not in the account; the account's own basis never changes, and a copied or missing
 source is a disclosed gap, not fabricated text. Root and child read the same account; a nanny
 reads none. Every rule is pinned in both directions on the shared world fixture; no test calls
@@ -149,10 +149,14 @@ def test_selection_replaces_only_the_named_records_and_the_rest_stay_whole(tmp_p
     assert "\nMy accounts across rooms: 1 written, 1 in the common view.\n" in story + "\n"
     # Root and child read the same account block; the story is the same bytes; a nanny has none.
     assert _story(tmp_path, KID) == story and mv.render_story(_snapshot(tmp_path, NANNY)) == ""
-    # The local reader keeps A1 whole: a root working in Alpha sees its page's detail on the room page.
-    room = mv.render_room(_snapshot(tmp_path, {"id": "rootA001", "chat_id": rooms["alpha"]}))
-    assert f"### Pages of this room\n#### {a1} — 2026-09-03 00:03 → 2026-09-03 00:03\n  Alpha asked again and I counted." in room
+    # The selected account suppresses A1 in Alpha's resident view too; its exact source stays readable.
+    alpha_task = {"id": "rootA001", "chat_id": rooms["alpha"]}
+    room = mv.render_room(_snapshot(tmp_path, alpha_task))
+    assert "Alpha asked again and I counted." not in room
     assert G_TEXT not in room
+    source = _memory_read(_ctx(tmp_path), node_id=a1, revision=a1)
+    assert f"as of revision {a1}: the original alone" in source
+    assert "text:\nAlpha asked again and I counted." in source
     main_room = mv.render_room(_snapshot(tmp_path))
     assert "### Pages of this room" not in main_room and "Main started" not in main_room  # B1 is whole in the story
     # An empty replaces list shows the account beside everything; a withdrawn selection takes it out again.
@@ -162,6 +166,10 @@ def test_selection_replaces_only_the_named_records_and_the_rest_stay_whole(tmp_p
     assert store.select_account(g, replaces=[a1], shown=False, author=shared.MIND, reason="not yet").ok
     withdrawn = _story(tmp_path)
     assert G_TEXT not in withdrawn and "Alpha asked again and I counted." in withdrawn
+    restored = _snapshot(tmp_path, alpha_task)
+    assert "Alpha asked again and I counted." in mv.render_story(restored)
+    assert "Alpha asked again and I counted." not in mv.render_room(restored)  # once, in the restored story
+    assert _memory_read(_ctx(tmp_path), node_id=a1, revision=a1) == source
     assert "\nMy accounts across rooms: 1 written, 0 in the common view (the rest one memory_read away).\n" in withdrawn + "\n"
 
 
@@ -336,9 +344,9 @@ def test_a_correction_after_the_account_keeps_its_basis_and_is_shown_as_not_inco
     assert f"- later correction of its source {a1} (not in this account):\n  I counted twice, not once." in block
     assert "correction by me of" not in block  # not a fold's correction line: the relation is provenance
     assert G_TEXT in block  # the account's own words are untouched
-    # The local corrected text is usable: the room page and the reader show the page with its correction.
+    # The told page stays at its exact readers, never again in the room; the reader shows it with its correction.
     room = mv.render_room(_snapshot(tmp_path, {"id": "rootA001", "chat_id": rooms["alpha"]}))
-    assert "Alpha asked again and I counted.\n\n  [correction " in room and "I counted twice, not once." in room
+    assert "Alpha asked again and I counted." not in room and "I counted twice, not once." not in room
     read = _memory_read(_ctx(tmp_path), node_id=g)
     assert f"revision {a1} used; later corrections not in this account: {fix.record['id']}; memory_read(node_id={a1}, revision={a1})" in read
     assert "based on 2 sources, " in read.split("\n")[0] and "; 1 changed since;" in read.split("\n")[0]
@@ -459,11 +467,10 @@ def test_every_role_reads_the_same_account_and_its_own_detail(tmp_path):
     stories = {name: _story(tmp_path, task) for name, task in tasks.items()}
     assert len(set(stories.values())) == 1 and G_TEXT in stories["main"]
     rooms_text = {name: mv.render_room(_snapshot(tmp_path, task)) for name, task in tasks.items()}
-    for name in ("main", "wake", "child_main"):
-        assert "Main started and the owner asked me to go on." in rooms_text[name], name  # B1's detail in Main's page
-        assert "Alpha asked again" not in rooms_text[name], name
-    for name in ("root_alpha", "child_alpha"):
-        assert "Alpha asked again and I counted." in rooms_text[name] and "Main started" not in rooms_text[name], name
+    for name, text in rooms_text.items():  # told records are not repeated in any room; their detail is one reader away
+        assert "Main started" not in text and "Alpha asked again" not in text, name
+    for record, words in ((b1, "Main started and the owner asked me to go on."), (a1, "Alpha asked again and I counted.")):
+        assert "text:\n" + words in _memory_read(_ctx(tmp_path), node_id=record, revision=record)
     nanny = _snapshot(tmp_path, NANNY)
     assert mv.render_story(nanny) == "" and "Main started and the owner asked me to go on." in mv.render_room(nanny)
     assert G_TEXT not in mv.render_room(nanny)  # a nanny carries no life account
@@ -495,9 +502,12 @@ def test_the_floor_takes_an_account_like_a_page_and_keeps_what_it_tells_named(tm
     assert "Main was quiet." not in full and represented in full
     level = mv.FloorLevel((("F5", (g,)),))
     short = mv.render_story(snapshot, level)
-    assert G_TEXT not in short and "### My older pages, parts and accounts, by address" in short
+    assert G_TEXT not in short and "### My older pages, parts and accounts, by address" not in short
     label, period, _kind = _block(full, g).split("\n")[1][4:].split(" · ")  # "### <label> · <period> · account <id>"
-    assert f"- {label}; {period}; account {g}; memory_read(node_id='{g}')" in short and period == "2026-09-03 00:00 → 2026-09-03 00:03"
+    pointer = f"- {label}; {period}; account {g}; memory_read(node_id='{g}')"
+    assert period == "2026-09-03 00:00 → 2026-09-03 00:03"
+    prefix = full[:full.index(_block(full, g))]  # the addressed entry changes in place; earlier bytes stay
+    assert short.startswith(prefix) and short[len(prefix):].startswith("\n" + pointer)
     assert represented in short  # the horizon holds even when the account itself is addressed
     exact = _memory_read(_ctx(tmp_path), node_id=g)
     assert f"replaces 2: {a1}, legacy-b01-r1;" in exact

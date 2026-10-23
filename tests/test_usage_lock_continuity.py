@@ -679,6 +679,19 @@ def test_interactive_expiry_rejoins_real_loop_no_call_terminal(root, short_acqui
     assert all(item["owner_visible"] for item in waits)
     assert waits[-1]["elapsed_sec"] >= waits[0]["elapsed_sec"]
     assert trace["forced_finalization"]["control_reason"] == "accounting_wait_expired"
+    # The terminal this producer records is a technical interruption the owner may Continue
+    # (``owner_continue.TECHNICAL_REASON_CODES``), never retried automatically.
+    from ouroboros.agent_task_pipeline import _durable_terminal_status
+    from ouroboros.outcomes import derive_loop_outcome
+    from ouroboros.owner_continue import continuation_eligibility
+
+    outcome = derive_loop_outcome(text, usage, trace)
+    status = _durable_terminal_status(SimpleNamespace(drive_root=root), {"id": "child"},
+                                      outcome["outcome_axes"]["execution"]["status"], existing={})
+    assert (status, outcome["reason_code"]) == ("failed", "accounting_wait_expired")
+    assert continuation_eligibility({"status": status, "reason_code": outcome["reason_code"],
+                                     "root_task_id": "r"}, "r") == {
+        "eligible": True, "cause": "accounting_wait_expired", "refusal": ""}
 
 
 def test_unreadable_named_identity_is_not_positive_contention(root, monkeypatch):

@@ -36,6 +36,18 @@ the SUBJECT's own documents (``subject_root``) plus its required-source
 manifest. The shared-contract section is a rule of this repository's CODE and
 travels with the body layer only.
 
+A skill payload runs the **skill layer** (``layer="skill"``, owner 21.10 1A/F1):
+tier 1 inline is the Skill Review Checklist section the surface supplies plus
+BIBLE whole; tier 2 is required of every skill reviewer — the three architecture
+chapters that bind what a skill may touch and the module-size handbook chapter —
+plus, by the manifest's own facts (``manifest_facts``: ``type`` and what it
+declares), the PluginAPI contract and the extension UI validator; tier 3 is both
+books' navigation and the CREATING_SKILLS heading map. A packet seat receives
+tiers 1–2 inline and tier 3 as the index of what was NOT delivered; a retrieving
+seat receives tier 1 inline, tier 2 as required rows ("one read away") and tier
+3 as navigation. Selecting a contract by a manifest fact is context assembly,
+never a gate: nothing the reviewer decides depends on the match.
+
 Choosing which reference chapter to inline from an exact file-name mention is
 context ASSEMBLY, not behaviour selection: no verdict, routing decision or
 reviewer judgment depends on the match, and the reviewer may read anything else
@@ -73,7 +85,24 @@ _CARRIED_REASON = "carried by this surface's own delivery"
 
 CORE_LAYER = "core"
 BODY_LAYER = "body"
-GOVERNANCE_LAYERS = (CORE_LAYER, BODY_LAYER)
+SKILL_LAYER = "skill"
+GOVERNANCE_LAYERS = (CORE_LAYER, BODY_LAYER, SKILL_LAYER)
+# The skill layer's tier 2 (owner 21.10 F1): read in full by every skill reviewer.
+SKILL_REQUIRED_CHAPTERS = (
+    "docs/architecture/10-key-invariants.md",
+    "docs/architecture/12-host-service-companions-and-chat-ids.md",
+    "docs/architecture/13-external-skills-layer.md",
+    "docs/development/03-module-size-and-complexity.md",
+)
+SKILL_PLUGIN_API_PATH = "ouroboros/contracts/plugin_api.py"
+SKILL_UI_VALIDATION_PATH = "ouroboros/extension_ui_validation.py"
+CREATING_SKILLS_PATH = "docs/CREATING_SKILLS.md"
+# Manifest facts that make a host contract a required read: the PluginAPI contract for an
+# extension or any manifest that declares a host-mediated capability; the UI validator for
+# an extension (widgets may be registered dynamically from plugin.py) or a declared UI surface.
+SKILL_PLUGIN_API_FACTS = ("env_from_settings", "permissions", "subscribe_events", "companion_processes",
+                         "scheduled_tasks", "plugin_api")
+SKILL_UI_FACTS = ("ui_tab", "contributes", "page_module")
 # A body document in a core-layer manifest: named, not delivered, by rule.
 NOT_APPLICABLE_DISPOSITION = "not_applicable"
 _CORE_NOT_APPLICABLE = "core layer: governs Ouroboros's own body, not this subject"
@@ -322,6 +351,113 @@ def _core_layer_context(*, surface: str, touched_paths: Optional[Iterable[Any]],
                              tokens_estimate=estimate_tokens(navigation), layer=CORE_LAYER)
 
 
+def _contract_text(root: Path, path: str) -> str:
+    """A host contract rendered for a reviewer: a Python source in a fence, a document as it is."""
+    from ouroboros.tools.review_helpers import load_governance_doc
+    from ouroboros.tools.review_prompt_text import format_prompt_code_block
+
+    text = load_governance_doc(root, path, on_missing="explicit")
+    return format_prompt_code_block(text, "python") if path.endswith(".py") and not text.startswith("[⚠️") else text
+
+
+def _skill_layer_context(repo_dir: Any, *, surface: str, delivery: str, checklist_section_text: str,
+                         manifest_facts: Any) -> GovernanceContext:
+    """The skill layer (module docstring): tiers by the manifest's facts, never by a verdict."""
+    from ouroboros.context_layout import generate_doc_nav_map
+    from ouroboros.tools.review_helpers import load_governance_doc
+
+    root = Path(repo_dir)
+    packet = str(delivery or PACKET_DELIVERY) == PACKET_DELIVERY
+    facts = dict(manifest_facts or {}) if isinstance(manifest_facts, Mapping) else {}
+    kind = str(facts.get("type") or "")
+    declares = {str(item) for item in (facts.get("declares") or ())}
+    rows: list[dict] = []
+    tier1: list[tuple[str, str]] = []
+    selected: list[tuple[str, str]] = []
+    inline_texts: dict[str, str] = {}
+    checklist_text = str(checklist_section_text or "")
+    rows.append(_row(CHECKLISTS_PATH, 1, "inline", len(checklist_text),
+                     f"applicable {surface} checklist section (skill layer), supplied by the surface")
+                if checklist_text.strip() else
+                _row(CHECKLISTS_PATH, 1, "navigation", 0, "this surface supplies no checklist section"))
+    rows.append(_row(f"{CHECKLISTS_PATH}#{SHARED_CHECKLIST_SECTION}", 1, NOT_APPLICABLE_DISPOSITION, 0,
+                     "a rule of this repository's own code; a skill payload is not it"))
+    bible = load_governance_doc(root, BIBLE_PATH, on_missing="explicit")
+    tier1.append((BIBLE_PATH, bible))
+    inline_texts[BIBLE_PATH] = bible
+    rows.append(_row(BIBLE_PATH, 1, "inline", len(bible), "tier 1: every reviewer carries it"))
+    rows.append(_row(CHECKLISTS_ARCHIVE_PATH, 1, NOT_APPLICABLE_DISPOSITION, 0,
+                     "standing disclosures of the body's own changes; not a skill rule"))
+    required = [(path, "tier 2: binds what a skill may touch (the chapters the checklist names)")
+                for path in SKILL_REQUIRED_CHAPTERS]
+    plugin_facts = sorted(declares & set(SKILL_PLUGIN_API_FACTS))
+    ui_facts = sorted(declares & set(SKILL_UI_FACTS))
+    conditional = (
+        (SKILL_PLUGIN_API_PATH, kind == "extension" or bool(plugin_facts),
+         "the host contract of " + ("an extension" if kind == "extension" else f"a manifest declaring {', '.join(plugin_facts)}"),
+         "not an extension and the manifest declares no host-mediated capability"),
+        (SKILL_UI_VALIDATION_PATH, kind == "extension" or bool(ui_facts),
+         "the host's widget and contribution validator for " + (
+             "an extension (widgets may be registered from plugin.py)" if kind == "extension" else f"a manifest declaring {', '.join(ui_facts)}"),
+         "not an extension and the manifest declares no UI surface"),
+    )
+    for path, reason in required:
+        text = _contract_text(root, path)
+        if packet:
+            selected.append((path, text))
+            inline_texts[path] = text
+            rows.append(_row(path, 2, "inline", len(text), reason))
+        else:
+            rows.append(_row(path, 2, "required", len(text), reason + "; read it in full"))
+    for path, needed, reason, skipped in conditional:
+        text = _contract_text(root, path)
+        if not needed:
+            rows.append(_row(path, 2, "navigation", len(text), f"tier 2 by manifest facts: {skipped}"))
+        elif packet:
+            selected.append((path, text))
+            inline_texts[path] = text
+            rows.append(_row(path, 2, "inline", len(text), f"tier 2 by manifest facts: {reason}"))
+        else:
+            rows.append(_row(path, 2, "required", len(text), f"tier 2 by manifest facts: {reason}; read it in full"))
+    maps: list[str] = []
+    for book_id, entrypoint in ((DEVELOPMENT_BOOK_ID, "docs/DEVELOPMENT.md"), (ARCHITECTURE_BOOK_ID, "docs/ARCHITECTURE.md")):
+        book, problem = _load_book(root, book_id)
+        rows.append(_row(entrypoint, 3, "navigation", 0,
+                         "book navigation; a chapter not required above is one read away" if _book_sources(book)
+                         else problem or "no chaptered membership: navigation only"))
+        for chapter in _book_sources(book):
+            if chapter.source_path not in SKILL_REQUIRED_CHAPTERS:
+                rows.append(_row(chapter.source_path, 3, "navigation", len(chapter.text), "the map is never inlined whole"))
+        maps.append(_book_navigation(root, book_id, book, load_governance_doc, instructions=not packet))
+    creating = load_governance_doc(root, CREATING_SKILLS_PATH, on_missing="explicit")
+    rows.append(_row(CREATING_SKILLS_PATH, 3, "navigation", len(creating), "the skill author's guide: its heading map"))
+    maps.append(generate_doc_nav_map(creating, title=CREATING_SKILLS_PATH.rsplit("/", 1)[-1], rel_path=CREATING_SKILLS_PATH,
+                                     instructions=not packet) if not creating.startswith("[⚠️") else creating)
+    required_names = [row["path"] for row in rows if row["disposition"] == "required"]
+    navigation = _join([
+        "## Governance navigation (index of sources not inlined)" if packet else
+        "## Governance navigation (read on demand)",
+        ("The checklist section, BIBLE.md and the host contracts inlined above are the governance evidence "
+         "this packet delivers. This row has no repository tools: the maps below identify sources that were "
+         "NOT delivered, not additional evidence. State any resulting uncertainty; do not claim to have read "
+         "the named sources." if packet else
+         "The checklist section and BIBLE.md are inlined above. The sources named REQUIRED in your manifest "
+         "(" + ", ".join(f"`{name}`" for name in required_names) + ") bind what a skill may touch: read each "
+         "in full with `read_file(root=\"system_repo\", path=..., start_line=A, max_lines=N)` before you judge. "
+         "Everything else below is one read away, complete on disk and untruncated; a document named here "
+         "and not inlined was NOT dropped, and the review's governance manifest records the disposition of "
+         "each one."),
+        *maps,
+    ])
+    stable_inline = _join(_render(title, text) for title, text in tier1)
+    selected_inline = _join(_render(title, text) for title, text in selected)
+    return GovernanceContext(
+        inline_sections=tier1 + selected, navigation=navigation, manifest=rows,
+        tokens_estimate=estimate_tokens(_join([stable_inline, selected_inline, navigation])),
+        stable_inline=stable_inline, selected_inline=selected_inline, inline_whole_documents=inline_texts,
+        layer=SKILL_LAYER)
+
+
 def governance_context(
     repo_dir: Any,
     *,
@@ -333,6 +469,7 @@ def governance_context(
     already_inline: Any = (),
     layer: str = BODY_LAYER,
     subject_root: Any = None,
+    manifest_facts: Any = None,
 ) -> GovernanceContext:
     """Tier the governance corpus for ONE reviewer of ONE change.
 
@@ -345,7 +482,9 @@ def governance_context(
     delivery carries in full (:func:`_carried_reasons` states the mechanism).
     ``layer`` is the ONE external switch: ``body`` (the subject is Ouroboros's
     body) runs the three tiers; ``core`` (any other subject) runs
-    :func:`_core_layer_context` over ``subject_root``."""
+    :func:`_core_layer_context` over ``subject_root``; ``skill`` (a skill payload)
+    runs :func:`_skill_layer_context` over ``manifest_facts`` (``type`` and the
+    manifest's ``declares``)."""
     from ouroboros.tools.review_helpers import load_checklist_section, load_governance_doc
 
     if layer not in GOVERNANCE_LAYERS:
@@ -354,6 +493,9 @@ def governance_context(
         return _core_layer_context(surface=surface, touched_paths=touched_paths, delivery=delivery,
                                    checklist_section_text=checklist_section_text,
                                    subject_root=subject_root)
+    if layer == SKILL_LAYER:
+        return _skill_layer_context(repo_dir, surface=surface, delivery=delivery,
+                                    checklist_section_text=checklist_section_text, manifest_facts=manifest_facts)
 
     root = Path(repo_dir)
     names = _touched_names(touched_paths)

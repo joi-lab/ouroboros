@@ -6,8 +6,24 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros.tools import github
+from ouroboros.tools import github, github_read
 from ouroboros.tools.registry import ToolContext
+
+
+def _api_parts(argv):
+    """``(route, hostname, typed_fields)`` of one ``gh api`` argv; ``_api_method`` reads its HTTP verb."""
+    route, hostname, fields, rest = "", "", {}, list(argv[2:])
+    while rest:
+        item = rest.pop(0)
+        if item in ("--method", "--hostname", "--input"):
+            value = rest.pop(0)
+            hostname = value if item == "--hostname" else hostname
+        elif item in ("-f", "-F"):
+            key, _sep, value = rest.pop(0).partition("=")
+            fields[key] = value
+        elif item != "--include":
+            route = item
+    return route, hostname, fields
 
 
 def _context(tmp_path, kind):
@@ -48,19 +64,34 @@ def gh_calls(monkeypatch):
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
         output = ""
-        if argv[1:3] in (["issue", "list"], ["pr", "list"]):
-            output = "[]"
-        elif argv[1:3] in (["issue", "view"], ["pr", "view"]):
+        if argv[1] == "api":
+            route = _api_parts(argv)[0].split("?", 1)[0]
+            method = argv[argv.index("--method") + 1] if "--method" in argv else "GET"
+            if route == "graphql":
+                output = json.dumps({"data": {"nodes": [{"id": "PR_node7", "commits": {"totalCount": 1}, "reviewDecision": "APPROVED"}]}})
+            elif route.endswith(("/issues/7", "/pulls/7")):
+                output = json.dumps({"number": 7, "node_id": "PR_node7", "title": "Fixture", "state": "closed" if method == "PATCH" else "open",
+                                     "user": {"login": "fixture"}, "head": {"sha": SHA}, "html_url": f"{BASE}/pull/7", "body": ""})
+            elif method == "POST" and route.endswith("/issues"):
+                output = json.dumps({"number": 7, "title": "Title", "body": "Body", "labels": [{"name": "bug"}],
+                                     "user": {"login": "fixture"}, "html_url": f"{BASE}/issues/7"})
+            elif route.endswith("/comments"):
+                output = json.dumps({"id": 1, "body": "text", "user": {"login": "fixture"}, "created_at": "t",
+                                     "html_url": f"{BASE}/issues/7#issuecomment-1", "issue_url": f"{BASE}/issues/7"})
+            elif route.endswith("/reviews"):
+                output = json.dumps({"id": 1, "body": "text", "state": "COMMENTED", "user": {"login": "fixture"},
+                                     "submitted_at": "t", "html_url": f"{BASE}/pull/7#pullrequestreview-1"})
+            else:
+                output = "[]"
+        elif argv[1:3] == ["pr", "view"]:
             output = json.dumps({"number": 7, "title": "Fixture", "state": "OPEN", "author": {"login": "fixture"},
                                  "headRefOid": SHA, "url": f"{BASE}/pull/7"})
+        elif argv[1:3] == ["pr", "diff"]:
+            output = "diff --git a/x b/x"
         elif argv[1:3] == ["run", "list"]:
             output = json.dumps([_run(11, conclusion="failure")])
         elif argv[1:3] == ["run", "view"]:
             output = json.dumps({"jobs": [_job(55, "test", conclusion="failure")]})
-        elif argv[1] == "api":
-            output = "[]"
-        elif argv[1:3] == ["issue", "create"]:
-            output = "https://github.com/owner/selected/issues/7"
         return SimpleNamespace(returncode=0, stdout=output, stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
@@ -68,13 +99,14 @@ def gh_calls(monkeypatch):
 
 
 _CALLS = [
-    ("list_github_issues", {}, 1), ("get_github_issue", {"number": 7}, 1),
-    ("comment_on_issue", {"number": 7, "body": "text"}, 1),
-    ("close_github_issue", {"number": 7, "comment": "closing"}, 2),
-    ("create_github_issue", {"title": "Title", "body": "Body", "labels": "bug"}, 2),
-    ("list_github_prs", {}, 1), ("get_github_pr", {"number": 7}, 3),
-    ("comment_on_pr", {"number": 7, "body": "text"}, 1),
-    ("get_github_checks", {"number": 7}, 4),
+    ("github_read", {"method": "list", "kind": "issue"}, 1), ("github_read", {"method": "get", "kind": "issue", "target": 7}, 1),
+    ("github_write", {"method": "comment", "target": 7, "body": "text"}, 1),
+    ("github_write", {"method": "update", "target": 7, "state": "closed"}, 1),
+    ("github_write", {"method": "create_issue", "title": "Title", "body": "Body", "labels": ["bug"]}, 1),
+    ("github_read", {"method": "list", "kind": "pr"}, 1),
+    ("github_read", {"method": "get", "kind": "pr", "target": 7, "include": ["diff"]}, 3),
+    ("github_write", {"method": "review", "target": 7, "event": "COMMENT", "body": "text"}, 1),
+    ("github_read", {"method": "checks", "target": 7}, 4),
 ]
 
 
@@ -92,23 +124,31 @@ def test_every_repository_tool_keeps_target_in_all_subcalls(tmp_path, gh_calls, 
     assert not result.startswith("⚠️"), result
     assert len(gh_calls) == count
     assert "repo" in entry.schema["parameters"]["properties"]
-    assert sum(argv[1] == "api" for argv, _ in gh_calls) == (name == "get_github_checks")
     for argv, kwargs in gh_calls:
-        if argv[1] == "api":  # The checks reader's one literal path: its target is the URL GitHub returned.
-            assert argv == ["gh", "api", "repos/owner/selected/check-runs/55/annotations?per_page=100",
-                            "--hostname", "github.example"]
-            continue
-        assert kwargs["cwd"] == str(expected_cwd)
-        if repo:
+        if argv[1] == "api":
+            route, hostname, fields = _api_parts(argv)
+            if route == "graphql":  # Node facts follow the PR URL returned by GitHub, like list(kind='pr').
+                assert argv == ["gh", "api", "graphql", "--hostname", "github.example", "--input", "-"]
+                assert kwargs["cwd"] == str(ctx.repo_dir)
+                assert json.loads(kwargs["input"])["variables"] == {"ids": ["PR_node7"]}
+                continue
+            if route.startswith("repos/owner/selected/check-runs/"):  # The checks reader's one literal path: the URL GitHub returned.
+                assert argv == ["gh", "api", "repos/owner/selected/check-runs/55/annotations?per_page=100",
+                                "--hostname", "github.example"]
+                continue
+            assert "--repo" not in argv  # gh api has no --repo: the route or the typed fields name the repository.
+            if repo:
+                assert route.startswith("repos/owner/selected/") and hostname == "github.example" and "{owner}" not in route
+            else:
+                assert route.startswith("repos/{owner}/{repo}/") and not hostname
+        elif repo:
             assert argv[-2:] == ["--repo", repo]
         else:
             assert "--repo" not in argv
+        assert kwargs["cwd"] == str(expected_cwd)
         if kind != "system":
             assert "GH_REPO" not in kwargs["env"]
         assert kwargs["env"]["GH_HOST"] == "configured.example"
-    if name == "get_github_pr" and (kind != "system" or repo):
-        assert "fetch_pr_ref(" not in result
-        assert "stage_pr_merge(" not in result
 
 
 @pytest.mark.parametrize("failure", ["note", "missing-room", "fileless", "missing-workspace", "invalid-workspace-mode"])
@@ -123,7 +163,7 @@ def test_unusable_project_never_calls_gh_on_system_repo(tmp_path, gh_calls, fail
     else:
         project.rmdir()
 
-    result = github._list_issues(ctx)
+    result = github_read.run_read(ctx, method="list", kind="issue")
 
     assert "GH_TARGET_" in result
     assert gh_calls == []
@@ -132,8 +172,8 @@ def test_unusable_project_never_calls_gh_on_system_repo(tmp_path, gh_calls, fail
 def test_fileless_room_accepts_explicit_repo(tmp_path, gh_calls):
     ctx, _ = _context(tmp_path, "room")
     ctx.task_metadata = {}
-    assert not github._get_issue(ctx, 7, repo="owner/selected").startswith("⚠️")
-    assert gh_calls[0][0][-2:] == ["--repo", "owner/selected"]
+    assert not github_read.run_read(ctx, method="get", kind="issue", target=7, repo="owner/selected").startswith("⚠️")
+    assert gh_calls[0][0] == ["gh", "api", "repos/owner/selected/issues/7"]
 
 
 def test_generic_hub_transport_keeps_explicit_api_contract(tmp_path, gh_calls, monkeypatch):
@@ -158,6 +198,7 @@ def test_public_null_target_never_selects_internal_hub_transport(tmp_path, gh_ca
         ctx.task_metadata = {"_project_room_note": "registry unavailable"}
     monkeypatch.setenv("GH_REPO", "unrelated/wrong-repo")
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
     registry.set_context(ctx)
     result = registry.execute_result(name, {**args, "repo": None})
@@ -174,6 +215,7 @@ def test_required_target_is_an_error_then_a_valid_call_has_no_stale_failure(tmp_
     ctx, _ = _context(tmp_path, "room")
     ctx.task_metadata = {}
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
     registry.set_context(ctx)
     refused = registry.execute_result(name, args)
@@ -189,7 +231,7 @@ def test_required_target_is_an_error_then_a_valid_call_has_no_stale_failure(tmp_
 @pytest.mark.parametrize("repo", [False, 0, [], {}, 1])
 def test_invalid_public_target_values_cannot_be_generic_transport(tmp_path, gh_calls, repo):
     ctx, _ = _context(tmp_path, "queued")
-    assert "GH_TARGET_INVALID" in github._get_issue(ctx, 7, repo=repo)
+    assert "GH_TARGET_INVALID" in github_read.run_read(ctx, method="get", kind="issue", target=7, repo=repo)
     assert not gh_calls
 
 
@@ -218,7 +260,7 @@ def test_cli_discovery_accepts_the_execution_token_sources(tmp_path, monkeypatch
     if token != "settings":
         monkeypatch.setenv(token, "fixture")
     ctx, _ = _context(tmp_path, "queued")
-    assert _builtin_tool_availability("get_github_issue", ctx)[0] is True
+    assert _builtin_tool_availability("github_read", ctx)[0] is True
 
 
 def test_cli_store_metadata_enables_only_cli_tools_without_probing(tmp_path, monkeypatch):
@@ -237,41 +279,41 @@ def test_cli_store_metadata_enables_only_cli_tools_without_probing(tmp_path, mon
     ctx, _ = _context(tmp_path, "queued")
     for name, _, _ in _CALLS:
         assert _builtin_tool_availability(name, ctx)[0] is True
-    for name in ("submit_skill_to_hub", "generate_evolution_stats"):
-        assert _builtin_tool_availability(name, ctx) == (False, "missing_credential", "GITHUB_TOKEN")
+    assert _builtin_tool_availability("submit_skill_to_hub", ctx) == (False, "missing_credential", "GITHUB_TOKEN")
+    assert _builtin_tool_availability("generate_evolution_stats", ctx) == (True, "", "")
 
 
 @pytest.mark.parametrize("bound,explicit", [(False, False), (False, True), (True, True)])
 def test_presence_repository_selection_keeps_host_argument_authority(tmp_path, gh_calls, bound, explicit):
     from ouroboros.presence_authority import PresenceCapabilityCeiling, PresenceToolGrant, presence_ceiling_payload
-    from ouroboros.presence_capabilities import PresenceArgumentBinding
+    from tests.frozen_presence_capabilities import PresenceArgumentBinding
     from ouroboros.tools.registry import ToolRegistry
 
     bindings = (PresenceArgumentBinding(("repo",), "static", static_value="owner/allowed"),) if bound else ()
     ceiling = PresenceCapabilityCeiling(
         skill_name="fixture", skill_content_hash="a" * 64, profile_fingerprint="b" * 64,
         state_fingerprint="c" * 64, selection_fingerprint="d" * 64, model_slot="main",
-        inline_max_rounds=10, tool_grants=(PresenceToolGrant("get_github_issue", bindings),),
+        inline_max_rounds=10, tool_grants=(PresenceToolGrant("github_read", bindings),),
         resource_grants=(), digest="e" * 64,
     )
     ctx, _ = _context(tmp_path, "system")
     ctx.task_contract = {"capability_ceiling": presence_ceiling_payload(ceiling)}
     registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
     registry.set_context(ctx)
-    args = {"number": 7, **({"repo": "owner/unselected"} if explicit else {})}
+    args = {"method": "get", "kind": "issue", "target": 7, **({"repo": "owner/unselected"} if explicit else {})}
 
-    result = registry.execute("get_github_issue", args)
+    result = registry.execute("github_read", args)
 
     if explicit and not bound:
         assert "PRESENCE_ARGUMENT_BINDING_BLOCKED" in result
         assert not gh_calls
     else:
-        assert "Issue #7" in result
+        assert result.startswith("github_read get issue #7")
         assert len(gh_calls) == 1
         if bound:
-            assert gh_calls[0][0][-2:] == ["--repo", "owner/allowed"]
+            assert gh_calls[0][0][2] == "repos/owner/allowed/issues/7"
         else:
-            assert "--repo" not in gh_calls[0][0]
+            assert gh_calls[0][0][2] == "repos/{owner}/{repo}/issues/7"
 
 
 def test_child_does_not_gain_github_access_from_explicit_repo(tmp_path, gh_calls):
@@ -281,6 +323,6 @@ def test_child_does_not_gain_github_access_from_explicit_repo(tmp_path, gh_calls
     ctx.task_metadata = {"delegation_role": "subagent"}
     registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
     registry.set_context(ctx)
-    result = registry.execute("get_github_issue", {"number": 7, "repo": "owner/unselected"})
+    result = registry.execute("github_read", {"method": "get", "kind": "issue", "target": 7, "repo": "owner/unselected"})
     assert "BLOCKED" in result
     assert not gh_calls

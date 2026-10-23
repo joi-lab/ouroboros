@@ -14,7 +14,6 @@ export function mainHeaderActionsHtml() {
                             <button class="chat-header-menu-item" type="button" data-chat-command="bg">Consciousness</button>
                             <button class="chat-header-menu-item" type="button" data-chat-command="evolve">Evolve</button>
                             <button class="chat-header-menu-item" type="button" data-chat-command="review" title="Run review now">Review</button>
-                            <button class="chat-header-menu-item" type="button" data-plugins="off" title="Reload without skills' page code">Restart without plugins</button>
                         </div>
                     </details>
                 </div>

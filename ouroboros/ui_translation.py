@@ -113,7 +113,7 @@ def _core_catalogs() -> Dict[str, Tuple[Dict[str, str], str]]:
     from ouroboros import project_dialogue as pd
 
     return {
-        "task.headline": (pd.OUTCOME_PHASE_HEADLINE,
+        "task.headline": ({**pd.OUTCOME_PHASE_HEADLINE, "quiet": pd.QUIET_RUN_HEADLINE},
                           "the one-word status headline of a task card (Working, Done, Failed…)"),
         "task.cause": (pd.TASK_CAUSE_PHRASES,
                        "one sentence under a finished task explaining why its answer was or was not signed off"),
@@ -211,7 +211,7 @@ def _call_light(drive_root: pathlib.Path, messages: List[Dict[str, Any]], *, cli
     if not available:
         raise LanguageResolveError("language_needs_model", "no credentialed model is configured for the light slot", 400)
     deadline_ts = time.time() + _timeout_sec()
-    with model_concurrency.model_call_slot(model, use_local, deadline_ts=deadline_ts):
+    with model_concurrency.model_call_scope(model, use_local, deadline_ts=deadline_ts):
         remaining = deadline_ts - time.time()
         if remaining <= 0:
             raise TimeoutError("the translation ceiling was spent waiting for a model slot")

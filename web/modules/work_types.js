@@ -19,7 +19,7 @@
  */
 /**
  * @typedef {Object} WorkTail
- * @property {string} kind  // helper | run | review
+ * @property {string} kind  // helper | run | review | model
  * @property {string} state  // live | unknown
  * @property {string} code
  * @property {string} text  // its English sentence, said beside the work's word, never as it
@@ -48,6 +48,7 @@
 /**
  * @typedef {Object} WorkMembers
  * @property {Array<string>} ids  // every member task id (episode roots and helpers): a card of another id re-reads the state
+ * @property {Object<string, Object>=} states  // the same server classification for each Activity row
  */
 /**
  * @typedef {Object} WorkFocus
@@ -75,6 +76,8 @@
  * @property {*} since
  * @property {boolean} confirmed
  * @property {string} mark  // moving | still | pause | ring | none (docs/DESIGN.md "Status marks")
+ * @property {Object=} stop  // current stop and any independent member stop
+ * @property {Object=} refusal  // the continuation's last refusal, rechecked by Resume
  * @property {string=} outcome
  * @property {WorkFocus=} focus
  * @property {Array<Object>=} gaps

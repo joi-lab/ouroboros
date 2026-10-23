@@ -197,6 +197,7 @@ def test_managed_update_restart_arms_prepared_transaction_for_direct_reexec(
     import ouroboros.gateway.control as control
     import supervisor.git_ops as git_ops
     import supervisor.update_merge as update_merge
+    from ouroboros import server_process, server_restart
     import server
 
     prepared = {
@@ -214,19 +215,27 @@ def test_managed_update_restart_arms_prepared_transaction_for_direct_reexec(
     )
     monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(server_restart, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(server_restart, "_OWNER_STOP_BEGAN", threading.Event())
+    owner, restart = threading.Event(), threading.Event()
+    monkeypatch.setattr(server_process, "_owner_restart_requested", owner)
+    monkeypatch.setattr(server_process, "_restart_requested", restart)
+    monkeypatch.setattr(server, "_owner_restart_requested", owner)
+    monkeypatch.setattr(server_restart, "_owner_restart_requested", owner)
     monkeypatch.setattr(server, "_restart_current_process_impl", lambda *_a, **_kw: None)
     monkeypatch.setattr(update_merge, "read_update_tx_strict", lambda: ("valid", {"phase": "pending_boot_smoke"}))
     monkeypatch.delenv(delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV, raising=False)
 
-    request = type("Request", (), {"app": type("App", (), {"state": type("State", (), {
-        "request_restart": lambda _self, owner=False: None,
-    })()})()})()
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        request_restart=server_process._request_restart_exit)))
     response = control._restart_response(request, strategy="auto_merge", plan={})
 
     assert response.status_code == 200
+    assert owner.is_set() and restart.is_set()
     assert delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV not in os.environ
     server._restart_current_process("127.0.0.1", 8765)
     assert os.environ[delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV] == "tx-owner-wait"
+    assert not delegate_recovery.owner_restart_in_progress(tmp_path)
 
 
 def test_failed_managed_update_restart_disarms_transaction_token(monkeypatch, tmp_path):

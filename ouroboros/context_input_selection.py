@@ -259,6 +259,25 @@ def _task_uses_external_context(task: Dict[str, Any]) -> bool:
     return False
 
 
+def task_input_pointer(env: Any, task: Dict[str, Any], user_content_json: str) -> Optional[str]:
+    """The exact task input as a source pointer (user content JSON), or ``None`` when it cannot be retained.
+
+    The original input stays exact in the captured core and the actor source store; only its Nano delivery
+    changes. This is neither the external-assignment compiler nor a summary.
+    """
+    try:
+        from ouroboros.artifacts import store_actor_source_bytes
+        source = store_actor_source_bytes(env.drive_root, str(task["id"]), category="context_checkpoints",
+            source_id="task_input", data=user_content_json.encode("utf-8"), extension="json")
+    except (OSError, ValueError, KeyError):
+        log.warning("Exact task input source could not be retained; preserving complete input", exc_info=True)
+        return None
+    return json.dumps("[Exact task input source]\nThe complete original user input is stored as JSON at this source. "
+                      "Read its full content through the given reader in ranges before substantive decisions. "
+                      "This pointer is not a summary or a change to the task.\n"
+                      + json.dumps(source, ensure_ascii=False, sort_keys=True), ensure_ascii=False)
+
+
 def _validate_declared_input_task(task: Dict[str, Any]) -> None:
     """A selected request must not silently enter an unqualified task class."""
     meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
@@ -290,7 +309,10 @@ def _capture_declared_context_core(
     retries and fitting operate on the resulting immutable ContextCore.
     """
     from ouroboros.subagent_work_order import input_source_selection_receipt
-    from ouroboros.subagent_runtime import current_model_visible_subagent_catalog, review_facts_block, review_records_block
+    from ouroboros.subagent_metrics import fact_line
+    from ouroboros.subagent_runtime import (
+        current_model_visible_subagent_catalog, review_facts_block, review_records_block, subagent_supervision_fact_line,
+    )
 
     canonical_root = pathlib.Path(task.get("budget_drive_root") or getattr(env, "budget_drive_root", None) or memory.drive_root)
     same_drive = canonical_root.resolve(strict=False) == memory.drive_root.resolve(strict=False)
@@ -303,7 +325,7 @@ def _capture_declared_context_core(
     ]
     parts.extend(snapshot_labelled(section, sources["captured_at"]) for section in
                  process_memory.recent_activity_sections(str(task["id"]), own_drive=None if same_drive else memory))
-    catalog_text = ""
+    catalog_text, catalog = "", None
     try:
         catalog = current_model_visible_subagent_catalog()
         if catalog:
@@ -313,7 +335,11 @@ def _capture_declared_context_core(
     review_text = ""
     try:
         review_text = review_facts_block()
-        parts.append(review_records_block(drive_root=canonical_root, task_id=str(task["id"])))
+        parts.extend(filter(None, (
+            review_records_block(drive_root=canonical_root, task_id=str(task["id"])),
+            subagent_supervision_fact_line(task, ctx=ctx, catalog=catalog),
+            fact_line(task, drive_root=canonical_root),
+        )))
     except Exception:
         log.warning("Failed to build the Review block", exc_info=True)
     return _ContextCore(

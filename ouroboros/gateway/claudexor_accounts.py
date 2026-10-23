@@ -385,6 +385,23 @@ def _read_status_payload(include_models: bool) -> Dict[str, Any]:
                 # gateway has quota_state; its shared reader preserves one
                 # complete evidence epoch, including negotiated legacy resources.
                 return {"snapshots": gateway.quota_snapshots(), "absences": []}
+
+            def _capability_marks() -> Dict[str, Any] | None:
+                from ouroboros.gateways.claudexor_routing import capability_marks_supported, read_capability_marks
+                from ouroboros.utils import utc_now_iso
+
+                # Optional and passive: an engine that does not advertise the rows (or
+                # whose catalog is unreadable: resource_capabilities_read owns that) is
+                # not asked, and a failed read is one dated fact, never "no marks".
+                try:
+                    if not capability_marks_supported(operations_call.result()):
+                        return None
+                except Exception:
+                    return None
+                try:
+                    return {"evidence": read_capability_marks(gateway)}
+                except Exception:
+                    return {"failed_at": utc_now_iso()}
             # The catalog, manifest, profile and quota reads are INDEPENDENT GETs
             # over one thread-safe httpx client, and each costs SECONDS daemon-side
             # (it probes the real coding-agent CLIs on every read: binary, version,
@@ -394,12 +411,13 @@ def _read_status_payload(include_models: bool) -> Dict[str, Any]:
             # on its own (see `_facet_outcome`), a refusal surfaces as that facet's
             # own typed error below WITHOUT downgrading the siblings that
             # landed, and a manifest refusal still fails OPEN.
-            with ThreadPoolExecutor(max_workers=5) as pool:
+            with ThreadPoolExecutor(max_workers=6) as pool:
                 operations_call = pool.submit(lambda: gateway.operations())
                 catalog_call = pool.submit(gateway.agent_capabilities)
                 manifests_call = pool.submit(gateway.harnesses)
                 profiles_call = pool.submit(gateway.credential_profiles)
                 quota_call = pool.submit(_quota_state)
+                marks_call = pool.submit(_capability_marks)
                 # Deferred lookup on purpose: the failure of THIS read (or a
                 # transport double that lacks the method) must land inside the
                 # future, where the absorbed fail-closed handling below owns it.
@@ -518,6 +536,12 @@ def _read_status_payload(include_models: bool) -> Dict[str, Any]:
                     and isinstance(w.get("profile"), dict)
                     and str(w["profile"].get("harness_id") or "") in (capable | vouched)
                 ]
+            marks = marks_call.result()
+            if profiles_outcome[0] == READ_OK and marks is not None:
+                # The open roster envelope carries them (public schema unchanged):
+                # marks only beside a successful account read, a failure once.
+                profiles = ({**profiles, "routing_evidence": marks["evidence"]} if "evidence" in marks else
+                            {**profiles, "routing_evidence_read": {"state": READ_FAILED, "observed_at": marks["failed_at"]}})
             payload["profiles"] = profiles
             quota = quota_outcome[1] if quota_outcome[0] == READ_OK else {}
             raw_snapshots = quota.get("snapshots") if isinstance(quota, dict) else None

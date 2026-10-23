@@ -460,7 +460,7 @@ def test_render_substitutes_every_placeholder_and_keeps_every_event(tmp_path, mo
     for key in wake.PLACEHOLDERS:
         assert "{" + key + "}" not in text, key
     assert text.startswith("You are Ouroboros. No one has asked for a task")
-    assert "1 h 30 min ago" in text and "autonomy: act — everything your runtime mode allows except" in text
+    assert "1 h 30 min ago" in text and "autonomy: Acts — Also acts on its own:" in text
     assert "toggle_evolution, request_restart" in text
     assert "allowance known spend (last 24 h): 4.00 / 20.00 USD" in text and "tasks running: 1/2" in text
     assert "next interval: 3300 s" in text
@@ -472,7 +472,7 @@ def test_render_substitutes_every_placeholder_and_keeps_every_event(tmp_path, mo
         events=_observe(tmp_path / "empty", since=T0 + 1).full_text())
     assert "no wake since this process started" in quiet and "wake cause: the scheduled wake time" in quiet
     assert "unavailable tools: none" in quiet and "allowance known spend (last 24 h): unknown / 0.00 USD" in quiet
-    assert "including evolution" in quiet
+    assert "Also changes itself: its own code, its settings, connecting new places." in quiet
 
 
 def test_render_survives_a_missing_template_and_an_unreadable_task_store(tmp_path):

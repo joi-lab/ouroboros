@@ -659,7 +659,7 @@ def test_only_the_main_window_gets_the_integrated_bar(mac, monkeypatch):
     from ouroboros import launcher_onboarding
 
     monkeypatch.setattr(lb, "indicator_class", lambda: None)
-    background = lb.Background(lambda: None, lambda: 8765, threading.Event())
+    background = lb.Background(lambda: None, lambda: 1, threading.Event())
     main = Window(NSWindow())
     main.events.closing, main.events.shown = Hook(), Hook()
     background.attach(main)
@@ -681,7 +681,7 @@ def test_only_the_main_window_gets_the_integrated_bar(mac, monkeypatch):
     fake.create_window, fake.start = create_window, lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "webview", fake)
     monkeypatch.setitem(sys.modules, "webview.menu", menu)
-    launcher_onboarding.present_first_run_onboarding({}, 8765, open_external_url=lambda url: {"ok": False})
+    launcher_onboarding.present_first_run_onboarding({}, 1, open_external_url=lambda url: {"ok": False})
     assert created["window"].events.before_load.handlers == []
 
 
@@ -698,16 +698,56 @@ def test_the_spa_declares_after_its_theme_script_and_only_the_spa_declares():
     assert "ouroboros-window-chrome" not in _read("web/onboarding_template.html")
 
 
-def test_the_page_reserves_room_only_under_the_measured_state():
-    """No phantom spacer: every rule reading the shell's geometry is scoped to the attribute the shell
-    writes after measuring, so a browser, another OS or an older shell lays out exactly as before."""
-    css = re.sub(r"/\*.*?\*/", "", _read("web/style.css"), flags=re.S)
+def _selector_list(text):
+    """Split selector lists, keeping commas in :is/:where, attributes and strings."""
+    start, depth, quote, escaped = 0, 0, "", False
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+        elif char == "," and depth == 0:
+            yield text[start:index].strip()
+            start = index + 1
+    yield text[start:].strip()
+
+
+def _assert_measured_geometry_is_scoped(css):
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
     readers = [m for m in re.finditer(r"([^{}]*)\{([^{}]*var\(--window-chrome-[^{}]*)\}", css)]
     assert readers, "style.css consumes the measured title bar geometry"
     for rule in readers:
-        for selector in rule.group(1).split(","):
-            assert ':root[data-window-chrome="integrated"]' in selector, selector.strip()
+        for selector in _selector_list(rule.group(1)):
+            assert selector.startswith(':root[data-window-chrome="integrated"]'), selector
+
+
+def test_the_page_reserves_room_only_under_the_measured_state():
+    """No phantom spacer: every rule reading the shell's geometry is scoped to the attribute the shell
+    writes after measuring, so a browser, another OS or an older shell lays out exactly as before."""
+    css = _read("web/style.css")
+    _assert_measured_geometry_is_scoped(css)
+    with pytest.raises(AssertionError):
+        _assert_measured_geometry_is_scoped(css.replace(':root[data-window-chrome="integrated"]', ':root'))
     assert "window-chrome" not in re.sub(r"/\*.*?\*/", "", _read("web/ui.css"), flags=re.S)
+
+
+@pytest.mark.parametrize("selector", [
+    ':root[data-window-chrome="integrated"] :is(.chat, .project), .unguarded',
+    '.unguarded, :root[data-window-chrome="integrated"] :where(.chat, .project)',
+    ':is(:root[data-window-chrome="integrated"] .chat, .unguarded)',
+])
+def test_a_functional_selector_does_not_hide_an_unguarded_geometry_reader(selector):
+    with pytest.raises(AssertionError):
+        _assert_measured_geometry_is_scoped(selector + ' { height: var(--window-chrome-top); }')
 
 
 def test_the_shell_writes_exactly_the_names_the_page_reads():

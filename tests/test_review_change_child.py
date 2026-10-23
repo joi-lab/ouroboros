@@ -274,7 +274,7 @@ def test_child_cold_rejoin_survives_drive_removal_at_cap(tree, monkeypatch, surf
         retained = [ref for row in record['rows'] for ref in row['source_refs'] if ref['status'] == 'retained']
         assert 'response' in {ref['role'] for ref in retained}
         prompts = [ref for ref in record['rows'][0]['source_refs'] if ref['role'] == 'observability_prompt']
-        assert prompts and prompts[0]['ref']['call_id'] == operation + '_prompt'
+        assert prompts and prompts[0]['ref']['call_id'] == operation + '_prompt', record['rows'][0]
         assert all(read_source(parent.drive_root, child.task_id, ref) for ref in retained)
         assert not checkout.exists()
         # The addressed-wait finalizer has to find the same attempt after the

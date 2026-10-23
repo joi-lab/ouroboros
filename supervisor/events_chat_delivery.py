@@ -21,6 +21,7 @@ from ouroboros.utils import utc_now_iso
 from ouroboros.observability import emit_finalization_timing, timed_phase
 from ouroboros.store import acquisition_budget
 from ouroboros._usage_wait import ACQUISITION_SLICE_SEC
+from ouroboros.owner_stop_receipt import EVENT_FIELD as RETAINED_WORK_FIELD
 
 log = logging.getLogger(__name__)
 
@@ -239,7 +240,7 @@ def _handoff_delivered_review(ctx: Any, task_id: str, delivery_id: str) -> None:
 def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> bool:
     """Own this physical send until it returns; contention leaves the exact outbox debt."""
     key = _delivery_key(getattr(ctx, "DRIVE_ROOT", None), evt)
-    claimed = bool(key[1]) and not evt.get("terminal_custody_notice")
+    claimed = bool(key[1]) and not (evt.get("terminal_custody_notice") or evt.get(RETAINED_WORK_FIELD))
     with _DELIVERY_LOCK:
         if claimed and key in _ACTIVE_DELIVERIES:
             return False
@@ -256,14 +257,18 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> bool:
 
 def _send_message(evt: Dict[str, Any], ctx: Any) -> Any:
     try:
-        if evt.get("terminal_custody_notice"):
+        if evt.get("terminal_custody_notice") or evt.get(RETAINED_WORK_FIELD):
             from supervisor.terminal_delivery import register_pending_delivery
 
             # Issue #1006: open delegated execution is a typed row OF the task's
             # card, so it is split off before the host notice and never carries
             # the answer's phase — a custody row concludes or relabels nothing.
+            # Wrap up's receipt (#1564) is a second such row under the Stop's own
+            # identity, so whichever terminal message carries it, it lands once.
             answer = dict(evt)
-            custody = str(answer.pop("terminal_custody_notice"))
+            custody = str(answer.pop("terminal_custody_notice", "") or "")
+            retained = answer.pop(RETAINED_WORK_FIELD, None)
+            retained = retained if isinstance(retained, dict) and retained.get("text") else {}
             meta = evt.get("progress_meta") if isinstance(evt.get("progress_meta"), dict) else {}
             # Derived from the ANSWER's id, so a re-split never grows a suffix. An
             # answer that reaches this seam unregistered gets the same canonical
@@ -276,33 +281,37 @@ def _send_message(evt: Dict[str, Any], ctx: Any) -> Any:
                 from supervisor.terminal_delivery import delivery_id_for
 
                 base_id = delivery_id_for(str(evt.get("task_id")), str(evt.get("text") or ""))
+            def _row(text: str, row_id: str, **marks: Any) -> Dict[str, Any]:
+                row = {**answer, "text": text, "log_text": text, "role": "system", "system_type": "custody_notice"}
+                if row_id:
+                    row.update(delivery_id=row_id, progress_meta={
+                        **{key: value for key, value in meta.items() if key not in ("task_phase", "task_terminal_status")},
+                        "card_row": "timeline", "card_row_id": row_id, **marks})
+                for key in ("terminal_host_notice", "terminal_origin", "_finalization_timing",
+                            "terminal_projection_token"):
+                    row.pop(key, None)
+                return row
+
             if not base_id:
-                # Nothing to key the row by: the custody fact still reaches the
+                # Nothing to key the custody row by: the fact still reaches the
                 # chat as its OWN typed row instead of riding a host-notice
                 # field no consumer reads, and it mints no task-independent
                 # delivery id the delivered registry would suppress for every
                 # later task.
                 answer.pop("terminal_host_notice", None)
-                row = {**answer, "text": custody, "log_text": custody,
-                       "role": "system", "system_type": "custody_notice"}
-                row.pop("terminal_origin", None)
-                row.pop("_finalization_timing", None)
-                _handle_send_message(answer, ctx)
-                _handle_send_message(row, ctx)
-                return
-            row_id = base_id + ":custody_notice"
-            row = {**answer, "text": custody, "log_text": custody, "role": "system",
-                   "system_type": "custody_notice", "delivery_id": row_id,
-                   "progress_meta": {**{key: value for key, value in meta.items()
-                                        if key not in ("task_phase", "task_terminal_status")},
-                                     "card_row": "timeline", "card_row_id": row_id}}
-            row.pop("terminal_host_notice", None)
-            row.pop("terminal_origin", None)
-            row.pop("_finalization_timing", None)
-            # Owe the row before the answer send clears its bundled outbox row.
-            register_pending_delivery(ctx.DRIVE_ROOT, row)
+            rows = [_row(custody, base_id and base_id + ":custody_notice")] if custody else []
+            if retained:
+                # Typed as a terminal receipt: a transport that leaves card rows to
+                # its progress toggle still sends this one (Telegram).
+                rows.append(_row(str(retained["text"]), str(retained.get("id") or "")
+                                 or (base_id and base_id + ":retained_work"), terminal_receipt="retained_work"))
+            # Owe the rows before the answer send clears its bundled outbox row.
+            for row in rows:
+                if row.get("delivery_id"):
+                    register_pending_delivery(ctx.DRIVE_ROOT, row)
             _handle_send_message(answer, ctx)
-            _handle_send_message(row, ctx)
+            for row in rows:
+                _handle_send_message(row, ctx)
             return
         delivery_id = str(evt.get("delivery_id") or "")
         if delivery_id and getattr(ctx, "DRIVE_ROOT", None):
@@ -760,11 +769,11 @@ def _handle_send_quiz_state(evt: Dict[str, Any], ctx: Any) -> None:
                      require_write=True)
             mark_quiz_history_written(ctx.DRIVE_ROOT, tid, qid)
         if block.get("closed_actor") == "owner" and not (block.get("delivery") or {}).get("mailbox_at"):
-            from ouroboros.gateway.task_decision import _live_root_task
+            from ouroboros.gateway.task_decision import _mail_holder
             from ouroboros.owner_mailbox import KIND_QUIZ_CLOSED, write_owner_message
             from supervisor.queue import _task_drive_for_task
 
-            task, _refusal = _live_root_task(tid)
+            task, _refusal = _mail_holder(tid)  # a paused author learns it when it continues
             if task is not None:
                 frame = (f"[Owner question closed without answer] quiz {qid} — "
                          f"closed {block['closed_at']}. Reason: {block['closed_reason']}\n"

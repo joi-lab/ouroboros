@@ -284,7 +284,7 @@ def test_each_desktop_window_owns_its_appearance_and_bridge(windows, monkeypatch
     from ouroboros import launcher_onboarding
 
     monkeypatch.setattr(lb, "indicator_class", lambda: None)
-    background = lb.Background(lambda: None, lambda: 8765, threading.Event())
+    background = lb.Background(lambda: None, lambda: 1, threading.Event())
     main = Window("#0d0b0f")
     main.events.closing, main.events.shown = Hook(), Hook()
     background.attach(main)
@@ -307,7 +307,7 @@ def test_each_desktop_window_owns_its_appearance_and_bridge(windows, monkeypatch
 
     fake.create_window, fake.start = create_window, lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "webview", fake)
-    launcher_onboarding.present_first_run_onboarding({}, 8765, open_external_url=lambda url: {"ok": False})
+    launcher_onboarding.present_first_run_onboarding({}, 1, open_external_url=lambda url: {"ok": False})
     setup = created["window"]
     assert created["js_api"].set_native_appearance("dark", PAGE_A, 1) == {"ok": True, "state": "pending"}
     setup.events.before_show.fire()

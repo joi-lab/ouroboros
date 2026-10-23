@@ -4,7 +4,7 @@ A real publisher (a plan council reply that settles after its task ended) persis
 source, then keeps ONE host mark in the room that owns the work; the helper's own tests publish
 the record a pre-fold late acceptance settlement wrote, whose marks stay as history.
 The next request of that room carries it through the real memory view and context assembly;
-another room's request does not; consciousness reads every room's. Showing, reading, a page seal and a fitted window never
+another room's request does not; consciousness reads foreign marks by pointer. Showing, reading, a page seal and a fitted window never
 release it; only the integrating mind's ``memory_mark(release_id, reason)`` does, and a replay
 never brings it back, also after the index is lost. An unproven room keeps no mark. No test
 calls a model or the network.
@@ -164,7 +164,13 @@ def test_the_next_request_of_the_owning_room_carries_it_and_another_room_never_d
     assert SECTION in alpha_c and "MAIN-DEFECT-bound" in alpha_c and "MAIN-DEFECT-main1" not in alpha_c
     assert "MAIN-DEFECT-bound" in alpha_c.split(SECTION, 1)[1].split("\n## ", 1)[0], "in its own section"
     wake = room_text(root, {"id": "wake1", "chat_id": 1, "metadata": WAKE})
-    assert all(f"MAIN-DEFECT-{task}" in wake for task in marks), "consciousness reads every room's"
+    assert "MAIN-DEFECT-main1" in wake
+    assert "MAIN-DEFECT-bound" not in wake and "MAIN-DEFECT-pres1" not in wake
+    for task in ("bound", "pres1"):
+        lines = [line for line in wake.splitlines() if f"Late review of task {task}:" in line]
+        assert len(lines) == 1 and f'memory_read(node_id="{marks[task]}")' in lines[0]
+        assert f"MAIN-DEFECT-{task}" in _memory_read(_ctx(root, "wake1"), node_id=marks[task])
+    assert len(_late_marks(root)) == 3  # projection/read never releases any mark
     presence = room_text(root, {"id": "pt1", "chat_id": 555, "metadata": PRESENCE})
     assert "MAIN-DEFECT-pres1" in presence and "MAIN-DEFECT-main1" not in presence
     beta = room_text(root, {"id": "tb2", "chat_id": rooms["beta"]})

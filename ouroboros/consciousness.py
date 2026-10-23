@@ -5,8 +5,9 @@ Main's prompt, memory, tools and loop, started through ``supervisor.workers.hand
 with the wake's envelope, the Main lane's own routing facts and rendered message. This module owns only
 the clock — WHEN such a turn starts and what to say about it afterwards. No thread, no private
 registry, no observation inbox, no pause/resume: the supervisor loop calls ``tick(now)`` once
-per pass and the ``DirectActivityRegistry`` (the census of live direct turns) is the only
-liveness truth. Tick order, each step a typed outcome: disabled → a live wake → a live owner
+per pass; ``DirectActivityRegistry`` and the ordinary pool census supply liveness.
+Only ``wake_cause=own_clock`` blocks this clock; focuses are neither its wake nor owner turns.
+Tick order, each step a typed outcome: disabled → a live wake → a live owner
 turn → not yet due → the rolling-24h allowance (an unreadable ledger is the disclosed skip
 ``allowance_unknown``, never a silent block; known spend at the daily limit is
 ``allowance_exhausted``) → an owner chat must be bound → launch.
@@ -18,13 +19,16 @@ nearly spent day. The next
 wake is ``last finish + interval``: the MODEL's choice (``set_next_wakeup`` persists
 ``consciousness_next_interval_sec``) or ``WAKE_DEFAULT_SEC``, clamped into the owner's
 [min, max]; a runner failure — or a wake the lane could not admit — doubles it up to max until a
-wake succeeds. Nothing else moves the alarm (owner 12 Oct, #1603: no accelerated wake, only the
+wake succeeds. The persisted own actor id and cause fence completion; a carrier handoff
+does not finish the logical wake, and repeated terminal callbacks do not advance it twice.
+Nothing else moves the alarm (owner 12 Oct, #1603: no accelerated wake, only the
 scheduled time): a task finishing, a project digest or an orphan-heal sweep never pulls the next
 wake earlier — they wait as observed facts for the scheduled wake (``observe_wake``), so every
 wake's reason is the heartbeat. Neither does an owner message, nor a health event (``build_health_invariants``
 is read-side; health is visible in the next wake's context).
-Panic and ``/bg stop`` arrive through ``stop()``, which arms a graceful stop of a live wake
-off-thread. The legacy observation inbox, if present, is moved once to the archive unread.
+Panic and ``/bg stop`` arrive through ``stop()``, which arms ordinary graceful cascade
+cancellation for own wakes, live/lent focuses and autonomous work, off-thread.
+The legacy observation inbox, if present, is moved once to the archive unread.
 What a wake OBSERVES is not this clock's business: it starts after the chat-chain position and
 the task-result transition state the last admitted wake observed
 (``consciousness_observation_boundary``, persisted only once the lane admits the wake;
@@ -36,7 +40,6 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import math
-import os
 import pathlib
 import threading
 import time
@@ -51,7 +54,7 @@ from ouroboros.config import (
     runtime_setting,
 )
 from ouroboros.consciousness_allowance import STATUS_EXHAUSTED, STATUS_UNKNOWN, allowance_window
-from ouroboros.consciousness_authority import is_consciousness_origin
+from ouroboros.consciousness_authority import is_consciousness_origin, is_own_clock_wake
 from ouroboros.consciousness_wake import bind_wake_observation, observe_wake, render_wake_message, wake_task_metadata
 from ouroboros.deadline_utils import parse_deadline_ts
 from ouroboros.utils import append_jsonl, utc_now_iso
@@ -61,6 +64,7 @@ log = logging.getLogger(__name__)
 NEXT_WAKE_STATE_KEY = "consciousness_next_wake_at"
 INTERVAL_STATE_KEY = "consciousness_next_interval_sec"
 LAST_WAKE_STATE_KEY = "consciousness_last_wake_at"
+OWN_WAKE_STATE_KEY = "consciousness_own_wake"  # the admitted clock actor, retained across carrier changes/restart
 OBSERVATION_STATE_KEY = "consciousness_observation_boundary"  # chat position + transition state the last ACCEPTED wake observed
 OBSERVATION_BOOTSTRAP_STATE_KEY = "consciousness_observation_bootstrap_since"
 LEGACY_INBOX_REL = pathlib.Path("state") / "consciousness_observations.jsonl"
@@ -77,21 +81,10 @@ def _iso(ts: float) -> str:
 
 
 def panic_blocks_wake(drive_root: Any) -> bool:
-    """A kept Panic intent bars all automatic wake grants. Only a proven absence of the flag
-    (``confirm_absent``) permits one: a dangling link is present, and an unreadable flag or
-    an absence no directory ancestor proves is unknown, so it bars too."""
-    from supervisor.state_initialization import confirm_absent
+    """An unreceived Panic input bars automatic wake grants."""
+    from ouroboros.installation_stop import installation_panic
 
-    path = pathlib.Path(drive_root) / "state" / "panic_stop.flag"
-    try:
-        try:
-            os.lstat(path)  # lstat, not stat: a dangling link IS present
-        except FileNotFoundError:
-            confirm_absent(path)
-            return False
-        return True
-    except OSError:
-        return True
+    return installation_panic(drive_root)
 
 
 class BackgroundConsciousness:
@@ -134,6 +127,9 @@ class BackgroundConsciousness:
         self._last_wake_at, self._last_wake_task_id, self._last_wake_outcome, self._last_error = (
             persisted_last_wake, "", "", ""
         )
+        admitted = state.get(OWN_WAKE_STATE_KEY)
+        self._own_wake = dict(admitted) if isinstance(admitted, dict) else {}
+        self._last_wake_task_id = str(self._own_wake.get("task_id") or "")
         try:
             bootstrap = float(state.get(OBSERVATION_BOOTSTRAP_STATE_KEY, persisted_last_wake or self._booted_at))
             if not math.isfinite(bootstrap) or not 0 <= bootstrap <= self._booted_at:
@@ -167,17 +163,6 @@ class BackgroundConsciousness:
             state.update_state(lambda st: st.__setitem__(NEXT_WAKE_STATE_KEY, self._next_wake_at))
         except Exception:
             log.debug("consciousness: next wake time not persisted", exc_info=True)
-
-    def _set_last_wake_at(self, at: float) -> None:
-        from supervisor import state
-
-        try:
-            # Even if the first bootstrap write failed, alarm completion may
-            # never persist without the observation lower bound beside it.
-            state.update_state(lambda st: st.update({LAST_WAKE_STATE_KEY: float(at),
-                OBSERVATION_BOOTSTRAP_STATE_KEY: self._observation_bootstrap_since}))
-        except Exception:
-            log.debug("consciousness: wake completion not persisted", exc_info=True)
 
     @staticmethod
     def _set_state(key: str, value: Any) -> None:
@@ -217,9 +202,9 @@ class BackgroundConsciousness:
         for entry in get_direct_activity_registry().actors():
             activity_id = str(entry.activity_id)
             metadata = (direct_chat_turn(activity_id) or {}).get("metadata") or {}
-            if activity_id == self._last_wake_task_id or is_consciousness_origin(metadata):
+            if is_own_clock_wake(metadata):
                 wake = activity_id
-            else:
+            elif not is_consciousness_origin(metadata) or metadata.get("work_kind") == "owner":
                 owner = True
         from supervisor.consciousness_carriers import queued_wakes
         pooled = queued_wakes(blocking=queue_blocking)
@@ -287,19 +272,28 @@ class BackgroundConsciousness:
         self._set_state(OBSERVATION_BOOTSTRAP_STATE_KEY, self._observation_bootstrap_since)
         observation = observe_wake(self._drive_root, boundary=self._read_state().get(OBSERVATION_STATE_KEY),
                                    since=self._observation_bootstrap_since, now=now, reason=reason)
+        context = self._context_facts(window)
 
         def render(events: str) -> str:
             return render_wake_message(
                 self._repo_dir, reason=reason, last_wake_at=self._last_wake_at, now=now, level=level,
                 disabled_tools=list(metadata.get("disabled_tools") or []), spent_usd=window.get("settled_usd"),
                 spent_is_floor=int(window.get("unknown_unmetered") or 0) > 0,
-                daily_usd=window.get("limit_usd") or 0.0, running=self._running_roots(),
-                max_tasks=get_consciousness_max_tasks(), interval=self._interval(), events=events)
+                daily_usd=window.get("limit_usd") or 0.0, running=len(context["counted_roots"]),
+                max_tasks=get_consciousness_max_tasks(), interval=self._interval(), events=events,
+                **context)
 
         accepted_boundary = None
 
         def bind_input(task):
             nonlocal accepted_boundary
+            if not is_own_clock_wake(task.get("metadata")):
+                return
+            # Bind before the thread starts: even an immediate completion has an owner.
+            self._own_wake = {"task_id": str(task["id"]), "wake_cause": metadata["wake_cause"],
+                              "initiator": metadata["initiator"], "finished": False}
+            self._set_state(OWN_WAKE_STATE_KEY, self._own_wake)
+            self._last_wake_task_id, self._last_wake_outcome, self._last_error = str(task["id"]), "running", ""
             accepted_boundary = bind_wake_observation(self._drive_root, task, observation, render)
 
         # Check-and-register under the lane's own re-entrant gate lock: atomic with the census.
@@ -326,23 +320,40 @@ class BackgroundConsciousness:
             self._set_next_wake(now + (self.floor if transient else min(self.ceiling, self._interval() * self._backoff)))
             self._record("consciousness_wake_rejected", reason=why, wake_reason=reason)
             return f"rejected:{why}"
-        self._last_wake_task_id, self._last_wake_outcome, self._last_error = str(receipt["task_id"]), "running", ""
         # Accepted: the running wake owns this observation, so the next one starts
         # after it. A refused launch above consumed nothing; a crash before this
         # write replays the same window (at-least-once, never a silent skip).
-        if accepted_boundary is not None:
+        if accepted_boundary is not None and str(receipt["task_id"]) == self._own_wake.get("task_id"):
             self._set_state(OBSERVATION_STATE_KEY, accepted_boundary)
         self._record("consciousness_wake_started", task_id=self._last_wake_task_id, wake_reason=reason,
                      level=level, root_cost_ceiling_usd=ceiling)
         return "launched"
 
-    def _wake_finished(self, task_id: str, ok: bool) -> None:
-        """Runner success controls backoff; stored work facts describe its outcome."""
+    def _wake_finished(self, task_id: str, ok: bool, *, metadata=None, pooled: bool = False) -> None:
+        """Only the admitted own-clock actor's terminal advances the clock, once.
+
+        A direct stack handing the same id to the pool has not finished the wake.
+        A pooled terminal carries its stored cause and the persisted admission still
+        names its actor after restart; descendants and stale callbacks own neither.
+        """
+        if metadata is not None and not is_own_clock_wake(metadata):
+            return
+        from supervisor.consciousness_carriers import queued_wakes
+
+        if not pooled and task_id in queued_wakes():
+            return
+        with self._lock:
+            if (task_id != self._own_wake.get("task_id") or self._own_wake.get("finished")
+                    or not is_own_clock_wake(self._own_wake)):
+                return
         outcome = "unknown"
-        if ok:
-            try:
-                from ouroboros.task_results import load_task_result
-                row = load_task_result(self._drive_root, task_id, strict=True)
+        try:
+            from ouroboros.task_results import load_task_result
+            row = load_task_result(self._drive_root, task_id, strict=True)
+            owner = (row or {}).get("execution_owner") or {}
+            if not pooled and owner.get("kind") == "pooled":
+                return  # durable handoff can precede queue restoration / follow the pool's terminal
+            if ok:
                 pause = (row or {}).get("budget_pause") or {}
                 owner_pause = (row or {}).get("owner_pause") or {}
                 if owner_pause.get("state") == "requested" or pause.get("state") == "pausing":
@@ -354,18 +365,27 @@ class BackgroundConsciousness:
                     outcome = "paused"
                 elif row:
                     outcome = "done"  # the ordinary successful-turn contract is unchanged
-            except Exception:
-                log.debug("Wake outcome is unreadable for %s", task_id, exc_info=True)
+        except Exception:
+            log.debug("Wake outcome is unreadable for %s", task_id, exc_info=True)
         with self._lock:
+            if task_id != self._own_wake.get("task_id") or self._own_wake.get("finished"):
+                return
             now = time.time()
             self._last_wake_at, self._last_wake_task_id = now, str(task_id)
-            self._set_last_wake_at(now)
+            self._own_wake = {**self._own_wake, "finished": True}
             if ok:
                 self._backoff, self._last_wake_outcome, self._last_error = 1, outcome, ""
             else:
                 self._backoff, self._last_wake_outcome = min(self._backoff * 2, 1024), "failed"
                 self._last_error = f"wake-up {task_id} failed in its runner (see the chat and events.jsonl)"
-            self._set_next_wake(now + min(self.ceiling, self._interval() * self._backoff))
+            self._next_wake_at = now + min(self.ceiling, self._interval() * self._backoff)
+            from supervisor import state
+            try:
+                state.update_state(lambda st: st.update({OWN_WAKE_STATE_KEY: self._own_wake,
+                    LAST_WAKE_STATE_KEY: now, NEXT_WAKE_STATE_KEY: self._next_wake_at,
+                    OBSERVATION_BOOTSTRAP_STATE_KEY: self._observation_bootstrap_since}))
+            except Exception:
+                log.debug("consciousness: wake completion not persisted", exc_info=True)
 
     def start(self) -> str:
         with self._lock:
@@ -383,12 +403,22 @@ class BackgroundConsciousness:
             self._stopped = True
             was_enabled, self._enabled = self._enabled, False
         wake, _owner = self.live_turns()
-        from supervisor.consciousness_carriers import queued_wakes
-        wakes = list(dict.fromkeys(([wake] if wake else []) + queued_wakes()))
+        from supervisor.consciousness_carriers import autonomous_tasks
+        from ouroboros.conversation_lease import live_authors
+        from supervisor.active_activity import get_direct_activity_registry
+        from supervisor.workers import direct_chat_turn
+        direct = []
+        for entry in get_direct_activity_registry().actors():
+            task_id = str(entry.activity_id)
+            metadata = (direct_chat_turn(task_id) or {}).get("metadata") or {}
+            if is_consciousness_origin(metadata) and metadata.get("work_kind") != "owner":
+                direct.append(task_id)
+        wakes = list(dict.fromkeys(direct + autonomous_tasks() + live_authors(drive_root=self._drive_root)))
         if wakes:
             for task_id in wakes:
                 threading.Thread(target=self._stop_live_wake, args=(task_id,), name="wake-stop", daemon=True).start()
-            return f"Background consciousness disabled; wake-up {wake} ends at its next step."
+            return (f"Background consciousness disabled; wake-up {wake} ends at its next step." if wake
+                    else "Background consciousness disabled; autonomous work ends at its next step.")
         return "Background consciousness disabled." if was_enabled else "Background consciousness is already disabled."
 
     @staticmethod
@@ -409,12 +439,34 @@ class BackgroundConsciousness:
     def status_snapshot(self) -> Dict[str, Any]:
         wake, _owner = self.live_turns()
         window = self._allowance_view(time.time())
+        context = self._context_facts(window)
         values = (self._enabled, get_consciousness_autonomy(), _iso(self._next_wake_at),
                   _iso(self._last_wake_at), self._last_wake_task_id, self._last_wake_outcome, self._last_error,
                   window.get("settled_usd"), window.get("limit_usd"), str(window.get("resets_at") or ""),
-                  self._running_roots(), int(get_consciousness_max_tasks()), wake,
+                  len(context["counted_roots"]), int(get_consciousness_max_tasks()), wake,
                   int(window.get("unknown_unmetered") or 0), bool(window.get("integrity_degraded")))
-        return dict(zip(SNAPSHOT_KEYS, values))
+        places = context.pop("places")
+        return {**dict(zip(SNAPSHOT_KEYS, values)), **context,
+                "places_brief": [{key: place.get(key) for key in ("place_id", "label", "state", "unanswered")}
+                                 for place in places] if places is not None else None}
+
+    def details_snapshot(self, requested_enabled: bool | None) -> Dict[str, Any]:
+        """The full read-only panel; the state endpoint keeps its small snapshot."""
+        from ouroboros.consciousness_view import describe_consciousness_state, place_views, recent_wakes
+        snapshot = describe_consciousness_state(self.status_snapshot(), requested_enabled)
+        places = place_views(self._drive_root)
+        return {**snapshot, "places": places, "recent_wakes": recent_wakes(self._drive_root, places),
+                "recent_wakes_coverage": "wake turns among the 50 newest task rows"}
+
+    def _context_facts(self, window) -> dict:
+        from ouroboros.consciousness_view import cause_views, place_views, root_views
+        from supervisor.queue import live_consciousness_roots
+        try:
+            places = place_views(self._drive_root)
+        except Exception:
+            places = None
+        return {"spend_by_cause": cause_views(window.get("spend_by_cause"), places),
+                "counted_roots": root_views(live_consciousness_roots(), places), "places": places}
 
     def _allowance_view(self, now: float, *, fresh: bool = False) -> Dict[str, Any]:
         cached_at, cached = self._allowance
@@ -426,15 +478,6 @@ class BackgroundConsciousness:
             window = {"status": STATUS_UNKNOWN, "error": f"{type(exc).__name__}: {exc}"}
         self._allowance = (now, window)
         return window
-
-    @staticmethod
-    def _running_roots() -> int:
-        try:
-            from supervisor.queue import live_consciousness_root_count
-
-            return int(live_consciousness_root_count())
-        except Exception:
-            return 0
 
     def _routing_facts(self, chat_id: int) -> Dict[str, Any]:
         """The Main-lane host facts an owner turn in this chat gets (the routing manifest,

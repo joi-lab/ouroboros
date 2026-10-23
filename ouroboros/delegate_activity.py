@@ -16,10 +16,11 @@ snapshots that no reader could reconcile. This module keeps the facts typed inst
   them it discloses possibly repeated text/counts with the retained source. Equal
   texts or timestamps are never merged, and a range
   is never counted as if every seq in it were an event.
-* **Retained originals.** The redacted lines exactly as served are stored as a task source
-  handle (``artifacts.store_actor_source_bytes``, category ``delegated_activity``, in the
-  canonical custody store) and the record names that ref; the task-file route serves it
-  by its content address (``gateway.task_archive.serve_task_source``).
+* **Retained originals.** The redacted lines exactly as served, one LF-ended JSONL record
+  each, are stored as a task source handle (``artifacts.store_actor_source_bytes``,
+  category ``delegated_activity``, in the canonical custody store) and the record names
+  that ref; the task-file route serves it by its content address
+  (``gateway.task_archive.serve_task_source``).
 * **Commit after emission.** The per-run cursor moves only when the caller reports the
   frame emitted. A process that lost it resumes at the last retained range, re-reading
   that range once; a reader's seq identity keeps it shown once.
@@ -398,7 +399,10 @@ def retained_observations(ctx: Any, run_id: str):
         if last <= after or first > after + 1:
             continue  # Missing ranges stay unshown, never an invented cursor advance.
         raw = read_actor_source_bytes(custody_root(ctx), task_id, ref)
-        events = [json.loads(line) for line in raw.decode("utf-8").splitlines()]
+        # ``_persist`` ends each served line with LF, the one record separator: U+0085,
+        # U+2028 and U+2029, where ``str.splitlines`` also cuts, are text in a JSON line.
+        text = raw.decode("utf-8")
+        events = [json.loads(line) for line in text.removesuffix("\n").split("\n")] if text else []
         if not events or any(not isinstance(row, dict) or not isinstance(row.get("seq"), int)
                              or row.get("run_id") != run_id for row in events):
             continue
@@ -419,17 +423,14 @@ def _owner_stop(ctx: Any, task_id: str) -> str:
         from ouroboros.cancel_intents import cancel_pending
         from ouroboros.delegate_custody import custody_root
         from ouroboros.model_wait import current_model_wait
-        from supervisor.state_initialization import confirm_absent
+        from ouroboros.delegate_recovery import owner_restart_in_progress
 
         owner = current_model_wait()
         if owner is not None and (reason := owner.control_reason()):
             return reason
         root = custody_root(ctx)
-        try:
-            for name in ("panic_stop.flag", "owner_restart_no_resume.flag"):
-                confirm_absent(root / "state" / name)
-        except OSError:  # present, linked or unknown is not a proven absent Stop flag
-            return "panic"
+        if owner_restart_in_progress(root):
+            return "owner_restart"
         return "cancelled" if cancel_pending(root, task_id) else ""
     except Exception:
         log.debug("owner stop facts unreadable during a delegated drain", exc_info=True)

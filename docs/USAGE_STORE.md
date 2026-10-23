@@ -16,12 +16,31 @@ The shared store core defaults to `journal_mode=PERSIST`, `synchronous=FULL`
 and a 64 MiB idle journal size limit. A retained rollback journal avoids file
 creation/deletion on every commit; DELETE-mode older writers can interleave.
 WAL keeps FULL and requires all three facts: SQLite >= 3.51.3 (or the 3.50
-branch >= 3.50.7 / 3.44 branch >= 3.44.6), enforced locks, and a proven local
-filesystem. Darwin/FreeBSD use `statfs` (apfs/hfs/ufs); Linux uses mountinfo
+branch >= 3.50.7 / 3.44 branch >= 3.44.6, which carry the WAL-reset fix: a race
+between two connections, in threads or processes, writing or checkpointing the
+same WAL file at once, sqlite.org/wal.html §11), enforced locks, and a proven
+local filesystem. Darwin/FreeBSD use `statfs` (apfs/hfs/ufs); Linux uses mountinfo
 and known local filesystem types, with every overlay backing directory
 verified; Windows requires `GetDriveTypeW` = DRIVE_FIXED for the containing
 volume. Unknown or remote filesystems keep PERSIST. A working lock probe alone
-does not prove WAL shared-memory support.
+does not prove WAL shared-memory support. The gate is a fact about the opening
+runtime, not evidence that a file was damaged.
+
+Lifecycle owners choose the journal (`ouroboros/store_journal.py`): private
+builds publish their chosen header; lifespan boot calls explicit
+`initialize_journal=True` for current facts, money and dialogue before producers.
+`body_sha` and the repair CLI grant no journal authority. Boot checks existing
+child headers through the custody directory walk, without SQL on compatible
+children or creating absent stores; incompatible WAL leaves before lazy access.
+Export, switch and retier leave DELETE (`prepare_handoff`); a new tier is
+published only after conversion under the former protocol.
+Ordinary opens keep the WAL/rollback boundary: local PERSIST on rollback, WAL
+unchanged, incompatible WAL refused typed. `write=False` is still `mode=rw` and
+may write SQLite bookkeeping. Boot promotion is optional: an early lease defers
+it with a warning while rollback keeps serving. Required demotion retries only
+contention within one `wait_sec` budget; exhaustion is retryable `StoreBusy`,
+other failures propagate. Opens keep refusing incompatible WAL until a lifecycle
+owner succeeds; no failure authorizes unsafe WAL continuation.
 
 | table | holds |
 |---|---|
@@ -156,8 +175,10 @@ after checkpointing, before a rename; an active lease refuses handoff with the
 usual busy outcome. Any switch that retains a store while changing to an older
 SQLite runtime must also call `store.prepare_handoff` after quiescing writers.
 This includes switches whose target still contains the store module.
-Sibling import builds also close in DELETE mode before publication, so no
-temporary journal or WAL is left under the pre-rename filename.
+Private builds checkpoint and close their sole connection before publication:
+a WAL build keeps its header and leaves no log or index under the temporary
+name, a rollback build no journal. A refused switch (`forget_handoffs`) keeps its
+stores in the rollback journal until the next boot chooses again.
 Caller-owned raw connections must also close before rename on every platform.
 At normal interpreter exit the pool closes before Python clears the inode registry
 and its locks; thread exit closes that thread's connections earlier.
@@ -187,9 +208,11 @@ cannot be read is `UsageLedgerCorrupt` for every caller and is never replaced.
 
 ## 6. One-time import
 
-The server runs `migrate_from_journal(root)` at lifespan start on every door
-(a providerless install included), before any request, worker or supervisor;
-the supervisor's liveness phase `startup:usage_store` then finds it completed.
+The server runs `migrate_from_journal(root, initialize_journal=True)` at lifespan
+start on every door (a providerless install included), before any request,
+worker or supervisor, which is also where an existing store gets this runtime's
+journal (§1); the supervisor's liveness phase `startup:usage_store` then finds
+it completed and keeps the journal as it is.
 A display read (`allow_stale=True`) never imports: while a journal or a
 pre-ledger event chain awaits that job it reports the store unavailable, and with
 neither it creates the empty store. A non-display reader that finds no store (a tool or a test without a

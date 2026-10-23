@@ -359,6 +359,7 @@ EXPLICIT_RANGE_ARGS: frozenset[str] = frozenset({
     RESULT_VIEW_HEAD_ARG, RESULT_VIEW_TAIL_ARG,
     "max_chars", "max_lines", "start_char", "start_line",
     "source_start_char", "source_end_char", "offset", "limit",
+    "from", "to", "start", "after_seq",  # chronicle row bounds and continuation pages
 })
 
 # Tools whose own affordance IS paging: selects the recovery WORDING of a
@@ -463,13 +464,13 @@ OBSERVE_WORLD_MUTATION_TOOLS: frozenset[str] = frozenset({
     # skill payload; an orphan capture may belong to an unrelated earlier task,
     # so a read-only-children rule alone does not cover this path
     "integrate_delegated_patch", "integrate_subagent_patch",
-    # pushes docs/evolution.json to the public dashboard through the GitHub API
+    # writes a local task artifact; Observe does not grant general file writes
     "generate_evolution_stats",
     # the world beyond the repository: forms, skills, project notes
     "browser_action", "submit_skill_to_hub", "toggle_skill", "skill_owner_action",
     "skill_install", "skill_update",
     "journal_write", "workpad_write",
-    "create_github_issue", "comment_on_issue", "comment_on_pr", "close_github_issue", "pr_merge",
+    "github_write", "pr_merge",
 })
 
 

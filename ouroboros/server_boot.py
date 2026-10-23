@@ -95,11 +95,14 @@ def reconcile_review_jobs(root: pathlib.Path) -> None:
     reconcile_stale_review_jobs(root)
 
 
-def mcp_startup(settings: dict) -> None:
-    from ouroboros.mcp_client import reconfigure_from_settings, refresh_all_background
+def mcp_startup() -> None:
+    from ouroboros.config import load_settings
+    from ouroboros.mcp_client import get_manager, configuration_changed
 
-    reconfigure_from_settings(settings)
-    refresh_all_background(reason="startup")
+    get_manager().become_lister()
+    # Read the saved document when the step runs, never the early boot snapshot,
+    # and without waiting for a Save: one that changes MCP applies its own event.
+    configuration_changed(load_settings(), reason="startup")
 
 
 def wait_store_published(root: pathlib.Path, stop: threading.Event, document: BootDocument = BOOT) -> None:

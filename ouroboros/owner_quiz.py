@@ -324,6 +324,7 @@ def record_asked(
     max_wait_minutes: Optional[int] = None,
     host_facts: str = "",
     materials: Optional[List[Dict[str, Any]]] = None,
+    reply_to: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Worker-side projection write at ask time.
 
@@ -344,6 +345,9 @@ def record_asked(
         or not all(isinstance(value, str) for value in option_details)
     ):
         raise ValueError("option_details must preserve the labels' length and order")
+    from ouroboros.delegate_reply import normalize_reply_to
+
+    reply_to = normalize_reply_to(reply_to)
     stamp = utc_now_iso()
     block = {
         "quiz_id": str(quiz_id), "question": str(question or ""),
@@ -359,6 +363,7 @@ def record_asked(
            if isinstance(max_wait_minutes, int) and not isinstance(max_wait_minutes, bool) else {}),
         **({"host_facts": str(host_facts)} if str(host_facts or "") else {}),
         **({"materials": [dict(ref) for ref in materials]} if materials else {}),
+        **({"reply_to": reply_to} if reply_to else {}),
     }
 
     refused: Dict[str, str] = {}
@@ -732,6 +737,10 @@ def quiz_answer_frame(
         f"answered {block.get('answered_at')}.",
         f"Question was: {block.get('question')}",
     ]
+    from ouroboros.delegate_reply import reply_instruction
+
+    if block.get("reply_to"):
+        lines.append(reply_instruction(block["reply_to"]))
     if option_index is None:
         lines.append(
             "The owner answered in their own words without choosing an offered "

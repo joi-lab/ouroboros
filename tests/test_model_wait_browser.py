@@ -7,6 +7,7 @@ import json
 import pytest
 
 from tests import test_subscription_setup_browser as setup_browser
+from tests.test_reconnect_feed_browser import HISTORY_LANDED
 
 subscription_ui = setup_browser.subscription_ui
 capture = setup_browser.capture
@@ -400,9 +401,11 @@ def test_wait_reconnect_preserves_unsubmitted_form_without_context_or_animation(
     field.focus()
     field.evaluate("el => el.setSelectionRange(2, 8)")
     document_id = page.evaluate("window.waitDocumentId = crypto.randomUUID()")
+    page.evaluate(HISTORY_LANDED)
     with page.expect_response('**/api/chat/history*'):
         ui["sockets"][-1].close()
-    page.get_by_text("Reconnected", exact=True).wait_for()
+    page.wait_for_function("() => window.historyLanded > 0")  # response received; assert the retained form below
+    assert page.locator('[data-system-type="reconnect"]').count() == 0, "a reconnect adds no row"
     assert page.evaluate("window.waitDocumentId") == document_id
     assert field.input_value() == 'unfinished-owner-model'
     assert field.evaluate("el => document.activeElement === el")

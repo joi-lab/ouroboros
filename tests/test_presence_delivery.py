@@ -82,6 +82,10 @@ def test_http_records_exact_facts_with_nonterminal_history_type(tmp_path, state,
     export_for_older_body(tmp_path)  # Transition (unit H): history endpoint still owns the file reader.
     request = Request({"type": "http", "method": "GET", "path": "/api/chat/history", "query_string": b"", "headers": []})
     response = asyncio.run(make_chat_history_endpoint(tmp_path)(request))
+    assert not [item for item in json.loads(response.body)["messages"] if item.get("text") == payload["text"]]
+    request = Request({"type": "http", "method": "GET", "path": "/api/chat/history",
+                       "query_string": f"chat_id={row['chat_id']}".encode(), "headers": []})
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(request))
     projected = [item for item in json.loads(response.body)["messages"] if item.get("text") == payload["text"]]
     assert len(projected) == 1
     assert projected[0]["system_type"] == "presence_delivery"
@@ -332,9 +336,10 @@ def test_deferred_work_echoes_original_persisted_mode(tmp_path, status, version)
 
 
 def test_inbound_initiated_and_receipt_paths_derive_one_conversation_identity(tmp_path, monkeypatch):
-    from ouroboros.presence_bindings import PresenceBinding, PresenceEndpoint, new_presence_binding_id, save_presence_binding
+    from ouroboros.presence_bindings import PresenceBinding, PresenceEndpoint
+    from tests.frozen_presence_bindings import new_presence_binding_id, save_presence_binding
     from ouroboros.presence_runner import _stable_numeric_id
-    from ouroboros.tools.presence import get_tools
+    from tests.presence_legacy_helpers import legacy_tools as get_tools
     from ouroboros.tools.registry import ToolContext
 
     _seed_token(tmp_path, skill="telegram-bot", token="receipt-token",
@@ -352,13 +357,16 @@ def test_inbound_initiated_and_receipt_paths_derive_one_conversation_identity(tm
     client = TestClient(create_host_service_app(tmp_path, presence_runner=runner))
     initiate = next(item for item in get_tools() if item.name == "initiate_presence")
     identities = {}
+    bindings = {}
+    for thread in ("", "topic-1"):
+        endpoint = PresenceEndpoint("telegram", "bot-1", "room-1", thread)
+        bindings[thread] = save_presence_binding(tmp_path, PresenceBinding(
+            new_presence_binding_id(), "telegram-bot", "community-helper", endpoint, endpoint))
     for thread in ("", "topic-1"):
         payload = _turn_payload(inbound_binding)
         payload["event"].update(source_event_id=f"in-{thread}", thread_id=thread)
         assert client.post("/presence/turn", json=payload, headers={"X-Skill-Token": "receipt-token"}).status_code == 200
-        endpoint = PresenceEndpoint("telegram", "bot-1", "room-1", thread)
-        binding = save_presence_binding(tmp_path, PresenceBinding(
-            new_presence_binding_id(), "telegram-bot", "community-helper", endpoint, endpoint))
+        binding = bindings[thread]
         ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
         assert json.loads(initiate.handler(ctx, binding.binding_id, "Say hello.", f"wake-{thread}"))["ok"] is True
         receipt = _payload(provider="telegram", account_id="bot-1", conversation_id="room-1", thread_id=thread,
@@ -464,3 +472,9 @@ def test_receipt_and_turn_slots_return_on_success_and_on_exceptions(tmp_path, mo
     monkeypatch.setattr(ctx.presence_deliveries, "record", failing_record)
     assert [_post(client, _payload(part_id="9")).status_code for _ in range(7)] == [503] * 7
     assert not any(ctx._inflight.values())
+
+
+@pytest.fixture(autouse=True)
+def _focus_admission_enabled(monkeypatch):
+    monkeypatch.setattr("ouroboros.presence_admission.focus_enabled", lambda _root: True)
+    monkeypatch.setattr("ouroboros.presence_admission.focus_allowance", lambda _root: {"status": "available", "remaining_usd": 10})

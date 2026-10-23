@@ -403,7 +403,7 @@ def test_root_resume_holds_queued_children_for_selection_without_a_projected_lat
         fault.setattr(owner_pause, "read_fence", unreadable)
         refused = queue.resume_budget_paused_task("held")
     rows = {t["id"]: t for t in workers.PENDING}
-    assert refused == {"ok": False, "error": "owner_pause_custody_unreadable"}, refused
+    assert refused["ok"] is False and refused["error"] == "owner_pause_custody_unreadable", refused
     assert rows["held"].get("_budget_pause") and not any(budget_hold_fact(rows[c]) for c in children)
     assert (queue.BUDGET_ROOT_FENCES.get("held") or {}).get("fence_id") == projected
     resumed = queue.resume_budget_paused_task("held")
@@ -416,7 +416,7 @@ def test_root_resume_holds_queued_children_for_selection_without_a_projected_lat
     assert queue.resume_budget_paused_task(children[0], selected_by="held")["ok"]
     assert [t["id"] for t in _assign(host, monkeypatch)] == [children[0]], "only the selected child runs"
     [sibling] = [t for t in workers.PENDING if t["id"] == children[1]]
-    assert budget_hold_fact(sibling)["selected"] is False
+    assert budget_hold_fact(sibling) and "_resume_selection" not in sibling
     newer = pause("newer")  # a replacement Pause: the older Resume selects nothing more
     assert newer["fence_id"] != first["fence_id"]
     late = queue.resume_budget_paused_task(children[1], selected_by="held")

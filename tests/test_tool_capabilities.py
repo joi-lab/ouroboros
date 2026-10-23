@@ -321,8 +321,10 @@ def test_child_profiles_expose_existing_descendant_controls(tmp_path, constraint
     assert {"peek_task", "cancel_task", "discard_child_result"} <= names
 
 
-def test_local_readonly_verify_is_typed_zero_run_only(tmp_path):
+def test_local_readonly_verify_is_typed_zero_run_only(tmp_path, monkeypatch):
     """Readonly actor-first sessions may disclose no-leaf state, never run generic checks."""
+    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     from ouroboros.contracts.task_constraint import TaskConstraint
     from ouroboros.outcomes import (
         read_verification_receipts,
@@ -418,9 +420,7 @@ def test_ordinary_fresh_start_ignores_actor_first_zero_run_receipt_surface(tmp_p
 
     claimed, refusal = claimed_start_request(
         data,
-        claim_target="",
         actor_ctx=ctx,
-        enforce_actor_idle=True,
         run_id="",
         task_id=ctx.task_id,
         idempotency_key="ordinary-root-invocation",

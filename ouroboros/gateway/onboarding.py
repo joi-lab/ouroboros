@@ -800,9 +800,8 @@ def _persist(request: Request, old_settings: Dict[str, Any], current: Dict[str, 
         _start_supervisor_if_needed_for_request,
     )
 
-    to_save = dict(current)
-    to_save["OUROBOROS_RUNTIME_MODE"] = pending_mode
-    authored = ("OUROBOROS_SAFETY_MODE",) if safety_light else ()
+    to_save = {**current, "OUROBOROS_RUNTIME_MODE": pending_mode}
+    authored = ("OUROBOROS_SAFETY_MODE", "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE")
     # Under the seam-wide document lock: the fingerprint precondition protects
     # THIS write from a stale merge, but not a generic save whose (locked)
     # read happened before this write — without the lock that save would land
@@ -814,7 +813,7 @@ def _persist(request: Request, old_settings: Dict[str, Any], current: Dict[str, 
         _owner_write_settings(
             to_save,
             authored_keys=authored,
-            allow_safety_lowering=safety_light,
+            allow_safety_lowering=True,
             precondition=_write_precondition(
                 install_preset_applied, safety_light, read_fingerprint,
             ),
@@ -852,17 +851,19 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
         body = None
     if not isinstance(body, dict):
         return unsaved_error("JSON body must be an object.", 400)
-    from ouroboros.gateway.settings import ALLOW_EMPTY_REVIEW_POOL, REVIEW_LANES_KEY, review_pool_save_judgement
+    from ouroboros.gateway.settings import ALLOW_EMPTY_REVIEW_POOL, REVIEW_LANES_KEY, review_pool_save_judgement, _run_settings_writer
 
     allow_empty_pool = body.get(ALLOW_EMPTY_REVIEW_POOL) is True
     owner_draft, draft_error = _configured_owner_draft(body)
     if draft_error:
         return unsaved_error(draft_error, 400, code="invalid_available_subagents")
 
-    # BEFORE the read: a write landing between the two makes the derived document NEWER than the
-    # fingerprint, so the locked precondition refuses (the one ordering that fails closed). The
-    # whole document is written back, so without this a concurrent owner write would be silently
-    # undone while the owner is told the save succeeded (the owner endpoints' staleness digest).
+    # Complete startup migrations before capturing freshness; our own migration is not a concurrent edit.
+    from ouroboros.config import load_settings
+    migration = await _run_settings_writer(lambda *_: load_settings(), request, None)
+    if isinstance(migration, JSONResponse):
+        return migration
+    # The fingerprint still precedes the deciding read: concurrent owner changes must refuse the save.
     read_fingerprint = settings_document_digest()
     old_settings, current, error = _prepared_settings(body)
     if error:
@@ -872,6 +873,7 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
     eligible = preset_eligible(old_settings)
     safety_light = _fresh_settings_file()
     if safety_light:
+        current["OUROBOROS_CONSCIOUSNESS_SAFETY_MODE"] = "full"
         # Rev.3-2 desktop-wizard parity: a genuinely FRESH install authors the new-install ``light``
         # safety here (the shared validator must not: web/Docker reach it through the generic path);
         # the persist seam re-proves "no settings file yet" under the lock.
@@ -986,8 +988,6 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
 
     # Lazy, in the direction ``_persist`` already imports (settings.py imports
     # nothing from this module).
-    from ouroboros.gateway.settings import _run_settings_writer
-
     return await _run_settings_writer(_complete_locked, request, body)
 
 

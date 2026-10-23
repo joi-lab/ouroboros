@@ -21,7 +21,7 @@ pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
 def test_speechless_history_and_direct_resume(direct_server_with_data, engine):
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import expect, sync_playwright
     from ouroboros.task_results import load_task_result
 
     fixture = direct_server_with_data
@@ -65,10 +65,13 @@ def test_speechless_history_and_direct_resume(direct_server_with_data, engine):
 
     def state_route(route):
         data = dict(state)
-        rows = [{"activity_id": turn_id, "chat_id": 1, "kind": "direct_chat", **census}]
-        # The server's own work projection of the controlled row: its word, reason and controls.
+        pausing = census["phase"] == "budget_pausing"
+        rows = [{"activity_id": turn_id, "chat_id": 1, "kind": "direct_chat", "live": pausing, **census}]
+        # The projection also reads physical liveness and the current Pause fence.
+        # No author is declared by this fixture; it must not invent who pressed Pause.
         data.update(active_chat_activities=rows, active_chat_activities_complete=True,
-                    supervisor_ready=True, **work_fields(rows))
+                    supervisor_ready=True, **work_fields(rows, fences={
+                        turn_id: {"state": "requested" if pausing else "paused"}}))
         route.fulfill(json=data)
 
     with sync_playwright() as pw:
@@ -90,7 +93,6 @@ def test_speechless_history_and_direct_resume(direct_server_with_data, engine):
                 assert card.locator("[data-cancel-run]").count() == 0
                 assert card.locator("[data-live-title]").inner_text() == "Read source records"
                 assert page.locator(".chat-bubble.assistant:not(.typing-bubble)").count() == 0
-                assert "24 tool calls" in card.inner_text()
                 assert "outcome unknown" not in card.inner_text(), "unrelated archives cannot unsettle known calls"
                 # The running direct turn's Pause is still settling: the work's word alone (who paused is its line;
                 # this controlled row's press declared nobody).
@@ -115,6 +117,8 @@ def test_speechless_history_and_direct_resume(direct_server_with_data, engine):
                 page.keyboard.press("Escape")
                 page.screenshot(path=str(diagnostic_directory(root.parent, "task-evidence") / f"task-evidence-{engine}-{width}-paused.png"), full_page=True)
                 card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
+                expect(card.locator("[data-live-facts] .chat-live-fact").filter(
+                    has=page.locator("dt", has_text="Tool calls")).locator("dd")).to_have_text("24")
                 lines = card.locator(".chat-live-line")
                 # The tool calls, then the answer's own Done line.
                 assert lines.count() == 2, lines.all_inner_texts()
@@ -194,13 +198,13 @@ def test_pause_notice_translation_and_historical_wake_status(direct_server_with_
                 page.screenshot(path=str(diagnostic_directory(root.parent, "task-evidence") / f"main-wait-{wait_state}-{quiz_state}.png"), full_page=True)
             page.locator('[data-nav-page="dashboard"]').click()
             page.locator('[data-dashboard-tab="evolution"]').click()
-            pill = page.locator("#evo-bg-pill")
+            sentence = page.locator("#evo-consciousness")
             for next_status, label in (("wake_paused", "приостановлено"), ("wake_outcome_unknown", "исход неизвестен")):
                 status = next_status
-                page.locator("#evo-refresh").click()
-                expect(pill).to_have_text(f"Consciousness {label}")
-                expect(pill).to_have_class("evo-runtime-pill offline")  # goes on by itself: the plain pill
-                expect(page.locator("#evo-runtime-detail")).to_contain_text(details[status])
+                page.evaluate("() => window.dispatchEvent(new CustomEvent('ouro:dashboard-subtab-shown', {detail: {tab: 'evolution'}}))")
+                expect(sentence).to_have_text(f"Consciousness {label}")
+                expect(sentence).to_have_attribute("data-tone", "neutral")  # goes on by itself: never the owner's amber
+                expect(page.locator("#evo-consciousness-detail")).to_contain_text(details[status])
                 page.screenshot(path=str(diagnostic_directory(root.parent, "task-evidence") / f"evolution-{status}.png"), full_page=True)
         finally:
             browser.close()

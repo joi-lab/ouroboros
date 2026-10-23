@@ -1,8 +1,9 @@
-"""One header for every page and the Project panel (docs/DESIGN.md "Shell", plan P5, owner Q3=A, Q4=A).
+"""One header for every page and the Project panel (docs/DESIGN.md "Shell", plan P5, owner Q3=A, Q4=A, 19.10 A).
 
-Docked: no visible title where the sidebar names the page (the h2 stays), the Project keeps its name, and a
-header with no actions renders no bar. Stack: one row of at most 56px, `☰ · title · status … Panic · ⋯`, the
-title one line and ellipsized; Restart and the budget inside ⋯. No icon anywhere."""
+Docked: no visible title where the sidebar names the page (the h2 stays); the page's tabs or location take its place
+and its actions the end; the Project keeps its name, and a header with nothing to show renders no bar. Stack: one
+row of at most 56px, `☰ · title · status … Panic · ⋯`, tabs under it, the title one line and ellipsized; Restart and
+the budget inside ⋯. No icon anywhere."""
 from __future__ import annotations
 
 import re
@@ -47,7 +48,8 @@ def test_stack_header_is_one_row_of_at_most_56px_with_restart_and_budget_inside_
     # The note is a floating sibling under the bar, never a second row of it; the move into ⋯ follows the
     # bar's measured width as well as the layout (page_header.js), so a narrow docked column keeps one row too.
     assert '.chat-page-note {' in css and "top: var(--chat-header-bar, 56px)" in _rule(css, ".chat-page-note {")
-    assert "createHistoryControls(messagesDiv, pageNote || page.querySelector('.chat-panel-statusbar'))" in _read("web/modules/chat.js")
+    assert re.search(r"createHistoryControls\(messagesDiv, pageNote \|\| page\.querySelector\('\.chat-panel-statusbar'\)[,)]",
+                     _read("web/modules/chat.js"))
     header_js = _read("web/modules/page_header.js")
     assert "export const HEADER_FULL_ROW_MIN_WIDTH = 640;" in header_js
     assert "bar.clientWidth < HEADER_FULL_ROW_MIN_WIDTH" in header_js and "new Observer(place)" in header_js
@@ -98,3 +100,27 @@ def test_the_desktop_title_band_keeps_an_empty_header_as_a_plain_strip():
     assert "display: block" in band and "height: var(--window-chrome-top)" in band and "padding: 0" in band
     # Outside the desktop window an empty header still takes no room.
     assert "display: none" in _rule(css, 'html[data-layout="docked"] .app-page-header[data-empty] {')
+
+
+def test_a_desk_bar_starts_with_its_pages_navigation_and_ends_with_its_actions():
+    # Owner 19.10 (A): on a desk the tabs or Files' location take the hidden title's place and the actions keep the
+    # end, every control on Main's line (the band's centre in the macOS window); the stack layout keeps them under
+    # the row. The nodes move (page_header.js bindPageHeader), so selection, listeners and focus stay theirs.
+    css = _read("web/style.css")
+    bar = _rule(css, 'html[data-layout="docked"] .app-page-header[data-lead] {')
+    assert 'grid-template-areas: "title toolbar"' in bar and "padding-block: 0" in bar and "min-height: 50px" in bar
+    # The band's height only where the shell measured it (tests/test_launcher_window_chrome.py: no phantom spacer).
+    band = _rule(css, ':root[data-window-chrome="integrated"][data-layout="docked"] .app-page-header[data-lead] {')
+    assert "min-height: max(50px, var(--window-chrome-top))" in band
+    controls = _rule(css, 'html[data-layout="docked"] .app-page-header[data-lead] > .app-page-toolbar :is(.btn, button) {')
+    tab = _rule(css, 'html[data-layout="docked"] .app-page-lead .app-tab {')
+    assert "height: var(--chrome-control-h)" in controls and "height: var(--chrome-control-h)" in tab
+    # The strip lends its tabs' shadows room below the bar without taking presses there.
+    strip = _rule(css, 'html[data-layout="docked"] .app-page-lead .app-tab-strip {')
+    assert "pointer-events: none" in strip and "margin: 0 0 -16px" in strip and "pointer-events: auto" in tab
+    header_js = _read("web/modules/page_header.js")
+    assert "export function bindPageHeader(" in header_js and "toggleAttribute('data-lead', docked)" in header_js
+    for rel in ("web/modules/dashboard.js", "web/modules/settings_ui.js", "web/modules/skills.js", "web/modules/files.js"):
+        assert "bindPageHeader(" in _read(rel), rel
+    # Widgets has nothing of its own for the bar: its list starts one inset under it, never two.
+    assert "margin-top" not in _rule(css, ".widgets-list {")

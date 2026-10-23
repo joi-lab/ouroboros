@@ -3,16 +3,28 @@
 import { compareHistoryPosition } from './chat_history_replay.js';
 import { appendDelegatedItem, reconcileDelegatedItems } from './delegated_activity.js';
 import { isStoreMigrating } from './api_client.js';
+import { showToast } from './toast.js';
+import { tr } from './i18n.js';
 
 const nodePosition = node => node?.dataset?.historySource
     ? { source: node.dataset.historySource, offset: Number(node.dataset.historyOffset) } : null;
 
 // A feed holding only chrome has no conversation: the history control, the typing
-// indicator, Main's empty-state greeting and an ephemeral notice (the reconnect
-// banner). The loading state and the greeting share this one rule.
+// indicator, Main's empty-state greeting and an ephemeral notice (Restart
+// complete). The loading state and the greeting share this one rule.
 export const feedIsEmpty = messages => Array.from(messages.children).every(node =>
     node.classList.contains('chat-load-older') || node.classList.contains('typing-bubble')
     || node.classList.contains('chat-empty-welcome') || node.dataset.ephemeral === '1');
+
+const GAP_NOTE = 'Some saved history is not loaded. Shown messages may have gaps.';
+const gapNoticeDocs = new WeakSet();
+const defaultGapNotice = (text, messages) => {
+    if (typeof globalThis.document?.getElementById === 'function' && typeof globalThis.document?.createElement === 'function'
+        && globalThis.document?.body?.appendChild) {
+        return showToast(text, 'info', { haptic: false, dismissLabel: 'Dismiss history notice',
+            host: messages.closest('.page, .chat-instance-panel') });
+    }
+};
 
 /**
  * History chrome only; the chat instance retains navigation and reading state.
@@ -25,7 +37,9 @@ export const feedIsEmpty = messages => Array.from(messages.children).every(node 
  * positive gesture at an unambiguous island edge, and the floating scroll-to-latest
  * button remains the only return-to-present control.
  */
-export function createHistoryControls(messagesDiv, statusHost = null) {
+export function createHistoryControls(messagesDiv, statusHost = null, {
+    onGapNotice = defaultGapNotice, isVisible = () => messagesDiv.isConnected && messagesDiv.offsetParent !== null,
+} = {}) {
     const doc = messagesDiv.ownerDocument;
     const root = doc.createElement('div');
     root.className = 'chat-load-older';
@@ -34,14 +48,28 @@ export function createHistoryControls(messagesDiv, statusHost = null) {
     button.className = 'chat-load-older-btn ui-hit-area';
     const note = doc.createElement('span');
     note.className = 'chat-load-older-note';
-    root.append(button, note);
+    const gapNote = doc.createElement('span');
+    gapNote.className = 'chat-history-gap';
+    gapNote.hidden = true;
+    root.append(button, note, gapNote);
     // The recent-window read is the chat's own request, not a pager page, so its
     // in-flight and failed states are carried here and drawn by the same control
     // (issue #1102: an empty feed under a green header read as a dead app, and a
     // failed read looked identical to a slow one).
     let recent = null;
+    let notice = null;
+    let pendingNotice = false;
+    // Hidden hydration still draws the durable edge note. Only a showing room
+    // spends the document's announcement; showing it never reads history again.
+    function showNotice() {
+        if (!pendingNotice || doc.hidden || !isVisible() || gapNoticeDocs.has(doc) || typeof onGapNotice !== 'function') return;
+        gapNoticeDocs.add(doc);
+        notice = onGapNotice(tr('history.gap', GAP_NOTE), messagesDiv);
+    }
     return {
         olderButton: button,
+        showNotice,
+        destroy() { pendingNotice = false; notice?.dispose?.(); notice = null; },
         // Only an EMPTY feed (or a failure already on screen) gets the loading
         // state: an ordinary refresh never puts chrome over a painted transcript.
         // Returns whether there is a state to draw, so a painted feed costs nothing.
@@ -60,16 +88,23 @@ export function createHistoryControls(messagesDiv, statusHost = null) {
             const loading = hydrating || Boolean(snapshot.loading);
             const changedView = error?.body?.reason_code === 'history_view_changed';
             const incomplete = coverage.gaps === true;
+            pendingNotice = snapshot.initialized && !migrating && !error
+                && !(hydrating && feedIsEmpty(messagesDiv)) && incomplete;
+            showNotice();
+            const gapText = incomplete ? tr('history.gap', GAP_NOTE) : '';
             let noteText = migrating ? 'Saved history is being upgraded…' : error ? 'Some saved history could not be loaded.'
                 : hydrating && feedIsEmpty(messagesDiv) ? ''
-                : incomplete ? 'Some saved history is not loaded. Shown messages may have gaps.'
+                : incomplete ? gapText
                 : !hydrating && coverage.complete ? 'Beginning of saved history' : '';
-            if (approximate) noteText += `${noteText ? ' ' : ''}Saved position could not be restored exactly.`;
-            // One note moves into persistent chrome when it describes the reading
-            // window; the ordinary beginning marker belongs at the feed's start.
-            const host = statusHost && noteText && (error || incomplete || approximate) ? statusHost : root;
+            if (approximate) noteText = `${error ? `${noteText} ` : ''}Saved position could not be restored exactly.`;
+            // Failure and approximate restoration move into persistent chrome when it describes the reading
+            // window; the gap explanation and ordinary beginning marker belong at the feed's start.
+            const host = statusHost && noteText && Boolean(error || approximate) ? statusHost : root;
             if (note.parentNode !== host) host.appendChild(note);
             note.classList.toggle('chat-history-status', host === statusHost);
+            // A concurrent read/position problem must not consume the persistent gap explanation.
+            const separateGap = incomplete && Boolean(error || approximate)
+                && !(hydrating && feedIsEmpty(messagesDiv));
             // A grown room's exhausted chain offers the way on (it rebases to the present); a chain a navigation
             // began ends at its older end: ↓ is the way to the present.
             const buttonHidden = migrating || (!error && !snapshot.canOlder
@@ -79,7 +114,8 @@ export function createHistoryControls(messagesDiv, statusHost = null) {
                     : changedView ? 'Refresh history' : error ? 'Retry loading messages' : 'Load more history',
                     disabled: loading, hidden: buttonHidden }],
                 [note, { textContent: noteText, hidden: !noteText }],
-                [root, { hidden: buttonHidden && (host !== root || !noteText) }],
+                [gapNote, { textContent: separateGap ? gapText : '', hidden: !separateGap }],
+                [root, { hidden: buttonHidden && (host !== root || !noteText) && !separateGap }],
             ];
             for (const [node, values] of fields) {
                 for (const [key, value] of Object.entries(values)) if (node[key] !== value) node[key] = value;
@@ -290,12 +326,13 @@ export function liveCardProjectionChanged(before, record) {
     return before.some((value, index) => value !== after[index]);
 }
 
-// The expanded state belongs to the card's one disclosure, the "Show details" button; the summary band
+// The expanded state belongs to the card's one disclosure, the "Details" button; the summary band
 // above it is reading content and states nothing (a Main portal hides the button: work_portal.js).
+// Its word stays; `aria-expanded` and the turned chevron say open or closed.
 export function syncLiveCardToggle(record) {
     if (!record?.toggleEl) return;
     const expanded = record.root.dataset.expanded === '1';
-    const text = expanded ? 'Hide details' : 'Show details';
+    const text = 'Details';
     const ariaExpanded = expanded ? 'true' : 'false';
     if (record.toggleEl.textContent !== text) record.toggleEl.textContent = text;
     if (record.disclosureEl && record.disclosureEl.getAttribute('aria-expanded') !== ariaExpanded) {

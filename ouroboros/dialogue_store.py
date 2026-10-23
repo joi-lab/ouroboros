@@ -246,10 +246,10 @@ def create(root: Any, *, tier: Optional[str] = None) -> pathlib.Path:
         tmp = target.with_name(f"{target.name}.import-{os.getpid()}-{uuid.uuid4().hex[:8]}")
         try:
             with contextlib.closing(store.connect(tmp, tier, create=True)) as conn:
-                conn.executescript(_SCHEMA)
+                # Keep DDL, header and seed rows in the same durable commit.
+                conn.executescript("BEGIN IMMEDIATE;\n" + _SCHEMA)
                 conn.execute(f"PRAGMA application_id = {_APPLICATION_ID[tier]}")
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-                conn.execute("BEGIN IMMEDIATE")
                 for stream in STREAMS:
                     # The stream's live unit: every row stored after the cutover counts in it.
                     live = conn.execute("INSERT INTO import_ledger (stream, name, base, size, state) VALUES (?, ?, 0, 0, 'live')",
@@ -269,14 +269,15 @@ def create(root: Any, *, tier: Optional[str] = None) -> pathlib.Path:
 
 
 def retier(root: Any) -> Optional[str]:
-    """Bring the header to today's probed tier (the boot re-probe); returns the former tier when it changed."""
+    """Bring the header to today's probed tier (the boot re-probe); returns the former tier when it changed.
+    The file leaves WAL under the former tier first: the new one is published only on a DELETE file."""
     root = pathlib.Path(root)
     wanted, current = probed_tier(root), header_tier(root)
     if current is None or current == wanted:
         return None
     with store.process_lock(path(root)), store.name_lock(root, IMPORT_LOCK_NAME, timeout_sec=WAIT_SEC, stale_sec=600.0):
-        store.close_connections(path(root))
         try:
+            store.prepare_handoff(path(root), current, wait_sec=WAIT_SEC, seam=False)  # closes this process's handles
             with contextlib.closing(store.connect(path(root), current, wait_sec=WAIT_SEC)) as conn:
                 conn.execute(f"PRAGMA application_id = {_APPLICATION_ID[wanted]}")
                 conn.execute("BEGIN IMMEDIATE")
@@ -407,10 +408,11 @@ def stream_row(stream: str, columns: Dict[str, Any]) -> bool:
 
 
 def _row(record: sqlite3.Row) -> Row:
-    return Row(record["stream"], record["seq"], decode(record["body"]), record["dispatch"], record["length"])
+    from ouroboros.place_arrivals import project_source
+    return Row(record["stream"], record["seq"], project_source(record), record["dispatch"], record["length"])
 
 
-_SELECT = "SELECT stream, seq, body, dispatch, length FROM dialogue"
+_SELECT = "SELECT stream, seq, body, dispatch, dispatch_input, length FROM dialogue"
 
 
 # --- the one writer seam ---------------------------------------------------------------------
@@ -762,12 +764,13 @@ def main_candidates(root: Any, stream: str, *, exclude_chats: Iterable[int], pin
     return [_row(record) for record in records]
 
 
-def task_rows(root: Any, task_ids: Iterable[str], *, stream: str, after: int = -1, limit: int = 1000) -> List[Row]:
+def task_rows(root: Any, task_ids: Iterable[str], *, stream: str, after: int = -1,
+              before: Optional[int] = None, limit: int = 1000) -> List[Row]:
     """A task tree's rows in one stream, oldest first: every row whose task, parent, root or
     ``subagent_task_id`` (a child's rows written under its parent's task) is one of ``task_ids``
-    and lies after ``after`` (the timeline, the SSE follower, the recent-activity window)."""
+    and lies after ``after`` and before ``before`` (a captured boundary, or the live end)."""
     keys: List[Tuple[str, Any]] = [(column, task) for task in task_ids for column in _TASK_KEYS]
-    return probe_rows(root, stream, keys, lower=after + 1, limit=limit, newest_first=False)
+    return probe_rows(root, stream, keys, lower=after + 1, before=before, limit=limit, newest_first=False)
 
 
 def accepted_row(root: Any, chat_id: Optional[int], client_message_id: str) -> Optional[Row]:

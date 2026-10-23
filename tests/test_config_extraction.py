@@ -13,16 +13,20 @@ from ouroboros import (
     runtime_limits,
     settings_defaults,
     settings_scales,
+    safety_config,
 )
 
 REPO = pathlib.Path(__file__).parents[1]
 PACKAGE = REPO / "ouroboros"
 
-_LEAVES = (settings_defaults, settings_scales, model_slots, review_model_routes, runtime_limits)
+_LEAVES = (settings_defaults, settings_scales, model_slots, review_model_routes, runtime_limits, safety_config)
 
 # New subscription capabilities belong to the same leaves, but did not exist on
 # the historical extraction's facade and need not add compatibility re-exports.
 _ADDED_OWNERS = {
+    "_safety_values": safety_config,
+    "_resolved_safety_configuration": safety_config,
+    "safety_configuration_requires_owner": safety_config,
     "WORKER_READY_CEILING_SEC": runtime_limits,
     # A spawned direct-Restart successor's bounded wait for its exiting parent's data-root admission.
     "SERVER_ADMISSION_WAIT_SEC": runtime_limits,
@@ -126,6 +130,11 @@ _ADDED_OWNERS = {
 }
 
 _MOVED_OWNERS = {
+    "get_safety_mode": safety_config,
+    "safety_configuration": safety_config,
+    "_guard_safety_configuration": safety_config,
+    "_migrate_consciousness_safety": safety_config,
+    "get_safety_model": model_slots,
     "WORKER_SPAWN_GRACE_SEC": runtime_limits,
     "ARTIFACT_COMPRESSION_TIMEOUT_SEC": runtime_limits,
     "WORKER_READY_WINDOW_SEC": runtime_limits,
@@ -258,7 +267,7 @@ _PARENT_RETAINED = (
     "_settings_flag_enabled", "_settings_lock_path", "_acquire_settings_lock",
     "_release_settings_lock", "_coerce_setting_value", "load_settings",
     "load_settings_lock_held", "save_settings", "prepare_settings_for_persist",
-    "apply_settings_to_env", "get_runtime_mode", "get_safety_mode", "get_context_mode",
+    "apply_settings_to_env", "get_runtime_mode", "get_context_mode",
     "get_owner_context_mode", "initialize_runtime_mode_baseline",
     "_guard_context_mode_lowering", "_guard_safety_mode_lowering",
 )
@@ -377,5 +386,6 @@ def test_settings_extraction_size_bounds_have_meaningful_headroom():
     # (+ its shared «migrated» line) the read seam, the RC auditor and the boot notice read.
     # 538 -> 560: the main-interface key (OUROBOROS_UI_DIR) with its export exclusion and the
     # saved-choice precedence the config read and persist seams share.
-    assert counts["ouroboros.settings_defaults"] <= 560
+    # +7: independent Consciousness level, Supervisor model, owner rules and disk ownership.
+    assert counts["ouroboros.settings_defaults"] <= 567
     assert (PACKAGE / "config.py").is_file()

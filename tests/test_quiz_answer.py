@@ -189,7 +189,7 @@ def _decision_app(tmp_path, monkeypatch, live_task=None):
     monkeypatch.setattr(td, "request_drive_root", lambda request: tmp_path)
     monkeypatch.setattr(
         td, "_live_root_task",
-        lambda task_id: (live_task, "" if live_task else "task_not_live"),
+        lambda task_id, **_: (live_task, "" if live_task else "task_not_live"),
     )
     if live_task is not None:
         # Tests of live answer effects start from an explicitly published card.

@@ -441,6 +441,9 @@ def _review_status_message(projection: Dict[str, Any]) -> str:
             "result_unanswered": (
                 f"Review NOT_PERFORMED: {NOT_PERFORMED_PHRASES['result_unanswered']}. A result review counts only a "
                 "PASS/FAIL answer; each seat's error is recorded in the attempt."),
+            "skill_unanswered": (
+                f"Review NOT_PERFORMED: {NOT_PERFORMED_PHRASES['skill_unanswered']}. A skill review counts only a "
+                "PASS/FAIL answer; each seat's error is recorded in the attempt, and the skill stays pending."),
             "critical_findings": "Reviewers found critical issues. Repair or rebut (review_rebuttal) the findings listed, then re-run commit_reviewed.",
             "review_quorum": "Not enough review models responded. Retry — usually transient.",
             "parse_failure": "Review models could not produce parseable output. Retry the commit.",
@@ -457,7 +460,7 @@ def _review_status_message(projection: Dict[str, Any]) -> str:
             "review_subject_binding_mismatch": "The reviewed managed subject is not the tree this commit would write. Re-stage the intended candidate and retry so review and commit describe the same tree.",
         }
         label = "BLOCKED" if ca.status == "blocked" else "FAILED"
-        what = "result review" if getattr(ca, "tool_name", "") == "review_result" else "commit"
+        what = {"review_result": "result review", "review_skill": "skill review"}.get(getattr(ca, "tool_name", ""), "commit")
         if what == "result review":  # a result is revised and delivered again, never committed
             reason_map.update(
                 critical_findings="Reviewers found critical issues in the result. Revise it or answer the findings, then deliver again.",

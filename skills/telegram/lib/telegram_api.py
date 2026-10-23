@@ -857,7 +857,7 @@ class TelegramClient:
 
 
 _MENU_TEXTS_EN = {
-    "menu_title_strict": "🤖 **Ouroboros Control Panel**\nStrict mode is active. Commands are blocked.\n\nSelect action:",
+    "menu_title_strict": "🤖 **Ouroboros Control Panel**\nStrict mode is active. Owner /panic remains available.\n\nSelect action:",
     "menu_title": "🤖 **Ouroboros Control Centre**\nCommand Mode: `{command_mode}`\nLanguage: `{language}`\n\nExplore and monitor the core using the buttons below:",
     "btn_metrics": "📉 Status & Metrics",
     "btn_mind": "🧠 Mind & BG",
@@ -891,9 +891,10 @@ _MENU_TEXTS_EN = {
         "• `/menu` — Show interactive control panel with active tabs\n"
         "• `/language` — Change the interface language of this installation\n"
         "• `/status` — Request live system status (if allowed)\n"
+        "• `/panic` — Emergency stop for the bound owner, in every mode\n"
         "• `/help` — Show this friendly usage guide\n\n"
         "Modes description (changed in Web UI → Settings → Telegram):\n"
-        "• **strict** — block all command injections (only `/menu`, `/help`, `/language`)\n"
+        "• **strict** — allow only `/menu`, `/help`, `/language` and owner `/panic`\n"
         "• **safe_commands** — allow status monitoring\n"
         "• **full_access** — allow status + background loop start/stop"
     ),
@@ -930,6 +931,8 @@ _MENU_TEXTS_EN = {
     "cmd_review": "Run a self-review",
     "cmd_restart": "Restart the agent",
     "cmd_panic": "Emergency stop",
+    "panic_earlier": "An earlier Panic message was not executed again. Its previous outcome is unknown.",
+    "panic_unconfirmed": "Panic was not confirmed and will not be retried. Check Ouroboros on the host computer.",
 }
 # Every line the bridge composes is English source here and translated by the install's
 # memory under the one interface language (lib/telegram_i18n.py); the skill ships no

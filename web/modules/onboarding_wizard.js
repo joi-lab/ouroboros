@@ -11,7 +11,7 @@ import {
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 import { bindLanguageSettings, languageBlockHtml, saveLanguageChoice } from './settings_language.js';
 import { installAltMenuSuppression, installDesktopShellLinkInterceptor } from './ui_helpers.js';
-import { createModelRolesEditor, modelRolesHost, modelRoleMap, parseModelSource } from './model_roles.js';
+import { createModelRolesEditor, inheritTargetOf, modelRolesHost, modelRoleMap, parseModelSource } from './model_roles.js';
 import { ALLOW_EMPTY_REVIEW_POOL, PACKET_ONLY_POOL_WARNING, availableSubagentsEditorHost, packetOnlyReviewPool, reviewPoolRows, reviewerTickCaption } from './subagents_settings.js';
 import { PROCESSING_PREFERENCE_KEY, MODEL_PROCESSING_PREFERENCES_KEY, processingIntentLabel,
     configuredApiProviders, apiProviderLabel } from './route_editor_primitives.js';
@@ -620,7 +620,8 @@ import { createStarterSkillsRow } from './onboarding_starter_skills.js';
     function modelSummary(slot) {
         const values = trim(state[slot.stateKey]).split(',').map((value) => value.trim()).filter(Boolean);
         const inherited = !values.length && slot.slot !== 'fallback';
-        if (inherited) values.push(trim(state.mainModel));
+        const from = MODEL_SLOTS.find((entry) => entry.slot === inheritTargetOf(slot)) || { stateKey: 'mainModel', label: 'Main' };
+        if (inherited) values.push(trim(state[from.stateKey] || '') || trim(state.mainModel));  // Safety: Light, then Main
         return values.map((value, index) => {
             const { source, model } = parseModelSource(value);
             const account = slot.slot === 'fallback' ? state.modelAccounts.fallback?.[index] : state.modelAccounts[slot.slot];
@@ -628,7 +629,7 @@ import { createStarterSkillsRow } from './onboarding_starter_skills.js';
             const processing = slot.slot === 'fallback' ? state.modelProcessingPreferences?.fallback?.[index] : state.modelProcessingPreferences?.[slot.slot];
             const assignment = source.startsWith('subscription:')
                 ? `${source.slice(13)} · ${model} · ${account ? `Account: ${account}` : 'Auto rotation'}` : value;
-            return `${inherited ? 'Uses Main · ' : ''}${assignment} · Processing: ${processingIntentLabel(processing, state.processingPreference)}${Number(context) > 0 ? ` · ${Number(context).toLocaleString('en-US')} tokens, set by you` : ''}`;
+            return `${inherited ? `Uses ${from.label.replace(/ Model$/, '')} · ` : ''}${assignment} · Processing: ${processingIntentLabel(processing, state.processingPreference)}${Number(context) > 0 ? ` · ${Number(context).toLocaleString('en-US')} tokens, set by you` : ''}`;
         }).join(' → ') || 'None';
     }
 

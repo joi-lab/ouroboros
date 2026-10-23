@@ -46,6 +46,7 @@ import pathlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.utils import append_jsonl, utc_now_iso
+from ouroboros.work_stop import pause_marker
 
 log = logging.getLogger(__name__)
 
@@ -66,10 +67,11 @@ def _locate_root_locked(q: Any, task_id: str) -> Tuple[Optional[Dict[str, Any]],
 
 
 def _late_work(q: Any, task_id: str) -> Tuple[Optional[Dict[str, Any]], bool]:
-    """``(result_row, live_review)`` of an answered root still owning late work, else ``(None, False)``.
+    """``(result_row, late_work)`` of an answered root still owning late work, else ``(None, False)``.
 
     Its open or in-flight upkeep is reachable so the Pause can end it at once; a live
     review operation is reachable so its unsent preparation can wait for Resume.
+    Live descendants also belong to the answered root, even after all its own phases ended.
     """
     from ouroboros.post_task_checkpoint import post_task_synthesis_in_flight, post_task_synthesis_is_open
     from ouroboros.review_operation import task_has_live_review_operation
@@ -81,9 +83,12 @@ def _late_work(q: Any, task_id: str) -> Tuple[Optional[Dict[str, Any]], bool]:
     except Exception:
         return None, False
     checkpoint = row.get("root_phase_checkpoint") if isinstance(row.get("root_phase_checkpoint"), dict) else {}
-    if live_review or post_task_synthesis_in_flight(q.DRIVE_ROOT, task_id) or post_task_synthesis_is_open(
+    with q._queue_lock:
+        descendants = any(str(task.get("root_task_id") or "") == task_id and task.get("id") != task_id
+                          for task in [*q.PENDING, *(m.get("task") or {} for m in q.RUNNING.values())])
+    if descendants or live_review or post_task_synthesis_in_flight(q.DRIVE_ROOT, task_id) or post_task_synthesis_is_open(
             checkpoint.get("post_task_synthesis")):
-        return {**row, "id": task_id}, live_review
+        return {**row, "id": task_id}, live_review or descendants
     return None, False
 
 
@@ -166,6 +171,8 @@ def request_owner_pause(task_id: str, *, request_id: str, by: Optional[Dict[str,
     )
     from ouroboros.task_results import resolve_task_lineage
     from ouroboros.store import acquisition_budget, StoreBusy
+    from ouroboros.control_actor import control_actor, observed_control_stop
+    from ouroboros.work_stop import release_refusal
 
     from supervisor import queue as q
     task_id = str(task_id or "").strip()
@@ -183,6 +190,9 @@ def request_owner_pause(task_id: str, *, request_id: str, by: Optional[Dict[str,
         if not lineage["is_root_task"]:
             return {"ok": False, "error": "not_a_root_task", "root_task_id": str(task.get("root_task_id") or "")}
         root_drive = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
+        if refusal := release_refusal(observed_control_stop(
+                root_drive, task, budget=q.BUDGET_ROOT_FENCES), control_actor()):
+            return refusal
         root_id = lineage["root_task_id"] if lineage["is_retry_root_attempt"] else task_id
         from ouroboros.owner_pause import root_actor
         if not root_actor(root_drive, root_id, task_id):
@@ -225,6 +235,17 @@ def request_owner_pause(task_id: str, *, request_id: str, by: Optional[Dict[str,
                 current = read_fence(root_drive, root_id)
                 if not fence_closed(current) or fence.get("fence_id") != current.get("fence_id"):
                     return released
+                latest, _lane = _locate_root_locked(q, task_id)
+                if (latest or {}).get("_budget_pause_hold") != task.get("_budget_pause_hold"):
+                    return {"ok": False, "error": "selection_authority_changed"}
+                if refusal := release_refusal(observed_control_stop(
+                        root_drive, latest, budget=q.BUDGET_ROOT_FENCES, owner=current), control_actor()):
+                    return refusal
+                # The accepted Pause replaces only the decision this actor may release.
+                # Independent exact continuation custody stays on its own marker.
+                for member in [*q.PENDING, *(m.get("task") or {} for m in q.RUNNING.values())]:
+                    if member.get("id") == task_id:
+                        member.pop("_budget_pause_hold", None)
                 latch = _set_root_budget_pause_locked(root_id, {
                     "fence_id": str(fence["fence_id"]), "cause": "owner_pause",
                     "paused_at": str(fence.get("requested_at") or utc_now_iso())})
@@ -310,7 +331,7 @@ def refresh_owner_pause_tree(root_task_id: str) -> str:
         running_meta = {task_id: dict(q.RUNNING.get(task_id) or {}) for task_id, _task in running_all}
         queued = [dict(item) for item in q.PENDING if isinstance(item, dict)
                   and root_task_id in (str(item.get("root_task_id") or ""), str(item.get("id") or ""))]
-        parked = [item for item in queued if isinstance(item.get("_budget_pause"), dict)]
+        parked = [item for item in queued if pause_marker(item)]
     try:
         fence = read_fence(root_drive, root_task_id)
     except Exception:
@@ -478,27 +499,6 @@ def complete_owner_pause_latch(root_task_id: str, fence: Dict[str, Any]) -> Opti
         "paused_at": str(fence.get("requested_at") or utc_now_iso())})
 
 
-def retain_late_phase_latch(drive_root: Any, root_task_id: str) -> None:
-    """Startup: an answered root's deferred late review keeps its owner Pause latch (and so
-    its census row and Resume) even when the restored snapshot was too old to carry it.
-    Never a grant."""
-    from ouroboros.owner_pause import fence_closed, read_fence
-    from supervisor import queue as q
-
-    try:
-        if not getattr(q, "INITIALIZED", False) or (
-                pathlib.Path(q.DRIVE_ROOT).resolve() != pathlib.Path(drive_root).resolve()):
-            return
-        fence = read_fence(drive_root, root_task_id)
-        if not fence_closed(fence):
-            return
-        with q._queue_lock:
-            if complete_owner_pause_latch(root_task_id, fence):
-                q.persist_queue_snapshot(reason="late_phase_pause_retained")
-    except Exception:
-        log.warning("Saved late-phase Pause latch of %s was not retained", root_task_id, exc_info=True)
-
-
 _SETTLE_RECHECK_SEC = 5.0
 _LAST_SETTLE_CHECK: Dict[str, float] = {}
 
@@ -632,7 +632,7 @@ def settle_requested_owner_pauses(q: Any = None, *, now: Optional[float] = None,
         with q._queue_lock:
             parked = [dict(item) for item in q.PENDING if isinstance(item, dict)
                       and root_id in (str(item.get("root_task_id") or ""), str(item.get("id") or ""))
-                      and isinstance(item.get("_budget_pause"), dict)]
+                      and pause_marker(item)]
             warm = [(str(task_id), dict(meta)) for task_id, meta in q.RUNNING.items()
                     if warm_paused_member(meta) and root_id in (
                         str((meta.get("task") or {}).get("root_task_id") or ""), str(task_id))]

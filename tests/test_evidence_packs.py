@@ -6,6 +6,7 @@ checkpoint handles stored through ``store_actor_source_bytes``.
 from __future__ import annotations
 
 import contextlib
+import gc
 import gzip
 import hashlib
 import json
@@ -16,6 +17,8 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import traceback
+import weakref
 
 import pytest
 
@@ -223,6 +226,54 @@ def test_admission_sees_every_physical_blob_source_and_its_refusal_is_never_a_mi
         with pytest.raises(PermissionError, match="refused"):
             obs.read_blob_ref(root, refs[0], admit=admit)
     assert obs.read_blob_ref(root, refs[0])["message"]["content"].startswith("answer")  # no callback: unchanged
+
+
+@pytest.mark.parametrize("case", ["missing", "packed", "retained", "damaged"])
+def test_a_kept_miss_or_damage_never_keeps_the_read_alive(root, case):
+    """A miss or a damaged loose copy is kept while later candidates are tried, and its traceback holds
+    the reader's frame; a frame still holding it is a cycle that keeps the caller's ``admit`` callback
+    (and, through the callers' frames, their payloads) until a GC pass. With the collector off, every
+    exit frees the callback with its last reference (the final raise; a pack or a retained root after a
+    miss; a pack after a damaged copy), and the raise is still the reader's own error with its traceback."""
+    drive = root / "task_drives" / "task-a" if case == "retained" else root
+    drive.mkdir(parents=True, exist_ok=True)
+    refs, _ = _task(drive, "task-a", blobs=1)
+    raw = gzip.decompress(pathlib.Path(refs[0]["path"]).read_bytes())
+    loose = root / "observability" / "blobs" / f"{refs[0]['sha256']}.json.gz"
+    if case == "missing":
+        loose.unlink()  # nothing loose and no pack anywhere
+        expected = [loose]
+    elif case == "retained":
+        _result(root, "task-a", child_drive_root=str(drive))  # this root misses; its retained child holds it
+        expected = [loose, pathlib.Path(refs[0]["path"])]
+    else:
+        _run(root)  # the pack holds the bytes, the loose copy is gone
+        if case == "damaged":
+            loose.write_bytes(b"damaged")  # not gzip: damage, never a miss
+        expected = [loose, root / "observability" / "packs" / "task-a.xz"]
+    admitted = []
+
+    def admit(path):
+        admitted.append(path)
+
+    watched, enabled = weakref.ref(admit), gc.isenabled()
+    gc.disable()  # only reference counting frees now, so a cycle stays alive and visible
+    try:
+        try:
+            read = packs.blob_bytes(root, refs[0], admit=admit)
+        except FileNotFoundError as error:  # facts only: the error must not outlive this block
+            read = (os.fspath(error.filename), {entry.name for entry in traceback.extract_tb(error.__traceback__)})
+        del admit
+        freed = watched() is None
+    finally:
+        if enabled:
+            gc.enable()
+    assert admitted == expected
+    if case == "missing":  # the first miss itself, its traceback down to the reader intact
+        assert read[0] == os.fspath(loose) and "read_loose_gzip" in read[1]
+    else:
+        assert read == raw
+    assert freed, "a kept error held the reader's frame and with it the caller's callback"
 
 
 # ---- damage, index cache, kill matrix --------------------------------------------

@@ -89,7 +89,7 @@ def _canonical_root(ctx: Any) -> pathlib.Path:
 
 
 def selectors(ctx: Any, *, senders: Any = None, tasks: Any = None, runs: Any = None, services: Any = None,
-              wake_at: Any = None, wake_after_sec: Any = None) -> Dict[str, Any]:
+              wake_at: Any = None, wake_after_sec: Any = None, reviewers: Any = None) -> Dict[str, Any]:
     """Validate the selected sources; ``ValueError`` names the first bad one.
 
     Senders and tasks must be tasks this installation knows (a readable result);
@@ -100,12 +100,13 @@ def selectors(ctx: Any, *, senders: Any = None, tasks: Any = None, runs: Any = N
 
     chosen = {"senders": _ids(senders, "senders"), "tasks": _ids(tasks, "tasks"), "runs": _ids(runs, "runs"),
               "wake_at": _wake_at(wake_at, wake_after_sec)}
-    root = _canonical_root(ctx)
-    for key in ("senders", "tasks"):
-        for task_id in chosen[key]:
-            validate_task_id(task_id)
-            if not load_task_result(root, task_id, strict=True):
-                raise ValueError(f"{key}: task {task_id} is unknown")
+    if chosen["senders"] or chosen["tasks"]:  # the root is read only when a task id needs checking
+        root = _canonical_root(ctx)
+        for key in ("senders", "tasks"):
+            for task_id in chosen[key]:
+                validate_task_id(task_id)
+                if not load_task_result(root, task_id, strict=True):
+                    raise ValueError(f"{key}: task {task_id} is unknown")
     if chosen["runs"]:
         owned = _owned_runs(ctx)
         missing = [run_id for run_id in chosen["runs"] if run_id not in owned]
@@ -115,6 +116,9 @@ def selectors(ctx: Any, *, senders: Any = None, tasks: Any = None, runs: Any = N
     if pins:  # absent otherwise: a sleep without services keeps its existing shape
         chosen["services"] = pins
     chosen["any_mail"] = not (chosen["senders"] or chosen["tasks"] or chosen["runs"] or pins)
+    if reviewers is not None:
+        chosen.update(reviewer_slots=_ids(reviewers, "reviewers"), reviewers=[])
+        chosen["any_mail"] = chosen["any_mail"] and not chosen["reviewer_slots"]
     return chosen
 
 
@@ -246,14 +250,54 @@ def acknowledge_question_delivery(ctx: Any, text: str) -> None:
         record_question_notice(ctx, result["questions"])
 
 
-def wake_reason(ctx: Any, chosen: Dict[str, Any]) -> str:
+def terminal_readiness(ctx: Any, chosen: Dict[str, Any], seen: Any = (), *, ordinary_only: bool = False,
+                       task_results: Any = None, review_entries: Any = ()) -> list:
+    """Peek selected terminal facts only: no mailbox materialization or acknowledgement."""
+    from ouroboros.delegate_custody import TERMINAL_STATES
+    from ouroboros.task_status import SETTLED_STATUSES
+    from ouroboros.task_store import task_versions
+
+    ready, errors, delivered = [], [], set(seen)
+    try:
+        versions = ({tid: (None, (task_results.get(tid) or {}).get("status"), None) for tid in chosen.get("tasks", ())}
+                    if task_results is not None else
+                    task_versions(_canonical_root(ctx), chosen["tasks"]) if chosen.get("tasks") else {})
+        for task_id, (_, status, _) in versions.items():
+            status = str(status or "").strip().lower()
+            identity = f"task:{task_id}"
+            if status in SETTLED_STATUSES and identity not in delivered:
+                ready.append({"id": identity, "reason": f"{identity}:{status}"})
+    except Exception as exc:
+        errors.append(exc)
+    try:
+        if chosen.get("reviewers"):
+            from ouroboros.review_waiting import review_terminals
+            ready.extend(review_terminals(ctx, chosen, delivered, review_entries))
+    except Exception as exc:
+        errors.append(exc)
+    try:
+        owned = _owned_runs(ctx) if chosen.get("runs") else {}
+        for run_id in chosen.get("runs") or ():
+            run, identity = owned.get(run_id), f"run:{run_id}"
+            if (run is not None and (not ordinary_only or not run.review_owned) and identity not in delivered
+                    and (run.terminal_state in TERMINAL_STATES or run.settled)):
+                ready.append({"id": identity, "reason": identity, "state": run.terminal_state or "settled"})
+    except Exception as exc:
+        errors.append(exc)
+    if not ready and errors:
+        raise errors[0]
+    return ready
+
+
+def wake_reason(ctx: Any, chosen: Dict[str, Any], *, seen: Any = (), review_entries: Any = (),
+                wake_fact: Dict[str, Any] | None = None) -> str:
     """Why the sleep is ready now (``""`` = not yet). Owner input is never filtered."""
     from ouroboros.deadline_utils import parse_deadline_ts, utc_now
     from ouroboros.owner_mailbox import KIND_CARD_INPUT, KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_QUIZ_CLOSED, KIND_TASK_MESSAGE
     from ouroboros.owner_wait import _wait_entries
-    from ouroboros.task_status import SETTLED_STATUSES
-
     first_error = None
+    if wake_fact is not None:
+        wake_fact.clear()
 
     def read_source(read, *args, **kwargs):
         # Sources are alternatives, not prerequisites for each other. Retain
@@ -267,7 +311,11 @@ def wake_reason(ctx: Any, chosen: Dict[str, Any]) -> str:
                 log.debug("Sleep readiness source unreadable for %s", ctx.task_id, exc_info=True)
             return None
 
-    for entry in read_source(_wait_entries, ctx) or ():
+    entries = read_source(_wait_entries, ctx) or ()
+    # A later control/owner input outranks an earlier ordinary message.
+    owner_kinds = {KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_QUIZ_CLOSED, KIND_CARD_INPUT}
+    for entry in sorted(entries, key=lambda row: 2 if row.get("kind") == KIND_TASK_MESSAGE
+                        else 1 if row.get("kind", KIND_OWNER_TEXT) in owner_kinds else 0):
         kind = str(entry.get("kind") or KIND_OWNER_TEXT)
         if kind in {KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_QUIZ_CLOSED, KIND_CARD_INPUT}:
             return "owner_text"
@@ -277,37 +325,26 @@ def wake_reason(ctx: Any, chosen: Dict[str, Any]) -> str:
         if (entry.get("provenance") == "descendant_task" or chosen.get("any_mail")
                 or source in chosen.get("senders", [])):
             return f"mail:{source or 'unknown'}"
-    if chosen.get("tasks"):
-        from ouroboros.task_store import task_versions
-
-        versions = read_source(task_versions, _canonical_root(ctx), chosen["tasks"]) or {}
-        for task_id in chosen["tasks"]:
-            status = versions.get(task_id, (0, "", False))[1]
-            if status in SETTLED_STATUSES:
-                return f"task:{task_id}:{status}"
-    from ouroboros.delegate_custody import TERMINAL_STATES
     from ouroboros.sleep_custody import seen_interactions
 
-    # A selected terminal waits on contention like any arm-time read; the pollers
-    # bound their whole readiness pass to a probe instead.
-    owned = (read_source(_owned_runs, ctx) or {}) if chosen.get("runs") else {}
-    for run_id in chosen.get("runs") or ():
-        run = owned.get(run_id)
-        if run is not None and (run.terminal_state in TERMINAL_STATES or run.settled):
-            return f"run:{run_id}"
     # Questions need their responsible author, even when it selected another
     # branch. Reviewer custody belongs to its panel, never to this sleeper.
-    seen = seen_interactions(ctx)
+    interactions = seen_interactions(ctx)
     for run_id, run in _question_runs(ctx).items():
-        shown = set(seen.get(run_id) or ()) | set((chosen.get("interaction_seen") or {}).get(run_id) or ())
+        shown = set(interactions.get(run_id) or ()) | set((chosen.get("interaction_seen") or {}).get(run_id) or ())
         if _pending_question(run) and set(run.pending_interaction_ids) - shown:
             return f"run_question:{run_id}"
+    ready = read_source(terminal_readiness, ctx, chosen, seen, review_entries=review_entries)
+    if ready:
+        if wake_fact is not None:
+            wake_fact.update(actor_id=ready[0].get("actor_id", ready[0]["id"]))
+        return ready[0]["reason"]
     for pin in chosen.get("services") or ():
         observed = _service_wake(pin)  # already returns an unknown wake on a read failure
         if observed:
             return observed
     wake_at = parse_deadline_ts(chosen.get("wake_at") or "")
-    if wake_at is not None and utc_now() >= wake_at:
+    if wake_at is not None and utc_now() >= wake_at and f"time:{chosen.get('wake_at')}" not in seen:
         return "timeout"
     if first_error is not None:
         raise first_error
@@ -472,6 +509,8 @@ def begin(ctx: Any, *, started_at: float | None = None) -> None:
     if waiter is not None:
         waiter.sleep_started_monotonic = time.monotonic() - max(0.0, now - started)
     ctx._model_sleep_started = started
+    from ouroboros.swarm_wait_facts import sleep_started
+    sleep_started(ctx, started)
 
 
 def end(ctx: Any) -> float:
@@ -501,6 +540,8 @@ def announce_resumed(ctx: Any, outcome: Any = "") -> None:
     from ouroboros.utils import utc_now_iso
 
     reason, queue = str(outcome or ""), getattr(ctx, "event_queue", None)
+    from ouroboros.swarm_wait_facts import sleep_woke
+    sleep_woke(ctx, reason)
     task_id = str(getattr(ctx, "task_id", "") or "")
     if queue is None or not task_id or (reason.startswith("control:") and reason != "control:owner_resume"):
         return

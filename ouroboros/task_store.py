@@ -45,6 +45,25 @@ def exists(root: Any, task_id: str) -> bool:
         return txn.row(str(task_id), "task_id") is not None
 
 
+def receipt_anchor(root: Any, task_id: str) -> Optional[Tuple[str, bool]]:
+    """``(root_task_id, root_has_swarm_receipt)`` of one task without decoding a body.
+
+    The root is the task's typed column, else the body's ``metadata.root_task_id``,
+    else the task itself; ``None`` for an absent task. A publication hook asks this
+    instead of parsing two task results merely to learn whether a receipt exists."""
+    with open_store(root, write=False) as txn:
+        record = txn.conn.execute(
+            "SELECT COALESCE(NULLIF(t.root_task_id, ''), NULLIF(json_extract(b.body, '$.metadata.root_task_id'), ''),"
+            " t.task_id) AS root_id FROM tasks AS t JOIN task_bodies AS b ON b.task_id = t.task_id WHERE t.task_id = ?",
+            (str(task_id),)).fetchone()
+        if record is None:
+            return None
+        root_id = str(record["root_id"])
+        receipt = txn.conn.execute("SELECT json_type(body, '$.swarm_receipt') AS kind FROM task_bodies WHERE task_id = ?",
+                                   (root_id,)).fetchone()
+    return root_id, bool(receipt is not None and receipt["kind"] not in (None, "null"))
+
+
 def signature(root: Any, task_id: str, *, txn: Optional[Txn] = None) -> Optional[Tuple[int, str]]:
     """``(write_seq, updated_at)``: changes on every write; ``None`` for an absent task. The key
     the memos compare that used to compare a result file's stat."""

@@ -30,11 +30,24 @@ def load_swarm_rollup(drive_root, task_id):
     row = load_task_result(root, task_id, strict=True) or {}
     prior = row.get("swarm_fanout_rollup")
     facts = copy.deepcopy(prior) if isinstance(prior, dict) and prior.get("source_root") == str(root.resolve()) else {}
-    source = JsonlChainSnapshot(root / "logs/events.jsonl")
-    through = facts.get("through", 0)
+    children, lanes = set(facts.get("child_ids", [])), list(facts.get("lanes_requested", []))
+    through = fold_event_suffix(root, facts.get("through", 0),
+                                lambda event: _accumulate(facts, children, lanes, event, task_id))
+    facts.update(source_root=str(root.resolve()), through=through, child_ids=sorted(children), lanes_requested=lanes)
+    if row and facts != prior:
+        def publish(current, fields):
+            if current.get("swarm_fanout_rollup") != prior:
+                return None
+            return {**fields, "status": current["status"], "swarm_fanout_rollup": facts}
+        write_task_result(root, task_id, row["status"], _field_projector=publish, strict_existing_dict=True)
+    return facts
+
+
+def fold_event_suffix(root, through, consume):
+    """Visit complete unconsumed lines; the caller commits effects and cursor together."""
+    source = JsonlChainSnapshot(pathlib.Path(root) / "logs/events.jsonl")
     if through > source.upper:
         raise ValueError("swarm event chain shortened")
-    children, lanes = set(facts.get("child_ids", [])), list(facts.get("lanes_requested", []))
     for index in range(len(source.entries)):
         _, end = source.segment(index)
         if through >= end:
@@ -52,15 +65,8 @@ def load_swarm_rollup(drive_root, task_id):
                     continue
                 event = json.loads(raw)
                 if isinstance(event, dict):
-                    _accumulate(facts, children, lanes, event, task_id)
-    facts.update(source_root=str(root.resolve()), through=through, child_ids=sorted(children), lanes_requested=lanes)
-    if row and facts != prior:
-        def publish(current, fields):
-            if current.get("swarm_fanout_rollup") != prior:
-                return None
-            return {**fields, "status": current["status"], "swarm_fanout_rollup": facts}
-        write_task_result(root, task_id, row["status"], _field_projector=publish, strict_existing_dict=True)
-    return facts
+                    consume(event)
+    return through
 
 
 def _accumulate(facts, children, lanes, event, task_id):

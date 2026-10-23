@@ -93,6 +93,56 @@ def test_the_select_arrow_is_a_theme_token_not_a_baked_colour():
         assert not baked, f"{rel}: inline SVG carries a fixed colour: {baked}"
 
 
+def _rules(css: str) -> list[tuple[str, str]]:
+    """``(selector, body)`` of every innermost rule, comments removed (an @media wrapper is not a selector)."""
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    return [(" ".join(selector.split()), body) for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css)]
+
+
+THEME_BLOCKS = (":root", ':root[data-theme="light"]')
+DARK_VOICE = ':root:not([data-theme="light"])'
+# The roles the dark palette sets apart from the light theme's: each has its own light value, equal to the light
+# theme's before the dark voices were added (docs/DESIGN.md seed table). `--green` among them: the light theme read
+# the dark seed's green until the dark one changed.
+LIGHT_RESTATED = (
+    "--voice-owner", "--voice-ouroboros", "--voice-ouroboros-card", "--system-sender", "--amber",
+    "--green", "--status-ok-fg", "--status-warn-fg", "--status-error-fg", "--accent-light", "--focus-accent-border",
+    "--assistant-sender", "--panic-ink", "--tone-chosen-answer", "--tone-chosen-answer-ink",
+    "--tone-chosen-answer-detail", "--tone-chosen-answer-shadow", "--chosen-answer-cue-display", "--tone-recommended",
+    "--tone-recorded-answer", "--tone-recorded-mark", "--quiz-held-opacity", "--message-pending-opacity",
+)
+
+
+def test_the_dark_voice_materials_stay_out_of_the_light_theme():
+    """A voice material (ui.css, after the light block) restates palette roles on a voice's own objects. Only the dark
+    theme has one. Code blocks deliberately reset their quiet hover to the room's neutral material in both themes;
+    every other role override stays in its theme block."""
+    rules = _rules(_read("web/ui.css"))
+    declared = lambda body: set(re.findall(r"(--[\w-]+)\s*:", body))  # noqa: E731
+    materials = {selector: declared(body) for selector, body in rules if selector.startswith(DARK_VOICE)}
+    assert set(materials) == {f"{DARK_VOICE} :is(.chat-bubble.assistant, .chat-live-card)", f"{DARK_VOICE} .chat-bubble.user"}, materials
+    voice_roles = set().union(*materials.values())
+    neutral_code = [body.strip() for selector, body in rules if selector == ".md-code-block"]
+    assert neutral_code == ["--tone-quiet-hover: var(--bg-hover);"], neutral_code
+    leaks = [(selector, sorted(declared(body) & voice_roles)) for selector, body in rules
+             if selector not in (*THEME_BLOCKS, ".md-code-block")
+             and not selector.startswith(DARK_VOICE) and declared(body) & voice_roles]
+    assert not leaks, f"voice material roles restated outside the dark voice materials: {leaks}"
+    light = "".join(body for selector, body in rules if selector == ':root[data-theme="light"]')
+    missing = [name for name in LIGHT_RESTATED if not re.search(rf"(?<![\w-]){re.escape(name)}\s*:", light)]
+    assert not missing, f"these roles differ in the dark seed and need their own light value: {missing}"
+
+
+def test_every_colour_the_design_seed_table_names_is_a_value_of_the_palette():
+    """The seed table (docs/DESIGN.md) and web/ui.css say the same colours: a value changed on one side only fails."""
+    design = _read("docs/DESIGN.md")
+    table = design.split("**Seed (light | dark)**", 1)[1].split("\n\n", 2)[1]
+    named = {value.lower() for value in re.findall(r"#[0-9a-fA-F]{6}\b", table)}
+    ui = {value.lower() for value in re.findall(r"#[0-9a-fA-F]{6}\b", re.sub(r"/\*.*?\*/", "", _read("web/ui.css"), flags=re.S))}
+    assert len(named) > 15, "the seed table was not found"
+    assert not named - ui, f"the seed table names colours web/ui.css does not have: {sorted(named - ui)}"
+
+
 def test_selected_advisory_reads_like_every_other_setting_value():
     """A setting's value is never amber: the selected Advisory takes the shared selected look of a chosen option,
     the themed soft crimson pair, so the old ~2:1 amber wash on the light surface cannot come back."""

@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 
 _CONTINUE_PREFIX = "Continue: "
 # The census's execution facts for a member (gateway/state.py), never a work's identity.
-_EXECUTION_FACTS = frozenset({"running", "owner_pause_warm"})
+_EXECUTION_FACTS = frozenset({"running", "owner_pause_warm", "owner_wait"})
 
 
 def _strip_continue(name: str) -> str:
@@ -48,6 +48,7 @@ class _Observations:
         self.fences: Dict[str, dict] = {}
         self.stops: Dict[str, frozenset] = {}
         self.reviews: Dict[str, bool] = {}
+        self.models: Dict[str, list] = {}
         self.gaps: List[Dict[str, Any]] = []
 
     def result(self, task_id: str) -> Optional[dict]:
@@ -84,6 +85,12 @@ class _Observations:
                 log.debug("Work projection could not read the review of %s", task_id, exc_info=True)
                 self.reviews[task_id] = False  # an unreadable operation proves no review
         return self.reviews[task_id]
+
+    def model_handoffs(self, root_id: str, drive_root: Any = None) -> list:
+        if root_id not in self.models:
+            from supervisor.continuation_admission import model_handoffs
+            self.models[root_id] = model_handoffs(drive_root or self.drive_root, root_id)
+        return self.models[root_id]
 
     def stop_unknown(self, task_id: str, drive_root: Any = None, owner: Optional[Mapping[str, Any]] = None
                      ) -> frozenset:
@@ -183,17 +190,19 @@ def _member_raw(row: Mapping[str, Any], raw: Mapping[str, Any], obs: _Observatio
     hold = raw.get("_budget_pause_hold") if isinstance(raw.get("_budget_pause_hold"), dict) else {}
     pause = raw.get("_budget_pause") if isinstance(raw.get("_budget_pause"), dict) else {}
     facts: Dict[str, Any] = {"hold": hold, "paused_at": pause.get("paused_at") or pause.get("requested_at"),
-                             "running": bool(raw.get("running"))}
-    if row.get("phase") == "budget_pausing" and (raw.get("owner_pause_warm") or row.get("kind") == "direct_chat"):
+                             "running": bool(raw.get("running", row.get("live"))), **dict(raw)}
+    if row.get("phase") in {"budget_pausing", "budget_paused"} and (raw.get("owner_pause_warm") or row.get("kind") == "direct_chat"):
         # Parked warm under a Pause still settling: the review it already sent still runs beside it.
         facts["sent_review"] = obs.sent_review(str(row.get("activity_id") or ""))
-    if row.get("pause_cause") == "owner" and row.get("phase") in {"budget_paused", "budget_pausing"}:
+    if row.get("phase") in {"budget_paused", "budget_pausing"}:
         from ouroboros.control_actor import pause_author
 
         fence = obs.fence(root_id, raw.get("budget_drive_root"))
         # The Pause is dated from its press: a settling fence restamps ``paused_at``.
         facts["paused_at"] = fence.get("requested_at") or fence.get("paused_at") or facts["paused_at"]
         facts["pause_by"] = pause_author(fence)
+        facts["fences"] = {"owner": fence}
+        facts["model_handoffs"] = obs.model_handoffs(root_id, raw.get("budget_drive_root"))
         facts["parked"] = [str(task) for task in fence.get("parked_members") or () if task]
     return facts
 
@@ -342,6 +351,14 @@ def _snapshot(drive_root: Any, owners: List[Mapping[str, Any]], raw: Dict[str, M
         logical = [current_root] if current_root and current_root != current_id else []
         ended = [] if current_state is not None else [current_id]
         controls = ws.controls_for(current_state, current_row, earlier_live=earlier, live_roots=ended + logical + earlier)
+        if current_state is None and members and any(m["activity"] in {"working", "queued", "waiting"} for m in members):
+            controls.insert(0, {"action": "pause", "target": current_id})
+        if current_state is None:
+            # An ended author is never run again. Each held helper has its own
+            # addressed Resume in Activity; a work-level press selects none.
+            controls.extend({"action": "resume", "target": member["task_id"], "scope": "single"}
+                            for member in members if member["activity"] == "paused" and member.get("resumable")
+                            and member.get("stop", {}).get("scope") != "tree")
         work.update(kind="direct" if str(room_row.get("kind") or "") == "direct_chat" else "task",
                     project_id=str(room_row.get("project_id") or ""), since=_since(room_row), controls=controls)
         cmid = str(room_row.get("client_message_id") or "")

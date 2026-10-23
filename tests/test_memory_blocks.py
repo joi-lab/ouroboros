@@ -88,39 +88,3 @@ class TestDialogueBlocks:
         blocks_path = memory.drive_root / "memory" / "dialogue_blocks.json"
         blocks_path.write_text("NOT VALID JSON {{{", encoding="utf-8")
         assert memory.load_dialogue_blocks() == []
-
-
-class TestCacheHitRate:
-    def test_cache_hit_rate_computation(self, memory):
-        from ouroboros.context import _compute_cache_hit_rate
-        import types
-
-        events_path = memory.logs_path("events.jsonl")
-        events_path.parent.mkdir(parents=True, exist_ok=True)
-
-        entries = []
-        for i in range(10):
-            entries.append(json.dumps({
-                "type": "llm_round",
-                "prompt_tokens": 1000,
-                "cached_tokens": 600,
-                "cache_hit_rate": 0.6,
-            }))
-        events_path.write_text("\n".join(entries), encoding="utf-8")
-
-        env = types.SimpleNamespace(
-            drive_path=lambda p: memory.drive_root / p,
-        )
-        rate = _compute_cache_hit_rate(env)
-        assert rate is not None
-        assert abs(rate - 0.6) < 0.01
-
-    def test_cache_hit_rate_insufficient_data(self, memory):
-        from ouroboros.context import _compute_cache_hit_rate
-        import types
-
-        env = types.SimpleNamespace(
-            drive_path=lambda p: memory.drive_root / p,
-        )
-        rate = _compute_cache_hit_rate(env)
-        assert rate is None

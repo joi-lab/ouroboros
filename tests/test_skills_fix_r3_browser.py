@@ -148,7 +148,7 @@ def test_publication_visibility_survives_saved_sources_confirmation_and_task(ski
             page.locator("#skills-installed-search").fill(name)
             card = page.locator(f'.skills-card[data-skill="{name}"]')
             card.locator("[data-skill-menu-trigger]").click()
-            page.locator("body > .skills-card-menu-dialog .skills-submit-hub").click()
+            page.locator("body > .skills-card-menu-dialog:not([data-leaving]) .skills-submit-hub").click()
             dialog = page.locator(".skills-dialog")
             dialog.wait_for()
             repository = "owner/ouroboros-skills"

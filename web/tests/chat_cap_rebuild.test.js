@@ -185,6 +185,8 @@ function installDom(fetchImpl = async () => ({ ok: true, json: async () => ({ ac
         addEventListener() {}, removeEventListener() {},
     };
     const mount = new ElementStub('div', document);
+    document.body = new ElementStub('body', document);
+    document.body.appendChild(mount);
     document.byId.set('content', mount);
     const storage = new Map();
     globalThis.document = document;

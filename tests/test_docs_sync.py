@@ -209,7 +209,7 @@ PROMPT_NON_TOOL_IDENTIFIERS = frozenset({
     "skill_payload", "subagent_projects", "system_repo", "task_drive", "user_files",
     "write_root", "write_surface",
     # tool parameters named as cross-tool policy
-    "project_id", "project_name", "recommended_use", "review_rebuttal", "subagent_id", "working_note",
+    "project_id", "project_name", "recommended_use", "retry_of", "review_rebuttal", "subagent_id", "working_note",
     "extra_tests", "full_tests", "test_reason",
     # typed outcomes / statuses / runtime-context keys
     "needs_manual_target", "started_uncustodied", "owner_client",
@@ -264,11 +264,13 @@ def test_prompt_tool_names_resolve_to_registered_tools(tmp_path):
     registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
     registered = {schema["function"]["name"] for schema in registry.schemas()}
     universe = registered | PROMPT_NON_TOOL_IDENTIFIERS
+    from ouroboros.presence_context import PLACEHOLDERS as FOCUS_PLACEHOLDERS
     wake_universe = universe | set(PLACEHOLDERS)
     for rel, allowed in (
         ("prompts/SYSTEM.md", universe),
         ("prompts/SAFETY.md", universe),
         ("prompts/CONSCIOUSNESS.md", wake_universe),
+        ("prompts/FOCUS.md", universe | set(FOCUS_PLACEHOLDERS)),
     ):
         text = (root / rel).read_text(encoding="utf-8")
         unresolved = _prompt_backticked_identifiers(text) - allowed

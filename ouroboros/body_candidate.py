@@ -643,17 +643,55 @@ def executor_environment(ctx: Any, cwd: Any, *, executor, map_path) -> Optional[
             f"the executor must map both the body copy and its sibling .env directory: {exc}") from exc
 
 
-def record_reviewed_commit(ctx: Any, commit_sha: str, *, row: Optional[Dict[str, Any]] = None) -> None:
+def record_reviewed_commit(ctx: Any, commit_sha: str, *, row: Optional[Dict[str, Any]] = None, created_tag: str = "") -> None:
     """The commit gate created ``commit_sha`` on this candidate under the configured enforcement
-    (``row``: the candidate whose interrupted gate an evolution intent proves)."""
+    (``row``: the candidate whose interrupted gate an evolution intent proves). The author's
+    test widening stays with that commit, so a later run of the same unadopted delta keeps it."""
     bound = row or descriptor(ctx)
     if not bound or not commit_sha:
         return
+    request = getattr(ctx, "_commit_test_request", None)
+
+    def record(entry: Dict[str, Any]) -> None:
+        entry["reviewed_commits"] = [
+            *[sha for sha in entry.get("reviewed_commits") or [] if sha != commit_sha], str(commit_sha)]
+        if isinstance(request, dict):  # an explicit default is known; recovery without a context is not
+            entry["test_requests"] = {**(entry.get("test_requests") or {}), str(commit_sha):
+                                      {**request, "extra_tests": list(request.get("extra_tests") or ())}}
+        if created_tag:
+            entry["reviewed_release_tags"] = {
+                **(entry.get("reviewed_release_tags") or {}), str(commit_sha): str(created_tag)}
+
     try:
-        _update_row(bound, lambda entry: entry.__setitem__("reviewed_commits", [
-            *[sha for sha in entry.get("reviewed_commits") or [] if sha != commit_sha], str(commit_sha)]))
+        _update_row(bound, record)
     except Exception:
         log.warning("reviewed candidate commit %s was not recorded on its row", commit_sha[:12], exc_info=True)
+
+
+def interval_widening(row: Dict[str, Any], base: str, head: str = "HEAD") -> Dict[str, Any]:
+    """Combine first-parent ``base..head`` widening still owed before adoption."""
+    recorded, reviewed = row.get("test_requests") or {}, set(row.get("reviewed_commits") or ())
+    listed = _git(row["path"], "rev-list", "--first-parent", f"{base}..{head}").stdout.split()
+    requests = [recorded.get(sha) for sha in reversed(listed) if sha in reviewed]
+    if any(not isinstance(request, dict) for request in requests):
+        return {"extra_tests": [], "full_tests": True, "test_reason": "prior reviewed test scope is unknown"}
+    reasons = (str(request.get("test_reason") or "").strip() for request in requests)
+    return {"extra_tests": sorted({str(p) for request in requests for p in request.get("extra_tests") or ()}),
+            "full_tests": any(request.get("full_tests") is True for request in requests),
+            "test_reason": "; ".join(dict.fromkeys(reason for reason in reasons if reason))}
+
+
+def qualification_request(ctx: Any, request: Dict[str, Any]) -> Dict[str, Any]:
+    """Select against the adoption base; adoption independently re-checks any unreadable earlier widening."""
+    from ouroboros.test_selection import inherit_widening
+
+    base, earlier = adoption_base(ctx), {}
+    try:
+        row = find(owner_id(ctx))
+        earlier = interval_widening(row, base) if row and base else {}
+    except Exception:
+        log.warning("earlier authored test widening unreadable for this candidate", exc_info=True)
+    return {**inherit_widening(pathlib.Path(ctx.repo_dir), request, earlier), **({"base": base} if base else {})}
 
 
 def intent_capture(task_id: str, serving_capture):
@@ -701,6 +739,17 @@ def holds_commit(task_id: str, commit_sha: str, data_dir: Optional[Any] = None) 
         return True
     except Exception:
         return None
+
+
+def adoption_base(ctx: Any) -> str:
+    """Where the bound candidate forks from the serving HEAD (``""`` if unresolved): the selection
+    base of its post-commit tests, so a proof covers the whole delta an adoption switches."""
+    try:
+        serving = _git(serving_repo_dir_for(ctx), "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+        return _git(ctx.repo_dir, "merge-base", serving, "HEAD").stdout.strip()
+    except Exception:
+        log.warning("candidate adoption base unresolved; its run selects against the last commit only", exc_info=True)
+        return ""
 
 
 def publication_note(ctx: Any) -> str:

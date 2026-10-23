@@ -1,4 +1,5 @@
-import { renderPageHeader } from './page_header.js';
+import { bindPageHeader, renderPageHeader } from './page_header.js';
+import { bindScrollFade } from './scroll_fade.js';
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
 import { fetchJson, jsonPost } from './api_client.js';
 import { openConfirmDialog } from './confirm_dialog.js';
@@ -96,6 +97,28 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
     const newDirBtn = page.querySelector('#files-new-dir');
     const searchEl = page.querySelector('#files-search');
     const refreshBtn = page.querySelector('#files-refresh');
+    // On a desk the folder's location starts the bar and its own actions join Refresh at the end; in the stack
+    // layout they stay over the list they act on (docs/DESIGN.md "Page header"). In the bar a long location scrolls
+    // inside it: it rests at its end, the folder you are in, after each path and whenever the bar gives it another
+    // width (the page shown, the layout switched, the window resized), and a folder the keyboard reaches comes
+    // wholly into view, where an engine would stop at partly. Only the strip scrolls. Files lives as long as the app
+    // (app.js builds it once and keeps no handle; its window and document listeners below have no destroy either),
+    // so these bindings live as long and keep no disposer.
+    bindPageHeader(page.querySelector('.app-page-header'), {
+        lead: breadcrumbEl, actions: page.querySelector('.files-browser-actions') });
+    const revealFolder = (crumb) => {
+        if (!crumb || !breadcrumbEl.clientWidth) return;
+        const view = breadcrumbEl.getBoundingClientRect();
+        const box = crumb.getBoundingClientRect();
+        const inset = Math.max(0, Math.min(parseFloat(getComputedStyle(breadcrumbEl).scrollPaddingInlineStart) || 0,
+            (view.width - box.width) / 2));
+        if (box.left < view.left + inset) breadcrumbEl.scrollLeft -= view.left + inset - box.left;
+        else if (box.right > view.right - inset) breadcrumbEl.scrollLeft += box.right - view.right + inset;
+    };
+    const revealCurrentFolder = () => revealFolder(breadcrumbEl.lastElementChild);
+    bindScrollFade(breadcrumbEl, { axis: 'x' });
+    if (typeof ResizeObserver === 'function') new ResizeObserver(revealCurrentFolder).observe(breadcrumbEl);
+    breadcrumbEl.addEventListener('focusin', (event) => revealFolder(event.target.closest?.('.files-crumb')));
 
     const state = {
         path: '.',
@@ -310,6 +333,7 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
                 breadcrumbEl.appendChild(sep);
             }
         });
+        revealCurrentFolder();
     }
 
     function renderList() {

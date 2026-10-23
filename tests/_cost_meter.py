@@ -481,6 +481,13 @@ def _install(meter: CostMeter) -> None:
             continue
         _ORIG[key] = _replace(meter, module, attr, wrapper)
         originals[id(_ORIG[key])] = wrapper
+    # Capability probes must see the same platform while its OS doors are wrapped.
+    # Otherwise confined_files imported during a cold boot refuses every POSIX child.
+    for attr in ("supports_dir_fd", "supports_fd", "supports_follow_symlinks", "supports_effective_ids"):
+        if hasattr(os, attr):
+            supported = getattr(os, attr)
+            setattr(os, attr, {originals.get(id(call), call) for call in supported})
+            meter._patched.append((os, attr, supported))
     for attr, wrapper in _ACCESSOR_PATCHES:
         _ORIG["accessor." + attr] = _replace(meter, _ACCESSOR, attr, staticmethod(wrapper))
     _ORIG["Popen.__init__"] = _replace(meter, subprocess.Popen, "__init__", _w_popen_init)

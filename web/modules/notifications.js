@@ -231,6 +231,7 @@ export function classifyLiveFrame(frame, { kind = 'chat', isMain = false, isRoot
         // Log frames carry runtime diagnostics, not owner-facing prose, so this
         // one stays title-only even when message text is switched on.
         if (text(frame.type || frame.event) !== 'task_done') return null;
+        if (frame.quiet_effective === true) return null;
         if (!rootEligible(taskId)) return null;
         // A task_done frame is not always an ending: an update or restart
         // teardown pushes a NON-settled `interrupted` terminal and requeues the
@@ -297,6 +298,7 @@ export function classifyLiveFrame(frame, { kind = 'chat', isMain = false, isRoot
     // every stopped or failed conversation "a task finished" — it falls through
     // to the ordinary-reply category below instead.
     if (systemType === 'task_summary') {
+        if (frame.quiet_effective === true) return null;
         if (!rootEligible(taskId)) return null;
         return {
             category: 'task_done',

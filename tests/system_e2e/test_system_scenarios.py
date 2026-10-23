@@ -29,9 +29,9 @@ sockets: the scenario manifest (gen/verify in BOTH directions), the stub's branc
 classification (review-organ branch BEFORE the finalization check), the prompt-marker
 literals against the tree's source, the ReplayModel binding/consumption contract, and
 the keyless/egress hardening (roast F21). The ``mock`` lane spawns real isolated
-servers; every scenario test carries BOTH ``integration`` and ``serial`` markers (so
-neither the default local run, nor either CI pytest pass, nor the CI-shape battery
-picks it up) AND the ``OUROBOROS_E2E_DEEP=mock`` env gate. Run it with::
+servers; every scenario carries ``integration`` (excluding both default pytest
+passes) and the ``OUROBOROS_E2E_DEEP=mock`` gate. Scenarios sharing resources also
+carry ``serial``; isolated scenarios may run concurrently. Run it with::
 
     OUROBOROS_E2E_DEEP=mock pytest tests/system_e2e/ -o addopts="" -q
 
@@ -150,16 +150,18 @@ def test_every_scenario_test_is_declared_in_the_manifest():
         )
 
 
-def test_every_scenario_test_carries_integration_and_serial_markers():
-    """The marker discipline that keeps the suite OUT of the default non-serial run,
-    both CI pytest passes, and the CI-shape battery: every scenario test must carry
-    ``integration`` AND ``serial``. (The ``OUROBOROS_E2E_DEEP`` env gate is the second
-    belt; markers are what the -m expressions see.)"""
+def test_every_scenario_test_carries_integration_marker():
+    """Integration excludes scenarios from BOTH default passes; serial is not a lane.
+
+    Pytest inherits module marks, so check them as well as function decorators.
+    A private-root, port-zero scenario needs no shared-resource serial marker.
+    """
     for qualified, _name, fn in _scenario_tests():
-        marks = {mark.name for mark in getattr(fn, "pytestmark", [])}
-        assert {"integration", "serial"} <= marks, (
-            f"{qualified} must be decorated with @pytest.mark.integration and "
-            f"@pytest.mark.serial (has: {sorted(marks)})"
+        module = sys.modules[fn.__module__]
+        marks = {mark.name for owner in (module, fn)
+                 for mark in getattr(owner, "pytestmark", [])}
+        assert "integration" in marks, (
+            f"{qualified} must carry @pytest.mark.integration (has: {sorted(marks)})"
         )
 
 

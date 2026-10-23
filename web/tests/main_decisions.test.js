@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test, { mock } from 'node:test';
-import { NodeStub, fixture, turn } from './chat_decision_fixture.js';
+import { NodeStub, fixture, frameBubble, turn } from './chat_decision_fixture.js';
 import { fixture as mediaFixture, NodeStub as MediaNode } from './helpers/media_dom.js';
 import { ElementStub, installDom, restoreDom } from './chat_dom_fixture.js';
 import { createChatInstance } from '../modules/chat.js';
@@ -21,13 +21,12 @@ const find = (node, predicate) => predicate(node) ? node
 function feedFixture(extra = {}) {
     const feed = new NodeStub();
     const inserted = [], recounts = [];
-    const fx = fixture({ isMain: true,
-        frameNode: (_msg, card) => { const bubble = new NodeStub(); bubble.append(card); return bubble; },
+    const fx = fixture({ isMain: true, frameNode: frameBubble,
         insertMessageNode: node => { inserted.push(node); feed.append(node); return true; },
         removeMessageNode: node => node.remove(),
         onQuestionsChanged: () => recounts.push(feed.children.length), ...extra });
     return { ...fx, feed, inserted, recounts, add: row => fx.decision.appendQuestionPointer(row),
-        cards: () => feed.children.map(bubble => bubble.children[0]) };
+        cards: () => feed.children.map(bubble => bubble.querySelector('.chat-quiz-card')) };
 }
 
 // Main's waiting navigator over a stub page: owner-action messages enter the feed, the pill the
@@ -190,7 +189,7 @@ test('a history copy is the full form at once while nothing is forgotten; the ce
         const card = fx.cards()[0];
         assert.equal(card.dataset.state, 'open');
         assert.ok(card.querySelector('.chat-quiz-comment'));
-        assert.ok(card.querySelector('.chat-live-project-name'));
+        assert.ok(card.parentNode.querySelector('.chat-live-project-name'), 'the voice line names the Project');
         assert.equal(reads, 0, 'only an evicted memory sends a copy to its canonical read');
         fx.decision.syncCurrentQuestions([question('old', { quiz_state: 'expired_terminal' })], true);
         assert.equal(card.dataset.state, 'expired_terminal');

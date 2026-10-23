@@ -69,6 +69,7 @@ from ouroboros.model_slots import (
     get_heavy_model,  # noqa: F401
     get_image_input_mode,  # noqa: F401
     get_light_model,  # noqa: F401
+    get_safety_model,  # noqa: F401
     get_vision_model,  # noqa: F401
     migrate_legacy_slot_keys,  # noqa: F401
     parse_fallback_chain,  # noqa: F401
@@ -417,17 +418,6 @@ def get_runtime_mode() -> str:
     return normalize_runtime_mode(os.environ.get("OUROBOROS_RUNTIME_MODE", default_val) or default_val)
 
 
-def get_safety_mode() -> str:
-    """Return captured Supervisor coverage (full | light | off).
-
-    Ordinary modes use the owner writer; Cyber may configure subsequent work
-    through the same settings owner. Coverage is separate from Cyber's advisory
-    decision authority and from the facts of a saved physical request.
-    """
-    default_val = str(SETTINGS_DEFAULTS["OUROBOROS_SAFETY_MODE"])
-    return normalize_safety_mode(runtime_setting("OUROBOROS_SAFETY_MODE", default_val) or default_val)
-
-
 def get_context_mode() -> str:
     """Working-context choice in the current settings read view.
 
@@ -499,6 +489,7 @@ def prepare_settings_for_persist(settings: dict, *, authored_keys: Sequence[str]
         and str(v) == str(SETTINGS_DEFAULTS.get(k, "")))}
     _guard_context_mode_lowering(prepared, allow_context_lowering=allow_context_lowering)
     _guard_safety_mode_lowering(prepared, allow_safety_lowering=allow_safety_lowering)
+    _guard_safety_configuration(prepared, owner_write=allow_safety_lowering)
     if runtime_mode_at_least(get_runtime_mode(), "cyber_pro") and prepared.get("OUROBOROS_CONTEXT_MODE") == "low":
         # Cyber may author Low. Keep that explicit choice distinct from retired auto-Low.
         prepared["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
@@ -517,13 +508,14 @@ def _guard_safety_mode_lowering(settings: dict, *, allow_safety_lowering: bool =
     owner-only outside Cyber Pro (mirrors the context-mode ratchet, BIBLE P3)."""
     if runtime_mode_at_least(get_runtime_mode(), "cyber_pro"):
         return
-    previous_mode = normalize_safety_mode(_settings_file_value("OUROBOROS_SAFETY_MODE", "full"))
-    next_mode = normalize_safety_mode(settings.get("OUROBOROS_SAFETY_MODE", previous_mode))
-    if _SAFETY_MODE_RANK[next_mode] < _SAFETY_MODE_RANK[previous_mode] and not allow_safety_lowering:
-        raise PermissionError(
-            f"OUROBOROS_SAFETY_MODE lowering refused: {previous_mode!r} -> {next_mode!r}. "
-            "Safety mode is owner-controlled — use the dedicated /api/owner/safety-mode endpoint."
-        )
+    for key in ("OUROBOROS_SAFETY_MODE", "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE"):
+        previous_mode = normalize_safety_mode(_settings_file_value(key, "full"))
+        next_mode = normalize_safety_mode(settings.get(key, previous_mode))
+        if _SAFETY_MODE_RANK[next_mode] < _SAFETY_MODE_RANK[previous_mode] and not allow_safety_lowering:
+            raise PermissionError(
+                f"{key} lowering refused: {previous_mode!r} -> {next_mode!r}. "
+                "Safety mode is owner-controlled — use the dedicated /api/owner/safety-mode endpoint."
+            )
 
 
 def get_skills_repo_path() -> str:
@@ -697,6 +689,10 @@ def verify_settings_integrity() -> str | None:
     return _settings_integrity.verify_settings_integrity(SETTINGS_PATH)
 
 
+from ouroboros.safety_config import (  # noqa: F401 -- the settings API stays config.*
+    get_safety_mode, safety_configuration, _guard_safety_configuration, _migrate_consciousness_safety,
+)
+
 log = logging.getLogger(__name__)
 
 # Retired-key combinations reported by normalize_settings_raw each get one notice.
@@ -822,6 +818,7 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
     except Exception:
         raw = None
     if isinstance(raw, dict):
+        raw = _migrate_consciousness_safety(raw, lock_held=_settings_lock_held)
         raw = normalize_and_persist_context_mode_compat(
             raw,
             settings_path=SETTINGS_PATH,
@@ -882,7 +879,8 @@ def save_settings(
         if onboarding_safety_default:
             wants_light = str(settings.get("OUROBOROS_SAFETY_MODE", "") or "").strip().lower() == "light"
             if wants_light and not SETTINGS_PATH.exists():
-                authored_keys = ("OUROBOROS_SAFETY_MODE",)
+                settings = {**settings, "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full"}
+                authored_keys = ("OUROBOROS_SAFETY_MODE", "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE")
                 allow_safety_lowering = True
         settings = prepare_settings_for_persist(
             settings, authored_keys=authored_keys,

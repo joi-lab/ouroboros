@@ -204,8 +204,9 @@ def test_startup_notice_matches_loaded_runtime_bounds_and_raw_presence(
     if launch_env is not None:
         monkeypatch.setenv(key, launch_env)
     monkeypatch.setenv(other, "unlimited")
-    if document is not None:
-        path.write_text(json.dumps({other: "unlimited", **document}), encoding="utf-8")
+    if document is not None:  # an install that already carries the consciousness level (no one-time copy)
+        path.write_text(json.dumps({other: "unlimited", "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full", **document}),
+                        encoding="utf-8")
     before = path.read_bytes() if path.exists() else None
     for name, value in {"DRIVE_ROOT": tmp_path, "STATE_PATH": tmp_path / "state/state.json",
                         "STATE_LAST_GOOD_PATH": tmp_path / "state/state.last_good.json",

@@ -16,7 +16,6 @@ WEB = Path(__file__).resolve().parents[1] / "web"
 BOOT = """<script type="module">
 import {initDashboard} from '/static/modules/dashboard.js';
 import {initUpdates} from '/static/modules/updates.js';
-document.getElementById('reconnect-overlay').remove();
 document.querySelectorAll('[data-nav-page]').forEach(node=>node.classList.toggle('active',node.dataset.navPage==='dashboard'));
 const state={activePage:'dashboard',dashboardActiveSubtab:'updates'};
 const dashboard=initDashboard({state}); dashboard.page.classList.add('active');

@@ -84,6 +84,8 @@ def candidate_apply_possible(record: Any) -> bool:
     an unknown source included, stays possible: a conservative answer, not
     proof of permission.
     """
+    if _fact(record, "execution_mode") == "plan" or _fact(record, "mode") == "plan":
+        return False
     source = str(_fact(record, "authority_source") or "")
     if source in _NO_APPLY_AUTHORITY_SOURCES:
         return False
@@ -241,6 +243,7 @@ STARTED_STR_FIELDS: Tuple[Tuple[str, str], ...] = tuple(
         "ledger_root", "idempotency_key", "invocation_id",
         "snapshot_id", "execution_root", "execution_binding_fingerprint", "baseline_sha", "target_root",
         "authority_source", "access", "mode", "isolation",
+        "execution_mode", "effective_access", "thread_id",
         "selected_subagent_id", "config_fingerprint", "work_order_fingerprint",
         "work_order_coverage", "authority_fingerprint",
         # The prior run this start explicitly continues ("" for every ordinary
@@ -251,6 +254,7 @@ STARTED_STR_FIELDS: Tuple[Tuple[str, str], ...] = tuple(
 )
 # None means an old row omitted the choice; '' is a captured default choice. ``row_effort`` is
 # the configured row's pin ('' = Auto) beside ``effort``, the LEAF level the engine ran.
+STARTED_MAPPING_FIELDS = ("authority_ceiling", "promotion")
 STARTED_OPTION_FIELDS = ("effort", "processing_preference", "row_effort")
 # Progress carried forward from a previous row: an idempotent re-start writes a
 # SECOND started row; replacing wholesale would forget a settlement and put a
@@ -275,4 +279,5 @@ STARTED_FIRST_WINS_FACTS: Tuple[str, ...] = (
     "capture_id", "snapshot_task_id", "authority_source", "resource_ref", "selected_subagent_id",
     "config_fingerprint", "work_order_fingerprint", "work_order_coverage",
     "authority_fingerprint", "work_order_source_request", "category", "source",
+    "execution_mode", "effective_access", "thread_id", *STARTED_MAPPING_FIELDS,
     *REVIEW_ATTRIBUTION_KEYS)

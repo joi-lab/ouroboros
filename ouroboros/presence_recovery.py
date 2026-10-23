@@ -138,12 +138,12 @@ def retained_work_view(stored: Mapping[str, Any], reference: str,
     status = str(stored.get("status") or "")
     from ouroboros.presence_runner import _terminal_refusal, presence_result_from_stored
 
-    continued = work_view(stored, reference)  # a continuing Presence author's own poll (#1536)
+    continued = work_view(stored, reference, drive_root)  # a continuing author's own poll
     if status in {"completed", "failed", "cancelled"} and not _terminal_refusal(stored):
         # A canonical answer is final the moment it is recorded.
         if continued is not None:
             return continued
-        result = presence_result_from_stored(stored, reference)
+        result = presence_result_from_stored(stored, reference, drive_root)
         return 200, {"ok": True, "status": status, "outcome": result.outcome, "text": result.text,
                      "work_ref": reference, "delivery_reporting_version": result.delivery_reporting_version}
     if not attempt_ended(stored, drive_root):

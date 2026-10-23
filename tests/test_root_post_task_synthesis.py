@@ -546,7 +546,7 @@ def test_root_post_phase_keeps_frozen_dialogue_memory_and_buys_no_dialogue_light
     monkeypatch.setattr(context_fit, "resolve_context_fit_route", lambda task, *, allow_fetch: (
         {"model": task["model"], "provider": "openrouter"},
         CapabilityEvidence(1_000_000, "confirmed", "test", "route-test", model=task["model"], provider="openrouter")))
-    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_: 1.0)
+    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_, **_kw: 1.0)
     monkeypatch.setattr(_RecordingLight, "prompts", [])
     monkeypatch.setattr(llm_mod, "LLMClient", _RecordingLight)
     monkeypatch.setattr(post_task_evolution, "maybe_promote", lambda *_args, **_kwargs: None)
@@ -613,7 +613,7 @@ def test_the_one_memory_light_call_of_a_root_is_the_fallback_draft_and_only_whil
     monkeypatch.setattr(context_fit, "resolve_context_fit_route", lambda task, *, allow_fetch: (
         {"model": task["model"], "provider": "openrouter"},
         CapabilityEvidence(1_000_000, "confirmed", "test", "route-test", model=task["model"], provider="openrouter")))
-    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_: 1.0)
+    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_, **_kw: 1.0)
     monkeypatch.setattr(_RecordingLightWithDrafts, "prompts", [])
     monkeypatch.setattr(llm_mod, "LLMClient", _RecordingLightWithDrafts)
     monkeypatch.setattr(post_task_evolution, "maybe_promote", lambda *_args, **_kwargs: None)

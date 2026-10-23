@@ -301,7 +301,8 @@ def test_start_agent_exports_presentation_posture(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher, "EMBEDDED_PYTHON", sys.executable)
     monkeypatch.setattr(launcher, "_load_settings", lambda: {})
     monkeypatch.setattr(launcher, "_apply_settings_to_env", lambda _settings: None)
-    monkeypatch.setattr(launcher, "subprocess_new_group_kwargs", lambda: {"start_new_session": True})
+    monkeypatch.setattr(launcher, "subprocess_new_group_kwargs",
+                        lambda *, suspended: {"start_new_session": True} if not suspended else {})
     monkeypatch.setattr(launcher, "_hidden_popen", fake_popen)
     monkeypatch.setattr(launcher, "process_group_id", lambda _pid: 4242)
 
@@ -357,7 +358,8 @@ def test_start_agent_unix_uses_process_group_and_writes_server_record(monkeypatc
     else:
         monkeypatch.setenv("OUROBOROS_SERVER_HOST", parent_host)
     monkeypatch.setattr(launcher, "_apply_settings_to_env", lambda _settings: None)
-    monkeypatch.setattr(launcher, "subprocess_new_group_kwargs", lambda: {"start_new_session": True})
+    monkeypatch.setattr(launcher, "subprocess_new_group_kwargs",
+                        lambda *, suspended: {"start_new_session": True} if not suspended else {})
     monkeypatch.setattr(launcher, "_hidden_popen", fake_popen)
     monkeypatch.setattr(launcher, "process_group_id", lambda _pid: 12345)
 
@@ -398,7 +400,7 @@ def test_recorded_server_cleanup_ignores_unrelated_pid(monkeypatch, tmp_path):
             "pgid": 22222,
             "server_path": str(server_py.resolve()),
             "repo_dir": str(repo_dir.resolve()),
-            "port": 8765,
+            "port": 1,
         }),
         encoding="utf-8",
     )
@@ -434,7 +436,7 @@ def test_recorded_server_cleanup_kills_verified_process_group(monkeypatch, tmp_p
             "pgid": 33333,
             "server_path": str(server_py.resolve()),
             "repo_dir": str(repo_dir.resolve()),
-            "port": 8765,
+            "port": 1,
         }),
         encoding="utf-8",
     )
@@ -476,7 +478,7 @@ def test_recorded_server_cleanup_ignores_mismatched_process_group(monkeypatch, t
             "pgid": 55555,
             "server_path": str(server_py.resolve()),
             "repo_dir": str(repo_dir.resolve()),
-            "port": 8765,
+            "port": 1,
         }),
         encoding="utf-8",
     )
@@ -510,8 +512,8 @@ def test_update_server_process_record_port_records_actual_port(monkeypatch, tmp_
             "pgid": 123,
             "server_path": "/tmp/server.py",
             "repo_dir": "/tmp/repo",
-            "requested_port": 8765,
-            "port": 8765,
+            "requested_port": 1,
+            "port": 1,
         }),
         encoding="utf-8",
     )
@@ -520,7 +522,7 @@ def test_update_server_process_record_port_records_actual_port(monkeypatch, tmp_
     launcher._update_server_process_record_port(123, 8769)
 
     record = json.loads(record_path.read_text(encoding="utf-8"))
-    assert record["requested_port"] == 8765
+    assert record["requested_port"] == 1
     assert record["port"] == 8769
     assert record["port_updated_at"]
 
@@ -554,8 +556,14 @@ def test_start_agent_windows_assigns_job_before_resume_and_records(monkeypatch, 
     monkeypatch.setattr(launcher, "DATA_DIR", data_dir)
     monkeypatch.setattr(launcher, "REPO_DIR", repo_dir)
     monkeypatch.setattr(launcher, "EMBEDDED_PYTHON", sys.executable)
-    monkeypatch.setattr(launcher, "_CREATE_NEW_PROCESS_GROUP", 0x200)
-    monkeypatch.setattr(launcher, "_CREATE_SUSPENDED", 0x4)
+    from ouroboros import platform_layer
+
+    def windows_group_kwargs(**options):  # the real helper composes the Windows flags; nothing else sees Windows
+        with monkeypatch.context() as scoped:
+            scoped.setattr(platform_layer, "IS_WINDOWS", True)
+            return platform_layer.subprocess_new_group_kwargs(**options)
+
+    monkeypatch.setattr(launcher, "subprocess_new_group_kwargs", windows_group_kwargs)
     monkeypatch.setattr(launcher, "_load_settings", lambda: {})
     monkeypatch.setattr(launcher, "_apply_settings_to_env", lambda _settings: None)
     monkeypatch.setattr(launcher, "_hidden_popen", fake_popen)
@@ -563,7 +571,7 @@ def test_start_agent_windows_assigns_job_before_resume_and_records(monkeypatch, 
     monkeypatch.setattr(launcher, "assign_pid_to_job", lambda job, pid: calls.append(("assign", (job, pid))) or True)
     monkeypatch.setattr(launcher, "resume_process", lambda pid: calls.append(("resume", pid)) or True)
 
-    proc = launcher.start_agent(port=8765)
+    proc = launcher.start_agent(port=1)
 
     assert proc.pid == 54321
     env = next(value for key, value in calls if key == "popen_env")
@@ -578,7 +586,7 @@ def test_start_agent_windows_assigns_job_before_resume_and_records(monkeypatch, 
     ]
     record = json.loads((data_dir / "state" / "server_process.json").read_text(encoding="utf-8"))
     assert record["pid"] == 54321
-    assert record["port"] == 8765
+    assert record["port"] == 1
 
 
 def test_launcher_reexports_the_windows_runtime_leaf():
@@ -633,64 +641,86 @@ def test_external_source_launcher_keeps_older_seed_version_and_local_head(tmp_pa
     assert (seed / 'repo_bundle_manifest.json').read_bytes() == original_manifest
 
 
-@pytest.mark.parametrize("packaged,helper_changed", [(False, True), (True, True), (True, False)])
-def test_external_restart_reexecs_current_source_after_sync_in_same_process(tmp_path, monkeypatch, packaged,
-                                                                            helper_changed):
-    import launcher
-    from ouroboros import launcher_server_reaper
+def _helper_seed(tmp_path):
+    """Seed and checkout both hold the helper the simulated launcher imported."""
+    src, seed, repo = tmp_path / 'src', tmp_path / 'seed', tmp_path / 'repo'
+    src.mkdir()
+    for args in (['init'], ['config', 'user.name', 'Test'], ['config', 'user.email', 'test@example.com'],
+                 ['checkout', '-b', 'ouroboros'], ['remote', 'add', 'origin', 'https://github.com/razzant/ouroboros.git']):
+        _run(['git', *args], cwd=src)
+    (src / 'VERSION').write_text('4.50.0-rc.2\n', encoding='utf-8')
+    (src / 'server.py').write_text("print('bundle-v1')\n", encoding='utf-8')
+    (src / 'ouroboros').mkdir()
+    (src / 'ouroboros' / 'launcher_server_reaper.py').write_text('GEN = 1\n', encoding='utf-8')
+    _run(['git', 'add', '-A'], cwd=src)
+    _run(['git', 'commit', '-m', 'bundle v1'], cwd=src)
+    _run(['git', 'tag', '-a', 'v4.50.0-rc.2', '-m', 'Release v4.50.0-rc.2'], cwd=src)
+    _write_bundle(src, seed)
+    (seed / 'VERSION').write_text('4.50.0-rc.2\n')
+    bootstrap_module.ensure_managed_repo(_make_context(seed, repo))
+    return seed, repo
 
-    class ReexecReached(BaseException):
+
+@pytest.mark.parametrize("host,changed", [("frozen", "helper"), ("frozen", "server"), ("seed", "helper"),
+                                          ("seed", "server"), ("checkout", "helper"), ("checkout", "server"),
+                                          ("container", "helper"), ("container", "server")])
+def test_exit_42_hands_over_only_when_a_module_the_launcher_loaded_changed(tmp_path, monkeypatch, host, changed):
+    """Frozen and seed-copy origins come from their manifest; the checkout launcher records its own HEAD.
+    A loaded helper change hands over, while a server-only update keeps the shell, even with seed argv.
+    POSIX exec is stood in here; the repositories are real and no native app is launched."""
+    import launcher
+    from ouroboros import launcher_server_reaper, platform_layer
+
+    class Handover(BaseException):
         pass
 
     class NextGeneration(BaseException):
         pass
 
+    seed, repo = _helper_seed(tmp_path)
     calls = []
-    repo = tmp_path / 'repo'
     monkeypatch.setattr(bootstrap_module, '_LOADED_CHECKOUT_SHA', '')
-    process = types.SimpleNamespace(pid=12345, returncode=launcher.RESTART_EXIT_CODE,
-                                    wait=lambda: None)
-    monkeypatch.setattr(launcher, '_external_seed_bundle', tmp_path / 'seed')
-    monkeypatch.setattr(launcher, 'REPO_DIR', tmp_path / 'repo')
-    monkeypatch.setattr(launcher, '_launch_argv', ['--no-ui', '--seed-bundle', str(tmp_path / 'seed')])
-    if not packaged:
-        # Source-seed hosts carry the immutable seed's version too.
-        (tmp_path / 'seed').mkdir()
-        (tmp_path / 'seed' / 'VERSION').write_text('4.50.0-rc.2\n', encoding='utf-8')
-    if packaged:
-        seed = tmp_path / 'seed'
-        _write_bundle(_make_bundle_source(tmp_path), seed)
-        (seed / 'VERSION').write_text('4.50.0-rc.2\n')
-        bootstrap_module.ensure_managed_repo(_make_context(seed, tmp_path / 'repo'))
-        monkeypatch.setattr(launcher.sys, 'frozen', True, raising=False)
+    monkeypatch.setattr(launcher, 'REPO_DIR', repo)
+    monkeypatch.setattr(platform_layer, 'IS_WINDOWS', False)  # POSIX transport on every test host
+    monkeypatch.setattr(launcher, 'IS_MACOS', False)
+    monkeypatch.setattr(launcher, 'stop_tray_before_exit', lambda release: release())
+    process = types.SimpleNamespace(pid=12345, returncode=launcher.RESTART_EXIT_CODE, wait=lambda: None)
+    monkeypatch.setattr(launcher.sys, 'frozen', host == 'frozen', raising=False)
+    if host == 'frozen':
         monkeypatch.setattr(launcher.sys, '_MEIPASS', str(seed), raising=False)
         monkeypatch.setattr(launcher, '_external_seed_bundle', None)
         monkeypatch.setattr(launcher, '_launch_argv', ['--launch-intent', 'owner'])
-        # The real detector decides. A frozen launcher imported this helper from its bundle
-        # (PyInstaller's frozen-module path); the checkout holds it at its repository path.
-        # A synthetic bundle, not a native frozen application run.
-        monkeypatch.setattr(launcher_server_reaper, '__file__', str(seed / 'ouroboros' / 'launcher_server_reaper.pyc'))
-        (repo / 'ouroboros').mkdir()
-        (repo / 'ouroboros' / 'launcher_server_reaper.py').write_text('GEN = 1\n')
-        _run(['git', 'add', '-A'], cwd=repo)
-        _run(['git', 'commit', '-m', 'loaded helper'], cwd=repo)
-        # This fixture's synthetic frozen helper is from this commit, newer than
-        # the seed it originally cloned. Record that actual loaded generation.
-        monkeypatch.setattr(bootstrap_module, '_LOADED_CHECKOUT_SHA', _git_output(repo, 'rev-parse', 'HEAD'))
+        imported = seed / 'ouroboros' / 'launcher_server_reaper.pyc'
+    else:
+        monkeypatch.setattr(launcher, '_external_seed_bundle', seed)
+        monkeypatch.setattr(launcher, '_launch_argv', ['--no-ui', '--seed-bundle', str(seed)])
+        source_root = tmp_path / 'app' if host == 'container' else seed if host == 'seed' else repo
+        imported = source_root / 'ouroboros' / 'launcher_server_reaper.py'
+    # The container's image root is neither its immutable seed nor its mutable body.
+    # Use this host's actual import root, not other modules the pytest process loaded.
+    monkeypatch.setattr(launcher, '__file__', str(imported.parent.parent / 'launcher.py'))
+    monkeypatch.setattr(launcher_server_reaper, '__file__', str(imported))
+    origin = bootstrap_module.remember_loaded_checkout(repo, bundle_dir=None if host == 'checkout' else seed)
+    assert origin == (_git_output(repo, 'rev-parse', 'HEAD') if host == 'checkout'
+                      else json.loads((seed / 'repo_bundle_manifest.json').read_text())['source_sha'])
 
     def start_agent(port):
         calls.append('core')
         if calls.count('core') > 1:
             raise NextGeneration()
-        if packaged:  # the server lands the adopted candidate, then exits 42
-            (repo / ('ouroboros/launcher_server_reaper.py' if helper_changed else 'server.py')).write_text('GEN = 2\n')
-            _run(['git', 'commit', '-am', 'adopted candidate'], cwd=repo)
+        path = 'ouroboros/launcher_server_reaper.py' if changed == 'helper' else 'server.py'
+        (repo / path).write_text('GEN = 2\n')
+        _run(['git', 'commit', '-am', 'adopted candidate'], cwd=repo)
         return process
+
+    def execve(executable, argv, env):
+        calls.append(('exec', executable, argv, env.get(bootstrap_module.LAUNCHER_HANDOFF_ENV)))
+        raise Handover()
 
     monkeypatch.setattr(launcher, '_pre_generation_cleanup', lambda: [])
     monkeypatch.setattr(launcher, 'update_external_host', lambda *a: calls.append('native') or {})
     monkeypatch.setattr(launcher, 'start_agent', start_agent)
-    monkeypatch.setattr(launcher, '_await_generation_endpoint', lambda *a, **kw: 8765)
+    monkeypatch.setattr(launcher, '_await_generation_endpoint', lambda *a, **kw: 1)
     monkeypatch.setattr(launcher, '_update_server_process_record_port', lambda *a: None)
     monkeypatch.setattr(launcher, '_wait_for_server', lambda *a, **kw: True)
     monkeypatch.setattr(launcher, '_cleanup_recorded_server_group_for_pid', lambda *a: None)
@@ -698,36 +728,26 @@ def test_external_restart_reexecs_current_source_after_sync_in_same_process(tmp_
     monkeypatch.setattr(launcher, '_install_deps', lambda: calls.append('deps') or True)
     monkeypatch.setattr(launcher, 'release_pid_lock', lambda: calls.append('release'))
     monkeypatch.setattr(launcher.time, 'sleep', lambda *a: None)
-
-    def reexec(executable, argv):
-        calls.append(('exec', executable, argv))
-        raise ReexecReached()
-
-    monkeypatch.setattr(launcher.os, 'execv', reexec)
+    monkeypatch.setattr(bootstrap_module.os, 'execve', execve)
+    monkeypatch.setattr(bootstrap_module, 'source_launcher_importable', lambda *a, **kw: True)
     launcher._shutdown_event.clear()
     launcher._agent_restart_requested.clear()
     try:
-        try:
+        with pytest.raises(Handover if changed == 'helper' else NextGeneration):
             launcher.agent_lifecycle_loop()
-        except ReexecReached:
-            assert helper_changed
-        except NextGeneration:
-            assert not helper_changed  # nothing the launcher loaded changed: the same process continues
-            assert calls == ['native', 'core', 'source', 'deps', 'native', 'core']
-            return
-        else:
-            raise AssertionError('The same process did not re-exec the source launcher')
     finally:
         launcher._shutdown_event.clear()
+    if changed != 'helper':
+        assert calls == ['native', 'core', 'source', 'deps', 'native', 'core'], "the same process continues"
+        return
     assert calls[:5] == ['native', 'core', 'source', 'deps', 'release']
-    if not packaged:
-        assert calls[5] == ('exec', launcher.EMBEDDED_PYTHON,
-                        [launcher.EMBEDDED_PYTHON, str(tmp_path / 'repo' / 'launcher.py'),
-                         '--no-ui', '--seed-bundle', str(tmp_path / 'seed')])
-    else:
-        assert calls[5][2][:2] == [launcher.EMBEDDED_PYTHON, str(repo / 'launcher.py')]
-        options = bootstrap_module.parse_launch_options(calls[5][2][2:])
-        assert options.seed_bundle == seed and options.no_ui is False
+    _, executable, argv, mark = calls[5]
+    assert executable == launcher.EMBEDDED_PYTHON and argv[:2] == [launcher.EMBEDDED_PYTHON, str(repo / 'launcher.py')]
+    assert mark == '1', "the successor is a current handoff's: the legacy console prologue leaves it alone"
+    options = bootstrap_module.parse_launch_options(argv[2:])
+    assert options.seed_bundle == seed and argv.count('--seed-bundle') == 1 and options.no_ui is (host != 'frozen')
+    if host == 'frozen':  # the successor reconciles against the same immutable seed
+        monkeypatch.setattr(platform_layer, 'IS_WINDOWS', sys.platform == 'win32')  # real Git, no simulated POSIX OS calls
         monkeypatch.setattr(launcher.sys, 'frozen', False)
         monkeypatch.setattr(launcher, '_external_seed_bundle', options.seed_bundle)
         context = launcher._bootstrap_context()

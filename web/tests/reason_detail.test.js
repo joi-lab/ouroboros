@@ -5,8 +5,11 @@ import { buildTimelineItemHtml } from '../modules/chat_activity.js';
 import { installDom, restoreDom } from './chat_dom_fixture.js';
 
 import {
-    taskDoneIsTerminal, taskPresentation, taskReasonDetail, taskReasonPhrase, taskTerminalPhase, summarizeChatLiveEvent,
+    reasonCodesNote, taskDoneIsTerminal, taskPresentation, taskReasonCodes, taskReasonDetail, taskReasonPhrase, taskTerminalPhase,
+    summarizeChatLiveEvent,
 } from '../modules/log_events.js';
+
+const UNDESCRIBED = 'The recorded reason has no description yet.';
 
 // A degraded delivery used to name one generic cause on every card. The record
 // keeps the machine code; the card says what actually happened.
@@ -24,9 +27,35 @@ test('a typed cause is stated in the owner\'s words', () => {
     );
 });
 
-test('an unknown cause stays raw rather than becoming a wrong sentence', () => {
-    assert.equal(taskReasonDetail({ reason_code: 'some_future_code' }), 'some_future_code');
+test('a typed cause with no sentence yet says so; its exact code is the details\' (owner 21.10, 2A)', () => {
+    assert.equal(taskReasonDetail({ reason_code: 'some_future_code' }), UNDESCRIBED);
+    assert.deepEqual(taskReasonCodes({ reason_code: 'some_future_code' }), ['some_future_code']);
+    assert.equal(reasonCodesNote(['some_future_code']), 'Recorded reason: some_future_code');
+    assert.equal(reasonCodesNote([]), '');
+    // The bare lookup (the Continue note, the host-text twin) still never borrows a sentence: it stays raw.
     assert.equal(taskReasonPhrase('some_future_code'), 'some_future_code');
+    // A real producer's cause has its words and leaves nothing for the details.
+    const crashed = { status: 'failed', reason_code: 'worker_crash_signal' };
+    assert.equal(taskReasonDetail(crashed), 'The worker process running the task crashed');
+    assert.deepEqual(taskReasonCodes(crashed), []);
+    // Two undescribed codes are one neutral clause and both codes, in order.
+    const two = { status: 'completed', reason_code: 'first_future_code', outcome_axes: {
+        execution: { status: 'degraded', reason_code: 'first_future_code' },
+        review: { acceptance_decision: { status: 'finalized_unaccepted', reason: 'second_future_code' } } } };
+    assert.equal(taskReasonDetail(two), UNDESCRIBED);
+    assert.deepEqual(taskReasonCodes(two), ['first_future_code', 'second_future_code']);
+    assert.equal(reasonCodesNote(taskReasonCodes(two)), 'Recorded reasons: first_future_code, second_future_code');
+    // Authored words are never censored: the author's own stop reason stays beside the neutral clause.
+    const stop = { status: 'completed', reason_code: 'final_message', outcome_axes: {
+        execution: { status: 'ok', task_completion: { action: 'stop', rationale: 'The export still fails on empty input.' } },
+        objective: { status: 'fail', source: 'task_completion', reason: 'author_stop', warnings: ['partial coverage'] } } };
+    assert.equal(taskReasonDetail(stop), 'Ouroboros stopped with unfinished work; no review approval was granted'
+        + ' · partial coverage · The export still fails on empty input.');
+    assert.deepEqual(taskReasonCodes(stop), [], 'a legacy warning may be authored prose, not a typed reason code');
+    // The card's collapsed line says the sentence; its details name the code.
+    const summary = summarizeChatLiveEvent({ type: 'task_done', task_id: 't', status: 'failed', reason_code: 'example_new_reason' });
+    assert.equal(summary.activityPreview, UNDESCRIBED);
+    assert.equal(summary.body, `${UNDESCRIBED}\nRecorded reason: example_new_reason`);
 });
 
 test('a foreign install keeps its preserved explanation despite the old terminal outcome', (t) => {
@@ -55,8 +84,9 @@ test('a foreign install keeps its preserved explanation despite the old terminal
 test('ordinary reasons ignore foreign detail and an absent detail stays explicit', () => {
     const reason_detail = 'This is not the reason for an ordinary task.';
     assert.equal(taskReasonDetail({ reason_code: 'final_message', reason_detail }), '');
-    assert.equal(taskReasonDetail({ reason_code: 'some_future_code', reason_detail }), 'some_future_code');
-    assert.equal(taskReasonDetail({ reason_code: 'foreign_install_root' }), 'foreign_install_root');
+    assert.equal(taskReasonDetail({ reason_code: 'some_future_code', reason_detail }), UNDESCRIBED);
+    assert.equal(taskReasonDetail({ reason_code: 'foreign_install_root' }), UNDESCRIBED);
+    assert.deepEqual(taskReasonCodes({ reason_code: 'foreign_install_root' }), ['foreign_install_root']);
 });
 
 test('no cause and an owner-requested stop both render nothing', () => {
@@ -147,14 +177,17 @@ test('one status-word family: the card phase matches the host over the shared fi
         readFileSync(new URL('./fixtures/outcome_phase_parity.json', import.meta.url), 'utf8'),
     );
     assert.ok(fixture.cases.length >= 10);
-    for (const { name, record, phase, headline, acceptance_clause: clause } of fixture.cases) {
+    for (const { name, record, phase, headline, acceptance_clause: clause, described_clause: described,
+        undescribed = [] } of fixture.cases) {
         const resolved = taskDoneIsTerminal(record) ? taskTerminalPhase(record) : 'working';
         assert.deepEqual(taskPresentation(resolved), { phase, headline }, name);
         if (clause !== undefined) {
-            // The host composes the same sentence for its durable prose rows and
-            // terminates it there; the card line adds no punctuation of its own.
+            // The host composes the same sentence for its durable prose rows and terminates it there; the card line adds
+            // no punctuation of its own. The card has details, so an undescribed code reads neutrally here (owner 2A).
+            const expected = described ?? clause;
             const detail = taskReasonDetail(record);
-            assert.ok(clause === detail || clause === `${detail}.`, `${name}: ${detail} vs ${clause}`);
+            assert.ok(expected === detail || expected === `${detail}.`, `${name}: ${detail} vs ${expected}`);
+            assert.deepEqual(taskReasonCodes(record), undescribed, name);
         }
     }
 });
@@ -199,7 +232,7 @@ test('an accepted decision omits neutral final_message and preserves substantive
         },
     };
     assert.equal(taskReasonDetail(accepted), '');
-    assert.equal(taskReasonDetail({ ...accepted, reason_code: 'custom_reason' }), 'custom_reason');
+    assert.equal(taskReasonDetail({ ...accepted, reason_code: 'custom_reason' }), UNDESCRIBED);
 });
 
 test('a decision carrying no typed reason states no cause at all', () => {

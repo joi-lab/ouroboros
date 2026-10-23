@@ -139,6 +139,12 @@ def _is_workspace_task_record(record: Optional[Dict[str, Any]]) -> bool:
     return bool(str(record.get("workspace_root") or "").strip() or str(metadata.get("workspace_root") or "").strip())
 
 
+def queued_address(task: Any, existing: Any) -> Dict[str, Any]:
+    """A never-started task's queue address for its first result row; a recorded one stays."""
+    chat = task.get("chat_id") if isinstance(task, dict) else None
+    return {"chat_id": chat} if chat is not None and (existing or {}).get("chat_id") is None else {}
+
+
 def _cancel_result_fields(
     task: Optional[Dict[str, Any]],
     *,
@@ -159,8 +165,12 @@ def _cancel_result_fields(
     shared workspace tree carry ``artifact_attribution: "shared_unproven"`` —
     the tree was not quiesced through the normal patch-capture seam, so the diff
     cannot prove which actor authored it (until the phase-C run isolation).
+
+    A task cancelled before it ever ran has no result row yet, so its queue address
+    is kept: the first terminal publication may run before ``task_done`` and would
+    otherwise read no room at all (an existing address, hidden 0 included, stays).
     """
-    payload: Dict[str, Any] = {**fields, "result": result}
+    payload: Dict[str, Any] = {**fields, "result": result, **queued_address(task, existing)}
     if not (_is_workspace_task_record(task) or _is_workspace_task_record(existing)):
         return payload
     try:

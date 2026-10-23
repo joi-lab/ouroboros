@@ -11,6 +11,7 @@ from tests.test_owner_wait_integration import wait_clone as clone_fixture
 from tests.test_native_owner_wait_browser import chat_connection
 from tests._shared import producer_evidence_dir
 from tests.test_ui_coherence_browser import pill_landing
+from tests.test_ui_smoke_playwright import direct_server_with_data as direct_server_with_data  # noqa: F401
 from tests.system_e2e.harness import (
     ArtifactOracle, KeylessIsolatedServer, ScriptedStubModel, keyless_settings,
     wait_durable_result, wait_until, write_settings_file,
@@ -18,6 +19,80 @@ from tests.system_e2e.harness import (
 
 wait_clone = clone_fixture
 pytestmark = [pytest.mark.serial, pytest.mark.browser]
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_quiet_cards_keep_live_and_reloaded_presentation(direct_server_with_data, tmp_path, engine):
+    from playwright.sync_api import expect, sync_playwright
+    from ouroboros import dialogue_store
+    from ouroboros.task_results import write_task_result
+    from ouroboros.task_store import delete_document
+    from ouroboros.terminal_projection import _project_row
+    from supervisor.message_bus import log_chat
+    from tests.ui_chat_viewport_smoke import (
+        _CAPTURE_TEST_SOCKET, _OBSERVE_STATE_READS, _emit_ws_frame, _wait_socket_open_quiescent,
+    )
+
+    fixture = direct_server_with_data
+    root = fixture["data_dir"]
+    evidence = producer_evidence_dir(tmp_path / "screenshots", "quiet-cards", env="OUROBOROS_BROWSER_EVIDENCE_OUT")
+    evidence.mkdir(parents=True, exist_ok=True)
+    notice = "A tool this task used failed and nothing recovered it"
+    cases = [("quiet", True, "", "Done · no message"),
+             ("notice", True, notice, "Done with warnings"), ("ordinary", False, "", "Done")]
+    with sync_playwright() as pw:
+        browser = getattr(pw, engine).launch()
+        page = browser.new_page(viewport={"width": 1100, "height": 900}, reduced_motion="reduce")
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.add_init_script(f"({_CAPTURE_TEST_SOCKET})(); ({_OBSERVE_STATE_READS})();")
+        try:
+            page.goto(fixture["url"], wait_until="domcontentloaded")
+            _wait_socket_open_quiescent(page)
+            for name, silent, host_notice, _headline in cases:
+                tid = f"quiet-card-{name}"
+                result = write_task_result(root, tid, "completed", chat_id=1, root_task_id=tid,
+                    delegation_role="root", result="Internal quiet words" if silent else "The published answer.",
+                    terminal_origin="model_final", wake_silent=silent, terminal_host_notice=host_notice,
+                    reason_code="tool_failure" if host_notice else "final_message",
+                    outcome_axes={"execution": {"status": "degraded" if host_notice else "ok"}})
+                summary = _project_row(tid, result, {}, {"chat_id": 1})
+                progress = {"task_id": tid, "chat_id": 1, "content": f"Checking {name}", "ts": summary["ts"],
+                            "narration": True}
+                dialogue_store.append(root, "progress", progress)
+                _emit_ws_frame(page, {**progress, "type": "chat", "role": "assistant", "is_progress": True})
+                if not silent:
+                    log_chat("out", 1, 1, result["result"], task_id=tid, drive_root=root)
+                    _emit_ws_frame(page, {"type": "chat", "role": "assistant", "chat_id": 1,
+                                         "task_id": tid, "content": result["result"]})
+                dialogue_store.append(root, "chat", summary)
+                _emit_ws_frame(page, {**summary, "type": "chat", "role": "system",
+                                     "system_type": "task_summary", "content": summary["text"]})
+
+            for visit in ("live", "reloaded", "pruned"):
+                if visit == "pruned":
+                    assert delete_document(root, "quiet-card-quiet")
+                if visit != "live":
+                    page.reload(wait_until="domcontentloaded")
+                for name, _silent, _notice, headline in cases:
+                    card = page.locator(f'.chat-live-card[data-task-id="quiet-card-{name}"]')
+                    expect(card.locator('[data-live-phase]')).to_have_text(headline, timeout=30000)
+                    expect(card).to_have_attribute("data-finished", "1")
+                    if card.get_attribute("data-expanded") != "1":
+                        card.locator('[data-live-disclosure]').click()
+                    if name == "notice":
+                        expect(card).to_contain_text(notice)
+                    elif name == "quiet":
+                        assert card.locator('.chat-live-line-body').count() == 0
+                        # Pruned results can settle from hidden evidence without retaining a timeline row.
+                        assert card.locator('.chat-live-line.done .chat-live-line-title').all_text_contents() in ([], [headline])
+                        card.screenshot(path=str(evidence / f"{engine}-{visit}-quiet.png"), animations="disabled")
+                expect(page.get_by_text("The published answer.", exact=True)).to_have_count(1)
+                assert "Internal quiet words" not in page.locator('#chat-messages').inner_text()
+                page.screenshot(path=str(evidence / f"{engine}-{visit}.png"), animations="disabled")
+            assert not errors, errors
+        finally:
+            browser.close()
 
 
 def _seed_history(root):
@@ -255,7 +330,9 @@ def test_ui_results_and_required_question_journey(wait_clone, tmp_path, monkeypa
                     unknown.locator('[data-live-meta]').filter(has_text="Outcome unavailable").wait_for(timeout=30000)
                     assert unknown.locator('[data-cancel-run]').count() == 0
                     route = page.locator('.chat-live-card[data-task-id="routing-history"]')
-                    route.locator('[data-live-meta]').filter(has_text="2 tool calls").wait_for()
+                    route_facts = route.locator('[data-live-facts] > div').filter(has_text="Tool calls")
+                    route_facts.wait_for(state="attached")
+                    assert route_facts.locator('dd').text_content() == "2"
                     assert route.locator('.chat-live-line.done').count() == 1
                     accepted = page.locator('.chat-live-card[data-task-id="parent1"]')
                     accepted.locator('[data-live-phase]').filter(has_text="Done with warnings").wait_for()
@@ -263,7 +340,7 @@ def test_ui_results_and_required_question_journey(wait_clone, tmp_path, monkeypa
                     # the expanded card (DESIGN "Reviews inside task cards").
                     accepted.locator('[data-live-review-summary]').filter(has_text="Reviews").wait_for()
                     if accepted.get_attribute('data-expanded') != '1':
-                        accepted.locator(':scope > [data-live-summary-button]').click()
+                        accepted.locator('[data-live-disclosure]').click()
                     accepted.locator('[data-review-section-toggle]').click()
                     accepted.get_by_text("Task acceptance", exact=True).wait_for()
                     accepted.locator('[data-review-group-toggle]').click()
@@ -302,7 +379,8 @@ def test_ui_results_and_required_question_journey(wait_clone, tmp_path, monkeypa
                             log_chat("in", project["chat_id"], 1, f"Retained later project note {index}", drive_root=root)
                         project_history = _api(server.base_url, "GET", f"/api/chat/history?chat_id={project['chat_id']}")["messages"]
                         assert not any(row.get("msg_type") == "quiz" for row in project_history)
-                        pointer.locator('.chat-quiz-project').click()
+                        # The Project reference is in the bubble's voice line, beside `Ouroboros`, outside the card.
+                        main_question.locator('.chat-bubble-voice > .chat-quiz-project').click()
                         quiz = page.locator(f'.chat-quiz-card[data-task-id="{task["id"]}"][data-quiz-id="{wait["quiz_id"]}"]'
                                             ':not(.project-question-card)')
                         quiz.get_by_text("Include the independent replication too.", exact=True).wait_for()
@@ -338,7 +416,7 @@ def test_ui_results_and_required_question_journey(wait_clone, tmp_path, monkeypa
                             {detail: {project, task_id: task, quiz_id: quiz}}))""", [project, task["id"], wait["quiz_id"]])
                         quiz.locator('.chat-quiz-option.chosen').filter(has_text="Both sources").wait_for(timeout=30000)
                         task_card = page.locator(f'.chat-live-card[data-task-id="{task["id"]}"]')
-                        task_card.locator('[data-live-meta]').filter(has_text="Last solve response:").wait_for(timeout=30000)
+                        task_card.locator('[data-live-facts]').filter(has_text="Last solve response").wait_for(state="attached", timeout=30000)
                         # The stub authors "still working" as narration and the reopened Project's first
                         # page carries that row, so it names the card the moment the card is painted;
                         # "Task activity" is only the no-narration fallback. A task still finishing can
@@ -372,7 +450,7 @@ def test_ui_results_and_required_question_journey(wait_clone, tmp_path, monkeypa
                         assert replay_quiz.evaluate("el => { const r=el.getBoundingClientRect(); return r.top >= 0 && r.bottom <= innerHeight; }")
                         replay_card = page.locator(f'.chat-live-card[data-task-id="{task["id"]}"]')
                         assert replay_card.locator('[data-live-title]').inner_text() == "still working"
-                        replay_card.locator('[data-live-meta]').filter(has_text="Last solve response:").wait_for()
+                        replay_card.locator('[data-live-facts]').filter(has_text="Last solve response").wait_for(state="attached")
                         page.screenshot(animations="disabled", path=str(screenshots / f'{live_engine}-{engine}-{viewport["width"]}-question-replay.png'), full_page=True)
                     finally:
                         browser.close()

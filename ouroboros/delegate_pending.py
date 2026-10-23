@@ -57,6 +57,7 @@ def pending_invocations(
                 "authority_source": str(row.get("authority_source") or ""),
                 # A pending continuation names the run whose snapshot it takes over.
                 **{key: str(row.get(key) or "") for key in ("continuation_of", "capture_id", "snapshot_task_id")},
+                **{key: copy.deepcopy(row[key]) for key in ("execution_mode", "effective_access", "thread_id", "authority_ceiling", "promotion") if key in row},
                 # Copies: the source rows are the caller's snapshot.
                 "resource_ref": copy.deepcopy(row.get("resource_ref")) if isinstance(row.get("resource_ref"), dict) else {},
                 "selected_subagent_id": str(row.get("selected_subagent_id") or ""),

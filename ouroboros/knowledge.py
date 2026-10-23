@@ -78,7 +78,7 @@ def focus_signature(ctx: Any) -> Dict[str, Any]:
     ``root``), ``presence``, ``main`` (the direct chat turn), else ``root``.
     The model never supplies it.
     """
-    from ouroboros.consciousness_authority import CONSCIOUSNESS_CATEGORY
+    from ouroboros.consciousness_authority import CONSCIOUSNESS_CATEGORY, WAKE_CAUSE_FOCUS, wake_cause
     from ouroboros.dialogue_provenance import is_presence_task
     from ouroboros.subagent_dispatch_notes import _nanny_route_dispatched_for  # D15->D07 is lazy-only
 
@@ -89,6 +89,8 @@ def focus_signature(ctx: Any) -> Dict[str, Any]:
         role = "nanny"
     elif str(meta.get("delegation_role") or "").strip().lower() == "subagent":
         role = "child"
+    elif wake_cause(meta) == WAKE_CAUSE_FOCUS:
+        role = "presence"
     elif meta.get("usage_category") == CONSCIOUSNESS_CATEGORY:
         role = "consciousness"
     elif is_presence_task({"metadata": meta}):
@@ -101,6 +103,22 @@ def focus_signature(ctx: Any) -> Dict[str, Any]:
     focus = {"role": role, "task_id": task_id, "parent_task_id": str(meta.get("parent_task_id") or ""),
              "root_task_id": str(meta.get("root_task_id") or task_id),
              "chat_id": chat_id if chat_id is not None else meta.get("chat_id")}
+    assignment = meta.get("focus") if isinstance(meta.get("focus"), Mapping) else {}
+    room = focus["chat_id"]
+    if getattr(ctx, "drive_root", None) is not None:
+        from ouroboros.dialogue_evidence import own_room_chat
+        from ouroboros.tool_access_paths import canonical_data_root
+
+        resolved = own_room_chat(ctx, canonical_data_root(ctx))
+        room = resolved if resolved is not None else room
+    room = assignment.get("room_chat_id", room)
+    focus["room_id"] = str(room if room is not None else 1)
+    from ouroboros.dialogue_provenance import presence_provenance_from_task
+
+    origin = {**presence_provenance_from_task({"metadata": meta}), **assignment}
+    for key in ("place_id", "conversation_key"):
+        if origin.get(key):
+            focus[key] = str(origin[key])
     return {"kind": "mind", "focus": focus, "task_id": task_id,
             "route": observed_route_stamp(getattr(ctx, "_accumulated_usage", None))}
 

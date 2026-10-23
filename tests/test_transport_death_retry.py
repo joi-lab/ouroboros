@@ -630,6 +630,7 @@ def test_round_dispatcher_leaves_unknown_recovery_to_the_shared_round(tmp_path, 
         context_fit_plan=None, active_context_mode="max", drive_root=tmp_path,
         active_effort="low", max_retries=3, drive_logs=tmp_path, task_id="t-cand", round_idx=1,
         event_queue=None, accumulated_usage={}, task_type="presence", active_use_local=False,
+        physical_send_claim=None,
     )
     msg, _cost = loop_mod._dispatch_round_model(ctx, None, attempt_cap=attempt_cap)
     assert msg is None and llm.calls == 1 and no_sleep == []

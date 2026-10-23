@@ -221,7 +221,7 @@ def test_unanswerable_lineage_of_other_page_rows_is_ordinary_unknown_never_a_bar
         _save(tmp_path, ts=_ts(41 + index), task_id=f"loose-{index}", direction="out", text=f"Loose work {index}")
     _, address = _save(tmp_path, ts=_ts(47), client_message_id="owner-row")
     _, quoted_work = _save(tmp_path, ts=_ts(50), task_id="loose-quoted", direction="out", text="Quoted work")
-    monkeypatch.setattr(projects_registry, "_read_lineage", lambda root, task_ids: None)  # the task store is busy
+    monkeypatch.setattr(projects_registry, "_read_lineage", lambda root, task_ids, **_kw: None)  # unreadable authority
     assert {"Loose work 4", "Loose work 5"} <= {row.get("text") for row in _found(tmp_path, address)["messages"]}
     # The quoted row's own room still needs readable authority: its task's lineage decides it.
     status, page = _read(tmp_path, around=quoted_work)

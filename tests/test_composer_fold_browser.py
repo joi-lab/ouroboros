@@ -2,7 +2,7 @@
 "Composer owner controls"; web/modules/composer_fold.js).
 
 On a phone, reading back folds the row (☰, Swarm, Context, Effort) away, keeping its fit, and ☰ waits beside the
-field, at its middle, a draft of several lines included, on the field's leading side in either direction; the way toward
+field on its last line, beside "+", a draft of several lines included, on the field's leading side in either direction; the way toward
 the latest and the field's focus bring it back; a tap on the folded ☰ opens the drawer; reduced motion folds it at
 once; a desk never folds it. Uses the static-server/API
 fixture. The feed is moved as the owner moves it, by a finger (CDP touch, Chromium's input pipeline) or a wheel: a
@@ -42,12 +42,14 @@ def drag(page, dy, strokes=3):
         cdp.detach()
     page.wait_for_timeout(450)
 FACTS = """() => { const wrap = document.querySelector('#page-chat .chat-input-wrap');
-    const row = wrap.querySelector('.chat-toolbar-row'), text = wrap.querySelector('.chat-text-row');
+    const row = wrap.querySelector('.chat-toolbar-row'), text = wrap.querySelector('.chat-field');
     const button = row.querySelector(':scope > .composer-menu');
     const menu = button.getBoundingClientRect(), field = text.getBoundingClientRect();
+    const plus = wrap.querySelector('[data-composer-plus]').getBoundingClientRect();
     const swarm = row.querySelector('.chat-swarm');
     return {folded: 'folded' in wrap.dataset, rowHeight: Math.round(row.getBoundingClientRect().height),
             menuMiddle: menu.top + menu.height / 2, fieldMiddle: field.top + field.height / 2,
+            plusMiddle: plus.top + plus.height / 2,
             menuRight: menu.right, fieldLeft: field.left, menuLeft: menu.left, fieldRight: field.right,
             // What a finger reaches at ☰'s centre: ☰ itself, never "+" painted over it.
             menuHit: button.contains(document.elementFromPoint(menu.left + menu.width / 2, menu.top + menu.height / 2)),
@@ -59,7 +61,7 @@ FACTS = """() => { const wrap = document.querySelector('#page-chat .chat-input-w
 # line, the field and each control on the line. No fold within 5 s gives no frames: the facts read next say so.
 FOLD_FRAMES = """ms => new Promise((resolve) => {
     const wrap = document.querySelector('#page-chat .chat-input-wrap');
-    const row = wrap.querySelector('.chat-toolbar-row'), text = wrap.querySelector('.chat-text-row');
+    const row = wrap.querySelector('.chat-toolbar-row'), text = wrap.querySelector('.chat-field');
     const menu = row.querySelector(':scope > .composer-menu'), pills = row.querySelector(':scope > .chat-composer-pills');
     const lead = getComputedStyle(text).direction === 'rtl' ? 'marginRight' : 'marginLeft';
     const down = (el) => { const t = getComputedStyle(el).transform; return t === 'none' ? 0 : new DOMMatrixReadOnly(t).m42; };
@@ -113,7 +115,7 @@ def test_reading_back_folds_the_row_and_the_way_down_brings_it_back(chromium_ui,
     latest, reading, back, again, writing = (facts[k] for k in ('latest', 'reading', 'back', 'again', 'writing'))
     assert latest['folded'] is False and latest['swarm'] == 'visible', ('at the latest the row is there', latest)
     assert reading['folded'] is True and reading['swarm'] == 'hidden' and reading['rowHeight'] == 0, reading
-    assert abs(reading['menuMiddle'] - reading['fieldMiddle']) <= 1.5, ('☰ waits at the field\'s middle', reading)
+    assert abs(reading['menuMiddle'] - reading['plusMiddle']) <= 1.5, ('☰ waits on the field\'s last line, beside "+"', reading)
     assert reading['menuRight'] < reading['fieldLeft'], ('beside the field, not over it', reading)
     assert reading['fit'] == latest['fit'], ('folded, the row keeps its fit (☰ off its line misled the refit)', reading, latest)
     assert reading['area'] <= latest['area'] - 30, ('the composer gives its line back to the feed', reading, latest)
@@ -121,9 +123,10 @@ def test_reading_back_folds_the_row_and_the_way_down_brings_it_back(chromium_ui,
     assert again['folded'] is True and writing['folded'] is False, ('the field\'s focus brings it back', writing)
 
 
-def test_a_folded_draft_of_several_lines_keeps_the_menu_at_its_middle(chromium_ui, tmp_path):
+def test_a_folded_draft_of_several_lines_keeps_the_menu_on_its_last_line(chromium_ui, tmp_path):
     """Folded, the field is narrower by ☰'s place, so a draft of several lines wraps into one more line and grows from
-    its bottom; ☰ follows it to its middle (measured once as the fold started, it stood 12 px too high)."""
+    its bottom; ☰ stays on its last line beside "+", never its middle (owner 20.10, 1C: the controls ride the last
+    line)."""
     page = seed_page(chromium_ui, 390, 844)
     facts = {}
     try:
@@ -141,7 +144,8 @@ def test_a_folded_draft_of_several_lines_keeps_the_menu_at_its_middle(chromium_u
     folded = facts['folded']
     assert folded['folded'] is True and folded['fieldHeight'] > facts['open']['fieldHeight'], (
         'setup: folded, the draft wraps into one more line', facts)
-    assert abs(folded['menuMiddle'] - folded['fieldMiddle']) <= 1.5, ('☰ waits at the draft\'s middle', folded)
+    assert abs(folded['menuMiddle'] - folded['plusMiddle']) <= 1.5, ('☰ waits on the draft\'s last line', folded)
+    assert folded['plusMiddle'] - folded['fieldMiddle'] >= 20, ('setup: the last line is not the middle', folded)
     assert folded['menuRight'] < folded['fieldLeft'], ('beside the field, not over it', folded)
 
 
@@ -201,7 +205,7 @@ def test_the_folded_menu_waits_on_the_fields_leading_side_and_moves_only_where_m
         evidence(tmp_path, f'composer-fold-{direction}-{motion}-{shell_ui["engine"]}', facts)
         page.close()
     folded, frames = facts['folded'], facts['frames']
-    assert folded['folded'] is True and abs(folded['menuMiddle'] - folded['fieldMiddle']) <= 1.5, folded
+    assert folded['folded'] is True and abs(folded['menuMiddle'] - folded['plusMiddle']) <= 1.5, folded
     assert folded['menuHit'] is True, ('folded, a finger reaches ☰, not "+"', folded)
     if direction == 'ltr':
         assert folded['menuRight'] < folded['fieldLeft'], ('beside the field, on its left', folded)

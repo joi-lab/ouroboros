@@ -643,18 +643,19 @@ def _caption_for_block(
     task_id: str = "",
     event_queue: Any = None,
 ) -> Tuple[str, str]:
-    """Return (caption, failure), both empty if no route can accept these pixels.
-
-    Each candidate's prepared-byte identity governs its refusal and memo lookup.
-    """
+    """Return (caption, failure), both empty without a route. Each candidate's
+    prepared-byte identity governs its refusal and memo lookup."""
     memo = accumulated_usage.setdefault("_vision_caption_memo", {})
     model, url, url_digest, preparation_note, failure = prepare_caption_image(block, ctx, llm, accumulated_usage)
     # Completed captions remain reusable after their generating account is unavailable.
     key = f"{url_digest}|{model}|v1"
     if memo.get(key):
         return str(memo[key]), ""
+    from ouroboros.loop_llm_call import TIMEOUT_REPEAT_KEY  # an owed timeout repeat (#1886) buys no caption
     if not model or not url:
         return "", failure
+    if TIMEOUT_REPEAT_KEY in accumulated_usage:
+        return "", failure or "no new caption is generated for a timeout repeat"
     call_id = new_call_id("vision_caption")
     prompt_ref = {}
 
@@ -878,7 +879,7 @@ def prepare_messages_for_send(
 _ROUND_ERROR_KEYS = ("_last_llm_error", "_last_llm_error_kind", "_last_llm_retry_same_request", "_last_llm_status_code",
                      "_last_llm_provider_code", "_last_llm_provider_message", "_last_llm_provider_fields",
                      "_last_llm_provider_message_cut", "_last_llm_resource_refusal", "_last_llm_reset_at",
-                     "_last_llm_attempt_custody", "execution_status", "reason_code")
+                     "_last_llm_attempt_custody", "_last_llm_failure", "execution_status", "reason_code")
 
 
 def _round_capture(ctx: Any, failed: Any) -> bool:
@@ -952,7 +953,7 @@ def retry_refused_image_round(ctx: Any, failed: Any) -> Optional[Tuple[Any, Any]
     if refusal is None or not _round_capture(ctx, failed):
         return None
     from ouroboros import loop
-    from ouroboros.loop_llm_call import RETRY_ATTEMPTS_SPENT_KEY, RETRY_WALL_EXHAUSTED_KEY
+    from ouroboros.loop_llm_call import REFUSED_CANDIDATE_KEY, RETRY_ATTEMPTS_SPENT_KEY, RETRY_WALL_EXHAUSTED_KEY
     from ouroboros.usage_accounting import PhysicalAttemptPreconditionFailed
 
     from ouroboros.model_slots import task_model_binding
@@ -983,6 +984,11 @@ def retry_refused_image_round(ctx: Any, failed: Any) -> Optional[Tuple[Any, Any]
         pending = (usage.pop(_PENDING_REFUSALS_KEY, None) or {}).get(route) or {}
     if msg is not None:
         usage.setdefault(REFUSED_IMAGES_KEY, {}).setdefault(route, {}).update(pending)
+    elif usage.get(REFUSED_CANDIDATE_KEY):
+        # Main admission refused this candidate before sending. Keep its size
+        # facts for the common recovery path, without claiming an executed retry.
+        sent = False
+        retry = {"error_kind": "context_overflow", "cause": "pre_send_admission"}
     elif sent:
         capture = loop.last_physical_attempt_capture()
         own = capture is not None and getattr(capture, "attempt_id", None) != getattr(failed, "attempt_id", None)

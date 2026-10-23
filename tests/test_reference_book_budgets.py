@@ -227,7 +227,8 @@ def test_both_ci_jobs_feed_the_size_lane_the_decided_mode(job):
     assert mode["env"]["REF"] == "${{ github.ref }}"
     assert steps.index(mode) < steps.index(size)
     assert size["env"][MODE_ENV] == "${{ steps.book_mode.outputs.mode }}"
-    assert workflow["jobs"][job]["permissions"] == {"contents": "read", "pull-requests": "read"}
+    # PR label events for this mode; issue label events for the accepted-failure check.
+    assert workflow["jobs"][job]["permissions"] == {"contents": "read", "pull-requests": "read", "issues": "read"}
 
 
 PUSH_SHA = "a" * 40

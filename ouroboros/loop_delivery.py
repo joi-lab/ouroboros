@@ -3,7 +3,7 @@ delivery evidence state, the candidate binding, candidate publish/replace/degrad
 the delivery-control prompt cycle, the subagent handoff and the no-tool final
 answer. Extracted from loop.py (v7 L-B split); loop.py re-exports every name.
 
-Completion is an author act: ``finish_task`` (``presence_finish`` for presence
+Completion is an author act: ``finish_task`` (including focus
 tasks) selects ``action=finish|stop`` with complete ``answer`` bytes or an
 ``answer_sha256`` naming the retained candidate or the latest whole held
 response. Every held no-tool round appends the assistant row and a host row to
@@ -13,6 +13,8 @@ observed are frozen before its batch executes; only feedback positively exposed
 in a returned request counts as seen."""
 
 from __future__ import annotations
+
+from ouroboros.loop_completion_schema import completion_schema as completion_schema
 
 import hashlib
 import json
@@ -574,26 +576,6 @@ def _delivery_control_prompt(candidate: DeliveryCandidate, *, pending_review_cho
             "Interim prose is activity, not a new completion selection."
             + (" Pending critics: choose pending_review=wait (default) or finish where permitted."
                if pending_review_choice else ""))
-
-
-def completion_schema(tools: ToolRegistry, schemas: list | None = None) -> str:
-    """Materialize the current permitted front door, including cold/Nano holds."""
-    from ouroboros.dialogue_provenance import is_presence_task
-    from ouroboros.usage_accounting import invalidate_task_cache_splits
-    ctx = tools._ctx
-    name = "presence_finish" if is_presence_task({"metadata": getattr(ctx, "task_metadata", {})}) else "finish_task"
-    getter = getattr(tools, "get_schema_by_name", None)
-    if not callable(getter):
-        return name
-    schema = getter(name)
-    if schema is None:
-        return "no currently permitted completion tool"
-    if schemas is not None and not any(row.get("function", {}).get("name") == name for row in schemas):
-        schemas.append(schema)
-        invalidate_task_cache_splits(getattr(ctx, "task_id", ""))
-        getattr(ctx, "messages", []).append({"role": "user", "content":
-            "[SYSTEM NOTICE] Current permitted completion schema loaded: " + name + ". The schema prefix changed."})
-    return name
 
 
 def hold_completion_response(content: Any, tools: ToolRegistry, ctx: Any, trace: dict,
@@ -1260,6 +1242,9 @@ def _no_tool_final_answer(
             )
             _loop()._merge_finalization_trace(llm_trace, forced_trace)
             return text, usage, llm_trace
+        from ouroboros.place_intake import reopen_for_place_mail
+        if not stopping and reopen_for_place_mail(tools._ctx, post_controls):
+            return held()  # keep the answer; the accepted place context gets a model round
     _loop()._project_child_result_dispositions(limit_ctx, llm_trace)
     # UNKNOWN evidence delivers a candidate retained over it as published; a KNOWN candidate is re-retained below.
     evidence_revision, evidence_fingerprint = _loop()._delivery_evidence_state(tools, limit_ctx, llm_trace)
@@ -1288,14 +1273,20 @@ def _no_tool_final_answer(
         record_stopped_completion(tools, limit_ctx, llm_trace, request, candidate)
         if not _seal_admission_before_delivery(tools, limit_ctx, llm_trace):
             return held()
-    if isinstance(getattr(tools._ctx, "_presence_completion", None), dict):
-        # Only this successful common exit accepts the requested outcome. Holds,
-        # owner controls and budget exits must not inherit an earlier silent/send.
+    from ouroboros.place_reply import prepare_focus_reply
+    allowed, refusal = prepare_focus_reply(tools._ctx, str(content or ""), quiet=bool(getattr(candidate, "quiet", False)))
+    if not allowed:
+        messages.append({"role": "user", "content": refusal})
+        _loop()._arm_delivery_control(tools, limit_ctx, llm_trace)
+        return held()
+    if isinstance(getattr(tools._ctx, "_presence_completion", None), dict):  # Accept only at this common exit.
         tools._ctx._presence_completion_accepted = True
         limit_ctx.accumulated_usage["presence_completion_outcome"] = tools._ctx._presence_completion["outcome"]
         limit_ctx.accumulated_usage["terminal_origin"] = _loop().TERMINAL_ORIGIN_MODEL_FINAL
     if getattr(candidate, "quiet", False):  # only this exit accepts a wake's silent finish
         limit_ctx.accumulated_usage.update(wake_silent=True, terminal_origin=_loop().TERMINAL_ORIGIN_MODEL_FINAL)
+    from ouroboros.swarm_receipt import retain_comparison
+    retain_comparison(tools._ctx)
     return _loop()._handle_text_response(str(content or ""), llm_trace, limit_ctx.accumulated_usage)
 
 

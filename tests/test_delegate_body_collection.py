@@ -165,6 +165,22 @@ def test_foreground_supervision_joins_collection_without_a_model_wake(tmp_path, 
     assert json.loads(result.text)["status"] == "terminal" and len(money) == 1
 
 
+def test_foreground_supervision_wakes_on_terminal_custody_without_a_collector(tmp_path, monkeypatch):
+    from ouroboros import delegate_supervision
+    from ouroboros.tools.registry import ToolContext
+
+    entry = started(tmp_path)
+    assert body.observe_run(tmp_path, entry, terminal())
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id=entry.task_id)
+    monkeypatch.setattr(delegate_supervision, "_leaf_live_input", lambda *args: "unknown")
+    result = delegate_supervision.supervised_wait(ctx, entry.run_id, wait_once=lambda *_a, **_k:
+        json.dumps({"status": "no_progress", "run_id": entry.run_id}))
+    payload = json.loads(result.text)
+    assert payload["status"] == "terminal_custody"
+    assert payload["terminal_facts"] == [{"id": "run:" + entry.run_id,
+                                          "reason": "run:" + entry.run_id, "state": "succeeded"}]
+
+
 def test_collector_does_not_take_over_review_panel(tmp_path, money):
     entry = started(tmp_path, source="review_substrate_commit")
     assert entry.review_owned

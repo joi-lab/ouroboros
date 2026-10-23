@@ -12,10 +12,11 @@ monkeypatch ``context._STRAY_PROBE_CACHE``) keeps working unchanged.
 from __future__ import annotations
 
 import logging
+import json
 import pathlib
 import re
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from ouroboros.context_budget import SCRATCHPAD_BLOAT_WARN_CHARS
 from ouroboros.utils import iter_jsonl_objects, read_json_dict, read_text
@@ -71,17 +72,14 @@ def _collect_log_analysis_checks(env: Any, checks: List[str]) -> None:
     except Exception:
         pass
 
-    try:
-        hit_rate = _compute_cache_hit_rate(env)
-        if hit_rate is not None:
-            if hit_rate < 0.30:
-                checks.append(f"WARNING: LOW CACHE HIT RATE — {hit_rate:.0%} cached. Context structure may be degrading prompt caching efficiency.")
-            elif hit_rate >= 0.50:
-                checks.append(f"OK: cache hit rate ({hit_rate:.0%})")
-            else:
-                checks.append(f"INFO: cache hit rate moderate ({hit_rate:.0%})")
+    try:  # who changed sent history under the running code; a provider's cache share is not a health verdict
+        from ouroboros.transcript_prefix import history_changes_line
+
+        line = history_changes_line(getattr(env, "budget_drive_root", None) or getattr(env, "drive_root", None))
+        if line:
+            checks.append(line)
     except Exception:
-        pass
+        log.debug("sent-history change fact unavailable", exc_info=True)
 
     try:
         events_path = env.drive_path("logs/events.jsonl")
@@ -274,27 +272,24 @@ def _foreign_owner(run: Any, task_id: str) -> str:
     return str(run.task_id) if task_id and run.task_id and task_id != run.task_id else ""
 
 
-def _foreign_work_line(owner: str, work: Dict[str, List[str]]) -> str:
-    """Another task's delegated obligations as ONE line (owner decision Q3=A, 18.10.2026).
+def _foreign_work_line(root: Any, foreign: Dict[str, Dict[str, List[str]]]) -> str:
+    """One line for all foreign obligations; the exact list uses the existing blob reader.
 
-    D7 keeps them visible to every reader, but only their owner reads and acknowledges its results, and
-    decides its patches while it lives; a copy of every run's line in every task's context was most of
-    the Health section (17.10: 223 lines, ~110k characters, nearly all about other tasks). The reader
-    sees each owner once: the counts, the run ids, the authority rule and the owner's record, which
-    any task can read (a run's own reader resolves only in its owner's lineage).
+    No seen-state: identical lists reuse content-addressed source bytes. If retention fails,
+    keep the list in the line rather than publishing an unreadable pointer.
     """
-    parts = [f"{label}: {', '.join(work[key])}" for key, label in (
-        ("unread", "results not read to EOF"), ("patches", "patches awaiting apply/reject")) if work[key]]
-    line = (f"{'WARNING' if work['patches'] else 'INFO'}: ANOTHER TASK'S DELEGATED WORK — owner task {owner}: "
-            + "; ".join(parts) + ". Only the owner reads and acknowledges its results and decides its patches "
-            "while it lives; once it is terminal, a live top-level task may reject them from any root or apply "
-            "them from the recorded target or a fresh payload binding (integrate_delegated_patch; the disposition "
-            f"row records who acted). The owner's record: query_data(op='json', kind='task_result', ids=['{owner}']).")
-    if work["yours"]:
-        run_id = work["yours"][0] if len(work["yours"]) == 1 else "<run_id>"
-        line += (f" Your active root matches the target of {', '.join(work['yours'])}: once the owner is terminal, "
-                 f"integrate_delegated_patch(run_id='{run_id}', decision='apply'|'reject').")
-    return line
+    from ouroboros.observability import write_blob
+
+    try:
+        ref = write_blob(root, foreign)
+        source = f"query_data(op='blob', sha256='{ref['sha256']}')"
+    except OSError:
+        source = "retention unavailable; exact list: " + json.dumps(foreign, ensure_ascii=False, sort_keys=True)
+    severity = "WARNING" if any(work["patches"] for work in foreign.values()) else "INFO"
+    return (f"{severity}: OTHER TASKS' DELEGATED WORK — full owner/run list (unread results, undisposed patches, "
+            f"'yours' = matching active target): {source}. Only the owner acknowledges results and decides patches "
+            "while live; after it ends, a live top-level task may reject from any root or apply from the recorded "
+            "target or a fresh payload binding via integrate_delegated_patch.")
 
 
 # One line per own settled run, bounded like ``terminal_custody_notice``.
@@ -512,7 +507,7 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
     except Exception:
         custody_state = None
 
-    foreign: Dict[str, Dict[str, List[str]]] = {}  # another task's obligations, one line per owner (Q3=A)
+    foreign: Dict[str, Dict[str, List[str]]] = {}  # exact source for one line covering all foreign owners
 
     def foreign_work(owner: str) -> Dict[str, List[str]]:
         return foreign.setdefault(owner, {"unread": [], "patches": [], "yours": []})
@@ -567,10 +562,7 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
                     f"before any apply)"
                 )
                 persist_clause = "The snapshot persists until that disposition."
-            # Another task's patch folds into its owner's one line (Q3=A); the predicate the apply
-            # gate uses names the runs whose recorded target this reader's own active root already
-            # satisfies, so the line can carry the concrete call (no per-orphan task_result read;
-            # the tool re-verifies every guard).
+            # Keep target-match facts in the retained list; the apply tool re-verifies every guard.
             owner = _foreign_owner(run, task_id)
             if owner:
                 foreign_work(owner)["patches"].append(str(run.run_id or "?"))
@@ -589,7 +581,8 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
             )
     except Exception:
         pass
-    checks.extend(_foreign_work_line(owner, work) for owner, work in foreign.items())
+    if foreign:
+        checks.append(_foreign_work_line(getattr(env, "budget_drive_root", None) or custody_root, foreign))
 
     try:
         from ouroboros.delegate_custody import open_containment_faults
@@ -618,35 +611,3 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
     if not checks:
         return ""
     return "## Health Invariants\n\n" + "\n".join(f"- {check}" for check in checks)
-
-
-def _compute_cache_hit_rate(env: Any) -> Optional[float]:
-    from ouroboros.event_token_totals import token_counter
-
-    total_prompt = total_cached = reported = 0
-    try:
-        for ev in _iter_recent_jsonl(env.drive_path("logs/events.jsonl")):
-            if ev.get("type") != "llm_round":
-                continue
-            # Per round (#1578): an absent, null (record v2) or malformed counter
-            # means the round measured nothing, and an unstamped/v1 zero may be an
-            # old writer's unknown-to-zero (record contract LEGACY_RULE), so such a
-            # round joins NEITHER side of the ratio and never voids the measured
-            # rounds beside it; a v2 zero is a real measured miss.
-            pt_state, pt = token_counter(ev, "prompt_tokens")
-            cached_state, cached = token_counter(ev, "cached_tokens")
-            if pt and pt_state == cached_state == "known":
-                total_prompt += pt
-                total_cached += cached
-                reported += 1
-    except Exception:
-        return None
-    # Nobody reporting a cache is not a cache that missed: without the key the
-    # share is UNKNOWN, and the arithmetic zero below would render that absence
-    # as an honest 0% and send the owner hunting a caching regression no round
-    # ever measured. The window is the REPORTING rounds for the same reason: on
-    # an install whose providers are mixed, charging a silent round's prompt to
-    # the denominator understates the share the measuring rounds actually saw.
-    if reported < 5 or total_prompt == 0:
-        return None
-    return total_cached / total_prompt

@@ -84,6 +84,16 @@
         "stateKey": "lightModel"
       },
       {
+        "inputId": "safety-model",
+        "label": "Safety Supervisor",
+        "note": "Empty uses the Light model.",
+        "settingKey": "OUROBOROS_MODEL_SAFETY",
+        "settingsInputId": "s-model-safety",
+        "settingsToggleId": "",
+        "slot": "safety",
+        "stateKey": "safetyModel"
+      },
+      {
         "inputId": "vision-model",
         "label": "Vision Model",
         "note": "Caption and VLM lane. Empty uses Main.",
@@ -419,6 +429,7 @@
     "providerProfile": "openrouter",
     "reviewEnforcement": "advisory",
     "runtimeMode": "advanced",
+    "safetyModel": "",
     "skillsRepoPath": "",
     "totalBudget": 200.0,
     "visionModel": "",
@@ -455,6 +466,7 @@
       "fallback": "anthropic::claude-sonnet-5",
       "light": "anthropic::claude-sonnet-5",
       "main": "anthropic::claude-opus-5-5",
+      "safety": "",
       "vision": ""
     },
     "cloudru": {
@@ -462,6 +474,7 @@
       "fallback": "cloudru::zai-org/GLM-4.7",
       "light": "cloudru::zai-org/GLM-4.7",
       "main": "cloudru::zai-org/GLM-4.7",
+      "safety": "",
       "vision": ""
     },
     "deepseek": {
@@ -470,6 +483,7 @@
       "fallback": "deepseek::deepseek-v4-flash",
       "light": "deepseek::deepseek-v4-flash",
       "main": "deepseek::deepseek-v4-pro",
+      "safety": "",
       "vision": ""
     },
     "direct-multi": {
@@ -477,6 +491,7 @@
       "fallback": "",
       "light": "",
       "main": "",
+      "safety": "",
       "vision": ""
     },
     "local": {
@@ -484,6 +499,7 @@
       "fallback": "",
       "light": "",
       "main": "google/gemini-3.8-flash",
+      "safety": "",
       "vision": ""
     },
     "minimax": {
@@ -491,6 +507,7 @@
       "fallback": "minimax::MiniMax-M2.7",
       "light": "minimax::MiniMax-M2.7",
       "main": "minimax::MiniMax-M3",
+      "safety": "",
       "vision": ""
     },
     "openai": {
@@ -499,6 +516,7 @@
       "fallback": "openai::gpt-5.6-sol",
       "light": "openai::gpt-5.6-luna",
       "main": "openai::gpt-5.6-terra",
+      "safety": "",
       "vision": ""
     },
     "openai-compatible": {
@@ -506,6 +524,7 @@
       "fallback": "",
       "light": "",
       "main": "",
+      "safety": "",
       "vision": ""
     },
     "openrouter": {
@@ -513,6 +532,7 @@
       "fallback": "openai/gpt-5.6-luna",
       "light": "openai/gpt-6-luna",
       "main": "google/gemini-3.8-flash",
+      "safety": "",
       "vision": ""
     },
     "zai": {
@@ -520,6 +540,7 @@
       "fallback": "zai::glm-5.3-flash",
       "light": "zai::glm-5.3-flash",
       "main": "zai::glm-5.3",
+      "safety": "",
       "vision": "zai::glm-5.3-flash"
     }
   },

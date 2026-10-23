@@ -625,12 +625,29 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any, preparation: Any = None
         preparation.admit(step)
 
 
+def _admitted_cognitive_route(ctx: Any, r: SimpleNamespace) -> Optional[dict]:
+    """Reject a malformed new carrier through the ordinary admission rollback."""
+    from ouroboros.subagent_runtime import SubagentSelectionError
+    from ouroboros.supervisor_route import validate_cognitive_route
+
+    try:
+        return validate_cognitive_route(r.parent_cognitive_route)
+    except SubagentSelectionError as exc:
+        r.reject(ctx, tid=r.tid, chat_id=r.chat_id, delegation_role=r.delegation_role,
+                 parent_id=r.parent_id, root_task_id=r.root_task_id, role=r.role,
+                 result_fields=r.result_fields, detail=exc.detail, reason_code=exc.code)
+        return None
+
+
 def _admit_scheduled_payload(ctx: Any, preparation: Any, r: SimpleNamespace) -> None:
     """The composed request's final admission: the receipt-then-put interlock, its refusals, the
     scheduled notice and the snapshot. On a claim this runs on the admission lane."""
     from supervisor.queue import PENDING as QUEUE_PENDING, RUNNING as QUEUE_RUNNING
     from supervisor.task_admission import enqueue_subagent_with_scheduled_result, scheduled_admission_rejection
 
+    cognitive_route = _admitted_cognitive_route(ctx, r)
+    if cognitive_route is None:
+        return
     tid, delegation_role, root_task_id, parent_id, role = r.tid, r.delegation_role, r.root_task_id, r.parent_id, r.role
     view = _gate_view(ctx, preparation)
     pending_ref = getattr(ctx, "PENDING", QUEUE_PENDING)  # the live list admission may roll back
@@ -673,7 +690,7 @@ def _admit_scheduled_payload(ctx: Any, preparation: Any, r: SimpleNamespace) -> 
         "required_capabilities": r.required_capabilities, "model_lane": r.requested_model_lane,
         **r.intent, "task_group_id": r.task_group_id, "task_group": r.task_group,
         "subagent_envelope": r.subagent_envelope, "configured_subagent": r.configured_subagent,
-        "parent_cognitive_route": r.parent_cognitive_route, "parent_id": parent_id,
+        "parent_cognitive_route": cognitive_route, "parent_id": parent_id,
         "origin_metadata": evt.get("origin_metadata"),
         **({"presence_binding_authority": evt["presence_binding_authority"]}
            if "presence_binding_authority" in evt else {}),
@@ -786,6 +803,7 @@ def _admit_scheduled_payload(ctx: Any, preparation: Any, r: SimpleNamespace) -> 
                 root_task_id, getattr(view, "PENDING", pending_ref), getattr(view, "RUNNING", running_view)),
             max_active_subagents=max_active,
         ))
+        progress_meta["parent_cognitive_route"] = cognitive_route
         if queued_behind_active_cap:
             progress_meta["queued_behind_active_cap"] = True
     else:

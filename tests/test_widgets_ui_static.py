@@ -118,19 +118,19 @@ def test_widgets_page_reads_cheap_list_and_reconciles_by_signature():
     # `render()` takes no force flag: there is no path that clears every owner
     # Stop and rebuilds every card while the page stays open.
     assert "async function render() {" in source
-    assert "stoppedByOwner.clear()" not in source
-    # A vanished card's declarative session state and the owner's page-session Stop
-    # are evicted on BOTH removal paths: the keyed patch, and the rebuild branch the
-    # patch never sees (the last card leaving, or the first list arriving). Eviction
-    # runs after disposal, because a declarative disposer writes that snapshot as it
-    # goes. Without it, re-enabling the only skill restores values the owner never
-    # re-entered and keeps its card suppressed.
+    assert "stoppedByOwner" not in source, "the owner's Stop lives in the start ledger (holds.js), never a page set"
+    # A vanished card's declarative session state is evicted on BOTH removal paths:
+    # the keyed patch, and the rebuild branch the patch never sees (the last card
+    # leaving, or the first list arriving). Eviction runs after disposal, because a
+    # declarative disposer writes that snapshot as it goes. Without it, re-enabling
+    # the only skill restores values the owner never re-entered. The owner's Stop
+    # stays on both paths: it holds on this device until Start.
     rebuild = source.split("// Rebuilding the shell destroys frames", 1)[1].split("renderShell(list, tabs);", 1)[0]
     assert "await disposeMountedWidgets();" in rebuild
     assert rebuild.index("await disposeMountedWidgets();") < rebuild.index("widgetSessionState.delete(key);")
-    assert "stoppedByOwner.delete(key);" in rebuild
     patch = source.split("function patchWidgetCards(", 1)[1].split("for (const tab of nextTabs)", 1)[0]
-    assert "widgetSessionState.delete(key);" in patch and "stoppedByOwner.delete(key);" in patch
+    assert "widgetSessionState.delete(key);" in patch
+    assert "holds.release" not in rebuild and "holds.release" not in patch
 
 
 def test_widgets_escape_and_sanitize_untrusted_content():
@@ -419,12 +419,12 @@ def test_widgets_launch_policy_controls_and_stop_suppression():
         assert token not in controls_css, token
     assert "color: var(--text-meta);" in controls_css
     # Page: policy gate, suppression, owner controls, whole-map persistence.
-    assert "const stoppedByOwner = new Set();" in page
+    assert "const holds = getHolds();" in page
     assert "effectiveStartMode(tab, uiPreferences) !== 'manual'" in page
-    assert "&& !stoppedByOwner.has(widgetKey(tab));" in page
+    assert "&& !holds.reason(stopHoldKey(tab)) && !holds.reason(codeHoldKey(tab), tab.revision);" in page
     assert "if (isFramedWidget(tab) && !startsOnShow(tab)) await settleStopped(card, tab);" in page
-    assert "stoppedByOwner.add(widgetKey(tab));" in page
-    assert "stoppedByOwner.delete(widgetKey(tab));" in page
+    assert "holds.stop(stopHoldKey(tab));" in page
+    assert "holds.release(stopHoldKey(tab));" in page and "holds.release(codeHoldKey(tab));" in page
     assert "apiClient.saveUiPreferences({ widget_start_mode: next })" in page
     assert "const next = withWidgetStartMode(current, key, mode);" in page
     # Launch-policy writes are serialized (AUD-13): the card applies after its write.
@@ -438,7 +438,6 @@ def test_widgets_launch_policy_controls_and_stop_suppression():
     removed_branch = page.split("for (const key of plan.removed) {", 1)[1].split("for (const tab of nextTabs) {", 1)[0]
     assert "disposeWidgetByKey(key)" in removed_branch
     assert "widgetSessionState.delete(key);" in removed_branch
-    assert "stoppedByOwner.delete(key);" in removed_branch
     assert "if (settling) retireCard(card, settling);" in removed_branch
     # A stopped framed card ends with its facade and Start (CA-13): on leave for
     # every card not kept running, and while a card starts (idempotent facade).

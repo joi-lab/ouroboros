@@ -131,7 +131,7 @@ export function reasonText(reason) {
     const text = typeof reason.text === 'string' ? reason.text : code;
     if (!code || !text) return text;
     if (Number.isInteger(reason.count)) return COUNTED_REASONS[code] ? COUNTED_REASONS[code](reason.count) : text;
-    if (code === 'paused_by_mind' && reason.by?.text) return fmt('Ouroboros: {reason}', { reason: String(reason.by.text) });
+    if (code === 'paused_by_mind' && reason.by?.text) return `${tr(`work.because.${code}`, text)}: ${String(reason.by.text)}`;
     return tr(`work.because.${code}`, text);
 }
 
@@ -292,6 +292,7 @@ export function workControls(work) {
         // A reusable slot (`active`) hosts many cycles: no control reaches one of them by that id.
         const target = String(control?.target || '').trim();
         if (!target || REUSABLE_TASK_IDS.has(target)) continue;
+        if (control.action === 'resume' && control.scope === 'single') continue;
         const many = { stop: out.stop, stop_earlier: out.stopEarlier }[control.action];
         if (many) { if (!many.includes(target)) many.push(target); continue; }
         const one = { pause: 'pause', resume: 'resume', hurry: 'hurry', wrap_up: 'wrapUp' }[control.action];
@@ -307,10 +308,19 @@ export function workOfEpisode(data, taskId) {
         && String(work.episode.task_id || '') === id) || null;
 }
 
+/** The server's state for an individual member, without interpreting queue carriers in the browser. */
+export function memberState(data, taskId) {
+    const id = String(taskId || '');
+    return list(data?.works).find((work) => work?.confirmed !== false && work.members?.states?.[id])
+        ?.members.states[id] || null;
+}
+
 /** Every task a confirmed work's Resume control names in one body: where Activity may offer Resume. */
 export function resumeTargets(data) {
     return new Set(list(data?.works).filter((work) => work?.confirmed !== false)
-        .map((work) => workControls(work).resume).filter(Boolean));
+        .flatMap((work) => list(work.controls).filter((control) => control.action === 'resume')
+            .map((control) => String(control.target || '').trim()))
+        .filter((target) => target && !REUSABLE_TASK_IDS.has(target)));
 }
 
 /** The shared menu's items for a work's controls. Resume is its own button wherever one stands beside the menu;

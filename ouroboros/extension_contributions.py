@@ -11,6 +11,7 @@ import logging
 from urllib.parse import quote
 
 from ouroboros.extension_ui_validation import validate_contributions
+from ouroboros.icon_geometry import icon_spec, sanitize_svg, validate_icon
 from ouroboros.skill_identity import payload_bucket, release_declaration, release_digest_from_file_digests
 from ouroboros.skill_loader import _iter_payload_files
 
@@ -50,8 +51,13 @@ def _capture_host_sources(skill, revision: str) -> dict[str, bytes]:
 def stage_contributions(api, skill, revision: str) -> None:
     """Stage before the loader's atomic publish; invalid entries never abort register()."""
     entries, problems = validate_contributions(skill.manifest, skill_dir=skill.skill_dir)
+    try:
+        icon = validate_icon(skill.manifest.raw_extra.get("icon", ""))
+    except ValueError as exc:
+        icon = ""
+        problems.append(f"icon: {exc}")
     sources = {}
-    if any(entry["render"]["kind"] == "host" for entry in entries):
+    if (icon == "ui/icon.svg" or any(entry["icon"] == "ui/icon.svg" or entry["render"]["kind"] == "host" for entry in entries)):
         try:
             sources = _capture_host_sources(skill, revision)
         except (OSError, ValueError, RuntimeError) as exc:
@@ -63,20 +69,44 @@ def stage_contributions(api, skill, revision: str) -> None:
             else:
                 available.append(entry)
         entries = available
-    api._staged.contributions = project_contributions(skill.name, entries, revision, skill.manifest.name)
+    if icon == "ui/icon.svg" or any(entry["icon"] == "ui/icon.svg" for entry in entries):
+        try:
+            sources["ui/icon.svg"] = sanitize_svg(sources.get("ui/icon.svg", b"")).encode("utf-8")
+        except ValueError as exc:
+            sources.pop("ui/icon.svg", None)
+            problems.append(f"icon: {exc}; fix ui/icon.svg or use a host icon name")
+    api._staged.contributions = project_contributions(
+        skill.name, entries, revision, skill.manifest.name, sources=sources,
+        tools=skill.manifest.raw_extra.get("tools", []))
     api._staged.contribution_problems = problems
     api._staged.host_sources = sources
     for problem in problems:
         log.warning("skill %s: %s", skill.name, problem)
 
 
-def project_contributions(skill: str, entries: list[dict], revision: str, label: str = "") -> list[dict]:
+def project_contributions(skill: str, entries: list[dict], revision: str, label: str = "", *,
+                          sources: dict[str, bytes] | None = None, tools: list | None = None) -> list[dict]:
     """Host-owned absolute paths; authors never choose a different skill's namespace."""
     prefix = f"/api/extensions/{quote(skill, safe='')}/"
     rows = []
     for entry in entries:
         row = copy.deepcopy(entry)
         row.update(key=f"{skill}:{entry['id']}", skill=skill, skill_label=label or skill, revision=revision)
+        row["icon_spec"] = icon_spec(row.get("icon", ""), (sources or {}).get("ui/icon.svg"))
+        if row.get("provides") == "place":
+            from ouroboros.extension_surface_names import extension_surface_name
+            from ouroboros.contracts.plugin_api import ExtensionRegistrationError
+
+            row["tools"] = []
+            for tool in tools if isinstance(tools, list) else []:
+                if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+                    continue
+                try:
+                    full_name = extension_surface_name(skill, tool["name"])
+                except ExtensionRegistrationError:
+                    continue
+                row["tools"].append({**{k: copy.deepcopy(tool[k]) for k in ("effect", "target", "conversation", "thread") if k in tool},
+                                     "name": full_name})
         route = row.pop("route", "")
         if row.get("action", {}).get("verb") == "skill.request":
             route = row["action"].pop("route")

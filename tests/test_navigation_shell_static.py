@@ -167,9 +167,10 @@ def test_project_panel_composer_and_welcome_contracts():
     assert "addMessage" not in welcome_js
     assert "padding: 10px 292px" not in css
     assert "right: 8px;\n    bottom: 6px" not in send_group_css
-    assert ".chat-text-row:focus-within" in css
+    # The field is one object under the row of capsules: it takes the focus ring, the text row inside it none.
+    assert ".chat-field:focus-within" in css and ".chat-text-row:focus-within" not in css
     assert ".chat-toolbar-row {\n    order: 1;" in css
-    assert ".chat-text-row {\n    order: 2;" in css
+    assert ".chat-field {\n    order: 2;" in css
     assert "chat-header-more" in chat_js
     assert "chat-header-menu" in css
     # The Project is a reading surface, not a particular blur implementation.

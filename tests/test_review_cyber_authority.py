@@ -216,9 +216,8 @@ def test_skill_author_can_finish_without_fabricating_first_feedback(tmp_path, ac
 
 def test_skill_review_texts_state_the_gate_skill_exec_obeys(tmp_path, access, monkeypatch):
     """#1735: no skill_review text promises a lock Cyber Pro does not apply."""
-    from ouroboros import skill_review_passes
     from ouroboros.skill_loader import save_enabled
-    from ouroboros.tools import skill_exec
+    from ouroboros.tools import review_change, skill_exec
     from tests.test_skill_exec import _build_skill, _make_ctx, _valid_script_manifest
 
     ctx = _make_ctx(tmp_path)
@@ -228,7 +227,7 @@ def test_skill_review_texts_state_the_gate_skill_exec_obeys(tmp_path, access, mo
     manifest = _valid_script_manifest("demo").replace(
         "---\n# body", "  - name: absent.py\n    description: Missing.\n---\n# body")
     _build_skill(skills_root, "demo", manifest=manifest)
-    monkeypatch.setattr(skill_review_passes, "run_skill_review_passes", lambda *a, **k: pytest.fail("no panel"))
+    monkeypatch.setattr(review_change, "run_review_change", lambda *a, **k: pytest.fail("no panel"))
     reviewed = skill_exec._handle_review_skill(ctx, skill="demo")
     assert "status=pending" in reviewed and "skill_preflight failed" in reviewed
     assert "not executable" not in reviewed

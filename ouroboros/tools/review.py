@@ -348,7 +348,9 @@ def _collect_review_findings(ctx: ToolContext, model_results: list, row_plan: Op
 
     plan = row_plan or {}
     row_parts = {str(slot): tuple(parts) for slot, parts in zip(plan.get("slot_ids") or [], plan.get("parts") or [])}
-    parsed = parse_seat_answers({"results": model_results}, row_parts)
+    # A single-question wave may declare which items block (a skill wave's checklist rule):
+    # the parser applies it before any verdict is read.
+    parsed = parse_seat_answers({"results": model_results}, row_parts, severity_policy=plan.get("severity_policy"))
     # #1578: the one canonical owner; a run-level failure already logged is skipped.
     emit_review_model_error_events(ctx, parsed, source="multi_model_review")
     critical_fails: List[str] = []
@@ -358,7 +360,8 @@ def _collect_review_findings(ctx: ToolContext, model_results: list, row_plan: Op
     triad_raw_results = [record.to_dict() for record in parsed.actor_records]
     advisers = {sid for sid, extra in zip(plan.get("slot_ids") or [], plan.get("additional") or []) if extra}
     for raw in triad_raw_results:
-        raw["additional"] = raw.get("slot_id") in advisers
+        if not raw.get("outcome"):  # Historical envelopes have no saved assignment result.
+            raw["additional"] = raw.get("slot_id") in advisers
     errored_models = [record.model_id for record in parsed.actor_records if record.status == "error"]
 
     for record in parsed.actor_records:

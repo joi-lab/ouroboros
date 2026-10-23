@@ -1,16 +1,22 @@
-"""Unsigned durable receipts of the complete default hermetic test gate.
+"""Unsigned durable receipts of a complete hermetic test gate.
 
 ``commit_admission.PreflightTestProof`` is process-held, so a new process or a
 Restart repeated the whole battery for an unchanged subject. Owner decision 3A
 (12.10.2026): one full run per fixed code version, accepted after a restart
 when everything matches, shown to reviewers, unsigned. This module keeps ONE
 small JSON per exact identity under the caller's canonical data root. Only
-``preflight_runner.run_hermetic_pytest`` writes it, after a complete default
-run (the node lane when the candidate carries web tests, the parallel
-``not serial`` pass green on two observed xdist workers or the one admitted, the
-flag-free serial pass, a proven containment reap). That runner reads it at its
-existing reuse seam after the baseline and assembly checks; adoption reads it for
-exactly its commit (``preflight_qualification.receipt_for_commit``).
+``preflight_runner.run_hermetic_pytest`` writes it, after a complete run (the
+node lane when the candidate carries web tests, the parallel ``not serial`` pass
+green on two observed xdist workers or the one admitted, the serial pass without
+xdist flags, a proven containment reap). That runner reads it at its existing reuse
+seam after the baseline and assembly checks; adoption reads it for exactly its
+commit (``preflight_qualification.receipt_for_commit``).
+
+A run of the full battery writes schema 1. A SELECTED run (owner choice A,
+21.10.2026: local adoption may rest on exact selected qualification) is durable
+only as an exact commit, the one subject adoption can name, as schema 2 with its
+selection scope (base, policy, changed paths, authored widening) in the identity:
+every full-only reader, of any version, accepts schema 1 alone and skips it.
 
 The identity is the process-held proof (tested HEAD, tree, index and effective
 workload), the installation the test interpreter loads (probed under the exact
@@ -41,6 +47,7 @@ from typing import Any, Optional
 log = logging.getLogger(__name__)
 
 RECEIPT_SCHEMA = 1
+SELECTED_SCHEMA = 2  # a selected-tier record: never a full one, whatever reads it
 RECEIPTS_DIR = "preflight_receipts"  # <canonical data root>/state/preflight_receipts/<key>.json
 
 # The executing implementation a server, worker or standalone review entry runs its
@@ -215,20 +222,33 @@ def _installation_identity(agent_python: str, env: dict, temp_root: pathlib.Path
 _PROVENANCE = ("created_at", "task_id", "phase")
 
 
+_SCOPE_TYPES = {"base": str, "policy": str, "changed": list, "extra_tests": list, "full_tests": bool,
+                "test_reason": str}
+
+
 def _record_problem(document: Any, identity: dict, node_ran: bool) -> str:
-    """Why a receipt record cannot stand for this identity's complete default run, or ``""``.
+    """Why a receipt record cannot stand for this identity's complete run, or ``""``.
 
     Proportional coherence, not a forgery defence (the file is unsigned): the lanes must
     be the ones THIS identity's recipe requires — the node lane exactly when the candidate
     carries web tests, a non-empty parallel lane on two observed workers (or the one the
     budget admitted), the serial lane — and the record must keep its run's provenance.
+    A selected record also keeps its whole selection scope, and only a selected one does.
     """
     if not isinstance(document, dict):
         return "not a JSON object"
-    for key, expected in (("schema", RECEIPT_SCHEMA), ("identity", identity), ("result", "passed"),
+    schema = identity.get("schema") if isinstance(identity, dict) else None
+    if schema not in (RECEIPT_SCHEMA, SELECTED_SCHEMA) or (schema == SELECTED_SCHEMA) != (
+            identity.get("tier") == "selected"):
+        return "schema does not match"
+    for key, expected in (("schema", schema), ("identity", identity), ("result", "passed"),
                           ("authenticity", "unsigned")):
         if document.get(key) != expected:
             return f"{key} does not match"
+    scope = identity.get("scope")
+    if schema == SELECTED_SCHEMA and not (isinstance(scope, dict) and set(scope) == set(_SCOPE_TYPES) and all(
+            type(scope[key]) is kind for key, kind in _SCOPE_TYPES.items()) and not scope["full_tests"]):
+        return "the selection scope is incomplete"
     lanes, seconds = document.get("lanes"), document.get("pass_seconds")
     if not isinstance(lanes, dict) or lanes.get("node") != ("passed" if node_ran else "absent"):
         return "the node lane does not match the recipe this candidate requires"
@@ -246,8 +266,8 @@ def _record_problem(document: Any, identity: dict, node_ran: bool) -> str:
     return ""
 
 
-class FullGateReceipt:
-    """The durable identity of one complete default gate attempt, or why it has none.
+class GateReceipt:
+    """The durable identity of one complete gate attempt, or why it has none.
 
     ``status`` discloses what happened (``declined``, ``absent``, ``unreadable``,
     ``invalid``, ``reused``, ``published``, ``unwritten``); it is diagnostics, and no
@@ -260,12 +280,13 @@ class FullGateReceipt:
         self.path, self.identity, self.reason, self.node_ran = path, identity, reason, node_ran
         self.status = "declined" if path is None else "unchecked"
         self.origin: dict = {}
+        self.counts: dict = {}  # a selected record's selection size, disclosure only
         self.empty_lanes: Optional[list] = None
         self.evidence = None
 
     @classmethod
     def prepare(cls, ctx: Any, subject: Any, passes, probe_module: str, agent_python: str,
-                temp_root: pathlib.Path, worktree: pathlib.Path) -> "FullGateReceipt":
+                temp_root: pathlib.Path, worktree: pathlib.Path) -> "GateReceipt":
         """Bind the identity before any lane runs; any missing fact declines durability only."""
         from ouroboros import preflight_runner as pr
         from ouroboros.commit_admission import workload_fingerprint
@@ -274,8 +295,10 @@ class FullGateReceipt:
             return cls(None, {}, "no tested subject (no caller ctx, or the checkout could not be bound)")
         if [spec.label for spec in passes] != ["parallel", "serial"] or probe_module not in passes[0].args:
             return cls(None, {}, "not the complete default recipe")
-        if subject.tier != "full":
-            return cls(None, {}, "selected evidence cannot mint a FullGateReceipt")
+        selected = subject.tier != "full"
+        if selected and (subject.selection is None or not subject.tree == subject.index_tree == pr._run_git(
+                worktree, ["rev-parse", "--verify", f"{subject.head}^{{tree}}"]).stdout.strip()):
+            return cls(None, {}, "a selected run is durable only as an exact commit")
         root = canonical_data_root(ctx)
         if root is None:
             return cls(None, {}, "no canonical data root")
@@ -288,8 +311,14 @@ class FullGateReceipt:
         identity = {"schema": RECEIPT_SCHEMA, "head": subject.head, "tree": subject.tree,
                     "index_tree": subject.index_tree, "workload": workload_fingerprint(subject.workload),
                     "installation": _digest(installation), "source": source}
-        return cls(root / "state" / RECEIPTS_DIR / f"{_digest(identity)}.json", identity,
-                   node_ran=bool(subject.workload[4]))
+        if selected:  # a full identity keeps exactly its historical keys, so old receipts still match
+            identity.update(schema=SELECTED_SCHEMA, tier="selected", scope=subject.selection.scope())
+        receipt = cls(root / "state" / RECEIPTS_DIR / f"{_digest(identity)}.json", identity,
+                      node_ran=bool(subject.workload[4]))
+        if selected:
+            record = subject.selection.record()
+            receipt.counts = {key: record[key] for key in ("rule", "file_count", "omitted_files")}
+        return receipt
 
     @property
     def key(self) -> str:
@@ -349,13 +378,14 @@ class FullGateReceipt:
                 return
             self.evidence = getattr(ctx, "_preflight_test_evidence", None)
             atomic_write_json(self.path, {
-                "schema": RECEIPT_SCHEMA, "identity": self.identity, "result": "passed",
+                "schema": self.identity["schema"], "identity": self.identity, "result": "passed",
                 "authenticity": "unsigned",
                 "lanes": {"node": "passed" if self.node_ran else "absent", "parallel_workers": workers,
                           "admitted_workers": admitted, "serial": "empty" if "serial" in empty_passes else "passed"},
                 "pass_seconds": dict(timings), "phase": phase,
                 "task_id": str(getattr(ctx, "task_id", "") or ""), "created_at": utc_now_iso(),
                 "evidence": getattr(ctx, "_preflight_test_evidence", None),
+                **({"selection": self.counts} if self.counts else {}),
             })
             self.status = "published"
         except Exception as exc:  # durability is an optimization; the verdict is already decided

@@ -173,9 +173,25 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
                 succeeded.discard(entry.run_id)
                 if "source_incomplete" not in failure_states:
                     failure_states.append("source_incomplete")
+    from ouroboros.delegate_bootstrap_identity import read_identity
+    from ouroboros.delegate_recovery import unsettled_start_ids
+
+    try:
+        initial = read_identity(drive_root, task_id)
+        initial_run = next((run for run in runs.values() if initial and run.invocation_id == initial["invocation_id"]), None)
+        if initial:
+            fate = custody.invocation_record(drive_root, initial["invocation_id"]) or {}
+            initial = {**initial, "run_id": initial_run.run_id if initial_run else str(fate.get("run_id") or ""),
+                       "state": initial_run.terminal_state if initial_run and initial_run.settled else str(fate.get("state") or "unknown")}
+        obligations = unsettled_start_ids(drive_root, task_id)
+    except Exception:
+        initial, obligations = {"state": "unknown"}, {"status": "unknown"}
+        evidence_read_failed = True
     return {
         # A settled row whose started row fell out of the log is still a run that ran.
         "delegated_runs_started": len(started | settled),
+        "initial_execution": initial,
+        "delegated_obligations": obligations,
         "delegated_runs_settled": len(settled),
         # The terminal-state axis (F4, 2026-08-10 saga): a run that STARTED and
         # FAILED is an ATTEMPTED route, not a refusal to delegate. Readers (the

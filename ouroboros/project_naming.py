@@ -212,7 +212,7 @@ def llm_project_name(
         )
         from ouroboros.usage_accounting import usage_scope
 
-        with model_concurrency.model_call_slot(model, use_local):
+        with model_concurrency.model_call_scope(model, use_local):
             with usage_scope(_project_naming_usage_scope(drive_root, task_id)):
                 if drive_root is not None:
                     from ouroboros.llm_observability import chat_observed

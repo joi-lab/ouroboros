@@ -385,7 +385,7 @@ def managed_runtime_dir(pin: ClaudexorRuntimePin) -> pathlib.Path:
 
 
 def managed_node_dir(pin: ClaudexorRuntimePin, platform_key: str) -> pathlib.Path:
-    """Immutable host-Node directory for source and pre-Node package upgrades."""
+    """Legacy Node root; new immutable generations are uniquely named siblings."""
     pin.validate()
     return managed_runtime_root() / "node" / f"{pin.node_version}-{platform_key}"
 
@@ -524,6 +524,18 @@ class ClaudexorRuntimeManager:
             except ClaudexorRuntimeError as exc:
                 self._last_error = f"{exc.code}: {exc}"
                 raise
+
+    def prepare_node_toolchain(self) -> str:
+        """Explicit maintenance preparation, without replacing an engine tree or process."""
+        with self._lock:
+            if self._pin_error or self._pin is None:
+                raise ClaudexorRuntimeError("runtime_cli_unavailable", self._pin_error or "no reviewed runtime pin")
+            self._cli_node_artifact(self._pin)
+            self._install(self._pin, require_npm=True, node_only=True)
+            node = self._resolve_node_toolchain(self._pin)
+            if not node:
+                raise ClaudexorRuntimeError("runtime_node_install_failed", "prepared Node/npm is not selectable")
+            return node
 
     def ensure(self) -> list[str]:
         """Foreground install/repair/update intent, returning the next command."""
@@ -863,7 +875,28 @@ class ClaudexorRuntimeManager:
         return raw
 
     @staticmethod
-    def _resolve_preserved_node(node_version: str) -> str:
+    def _node_roots(version: str, platform_key: str) -> list[pathlib.Path]:
+        """Complete generations first; the pre-generation root remains read-only."""
+        legacy = managed_runtime_root() / "node" / f"{version}-{platform_key}"
+        try:
+            generations = sorted(legacy.parent.glob(legacy.name + ".g-*"), reverse=True)
+        except OSError:
+            generations = []
+        return [*generations, legacy]
+
+    @staticmethod
+    def _node_metadata(root: pathlib.Path) -> dict[str, Any]:
+        try:
+            raw = json.loads((root / _NODE_META_FILENAME).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if (not isinstance(raw, dict) or type(raw.get("schema_version")) is not int
+                or raw["schema_version"] not in (1, _NODE_META_SCHEMA_VERSION)):
+            return {}
+        return raw
+
+    @classmethod
+    def _resolve_preserved_node(cls, node_version: str) -> str:
         """Find an already-admitted Node without consulting the next pin."""
         from ouroboros.platform_layer import (
             bundled_resource_bases,
@@ -875,6 +908,23 @@ class ClaudexorRuntimeManager:
         version = str(node_version or "").strip()
         if not _SEMVER.fullmatch(version):
             return ""
+        platform_key = node_distribution_platform()
+        node_only, invalid = [], False
+        for root in cls._node_roots(version, platform_key) if platform_key else []:
+            raw = cls._node_metadata(root)
+            if raw.get("version") != version or raw.get("platform") != platform_key:
+                invalid |= (root / _NODE_META_FILENAME).exists()
+                continue
+            candidate = embedded_node_candidates(root)[0]
+            try:
+                if not candidate.is_file() or probe_node_version(str(candidate)) != version:
+                    continue
+                if (raw["schema_version"] == _NODE_META_SCHEMA_VERSION
+                        and cls._managed_npm_cli(candidate).is_file()):
+                    return str(candidate.resolve())
+                node_only.append(candidate)
+            except (OSError, RuntimeError):
+                continue
         for base in bundled_resource_bases():
             for candidate in embedded_node_candidates(base):
                 try:
@@ -882,41 +932,15 @@ class ClaudexorRuntimeManager:
                         return str(candidate.resolve())
                 except (OSError, RuntimeError):
                     continue
-        platform_key = node_distribution_platform()
-        if not platform_key:
-            return ""
-        root = managed_runtime_root() / "node" / f"{version}-{platform_key}"
-        try:
-            raw = json.loads((root / _NODE_META_FILENAME).read_text(encoding="utf-8"))
-        except OSError:
-            return ""
-        except ValueError as exc:
+        if node_only:
+            return str(node_only[0].resolve())
+        if invalid:
             raise ClaudexorRuntimeError(
-                "runtime_serving_node_metadata_invalid",
-                "the preserved Node metadata is not valid JSON",
-            ) from exc
-        schema = raw.get("schema_version") if isinstance(raw, dict) else None
-        if (
-            not isinstance(raw, dict)
-            or type(schema) is not int
-            or schema not in (1, _NODE_META_SCHEMA_VERSION)
-            or raw.get("version") != version
-            or raw.get("platform") != platform_key
-        ):
-            raise ClaudexorRuntimeError(
-                "runtime_serving_node_metadata_invalid",
-                "the preserved Node metadata has an unsupported or malformed schema",
-            )
-        candidate = embedded_node_candidates(root)[0]
-        try:
-            if candidate.is_file() and probe_node_version(str(candidate)) == version:
-                return str(candidate.resolve())
-        except (OSError, RuntimeError):
-            pass
+                "runtime_serving_node_metadata_invalid", "the preserved Node metadata is malformed")
         return ""
 
     def _resolve_node(self, pin: ClaudexorRuntimePin) -> str:
-        """Select an exact packaged/source Node, then an exact managed copy."""
+        """Prefer a ready exact full runtime, then bundled Node, then Node-only."""
         from ouroboros.platform_layer import (
             bundled_resource_bases,
             embedded_node_candidates,
@@ -924,6 +948,10 @@ class ClaudexorRuntimeManager:
             probe_node_version,
         )
 
+        platform_key = node_distribution_platform()
+        complete = self._resolve_managed_node(pin, platform_key, require_npm=True) if platform_key else ""
+        if complete:
+            return complete
         for base in bundled_resource_bases():
             for candidate in embedded_node_candidates(base):
                 try:
@@ -931,7 +959,6 @@ class ClaudexorRuntimeManager:
                         return str(candidate)
                 except OSError:
                     continue
-        platform_key = node_distribution_platform()
         if not platform_key:
             return ""
         return self._resolve_managed_node(pin, platform_key)
@@ -958,11 +985,6 @@ class ClaudexorRuntimeManager:
     ) -> str:
         from ouroboros.platform_layer import embedded_node_candidates, probe_node_version
 
-        root = managed_node_dir(pin, platform_key)
-        try:
-            raw = json.loads((root / _NODE_META_FILENAME).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return ""
         artifact = pin.node_artifacts.get(platform_key)
         if artifact is None:
             return ""
@@ -975,26 +997,23 @@ class ClaudexorRuntimeManager:
             "archive_size": artifact.size_bytes,
             "archive_executable": artifact.executable,
         }
-        if not isinstance(raw, dict) or any(raw.get(key) != value for key, value in expected.items()):
-            return ""
-        schema = raw.get("schema_version")
-        if schema not in (1, _NODE_META_SCHEMA_VERSION):
-            return ""
-        if require_npm and (
-            schema != _NODE_META_SCHEMA_VERSION
-            or not archive_npm_cli
-            or raw.get("archive_npm_cli") != archive_npm_cli
-        ):
-            return ""
-        candidate = embedded_node_candidates(root)[0]
-        try:
-            if not candidate.is_file() or probe_node_version(str(candidate)) != pin.node_version:
-                return ""
-            if require_npm and not self._managed_npm_cli(candidate).is_file():
-                return ""
-            return str(candidate)
-        except OSError:
-            return ""
+        for root in self._node_roots(pin.node_version, platform_key):
+            raw = self._node_metadata(root)
+            if any(raw.get(key) != value for key, value in expected.items()):
+                continue
+            if require_npm and (raw["schema_version"] != _NODE_META_SCHEMA_VERSION or not archive_npm_cli
+                                or raw.get("archive_npm_cli") != archive_npm_cli):
+                continue
+            candidate = embedded_node_candidates(root)[0]
+            try:
+                if not candidate.is_file() or probe_node_version(str(candidate)) != pin.node_version:
+                    continue
+                if require_npm and not self._managed_npm_cli(candidate).is_file():
+                    continue
+                return str(candidate)
+            except OSError:
+                continue
+        return ""
 
     def _resolve_node_toolchain(self, pin: ClaudexorRuntimePin) -> str:
         from ouroboros.platform_layer import node_distribution_platform
@@ -1078,12 +1097,12 @@ class ClaudexorRuntimeManager:
         from ouroboros.platform_layer import embedded_node_candidates, probe_node_version
         from ouroboros.utils import atomic_write_json
 
-        root = managed_node_dir(pin, platform_key)
-        parent = root.parent
+        legacy = managed_node_dir(pin, platform_key)
+        parent = legacy.parent
         parent.mkdir(parents=True, exist_ok=True)
         nonce = uuid.uuid4().hex[:8]
         staging = parent / f".tmp-{os.getpid()}-{nonce}"
-        displaced = parent / f".old-{nonce}"
+        root = parent / f"{legacy.name}.g-{artifact.sha256[:12]}-{nonce}"
         try:
             staging.mkdir(parents=False, exist_ok=False)
             node = embedded_node_candidates(staging)[0]
@@ -1120,17 +1139,9 @@ class ClaudexorRuntimeManager:
                 trailing_newline=True,
                 fsync=True,
             )
-            had_old = root.exists()
-            if had_old:
-                replace_atomic(root, displaced)
-            try:
-                replace_atomic(staging, root)
-            except Exception:
-                if had_old and displaced.exists() and not root.exists():
-                    replace_atomic(displaced, root)
-                raise
-            if displaced.exists():
-                shutil.rmtree(displaced, ignore_errors=True)
+            # Never rename, repair or remove an earlier generation: Node/npm may
+            # still load its files from a live daemon, installer or vendor child.
+            replace_atomic(staging, root)
         except ClaudexorRuntimeError:
             raise
         except Exception as exc:
@@ -1140,8 +1151,6 @@ class ClaudexorRuntimeManager:
             ) from exc
         finally:
             shutil.rmtree(staging, ignore_errors=True)
-            if displaced.exists() and root.exists():
-                shutil.rmtree(displaced, ignore_errors=True)
 
     @staticmethod
     def _extract_node_archive(
@@ -1315,7 +1324,9 @@ class ClaudexorRuntimeManager:
         except OSError:
             return []
 
-    def _install(self, pin: ClaudexorRuntimePin, *, require_npm: bool = False) -> None:
+    def _install(
+        self, pin: ClaudexorRuntimePin, *, require_npm: bool = False, node_only: bool = False
+    ) -> None:
         from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 
         root = managed_runtime_root()
@@ -1327,7 +1338,8 @@ class ClaudexorRuntimeManager:
             metadata=f"pid={os.getpid()} version={pin.version} build_sha={pin.build_sha}\n",
         )
         if lock_fd is None:
-            command = self._managed_cli_command() if require_npm else self._managed_command()
+            command = (self._resolve_node_toolchain(pin) if node_only else
+                       self._managed_cli_command() if require_npm else self._managed_command())
             if command:
                 return
             raise ClaudexorRuntimeError(
@@ -1339,6 +1351,8 @@ class ClaudexorRuntimeManager:
                 self._ensure_node_toolchain(pin)
             else:
                 self._ensure_node(pin)
+            if node_only:
+                return
             try:
                 command = (
                     self._managed_cli_command()

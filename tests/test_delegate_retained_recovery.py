@@ -11,7 +11,7 @@ from ouroboros import delegate_custody_current as current
 from ouroboros.gateways.claudexor import ClaudexorUnavailable
 from ouroboros.tools.delegate_terminal_evidence import collect_and_deliver_terminal, retained_terminal_result
 from ouroboros.tools.registry import ToolContext
-from tests.test_delegate_body_collection import money, started, terminal  # noqa: F401
+from tests.test_delegate_body_collection import _until, money, started, terminal  # noqa: F401
 
 
 class AbsentGateway:
@@ -78,11 +78,16 @@ def test_settled_local_capture_recovers_without_remote_run(tmp_path, monkeypatch
     monkeypatch.setattr(gateway, "start_run",
                         lambda *a, **kw: pytest.fail("collection cannot replay a pending start"), raising=False)
     outcomes = recover(root, entry, None, surface)  # public default must attach only
-    assert outcomes
+    assert not current.run(root, entry.run_id).patch_captured
     if pending:
         assert _pending_ids(root, entry.task_id) == [INVOCATION]
         retained = [row for row in outcomes if row.get("action") == "invocation_retained"]
         assert bool(retained) == (surface == "orphan")
+    runtime = body.start_body_runtime(root, gateway_factory=factory)
+    try:
+        _until(lambda: current.run(root, entry.run_id).patch_captured)
+    finally:
+        runtime.close(wait=True)
     after = current.run(root, entry.run_id)
     assert after.patch_captured and not body.collection_pending(after)
     assert after.terminal_source == before.terminal_source
@@ -105,12 +110,12 @@ def test_unchanged_local_debt_emits_no_reconciliation_storm(tmp_path, monkeypatc
     body.collect_terminal(tmp_path, entry.run_id, detail=terminal())
     gateway = AbsentGateway()
     first = recover(tmp_path, entry, lambda: gateway, "orphan")
-    assert first[0]["collection"]["status"] == "pending"
+    assert first == []
     after_first = list(custody.custody_rows(tmp_path))
     for _ in range(3):
         result = recover(tmp_path, entry, lambda: gateway, "orphan")
-        assert result[0]["collection"]["status"] == "pending"
-    assert len(calls) == 5, "the existing recovery owner still attempts the owed local duty"
+        assert result == []
+    assert len(calls) == 1, "control reconciliation leaves local collection to the body"
     assert list(custody.custody_rows(tmp_path)) == after_first
     assert current.run(tmp_path, entry.run_id).settled and len(money) == 1
     assert body.collection_pending(current.run(tmp_path, entry.run_id))

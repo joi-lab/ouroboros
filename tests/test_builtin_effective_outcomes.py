@@ -322,16 +322,20 @@ def test_search_own_failure_object_reaches_registry_without_losing_custody(invok
     assert "operation_outcome" not in result.meta
 
 
-@pytest.mark.parametrize("published", [False, True])
-def test_evolution_stats_publication_outcome_is_not_hidden_by_summary(invoke, monkeypatch, published):
+@pytest.mark.parametrize("saved", [False, True])
+def test_evolution_stats_artifact_outcome_is_not_hidden_by_summary(invoke, monkeypatch, saved):
     from ouroboros.tools import evolution_stats
+    from ouroboros import artifacts
+    invoke.ctx.task_id = "local-evolution-export"
     monkeypatch.setattr(evolution_stats, "_collect_data", lambda: [
         {"ts": "2026-10-13", "py_lines": 1, "bible_bytes": 2, "system_bytes": 3}])
-    monkeypatch.setattr(evolution_stats, "_push_to_github", lambda data: (
-        published, "pushed one point" if published else "error: remote refused"))
+    if not saved:
+        def fail(*args, **kwargs):
+            raise OSError("fixture disk refused")
+        monkeypatch.setattr(artifacts, "store_task_artifact_bytes", fail)
     result = invoke(evolution_stats.get_tools()[0].handler)
-    assert result.code == ("OK" if published else "TOOL_ERROR")
-    assert "py_lines=1 bible=2B system=3B" in result.text
+    assert result.code == ("OK" if saved else "TOOL_ERROR")
+    assert ("py_lines=1 bible=2B system=3B" if saved else "fixture disk refused") in result.text
     assert "operation_outcome" not in result.meta
 
 
@@ -584,22 +588,20 @@ def test_review_gate_return_boundaries_reach_consumers(invoke, monkeypatch, case
 
 @pytest.mark.parametrize("refused", [False, True])
 def test_skill_cycle_refusal_preserves_pending_payload(invoke, monkeypatch, refused):
-    from ouroboros import skill_review_cycles
-    from ouroboros.skill_review import SkillReviewOutcome
+    from ouroboros.skill_review import SkillReviewOutcome, _outcome_from_result
     from ouroboros.skill_review_runner import _outcome_payload
     from ouroboros.tools import skill_exec
     binding = SimpleNamespace(state_drive_root=invoke.ctx.drive_root)
-    monkeypatch.setattr(skill_review_cycles, "review_max_cycles", lambda: 3)
-    monkeypatch.setattr(skill_review_cycles, "count_paid_skill_review_cycles", lambda *a, **k: 3 if refused else 0)
-    monkeypatch.setattr(skill_review_cycles, "emit_review_cycles_exhausted", lambda *a, **k: None)
-    outcome = skill_review_cycles.skill_review_cycles_refusal(
-        invoke.ctx, "fixture", drive_root=invoke.ctx.drive_root, group_id="task:root:fixture",
-        models=["fixture-reviewer"], content_hash="same", contract_fingerprint="contract",
-    )
     if refused:
+        # The wave's typed $0 refusal at the shared ceiling (review_change), as review_skill reads it.
+        result = {"state": "settled", "aggregate": "NOT_DISPATCHED", "record_id": "rl-refused", "rows": [],
+                  "findings": {}, "panel": {"seats": 1}, "cost": {}, "reused": False,
+                  "dispatch_refusal": {"kind": "review_cycles_exhausted",
+                                       "message": "⚠️ REVIEW_CYCLES_EXHAUSTED: 3 of 3 paid skill-review waves spent"}}
+        outcome = _outcome_from_result(SimpleNamespace(name="fixture"), SimpleNamespace(tree_sha="same", delivery={}),
+                                       result, rebuttal_sha="")
         assert outcome.dispatch_refusal_code == "LEGACY_BLOCKED" and outcome.paid is False
     else:
-        assert outcome is None
         # Quoted/recorded prose cannot fabricate a live dispatch refusal.
         outcome = SkillReviewOutcome(skill_name="fixture", status="pending", content_hash="same",
             error="⚠️ REVIEW_CYCLES_EXHAUSTED: retained observation, no live refusal")
@@ -609,8 +611,6 @@ def test_skill_cycle_refusal_preserves_pending_payload(invoke, monkeypatch, refu
     assert ("dispatch_refusal_code" in payload) is refused
     monkeypatch.setattr(skill_exec, "_skill_tool_preflight", lambda *a: "")
     monkeypatch.setattr("ouroboros.skill_review_runner.run_skill_review_lifecycle_blocking", lambda *a, **k: payload)
-    monkeypatch.setattr("ouroboros.skill_review._count_attempts_for_content", lambda *a: 3)
-    monkeypatch.setattr("ouroboros.skill_review._load_accepted_rebuttals", lambda *a: [])
     # Keep the renderer's real content and append the existing job reference.
     result = invoke(lambda ctx: skill_exec._handle_review_skill(ctx, skill="fixture", _resolved_binding=binding))
     _assert_consumers(result, "LEGACY_BLOCKED" if refused else "OK")

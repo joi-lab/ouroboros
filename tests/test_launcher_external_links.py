@@ -28,7 +28,7 @@ def test_setup_and_main_bridge_share_the_bounded_external_opener(monkeypatch, se
     monkeypatch.setattr(launcher, "_open_browser_detached", open_browser)
     created, _ = _install_fake_webview(monkeypatch)
     result = launcher_onboarding.present_first_run_onboarding(
-        {}, 8765, open_external_url=launcher._open_external_url,
+        {}, 1, open_external_url=launcher._open_external_url,
     )
     # Evaluate the actual main-window API class without launching a server/UI.
     source = inspect.getsource(launcher.main)

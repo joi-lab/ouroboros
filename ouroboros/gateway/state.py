@@ -152,6 +152,15 @@ def _describe_bg(request: Request) -> Callable[[bool], dict[str, Any]] | None:
     return _state_attr(request, "describe_bg_consciousness_state")
 
 
+async def api_consciousness(request: Request) -> JSONResponse:
+    """The Dashboard's consciousness panel: status, spend by cause, places and recent wakes (read-only)."""
+    describe = _state_attr(request, "describe_consciousness")
+    if describe is None:
+        return JSONResponse({"status": "unavailable", "places": [], "recent_wakes": []}, status_code=503,
+                            headers={"Cache-Control": "no-store"})
+    return JSONResponse(await asyncio.to_thread(describe), headers={"Cache-Control": "no-store"})
+
+
 def _state_snapshot(request: Request) -> Dict[str, Any]:
     """Collect every heavy synchronous input for the ``/api/state`` payload.
 
@@ -432,6 +441,27 @@ def _managed_task_finalizing(drive_root: Any, task_id: str) -> bool:
         return False
 
 
+def _pending_resume_available(q: Any, task: dict, *, owner_paused: bool) -> bool:
+    """Present the current release rule; root custody still owns member selection."""
+    from ouroboros.work_stop import continuation_refusal, current_stop
+    from ouroboros.owner_pause import root_actor
+    from supervisor.events_budget import live_root_resume_grant
+    from supervisor.queue_transitions import budget_pause_fact
+
+    stop = current_stop(task, {"budget": q.BUDGET_ROOT_FENCES})
+    if owner_paused or not (stop.get("release") in {"resume", "owner"} or continuation_refusal(task)):
+        return False
+    task_id = str(task.get("id") or "")
+    root_id = str(task.get("root_task_id") or task_id)
+    result_root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
+    if root_actor(result_root, root_id, task_id, strict=True):
+        return True
+    fence = q.BUDGET_ROOT_FENCES.get(root_id) or {}
+    root_parked = fence.get("status") in {"active", "paused"} or any(
+        row.get("id") == root_id and budget_pause_fact(row, q.BUDGET_ROOT_FENCES) is not None for row in q.PENDING)
+    return not root_parked and not live_root_resume_grant(q, root_id, result_root)
+
+
 def _managed_task_budget_pausing(drive_root: Any, row: Dict[str, Any], task_id: str) -> bool | None:
     """A RUNNING task writing its exact budget pause (#1196): the durable
     ``budget_pause`` row is the only truth of that window; None means unreadable."""
@@ -498,7 +528,7 @@ def _raw_work_facts(row: dict) -> dict:
     metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
     continuation = metadata.get("continuation") if isinstance(metadata.get("continuation"), dict) else {}
     facts = {key: row[key] for key in ("_budget_pause_hold", "_budget_pause", "title", "suggested_name", "focus",
-                                        "root_task_id", "parent_task_id", "original_task_id", "budget_drive_root")
+                                        "root_task_id", "parent_task_id", "original_task_id", "budget_drive_root", "owner_wait")
              if row.get(key)}
     edges = {key: continuation[key] for key in ("predecessor_task_id", "work_id", "work_name") if continuation.get(key)}
     return {**facts, **({"continuation": edges} if edges else {})}
@@ -506,28 +536,24 @@ def _raw_work_facts(row: dict) -> dict:
 
 def _activity_pause_cause(row: dict, fence: dict) -> str:
     """Explain a parked census row from its existing typed control, never its phase name."""
-    hold = row.get("_budget_pause_hold") or {}
-    if isinstance(hold, dict) and hold.get("reason") in {"owner_restart_hold", "saved_work_hold"} \
-            and not hold.get("selected"):
-        # saved_work_hold: work saved before the application stopped waits for Resume
-        # after it started again (#1563); the published cause vocabulary is unchanged.
-        # A hold the owner's Resume already released explains no later pause.
-        return "restart"
-    if fence.get("cause") == "owner_pause":
-        return "owner"
-    pause = row.get("_budget_pause") or row.get("budget_pause") or {}
-    reason = pause.get("reason") if isinstance(pause, dict) else None
-    if reason in {"budget", "owner", "sleep", "authority"}:
-        return reason
-    if isinstance(pause, dict) and pause.get("status") == "paused_before_dispatch":
-        return "budget"
-    if row.get("reason_code") in {"budget_paused", "budget_exhausted"}:
-        return "budget"
-    if row.get("reason_code") == "owner_paused":
-        return "owner"
-    if row.get("reason_code") == "authority_paused":
-        return "authority"
-    return "unknown"
+    from ouroboros.work_stop import stop_presentation
+
+    root_id = str(row.get("root_task_id") or row.get("id") or "")
+    return stop_presentation(row, {"budget": {root_id: fence}})["pause_cause"]
+
+
+def _activity_stop_view(drive_root, row, task_id, fence, *, owner_resumed=False):
+    from types import SimpleNamespace
+    from ouroboros.budget_pause import budget_pause_row
+    from ouroboros.owner_pause import member_fence
+    from ouroboros.work_stop import stop_presentation
+
+    root = pathlib.Path(row.get("budget_drive_root") or drive_root)
+    root_id = str(row.get("root_task_id") or task_id)
+    owner = {} if owner_resumed else member_fence(SimpleNamespace(
+        task_id=task_id, root_task_id=root_id, budget_drive_root=root))
+    task = {**row, "id": task_id, "budget_pause": budget_pause_row(root, task_id)}
+    return stop_presentation(task, {"owner": owner, "budget": {root_id: fence}})
 
 
 def _direct_activity_pause_projection(drive_root: Any, row: dict, availability: Any) -> dict:
@@ -552,7 +578,9 @@ def _direct_activity_pause_projection(drive_root: Any, row: dict, availability: 
         except Exception:
             own = {}
         if own.get("owner_wait_state") == "waiting" and own.get("owner_wait_reason") == "owner_pause":
-            activity.update(phase="budget_paused" if state == "paused" else "budget_pausing", pause_cause="owner")
+            view = _activity_stop_view(drive_root, row, task_id, {})
+            activity.update(phase="budget_paused", live=False, stop=view["stop"],
+                            refusal=view["refusal"], pause_cause=view["pause_cause"])
             if state == "paused" and (finishing := _finishing_reviews(drive_root, row, task_id)):
                 activity["finishing_reviews"] = finishing
     return activity
@@ -577,6 +605,7 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 (str(task_id), {**(meta.get("task") or {}), "_attempt": int(meta.get("attempt")
                     or (meta.get("task") or {}).get("_attempt") or 1),
                     "model_activity": (meta.get("active_llm_call") or {}).get("model_activity"),
+                    "owner_wait": dict(meta.get("owner_wait") or {}),
                     "_owner_pause_warm": warm_paused_member(meta)} if isinstance(meta, dict) else {},
                  _epoch_or_zero(meta.get("started_at")) if isinstance(meta, dict) else 0.0)
                 for task_id, meta in queue_mod.RUNNING.items()]
@@ -655,12 +684,18 @@ def _chat_activities_snapshot(drive_root, task_bindings, direct_rows, pending_ro
                 return False
 
         def _activity(task_id: str, row: Dict[str, Any], phase: str, started_at: float, *, root: bool = True,
-                      can_resume: bool = False, owner_resumed: bool = False) -> Dict[str, Any]:
+                      can_resume: bool = False, owner_resumed: bool = False, live: bool = False) -> Dict[str, Any]:
             from ouroboros.project_admission import project_hold_fact
             from ouroboros.task_activity_facts import card_facts
 
             if phase == "unknown" and availability is not None:
                 availability["complete"] = False
+            view = {}
+            if phase in {"budget_paused", "budget_pausing"}:
+                view = _activity_stop_view(drive_root, row, task_id, {} if owner_resumed else fence_rows.get(
+                    str(row.get("root_task_id") or task_id), {}), owner_resumed=owner_resumed)
+                if phase == "budget_pausing" and not live:
+                    phase = "budget_paused"
             return {
                 "activity_id": task_id,
                 "detached": card_facts(row)["detached"],
@@ -670,12 +705,10 @@ def _chat_activities_snapshot(drive_root, task_bindings, direct_rows, pending_ro
                 "kind": "direct_chat" if row.get("_is_direct_chat") else "managed_task",
                 "phase": phase,
                 # Cancel stops a lineage-resolved root (``ChatOutbound.cancelable``); Resume is the
-                # parked row's own release rule (``events_budget.explicit_resume_required``).
+                # parked row's own release rule (``work_stop.current_stop``).
                 "can_resume": bool(can_resume), "cancelable": bool(root),
-                # A consumed owner Resume answered that fence's Pause: the row's own facts explain it.
-                **({"pause_cause": _activity_pause_cause(row, {} if owner_resumed else fence_rows.get(
-                    str(row.get("root_task_id") or task_id), {}))}
-                   if phase in {"budget_paused", "budget_pausing"} else {}),
+                **({"pause_cause": view["pause_cause"], "stop": view["stop"], "refusal": view["refusal"],
+                    "live": live} if view else {}),
                 **({"finishing_reviews": finishing} if phase == "budget_paused" and (
                     finishing := _finishing_reviews(drive_root, row, task_id)) else {}),
                 "started_at": started_at,
@@ -693,7 +726,6 @@ def _chat_activities_snapshot(drive_root, task_bindings, direct_rows, pending_ro
 
         from types import SimpleNamespace
 
-        from supervisor.events_budget import explicit_resume_required
         from supervisor.queue_transitions import budget_pause_fact
 
         registries = SimpleNamespace(PENDING=pending_rows, BUDGET_ROOT_FENCES=fence_rows, DRIVE_ROOT=drive_root,
@@ -718,7 +750,7 @@ def _chat_activities_snapshot(drive_root, task_bindings, direct_rows, pending_ro
                 interrupted = phase in {"budget_paused", "budget_pausing"} and _interrupted_owner_resume(
                     drive_root, row, task_id)
                 phase = "unknown" if interrupted is None else "budget_paused" if interrupted else phase
-                resume = interrupted is True or (phase == "budget_paused" and explicit_resume_required(
+                resume = interrupted is True or (phase in {"budget_paused", "budget_pausing"} and _pending_resume_available(
                     registries, row, owner_paused=(fence_rows.get(str(row.get("root_task_id") or task_id)) or {}).get(
                         "cause") == "owner_pause" or _owner_fence_state(drive_root, row, task_id) == "paused"))
                 activities.append(_activity(task_id, row, phase, _epoch_or_zero(row.get("queued_at")),
@@ -745,7 +777,7 @@ def _chat_activities_snapshot(drive_root, task_bindings, direct_rows, pending_ro
                     phase = "budget_paused"  # its stack parked warm under a settled Pause
                 else:
                     phase = "finalizing" if _managed_task_finalizing(drive_root, task_id) else "working"
-                activities.append(_activity(task_id, row, phase, started_at, root=root))
+                activities.append(_activity(task_id, row, phase, started_at, root=root, live=not row.get("_owner_pause_warm")))
                 if work_facts is not None:  # whether a settling Pause's member still executes, or waits parked warm
                     warm = {"owner_pause_warm": True} if row.get("_owner_pause_warm") else {}
                     work_facts[task_id] = {**_raw_work_facts(row), "running": not warm, **warm}
@@ -770,11 +802,15 @@ def _chat_activities_snapshot(drive_root, task_bindings, direct_rows, pending_ro
                 phase = "budget_pausing"
             elif task_has_live_review_operation(drive_root, root_id):
                 phase = "budget_paused"  # an unsent review operation deferred until Resume
+            elif any(str(item.get("root_task_id") or "") == root_id for item in pending_rows) or any(
+                    str(item.get("root_task_id") or "") == root_id for _tid, item, _at in running_rows):
+                phase = "budget_paused"
             else:
                 continue
             row = dict(facts.get("row") or {})
-            visible[root_id] = _activity(root_id, row, phase, _epoch_or_zero(row.get("queued_at")))
-            if work_facts is not None and phase == "budget_pausing":  # its late work still runs
+            live = phase == "budget_pausing" and post_task_synthesis_in_flight(drive_root, root_id)
+            visible[root_id] = _activity(root_id, row, phase, _epoch_or_zero(row.get("queued_at")), live=live)
+            if work_facts is not None and live:  # its late work still runs
                 work_facts[root_id] = {**_raw_work_facts(row), "running": True}
             census_ids.add(root_id)
             activities.append(visible[root_id])

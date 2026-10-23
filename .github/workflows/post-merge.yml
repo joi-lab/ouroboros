@@ -1,0 +1,106 @@
+# Post-merge check: after merges land on `ouroboros`, the tests they affect run here.
+#
+# Owner decision 3A (2026-10-21): nobody waits before a merge. After merged changes a small check
+# of the affected tests starts by itself, and several merges in a row are checked by one run: the
+# concurrency group keeps one run going and one pending, every newer push replaces the pending
+# one, and its base (the head of the last completed check) still covers the merges in between.
+# Each finding of the release's lint gate (`ruff check --select F`, owner decision 2A, 2026-10-22) is red
+# without a retry. A red test runs once more (passing then = flaky: reported, never handed over); a red again
+# is bisected over the first-parent merges to the merge that broke it and handed to that pull
+# request's author (one comment) and to Ouroboros (an issue labelled `post-merge-red`, which a
+# later run closes once the tests pass and the findings are gone). The check blocks nothing, reverts nothing, runs on no
+# schedule and uses no secret: only this workflow's own GITHUB_TOKEN with the permissions below.
+# scripts/post_merge_check.py documents each step.
+
+name: Post-merge check
+
+on:
+  push:
+    branches:
+      - ouroboros
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: post-merge-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  post-merge:
+    # Only the official repository hands reds to the authors of its merges.
+    if: github.repository == 'razzant/ouroboros'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      # This job provisions pytest-xdist/pytest-timeout and node 22, so the gate's real-spawn
+      # tests run here instead of skipping, as in ci.yml's test jobs.
+      OUROBOROS_PREFLIGHT_REQUIRE_PLUGINS: "1"
+      OUROBOROS_PREFLIGHT_REQUIRE_NODE: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0  # the base and every commit a bisection probes
+      # Dependencies only, never the project: an installed checkout would let a probe's test
+      # processes import the head's code instead of the probed commit's (scripts/post_merge_check.py).
+      - uses: ./.github/actions/setup-python-env
+        id: setup_python
+        with:
+          interpreter: shipped
+          install-project: 'false'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        id: setup_node
+        with:
+          node-version: '22'
+      - name: Choose the base (the head of the last completed check)
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        run: python scripts/post_merge_check.py base --evidence-dir "$RUNNER_TEMP/post-merge"
+      # Red here is not the verdict: the retry below separates FAILED from FLAKY.
+      - name: Run the affected tests (contract floor + affected modules and the complete Node lane)
+        id: selected
+        timeout-minutes: 95
+        continue-on-error: true
+        env:
+          BASE: ${{ steps.base.outputs.base }}
+        run: python scripts/run_tests.py --selected --base "$BASE" --sequential --keep-going --evidence-dir "$RUNNER_TEMP/post-merge"
+      - name: Run each red once more (FAILED or FLAKY)
+        id: classify
+        if: ${{ !cancelled() && steps.base.outcome == 'success' }}
+        timeout-minutes: 15
+        run: python scripts/post_merge_check.py classify --evidence-dir "$RUNNER_TEMP/post-merge"
+      - name: Find the merge that broke each FAILED test
+        id: attribute
+        if: ${{ !cancelled() && steps.classify.outcome == 'success' }}
+        timeout-minutes: 20
+        env:
+          BASE: ${{ steps.base.outputs.base }}
+        run: python scripts/post_merge_check.py attribute --evidence-dir "$RUNNER_TEMP/post-merge" --base "$BASE" --head "$GITHUB_SHA"
+      # Also after a retry or bisection cut short by its timeout: what they recorded is handed over,
+      # and only a finished bisection ever names a pull request.
+      - name: Hand each red to its author and to Ouroboros; close issues that are green again
+        id: route
+        if: ${{ !cancelled() && steps.base.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python scripts/post_merge_check.py route --evidence-dir "$RUNNER_TEMP/post-merge" --run-url "$RUN_URL"
+      - name: Upload the evidence
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: post-merge-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/post-merge/
+          retention-days: 14
+          if-no-files-found: ignore
+      # The run is red when a test failed again on its retry or the check could not finish.
+      - name: Publish the result
+        if: ${{ !cancelled() }}
+        run: python scripts/post_merge_check.py summary --evidence-dir "$RUNNER_TEMP/post-merge"

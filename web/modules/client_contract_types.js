@@ -2,6 +2,17 @@
  *  `api_types.js` indexes: the served main interface, the setup bootstrap, the settings writers' refusal,
  *  the auth gate's JSON login and the `GET /api/contract` document. */
 /**
+ * @typedef {Object} CommandInbound
+ * @property {Object=} client_surface
+ * @property {"command"} type
+ * @property {string} cmd
+ */
+/**
+ * Emergency request accepted on this connection; does not prove process exit.
+ * @typedef {Object} PanicAcceptedOutbound
+ * @property {"panic_accepted"} type
+ */
+/**
  * The main interface THIS server generation serves at `/` and `/static`: the applied selection (fixed until
  * the core restarts), not the requested value and not an asset digest.
  * @typedef {Object} ServedUiState
@@ -120,6 +131,7 @@
  * The wizard's starting values; besides these keys it carries one key per `contract.providerFields[].stateKey`
  * (a configured secret reads as `secretPlaceholder`), `contract.budgetFields[].stateKey` and `contract.modelSlots[].stateKey`.
  * @typedef {Object} SetupInitialState
+ * @property {string} safetyModel
  * @property {string} providerProfile
  * @property {string} reviewEnforcement
  * @property {string} runtimeMode
@@ -372,7 +384,8 @@
  * Additive /api/chat/history row fields on `system_type: "skill_review"` rows:
  * the exact-job reference the producer already writes into chat.jsonl. A row
  * carrying a non-empty `job_id` lets the Chat card lazily fetch the rendered
- * review via GET /api/skills/{skill}/review-history/{job_id}; rows without it
+ * review via GET /api/skills/{skill}/review-history/{record_id or job_id} (the
+ * review record when the row names one, else the job); rows without either
  * (legacy full-text rows) keep local expansion. All fields are additive and
  * safely ignorable by renderers.
  * @typedef {Object} SkillReviewHistoryRowFields
@@ -380,6 +393,7 @@
  * @property {string=} status
  * @property {string=} content_hash
  * @property {string=} job_id
+ * @property {string=} record_id
  * @property {number=} review_round
  * @property {number=} snapshot_attempt
  */
@@ -463,6 +477,7 @@
 
 /**
  * @typedef {Object} OwnerSafetyModeRequest
+ * @property {'your_work'|'consciousness'=} kind
  * @property {'full'|'light'|'off'} mode
  */
 
@@ -471,6 +486,36 @@
  * `/api/desktop/background` and `PATCH /api/claudexor/credential-profiles/...`.
  * @typedef {Object} OwnerEnabledRequest
  * @property {boolean} enabled
+ */
+
+/**
+ * Connect an installed connector; omitted account and conversation ids default to empty.
+ * @typedef {Object} PlaceConnectRequest
+ * @property {string} connector
+ * @property {string=} account_id
+ * @property {string=} conversation_id
+ */
+
+/**
+ * Confirm a person; omitted account_id uses the place's account.
+ * @typedef {Object} PlaceOwnerAccountRequest
+ * @property {string} platform_actor_id
+ * @property {string=} label
+ * @property {string=} account_id
+ */
+
+/**
+ * Atomic owner choices. Send a nonempty body; expected_revision compares before writing.
+ * @typedef {Object} PlaceUpdateRequest
+ * @property {'active'|'silent'|'paused'=} state
+ * @property {Array<string>=} wakes
+ * @property {string=} add_note
+ * @property {string=} remove_note
+ * @property {string=} working_folder
+ * @property {string=} model
+ * @property {PlaceOwnerAccountRequest=} confirm_owner_account
+ * @property {string=} revoke_owner_account
+ * @property {number=} expected_revision
  */
 
 /**
@@ -693,6 +738,9 @@
  * @property {string} task_id
  * @property {string=} root_task_id
  * @property {('resumed'|'settled')=} late_phase
+ * @property {boolean=} tree_only
+ * @property {boolean=} owner_pause_released
+ * @property {boolean=} snapshot_persisted
  * @property {boolean=} exact_continuation
  * @property {string=} grant_id
  * @property {number=} grant_generation
@@ -715,6 +763,7 @@
  * @property {string} at
  * @property {'owed'|'delivered'|'forwarded'} delivery
  * @property {string} request_id
+ * @property {string=} reason_code  // 'awaiting_recipient_read' until a paused, held or queued author reads it
  */
 
 /**
@@ -783,10 +832,77 @@
  */
 
 /**
+ * One start the page did not outlive (web/modules/holds.js).
+ * @typedef {Object} UiHold
+ * @property {string} key
+ * @property {string} rev
+ */
+
+/**
+ * @typedef {Object} UiHoldsSurface
+ * @property {boolean=} pywebview
+ * @property {boolean=} telegram
+ */
+
+/**
+ * `POST /api/ui/holds`.
+ * @typedef {Object} UiHoldsRequest
+ * @property {Array<UiHold>} holds
+ * @property {UiHoldsSurface=} surface
+ */
+
+/**
+ * @typedef {Object} UiHoldsResponse
+ * @property {boolean} ok
+ * @property {number} named
+ */
+
+/**
+ * `POST /api/widgets/fault` (`gateway/widgets.py`): one fault a mounted module widget's card shows; identity is
+ * the page's mount, the rest the frame's clipped report.
+ * @typedef {Object} WidgetFaultRequest
+ * @property {string} skill
+ * @property {string} tab_id
+ * @property {string} revision
+ * @property {'board'|'message'} where
+ * @property {'error'|'rejection'|'csp'} kind
+ * @property {string} message
+ * @property {string} source
+ * @property {number} line
+ */
+
+/**
+ * @typedef {Object} WidgetFaultResponse
+ * @property {boolean} ok
+ * @property {boolean} logged
+ */
+
+/**
  * `POST`/`DELETE /api/cards/{card_id}/pin`.
  * @typedef {Object} CardPinResponse
  * @property {boolean} ok
  * @property {string} card_id
  * @property {boolean} pinned
  * @property {string=} pinned_at
+ */
+
+/**
+ * @typedef {Object} OwnerSafetyRulesRequest
+ * @property {string} rules
+ */
+
+/**
+ * @typedef {Object} OwnerSafetyRulesResponse
+ * @property {boolean} ok
+ * @property {string} rules
+ */
+
+/**
+ * @typedef {Object} OwnerSafetyModelRequest
+ * @property {Object} settings
+ */
+
+/**
+ * @typedef {Object} OwnerSafetyModelResponse
+ * @property {boolean} ok
  */

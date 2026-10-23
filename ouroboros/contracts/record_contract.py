@@ -179,7 +179,7 @@ ANCHOR_ROWS: tuple[AnchorRow, ...] = (
         nullable=_fields("status_code"),
         optional=_fields("retry_same_request provider_code provider_message requested_profile observed_route "
                          "request_ref operation_id physical_attempt_id attempt_custody_state provider_error_type "
-                         "transport_cause_type " + _CONTEXT_FIT),
+                         "transport_cause_type stream_incomplete generation_id explicit_timeout model_output_received " + _CONTEXT_FIT),
         content=_fields("error provider_message"), natural_key=("llm_call_id",),
     ),
     AnchorRow(
@@ -316,7 +316,8 @@ ACCOUNTING_RULE = (
 COVERAGE_GAPS = (
     "No canonical row marks a task start: the task's store row (get_task_result / query_data) with status running is the start fact.",
     "Worker rows (llm_round, llm_api_error, task_received, task_error) of a task with a child drive vanish "
-    "with the drive after retention; canonical rows and the archive stay. Ship child drives before then.",
+    "with the drive after retention; canonical rows and the archive stay. API-child timeout handovers retain "
+    "trace_refs.timeout_repeat and its call sources in the task result; other raw rows require the drive.",
     "llm_round covers a task's main loop only: review, search, vision and memory calls appear only as "
     "llm_usage, without a duration. A round that never settles has no llm_round: its failed attempts are "
     "llm_api_error rows or the non-anchor rows named below.",

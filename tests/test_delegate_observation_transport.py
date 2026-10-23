@@ -569,6 +569,12 @@ def test_a_delivered_refused_wake_is_acknowledged_by_the_loop_and_the_next_wait_
         execution.process_tool_results([refused], messages, {"tool_calls": []}, lambda *_a, **_k: None,
                                        tools=registry)
         assert [m["tool_call_id"] for m in messages] == ["wait-refused"]
+        from ouroboros import delegate_supervision as supervision
+        from ouroboros.working_checkpoint import flush_content_acks
+
+        assert supervision._load_state(ctx, "")["pending_wake"]
+        flush_content_acks(ctx)  # The loop flushes only after its incorporated save.
+        assert not supervision._load_state(ctx, "")["pending_wake"]
         observed = json.loads(wait("wait-next")["result"])
     finally:
         executor.shutdown()

@@ -380,3 +380,17 @@ def test_effective_retry_read_keeps_predecessor_unknown_effect_history(tmp_path,
     data = load_task_result(tmp_path, "new")
     result = _get_task_result(ctx, "old", **({"known_result_sha256": _child_result_sha256(data)} if known else {}))
     assert "original-op" in result and "external effects remain unknown" in result, result
+
+
+@pytest.mark.parametrize('status, owns', [('read', False), ('delivered', False), ('unconfirmed', True), (None, True)])
+def test_a_read_steer_receipt_discharges_its_message_handoff(tmp_path, status, owns):
+    """A relayed message acknowledged as read settles its handoff; nothing is resent."""
+    from ouroboros.project_dialogue import append_chat_annotation
+    from ouroboros.tool_custody import claim_still_owns_effect
+
+    claim = {'state': 'returned', 'control_receipts': [
+        {'type': 'steer_task', 'task_id': '', 'client_message_id': 'quiz_answer:root:1', 'routing_token': 'relay-1'}]}
+    if status is not None:
+        append_chat_annotation(tmp_path, 'quiz_answer:root:1', action='steer_task', target='child',
+                               status=status, routing_token='relay-1')
+    assert claim_still_owns_effect(tmp_path, claim) is owns

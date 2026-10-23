@@ -63,6 +63,26 @@ def retire_synthetic_retention(directory, *reasons) -> bool:
     return True
 
 
+def retention_left_in(directory) -> str:
+    """Name the retention markers beneath ``directory`` with each one's first reason; "" when none.
+
+    The conftest retention guard's report over release_scratch's own walk: an unreadable
+    subtree, which that walk also counts, is not a marker a test left.
+    """
+    from ouroboros.test_environment import RETENTION_MARKER, retention_markers
+
+    left = []
+    for marker in retention_markers(directory):
+        if marker.name != RETENTION_MARKER:
+            continue
+        try:
+            reason = marker.read_text(encoding="utf-8").splitlines()[0]
+        except (OSError, UnicodeError, IndexError):
+            reason = "unreadable"
+        left.append(f"{marker.parent} ({reason})")
+    return "; ".join(left[:3]) + (f" (+{len(left) - 3} more)" if len(left) > 3 else "")
+
+
 def reap_test_process_group(proc, *, timeout_sec: float = 5.0) -> None:
     """Reap a test child started in its own session; prove its helpers are gone.
 

@@ -105,7 +105,7 @@ EXPECTED_TOOLS = [
     "compact_context", "set_tool_timeout", "request_restart", "prepare_self_change",
     "inspect_harness", "maintain_harness", "inspect_subagent",
     "promote_to_stable", "schedule_subagent", "schedule_followup", "manage_schedules",
-    "configure_presence", "initiate_presence",
+    "configure_presence",
     "integrate_subagent_patch", "compare_subagent_patches",
     # C1: the explicit acceptance seam for a delegated run's captured patch —
     # a first-class tool, so the registry contract must name it.
@@ -127,9 +127,7 @@ EXPECTED_TOOLS = [
     "vcs_pull_ff", "vcs_restore", "vcs_revert",
     "fetch_pr_ref", "create_integration_branch", "cherry_pick_pr_commits",
     "stage_adaptations", "stage_pr_merge", "vcs_rollback",
-    "list_github_prs", "get_github_pr", "get_github_checks", "comment_on_pr", "pr_merge",
-    "list_github_issues", "get_github_issue", "comment_on_issue",
-    "close_github_issue", "create_github_issue",
+    "github_read", "github_write", "pr_merge",
     "codebase_health", "knowledge_read", "knowledge_write", "knowledge_list",
     "chronicle_write", "memory_read", "memory_mark",
     "journal_read", "journal_write", "workpad_read", "workpad_write",
@@ -201,15 +199,16 @@ def test_tool_schemas_have_no_empty_enum_values(registry):
         _walk(schema.get("function", {}).get("parameters", {}), schema.get("function", {}).get("name", "?"))
 
 
-def test_github_create_issue_schema_fields(registry):
-    schema = registry.get_schema_by_name("create_github_issue")["function"]
+def test_github_write_schema_fields(registry):
+    schema = registry.get_schema_by_name("github_write")["function"]
     props = schema["parameters"]["properties"]
-    assert schema["parameters"]["required"] == ["title"]
+    assert schema["parameters"]["required"] == ["method"]
+    assert "create_issue" in props["method"]["enum"]
     assert props["title"]["type"] == "string"
     assert props["body"]["type"] == "string"
     assert props["body"]["default"] == ""
-    assert props["labels"]["type"] == "string"
-    assert props["labels"]["default"] == ""
+    assert props["labels"]["type"] == "array"
+    assert "default" not in props["labels"]  # Omitted keeps labels; only an explicit [] clears them.
 
 
 def test_tool_execute_basic(registry):
@@ -234,11 +233,10 @@ def test_frozen_registry_includes_packaged_tool_modules(monkeypatch):
         "review_status",
         "plan_task",
         "vcs_rollback",
-        # github.py is in _FROZEN_TOOL_MODULES — PR inspection tools must work in frozen builds
-        "list_github_prs",
-        "get_github_pr",
-        "get_github_checks",
-        "comment_on_pr",
+        # github.py is in _FROZEN_TOOL_MODULES — the GitHub tools must work in frozen builds
+        "github_read",
+        "github_write",
+        "pr_merge",
         "query_code",
     }
     missing = expected_subset - available
@@ -658,7 +656,7 @@ def test_no_module_defines_the_same_top_level_name_twice():
     root = pathlib.Path(__file__).resolve().parents[1]
     offenders = []
     for path in sorted(root.rglob("*.py")):
-        parts = set(path.parts)
+        parts = set(path.relative_to(root).parts)
         if parts & {".git", "node_modules", "venv", ".venv", "build", "dist"}:
             continue
         try:
@@ -680,3 +678,21 @@ def test_no_module_defines_the_same_top_level_name_twice():
             if count > 1 and not name.startswith("__"):
                 offenders.append(f"{path.relative_to(root)}: {name} defined {count}x")
     assert not offenders, "Top-level names defined more than once:\n" + "\n".join(offenders)
+
+
+@pytest.mark.parametrize("ancestor, relative, detected", [
+    *[(name, "dup.py", True) for name in (".git", "node_modules", "venv", ".venv", "build", "dist")],
+    *[("checkout", f"{name}/dup.py", False) for name in (".git", "node_modules", "venv", ".venv", "build", "dist")],
+    ("build", "Build/dup.py", True),
+])
+def test_duplicate_scan_exclusions_are_relative_to_checkout(tmp_path, monkeypatch, ancestor, relative, detected):
+    root = tmp_path / ancestor / "source"
+    path = root / relative
+    path.parent.mkdir(parents=True)
+    path.write_text("x = 1\nx = 2\n", encoding="utf-8")
+    monkeypatch.setitem(globals(), "__file__", str(root / "tests" / "test_smoke.py"))
+    if detected:
+        with pytest.raises(AssertionError, match="dup.py: x defined 2x"):
+            test_no_module_defines_the_same_top_level_name_twice()
+    else:
+        test_no_module_defines_the_same_top_level_name_twice()

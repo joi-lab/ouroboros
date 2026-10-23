@@ -135,11 +135,17 @@ function statusParts(server) {
     const status = mcpStatusByServer[String(server.id ?? '')] || null;
     const toolCount = status ? Number(status.tool_count || 0) : 0;
     const lastError = status ? String(status.last_error || '') : '';
-    const lastRefreshed = status ? String(status.last_refreshed || '') : '';
+    const listedAt = status ? String(status.listed_at || '') : '';
+    const attempt = status?.latest_attempt;
     const tools = status && Array.isArray(status.tools) ? status.tools : [];
-    const badge = lastError ? [`Error: ${lastError}`, 'mcp-server-status-danger']
-        : toolCount > 0 ? [`${toolCountLabel(toolCount)} discovered`, 'mcp-server-status-ok']
-            : lastRefreshed ? ['0 tools discovered', 'mcp-server-status-warn'] : ['Not refreshed yet', 'mcp-server-status-muted'];
+    let label = listedAt ? `${toolCountLabel(toolCount)} (listed ${listedAt})`
+        : attempt ? 'Never listed under the current configuration' : 'Not listed yet';
+    if (attempt?.ok === false) label += `; last attempt ${attempt.at} failed: ${attempt.error}`;
+    else if (attempt?.partial) label += `; last attempt ${attempt.at} was partial`;
+    else if (lastError) label += `; ${lastError}`;
+    if (status?.publication_error) label += `; catalog publication failed: ${status.publication_error}`;
+    const badge = [label, lastError || status?.publication_error ? 'mcp-server-status-danger'
+        : toolCount > 0 ? 'mcp-server-status-ok' : listedAt ? 'mcp-server-status-warn' : 'mcp-server-status-muted'];
     const toolItems = tools.map((t) => `
                 <li>
                     <strong>${escapeHtml(t.name || t.prefixed_name || '')}</strong>
@@ -400,9 +406,11 @@ function bindCardEvents(card) {
         setCardMessage(server, 'Refreshing tools...', 'muted', 'refresh');
         try {
             const data = await jsonPost('/api/mcp/refresh', { server_id: sid }, { rejectOkFalse: true });
+            if (data.published === false) throw new Error(data.publication_error || 'Catalog was not published');
             await refreshStatus();
             if (mcpServers.includes(server)) setCardMessage(server, `Saved catalog refreshed — ${toolCountLabel(Number(data.tool_count || 0))} discovered. No tool was called.`, 'ok', 'refresh');
         } catch (err) {
+            await refreshStatus();
             if (mcpServers.includes(server)) setCardMessage(server, `Refresh failed: ${err && err.message ? err.message : err}`, 'danger', 'refresh');
         } finally {
             setPending(server, 'refresh', false);

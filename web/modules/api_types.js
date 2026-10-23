@@ -1,4 +1,4 @@
-/** Dependency-free JSDoc mirror of `ouroboros.gateway.contracts`; the interface-language envelopes (`UiI18n*`) sit in ./ui_i18n_types.js, the model-route previews in ./model_route_types.js, the Dashboard storage envelopes (`Storage*`) in ./storage_types.js, the MCP import preview in ./mcp_import_types.js, the replaceable-client envelopes (`ServedUiState`, setup bootstrap, `/api/contract`, chat history rows, journey request bodies) in ./client_contract_types.js, the product-management envelopes (skills, marketplaces, accounts, local model, MCP, update status) in ./management_contract_types.js, the owner-decision ingress in ./decision_types.js. */
+/** Dependency-free JSDoc mirror of `ouroboros.gateway.contracts`; the interface-language envelopes (`UiI18n*`) sit in ./ui_i18n_types.js, the model-route previews in ./model_route_types.js, the Dashboard storage envelopes (`Storage*`) in ./storage_types.js, the Dashboard Evolution history (`Evolution*`) in ./evolution_types.js, the MCP import preview in ./mcp_import_types.js, the replaceable-client envelopes (`ServedUiState`, setup bootstrap, `/api/contract`, chat history rows, journey request bodies) in ./client_contract_types.js, the product-management envelopes (skills, marketplaces, accounts, local model, MCP, update status) in ./management_contract_types.js, the owner-decision ingress in ./decision_types.js. */
 /**
  * @typedef {Object} CostPresentation
  * @property {'own'|'root_tree'} scope
@@ -93,13 +93,8 @@
 /** @typedef {import('./task_activity_types.js').ActiveDirectTurn} ActiveDirectTurn */
 /** @typedef {import('./task_activity_types.js').ActiveChatActivity} ActiveChatActivity */
 /** @typedef {import('./task_activity_types.js').ToolVerificationFact} ToolVerificationFact */
-/**
- * @typedef {Object} EvolutionDataResponse
- * @property {Object[]} points
- * @property {Object[]=} checkpoints
- * @property {string} generated_at
- * @property {boolean} cached
- */
+/** @typedef {import('./evolution_types.js').EvolutionRefresh} EvolutionRefresh */
+/** @typedef {import('./evolution_types.js').EvolutionDataResponse} EvolutionDataResponse */
 /**
  * @typedef {Object} HealthResponse
  * @property {"ok"} status
@@ -245,11 +240,8 @@
  * @property {string=} project_id  // per-project memory scope (v6.32.0)
  * @property {Object=} client_surface  // raw sending-surface observables measured at send time (pywebview/ua/viewport/matchMedia/captured_at; optional IANA timezone)
  */
-/**
- * @typedef {Object} CommandInbound
- * @property {"command"} type
- * @property {string} cmd
- */
+/** @typedef {import('./client_contract_types.js').CommandInbound} CommandInbound */
+/** @typedef {import('./client_contract_types.js').PanicAcceptedOutbound} PanicAcceptedOutbound */
 /**
  * @typedef {Object} ChatOutbound
  * @property {{kind:'publication'|'answer'|'closure',state:'owed'|'delivered',reason_code?:string,dismissed?:boolean}=} question_delivery Canonical settlement delivery fact.
@@ -302,15 +294,12 @@
  *   physical task it could not settle when that differed from the displayed id.
  * @property {string=} toast_once
  * @property {string=} toast_tone
- *   The incident's valence for the one-shot toast (warn/ok/error); absent =
- *   the alarm tone.
+ *   The incident's valence for the one-shot toast (warn/ok/error); absent = the alarm tone.
  * @property {boolean=} task_id_pending
- *   X3: a repair receipt whose managed task id does not exist yet (minted at
- *   promotion) — typed truth instead of an invented id.
+ *   X3: a repair receipt whose managed task id does not exist yet (minted at promotion); typed truth, not an invented id.
  * @property {Object=} lifecycle
  * @property {Object=} lifecycle_pointer
- *   C4 multi-chat dedupe: a duplicate lifecycle initiator's typed pointer to the
- *   job that already owns the routing ({job_id, kind, target, status, chat_id}).
+ *   C4 multi-chat dedupe: a duplicate initiator's typed pointer to the job that owns the routing ({job_id, kind, target, status, chat_id}).
  * @property {string=} subagent_event
  * @property {string=} subagent_task_id
  * @property {string=} root_task_id
@@ -329,11 +318,12 @@
  * @property {string=} effort_level  The effort decided at dispatch (a session row: its leaf's); empty = unknown, no chip.
  * @property {string=} effort_requested  The parent's request when it made one.
  * @property {string=} effort_source  auto | pin | model_name | cyber.
- * @property {string=} executor_route
- *   Phase 6: the OPAQUE harness route RESOLVED AT DISPATCH for this bubble /
- *   subagent (delegated routes only) — the route it was sent to, not a receipt
- *   from the engine saying where it landed. Absent/empty = the ordinary native
- *   path; no chip is drawn.
+ * @property {string=} executor_route  Opaque delegated harness route resolved at dispatch, not an engine receipt; absent = ordinary native presentation, no chip.
+ * @property {Object=} parent_cognitive_route  Recorded parent snapshot; never inferred from the child's model lane.
+ * @property {string=} coordinator_route
+ * @property {boolean=} use_local_model
+ * @property {string=} coordinator_billing  Recorded subscription | measured | unknown; never inferred on replay.
+ * @property {string=} coordinator_provenance
  * @property {Object=} executor_observation
  *   Latest observed progress actor, bound to own task/attempt/run/revision.
  *   model_source distinguishes requested and observed; not a terminal receipt.
@@ -459,6 +449,7 @@
  *   A host-stamped placement fact for a task-keyed System row: "timeline" = a timeline item of the task's card, "reviews" = the card's Reviews group carries the fact (the row is still attached to the card); absent = an ordinary row.
  * @property {string=} card_row_id  // the row's stable identity across live delivery, outbox replay and history
  * @property {number=} card_row_revision  // canonical source order, independent of delivery timestamp
+ * @property {"retained_work"=} terminal_receipt  // a placed row the host types as a terminal receipt (Wrap up's saved work), not progress
  * @property {Object=} late_evidence
  *   Late-review identity, reviewed revision and exact applied source_ref served by
  *   taskSourceDownloadUrl; not an original reviewer transcript or a copy of the row.
@@ -470,7 +461,7 @@
  * @property {Object=} terminal_time  // host-owned occurrence; ts remains publication time
  * @property {string=} completion_answer  // a Project root's model-authored final answer, mirrored into Main
  * @property {string=} completion_reason One recorded nonclean-outcome fact beside the answer.
- * @property {Object=} completion_notice Transport view: neutral, detail, phase, optional preserved salvage.
+ * @property {Object=} completion_notice Transport view: neutral/detail/phase/salvage; Main adds cause and undescribed codes.
  * @property {string=} delivery_id Stable logical publication identity across transport retries.
  * @property {string=} set_at  // a `reminder` row: when its words were written (live frame only; the text carries the signature)
  * @property {string=} scheduled_for  // a `reminder` row: the due point it was written for
@@ -965,54 +956,7 @@
  * @property {string} repair_hint
  */
 
-/**
- * Skill review and owner attestation outcome (`gateway/management_contracts.py::SkillReviewResponse`).
- * @typedef {Object} SkillReviewResponse
- * @property {string} skill
- * @property {string} status  // clean | warnings | blockers | pending
- * @property {string=} content_hash
- * @property {string=} error
- * @property {boolean=} ok  // attest only
- * @property {number=} status_code  // attest refusal only
- * @property {boolean=} pending  // attest only: the job outlasted the answer bound; job_id and message name it
- * @property {string=} message  // attest only, with pending
- * @property {string[]=} reviewer_models
- * @property {string=} review_profile
- * @property {Object[]=} findings
- * @property {Object[]=} raw_actor_records
- * @property {*=} advisory_result
- * @property {Object=} review_gate
- * @property {boolean=} executable_review
- * @property {*=} auto_flow
- * @property {string[]=} auto_granted_keys
- * @property {string[]=} requested_keys
- * @property {string[]=} auto_granted_permissions
- * @property {string[]=} requested_permissions
- * @property {string=} deps_status
- * @property {string=} deps_error
- * @property {string=} extension_action
- * @property {string=} extension_reason
- * @property {string=} extension_process
- * @property {string=} extension_server_reconcile
- * @property {string|null=} extension_load_error
- * @property {boolean|null=} extension_live_loaded
- * @property {*=} convergence_hint
- * @property {string=} job_id
- * @property {string=} job_status
- * @property {string=} group_id
- * @property {number=} review_round
- * @property {number=} snapshot_attempt
- * @property {boolean=} snapshot_revised
- * @property {string=} task_id
- * @property {string=} root_task_id
- * @property {string=} origin_task_id
- * @property {string=} origin_root_task_id
- * @property {string=} presentation_owner_task_id
- * @property {number=} chat_id
- * @property {string=} source
- * @property {string=} terminal_reason
- * @property {Object[]=} executions
- */
+/** @typedef {import('./management_contract_types.js').SkillReviewResponse} SkillReviewResponse */
 
 /**
  * `POST /api/skills/{skill}/grants`; refusals use `SkillActionRefusal`, slow setup {ok, pending: true, job_id, message}.
@@ -1204,6 +1148,7 @@
  * @property {Object.<string, {name:string, files:number, size:number, excluded:number, available:boolean}>=} artifact_archives
  *   Per top-level result directory, what `?archive=<dir>` would stream now (members from one
  *   confined stat each, rows left out counted); a folder offers its `.zip` only when `available`.
+ * @property {{name:string, request_id:string}=} wrap_up_document  Wrap up's saved-work document, written on read by `?wrap_up=<request_id>` (`taskWrapUpDocumentUrl`); no size or digest before download.
  * @property {Object.<string,Object>=} model_waits
  * @property {TaskCostBreakdown=} cost_breakdown
  * @property {{status: 'pending'|'problem'|'complete', pending_count: number, problem_count: number, promoted_ref_count: number, promoted_source_handle_count: number, problem_reasons?: Array<{reason:string,count:number}>}=} history_retention
@@ -1356,7 +1301,7 @@
  */
 /**
  * @typedef {Object} ScheduleActionResponse
- * @property {boolean} ok  // the requested state was ACHIEVED and both audit records landed (restored_not_ready: changed, not ok)
+ * @property {boolean} ok  // the requested state was ACHIEVED and both audit records landed
  * @property {boolean} changed  // the durable fact, whatever the audit did
  * @property {string} status
  * @property {string} schedule_id
@@ -1527,6 +1472,7 @@
  * @property {string=} task_id
  * @property {UpdateMergePlan=} merge_plan
  * @property {string=} error
+ * @property {string=} keep_branch
  */
 
 /**
@@ -1589,7 +1535,7 @@ export const MAX_QUIZ_OPTIONS = 6;
 // Mirror task_decision._COMMENT_MAX: ingress refuses longer comments, never
 // truncates; cards must offer only comments the ingress can deliver verbatim.
 export const MAX_DECISION_COMMENT = 2000;
-export const GATEWAY_CONTRACT_VERSION = '7.7.1';
+export const GATEWAY_CONTRACT_VERSION = '7.8.0';
 /** @typedef {import('./client_contract_types.js').ChatHistoryPosition} ChatHistoryPosition */
 /** @typedef {import('./client_contract_types.js').ChatHistoryResponse} ChatHistoryResponse */
 

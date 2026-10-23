@@ -226,7 +226,7 @@ def _offline_light(monkeypatch):
     monkeypatch.setattr(context_fit, "resolve_context_fit_route", lambda task, *, allow_fetch: (
         {"model": task["model"], "provider": "openrouter"},
         CapabilityEvidence(1_000_000, "confirmed", "test", "route-test", model=task["model"], provider="openrouter")))
-    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_: 1.0)
+    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_, **_kw: 1.0)
 
 
 def _recorded_call_types(monkeypatch):
@@ -675,9 +675,10 @@ def _actor(env, task_id, drive_root=None, **fields):
 
 def _speaker(env, task_id, *targets):
     """A Presence speaker whose host-minted ceiling selects exactly ``targets`` beyond its baseline."""
-    from ouroboros.presence_authority import build_presence_capability_ceiling, presence_ceiling_payload
-    from ouroboros.presence_capabilities import PresenceProfileResolution, PresenceSelection, PresenceToolTarget
-    from ouroboros.presence_runtime import ResolvedPresenceRuntime
+    from ouroboros.presence_authority import presence_ceiling_payload
+    from tests.frozen_presence_authority import build_presence_capability_ceiling
+    from tests.frozen_presence_capabilities import PresenceProfileResolution, PresenceSelection, PresenceToolTarget
+    from tests.frozen_presence_runtime import ResolvedPresenceRuntime
 
     selected = targets or (PresenceToolTarget("builtin", "chat_history"),)
     resolution = PresenceProfileResolution(
@@ -778,7 +779,7 @@ def test_context_readers_open_canonical_history_in_every_mode_and_focus(tmp_path
 
 def test_a_presence_ceiling_admits_only_what_it_selected(tmp_path, monkeypatch):
     import ouroboros.config as cfg
-    from ouroboros.presence_capabilities import PresenceResourceTarget, PresenceToolTarget
+    from tests.frozen_presence_capabilities import PresenceResourceTarget, PresenceToolTarget
 
     monkeypatch.setattr(cfg, "DATA_DIR", tmp_path / "data")
     env, memory = _context_world(tmp_path)

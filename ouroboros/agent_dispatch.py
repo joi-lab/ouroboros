@@ -40,7 +40,8 @@ def _agent():
 
 
 def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
-                           lane: Optional["SubagentLaneResolution"] = None) -> str:
+                           lane: Optional["SubagentLaneResolution"] = None,
+                           *, cognitive_route: Optional[Dict[str, Any]] = None) -> str:
     """The child's VISIBLE marker for a substrate decision it did not make ('' = silent).
 
     The rule table's `auto` rows are only honest if the child can see which way they
@@ -65,18 +66,25 @@ def dispatch_executor_note(decision: Optional[SubagentExecutorResolution],
         route = decision.route.route_id if decision.route else ""
         configured_atomic = lane is not None and lane.provenance == "configured_subagent"
         if configured_atomic:
+            from ouroboros.supervisor_route import cognitive_route_provenance
+
+            provenance = cognitive_route_provenance(cognitive_route)
+            cognition = (f" Your cognitive route is {lane.model} ({provenance}); "
+                         "its calls bill as that route bills. You may change it with switch_model. "
+                         if provenance else " ")
             return (
                 f"EXECUTOR: your parent selected the configured agent-session route ({route}). "
-                "You are its Ouroboros NANNY. The host starts the exact configured leaf run "
-                "BEFORE your first metered round; the startup/wake receipt in this context "
-                "is the truth about that run, and waiting on it is your own call "
+                "You are its Ouroboros NANNY." + cognition + "For fresh work the host starts the exact leaf "
+                "before your first round. Restored supervision follows its continuation receipt; "
+                "the receipt states custody, and waiting is your own call "
                 "(delegate_wait when you want its facts). Your "
-                "metered rounds are for judgment — verify and integrate what the run "
+                "supervisory rounds are for judgment — verify and integrate what the run "
                 "produces, answer its authorized questions, decide recovery — never for "
-                "rebuilding its work: co-building beside a delegated run is a metered "
-                "duplicate of already-paid work. After a terminal failure, retry or replace "
-                "through delegate_start(retry_of=..., prompt=...) only once cancellation and "
-                "terminal settlement are verified. Auxiliary or API-backed work must be an "
+                "rebuilding its work: co-building beside a delegated run is a "
+                "duplicate of already-paid work. After a terminal failure, replace through "
+                "delegate_start(prompt='') only once cancellation and terminal settlement are "
+                "verified; an unknown start outcome is retried with "
+                "delegate_start(retry_of=..., prompt=''). Auxiliary or API-backed work must be an "
                 "explicit separate child, so its authorship and spend remain visible. When "
                 "no physical run exists and none can be started, record the typed zero-run "
                 "terminal through verify_and_record(contract_kind=delegation_zero_run, "

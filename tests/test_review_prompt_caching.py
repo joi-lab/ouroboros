@@ -249,9 +249,9 @@ def _main_loop_messages(system_ttl: dict) -> list:
             {"id": f"call_{idx}", "function": {"name": "zeta_tool", "arguments": "{}"}},
         ]})
         messages.append({"role": "tool", "tool_call_id": f"call_{idx}", "content": f"output {idx}"})
-    seal_task_transcript(messages, keep_active=2, min_prefix_tokens=0)
-    sealed = [m for m in messages if m["role"] == "tool" and isinstance(m["content"], list)]
-    assert len(sealed) == 1, "fixture must carry exactly one rolling cache anchor"
+    seal_task_transcript(messages, min_prefix_tokens=0)
+    sealed = [m for m in messages if "cache_control" in m]
+    assert [m["role"] for m in sealed] == ["tool"], "fixture must carry exactly one rolling cache anchor"
     return messages
 
 
@@ -270,7 +270,7 @@ def test_short_transcript_payload_declares_exactly_four_breakpoints(monkeypatch)
         ]},
         {"role": "user", "content": "task"},
     ]
-    seal_task_transcript(messages, keep_active=5, min_prefix_tokens=0)
+    seal_task_transcript(messages, min_prefix_tokens=0)
     payload, usage = _send_direct_anthropic(monkeypatch, messages, _tools())
 
     assert len(_deep_markers(payload)) == LLMClient._MAX_CACHE_BREAKPOINTS
@@ -520,6 +520,7 @@ def test_global_ttl_docstrings_name_every_consumer():
         if p.name not in definition_sites and call.search(p.read_text(encoding="utf-8"))
     )
     assert consumers == [
+        "ouroboros/effort_evidence.py",
         "ouroboros/llm_attempt.py",
         "ouroboros/tools/review_helpers.py",
         "ouroboros/usage_accounting.py",
@@ -531,8 +532,14 @@ def test_global_ttl_docstrings_name_every_consumer():
         f"the setting: {consumers}"
     )
     assert "cached_prompt_blocks" in finalizer_doc  # names the other reader
+    assert "session_prompt_cache_ttl_request" in finalizer_doc
     resolver_doc = resolve_prompt_cache_ttl.__doc__ or ""
-    for name in ("_normalize_payload_cache_ttl", "cached_prompt_blocks", "_reservation_cost"):
+    for name in (
+        "_normalize_payload_cache_ttl",
+        "cached_prompt_blocks",
+        "session_prompt_cache_ttl_request",
+        "_reservation_cost",
+    ):
         assert name in resolver_doc, f"config's docstring omits the {name} consumer"
 
 
@@ -1011,21 +1018,42 @@ def test_triad_template_stable_part_has_no_dynamic_fields():
         assert stable_field not in dynamic
 
 
-def test_skill_review_prompt_stable_prefix_is_payload_independent(tmp_path):
-    from ouroboros import skill_review
+def test_skill_review_brief_stable_half_is_payload_independent(tmp_path):
+    import pathlib
 
-    p1, n1 = skill_review._build_review_prompt(
-        "demo", tmp_path / "demo", "{\"a\": 1}", "hash-one", "plugin.py\nprint('one')",
-    )
-    p2, n2 = skill_review._build_review_prompt(
-        "other", tmp_path / "other", "{\"b\": 2}", "hash-two", "plugin.py\nprint('two')",
-    )
-    assert n1 == n2
-    assert p1[:n1] == p2[:n2]  # governance prefix is byte-identical
-    assert "## Skill identity" not in p1[:n1]  # per-skill identity is dynamic-tail only
-    assert "hash-one" not in p1[:n1]
-    # Output contract (the anti-injection boundary) stays after the payload.
-    assert p1.rindex("## Output contract") > p1.index("## Skill files")
+    from ouroboros.tools import review_skill
+    from ouroboros.tools.governance_context import governance_context
+
+    rubric = review_skill.skill_rubric()
+    governance = governance_context(pathlib.Path(__file__).resolve().parents[1], surface="skill", delivery="packet",
+                                    checklist_section_text=rubric, layer="skill", manifest_facts={"type": "script", "declares": []})
+    brief = lambda subject: review_skill._brief(rubric, governance, subject, drive_root=tmp_path, change=None,
+                                                goal="", scope="", review_rebuttal="")
+    s1, d1 = brief(_skill_subject(tmp_path / "demo"))
+    s2, d2 = brief(_skill_subject(tmp_path / "other", name="other", content_hash="hash-two", manifest_json='{"b": 2}',
+                                  payload="plugin.py\nprint('two')"))
+    assert s1 == s2  # the governance half is byte-identical: the provider cache prefix
+    assert "## Skill identity" not in s1 and "hash-one" not in s1  # per-skill identity is dynamic-tail only
+    assert "hash-one" in d1 and "hash-two" in d2
+    # The output contract (the anti-injection boundary) is the tail of the dynamic half, after the identity;
+    # prepare_skill_review places the pasted payload between the two halves.
+    assert d1.rindex("## Your answer") > d1.index("## Skill identity")
+
+
+def _skill_subject(folder, *, name="demo", content_hash="hash-one", manifest_json='{"a": 1}',
+                   payload="plugin.py\nprint('one')"):
+    """A frozen skill subject without a payload on disk: enough for the brief's two halves."""
+    from ouroboros.tools.review_skill import SKILL_LAYER, FrozenSkillSubject
+    from ouroboros.tools.review_subject import ReviewSubjectSpec
+
+    import pathlib
+
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    spec = ReviewSubjectSpec(root_kind="skill_payload", root=str(folder), kind="skill", governance_root=str(repo),
+                             surface="skill", body_fact="false", body_how="skill_payload", layer=SKILL_LAYER)
+    return FrozenSkillSubject(spec=spec, diff_text=manifest_json, diff_sha="d" * 64, tree_sha=content_hash, parent_sha="",
+                              checkout=str(folder), skill=name, bucket="external", files=(("plugin.py", "s" * 64, 12),),
+                              manifest_json=manifest_json, payload_text=payload)
 
 
 def test_acceptance_request_messages_are_cache_blocked():

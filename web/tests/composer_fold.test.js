@@ -1,6 +1,6 @@
 // The row of capsules folds while the owner reads back through a room's history (composer_fold.js, owner 19.10 2A):
-// a run of reading back folds it and ☰ lands at the field's middle, whatever the folded field's height and past a reply
-// staged above the field; the way down, the latest, the field's focus, an open capsule, another layout and the end of
+// a run of reading back folds it and ☰ lands on the field's last line beside "+", whatever the folded field's height and
+// a reply staged inside the field; the way down, the latest, the field's focus, an open capsule, another layout and the end of
 // the room bring it back; a focused field keeps it; history paged in or let go, rows arriving or growing and a hidden
 // typing row move nothing, and a press on another control is that control's. Unless the owner's own gesture took the room
 // off its newest row (not a swipe begun in a card's frame, which the feed never sees, nor the app's own navigation such
@@ -25,9 +25,11 @@ function rig({ stack = true } = {}) {
         lastElementChild: typing, scrollHeight: 6000, clientHeight: 810, scrollTop: 5190,
         getBoundingClientRect: () => ({ bottom: 810 }), addEventListener: on('feed'), removeEventListener: off('feed'),
     };
-    // The field's box (.chat-text-row) lies the wrap's gap (8px) under the line; a staged reply's strip would lower it.
+    // The field's box (.chat-field) lies the wrap's gap (8px) under the line; a staged reply's strip makes it taller.
     const field = { top: 725, height: 52, getBoundingClientRect() { return { top: this.top, height: this.height }; },
         get offsetHeight() { return this.height; } };
+    // "+" rides on the field's last line: its centre 24px above the field's bottom, whatever the field holds.
+    const plus = { getBoundingClientRect: () => ({ top: field.top + field.height - 24 - 18, height: 36 }) };
     const input = { name: 'textarea' };  // the field the owner writes in
     const menu = { getBoundingClientRect: () => ({ top: 685, height: 32 }), contains: (el) => el === menu };
     const swarm = { name: 'swarm' };  // a capsule of the row, hidden while it is folded
@@ -48,7 +50,7 @@ function rig({ stack = true } = {}) {
         dataset: {}, offsetHeight: 120, inside: new Set([field]),
         style: { setProperty: (k, v) => props.set(k, v), removeProperty: (k) => props.delete(k) },
         contains(el) { return this.inside.has(el); },
-        querySelector: (selector) => (selector === '.chat-text-row' ? field : selector === 'textarea' ? input : null),
+        querySelector: (selector) => ({ '.chat-field': field, '[data-composer-plus]': plus, textarea: input })[selector] || null,
         addEventListener: on('wrap'), removeEventListener: off('wrap'),
     };
     const keys = new Set();
@@ -85,7 +87,7 @@ function rig({ stack = true } = {}) {
         listeners, scroll, runTimers, resize, observers };
 }
 
-test('reading back folds the row, ☰ lands at the field\'s middle, and the way down brings it back', () => {
+test('reading back folds the row, ☰ lands on the field\'s last line, and the way down brings it back', () => {
     const r = rig();
     r.scroll(true);  // the first read is the baseline
     r.scroll(true);
@@ -94,7 +96,7 @@ test('reading back folds the row, ☰ lands at the field\'s middle, and the way 
     assert.equal(r.fold.folded(), true, 'a run of 60px folds it');
     assert.equal('folded' in r.wrap.dataset, true);
     assert.equal(r.props.get('--fold-row-h'), '32px', 'the line collapses from its own height');
-    assert.equal(r.props.get('--fold-menu-dy'), `${52 / 2 - 16}px`, 'down by half the field less its own centre on the line');
+    assert.equal(r.props.get('--fold-menu-dy'), `${52 - 24 - 16}px`, 'down to the field\'s last line, less its own centre on the line');
     r.scroll(false);
     assert.equal(r.fold.folded(), true, 'one step back is not a run');
     r.scroll(false);
@@ -106,15 +108,15 @@ test('reading back folds the row, ☰ lands at the field\'s middle, and the way 
     assert.ok(FOLD.run <= 60 && FOLD.away < 90, 'the fixture reads past both bounds');
 });
 
-test('folded, ☰ waits at the field\'s middle whatever its height, and past a reply staged above the field', () => {
+test('folded, ☰ waits on the field\'s last line whatever its height, a reply staged inside the field included', () => {
     const r = rig();
     for (let i = 0; i < 3; i += 1) r.scroll(true);
     assert.equal(r.fold.folded(), true);
-    assert.equal(r.props.get('--fold-menu-dy'), '10px', 'a field of one line: half of it, less ☰\'s centre on the line');
+    assert.equal(r.props.get('--fold-menu-dy'), '12px', 'a field of one line: down to its line, less ☰\'s centre on the line');
     // Folded, the field is narrower by ☰'s place: a draft of several lines wraps into one more, its bottom staying.
     r.field.height = 75;
     r.resize(r.field);
-    assert.equal(r.props.get('--fold-menu-dy'), `${Math.round(75 / 2 - 16)}px`, '☰ follows the field to its new middle');
+    assert.equal(r.props.get('--fold-menu-dy'), `${75 - 24 - 16}px`, '☰ follows the field\'s last line, beside "+"');
     r.scroll(false);
     r.scroll(false);
     r.field.height = 52;
@@ -122,21 +124,21 @@ test('folded, ☰ waits at the field\'s middle whatever its height, and past a r
     r.runTimers();
     assert.equal(r.fold.folded(), false);
     assert.equal(r.props.has('--fold-menu-dy'), false, 'back, the row is ☰\'s line again');
-    // A reply staged between the line and the field: its strip (56px) and the wrap's gap above the field.
-    r.field.top = 725 + 56 + 8;
+    // A reply staged: its strip (56px) is the field's first line, so the field is taller and still right under the line.
+    r.field.height = 52 + 56;
     for (let i = 0; i < 3; i += 1) r.scroll(true);
     assert.equal(r.fold.folded(), true);
-    assert.equal(r.props.get('--fold-menu-dy'), `${56 + 8 + 52 / 2 - 16}px`, 'down past the strip, to the field\'s middle');
-    r.field.height = 75;
+    assert.equal(r.props.get('--fold-menu-dy'), `${52 + 56 - 24 - 16}px`, 'past the strip, down to the last line');
+    r.field.height = 75 + 56;
     r.resize(r.field);
-    assert.equal(r.props.get('--fold-menu-dy'), `${Math.round(56 + 8 + 75 / 2 - 16)}px`);
+    assert.equal(r.props.get('--fold-menu-dy'), `${75 + 56 - 24 - 16}px`);
 });
 
-test('a reply cancelled or staged while the line is still held: the next fold reads what lies between again', () => {
+test('a reply cancelled or staged while the line is still held: the next fold reads the field again', () => {
     const r = rig();
-    r.field.top = 725 + 56 + 8;  // a reply staged: its strip (56px) and the wrap's gap above the field
+    r.field.height = 52 + 56;  // a reply staged: its strip (56px) is the field's first line
     for (let i = 0; i < 3; i += 1) r.scroll(true);
-    assert.equal(r.props.get('--fold-menu-dy'), `${56 + 8 + 52 / 2 - 16}px`);
+    assert.equal(r.props.get('--fold-menu-dy'), `${52 + 56 - 24 - 16}px`);
     // × on the strip: the strip goes and the field takes the focus (chat_reply.js), which brings the row back.
     const back = () => {
         r.doc.activeElement = r.input;
@@ -146,19 +148,19 @@ test('a reply cancelled or staged while the line is still held: the next fold re
     };
     back();
     // Reading back before FOLD.settle (no timer runs): the line is still held and comes back mid-motion (20px of its 32,
-    // a margin of -3px); the field lies right under it now.
+    // a margin of -3px); the field, without the strip now, lies right under it.
     Object.assign(r.line, { height: 20, margin: -3 });
-    r.field.top = 685 + 20 - 3 + 8;
+    Object.assign(r.field, { top: 685 + 20 - 3 + 8, height: 52 });
     for (let i = 0; i < 3; i += 1) r.scroll(true);
     assert.equal(r.fold.folded(), true);
     assert.equal('fold' in r.wrap.dataset, true, 'the line is still the held one');
-    assert.equal(r.props.get('--fold-menu-dy'), `${52 / 2 - 16}px`, 'the strip is gone: down to the field\'s middle, not past it');
-    // A reply staged inside the hold: the strip lies between the line and the field again.
+    assert.equal(r.props.get('--fold-menu-dy'), `${52 - 24 - 16}px`, 'the strip is gone: down to the one line, not past a strip');
+    // A reply staged inside the hold: the field is taller again.
     back();
-    r.field.top = 685 + 20 - 3 + 8 + 56 + 8;
+    r.field.height = 52 + 56;
     for (let i = 0; i < 3; i += 1) r.scroll(true);
     assert.equal(r.fold.folded(), true);
-    assert.equal(r.props.get('--fold-menu-dy'), `${56 + 8 + 52 / 2 - 16}px`, 'past the new strip, to the field\'s middle');
+    assert.equal(r.props.get('--fold-menu-dy'), `${52 + 56 - 24 - 16}px`, 'past the new strip, to the last line');
 });
 
 test('at the latest the row stays; a wobble, older history above and the hidden typing row move nothing', () => {

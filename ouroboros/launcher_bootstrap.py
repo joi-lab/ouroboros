@@ -8,12 +8,16 @@ import json
 import os
 import pathlib
 import shutil
+import logging
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
+
+from ouroboros.desktop_media import host_environment
 
 
 BUNDLE_REPO_NAME = "repo.bundle"
@@ -25,6 +29,141 @@ DEFAULT_MANAGED_REMOTE_NAME = "managed"
 DEFAULT_MANAGED_LOCAL_BRANCH = "ouroboros"
 DEFAULT_MANAGED_LOCAL_STABLE_BRANCH = "ouroboros-stable"
 DEFAULT_MANAGED_REMOTE_STABLE_BRANCH = "ouroboros-stable"
+
+
+_BOOTSTRAP_COMMANDS = []  # live invocation owners only; never a scan of historical work
+
+
+class _SourceHandoff:
+    """Keep a Windows successor owned until transfer or Panic has won termination.
+
+    The lock covers only publication and the terminal decision, never Popen or
+    stopping a child. Panic never waits for spawn: a compatible successor observes
+    the inherited parent handle before startup, even before Popen returns here.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.stopped = False
+        self.successor = None
+
+    def claim_stop(self):
+        with self.lock:
+            self.stopped = True
+
+    def begin(self, cancelled):
+        with self.lock:
+            if self.stopped or cancelled():
+                return False
+            return True
+
+    def stop(self):
+        from ouroboros.platform_layer import request_process_tree_kill
+
+        with self.lock:
+            self.stopped = True
+            proc = self.successor
+        return request_process_tree_kill(proc) if proc is not None else None
+
+    def spawned(self, proc, cancelled):
+        with self.lock:
+            self.successor = proc
+            stopping = self.stopped or cancelled()
+        if stopping:
+            self.stop()
+
+    def leave(self, code, cancelled):
+        with self.lock:
+            if not self.stopped and not cancelled():
+                os._exit(code)  # terminal commit, with no intervening spawn or I/O
+
+
+source_handoff = _SourceHandoff()
+
+
+def stop_bootstrap_commands(*, include_interactive=True) -> list[dict]:
+    """Request captured bootstrap children before early tray Panic hard-exits."""
+    from ouroboros.platform_layer import request_process_tree_kill
+
+    successor_stop = source_handoff.stop()
+    return ([successor_stop] if successor_stop is not None else []) + [
+            request_process_tree_kill(owner["proc"], job_handle=getattr(owner["container"], "_job", None))
+            for owner in list(_BOOTSTRAP_COMMANDS) if owner["proc"] is not None
+            and (include_interactive or owner["container"] is not None)]
+
+
+def spawn_bootstrap_command(command, shutdown, *, interactive=False, **kwargs):
+    """Capture a bootstrap command in the existing Job/lifeline owner before exposing its handle."""
+    from ouroboros.process_containment import ProcessContainer
+    from ouroboros.platform_layer import merge_hidden_kwargs
+
+    if shutdown.is_set():
+        raise InterruptedError("Launcher shutdown stopped bootstrap admission")
+    # Interactive OS installers keep their terminal and may finish after an
+    # ordinary setup-window close; Panic still has their captured Popen to stop.
+    # Frozen sys.executable is the app bootloader, not a Python CLI for the
+    # lifeline guardian. Keep group/token (Windows: Job) custody and Panic stops;
+    # frozen POSIX has no guardian for an abrupt launcher death during bootstrap.
+    owner = {"proc": None, "container": None if interactive else
+             ProcessContainer(lifeline=not getattr(sys, "frozen", False))}
+    _BOOTSTRAP_COMMANDS.append(owner)
+    try:
+        owner["proc"] = (subprocess.Popen(command, **merge_hidden_kwargs(kwargs)) if interactive
+                         else owner["container"].spawn(command, **kwargs))
+        if shutdown.is_set():
+            stop_bootstrap_commands()
+        return owner
+    except BaseException:
+        if owner["container"] is not None:
+            owner["container"].reap()
+            owner["container"].close()
+        _BOOTSTRAP_COMMANDS.remove(owner)
+        raise
+
+
+def run_bootstrap_command(command, shutdown, **kwargs):
+    """subprocess.run's result contract with early Quit/Panic and owned-tree cleanup."""
+    data, check, timeout = kwargs.pop("input", None), kwargs.pop("check", False), kwargs.pop("timeout", None)
+    if data is not None:
+        if "stdin" in kwargs:
+            raise ValueError("stdin and input arguments may not both be used")
+        kwargs["stdin"] = subprocess.PIPE
+    if kwargs.pop("capture_output", False):
+        if "stdout" in kwargs or "stderr" in kwargs:
+            raise ValueError("stdout and stderr arguments may not be used with capture_output")
+        kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    owner = spawn_bootstrap_command(command, shutdown, **kwargs)
+    proc, container = owner["proc"], owner["container"]
+    deadline = None if timeout is None else time.monotonic() + timeout
+    partial = None
+    try:
+        while True:
+            if shutdown.is_set():
+                stop_bootstrap_commands()
+                raise InterruptedError("Launcher shutdown interrupted bootstrap")
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout,
+                    output=partial.output if partial else None, stderr=partial.stderr if partial else None)
+            try:
+                stdout, stderr = proc.communicate(data, timeout=min(0.2, remaining) if remaining is not None else 0.2)
+                break
+            except subprocess.TimeoutExpired as exc:
+                partial = exc
+                data = None  # communicate retains the pending input/output across retries
+        if check and proc.returncode:
+            raise subprocess.CalledProcessError(proc.returncode, command, stdout, stderr)
+        return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+    finally:
+        error = container.reap()
+        container.close()
+        _BOOTSTRAP_COMMANDS.remove(owner)
+        proc.wait(timeout=5)
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+        if error:
+            logging.getLogger("launcher").error("Bootstrap command cleanup unconfirmed: %s", error)
 
 
 @dataclass(frozen=True)
@@ -43,19 +182,24 @@ class BootstrapContext:
 
 def checkout_sha(repo_dir: pathlib.Path) -> str:
     """HEAD of the checkout, or "" when Git or the repository is unavailable (never a guess)."""
+    from ouroboros.platform_layer import merge_hidden_kwargs
+
     try:
-        shown = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_dir), capture_output=True,
-                               text=True, encoding="utf-8", check=False)
+        shown = subprocess.run(["git", "rev-parse", "HEAD"], **merge_hidden_kwargs(
+            {"cwd": str(repo_dir), "capture_output": True, "text": True, "encoding": "utf-8", "check": False,
+             **({"env": host_environment()} if sys.platform == "linux" else {})}))
     except OSError:
         return ""
     return shown.stdout.strip() if shown.returncode == 0 else ""
 
 
-_LOADED_CHECKOUT_SHA = ""  # the checkout whose modules the launcher process imported (its first launch)
+_LOADED_CHECKOUT_SHA = ""  # the commit whose modules this launcher process imported (remember_loaded_checkout)
 
 
 def remember_loaded_checkout(repo_dir: pathlib.Path, *, bundle_dir: pathlib.Path | None = None) -> str:
-    """Record the loaded generation once: macOS before bootstrap can advance the checkout, elsewhere at first start."""
+    """Record once, before bootstrap can advance the checkout, which commit the launcher's modules came
+    from: a frozen app or a seed copy imported them from ``bundle_dir`` (its manifest's ``source_sha``),
+    the checkout's own launcher from ``repo_dir`` (its HEAD)."""
     global _LOADED_CHECKOUT_SHA
     if _LOADED_CHECKOUT_SHA:
         return _LOADED_CHECKOUT_SHA
@@ -67,13 +211,13 @@ def remember_loaded_checkout(repo_dir: pathlib.Path, *, bundle_dir: pathlib.Path
 
 
 def launcher_sources_changed(repo_dir: pathlib.Path, loaded_sha: str | None = None, *,
-                             bundle_dir: pathlib.Path | None = None, packaged: bool = False) -> bool:
+                             bundle_dir: pathlib.Path | None = None, packaged: bool = False,
+                             source_root: pathlib.Path | None = None) -> bool:
     """True when the landed checkout changed a module the launcher process has loaded.
 
-    The launcher imports its helpers once; a body adoption (or any release) that
-    lands another version of them while the agent is down leaves that process
-    serving stale code, so its exit-42 branch re-executes the launcher exactly
-    then (the same move the seed-bundle first run makes). The comparison is the
+    The launcher imports its helpers once; a cold start or body adoption that
+    finds another version in the checkout hands off through ``exec_source_launcher``.
+    A server-only update leaves the launcher running. The comparison is the
     checkout's own history, not the file system: the commit the launcher imported
     from (``loaded_sha``, "" when unknown: never a relaunch) against the commit
     that now serves, over the loaded modules' repository paths plus ``launcher.py``.
@@ -81,21 +225,22 @@ def launcher_sources_changed(repo_dir: pathlib.Path, loaded_sha: str | None = No
     them ``<pkg>/<module>.pyc`` or ``.py`` there); they count under their repository
     paths. A path counts as named or resolved: a macOS app's bundle is
     ``Contents/Frameworks``, whose ``<pkg>`` links into ``Contents/Resources``, so
-    there only the named path lies inside the bundle.
+    there only the named path lies inside the bundle. ``source_root`` also covers
+    seed hosts that import from a separate image directory (the container's /app).
 
-    ``packaged`` (a frozen launcher's cold check) counts the whole packaged trees,
+    ``packaged`` (the cold check) counts the whole packaged trees,
     ``ouroboros`` and ``supervisor``, not only what is loaded so far: later imports
     (Panic sweep, restart acknowledgement, server records) would come from the seed
     too. Conservative by design: a body-only change there hands off as well, while a
-    ``server.py``-only update keeps the frozen launcher.
+    ``server.py``-only update keeps the launcher.
     """
-    import sys
+    from ouroboros.platform_layer import merge_hidden_kwargs
 
     loaded_sha = _LOADED_CHECKOUT_SHA if loaded_sha is None else loaded_sha
     head = checkout_sha(repo_dir)
     if not loaded_sha or not head or head == loaded_sha:
         return False
-    roots = [pathlib.Path(os.path.abspath(root)) for root in (repo_dir, bundle_dir) if root]
+    roots = [pathlib.Path(os.path.abspath(root)) for root in (repo_dir, bundle_dir, source_root) if root]
     roots += [root.resolve() for root in roots]
     loaded = {"launcher.py", *(("ouroboros", "supervisor") if packaged else ())}
     for module in list(sys.modules.values()):
@@ -111,7 +256,8 @@ def launcher_sources_changed(repo_dir: pathlib.Path, loaded_sha: str | None = No
         if relative is not None:
             loaded.add((relative.with_suffix(".py") if relative.suffix == ".pyc" else relative).as_posix())
     probe = subprocess.run(["git", "diff", "--quiet", loaded_sha, head, "--", *sorted(loaded)],
-                           cwd=str(repo_dir), capture_output=True, check=False)
+                           **merge_hidden_kwargs({"cwd": str(repo_dir), "capture_output": True, "check": False,
+                               **({"env": host_environment()} if sys.platform == "linux" else {})}))
     return probe.returncode == 1
 
 
@@ -142,7 +288,9 @@ def embedded_python_env(data_dir: pathlib.Path, base: dict[str, str] | None = No
     stated here rather than changed unilaterally. Recovery is manual and total:
     delete ``<data>/state/python-userbase`` and relaunch.
     """
-    env = dict(os.environ if base is None else base)
+    # Defaults are for bootstrap host commands. Source-launcher probe/exec pass
+    # their explicit GUI base and must retain it for GI and WebKit helpers.
+    env = dict((host_environment() if sys.platform == "linux" else os.environ) if base is None else base)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     state_dir = pathlib.Path(data_dir) / "state"
     pycache_dir = state_dir / "pycache"
@@ -573,7 +721,7 @@ def bootstrap_repo(context: BootstrapContext) -> bool:
         if not world_path.exists():
             # Roots ride the environment and the path argv (a quote in it cannot break the
             # program text); the one-argument call also suits an older seed's profiler.
-            env = {**os.environ, "PYTHONPATH": str(context.repo_dir),
+            env = {**(host_environment() if sys.platform == "linux" else os.environ), "PYTHONPATH": str(context.repo_dir),
                    "OUROBOROS_REPO_DIR": str(context.repo_dir), "OUROBOROS_DATA_DIR": str(context.data_dir)}
             context.hidden_run(
                 [
@@ -753,18 +901,34 @@ def shell_runtime_facts(repo_dir: pathlib.Path, seed: pathlib.Path | None, shell
     entry = macos_source_entry(seed) if macos and seed else None
     return {"shell_version": shell_version, "bundle_version": bundle_version,
             "source_launcher": not frozen,
-            "source_revision": remember_loaded_checkout(repo_dir, bundle_dir=seed if frozen and macos else None),
+            "source_revision": remember_loaded_checkout(repo_dir, bundle_dir=seed if frozen else None),
             "macos_source_entry": bool(entry and pathlib.Path(sys.executable) == entry) if macos and seed else None}
 
 
+# Consumed by launcher.py's stdlib prologue before any package import.
+LAUNCHER_HANDOFF_ENV = "OUROBOROS_LAUNCHER_HANDOFF"
+
+
 def exec_source_launcher(context: BootstrapContext, argv: list[str], *, release_lock: Callable[[], None],
-                         desktop: bool, macos: bool) -> None:
-    """Hand off to compatible managed source, keeping the running shell if the probe fails."""
+                         acquire_lock: Callable[[], bool], before_release: Callable[[], None],
+                         on_failure: Callable[[], None], desktop: bool, macos: bool, cancelled=lambda: False) -> None:
+    """Hand off to compatible managed source; keep the shell on probe or spawn refusal.
+
+    macOS selects its signed entry and probes imports/protocol with plain Python before
+    teardown or unlocking. POSIX replaces the process image with that exact command.
+    Windows spawns a quoted argv, preserving an attached CLI console and hiding only
+    when there is none. Remove the old icon while holding the lock; a definite refusal
+    reacquires it before restoring the shell, or exits if another launcher took it.
+    A successor that starts and then fails is not a spawn refusal; no retry state is kept.
+    """
+    from ouroboros.platform_layer import IS_WINDOWS, inherited_console_kwargs
+
     entry = macos_source_entry(context.bundle_dir) if macos else None
     frozen = getattr(sys, "frozen", False)
-    if entry is not None and not source_launcher_importable(
-            context, desktop=desktop, python=find_embedded_python(context.bundle_dir, macos=macos),
-            require_macos_entry=True):
+    if not source_launcher_importable(
+            context, desktop=desktop, python=(find_embedded_python(context.bundle_dir, macos=macos)
+                if entry is not None or frozen else context.embedded_python),
+            require_macos_entry=entry is not None):
         return  # old/rollback source or a missing dependency must not lose the working shell
     handoff = source_handoff_argv(argv, keep_runtime_venv=entry is not None)
     if frozen:
@@ -773,10 +937,43 @@ def exec_source_launcher(context: BootstrapContext, argv: list[str], *, release_
     context.log.info("Loading managed source launcher through %s", command[0])
     # The source shell needs the dependencies bootstrap installed in the userbase,
     # too. Do not export PYTHONHOME or change any child's process/bundle identity.
-    if entry is not None:
-        os.environ.update(embedded_python_env(context.data_dir))
+    env = embedded_python_env(context.data_dir, {**os.environ, LAUNCHER_HANDOFF_ENV: "1"})
+    if cancelled():
+        return
+    before_release()
     release_lock()
-    os.execv(command[0], command)
+    try:
+        if cancelled():
+            if acquire_lock():
+                on_failure()
+            return  # the Panic owner must finish even if another launcher took the lock
+        if not IS_WINDOWS:
+            os.execve(command[0], command, env)  # returns only by raising
+        from ouroboros.server_control import _windows_restart_handoff
+
+        # Use the direct-restart parent handle/stdio contract. A current source
+        # launcher refuses its parent's Panic before startup; old source still
+        # imports/runs, but cannot guarantee this pre-Popen-return stop boundary.
+        with _windows_restart_handoff(env, context.log) as (_, inheritance):
+            if not source_handoff.begin(cancelled):
+                return
+            successor = None
+            try:
+                successor = subprocess.Popen(command, env=env, **inherited_console_kwargs(),
+                                             **{"close_fds": True, **inheritance})
+            finally:
+                source_handoff.spawned(successor, cancelled)
+    except Exception:
+        context.log.error("The checkout's launcher did not start", exc_info=True)
+        if acquire_lock():
+            on_failure()
+            return
+        if cancelled():
+            return  # a failed spawn cannot hard-exit over Panic's pending stop/writes
+        context.log.error("Another launcher took the single-instance lock meanwhile; this one exits")
+        source_handoff.leave(1, cancelled)
+        return
+    source_handoff.leave(0, cancelled)  # no atexit release over the successor's PID lock
 
 
 def source_launcher_importable(context: BootstrapContext, *, desktop: bool, python: str | None = None,
@@ -825,14 +1022,9 @@ def source_handoff_argv(argv, *, keep_runtime_venv: bool = False) -> list[str]:
 
 def automatic_launch_allowed(intent: str, data_dir: pathlib.Path, log: Any) -> bool:
     if intent == "automatic":
-        # The server consumes this existing marker on an explicit owner start.
-        # A boot entry must not start it and accidentally erase the owner's Stop.
-        # The same file also carries owner_restart_no_resume: that is a restart,
-        # not Panic, and must remain launchable. No second stop-state store.
-        try:
-            stopped = (data_dir / "state" / "panic_stop.flag").read_text(encoding="utf-8").strip() == "panic"
-        except FileNotFoundError:
-            stopped = False
+        from ouroboros.installation_stop import installation_panic
+
+        stopped = installation_panic(data_dir)
         if stopped:
             log.info("Automatic start skipped: Ouroboros was stopped with Panic.")
             print("Ouroboros is stopped. Use Start to resume.", flush=True)

@@ -50,20 +50,22 @@ def _decode(raw):
     return entry
 
 
-def collection_pending(entry) -> bool:
-    """Applicable technical duties on an observed terminal, independent of money or disposition alone."""
-    if entry is None:
+def collection_pending(entry, root=None) -> bool:
+    """Ordinary-run collection debt; review copies belong to their native checking markers."""
+    if entry is None or entry.review_owned:
         return False
-    capture = bool(entry.execution_root or entry.resource_ref.get("workspace_kind") == "directory")
-    return bool(entry.terminal_source and (not entry.ledger_recorded or not entry.settled
+    capture = entry.mode != "plan" and bool(entry.execution_root or entry.resource_ref.get("workspace_kind") == "directory")
+    if entry.terminal_source and (not entry.ledger_recorded or not entry.settled
         or not entry.output_source or not entry.output_complete
         or entry.output_terminal_sha != entry.terminal_source.get("sha256")
-        or (capture and not entry.patch_captured and not entry.patch_disposed and not entry.superseded_by)))
+        or (capture and not entry.patch_captured and not entry.patch_disposed and not entry.superseded_by)):
+        return True
+    return False
 
 
 def _held(entry) -> bool:
     return (not entry.settled or entry.project_owned or collection_pending(entry)
-            or ((entry.snapshot_id or (entry.resource_ref.get("workspace_kind") == "directory"
+            or (entry.mode != "plan" and (entry.snapshot_id or (entry.resource_ref.get("workspace_kind") == "directory"
                                       and entry.resource_ref.get("strategy") == "copy"))
                 and not entry.patch_disposed))
 

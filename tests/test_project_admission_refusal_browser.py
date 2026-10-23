@@ -221,6 +221,7 @@ def _seed(host, monkeypatch, data_dir: Path, tmp_path: Path) -> dict:
 _MAIN_FACTS = """() => [...document.querySelectorAll('#chat-messages .chat-bubble[data-system-type='
     + '"project_completion_summary"], #chat-messages .chat-bubble.project-answer')]
     .map(n => ({task: n.dataset.taskId || '', text: n.innerText,
+                phase: n.querySelector('.project-ending-head .ui-status')?.innerText.trim() || '',
                 voice: n.classList.contains('project-answer') ? 'answer' : 'pointer'}))"""
 _PANEL_OPEN = """(pid) => {
     const host = document.getElementById('project-panel');
@@ -283,9 +284,12 @@ def _assert_refusal_is_origin_receipt_only(main, panel, seed):
 
 
 def _assert_failures_stay_visible(main, tasks):
-    by_task = {row["task"]: row["text"] for row in main}
+    by_task = {row["task"]: row for row in main}
     for task_id in tasks:
-        assert " · Failed" in by_task.get(task_id, ""), (task_id, main)
+        row = by_task.get(task_id, {})
+        # Typed endings give the outcome its own status, separate from the title.
+        assert row.get("phase") == "Failed" and row.get("voice") == "pointer", (task_id, main)
+        assert "Failed" in row["text"].splitlines(), (task_id, main)
 
 
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])

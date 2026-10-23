@@ -54,7 +54,7 @@ from ouroboros import chat_chain
 from ouroboros.chronicle_import import legacy_frontier
 from ouroboros.chronicle_store import ChronicleStore, source_time_span
 from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID, is_a2a_chat_id
-from ouroboros.dialogue_provenance import row_class
+from ouroboros.dialogue_provenance import row_class, row_provenance
 
 # The key of the memory view's last-capture fact in a task's ``llm_trace``.
 VIEW_TRACE_KEY = "memory_view"
@@ -67,7 +67,7 @@ MAIN_ROOM = 1
 _META_FIELDS = ("chat_id", "ts", "type", "direction", "task_id", "parent_task_id", "root_task_id",
                 "client_message_id", "subagent_task_id", "delegation_role", "subagent_role", "initiator",
                 "summary_kind", "sender_label", "username", "author", "source", "transport",
-                "status", "outcome", "outcome_phase", "reason_code", "result_ref")
+                "status", "outcome", "outcome_phase", "reason_code", "result_ref", "presence", "presence_provenance")
 _MEMBERSHIP_FIELDS = ("chat_id", "ts", "type", "task_id", "parent_task_id", "root_task_id", "source_keys")
 
 Entry = Tuple[Dict[str, Any], Dict[str, Any], int]
@@ -141,6 +141,8 @@ def rooms_of_row(meta: Mapping[str, Any], facts: MembershipFacts) -> FrozenSet[s
     chat = chat_chain._row_chat_id(meta)
     if is_a2a_chat_id(chat):
         return frozenset()
+    if row_provenance(meta) == "place":
+        return frozenset({str(chat)}) if chat != MAIN_ROOM else frozenset()
     kind = meta.get("type")
     bound = 0 if kind in ORIGIN_ADDRESSED_NOTICE_TYPES else bound_room_chat(facts.rooms, meta)
     pinned = kind in MAIN_PINNED_ROW_TYPES
@@ -476,7 +478,43 @@ def room_facts(store: ChronicleStore, room: str, entries: List[Entry], lineage: 
             "chars": sum(int(meta.get("text_chars") or 0) for _address, meta, _pos in entries),
             "earliest": str(entries[0][1].get("ts") or "") if entries else "",
             "latest": str(entries[-1][1].get("ts") or "") if entries else "", "notes": notes, "pages": len(pages),
-            "last_covered": str(source_time_span(ends).get("end") or "") if ends else ""}
+            "last_covered": str(source_time_span(ends).get("end") or "") if ends else "",
+            **({"place": place} if (place := place_activity(entries)) else {})}
+
+
+def place_activity(entries: List[Entry]) -> Dict[str, Any]:
+    """Index facts from open place rows; delivered event ids are facts, not an inferred obligation.
+
+    Counts cover the open rows only. Multipart receipts count their source event once;
+    failed receipts do not mark an event answered. No transcript text enters this index.
+    """
+    from ouroboros.dialogue_provenance import place_row_facts
+
+    rows = [entry for entry in entries if row_provenance(entry[1]) == "place"]
+    if not rows:
+        return {}
+    facts = [place_row_facts(meta) for _address, meta, _pos in rows]
+    arrivals = {fact["source_event_id"] for (_address, meta, _pos), fact in zip(rows, facts)
+                if fact.get("source_event_id") and meta.get("direction") == "in"}
+    answered = {fact["source_event_id"] for (_address, meta, _pos), fact in zip(rows, facts)
+                if fact.get("source_event_id") and meta.get("type") == "presence_delivery"
+                and (meta.get("transport") or {}).get("delivery", {}).get("state") in {"delivered", "accepted"}}
+    return {"place_id": next((fact["place_id"] for fact in reversed(facts) if fact.get("place_id")), ""),
+            "conversation_key": next((fact["conversation_key"] for fact in reversed(facts)
+                                      if fact.get("conversation_key")), ""),
+            "answered_events": len(answered), "unanswered_events": len(arrivals - answered),
+            "arrivals": len(arrivals), "rows": len(rows), "latest": str(rows[-1][1].get("ts") or ""),
+            "last_address": chat_chain.format_address(rows[-1][0])}
+
+
+def place_room_index(root: Any) -> List[Dict[str, Any]]:
+    """Open conversation facts for the own-wake places line; zero rows means no open activity.
+
+    The caller joins these rooms to its place registry for labels and current state.
+    Unanswered counts mean arrivals without a recorded accepted/delivered receipt.
+    """
+    return [{"room_id": room, **facts} for room, entries in open_rows_by_room(root).items()
+            if (facts := place_activity(entries))]
 
 
 # --- open segments --------------------------------------------------------------------------------

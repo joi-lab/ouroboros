@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from types import SimpleNamespace
 
@@ -19,14 +20,22 @@ def _git(root, *args):
                           capture_output=True, text=True)
 
 
-def test_execution_binding_makes_private_root_the_only_write_target():
+def test_execution_binding_makes_private_root_the_only_work_product_target():
+    from ouroboros.delegate_start_instructions import scratch_fact
+
     text = execution_binding_instruction("/tmp/private-snapshot", "/tmp/authority")
-    assert "/tmp/private-snapshot" in text
+    assert "the private execution root for this run is /tmp/private-snapshot:" in text
+    assert "goes only under it" in text and "every shell" not in text  # work product, not every process write
     assert "/tmp/authority" in text
-    assert "sole writable execution root" in text
     assert "read-only identity/reference" in text
     assert "sha256=" in text
     assert "typed execution-root mismatch" in text
+    # #2070: disposable process state has a lawful place, the one safe_test itself defaults to,
+    # named without the body's own launcher: a foreign project has no safe_test.
+    assert "outside every Git working tree" in text and scratch_fact() in text and "safe_test" not in text
+    evidence = os.path.join("/tmp/private-snapshot", ".review-evidence")
+    assert f"evidence worth returning under {evidence}: the host retains new files there" in text
+    assert "never applies them; files the project already tracks there stay ordinary work product" in text
 
 
 def test_runtime_child_environment_drops_launcher_authority(monkeypatch):
@@ -47,7 +56,7 @@ def test_execution_binding_appends_without_rewriting_canonical_work_order():
     assert bound.startswith(instructions)
     assert '"workspace_root":"/authority"' in bound
     assert '"write_root":"/authority"' in bound
-    assert "sole writable execution root" in bound
+    assert "the private execution root for this run is /private/snapshot:" in bound
 
 
 def test_directory_copy_binding_does_not_invent_source_as_execution_root():

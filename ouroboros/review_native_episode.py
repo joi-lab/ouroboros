@@ -423,6 +423,8 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
 
     def _observe_sent_view(self, messages: list, schemas: list) -> None:
         from ouroboros.tools.compact_context import record_context_view
+        from ouroboros.transcript_prefix import count_accepted_send
+        count_accepted_send(self._inspection_ctx, messages, schemas, round_idx=self._rounds_used, usage=self._episode_usage)
         record_context_view(self._inspection_ctx, messages, schemas)
         for receipt in self._tool_receipts:
             receipt["delivered"] = True
@@ -430,6 +432,13 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
         for execution, projected, shown in self._pending_staged_reads:
             acknowledge_staged_output_delivery(self._inspection_ctx, execution, projected, shown_ranges=shown)
         self._pending_staged_reads.clear()
+
+    def _retire_reasoning(self, messages: list, schemas: list, round_idx: int) -> None:
+        from ouroboros.transcript_prefix import append_reasoning_retirement_fact, prepare_reasoning_for_send
+
+        if prepare_reasoning_for_send(self._inspection_ctx, messages, schemas,
+                                      round_idx=round_idx, usage=self._episode_usage):
+            append_reasoning_retirement_fact(self._episode_usage, round_idx, messages)
 
     def _refresh_window(self, model_route: Optional[dict] = None) -> None:
         """Window evidence for the current route, never an assumed send limit."""
@@ -492,7 +501,9 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
         self._view_receipt = asdict(receipt)
         ref = self._store_source(f"view-{round_idx}", self._view_receipt)
         if receipt.status == "applied":
+            from ouroboros.transcript_prefix import sanction_rewrite
             messages[:] = candidate
+            sanction_rewrite(self._inspection_ctx, "compaction")  # the reviewer's own fold names its change
             self._view_changes += 1
         if receipt.status != "no_op":
             notice = {"role": "user", "content": json.dumps({"context_view_status": receipt.status,
@@ -679,6 +690,7 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
         values["messages"] = messages
         self.assignment = replace(self.assignment, slot=updated)
         self._refresh_window(values.pop("_model_observed_route", None))
+        self._retire_reasoning(messages, values.get("tools"), self._rounds_used + 1)
         return values
 
     def _run_episode(self) -> None:
@@ -703,6 +715,7 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
         scratch = tempfile.mkdtemp(prefix="ouro-native-review-")
         registry = None
         total_usage: Dict[str, Any] = {}
+        self._episode_usage = total_usage
         final_answer: Optional[str] = None
         last_content = ""  # the reviewer's latest prose — the product of an exhausted report episode
         end_reason = "not_started"  # the true reason is set by whichever end the episode takes
@@ -728,6 +741,7 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
                         break  # a report keeps its draft (marked incomplete below)
                     raise _deadline_exhausted_error("owner deadline exhausted mid native review episode")
                 round_idx += 1
+                self._retire_reasoning(messages, schemas, round_idx)
                 chat_kwargs = self._chat_kwargs(messages, schemas, max_tokens)
                 transport = review_transport_timeout(
                     slot.model, getattr(slot, "transport_timeout_sec", None), deadline_at,
@@ -1391,6 +1405,8 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
 
     def _verdict_result(self, force_extraction: bool = False) -> ReviewAttemptResult:
         text = self._raw_transcript or ""
+        if text.strip() and self.answer_observer:
+            self.answer_observer()
         canonical, method, extraction_usage = canonicalize_session_verdict(
             text,
             conformance_passed=False,  # no structured-output channel on this route

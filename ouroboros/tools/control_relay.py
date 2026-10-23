@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 
 
-def _tell_task(ctx, task_id: str, note: str = "", quote: list | None = None) -> str:
+def _tell_task(ctx, task_id: str, note: str = "", quote: list | None = None, summary: str = "") -> str:
     from ouroboros.owner_relay import quote_rows
     from ouroboros.dialogue_provenance import presence_caller_binding, presence_sender_origin
     from ouroboros.project_dialogue import AGENT_RECEIPT_ID_PREFIX
@@ -22,6 +22,7 @@ def _tell_task(ctx, task_id: str, note: str = "", quote: list | None = None) -> 
     own_chat = getattr(ctx, "current_chat_id", None)  # a teller may carry no chat: Main is the return room
     event = {"type": "steer_task", "routing_token": relay_id, "relay_id": relay_id,
              "target_task_id": target, "message": note, "quotes": quotes,
+             "summary": summary.strip() if isinstance(summary, str) else "",
              "chat_id": int(quotes[0]["source"]["chat_id"] if quotes else 1 if own_chat is None else own_chat),
              "client_message_id": message_id or f"{AGENT_RECEIPT_ID_PREFIX}{relay_id}",
              "issuer": {**_routing_issuer(ctx), "task_id": str(getattr(ctx, "task_id", "") or "")},

@@ -449,7 +449,6 @@ def run_witness(root: pathlib.Path, dropped_path: List[str],
     from ouroboros.claudexor_runtime import (
         ClaudexorRuntimeError,
         ClaudexorRuntimeManager,
-        managed_node_dir,
         managed_runtime_dir,
     )
     from ouroboros.config import DATA_DIR
@@ -469,10 +468,11 @@ def run_witness(root: pathlib.Path, dropped_path: List[str],
     except ClaudexorRuntimeError as exc:
         raise WitnessFailure(exc.code, str(exc)) from exc
     facts["node_archive"] = pin.node_artifacts[platform_key].archive_name
-    node_root = managed_node_dir(pin, platform_key)
-    node = embedded_node_candidates(node_root)[0]
-    if len(command) != 2 or pathlib.Path(command[0]) != node:
-        raise WitnessFailure("cli_command_unexpected", f"{command} does not run the managed Node {node}")
+    node = pathlib.Path(command[0])
+    node_root = next((path for path in manager._node_roots(pin.node_version, platform_key)
+                      if embedded_node_candidates(path)[0] == node), None)
+    if len(command) != 2 or node_root is None:
+        raise WitnessFailure("cli_command_unexpected", f"{command} does not run an admitted managed Node")
     cli, npm_cli = pathlib.Path(command[1]), official_npm_cli(node)
     metadata_path = node_root / "managed-node.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -506,11 +506,13 @@ def run_witness(root: pathlib.Path, dropped_path: List[str],
         repaired = ClaudexorRuntimeManager().ensure_cli_command()
     except ClaudexorRuntimeError as exc:
         raise WitnessFailure(exc.code, f"repair failed: {exc}") from exc
-    if repaired != command or _run([node, npm_cli, "--version"], "repair_failed") != npm_version:
-        raise WitnessFailure("repair_failed", "a deleted npm entrypoint was not restored")
-    facts["repair"] = "deleted npm-cli.js restored from the verified archive cache"
+    repaired_node = pathlib.Path(repaired[0])
+    if (repaired == command or npm_cli.exists()
+            or _run([repaired_node, official_npm_cli(repaired_node), "--version"], "repair_failed") != npm_version):
+        raise WitnessFailure("repair_failed", "npm repair did not preserve the old tree and select a complete new generation")
+    facts["repair"] = "complete replacement generation published from verified cache; damaged generation retained"
     if harness:
-        facts["harness_install"] = harness_install_witness(harness, node, command, cli_env)
+        facts["harness_install"] = harness_install_witness(harness, repaired_node, repaired, cli_env)
     return facts
 
 

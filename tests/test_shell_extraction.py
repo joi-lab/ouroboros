@@ -127,9 +127,11 @@ def test_shell_catalog_schema_bytes_and_handler_owners_are_stable():
     # only (Windows has no census; a Docker backend's children live in its container),
     # paid for inside the same description. Rolled for #1797 (owner decisions 18 Oct): both
     # outputs descriptions say a refused declaration stops the call before it starts and that
-    # only outputs accept a relative '../', judged by resolved location.
+    # only outputs accept a relative '../', judged by resolved location. Rolled for the
+    # tool-reuse sprint (20.10): run_script says the selected cwd is not on Python's
+    # import path and that a reusable script lives in a skill payload run with run_command.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "eeda91b2c89b3e51045360fc9029105101a215813a8828bda17fd5d54c4a1c74"
+        "466aa899d0d740260f9eddb78cb22226ffdebe29e73b0407d5c07bd5636ebd92"
     )
     original = json.loads(schema_bytes)
     for schema in original:

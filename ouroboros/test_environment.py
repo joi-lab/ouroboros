@@ -14,9 +14,21 @@ from pathlib import Path
 
 
 def default_temp_parent() -> Path:
-    """A short macOS root keeps nested multiprocessing sockets inside AF_UNIX's path limit.
-    Other platforms retain their normal temporary-directory selection."""
-    return Path("/tmp") if sys.platform == "darwin" else Path(tempfile.gettempdir())
+    """A short root keeps nested multiprocessing sockets inside AF_UNIX's path limit (104 bytes
+    on macOS, 108 on Linux): rooted in an inherited, already nested TMPDIR, a nested forkserver
+    or manager address outgrew it (#2110). Other platforms keep their temporary directory."""
+    short = sys.platform == "darwin" or sys.platform.startswith("linux")
+    return Path("/tmp") if short else Path(tempfile.gettempdir())
+
+
+def git_ancestor(path: Path):
+    """The nearest directory at or above ``path`` that Git would treat as a checkout.
+
+    safe_test refuses a disposable parent with one; delegated-session facts name the same refusal."""
+    for directory in (path, *path.parents):
+        if (directory / ".git").exists():
+            return directory
+    return None
 
 
 def settings_keys() -> set[str]:

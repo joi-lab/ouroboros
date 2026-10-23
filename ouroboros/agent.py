@@ -99,6 +99,17 @@ def _authority_source_terminal(refusal: Dict[str, Any]):
     return text, usage, {"reasoning_notes": ["authority_source_unavailable"], "tool_calls": []}
 
 
+def _worker_immediate_stop(error: BaseException, waiter: Any) -> bool:
+    """An owner's immediate Stop that ended a worker task: no worker-authored terminal before its
+    confirmed death; the supervisor's cancellation kills and settles the task (``_handle_task_scoped``)."""
+    from ouroboros.cancel_intents import STOP_POLICY_IMMEDIATE, active_intent, stop_policy
+
+    if getattr(error, "control_reason", None) != "cancelled" or waiter is None or not waiter.worker_slot_held:
+        return False
+    intent = active_intent(waiter.canonical_root, waiter.task_id)
+    return isinstance(intent, dict) and stop_policy(intent) == STOP_POLICY_IMMEDIATE
+
+
 def _task_exception_terminal(env: Any, task: Dict[str, Any], exc: Exception, drive_logs: pathlib.Path,
                              *, keep_terminal: bool = False):
     """Project captured loop evidence, or its explicit absence, without recovery.
@@ -159,18 +170,21 @@ def _load_start_continuation(ctx: Any, task: Dict[str, Any]) -> dict:
     """Read the existing validated continuation before dispatch or context assembly."""
     ctx.owner_wait_resume = task.get("_owner_wait_resume")
     ctx.budget_pause_resume = task.get("_budget_pause_resume")
-    ctx.working_recovery = task.get("_working_recovery")
-    from ouroboros.owner_wait import load_owner_wait
-    saved_wait = load_owner_wait(ctx)
-    if not saved_wait and ctx.budget_pause_resume:
+    ctx.working_recovery = (task.get("_working_recovery") or {}) if "_working_recovery" in task else None
+    from ouroboros.owner_wait import governing_continuation, load_owner_wait
+    carrier = governing_continuation(task)
+    if carrier == "owner_wait":
+        return load_owner_wait(ctx)
+    if carrier == "exact_pause":
         from ouroboros.budget_pause import load_budget_pause
-        saved_wait = load_budget_pause(ctx)  # same-ID budget continuation (#1196)
-    if not saved_wait and isinstance(ctx.working_recovery, dict):
+        return load_budget_pause(ctx)
+    saved_wait = {}
+    if carrier == "working":
         from ouroboros.working_checkpoint import load_recovery
         try:
-            saved_wait = load_recovery(ctx)  # same/new-ID recovery continues its clocks
+            saved_wait = load_recovery(ctx)
         except Exception:
-            saved_wait = {}  # the loop discloses the unreadable source itself
+            pass  # The loop discloses the selected source's gap, without fallback.
     return saved_wait
 
 
@@ -181,7 +195,7 @@ def _restore_saved_clocks(ctx: Any, task: Dict[str, Any], saved_wait: Optional[d
     else:
         ctx.owner_wait_resume = task.get("_owner_wait_resume")
         ctx.budget_pause_resume = task.get("_budget_pause_resume")
-        ctx.working_recovery = task.get("_working_recovery")
+        ctx.working_recovery = (task.get("_working_recovery") or {}) if "_working_recovery" in task else None
     if saved_wait:
         from ouroboros.settings_integrity import restore_cognition
         from ouroboros.task_pacing import restore_cost_ceiling
@@ -876,10 +890,12 @@ class OuroborosAgent:
         _exec_note = dispatch_executor_note(
             dispatch.executor_resolution if dispatch is not None else None,
             lane=dispatch.lane if dispatch is not None else None,
+            cognitive_route=task.get("parent_cognitive_route"),
         )
         if _exec_note:
             messages.append({"role": "user", "content": _exec_note})
-        subagent_bootstrap.append_startup_receipt(ctx, messages, startup_wake)
+        # The loop delivers after restoring cognition, then saves before external ACK.
+        ctx._configured_startup_wake = startup_wake
         # The nanny postcondition's input fact for the loop's finalization seam:
         # THIS task was dispatched onto the delegated substrate. ALL economics
         # marks reset together per dispatch (F4) — defensive, since the
@@ -965,19 +981,64 @@ class OuroborosAgent:
         self._current_chat_id = None
         # Hot-reload settings so UI changes affect the next task without
         # restart; a failed reload is disclosed loudly, not swallowed (#285).
-        settings_snapshot = subagent_runtime.apply_task_start_settings_or_disclose(
+        start_settings = subagent_runtime.apply_task_start_settings_or_disclose(
             str(task.get("id") or ""), self._emit_live_log)
-        from ouroboros.settings_integrity import actor_settings_snapshot
-
-        settings_snapshot = actor_settings_snapshot(
-            settings_snapshot, task, getattr(self.env, "budget_drive_root", None) or self.env.drive_root)
-
-        from ouroboros.usage_accounting import UsageScope, usage_scope
+        from ouroboros.usage_accounting import usage_scope
         from ouroboros.model_wait import task_model_wait_scope
         from ouroboros.utils import in_worker_process
 
         from ouroboros.config import task_settings_scope
 
+        with task_model_wait_scope(task=task, drive_root=self.env.drive_root, event_queue=self._event_queue,
+                                   worker_slot_held=in_worker_process()) as waiter:
+            self._bind_turn(task)  # a turn that waits for storage stays the live target of its own controls
+            try:
+                settings_snapshot, scope = self._prepare_task_start(task, start_settings)
+                # A read can wait inside SQLite and then succeed without unwinding
+                # through retry_presend. Observe controls accepted during that read
+                # before starting the body; only this bounded probe may repeat.
+                from ouroboros._usage_wait import retry_presend
+                from ouroboros.model_wait import dispatch_control_reason
+                from ouroboros.llm_attempt import PhysicalDispatchInterrupted
+                reason = retry_presend(lambda: dispatch_control_reason(waiter, before_task_start=True),
+                                       check=False, before_task_start=True)
+                if reason:
+                    raise PhysicalDispatchInterrupted(reason)
+            except Exception as exc:
+                exc.before_task_start = True  # this attempt's body never ran; a continuation it resumes still governs
+                from ouroboros.budget_pause import prestart_pause_event
+                if event := prestart_pause_event(task, exc, waiter):
+                    if not task.get("_is_direct_chat"):
+                        self._release_turn()
+                    return [event]
+                self._release_turn()
+                if _worker_immediate_stop(exc, waiter):
+                    return []  # as in the body: the supervisor's cancellation kills and settles this task
+                raise
+            with task_settings_scope(settings_snapshot), usage_scope(scope):
+                return self._handle_task_scoped(task)
+
+    def _prepare_task_start(self, task: Dict[str, Any], start_settings: Any) -> tuple:
+        """The task's room and billing binding: its unsent preparation, inside its own wait owner.
+
+        Positive storage contention keeps the unstarted input waiting visibly under its controls and
+        clocks, with no direct-turn idle window (owner 2026-10-21, A); only these reads repeat and the
+        body runs once afterwards. The direct lane's strict money gate now shares this owner."""
+        from ouroboros._usage_wait import retry_presend
+        from ouroboros.config import task_settings_scope
+        from ouroboros.settings_integrity import actor_settings_snapshot
+        from ouroboros.usage_origin import task_usage_scope
+
+        if task.get("_is_direct_chat"):
+            from supervisor.state import budget_remaining, load_state
+            from ouroboros.llm_attempt import PhysicalDispatchInterrupted
+
+            if retry_presend(lambda: budget_remaining(load_state(), strict=True),
+                             check=False, before_task_start=True) <= 0:
+                raise PhysicalDispatchInterrupted("budget_exhausted")
+        settings_snapshot = retry_presend(lambda: actor_settings_snapshot(
+            start_settings, task, getattr(self.env, "budget_drive_root", None) or self.env.drive_root),
+            check=False, before_task_start=True)
         with task_settings_scope(settings_snapshot):
             metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
             task_id = str(task.get("id") or metadata.get("task_id") or "")
@@ -992,34 +1053,22 @@ class OuroborosAgent:
             from ouroboros.usage_ledger import BillingAuthorityUnavailable
             try:
                 # The whole-work group and its cap (a Continue's successor spends the ORIGINAL cap).
-                billing = task_billing_fields(task, root_task_id, root_limit if root_limit > 0 else None,
-                                              budget_root, pin_initial=True)
+                billing = retry_presend(lambda: task_billing_fields(
+                    task, root_task_id, root_limit if root_limit > 0 else None, budget_root, pin_initial=True),
+                    check=False, before_task_start=True)
             except BillingAuthorityUnavailable as exc:
                 # Never bound as a stand-in: the group stays unbound, each send rereads it, and a
                 # failure that persists meets the loop's own technical rail before any paid call.
                 log.warning("Billing authority unavailable at start of %s: %s", task_id, exc)
                 billing = {"root_limit_usd": root_limit if root_limit > 0 else None}
-            scope = UsageScope(
-                drive_root=budget_root,
-                task_id=task_id,
-                root_task_id=root_task_id,
-                parent_task_id=parent_task_id,
-                category=str(metadata.get("usage_category") or task.get("type") or "task"),
-                source="agent.task",
-                root_cost_ceiling_usd=task.get("root_cost_ceiling_usd") or metadata.get("root_cost_ceiling_usd"),
-                **billing,
-            )
-            with usage_scope(scope), task_model_wait_scope(
-                task=task, drive_root=self.env.drive_root, event_queue=self._event_queue,
-                worker_slot_held=in_worker_process(),
-            ):
-                return self._handle_task_scoped(task)
+            scope = task_usage_scope(task, drive_root=budget_root, root_task_id=root_task_id,
+                                     parent_task_id=parent_task_id, billing=billing)
+        return settings_snapshot, scope
 
-    def _handle_task_scoped(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _bind_turn(self, task: Dict[str, Any]) -> None:
+        """This agent owns TASK's live turn from here: Stop, Pause, steering and the census address a
+        turn through these facts (``supervisor.workers.direct_chat_turn``), from its preparation on."""
         self._busy = True
-        start_time = self._task_started_ts = _settle_start_origin(task)
-        self._last_progress_ts = time.time()  # this worker is newly active; lifetime keeps its original start
-        self._pending_events = []
         # Preserve chat_id=0; it is a real session, not missing.
         _raw_chat = task.get("chat_id")
         try:
@@ -1036,6 +1085,26 @@ class OuroborosAgent:
                 else {}
             )
             self._accepting_owner_messages = inline_execution(task)
+
+    def _release_turn(self) -> None:
+        """The turn's end (its body's, or a preparation that ended before the body): nothing reads it as live."""
+        with self._owner_message_admission_lock:
+            self._accepting_owner_messages = False
+            self._busy = False
+            self._current_task_id = None
+            self._current_task_metadata = {}
+            self._current_task_text = ""
+        while not self._incoming_messages.empty():
+            try:
+                self._incoming_messages.get_nowait()
+            except queue.Empty:
+                break
+
+    def _handle_task_scoped(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
+        self._bind_turn(task)
+        start_time = self._task_started_ts = _settle_start_origin(task)
+        self._last_progress_ts = time.time()  # this worker is newly active; lifetime keeps its original start
+        self._pending_events = []
         authority_refusal = validate_task_authority_sources(self.env, task)
         if not authority_refusal:
             _persist_early_origin_stub(self.env.drive_root, task)
@@ -1149,17 +1218,12 @@ class OuroborosAgent:
                 except (BudgetExceeded, BudgetPauseRequested):
                     raise
                 except Exception as e:
-                    from ouroboros.cancel_intents import STOP_POLICY_IMMEDIATE, active_intent, stop_policy
-                    from ouroboros.model_wait import ModelWaitInterrupted, current_model_wait
+                    from ouroboros.model_wait import current_model_wait
 
-                    waiter = current_model_wait()
-                    if isinstance(e, ModelWaitInterrupted) and e.control_reason == "cancelled" and waiter is not None and waiter.worker_slot_held:
-                        intent = active_intent(waiter.canonical_root, waiter.task_id)
-                        if isinstance(intent, dict) and stop_policy(intent) == STOP_POLICY_IMMEDIATE:
-                            # No worker-authored terminal before confirmed death.
-                            # Empty events leave its queue slot/project owned until
-                            # supervisor cancellation kills and settles this task.
-                            return []
+                    if _worker_immediate_stop(e, current_model_wait()):
+                        # Empty events leave its queue slot/project owned until
+                        # supervisor cancellation kills and settles this task.
+                        return []
                     text, usage, llm_trace = _task_exception_terminal(self.env, task, e, drive_logs)
                     try:
                         from ouroboros.task_continuation import capture_review_continuation_from_state
@@ -1285,23 +1349,13 @@ class OuroborosAgent:
             return list(self._pending_events)
 
         finally:
-            with self._owner_message_admission_lock:
-                self._accepting_owner_messages = False
-                self._busy = False
-                self._current_task_id = None
-                self._current_task_metadata = {}
-                self._current_task_text = ""
+            self._release_turn()
             self._last_activity_ts = None  # WS3: turn finished — no longer a wedge candidate
             try:
                 from ouroboros.tools.browser import cleanup_browser
                 cleanup_browser(self.tools._ctx)
             except Exception:
                 log.debug("Failed to cleanup browser", exc_info=True)
-            while not self._incoming_messages.empty():
-                try:
-                    self._incoming_messages.get_nowait()
-                except queue.Empty:
-                    break
             if heartbeat_stop is not None:
                 heartbeat_stop.set()
             self._current_task_type = None

@@ -1,10 +1,10 @@
 """Current facts in ``state/current.sqlite`` and the SQLite protocol shared with ``usage_store``.
-PERSIST (WAL only on a fixed SQLite and proven local filesystem), ``synchronous=FULL``;
-a lazy connection per file and thread, short
-``BEGIN IMMEDIATE`` writes, every name-tier access under its name lock. SQLite 3.24 floor.
-``probe``/``open_store``: boot imports within the import window; first writes import absent stores;
-reads never import (facts present: ``StoreMigrating`` until publication; no facts: empty).
-The write gate requires a closed import window and PUBLISHED phase; ``service`` serves the
+PERSIST (WAL only on a fixed SQLite and proven local filesystem; only a private build or a lifecycle
+owner chooses, an ordinary open keeps the file's choice: ``store_journal``), ``synchronous=FULL``; a lazy
+connection per file and thread, short ``BEGIN IMMEDIATE`` writes, every name-tier access under its name
+lock. SQLite 3.24 floor. ``probe``/``open_store``: boot imports within the import window; first writes
+import absent stores; reads never import (facts present: ``StoreMigrating`` until publication; no facts:
+empty). The write gate requires a closed import window and PUBLISHED phase; ``service`` serves the
 importer/exporter/seam."""
 
 from __future__ import annotations
@@ -208,19 +208,25 @@ def _settle(key: Tuple[int, int], entry: _Inode) -> None:
     _INODES.pop(key, None)
 
 
-def _borrow(path: Any) -> Tuple[Tuple[int, int], int]:
+def _borrow(path: Any, dir_fd: Optional[int] = None) -> Tuple[Tuple[int, int], int]:
     """A read descriptor of PATH's file (POSIX): on POSIX closing ANY descriptor of a file releases
     every advisory lock this process holds on it, an open transaction's on another thread included,
     and another process then writes the same pages (sqlite.org howtocorrupt §2.2). So a raw read
     shares one descriptor per inode, and ``_return`` closes it only when no store connection of this
-    process has the file open (SQLite's unix VFS defers its own closes the same way)."""
-    key = _identity_key(os.stat(path))
+    process has the file open (SQLite's unix VFS defers its own closes the same way). With ``dir_fd``
+    PATH is one entry of that held directory (``confined_files``), stated and opened relative to it,
+    never through a link."""
+    key = _identity_key(os.stat(path, dir_fd=dir_fd, follow_symlinks=dir_fd is None))
     with _INODE_GUARD:
         entry = _INODES.get(key)
         if entry is not None and entry.files:
             entry.readers += 1
             return key, entry.files[0].fileno()
-    handle = pathlib.Path(path).open("rb", buffering=0)  # outside the guard: a slow open stalls only this caller
+    if dir_fd is None:
+        handle = pathlib.Path(path).open("rb", buffering=0)  # outside the guard: a slow open stalls only this caller
+    else:
+        from ouroboros.confined_files import FILE_FLAGS  # no-follow; a FIFO swapped in never blocks
+        handle = open(os.open(path, FILE_FLAGS, dir_fd=dir_fd), "rb", buffering=0)
     key = _identity_key(os.fstat(handle.fileno()))  # the path may name a newer file than the stat did
     with _INODE_GUARD:
         entry = _INODES.setdefault(key, _Inode())
@@ -249,11 +255,11 @@ class _StoreConnection(sqlite3.Connection):
 
     def close(self) -> None:
         if self._store_build:
-            # A sibling build is published by renaming ONLY the database. Leave no
-            # journal under its temporary name, on success or interrupted construction.
+            # A private build is published by renaming ONLY the database, keeping its chosen journal (a WAL header):
+            # complete or not, no journal, log or index stays under its temporary name (this sole close removes them).
             if self.in_transaction:
                 self.execute("ROLLBACK")
-            _delete_journal(self)
+            _delete_journal(self, keep_wal=True)
             self._store_build = False
         super().close()  # a close that raises leaves the connection counted: its lock may still be held
         key, self._store_key = self._store_key, None
@@ -265,13 +271,13 @@ class _StoreConnection(sqlite3.Connection):
                     _settle(key, entry)
 
 
-def _read_header(path: pathlib.Path) -> bytes:
+def _read_header(path: pathlib.Path, dir_fd: Optional[int] = None) -> bytes:
     """The first 100 bytes, read through the inode registry (``_borrow``); Windows locks belong
     to their handle, and a held handle there would block the export rename."""
     if os.name == "nt":
         with open(path, "rb") as handle:
             return handle.read(100)
-    key, fd = _borrow(path)
+    key, fd = _borrow(path, dir_fd)
     try:
         return os.pread(fd, 100, 0)
     finally:
@@ -291,13 +297,15 @@ def held_descriptor(path: Any) -> Optional[int]:
         return entry.files[0].fileno() if entry is not None and entry.files else None
 
 
-def is_sqlite_file(path: Any) -> bool:
+def is_sqlite_file(path: Any, *, dir_fd: Optional[int] = None) -> bool:
     """Whether PATH holds a SQLite database (its header magic), read without closing a descriptor
-    a store connection may depend on; a WAL index is none, and is never opened to look."""
+    a store connection may depend on; a WAL index is none, and is never opened to look. ``dir_fd``:
+    PATH is one entry of that held directory, and a link there is none (``_borrow``)."""
     try:
-        if not stat.S_ISREG(os.stat(path).st_mode) or is_wal_index(path):
+        if (not stat.S_ISREG(os.stat(path, dir_fd=dir_fd, follow_symlinks=dir_fd is None).st_mode)
+                or is_wal_index(path, dir_fd=dir_fd)):
             return False  # never open a FIFO or a device to look, nor a WAL index (``is_wal_index``)
-        return _read_header(pathlib.Path(path)).startswith(b"SQLite format 3\x00")
+        return _read_header(pathlib.Path(path), dir_fd).startswith(b"SQLite format 3\x00")
     except OSError:
         return False
 
@@ -305,8 +313,8 @@ def is_sqlite_file(path: Any) -> bool:
 class _BorrowedReader:
     """A binary reader over a borrowed descriptor (``_borrow``); closing returns the borrow."""
 
-    def __init__(self, path: Any) -> None:
-        self._key, self._fd = _borrow(path)
+    def __init__(self, path: Any, dir_fd: Optional[int] = None) -> None:
+        self._key, self._fd = _borrow(path, dir_fd)
         self._offset, self._open = 0, True
 
     def __enter__(self) -> "_BorrowedReader":
@@ -360,7 +368,7 @@ class WalIndexRefused(PermissionError):
     """A raw read of a SQLite WAL index (``is_wal_index``), refused before any descriptor opens."""
 
 
-def is_wal_index(path: Any) -> bool:
+def is_wal_index(path: Any, *, dir_fd: Optional[int] = None) -> bool:
     """Whether PATH is a SQLite WAL index: a regular file (nothing else ever is, and nothing is read
     before that is known) whose real name (a link stands for the file it names) is its database's name
     plus ``-shm``, folded as a case-insensitive volume folds it, where the database, a sibling in that
@@ -375,31 +383,41 @@ def is_wal_index(path: Any) -> bool:
     are ``current.sqlite``, ``usage.sqlite``, ``dialog.sqlite``, ``index.sqlite3``, ``index.sqlite`` and
     temporaries ending in hex): beside a database ``x``, a database ``x-shm`` reads as ``x``'s index and
     its own index ``x-shm-shm`` as a file, whose raw read drops only this process's locks, and this
-    process holds none on ``x-shm``. The ``-wal`` log carries no lock and reads as any file does."""
-    path = pathlib.Path(os.path.realpath(path) if os.path.islink(path) else path)
-    if len(path.name) <= 4 or path.name[-4:].casefold() != "-shm":
+    process holds none on ``x-shm``. The ``-wal`` log carries no lock and reads as any file does.
+    ``dir_fd`` (POSIX) asks it of one entry of that held directory (``confined_files``): every name is
+    stated relative to it and none is followed, so a link there is no index and names no database."""
+    path = (pathlib.PurePath(path) if dir_fd is not None
+            else pathlib.Path(os.path.realpath(path) if os.path.islink(path) else path))
+    # No database is named ``.`` or ``..`` (``with_name(".")`` would raise).
+    if len(path.name) <= 4 or path.name[-4:].casefold() != "-shm" or path.name[:-4] in {".", ".."}:
         return False
     database = path.with_name(path.name[:-4])
     try:
+        if dir_fd is not None:  # the header is read last, only for the entry ``<database>-shm`` names
+            own = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+            named = os.stat(database.with_name(database.name + "-shm"), dir_fd=dir_fd, follow_symlinks=False)
+            return (stat.S_ISREG(own.st_mode) and os.path.samestat(own, named)
+                    and is_sqlite_file(database, dir_fd=dir_fd))
         return (stat.S_ISREG(os.stat(path).st_mode) and not os.path.islink(database) and is_sqlite_file(database)
                 and os.path.samefile(path, database.with_name(database.name + "-shm")))
     except OSError:
         return False
 
 
-def refuse_wal_index(path: Any) -> None:
+def refuse_wal_index(path: Any, *, dir_fd: Optional[int] = None) -> None:
     """Raise ``WalIndexRefused`` for a WAL index, before anything opens it."""
-    if is_wal_index(path):
+    if is_wal_index(path, dir_fd=dir_fd):
         raise WalIndexRefused(errno.EACCES, "a SQLite WAL index is not read as a file (its bytes are shared "
                               "memory; the database's content is in the database and its log)", str(path))
 
 
-def open_for_read(path: Any) -> Any:
+def open_for_read(path: Any, *, dir_fd: Optional[int] = None) -> Any:
     """``open(path, "rb")`` for any reader in a process that may hold a store: on POSIX the read
     borrows the inode's shared descriptor, whose close waits until no store connection of this
-    process has the file open; Windows opens and closes as usual. A WAL index is refused."""
-    refuse_wal_index(path)
-    return pathlib.Path(path).open("rb") if os.name == "nt" else _BorrowedReader(path)
+    process has the file open; Windows opens and closes as usual. A WAL index is refused. ``dir_fd``
+    (POSIX) reads one entry of that held directory, never through a link."""
+    refuse_wal_index(path, dir_fd=dir_fd)
+    return pathlib.Path(path).open("rb") if os.name == "nt" else _BorrowedReader(path, dir_fd)
 
 
 def iter_file_bytes(path: Any, *, limit: Optional[int] = None, chunk: int = 1 << 20) -> Iterator[bytes]:
@@ -560,13 +578,13 @@ def _journal_mode(path: pathlib.Path, tier: str) -> str:
 
 
 def _set_journal_mode(conn: sqlite3.Connection, mode: str, wait_sec: float) -> str:
-    """``PRAGMA journal_mode``; a switch INTO WAL waits out contention within ``wait_sec`` in all. Turning a
-    rollback-journal file into WAL takes the write lock from inside a read transaction, where SQLite skips
-    the busy handler (two converters would deadlock), so a connection writing then, such as another
-    thread's first open converting the same freshly published store, would fail it at once. A retry's busy
-    handler gets only the time left, and the open's own busy timeout (``wait_sec``) comes back afterwards.
-    Leaving WAL is never retried: every other open WAL connection keeps its shared lock for its life, so
-    waiting would only delay the same refusal."""
+    """``PRAGMA journal_mode``; a switch INTO WAL (a boot owner's choice: ``store_journal``) waits out
+    contention within ``wait_sec`` in all. Turning a rollback-journal file into WAL takes the write lock
+    from inside a read transaction, where SQLite skips the busy handler (two converters would deadlock),
+    so a connection writing then would fail it at once. A retry's busy handler gets only the time left,
+    and the open's own busy timeout (``wait_sec``) comes back afterwards. Leaving WAL is never retried:
+    every other open WAL connection keeps its shared lock for its life, so waiting would only delay the
+    same refusal."""
     budget = max(0.0, wait_sec) if mode.upper() == "WAL" else 0.0
     deadline, bounded = time.monotonic() + budget, False
     while True:
@@ -586,13 +604,28 @@ def _set_journal_mode(conn: sqlite3.Connection, mode: str, wait_sec: float) -> s
     return actual
 
 
+def _kept_journal(conn: sqlite3.Connection, path: pathlib.Path, tier: str) -> str:
+    """An ordinary open's journal (``store_journal``): none for a file handed off at a seam, connection-local
+    PERSIST for a rollback file (every writer's), WAL kept as it is; never a conversion either way. A WAL
+    file this SQLite, lock tier or filesystem must not share (``_journal_mode``) is refused instead."""
+    if os.path.abspath(path) in _HANDED_OFF:
+        return ""
+    if conn.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+        return "PERSIST"
+    if _journal_mode(path, tier) == "WAL":
+        return ""
+    raise sqlite3.OperationalError(f"store journal is WAL, which SQLite {sqlite3.sqlite_version}, this lock tier "
+                                   "or filesystem must not share; a boot or handoff of this runtime leaves WAL")
+
+
 def connect(path: pathlib.Path, tier: str, *, create: bool = False, wait_sec: float = 0.0,
             shared: bool = False, journal_mode: Optional[str] = None) -> sqlite3.Connection:
     """A connection with the tier's lock protocol (``sqlite3.Error`` is the caller's to type);
     ``wait_sec`` is SQLite's busy wait on the enforced tier (the name tier's one lock is the
     name protocol the caller holds). Pragmas are set once here. ``shared`` allows the store
-    owner to close an idle cached connection from the export/fork thread. An empty
-    ``journal_mode`` leaves the journal alone for the checkpoint/handoff owner."""
+    owner to close an idle cached connection from the export/fork thread. Only ``create`` (a private
+    build) or a lifecycle owner's ``journal_mode`` chooses WAL versus rollback, else ``_kept_journal``;
+    an empty one leaves the journal alone for the checkpoint/handoff owner."""
     query = "mode=rwc" if create else "mode=rw"
     if tier == TIER_NAME:
         query += "&vfs=" + ("win32-none" if os.name == "nt" else "unix-none")
@@ -613,12 +646,11 @@ def connect(path: pathlib.Path, tier: str, *, create: bool = False, wait_sec: fl
     try:
         conn.execute("PRAGMA synchronous = FULL")
         if journal_mode is None:
-            journal_mode = "" if os.path.abspath(path) in _HANDED_OFF else _journal_mode(path, tier)
-        mode = journal_mode
-        if mode:
-            actual = _set_journal_mode(conn, mode, wait_sec if tier == TIER_ENFORCED else 0.0)
-            if actual != mode.lower():
-                raise sqlite3.OperationalError(f"store journal mode {actual}, expected {mode}")
+            journal_mode = _journal_mode(path, tier) if create else _kept_journal(conn, path, tier)
+        if journal_mode:
+            actual = _set_journal_mode(conn, journal_mode, wait_sec if tier == TIER_ENFORCED else 0.0)
+            if actual != journal_mode.lower():
+                raise sqlite3.OperationalError(f"store journal mode {actual}, expected {journal_mode}")
         conn.execute(f"PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT}")
     except BaseException as exc:
         exc.rollback_confirmed = not conn.in_transaction
@@ -767,15 +799,14 @@ def close_connections_under(root: pathlib.Path, *, idle_only: bool = False) -> N
 atexit.register(close_connections)  # before module globals (including the inode guard) are cleared
 
 
-# Files this process handed off at an export/switch seam (``prepare_handoff``): a later open in this
-# process (the seam's own receipt, a late writer before the exit) leaves their journal alone instead of
-# choosing WAL again, until a refused switch hands them back (``forget_handoffs``); the next boot chooses
-# again anyway. A lock-tier re-record converts the file the same way but never enters this set.
+# Files handed off at an export/switch seam (``prepare_handoff``): a later open in this process (the seam's
+# receipt, a late writer) sets no journal mode on them, not even PERSIST, until a refused switch hands them
+# back (``forget_handoffs``). A lock-tier re-record converts the file the same way but never enters this set.
 _HANDED_OFF: set = set()
 
 
 def forget_handoffs() -> None:
-    """Nothing switches after all (a refused door): this process keeps its stores and its journal choice."""
+    """Nothing switches after all (a refused door): this process keeps its stores, in rollback until a boot chooses."""
     _HANDED_OFF.clear()
 
 
@@ -824,8 +855,8 @@ def log_identity(path: Any) -> Optional[list]:
 def prepare_handoff(path: pathlib.Path, tier: str, *, wait_sec: float = STORE_WAIT_SEC, seam: bool = True) -> None:
     """Quiescent export/switch seam: release cached handles and leave a standalone DELETE file.
     Name-tier callers hold their name lock. An older SQLite may open the resulting file. A lock-tier
-    re-record (``seam=False``) converts it the same way, but this process keeps running and keeps
-    choosing its journal mode as its sibling processes do."""
+    re-record or a boot owner leaving WAL (``seam=False``) converts it the same way while this process
+    keeps running; its ordinary opens then keep the rollback journal (``store_journal``)."""
     close_connections(path)
     with contextlib.closing(connect(path, tier, wait_sec=wait_sec, journal_mode="")) as conn:
         _delete_journal(conn)
@@ -856,11 +887,11 @@ def hand_off(root: Any, *, wait_sec: float = STORE_WAIT_SEC) -> bool:
     return True
 
 
-def _delete_journal(conn: sqlite3.Connection) -> None:
-    if conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal":
-        if conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]:
-            raise StoreBusy("store checkpoint busy at handoff", reason="contention")
-    if conn.execute("PRAGMA journal_mode = DELETE").fetchone()[0] != "delete":
+def _delete_journal(conn: sqlite3.Connection, *, keep_wal: bool = False) -> None:
+    wal = conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    if wal and conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]:
+        raise StoreBusy("store checkpoint busy at handoff", reason="contention")
+    if not (wal and keep_wal) and conn.execute("PRAGMA journal_mode = DELETE").fetchone()[0] != "delete":
         raise StoreBusy("store journal still in use at handoff", reason="contention")
 
 

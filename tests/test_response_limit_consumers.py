@@ -430,7 +430,7 @@ def test_light_consolidation_and_memory_fit_plan_the_route_maximum(monkeypatch):
         return {"model": task["model"], "provider": "openrouter"}, evidence
     monkeypatch.setattr(consolidator, "_consolidation_route", lambda: ("test/model", False))
     monkeypatch.setattr(context_fit, "resolve_context_fit_route", resolve)
-    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_: 1.0)
+    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_, **_kw: 1.0)
     llm = _LLM()
     consolidator._call_consolidation_llm(llm, prompt, "Probe")
     assert len(llm.calls) == 1 and llm.calls[0]["max_tokens"] == 4096

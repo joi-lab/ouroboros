@@ -49,11 +49,12 @@ def _seed_reviewing_behavior(data_dir: pathlib.Path) -> str:
     """``test_host_service_api``'s fixture behavior, bound to any room of the account, whose owner also
     selected ``review_change``: its turns may review their own result (a result review takes no workspace
     binding, so no resource is selected)."""
-    from ouroboros.presence_bindings import PresenceBinding, PresenceEndpoint, new_presence_binding_id, save_presence_binding
-    from ouroboros.presence_capabilities import (
+    from ouroboros.presence_bindings import PresenceBinding, PresenceEndpoint
+    from tests.frozen_presence_bindings import new_presence_binding_id, save_presence_binding
+    from tests.frozen_presence_capabilities import (
         PresenceSelection, PresenceState, PresenceToolTarget, presence_state_fingerprint, save_presence_state,
     )
-    from ouroboros.presence_profile import parse_presence_profile, presence_request_fingerprint
+    from tests.frozen_presence_profile import parse_presence_profile, presence_request_fingerprint
     from ouroboros.skill_loader import SkillReviewState, load_skill, save_enabled, save_review_state
 
     skill_dir = data_dir / "skills" / "external" / "community-helper"
@@ -88,6 +89,10 @@ def _seed_reviewing_behavior(data_dir: pathlib.Path) -> str:
 
 @pytest.fixture
 def host(harness, monkeypatch):
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *_args, **_kwargs: (True, ""))
+    monkeypatch.setattr("ouroboros.presence_admission.focus_enabled", lambda _root: True)
+    monkeypatch.setattr("supervisor.consciousness_carriers.autonomous_work_enabled", lambda *_: True, raising=False)
+    monkeypatch.setattr("ouroboros.presence_admission.focus_allowance", lambda _root: {"status": "available", "remaining_usd": 10})
     h = harness
     monkeypatch.setenv("OUROBOROS_PRESENCE_MAX_ACTIVE", "1")
     _seed_token(h.data, skill="telegram-bot", token=_TOKEN, permissions=["presence"], manifest_permissions=["presence"])
@@ -101,7 +106,12 @@ def host(harness, monkeypatch):
 
     with TestClient(create_host_service_app(h.data, presence_runner=runner)) as client:
         h.client = client
-        yield h
+        try:
+            yield h
+        finally:
+            h.release.set()
+            executions = client.app.state.host_service_context.presence_turns
+            wait_for(lambda: not executions.live(), timeout=90, what="Host author teardown")
 
 
 def turn(h, number, text="Please prepare the status report", version=1, thread="topic-1", reporting=0, transport_queue=None):
@@ -289,7 +299,7 @@ def test_a_parked_author_still_live_in_this_process_stays_pending_and_is_never_r
 
 
 def _initiate(h, *args):
-    from ouroboros.tools.presence import get_tools
+    from tests.presence_legacy_helpers import legacy_tools as get_tools
     from ouroboros.tools.registry import ToolContext
 
     initiate = next(item for item in get_tools() if item.name == "initiate_presence")
@@ -308,7 +318,7 @@ def test_initiated_turn_outlives_the_callers_operation_bound(host, monkeypatch):
 
     h = host
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    monkeypatch.setattr("ouroboros.tools.presence._INITIATION_MARGIN_SEC", 0.5)
+    monkeypatch.setattr("tests.presence_legacy_helpers._INITIATION_MARGIN_SEC", 0.5)
     monkeypatch.setattr("ouroboros.presence_runner.run_presence_turn",
                         functools.partial(run_presence_turn, agent_factory=lambda **_kw: h.Agent()))
     gate = threading.Event()

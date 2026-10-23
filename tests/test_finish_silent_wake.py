@@ -1,4 +1,4 @@
-"""The quiet-wake door: finish_task(silent=true) on a consciousness wake's own turn.
+"""The quiet door: finish_task(silent=true) on a wake or a schedule-born root.
 
 The scenarios run the real loop (scripted model responses) and the real terminal
 pipeline: a clean silent wake publishes no final row and owes no outbox delivery,
@@ -21,7 +21,8 @@ from ouroboros.task_results import load_task_result
 from ouroboros.tools.registry import ToolRegistry
 
 TASK_ID = "wake-task"
-WAKE = {"initiator": "consciousness", "usage_category": CONSCIOUSNESS_CATEGORY, "wake_reason": "heartbeat"}
+WAKE = {"initiator": "consciousness", "usage_category": CONSCIOUSNESS_CATEGORY, "wake_reason": "heartbeat", "wake_cause": "own_clock"}
+SCHEDULE = {"schedule_occurrence": {"schedule_id": "daily-check", "token": "occurrence-1"}}
 
 
 def finish(answer=None, **kw):
@@ -76,7 +77,7 @@ def wake(tmp_path, monkeypatch):
     return state
 
 
-def emit(wake, text, usage, trace, *, bus=None, metadata=None, pending=None):
+def emit(wake, text, usage, trace, *, bus=None, metadata=None, pending=None, task=None):
     """The production terminal pipeline after the agent's empty-final resolution."""
     from ouroboros.agent import _resolve_intentional_empty
 
@@ -84,8 +85,9 @@ def emit(wake, text, usage, trace, *, bus=None, metadata=None, pending=None):
     replaced, _, text = _resolve_intentional_empty(wake.ctx, usage, text)
     if replaced:
         usage["terminal_origin"] = "host_notice"
-    task = {"id": TASK_ID, "type": "task", "chat_id": 1, "text": "wake", "_is_direct_chat": True,
-            "metadata": dict(metadata or WAKE)}
+    if task is None:
+        task = {"id": TASK_ID, "type": "task", "chat_id": 1, "text": "wake", "_is_direct_chat": True,
+                "metadata": dict(metadata or WAKE)}
     pipeline.emit_task_results(SimpleNamespace(drive_root=wake.root, repo_dir=wake.root), None, None,
                                pending, task, text, usage, trace, 0.0, wake.root / "logs",
                                ctx=wake.ctx, event_queue=bus)
@@ -117,11 +119,16 @@ def _no_post_task_model(monkeypatch):
 # --- clean silence: nothing published, everything retained ----------------------------
 
 @pytest.mark.parametrize("answer", [None, "", "Read the journal; nothing changed my view."])
-def test_clean_silent_wake_publishes_nothing_and_keeps_its_record(wake, answer):
-    text, usage, trace, bus = wake.run([finish(answer, silent=True)])
+@pytest.mark.parametrize("cause", ["own_clock", "focus"])
+def test_clean_silent_wake_publishes_nothing_and_keeps_its_record(wake, answer, cause):
+    metadata = {**WAKE, "wake_cause": cause}
+    if cause == "focus":  # the host stamps a focus with its place and its event
+        metadata.update(focus={"place_id": "place-1", "conversation_key": "slack:c1"},
+                        presence={"event": {"conversation_key": "slack:c1"}})
+    text, usage, trace, bus = wake.run([finish(answer, silent=True)], metadata=metadata)
     assert len(wake.calls) == 1 and usage.get("wake_silent") is True
     assert text == (answer or "")
-    pending, stored = emit(wake, text, usage, trace, bus=bus)
+    pending, stored = emit(wake, text, usage, trace, bus=bus, metadata=metadata)
     assert sends(pending) == [] and sends(drained(bus)) == [], "no final row, live or buffered"
     assert owed_rows(wake.root) == [], "boot replay owes nothing"
     assert stored["status"] == "completed" and stored.get("wake_silent") is True
@@ -248,6 +255,135 @@ def test_owner_quiz_closure_counts_as_owner_words(wake):
 
 # --- who may use the door ----------------------------------------------------------------
 
+@pytest.mark.parametrize("origin", [{}, {
+    "initiator": "consciousness", "usage_category": CONSCIOUSNESS_TASK_CATEGORY,
+}], ids=["scheduled-root", "consciousness-followup-root"])
+def test_schedule_born_root_may_finish_quietly(wake, origin):
+    wake.ctx.is_direct_chat = False
+    text, usage, trace, _ = wake.run([finish("Internal check result.", silent=True)],
+                                      metadata={**origin, **SCHEDULE})
+    assert usage.get("wake_silent") is True and text == "Internal check result."
+    assert not trace.get("completion_refusals")
+
+
+@pytest.mark.parametrize("extra,occurrence,parent", [
+    ({"delegation_role": "subagent"}, SCHEDULE["schedule_occurrence"], None),
+    ({}, SCHEDULE["schedule_occurrence"], "parent-task"),
+    ({"root_task_id": "other-root"}, SCHEDULE["schedule_occurrence"], None),
+    ({"presence": {"binding_id": "b1"}}, SCHEDULE["schedule_occurrence"], None),
+    ({"presence": {}}, SCHEDULE["schedule_occurrence"], None),
+    ({}, {"schedule_id": "daily-check"}, None),
+    ({}, {"token": "occurrence-1"}, None),
+    ({}, {"schedule_id": "daily-check", "token": " "}, None),
+    ({}, "daily-check", None),
+], ids=["delegated", "parent", "non-root", "presence", "empty-presence",
+        "missing-token", "missing-schedule", "empty-token", "invalid-occurrence"])
+def test_schedule_marker_does_not_bypass_quiet_authority(wake, extra, occurrence, parent):
+    from ouroboros.tools.control_runtime import _finish_task
+
+    wake.ctx.is_direct_chat = False
+    wake.ctx.task_id = TASK_ID
+    wake.ctx.parent_task_id = parent
+    wake.ctx.task_metadata = {**extra, "schedule_occurrence": occurrence}
+    assert "COMPLETION_ARGUMENT" in _finish_task(wake.ctx, action="finish", silent=True)
+    assert getattr(wake.ctx, "_completion_request", None) is None
+    assert "completion_requested" in _finish_task(wake.ctx, action="finish", answer="Ordinary answer.")
+
+
+def test_presence_ceiling_alone_refuses_quiet_schedule_finish(wake):
+    from ouroboros.tools.control_runtime import _finish_task
+
+    wake.ctx.is_direct_chat = False
+    wake.ctx.task_id = TASK_ID
+    wake.ctx.task_metadata = dict(SCHEDULE)
+    wake.ctx.task_contract = {"capability_ceiling": {}}
+    assert "COMPLETION_ARGUMENT" in _finish_task(wake.ctx, action="finish", silent=True)
+    wake.ctx.task_contract = {}
+    assert "completion_requested" in _finish_task(wake.ctx, action="finish", silent=True)
+
+
+def test_schedule_born_root_owes_a_reply_to_owner_words_mid_run(wake):
+    wake.ctx.is_direct_chat = False
+    _, usage, trace, _ = wake.run([
+        wake.owner_writes("Anything new?", call("chat_history", {}), "scheduled-owner-message"),
+        finish(silent=True),
+        call("send_user_message", {"text": "Nothing new."}),
+        finish(silent=True),
+    ], metadata=SCHEDULE)
+    reasons = [row["reason"] for row in trace.get("completion_refusals") or []]
+    assert len(reasons) == 1 and reasons[0].startswith("owner_reply_owed")
+    assert usage.get("wake_silent") is True and len(wake.calls) == 4
+
+
+def test_quiet_project_schedule_through_delivery_and_notifications(wake, monkeypatch):
+    import asyncio
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    from ouroboros.headless import prepare_terminal_task_files
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+    from supervisor.event_observation import ObservedEventQueue
+    from supervisor.events import _handle_task_done
+    from tests._dialogue import chat_rows
+    from tests.test_task_done_durable_vs_transport import _mk_ctx
+    from tests.test_telegram_notifications import _load, _Rec
+
+    project = create_project(wake.root, "checks", name="Checks")
+    bind_task_to_project(wake.root, TASK_ID, project["id"], project["chat_id"], origin={"absent": "system"})
+    task = {"id": TASK_ID, "type": "task", "text": "Check for changes", "title": "Check for changes",
+            "root_task_id": TASK_ID, "delegation_role": "root", "chat_id": project["chat_id"],
+            "project_id": project["id"], "metadata": dict(SCHEDULE), "_skip_post_task_synthesis": True}
+    wake.ctx.is_direct_chat = False
+    wake.ctx.current_chat_id = project["chat_id"]
+    bus = ObservedEventQueue()
+    monkeypatch.setattr("supervisor.workers.get_event_q", lambda **_kw: bus)
+    internal = "Internal: no changes worth a message."
+    text, usage, trace, _ = wake.run([finish(internal, silent=True)], metadata=SCHEDULE, bus=bus)
+    pending, stored = emit(wake, text, usage, trace, bus=bus, task=task)
+    assert stored["result"] == internal and stored["wake_silent"] is True
+    assert sends(pending) == [] and sends(drained(bus)) == [] and owed_rows(wake.root) == []
+    assert not prepare_terminal_task_files(wake.root, task)["error"]
+    sent, pushed = [], []
+    ctx = _mk_ctx(wake.root, sent, pushed)
+    ctx.RUNNING[TASK_ID] = {"task": task}
+    done_event = next(event for event in pending if event.get("type") == "task_done")
+    _handle_task_done({**done_event, "_files_prepared_attempt": 1}, ctx)
+    rows = chat_rows(wake.root)
+    done = next(row for row in rows if row.get("summary_id") == f"task-terminal:{TASK_ID}")
+    terminal = next(row for row in pushed if row.get("type") == "task_done")
+    for row in (done, terminal):
+        assert row.get("wake_silent") is True and row.get("quiet_effective") is True, row
+    assert done["text"] == "Done · no message" and done["chat_id"] == project["chat_id"]
+    assert not any(row.get("role") == "assistant" or row.get("direction") == "out" for row in rows)
+    assert not any(row.get("type") == "project_completion_summary" for row in rows)
+    assert not sent and sends(drained(bus)) == []
+    assert internal not in json.dumps(rows)
+    assert load_task_result(wake.root, TASK_ID)["result"] == internal
+
+    notifier = _load()
+    monkeypatch.setattr(notifier, "TelegramClient", _Rec)
+    _Rec.sent = []
+    state_dir = wake.root / "state" / "skills" / "telegram"
+    api = SimpleNamespace(get_state_dir=lambda: str(state_dir), get_settings=lambda _keys: {}, log=lambda *a, **k: None)
+    seen = {"notified_task_ids": []}
+    asyncio.run(notifier._check_tasks_notify(api, {"TELEGRAM_NOTIFY_TASKS": "on"}, 42, seen, "en"))
+    assert _Rec.sent == [] and seen["notified_task_ids"] == [TASK_ID]
+
+    node = shutil.which("node")
+    assert node, "Node is required for the Python-to-web quiet completion witness"
+    module = (Path(__file__).resolve().parents[1] / "web" / "modules" / "notifications.js").as_uri()
+    probe = subprocess.run([node, "--input-type=module", "-e", f"""
+        import {{ classifyLiveFrame }} from {json.dumps(module)};
+        let input = ''; for await (const chunk of process.stdin) input += chunk;
+        const [terminal, done] = JSON.parse(input);
+        const frames = [classifyLiveFrame(terminal, {{ kind: 'log' }}),
+            classifyLiveFrame({{ ...done, role: 'system', system_type: 'task_summary', content: done.text }}, {{ kind: 'chat' }})];
+        process.stdout.write(JSON.stringify(frames));
+    """], input=json.dumps([terminal, done]), text=True, capture_output=True, timeout=15, check=True)
+    assert json.loads(probe.stdout) == [None, None]
+
+
 @pytest.mark.parametrize("metadata,direct", [
     ({"initiator": "owner", "usage_category": "chat"}, True),
     ({"initiator": "consciousness", "usage_category": CONSCIOUSNESS_TASK_CATEGORY}, True),
@@ -303,7 +439,7 @@ def test_nonclean_outcome_publishes_a_host_notice_never_the_internal_words(wake,
     pending, stored = emit(wake, text, usage, trace, bus=bus)
     shown = sends(pending)
     assert len(shown) == 1 and shown[0]["role"] == "system", "one host-authored row, not the model's voice"
-    assert shown[0]["text"].startswith("⚠️ This wake chose to finish without a message, but it ended")
+    assert shown[0]["text"].startswith("⚠️ This run chose to finish without a message, but it ended")
     assert f"ended {status} " in shown[0]["text"] and shown[0]["terminal_origin"] == "host_notice"
     # Speech is every chat send, live or buffered, and every owed outbox row (tool-call activity is not speech).
     spoken = json.dumps([shown, sends(drained(bus)), owed_rows(wake.root)], ensure_ascii=False)
@@ -534,7 +670,7 @@ def test_forced_rail_retaining_quiet_bytes_publishes_only_the_host_notice(wake, 
     pending, stored = emit(wake, text, usage, trace, bus=bus)
     shown = sends(pending)
     assert len(shown) == 1 and shown[0]["role"] == "system" and shown[0]["terminal_origin"] == "host_notice"
-    assert shown[0]["text"].startswith("⚠️ This wake chose to finish without a message, but it ended")
+    assert shown[0]["text"].startswith("⚠️ This run chose to finish without a message, but it ended")
     assert f"({reason})" in shown[0]["text"] and "ended ok" not in shown[0]["text"]
     spoken = _spoken(wake, pending, bus)
     assert owed_rows(wake.root) and (not internal or internal not in spoken), "the notice is owed, never the words"
@@ -568,7 +704,7 @@ def test_forced_retention_of_stale_quiet_bytes_stays_internal(wake, monkeypatch)
     assert text == INTERNAL and usage.get("wake_silent") is True
     pending, stored = emit(wake, text, usage, trace, bus=bus)
     shown = sends(pending)
-    assert len(shown) == 1 and shown[0]["text"].startswith("⚠️ This wake chose to finish without a message")
+    assert len(shown) == 1 and shown[0]["text"].startswith("⚠️ This run chose to finish without a message")
     assert INTERNAL not in _spoken(wake, pending, bus)
     assert "STALE-EVIDENCE NOTICE" in stored["terminal_host_notice"] and stored["result"] == INTERNAL
 
@@ -586,7 +722,7 @@ def _host_notice_only(wake, text, usage, trace, bus, internal, reason):
     pending, stored = emit(wake, text, usage, trace, bus=bus)
     shown = sends(pending)
     assert len(shown) == 1 and shown[0]["role"] == "system" and shown[0]["terminal_origin"] == "host_notice"
-    assert shown[0]["text"].startswith("⚠️ This wake chose to finish without a message") and reason in shown[0]["text"]
+    assert shown[0]["text"].startswith("⚠️ This run chose to finish without a message") and reason in shown[0]["text"]
     spoken = _spoken(wake, pending, bus)
     assert "empty response" not in spoken and (not internal or internal not in spoken)
     assert stored["result"] == internal and stored.get("wake_silent") is True

@@ -571,3 +571,27 @@ test('saved Review readiness distinguishes pending/error from confirmed absence 
     await unrelated;
     assert.equal(settled.some(([id]) => id === 'unrelated'), false, 'disposed requests cannot resume positioning');
 });
+
+test('a sideways finger (the drawer, a swipe to reply) is not reading; a vertical one past the slop is', t => {
+    const f = fixture(t), navigation = [];
+    f.reading.bindGestures(direction => navigation.push(direction));
+    Object.assign(f.feed, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    f.reading.stick = true;
+    // 80 px sideways with a thumb's 6 px of drift: the drawer's or the row swipe's, following stays on.
+    f.gesture({ type: 'touchstart', touches: [{ clientX: 40, clientY: 300 }] });
+    for (const [x, y] of [[44, 302], [60, 304], [90, 306], [120, 306]]) {
+        f.gesture({ type: 'touchmove', touches: [{ clientX: x, clientY: y }] }); f.frame();
+    }
+    assert.equal(f.reading.stick, true, 'a sideways drag keeps following the newest message');
+    // Decided sideways, it stays the drawer's even if the thumb then wanders down.
+    f.gesture({ type: 'touchmove', touches: [{ clientX: 130, clientY: 380 }] }); f.frame();
+    assert.equal(f.reading.stick, true);
+    assert.deepEqual(navigation, []);
+    // The same thumb moving down the feed past the slop reads back.
+    f.gesture({ type: 'touchstart', touches: [{ clientX: 200, clientY: 300 }] });
+    f.gesture({ type: 'touchmove', touches: [{ clientX: 202, clientY: 306 }] }); f.frame();
+    assert.equal(f.reading.stick, true, 'the drift before the axis is decided is no reading');
+    f.gesture({ type: 'touchmove', touches: [{ clientX: 203, clientY: 360 }] }); f.frame();
+    assert.equal(f.reading.stick, false, 'a vertical move past the slop is reading back: following ends');
+    assert.deepEqual(navigation, [-1]);
+});

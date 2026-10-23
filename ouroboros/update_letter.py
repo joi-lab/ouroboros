@@ -6,7 +6,8 @@ routed at the light model), fed every commit reachable from the official target 
 from the running base, including merged branches, plus the README "Version History" rows
 ADDED along the target's first-parent line. Rows are recovered from the commit diffs rather than read from any
 README snapshot, because the history table is capped (rows roll off inside one range) and
-untagged releases have no tag to look up.
+untagged releases have no tag to look up. Subjects in the reverse range describe
+local-only history separately, not incoming changes or proof of preserved code.
 
 Floor (host code): exact versions and SHAs, the material and its disclosed bounds, an output
 budget, physical-attempt accounting, no silent model substitution, and a letter that is never
@@ -55,6 +56,8 @@ COMMIT_BODY_MAX_CHARS = 10000
 # release-row texts are bounded, because a long range must not become an invisible one.
 DEFAULT_MAX_BODIES = 200
 DEFAULT_MAX_ROWS = 60
+# Local history accumulates updater merges independently of the incoming release.
+LOCAL_SUBJECT_PREVIEW = 20
 
 def _row_re() -> "re.Pattern":
     """An added README history row, recognised with the repository's ONE version grammar.
@@ -122,6 +125,24 @@ def _split_row(line: str) -> Optional[Tuple[str, str, str]]:
     return cells[0], cells[1], cells[2].replace("\\|", "|")
 
 
+def _commit_subjects(capture: GitCapture, spec: str) -> Tuple[List[Dict[str, Any]], int]:
+    """Whole subject inventory of one exact range; malformed records stay counted."""
+    rc, out, err = capture(["git", "log", "--format=%H%x1f%aI%x1f%s%x1e", spec])
+    if rc != 0:
+        raise MaterialUnavailable(f"git log {spec} failed (rc={rc}): {str(err)[:200]}")
+    commits, omitted = [], 0
+    for chunk in out.split("\x1e") if out.strip() else []:
+        if not chunk.strip():
+            continue
+        parts = chunk.strip("\n").split("\x1f", 2)
+        if len(parts) != 3:
+            omitted += 1
+            continue
+        commits.append({"sha": parts[0].strip(), "date": parts[1].strip(),
+                        "subject": parts[2].strip(), "body": ""})
+    return commits, omitted
+
+
 def collect_range_material(
     base_sha: str,
     target_sha: str,
@@ -143,9 +164,9 @@ def collect_range_material(
     newest-first with first-wins per version; the newest ``max_rows`` keep their text and
     older rows stay as version and date (``rows_summarized``), malformed ones are counted
     in ``omitted_rows`` with the commits that carried them in ``omitted_row_commits``, so an
-    omission always names where to read it. ``versions`` are the VERSION files at both ends. Divergence
-    counts stay on the status dict that triggered the letter — nothing is collected that
-    neither the model nor the record reads. An empty range yields empty lists.
+    omission always names where to read it. ``versions`` are the VERSION files at both ends.
+    ``local_commits`` keeps target..base separately. The request shows a counted newest-subject
+    preview with that exact Git range, not proof of unique code or a preservation promise.
     """
     capture = git or _default_git()
     spec = f"{base_sha}..{target_sha}"
@@ -157,21 +178,9 @@ def collect_range_material(
     # Two reads on purpose: the subject line of EVERY commit (small, unbounded by design) and
     # the bodies of only the newest ``max_bodies`` — git never hands this process the bodies
     # of a whole long history just so most of them can be dropped again.
-    rc, out, err = capture([
-        "git", "log", "--format=%H%x1f%aI%x1f%s%x1e", spec,
-    ])
-    if rc != 0:
-        raise MaterialUnavailable(f"git log {spec} failed (rc={rc}): {str(err)[:200]}")
-    commits: List[Dict[str, Any]] = []
-    for chunk in out.split("\x1e") if out.strip() else []:
-        chunk = chunk.strip("\n")
-        if not chunk.strip():
-            continue
-        parts = chunk.split("\x1f", 2)
-        if len(parts) < 3:
-            material["omitted_commit_chunks"] += 1
-            continue
-        commits.append({"sha": parts[0].strip(), "date": parts[1].strip(), "subject": parts[2].strip(), "body": ""})
+    commits, material["omitted_commit_chunks"] = _commit_subjects(capture, spec)
+    material["local_commits"], material["omitted_local_chunks"] = _commit_subjects(
+        capture, f"{target_sha}..{base_sha}")
     if commits and max_bodies > 0:
         rc, out, err = capture([
             "git", "log", "-n", str(int(max_bodies)), "--format=%H%x1f%b%x1e", spec,
@@ -285,6 +294,17 @@ def material_text(material: Dict[str, Any]) -> str:
                 f"- [the bodies of the {material['bodies_omitted']} oldest commit(s) were not read; "
                 "their subjects are all listed above]"
             )
+    local = material.get("local_commits") or []
+    if local or material.get("omitted_local_chunks"):
+        lines.append("\nExisting local history absent from the official target (target..base; not incoming changes):")
+        lines.extend(f"- {c['sha']} {c['date']} {c['subject']}" for c in local[:LOCAL_SUBJECT_PREVIEW])
+        if len(local) > LOCAL_SUBJECT_PREVIEW:
+            lines.append(f"[{len(local) - LOCAL_SUBJECT_PREVIEW} older local subjects omitted from this preview; "
+                         f"read the full range with git log {material['target_sha']}..{material['base_sha']}]")
+        lines.append("These subjects include local updater merges; they do not prove unique code or preservation after apply.")
+        if material.get("omitted_local_chunks"):
+            lines.append(f"[{material['omitted_local_chunks']} local records unreadable; inspect "
+                         f"{material['target_sha']}..{material['base_sha']}]")
     if not lines:
         lines.append("(no commits in this range)")
     return "\n".join(lines)
@@ -319,7 +339,8 @@ def _request_text(status: Dict[str, Any], material: Dict[str, Any], target_versi
         + "\n\nWrite my human ONE short paragraph — no headings, no lists, no more than about "
         "120 words — about what this update brings, as myself and in the language my human and I "
         "use together. Summarize the whole range, prioritizing meaningful user-visible and operational changes, "
-        "not just the latest or merge commit. Use only what the material says; "
+        "not just the latest or merge commit. Distinguish incoming changes from the existing local history; "
+        "mention material local customizations separately without promising their preservation before apply. Use only what the material says; "
         "if the material does not say something, I do not invent it. This paragraph is shown on "
         "the Updates page and becomes part of my own context; the commit history stays readable "
         "for detail. Reply with the paragraph only.\n"
@@ -510,7 +531,7 @@ def write_letter(
         # hand the transport a second full window and double the ceiling behind the owner's
         # "Checking…" button.
         deadline_ts = time.time() + _letter_timeout_sec()
-        with model_concurrency.model_call_slot(model, use_local, deadline_ts=deadline_ts):
+        with model_concurrency.model_call_scope(model, use_local, deadline_ts=deadline_ts):
             remaining = deadline_ts - time.time()
             if remaining <= 0:
                 record.update(error_kind="timeout",

@@ -130,7 +130,7 @@ def assert_saved(ui, consumer, model, pin):
     with page.expect_response("**/api/settings"):
         page.locator("#btn-save-settings").click()
     page.wait_for_function("() => !document.querySelector('#btn-save-settings').disabled")
-    saved = [body for path, body in ui["posts"] if path == "/api/settings"][-1]
+    saved = roles.settings_saves(ui)[-1]
     target = f"claudexor::{SOURCE}={model}"
     if consumer == "Models":
         assert saved["OUROBOROS_MODEL"] == target

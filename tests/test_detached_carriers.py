@@ -63,7 +63,7 @@ def test_consciousness_blocks_on_wake_across_queue_carriers_but_not_detached_own
     workers.PENDING.append({"id": "owner-work", "_is_direct_chat": True, "detached_at": 1.0})
     assert mind.live_turns() == ("", False)
     wake = {"id": "wake", "_is_direct_chat": True, "detached_at": 1.0,
-            "metadata": {"initiator": "consciousness", "usage_category": "consciousness"}}
+            "metadata": {"initiator": "consciousness", "usage_category": "consciousness", "wake_cause": "own_clock"}}
     workers.PENDING.append(wake)
     assert mind.live_turns() == ("wake", False)
     workers.PENDING.remove(wake)

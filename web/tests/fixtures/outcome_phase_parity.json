@@ -2,6 +2,12 @@
   "purpose": "One status-word family across the browser and the host. Every case is a terminal-or-not task record read by log_events.js (taskDoneIsTerminal + taskTerminalPhase + taskPresentation) and by ouroboros.project_dialogue (outcome_phase + OUTCOME_PHASE_HEADLINE + _completion_verdict). Every typed cause with an owner sentence carries a case here, so the two TASK_CAUSE_PHRASES twins cannot drift apart unnoticed. A new axis, reason or acceptance status is added to both sides in the same commit, with a row here.",
   "cases": [
     {
+      "name": "empty length recovery ends incomplete with saved work",
+      "record": {"status": "failed", "reason_code": "output_recovery_exhausted", "outcome_axes": {"execution": {"status": "infra_failed"}, "objective": {"status": "not_evaluated"}}},
+      "phase": "error", "headline": "Failed",
+      "acceptance_clause": "Empty length-limited replies exhausted recovery; saved work remains available."
+    },
+    {
       "name": "earlier approval never replaces the execution-axis failure behind final_message",
       "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "degraded", "reason_code": "tool_failure"}, "review": {"status": "pass", "acceptance_decision": {"status": "accepted", "reason": "previous_revision_accepted"}}}},
       "phase": "warn", "headline": "Done with warnings",
@@ -520,11 +526,13 @@
       "acceptance_clause": "The task used up its review rounds before the answer was signed off."
     },
     {
-      "name": "an unknown acceptance reason stays raw rather than borrowing a wrong sentence",
+      "name": "An unknown cause is raw in host text and neutral beside exact details",
       "record": {"status": "completed", "outcome_axes": {"execution": {"status": "ok"}, "review": {"status": "degraded", "acceptance_decision": {"status": "finalized_unaccepted", "reason": "some_future_reason"}}}},
       "phase": "warn",
       "headline": "Done with warnings",
-      "acceptance_clause": "some_future_reason."
+      "acceptance_clause": "some_future_reason.",
+      "described_clause": "The recorded reason has no description yet.",
+      "undescribed": ["some_future_reason"]
     },
     {
       "name": "reviewers approved the earlier revision: Done, and the row says which revision",

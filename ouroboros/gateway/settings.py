@@ -345,7 +345,8 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
 
     skipped = {"OUROBOROS_CONTEXT_MODE_AUTO_LOW"} | _ENDPOINT_AUTHORED_SETTINGS | _ENDPOINT_WRITTEN_SETTINGS
     if not runtime_mode_at_least(get_runtime_mode(), "cyber_pro"):
-        skipped |= {"OUROBOROS_CONTEXT_MODE", "OUROBOROS_RUNTIME_MODE", "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS", "OUROBOROS_SAFETY_MODE"}
+        skipped |= {"OUROBOROS_CONTEXT_MODE", "OUROBOROS_RUNTIME_MODE", "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS", "OUROBOROS_SAFETY_MODE",
+                    "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "OUROBOROS_MODEL_SAFETY", "OUROBOROS_SAFETY_OWNER_RULES"}
     # Cyber authors controls through the same writer. Install receipts remain facts;
     # the retired auto-Low marker is derived from an explicit context choice below.
     for key in _SETTINGS_DEFAULTS:
@@ -839,49 +840,6 @@ def _api_owner_context_mode_sync(request: Request, body: Any) -> JSONResponse:
     return JSONResponse({"ok": True, "project_id": project_id, "context_mode": next_mode, "cognition": cognition})
 
 
-@owner_write_guard
-async def api_owner_safety_mode(request: Request) -> JSONResponse:
-    """Persist the owner-selected LLM-safety-supervisor coverage (full | light | off).
-
-    This dedicated owner path is audited. Ordinary modes skip this control in
-    generic settings saves; Cyber also has audited configuration authority there.
-    Subsequent operations use the new choice; current task snapshots stay intact."""
-    body = await _json_body_or_empty(request)
-    # Off the event loop, under the document lock (held inside): a slow
-    # generic save must not be able to freeze the loop THROUGH this
-    # endpoint's synchronous lock acquisition.
-    return await _run_settings_writer(_api_owner_safety_mode_sync, request, body)
-
-
-def _api_owner_safety_mode_sync(request: Request, body: Any) -> JSONResponse:
-    from ouroboros import config as _config
-
-    raw_mode = str((body or {}).get("mode") or "").strip().lower()
-    if raw_mode not in set(_config.VALID_SAFETY_MODES):
-        return unsaved_error("'mode' must be one of: full, light, off", 400)
-
-    def _set_safety_mode(current: Dict[str, Any]) -> Dict[str, Any]:
-        current["OUROBOROS_SAFETY_MODE"] = raw_mode
-        return current
-
-    with settings_document_mutation():
-        # The previous mode is read for the audit trail only; the digest binds that
-        # read to the document the locked update replaces.
-        digest = settings_document_digest()
-        previous = _config.normalize_safety_mode(
-            _owner_read_settings_raw().get("OUROBOROS_SAFETY_MODE"))
-        _owner_update_settings(_set_safety_mode, digest,
-                               authored_keys=("OUROBOROS_SAFETY_MODE",), allow_safety_lowering=True)
-        # Same-lock projection: see api_owner_auto_grant.
-        os.environ["OUROBOROS_SAFETY_MODE"] = raw_mode
-    _owner_audit(
-        request,
-        "safety_mode",
-        {"safety_mode": raw_mode, "previous_safety_mode": previous},
-    )
-    return JSONResponse({"ok": True, "safety_mode": raw_mode})
-
-
 async def api_acknowledge_capability(request: Request) -> JSONResponse:
     """Acknowledge a context window or response maximum for an exact route.
     Provider, model, endpoint and applicable headers/options bind the assertion;
@@ -1052,21 +1010,17 @@ def _apply_settings_save_side_effects(
     immediately" without saying so (#285).
     """
     side_effect_warnings: list = []
-    if any(k in all_changed for k in ("MCP_ENABLED", "MCP_SERVERS", "MCP_TOOL_TIMEOUT_SEC")):
-        try:
-            from ouroboros.mcp_client import (
-                reconfigure_from_settings as _mcp_reconfigure,
-                refresh_all_background as _mcp_refresh_background,
-            )
-            _mcp_reconfigure(current)
-            _mcp_refresh_background(reason="settings")
-        except Exception as exc:
-            log.warning("MCP reconfigure after settings change failed", exc_info=True)
-            side_effect_warnings.append(
-                "MCP reconfigure failed in the server process: "
-                f"{type(exc).__name__}: {exc}. The saved values are on disk; "
-                "agent processes retry on their next tool-schema read."
-            )
+    try:
+        from ouroboros.mcp_client import MCPManager, configuration_changed
+        if MCPManager._fingerprint(current) != MCPManager._fingerprint(old_effective_settings):
+            configuration_changed(current, reason="settings")
+    except Exception as exc:
+        log.warning("MCP reconfigure after settings change failed", exc_info=True)
+        side_effect_warnings.append(
+            "MCP reconfigure failed in the server process: "
+            f"{type(exc).__name__}: {exc}. The saved values are on disk; "
+            "server discovery setup retries on its next tool-schema read."
+        )
 
     # Skills repo/runtime changes require extension loader reconciliation.
     try:
@@ -1378,6 +1332,9 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
         unauthored = (repropose_unedited_slots(current, document, body, shown)
                       | repropose_unedited_catalog(current, document, body, shown))
         current, provider_defaults_changed, provider_default_keys = apply_runtime_provider_defaults(current)
+        from ouroboros.safety_config import safety_configuration_requires_owner
+        if not runtime_mode_at_least(current_runtime_mode, "cyber_pro") and safety_configuration_requires_owner(document, {k: v for k, v in current.items() if k not in unauthored}, before=old_effective_settings, after=current):
+            raise PermissionError("The resolved Safety Supervisor is owner-controlled; use /api/owner/safety-model.")
         if str(current.get("LOCAL_MODEL_SOURCE", "") or "").strip() and not has_startup_ready_provider(current):
             return unsaved_error("Local-only setups must route at least one model to the local runtime.", 400)
         # A catalog save retires the former review lanes: the pool replaces them.
@@ -1423,6 +1380,8 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
                            if key in all_changed}
         if control_changes:
             _owner_audit(request, "settings_controls", {"changes": control_changes})
+        from ouroboros.gateway.safety_settings import audit_safety_change
+        audit_safety_change(request, old_effective_settings, current)
         boundary.at("environment projection")
         _apply_settings_to_env(current)
         boundary.at("supervisor start")

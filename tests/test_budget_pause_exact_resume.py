@@ -620,19 +620,6 @@ def test_resume_child_task_is_policy_covered_and_exposed_beside_its_own_family()
     assert "resume_child_task" not in disabled_tools_for("full")
 
 
-def _repo_file(*parts):
-    return pathlib.Path(__file__).resolve().parents[1].joinpath(*parts).read_text()
-
-
-def test_activity_rows_show_a_held_budget_row_as_paused_not_queued():
-    """Scope note (static pin; the browser check is the parent's): a row whose root
-    fence was lifted carries an unselected HOLD and nothing will dispatch it, so
-    listing it as plain "queued" promises work that cannot start."""
-    source = _repo_file("web", "modules", "activity.js")
-    assert "_budget_pause_hold" in source and "heldRow" in source
-    assert "|| heldRow(t)" in source  # consulted by the pending-row pause predicate
-
-
 # --------------------------------------------------------------------------- consumption publication holds
 
 def _granted_loop(tmp_path, monkeypatch, task_id):

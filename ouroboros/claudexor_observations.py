@@ -1,13 +1,37 @@
-"""One passive quota read contract for Accounts, actor inspection and admission.
+"""One passive quota read contract for Accounts, actor inspection, admission and the primary observation.
 
 The engine owns applicability; a selector sent is not a selector honored. Old
 engines' observations remain readable without authorizing exact availability.
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 QUOTA_VIEW = "resources_freshness"
+# Never project arbitrary engine error codes or exception prose: either can
+# contain paths, credential material or an unbounded upstream response body.
+_SAFE_ERROR_CODES = frozenset({
+    "daemon_not_discovered", "daemon_descriptor_unreadable",
+    "daemon_descriptor_incomplete", "daemon_token_unreadable",
+    "daemon_endpoint_not_loopback", "daemon_unreachable",
+    "malformed_response", "protocol_incompatible", "daemon_recovery_only",
+})
+
+
+def passive_read_error(exc: Exception) -> dict[str, Any]:
+    """A failed passive read as a safe code and optional HTTP 400-599 status, never prose."""
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    if not isinstance(exc, ClaudexorUnavailable):
+        return {"code": "read_failed"}
+    code = exc.code if exc.code in _SAFE_ERROR_CODES else "read_refused"
+    if exc.observation_reason == "observation_read_timeout":
+        code = "observation_read_timeout"
+    result: dict[str, Any] = {"code": code}
+    if 400 <= exc.status_code <= 599:
+        result["status_code"] = exc.status_code
+    return result
 
 
 def quota_envelope_valid(value: Any) -> bool:
@@ -29,8 +53,8 @@ def quota_envelope_valid(value: Any) -> bool:
     return True
 
 
-def read_quota(gateway: Any, *, model: str | None = None,
-               request_kind: str = "text", require_resources: bool = False) -> dict[str, Any]:
+def read_quota(gateway: Any, *, model: str | None = None, request_kind: str = "text",
+               require_resources: bool = False, timeout_sec: float | None = None) -> dict[str, Any]:
     """No discovery/refresh. Accounts may require its already-advertised resources.
 
     A definite 400 permits a legacy view: Accounts requires resources, passive
@@ -38,29 +62,40 @@ def read_quota(gateway: Any, *, model: str | None = None,
     Legacy windows remain readable without implying honored model/kind filters.
     Accounts' existing catalog also permits resources after an ignored selector.
     Return that whole epoch, never combine reads or retry an unknown failure.
+    ``timeout_sec`` is one budget for every view asked; a spent one raises TimeoutError.
     """
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
     if request_kind not in ("text", "image"):
         raise ValueError("request_kind must be text or image")
+    started = time.monotonic()
+
+    def quota_state(**selectors: Any) -> Any:
+        if timeout_sec is None:
+            return gateway.quota_state(**selectors)
+        remaining = timeout_sec - (time.monotonic() - started)
+        if remaining <= 0:
+            raise TimeoutError("Quota read deadline elapsed")
+        return gateway.quota_state(**selectors, timeout_sec=remaining)
+
     try:
-        value = gateway.quota_state(view=QUOTA_VIEW, model=model, request_kind=request_kind)
+        value = quota_state(view=QUOTA_VIEW, model=model, request_kind=request_kind)
     except ClaudexorUnavailable as exc:
         if exc.status_code != 400:
             raise
         if require_resources:
-            value = gateway.quota_state(view="resources")
+            value = quota_state(view="resources")
         else:
             try:
-                value = gateway.quota_state(view="constraint_freshness")
+                value = quota_state(view="constraint_freshness")
             except ClaudexorUnavailable as legacy_exc:
                 if legacy_exc.status_code != 400:
                     raise
-                value = gateway.quota_state()
+                value = quota_state()
     else:
         if (require_resources and quota_envelope_valid(value)
                 and "resources" not in value and "availability_scope" not in value):
-            value = gateway.quota_state(view="resources")
+            value = quota_state(view="resources")
     if not quota_envelope_valid(value) or (require_resources and "resources" not in value):
         raise ClaudexorUnavailable("malformed_response", "Quota envelope is malformed")
     return value
@@ -138,3 +173,67 @@ def quota_availability(value: dict, harness: str, *, model: str | None = None,
     resets = [v.get("resets_at") for v in verdicts if isinstance(v.get("resets_at"), str)]
     return {"state": "exhausted" if any(v["state"] == "exhausted" for v in verdicts) else "cooldown",
             "resets_at": min(resets) if resets else None, "execution_guaranteed": False}
+
+
+def _dated_row(row: dict, *, snapshot: bool) -> dict:
+    """One engine row's subject, source and dates; no labels, ratios, money or detail prose."""
+    fact = {"subject_id": row["subject"].get("subject_id"), "observed_at": row.get("observed_at")}
+    if not snapshot:
+        return {**fact, "reason": row.get("reason")}
+    availability = row.get("availability") if isinstance(row.get("availability"), dict) else {}
+    constraints = row.get("constraints")
+    windows = [c for c in constraints if isinstance(c, dict)] if isinstance(constraints, list) else []
+    return {**fact, "source": row.get("source"), "freshness": row.get("freshness"),
+            "fresh_windows": sum(c.get("freshness") == "fresh" for c in windows), "windows": len(windows),
+            "state": availability.get("state"), "resets_at": availability.get("resets_at")}
+
+
+def quota_observation(harness: str, model: str | None, profile: str = "", *, timeout_sec: float,
+                      request_kind: str = "text") -> dict[str, Any]:
+    """Quota-only facts for one exact binding: the shared verdict and every scoped row, compact and dated.
+
+    One deadline covers the metadata connection, a default pin's roster proof and every
+    legacy view. A failed read, an unread envelope and an empty one stay distinct; an
+    unreadable roster only withholds the alias. Nothing refreshes, starts, selects or reads
+    money, and roster contents never leave here. Auto sees every subject of the harness.
+    """
+    from ouroboros.claudexor_daemon import read_owned_gateway
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    started = time.monotonic()
+
+    def left() -> float:
+        remaining = timeout_sec - (time.monotonic() - started)
+        if remaining <= 0:
+            raise TimeoutError("Quota observation deadline elapsed")
+        return remaining
+
+    fact: dict[str, Any] = {"requested_scope": {"model": model, "requestKind": request_kind,
+                                                "account": profile or "Auto"}}
+    aliases: tuple = ()
+    try:
+        gateway = read_owned_gateway(timeout_sec=left())
+        try:
+            if profile == f"{harness}-default":
+                try:
+                    aliases = default_subject_aliases(gateway.credential_profiles(timeout_sec=left()), harness, profile)
+                except ClaudexorUnavailable as exc:
+                    fact["roster_error"] = passive_read_error(exc)
+            value = read_quota(gateway, model=model, request_kind=request_kind, timeout_sec=left())
+        finally:
+            gateway.close()
+    except TimeoutError:
+        return {**fact, "read": "not_read", "reason": "observation_deadline_elapsed"}
+    except Exception as exc:
+        return {**fact, "read": "failed", "error": passive_read_error(exc)}
+    snapshots = subject_rows(value.get("snapshots"), harness, profile, aliases=aliases)
+    absences = subject_rows(value.get("absences"), harness, profile, aliases=aliases)
+    verdict = quota_availability(value, harness, model=model, profile=profile,
+                                 request_kind=request_kind, aliases=aliases)
+    fact.update(read="ok", scope_honored=scope_honored(value, model, request_kind),
+                subjects=("every engine subject of the harness, enabled or not" if not profile
+                          else "the pin and its proven default alias" if aliases else "the exact pin"),
+                availability={**verdict, "scope": "quota_only"},
+                snapshots=[_dated_row(row, snapshot=True) for row in snapshots],
+                absences=[_dated_row(row, snapshot=False) for row in absences])
+    return fact

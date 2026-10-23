@@ -15,8 +15,8 @@ function providerCredentials(settings = {}) {
 }
 
 export function modelWaitRoleLabel(role = '') {
-    const labels = { main: 'Main', light: 'Light', vision: 'Vision', consciousness: 'Background consciousness',
-        deep_review: 'Deep self-review', websearch: 'Web search' };
+    const labels = { main: 'Main', light: 'Light', vision: 'Vision', consciousness: 'Consciousness',
+        safety: 'Safety Supervisor', deep_review: 'Deep self-review', websearch: 'Web search' };
     if (labels[role]) return labels[role];
     const [kind, ...identity] = String(role).split(':');
     const suffix = identity.join(':');

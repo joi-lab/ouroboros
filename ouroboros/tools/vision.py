@@ -635,7 +635,7 @@ def _emit_usage(ctx: ToolContext, usage: Dict[str, Any], model: str) -> None:
         log.debug("Failed to emit VLM usage event", exc_info=True)
 
 
-def attach_local_image_to_context(ctx: ToolContext, path: str) -> Tuple[bool, str]:
+def attach_local_image_to_context(ctx: ToolContext, path: str, *, stamp: Any = None) -> Tuple[bool, str]:
     """Attach a LOCAL image file to the active conversation as a native image block.
 
     The single implementation behind BOTH the agent-called ``view_image`` tool and
@@ -671,7 +671,7 @@ def attach_local_image_to_context(ctx: ToolContext, path: str) -> Tuple[bool, st
             "_caption": caption,
             "_source_path": source_path,
         },
-    ])
+    ], stamp=stamp or ctx)  # a batch eviction of sent images names its origin on the live slot
     return True, (
         f"'{src_name}' is now attached as a local image block. Vision-capable remote routes can "
         f"inspect it inline; blind/local routes may receive a caption or placeholder at send time. "

@@ -199,7 +199,10 @@ class TestAliasProducerFanOutSweep:
         ("ouroboros/skill_loader.py", "cost_usd", "to_dict"): ("skill review outcome receipt serialization", 1),
         ("ouroboros/skill_loader.py", "cost_usd", "_read_review_record"): ("skill review state load", 1),
         ("ouroboros/skill_review.py", "cost_usd", "_run_deterministic_preflight"): ("skill review preflight receipt", 1),
-        ("ouroboros/skill_review.py", "cost_usd", "_persist_reviewed_outcome"): ("skill review outcome receipt", 1),
+        ("ouroboros/skill_review.py", "cost_usd", "_outcome_from_result"): ("skill review outcome receipt, read from the wave record's cost", 1),
+        ("ouroboros/skill_review.py", "cost_usd", "_persist_projection"): ("skill review outcome receipt (the review.json projection)", 1),
+        ("ouroboros/tools/review_skill.py", "cost_usd", "seat_facts"): ("skill review per-seat facts of the review.json projection", 1),
+        ("ouroboros/tools/review_skill.py", "cost_usd", "legacy_actor_records"): ("skill review record rows rendered in the legacy actor shape", 1),
         ("ouroboros/skill_owner_attestation.py", "cost_usd", "run_owner_attestation"): ("owner attestation review receipt", 1),
         ("ouroboros/tools/delegate_terminal_evidence.py", "cost_usd", "_reported_cost"): ("delegate terminal evidence rows", 4),
         ("ouroboros/tools/review_admission.py", "cost_usd", "triad_not_dispatched_records"): ("review admission receipt", 1),
@@ -211,6 +214,7 @@ class TestAliasProducerFanOutSweep:
         ("ouroboros/evolution_checkpoints.py", "cost_usd", "append_evolution_checkpoint"): ("evolution checkpoint records", 1),
         # custody settlement events
         ("ouroboros/delegate_collection.py", "cost_usd", "record_terminal_money"): ("custody SETTLED event row", 1),
+        ("ouroboros/owner_stop_receipt.py", "cost_usd", "retained_run_facts"): ("frozen per-run custody accounting receipt (disclosed spend + finality), passed through as evidence; not the task's ledger upper bound", 1),
     }
 
     @staticmethod
@@ -509,6 +513,30 @@ class TestProjectionBoundaryNormalization:
         assert _retired_alias_paths_deep(envelope) == []
         assert envelope["usage"]["accounted_upper_bound_usd"] == 0.75
         assert envelope["accounted_upper_bound_usd"] == 0.75
+
+
+class TestRetainedWorkAccountingPlane:
+    @pytest.mark.parametrize("disclosed, estimated, amount, expected", [
+        (False, False, 7.0, None), (True, True, 0.25, 0.25), (True, False, 0.0, 0.0),
+    ])
+    def test_run_receipt_keeps_its_accounting_schema_beside_public_task_cost(
+        self, tmp_path, disclosed, estimated, amount, expected,
+    ):
+        from ouroboros.delegate_custody import RunCustody
+        from ouroboros.owner_stop_receipt import retained_run_facts
+        from ouroboros.outcomes import public_task_result
+
+        run = RunCustody(run_id="run", task_id="task", cost_usd=amount,
+                         spend_disclosed=disclosed, spend_estimated=estimated)
+        facts = retained_run_facts(tmp_path, run)
+        evidence = {"owner_stop_children": {"runs": [facts]}}
+        public = public_task_result({"task_id": "task", "status": "cancelled", "cost_usd": 9.0,
+                                     "delegate_terminal_reconciliation": evidence})
+        assert public["accounted_upper_bound_usd"] == 9.0 and "cost_usd" not in public
+        receipt = public["delegate_terminal_reconciliation"]["owner_stop_children"]["runs"][0]
+        assert receipt["accounting"] == {"settled": False, "ledger_recorded": False,
+                                          "cost_usd": expected, "cost_final": disclosed and not estimated}
+        assert public["delegate_terminal_reconciliation"] == evidence
 
 
 class TestReviewPoolBoundary:

@@ -14,4 +14,7 @@ Wake facts (context only):
 - reason: {reason}; last wake: {last_wake_ago}
 - recent facts: {events}
 - autonomy: {level} — {level_line}; unavailable tools: {withheld_tools}
-- allowance known spend (last 24 h): {spent_usd} / {daily_usd} USD; tasks running: {running}/{max_tasks}; next interval: {interval} s
+- allowance known spend (last 24 h): {spent_usd} / {daily_usd} USD; by cause: {spend_by_cause}; tasks running: {running}/{max_tasks}; next interval: {interval} s
+- counted roots: {counted_roots}
+- places: {places}
+- memory: Main is my ordinary room; Live rooms is a directory; round facts name unsealed size/share and drafts awaiting a decision.

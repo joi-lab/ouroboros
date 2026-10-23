@@ -181,6 +181,7 @@ def test_context_mode_compat_migration_truth_table_and_second_start(
     for index, (raw, expected_mode, warning_expected) in enumerate(cases):
         settings_path = tmp_path / f"settings-{index}.json"
         raw_document = {
+            "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full",
             **raw,
             "OPENAI_API_KEY": "test-secret-preserved",
             "UNKNOWN_MIGRATION_KEY": {"nested": [index, False]},
@@ -244,6 +245,7 @@ def test_context_mode_compat_migration_write_failure_is_honest_and_nonfatal(
 
     settings_path = tmp_path / "settings.json"
     original = {
+        "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full",
         "OUROBOROS_CONTEXT_MODE": "low",
         "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "true",
         "UNKNOWN_MIGRATION_KEY": {"preserved": True},
@@ -296,6 +298,7 @@ def test_context_mode_compat_migration_does_not_rewrite_unchanged_raw_pair(
         },
     ]
     for index, document in enumerate(documents):
+        document = {"OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full", **document}
         settings_path = tmp_path / f"unchanged-{index}.json"
         settings_path.write_text(json.dumps(document), encoding="utf-8")
         monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)

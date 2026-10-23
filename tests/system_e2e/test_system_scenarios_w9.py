@@ -30,7 +30,7 @@ package-init hook switches the serving checkout before its imports, and generati
 settles the adoption on boot and verifies the restart on the serving SHA. The serving
 checkout is installation-shaped and CLEAN — the tree under test committed as the
 ``ouroboros`` line — because a restart resets a real install to that line. Adoption
-accepts only existing full green test evidence of exactly the adopted commit; S37 tests
+accepts exact-commit full or qualifying reviewed-local selected evidence; S37 tests
 the adoption mechanics, not qualification, so a TEST FIXTURE supplies that evidence as a
 labelled receipt (``_record_fixture_qualification``), and a refusal or any other dead end
 fails the scenario at once with its reason instead of waiting out the deadline.
@@ -179,7 +179,7 @@ def _candidate_rows(data_root: pathlib.Path) -> list:
 def _record_fixture_qualification(data_root: pathlib.Path, candidate: pathlib.Path, commit: str) -> str:
     """TEST FIXTURE: the durable receipt a complete full test run of exactly ``commit`` leaves.
 
-    Adoption accepts only existing full green evidence of exactly the adopted commit
+    Adoption accepts exact-commit full or qualifying reviewed-local selected evidence
     (``ouroboros/preflight_qualification.py`` ``receipt_for_commit``); it never runs the
     battery itself. S37 tests the adoption MECHANICS, not qualification: running the
     whole battery inside a keyless scenario would test the battery, and qualification's

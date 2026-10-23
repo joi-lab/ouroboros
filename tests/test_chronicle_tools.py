@@ -759,6 +759,9 @@ def test_the_write_and_read_schemas_carry_account_selection_and_revision():
     assert {"sources", "replaces", "shown"} <= set(schemas["chronicle_write"])
     assert schemas["chronicle_write"]["sources"]["type"] == "array" and schemas["chronicle_write"]["shown"]["type"] == "boolean"
     assert schemas["memory_read"]["revision"]["type"] == "string"
+    assert all(reader in schemas["memory_read"]["room_id"]["description"] for reader in ("'*'", "'candidates'"))
+    assert not any(reader in schemas[name]["room_id"]["description"]
+                   for name in ("chronicle_write", "memory_mark") for reader in ("'*'", "'candidates'"))
     assert "author" not in schemas["chronicle_write"] and "told_by" not in schemas["chronicle_write"]
 
 

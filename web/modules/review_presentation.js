@@ -5,7 +5,7 @@ import { escapeHtmlAttr, sinceLocalTime } from './utils.js';
 import { isStoreMigrating, taskSourceDownloadUrl } from './api_client.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
 import { reconcileReviewMarkup } from './review_dom_patch.js';
-import { actorAwaiting, actorUnresolved, formatReviewProjection } from './review_record_card.js';
+import { actorAwaiting, actorUnresolved, authorDoctrineLines, formatReviewProjection } from './review_record_card.js';
 import { planRecordEngaged, planRecordGroup } from './plan_record_presentation.js';
 export { formatReviewProjection } from './review_record_card.js';
 
@@ -159,6 +159,7 @@ function normalizeSkillAttempt(attempt, defaults = {}, ordinal = 0) {
     if (!attempt || typeof attempt !== 'object') return null;
     const skill = text(attempt.skill || defaults.skill);
     const jobId = text(attempt.job_id || attempt.jobId);
+    const recordId = text(attempt.record_id || attempt.recordId);
     const id = attemptIdentity(attempt, [
         text(attempt.content_hash), text(attempt.review_round),
         text(attempt.snapshot_attempt), String(ordinal + 1),
@@ -206,7 +207,7 @@ function normalizeSkillAttempt(attempt, defaults = {}, ordinal = 0) {
         executions: normalizedExecutions(attempt.executions, attempt.execution),
         execution: attempt.execution && typeof attempt.execution === 'object' ? attempt.execution : null,
         lifecycleOnly,
-        detailRef: skill && jobId ? { surface: 'skill', skill, jobId } : null,
+        detailRef: skill && jobId ? { surface: 'skill', skill, jobId, ...(recordId ? { recordId } : {}) } : null,
         detailText: '',
     };
 }
@@ -594,15 +595,8 @@ function planWaveDetail(wave) {
     }
     if (wave.findings_texts_truncated) lines.push('Some finding texts were truncated at capture.');
     if (wave.spec_body_truncated) lines.push('Spec body was truncated at capture.');
-    const author = wave.author_disposition;
-    if (author && typeof author === 'object' && text(author.disposition)) {
-        lines.push(
-            `Author ${author.action === 'stop' ? 'stop' : 'finish'}: ${text(author.disposition)}${text(author.reviewer_signal) ? ` · reviewer signal=${text(author.reviewer_signal)}` : ''}`
-            + `${text(author.rationale) ? ` · ${text(author.rationale)}` : ''}`
-            + `${text(author.subject_hash) ? ` · subject_hash=${text(author.subject_hash)}` : ''}`
-            + `${text(author.source) ? ` · source=${text(author.source)}` : ''}`,
-        );
-    }
+    const authorLine = authorDispositionText(wave.author_disposition);
+    if (authorLine) lines.push(authorLine);
     return lines.filter(Boolean).join('\n');
 }
 
@@ -778,6 +772,7 @@ function authorDispositionText(author, label = '') {
         text(author.rationale),
         text(author.subject_hash) ? `subject_hash=${text(author.subject_hash)}` : '',
         text(author.source) ? `source=${text(author.source)}` : '',
+        ...authorDoctrineLines(author),
     ].filter(Boolean).join(' · ');
 }
 
@@ -1359,6 +1354,7 @@ export function renderReviewsSection(groupsInput, disclosure = {}) {
             const skillRef = attempt.detailRef?.surface === 'skill' ? attempt.detailRef : null;
             const detailAttrs = skillRef
                 ? ` data-skill-review-skill="${escapeHtmlAttr(skillRef.skill)}" data-skill-review-job="${escapeHtmlAttr(skillRef.jobId)}"`
+                    + (skillRef.recordId ? ` data-skill-review-record="${escapeHtmlAttr(skillRef.recordId)}"` : '')
                 : '';
             const source = attempt.detailRef?.surface === 'task_acceptance' ? attempt.detailRef : null;
             const fullSource = source ? (source.url
@@ -1425,7 +1421,7 @@ export function renderReviewsSection(groupsInput, disclosure = {}) {
     const hydrateHtml = hydrateStatus === 'loading'
         ? '<div class="skill-review-loading" data-review-hydrate-status role="status" aria-live="polite"><span>Loading review details…</span></div>'
         : (hydrateStatus === 'error'
-            ? '<div class="skill-review-error" data-review-hydrate-status role="alert"><span>Review details failed to refresh — shown data may be incomplete. </span><button type="button" class="skill-review-retry" data-review-hydrate-retry>Retry</button></div>'
+            ? '<div class="skill-review-error" data-review-hydrate-status role="alert"><span>Review details failed to refresh — shown data may be incomplete. </span><button type="button" class="btn btn-default btn-sm" data-review-hydrate-retry>Retry</button></div>'
             : '');
     // The status node sits OUTSIDE the collapsible groups container: a failed
     // refresh stays visible on a collapsed section and the keyed node survives

@@ -246,11 +246,16 @@ def new_call_id(prefix: str) -> str:
     return f"{safe}_{uuid.uuid4().hex}"
 
 
-def _observability_root(drive_root: pathlib.Path) -> pathlib.Path:
+def _observability_dir(drive_root: pathlib.Path) -> pathlib.Path:
+    """The drive's observability root as its writers spell it; a pure read creates nothing."""
     base = pathlib.Path(drive_root)
     if not base.is_absolute():
         raise ValueError("observability drive_root must be an absolute path")
-    root = (base / OBSERVABILITY_DIR).resolve(strict=False)
+    return (base / OBSERVABILITY_DIR).resolve(strict=False)
+
+
+def _observability_root(drive_root: pathlib.Path) -> pathlib.Path:
+    root = _observability_dir(drive_root)
     root.mkdir(parents=True, exist_ok=True)
     _chmod_private_dir(root)
     return root
@@ -760,7 +765,7 @@ def _rewrite_child_ref_tree(
                 value = placed  # Only the mutable request projection rebinds addresses.
         return {
             key: _rewrite_child_ref_tree(item, parent_root, child_root,
-                source_owner(key, item, task_id), state, carrier=role)
+                source_owner(key, item, task_id, carrier=carrier, root=parent_root), state, carrier=role)
             if (role := source_carrier(value, key, carrier)) else item
             for key, item in value.items()
         }
@@ -1367,11 +1372,12 @@ def preserve_salvaged_output(preserve_root: pathlib.Path, task_id: str, text: st
 
 
 def preserved_salvage_path(preserve_root: pathlib.Path, task_id: str) -> str:
-    """The durable full-salvage copy path for a task, or "" when none exists."""
+    """The durable full-salvage copy path for a task, or "" when none exists. A pure read: no
+    directory is created and no mode re-applied (``preserve_salvaged_output`` owns both)."""
     safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(task_id or "")).strip("_")
     if not safe_task:
         return ""
-    path = _observability_root(pathlib.Path(preserve_root)) / SALVAGED_OUTPUT_DIR / f"{safe_task}.txt"
+    path = _observability_dir(pathlib.Path(preserve_root)) / SALVAGED_OUTPUT_DIR / f"{safe_task}.txt"
     return str(path) if path.is_file() else ""
 
 

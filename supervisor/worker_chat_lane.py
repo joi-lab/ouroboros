@@ -171,20 +171,7 @@ def _handle_chat_direct_locked(
     task_constraint: Optional[dict] = None,
     task_metadata: Optional[dict] = None,
 ) -> None:
-    from supervisor.state import budget_remaining, load_state
-    failure_meta = _host_operation_failure(task_metadata)
-    try:
-        remaining = budget_remaining(load_state(), strict=True)
-    except Exception:
-        _pool().send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", **failure_meta, role="system", system_type="task_admission_notice")
-        return
-    if remaining <= 0:
-        try:
-            _pool().send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", **failure_meta, role="system", system_type="task_admission_notice")
-        except Exception:
-            pass
-        return
-
+    # The registered agent owns the strict money read, including its storage wait and controls.
     _run_chat_task(
         None, chat_id, text, image_data,
         task_constraint=task_constraint, task_metadata=task_metadata,
@@ -332,6 +319,11 @@ def _admit_chat_task(
                 task["text"] = late_answer_model_text(
                     _pool().DRIVE_ROOT, task_metadata.get("late_answer"), str(text or ""),
                 )
+            elif task_metadata.get("card_press") is not None:
+                # A press on a finished author's card: the same, with the card frame rebuilt from the stored press.
+                from ouroboros.gateway.card_decision import card_press_model_text
+
+                task["text"] = card_press_model_text(_pool().DRIVE_ROOT, task_metadata.get("card_press"), str(text or ""))
             # The ingress-captured origin identity rides on the TASK RECORD so a
             # later post-hoc "Turn into project" reads it from the persisted
             # result instead of re-deriving identity from content.
@@ -525,18 +517,23 @@ def _execute_chat_task(admitted: Dict[str, Any]) -> bool:
             checkpoint = ((event.get("resource_limit") or {}).get("checkpoint")
                           if isinstance(event, dict) and isinstance(event.get("resource_limit"), dict) else None)
             if not (isinstance(event, dict) and str(event.get("type") or "") == "budget_pause"
-                    and event.get("_is_direct_chat") and isinstance(checkpoint, dict)):
+                    and event.get("_is_direct_chat") and (isinstance(checkpoint, dict)
+                    or (event.get("resource_limit") or {}).get("before_task_start"))):
                 remaining.append(event)
                 continue
             from supervisor.direct_pause import park_direct_pause
-            if not park_direct_pause(task, event):
-                remaining.append(event)
+            try:
+                if not park_direct_pause(task, event):
+                    remaining.append(event)
+            finally:
+                if (event.get("resource_limit") or {}).get("before_task_start"):
+                    agent._release_turn()
         for e in remaining:
             _pool().get_event_q().put(stamp_finalization_enqueue(turn_queue.stamp(e)))
         ok = True
     except Exception as e:
         from supervisor.direct_pause import recover_direct_pause
-        ok = recover_direct_pause(task)
+        ok = recover_direct_pause(task, e)
         if not ok:
             _report_direct_chat_error(admitted, e)
     finally:
@@ -549,12 +546,17 @@ def _report_direct_chat_error(admitted: Dict[str, Any], e: BaseException) -> Non
     import traceback
     task, chat_id, kind = admitted["task"], admitted["chat_id"], admitted["kind"]
     client_msg_id, task_metadata = admitted["client_msg_id"], admitted.get("task_metadata")
-    err_msg = f"⚠️ Error: {type(e).__name__}: {e}"
+    stopped = (getattr(e, "before_task_start", False)
+               and getattr(e, "control_reason", "") in {"cancelled", "finalize_requested"})
+    exhausted = getattr(e, "before_task_start", False) and getattr(e, "control_reason", "") == "budget_exhausted"
+    err_msg = ("⏹ The owner stopped this chat turn before it started; no work was done." if stopped else
+               "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings." if exhausted else
+               f"⚠️ Error: {type(e).__name__}: {e}")
     append_jsonl(
         _pool().DRIVE_ROOT / "logs" / "supervisor.jsonl",
         {
             "ts": utc_now_iso(),
-            "type": "direct_chat_error",
+            "type": "direct_chat_stopped" if stopped else "direct_chat_error",
             "task_id": str(task.get("id") or ""),
             "chat_id": int(chat_id or 0),
             "error": repr(e),
@@ -587,7 +589,7 @@ def _report_direct_chat_error(admitted: Dict[str, Any], e: BaseException) -> Non
                 log.debug("Failed-turn typing announce failed", exc_info=True)
         # The keyed final concludes its own turn and linked Sending; it keeps only the host-operation source.
         correlation = _host_operation_failure(task_metadata).get("progress_meta", {})
-        progress_meta = {"task_terminal_status": "failed"}
+        progress_meta = {"task_terminal_status": "cancelled" if stopped else "failed"}
         if "origin_message_ref" in correlation:
             progress_meta["origin_message_ref"] = correlation["origin_message_ref"]
         initiator = str((task_metadata or {}).get("initiator") or "")
@@ -598,7 +600,7 @@ def _report_direct_chat_error(admitted: Dict[str, Any], e: BaseException) -> Non
             err_msg,
             task_id=failed_task_id,
             progress_meta=progress_meta,
-            role="system", system_type="task_error")
+            role="system", system_type="task_not_started" if stopped or exhausted else "task_error")
     except Exception:
         log.debug("Suppressed exception", exc_info=True)
 
@@ -682,59 +684,40 @@ def handle_wake_direct(
 
 
 def auto_resume_after_restart() -> None:
-    """Auto-resume after a recent restart when scratchpad still has work.
-
-    The owner-Restart marker is consumed only AFTER the queue holding its
-    per-row Restart holds (``restart_retention``) is durably persisted: a
-    marker gone while the holds live only in memory would let the next boot
-    read the older queue as dispatchable work. A failed persist keeps the
-    marker (fail closed, no auto-wake) for the next boot to retry.
-    """
+    """Consume boot doors only after their work stops and controls are durable."""
     try:
-        owner_restart_flag = _pool().DRIVE_ROOT / "state" / "owner_restart_no_resume.flag"
-        if owner_restart_flag.exists():
-            from supervisor.queue import persist_queue_snapshot
-
+        from ouroboros.delegate_recovery import import_legacy_restart, pending_owner_restart, consume_owner_restart
+        from ouroboros.installation_stop import (PANIC_RECEIPT, panic_input, panic_received,
+                                                remove_received_panic)
+        from supervisor.queue import persist_queue_snapshot
+        root = _pool().DRIVE_ROOT
+        import_legacy_restart(root)
+        restart = pending_owner_restart(root)
+        if restart:
             if persist_queue_snapshot(reason="owner_restart_holds") is not True:
-                log.error("Owner restart holds are not durable yet; the restart marker is kept "
-                          "and nothing auto-resumes.")
+                log.error("Owner restart holds are not durable; its door is kept.")
                 return
             from supervisor.queue_schedules import schedule_transaction
             from supervisor.followup_policy import record_restart
-            with schedule_transaction(_pool().DRIVE_ROOT):
-                record_restart(_pool().DRIVE_ROOT)
-                owner_restart_flag.unlink(missing_ok=True)
-            panic_compat_flag = _pool().DRIVE_ROOT / "state" / "panic_stop.flag"
-            try:
-                if panic_compat_flag.read_text(encoding="utf-8").strip() == "owner_restart_no_resume":
-                    panic_compat_flag.unlink(missing_ok=True)
-            except FileNotFoundError:
-                pass
-            except Exception:
-                log.debug("Failed to consume owner restart compatibility flag", exc_info=True)
-            log.info("Owner restart flag detected — skipping auto-resume.")
-            if not (_pool().DRIVE_ROOT / "state" / "panic_stop.flag").exists():
-                return  # a kept Panic flag still owes its durable controls below
-
-        # Panic/owner-restart flags suppress auto-resume and are consumed — a Panic's
-        # only after the queue carrying its sleep holds is durable, like a Restart's.
-        panic_flag = _pool().DRIVE_ROOT / "state" / "panic_stop.flag"
-        if panic_flag.exists():
-            from supervisor.queue import persist_queue_snapshot
-
+            with schedule_transaction(root):
+                record_restart(root)
+                consume_owner_restart(root, restart)
+        identity = panic_input(root)
+        if identity:
+            if panic_received(root, identity):
+                remove_received_panic(root, identity)
+                return
             if persist_queue_snapshot(reason="panic_holds") is not True:
-                log.error("Panic holds are not durable yet; the panic marker is kept.")
+                log.error("Panic holds are not durable; its input is kept.")
                 return
             from ouroboros.server_control import PANIC_CONTROL_KEYS, _panic_controls
-            from supervisor.state import StateUnavailable, update_state
+            from supervisor.state import update_state
 
-            try:
-                update_state(_panic_controls, confirm=PANIC_CONTROL_KEYS)
-            except StateUnavailable as exc:
-                log.warning("Panic flag kept: its disabled controls are not durable yet (%s)", exc)
-                return
-            panic_flag.unlink(missing_ok=True)
-            log.info("Panic flag detected — skipping auto-resume.")
+            update_state(_panic_controls, confirm=PANIC_CONTROL_KEYS)
+            update_state(lambda state: state.update({PANIC_RECEIPT: identity}))
+            remove_received_panic(root, identity)
+            return
+        if restart:
             return
 
         from supervisor.state import control_value
@@ -749,22 +732,6 @@ def auto_resume_after_restart() -> None:
         if not restart_verify_path.exists():
             return
 
-        scratchpad_path = _pool().DRIVE_ROOT / "memory" / "scratchpad.md"
-        if not scratchpad_path.exists():
-            return
-
-        scratchpad = scratchpad_path.read_text(encoding="utf-8")
-        stripped = scratchpad.strip()
-        if not stripped or stripped == "# Scratchpad" or "(empty" in stripped.lower():
-            content_lines = [
-                ln.strip() for ln in stripped.splitlines()
-                if ln.strip() and not ln.strip().startswith("#") and ln.strip() != "- (empty)"
-            ]
-            content_lines = [ln for ln in content_lines if not ln.startswith("UpdatedAt:")]
-            if not content_lines:
-                return
-
-        time.sleep(2)  # Let everything initialize
         if not _pool().chat_turn_liveness():
             import threading
             threading.Thread(

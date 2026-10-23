@@ -7,7 +7,7 @@ import json
 import pytest
 
 from tests.test_subscription_setup_browser import subscription_ui as subscription_ui
-from tests.test_subscription_setup_browser import capture
+from tests.test_subscription_setup_browser import capture, settings_saves
 
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 
@@ -54,8 +54,8 @@ def test_settings_same_preview_keeps_live_row_handler_and_payload(subscription_u
     assert page.evaluate("() => window.__rowBefore === document.querySelector('[data-subagent-row]')")
     with page.expect_response("**/api/settings"):
         page.locator("#btn-save-settings").click()
-    assert saves
-    payload = saves[-1]["OUROBOROS_SUBAGENTS"]
+    assert saves and "OUROBOROS_SUBAGENTS" not in saves[-1], "the edited roster travels in the owner transaction"
+    payload = [body for path, body in ui["posts"] if path == "/api/owner/safety-model"][-1]["settings"]["OUROBOROS_SUBAGENTS"]
     if isinstance(payload, str):
         payload = json.loads(payload)
     assert payload["items"][0]["recommended_use"] == "SETTINGS EDIT 123"
@@ -136,7 +136,9 @@ def test_session_access_is_visible_and_preserved_by_the_real_editor(subscription
         with page.expect_response("**/api/onboarding/complete"):
             page.click("#next-btn")
         path = "/api/onboarding/complete"
-    payload = next(body for endpoint, body in reversed(ui["posts"]) if endpoint == path)["OUROBOROS_SUBAGENTS"]
+    written = settings_saves(ui)[-1] if path == "/api/settings" else next(
+        body for endpoint, body in reversed(ui["posts"]) if endpoint == path)
+    payload = written["OUROBOROS_SUBAGENTS"]
     payload = json.loads(payload) if isinstance(payload, str) else payload
     sessions = [row for row in payload["items"] if row["route"]["kind"] == "agent_session"]
     assert sessions[0]["access"] == "workspace_write"

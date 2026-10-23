@@ -67,6 +67,8 @@ function fixture(history = [], chatId = 1) {
         card: () => walkCard(messages, TASK),
         rows: () => nodes(walkCard(messages, TASK)).filter((n) => n.classList?.contains('chat-live-line')),
         meta: () => walkCard(messages, TASK)?.querySelector('[data-live-meta]')?.innerHTML || '',
+        // The labelled facts beyond the compact line (tool calls among them): the card's own details list.
+        facts: () => walkCard(messages, TASK)?.querySelector('[data-live-facts]')?.innerHTML || '',
         owner: () => messages.children.find((node) => node.dataset.clientMessageId === 'owner-message'),
         answerVisible: () => messages.children.some((node) => /The task is scheduled/.test(node.innerHTML)),
         emit: (type, row) => handlers.get(type)({ chat_id: chatId, ts: TS, ...row }),
@@ -177,7 +179,7 @@ test('read_file followed by promote keeps one block with one folded row, the ful
         f.emit('chat', { ...final, tool_calls: 2 });
         assert.equal(f.card(), card);
         assert.equal(card.dataset.finished, '1');
-        assert.match(f.meta(), /2 tool calls/);
+        assert.match(f.facts(), /<dt>Tool calls<\/dt><dd>2<\/dd>/);
         assert.match(f.meta(), /\$0\.75/);
     } finally { f.close(); }
 });
@@ -218,7 +220,7 @@ for (const type of ['task_metrics_event', 'task_eval']) {
             // The summary row beside the completion note the final already left
             // (the stub cannot repaint an in-place patch; the meta carries the count).
             assert.equal(f.rows().length, 2);
-            assert.match(f.meta(), /2 tool calls/);
+            assert.match(f.facts(), /<dt>Tool calls<\/dt><dd>2<\/dd>/);
         } finally { f.close(); }
     });
 }
@@ -230,7 +232,7 @@ test('a history rebuild keeps a live block whose evidence the window does not ca
         await f.instance.refreshHistory({ revision: 1 });
         assert.ok(f.card(), 'the rebuilt transcript keeps the live rows');
         f.log({ type: 'task_metrics_event', tool_calls: 2 });
-        assert.match(f.meta(), /2 tool calls/);
+        assert.match(f.facts(), /<dt>Tool calls<\/dt><dd>2<\/dd>/);
     } finally { f.close(); }
 });
 
@@ -356,7 +358,7 @@ for (const [status, phase] of [['completed', 'done'], ['failed', 'error']]) {
                 accounted_upper_bound_usd: 0.75, cost_final: true, cost_accounting_status: 'available' });
             assert.equal(f.card().dataset.finished, '1');
             assert.equal(f.card().querySelector('[data-live-phase]').dataset.phase, phase, 'the final owns the phase');
-            assert.match(f.meta(), /2 tool calls/);
+            assert.match(f.facts(), /<dt>Tool calls<\/dt><dd>2<\/dd>/);
             assert.match(f.meta(), /\$0\.75/);
         } finally { f.close(); }
     });

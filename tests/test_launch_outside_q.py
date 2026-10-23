@@ -340,11 +340,10 @@ def test_a_stop_waits_for_a_committed_launch_to_reach_its_worker(env, monkeypatc
 def test_a_stop_waits_for_a_scheduled_launch_to_reach_its_worker(env, monkeypatch):
     """The same for an occurrence a schedule fired: its receipt says ``possible`` only once the put
     is certain to follow, so restore never holds a never-sent occurrence (and its schedule fires on)."""
-    from supervisor import queue_schedules, schedule_occurrence
+    from supervisor import schedule_occurrence
     from tests.test_schedule_occurrence import _row
 
     worker, delivered = install_worker(env, monkeypatch)
-    monkeypatch.setattr(queue_schedules, "resync_skill_schedules", lambda *_a: {})
     monkeypatch.setattr("ouroboros.config.get_bg_wakeup_min_sec", lambda: 0)
     _row(SimpleNamespace(queue=queue, pending=queue.PENDING, root=env.data), intent={"kind": "system_repo"})
     queue.check_scheduled_tasks()

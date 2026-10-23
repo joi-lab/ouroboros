@@ -888,6 +888,7 @@ def build_completed_result_event(
     quiet = (stored or {}).get("wake_silent") is True  # its words stay internal; only custody may speak
     if not tid or not (core_text or quiet) or not chat_id:
         return None
+    from ouroboros.owner_stop_receipt import terminal_event_fields
     from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_NOTICE, terminal_custody_notice_text
 
     runs = [str(rid) for rid in (unreconciled_runs or []) if str(rid)]
@@ -903,6 +904,7 @@ def build_completed_result_event(
         "format": "markdown",
         "delivery_id": delivery_id_for(tid, core_text),
         **({"terminal_custody_notice": custody} if custody and not quiet else {}),
+        **({} if quiet else terminal_event_fields(drive_root, tid)),  # Wrap up's receipt row (#1564)
     }
     return project_terminal_result_event(
         pathlib.Path(drive_root), task_row, tid,
@@ -1411,9 +1413,8 @@ def build_unreviewed_salvage_event(
 ) -> Optional[Dict[str, Any]]:
     """Build (without sending) the one salvage/terminal chat message.
 
-    The build half of the seam (GR2-4): the cancel path registers this event as
-    OWED before it settles the durable intent. Returns None when the task has
-    no lineage chat to route to.
+    GR2-4: the cancel path owes this event before settling the intent.
+    Returns None without a lineage chat.
 
     ``settled_status`` is the TYPED stored status (GR2-12): the completed-vs-
     salvage branch compares it against ``STATUS_COMPLETED`` instead of parsing
@@ -1426,9 +1427,6 @@ def build_unreviewed_salvage_event(
     CF-04: ``_stop_episode_delivery_id`` retains the exact Stop identity across
     replay/settle; terminal paths without a Stop keep ``final:...`` identities.
 
-    GR7-4: content-derived ids digest stable framing/salvage/preview only;
-    mutable unreconciled-runs disclosure cannot mint a second identity.
-
     Q4/Q5 presentation: the message is a typed SYSTEM receipt (``role`` +
     ``system_type`` ride the event end to end — Q4 non-mimicry), a raw
     fragment is named the last persisted intermediate model message (never an
@@ -1439,6 +1437,7 @@ def build_unreviewed_salvage_event(
     sentence comes from TASK_CAUSE_PHRASES here, and the code rides the receipt, not the prose.
     TZ-2 C2: text and receipt state the files rescued (positive/zero/unknown, stat-only walk, no hashes).
     """
+    from ouroboros.owner_stop_receipt import terminal_event_fields
     from ouroboros.task_results import STATUS_COMPLETED
 
     tid = str(task_id or "").strip()
@@ -1534,6 +1533,7 @@ def build_unreviewed_salvage_event(
     }
     if code:
         event["reason_code"] = code
+    event.update(terminal_event_fields(drive_root, tid))
     return event
 
 

@@ -32,13 +32,12 @@ def test_native_paid_wait_retains_operation_when_owner_controls_end_wait(tmp_pat
                              'actors': [{'operation_id': 'same-operation', 'operation_state': 'in_flight'}]}]}
     before = copy.deepcopy(trace)
     # This direct actor binds the existing owner control reader, with real
-    # disposable-root cancel/flag facts. No live process or queue is touched.
+    # disposable-root cancellation and the existing direct control callback.
     ctx.model_wait_context.owner_control = lambda: _hold_control_reason(ctx)
     if control == 'stop':
         request_cancel(tmp_path, ctx.task_id, reason='owner stopped', source='owner', requested_by='owner')
     else:
-        (tmp_path / 'state').mkdir(exist_ok=True)
-        (tmp_path / 'state' / 'panic_stop.flag').write_text('panic')
+        ctx.model_wait_context.owner_control = lambda: 'panic'
     monkeypatch.setattr('ouroboros.owner_wait.time.sleep', lambda *_: pytest.fail('control must precede sleep'))
     wait_after_tools(ctx, [], trace, {}, 1, [], set(), review_binding='already-paid')
     assert trace == before

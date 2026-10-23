@@ -26,7 +26,7 @@ from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.tool_access import lineage_task_ids, scheduled_origin
 from ouroboros.tools.followup import _handle_schedule_followup
 from ouroboros.tools.registry import ToolContext, ToolRegistry
-from supervisor import queue, queue_schedules, workers
+from supervisor import queue, workers
 from tests._execution_clock_seams import agent_start
 from tests.test_predecessor_lineage_read import predecessor_envelope
 from tests.test_schedule_followup import _ctx
@@ -47,7 +47,7 @@ def origin(host, monkeypatch, tmp_path):  # noqa: F811
     monkeypatch.setenv("TOTAL_BUDGET", "1000")
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
-    monkeypatch.setattr(queue_schedules, "resync_skill_schedules", lambda *_a: {})
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     monkeypatch.setattr("ouroboros.config.get_bg_wakeup_min_sec", lambda: 0)
     write_task_result(host.root, ORIGIN, "running", root_task_id=ORIGIN, billing_group=BINDING)
     for task_id, name, text in ((ORIGIN, "report.md", "ORIGIN_DRIVE"), (GRAND, "notes.md", "GRAND_DRIVE"),

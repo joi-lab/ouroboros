@@ -13,8 +13,9 @@ exactly two concurrent reads, with bearer/protocol headers kept server-side:
 
 No handshake, catalog, doctor, status builder, provider refresh, runtime
 preparation, daemon startup, settings write or account mutation is requested.
-`claudexor_observations.read_quota` also serves full Accounts and delegated route
-health: the readers share engine facts, not separate resource/quota interpretations.
+`claudexor_observations.read_quota` also serves full Accounts, delegated route
+health and the primary-route observation: the readers share engine facts, not
+separate resource/quota interpretations.
 Full Accounts retains its existing operations read and diagnostics. If that catalog
 advertises resources, an HTTP 400 or an ignored rich selector (neither resources nor scope)
 uses one `GET /v2/quota?view=resources`; the complete fallback replaces the first
@@ -97,6 +98,32 @@ verdicts. A generic full Accounts echo cannot certify a particular actor; accoun
 and catalog facts (including a base-only `[1m]` qualifier) stay visible with
 `Not checked`. Resource merges bind scope to quota: retained rows keep their scope;
 unproven or mixed-scope replacement clears it. No new request is made.
+
+## Primary-route observation
+
+While a fallback acts, `primary_route_observation.observe_primary_route` asks
+`claudexor_observations.quota_observation` about a Claudexor primary's exact
+model, `requestKind=text` and pin or Auto, before its catalog check. One deadline,
+the observation's shared 3 s budget less caller bounds, covers
+`read_owned_gateway`, a `<harness>-default` pin's roster proof and every legacy
+view (`read_quota(timeout_sec=)`; `quota_state`/`credential_profiles(timeout_sec=)`);
+the catalog gets the remainder, and a spent budget reads nothing more. The row
+carries the unchanged `quota_availability` verdict (`scope: quota_only`) beside
+every scoped snapshot and absence row, none dropped: subject, source, `observed_at`,
+freshness, fresh/total windows and the engine's own state and reset, never plan
+labels, ratios, money, roster contents or absence prose; an unreadable roster
+withholds only the alias. `read: failed` (safe code), `not_read`
+(`observation_deadline_elapsed`) and an empty `ok` stay distinct. Auto rows cover
+every engine subject of the harness, enabled or not, so a fresh row beside a
+stale same-subject source keeps the aggregate unknown. A newer `observed_at`
+alone is not a changed fact; ageing into unknown is. Nothing refreshes, starts,
+selects or generates; `tests/test_primary_quota_observation.py` drives the loop.
+
+For an unchanged primary binding, checks are at least 120 s apart. A changed
+fact re-emits the whole set into context, including unchanged rows. The
+recorded 43-row sample was about 9.4 kB per emission. The interval bounds
+cadence, not cumulative context cost. Actual emission frequency is unknown;
+token price was not measured.
 
 ## Limits and checks
 

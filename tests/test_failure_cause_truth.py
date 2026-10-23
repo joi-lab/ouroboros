@@ -90,11 +90,11 @@ def test_durable_triad_rows_and_the_frozen_roster_keep_the_reported_cause():
 
     from ouroboros.review_custody import _frozen_actor
     from ouroboros.tools.review import _parse_model_response
-    from ouroboros.triad_review import parse_model_review_results
+    from ouroboros.triad_review import parse_seat_answers
 
     def _durable_row(result):
         envelope = _parse_model_response("codex=gpt-6-astra", result, None)
-        parsed = parse_model_review_results({"results": [envelope]}, required_items=("manifest_schema",))
+        parsed = parse_seat_answers({"results": [envelope]}, {})
         return parsed.actor_records[0].to_dict()
 
     failed = _durable_row({"error": "Error: delegated review session run-1 ended failed",

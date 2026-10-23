@@ -142,10 +142,12 @@ def test_pause_door_answers_migrating_inside_the_window_and_proceeds_outside(tmp
     assert outside.status_code == 200 and calls == [("t1", "r1", None)], "a bare body declares nobody"
 
 
-def test_presence_door_answers_migrating_inside_the_window_and_proceeds_outside(tmp_path):
+def test_presence_door_answers_migrating_inside_the_window_and_proceeds_outside(tmp_path, monkeypatch):
     from ouroboros.gateway.host_service import create_host_service_app
     from tests.test_host_service_api import _seed_presence_behavior, _seed_token
 
+    monkeypatch.setattr("ouroboros.presence_admission.focus_enabled", lambda _root: True)
+    monkeypatch.setattr("ouroboros.presence_admission.focus_allowance", lambda _root: {"status": "available", "remaining_usd": 10})
     _seed_token(tmp_path, skill="telegram-bot", token="presence-token", permissions=["presence"],
                 manifest_permissions=["presence"])
     binding_id = _seed_presence_behavior(tmp_path)

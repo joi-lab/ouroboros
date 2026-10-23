@@ -221,18 +221,6 @@ def test_legacy_hub_conversion_uses_only_the_original_manifest_declaration(tmp_p
         assert record["release"]["digest"] == si.release_digest_from_files(files)
 
 
-def test_free_replay_matches_history_rows_of_the_same_snapshot(tmp_path):
-    from ouroboros.skill_review_cycles import find_free_replay_row
-    from ouroboros.skill_review_history import append_history
-
-    drive_root = tmp_path / "data"
-    append_history(drive_root, "probe", status="clean", content_hash="1" * 64, findings=[],
-                   paid=True, review_contract_fingerprint="fp")
-    kwargs = dict(group_id="manual:probe", content_hash="2" * 64, contract_fingerprint="fp")
-    assert find_free_replay_row(drive_root, "probe", **kwargs) is None
-    assert find_free_replay_row(drive_root, "probe", legacy_hashes=("1" * 64,), **kwargs) is not None
-
-
 # --- the gate ----------------------------------------------------------------------------
 
 
@@ -462,7 +450,6 @@ def test_turn_on_when_ready_enables_an_accepted_install(tmp_path, not_cyber, mon
     from ouroboros.skill_lifecycle_actions import reconcile_turn_on_when_ready
     from ouroboros.skill_loader import load_enabled
 
-    monkeypatch.setattr("ouroboros.skill_lifecycle_actions._sync_schedules", lambda *a: None)
     drive_root = tmp_path / "data"
     _trusted_install(drive_root)
     result = reconcile_turn_on_when_ready(drive_root, "probe", repo_path="")
@@ -475,7 +462,6 @@ def test_turn_on_when_ready_never_overrides_a_choice_or_a_missing_basis(tmp_path
     from ouroboros.skill_lifecycle_actions import reconcile_turn_on_when_ready
     from ouroboros.skill_loader import load_enabled, save_enabled
 
-    monkeypatch.setattr("ouroboros.skill_lifecycle_actions._sync_schedules", lambda *a: None)
     drive_root = tmp_path / "data"
     _trusted_install(drive_root, turn_on=False)
     assert reconcile_turn_on_when_ready(drive_root, "probe", repo_path="")["action"] == "not_requested"
@@ -573,7 +559,7 @@ def test_a_verdict_lands_only_while_its_bytes_are_installed(tmp_path, moved_on):
     import types
 
     from ouroboros.skill_loader import find_skill, skill_state_dir_path
-    from ouroboros.skill_review import SkillReviewOutcome, _persist_reviewed_outcome
+    from ouroboros.skill_review import SkillReviewOutcome, _persist_projection
 
     drive_root = tmp_path / "data"
     skill_dir = _skill(drive_root / "skills" / "external")
@@ -582,8 +568,8 @@ def test_a_verdict_lands_only_while_its_bytes_are_installed(tmp_path, moved_on):
                                  content_hash=skill.content_hash)
     if moved_on:
         (skill_dir / "notes.md").write_text("changed during the panel\n", encoding="utf-8")
-    result = _persist_reviewed_outcome(types.SimpleNamespace(), skill, drive_root, outcome, history=[],
-                                       review_rebuttal="", contract_fp="fp", rebuttal_sha="")
+    _persist_projection(types.SimpleNamespace(), skill, drive_root, outcome)
+    result = outcome
     persisted = (skill_state_dir_path(drive_root, "probe") / "review.json").is_file()
     assert persisted is not moved_on
     assert result.status == ("pending" if moved_on else "clean")

@@ -552,6 +552,9 @@ def test_web_and_host_wait_decisions_share_saved_replay_and_attempt_fences(live_
 
     root, _gateway, _client, owner, _events, _decide = live_wait
     monkeypatch.setattr(config, "SETTINGS_PATH", root / "settings.json")
+    if persist_role:
+        config.SETTINGS_PATH.write_text(json.dumps({"OUROBOROS_MODEL_SAFETY": "fixed/checker",
+            "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full"}), encoding="utf-8")
     row = {"wait_id": "wait-one", "revision": 1, "task_attempt": 1, "state": "waiting", "role": "light"}
     model_wait.mutate_wait(root, "task-one", "wait-one", lambda _: row)
     owner.waits["wait-one"] = dict(row)

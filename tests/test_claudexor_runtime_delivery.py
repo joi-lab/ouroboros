@@ -155,7 +155,7 @@ def test_tracked_pin_names_a_cli_capable_release():
     of this proposal converged on while the pin was still pre-CLI 3.6.0)."""
     pin = runtime.load_runtime_pin()
     assert pin is not None
-    assert pin.version == "4.4.0"
+    assert pin.version == "4.6.2"
     assert pin.cli_entrypoint == "claudexor.bundle.cjs"
 
 
@@ -345,7 +345,7 @@ def test_clean_source_install_fetches_exact_managed_node_in_the_same_ensure(
     assert not (source_root / "node-standalone").exists()
     metadata = json.loads(
         (
-            runtime.managed_node_dir(pin, "linux-x64")
+            pathlib.Path(command[0]).parents[2]
             / "managed-node.json"
         ).read_text(encoding="utf-8")
     )
@@ -509,7 +509,8 @@ def test_cli_command_installs_exact_closure_and_managed_node_npm_tree(tmp_path, 
     monkeypatch.setattr(manager, "_probe", lambda _command, _pin: NODE_VERSION)
 
     command = manager.ensure_cli_command()
-    node_root = runtime.managed_node_dir(pin, "linux-x64") / "node-standalone"
+    node_root = pathlib.Path(command[0]).parents[1]
+    assert node_root.parent.name.startswith(runtime.managed_node_dir(pin, "linux-x64").name + ".g-")
     assert command == [str(node_root / "bin" / "node"),
                        str(runtime.managed_runtime_dir(pin) / "claudexor.bundle.cjs")]
     assert (node_root / "lib/node_modules/npm/bin/npm-cli.js").read_bytes() == b"npm cli\n"
@@ -568,7 +569,8 @@ def test_windows_cli_command_installs_exact_closure_and_managed_node_npm_tree(tm
     monkeypatch.setattr(manager, "_probe", lambda _command, _pin: NODE_VERSION)
 
     command = manager.ensure_cli_command()
-    node_root = runtime.managed_node_dir(pin, "win32-x64") / "node-standalone"
+    node_root = pathlib.Path(command[0]).parent
+    assert node_root.parent.name.startswith(runtime.managed_node_dir(pin, "win32-x64").name + ".g-")
     assert command == [str(node_root / "node.exe"), str(runtime.managed_runtime_dir(pin) / "claudexor.bundle.cjs")]
     assert (node_root / "node_modules/npm/bin/npm-cli.js").read_bytes() == b"npm cli\n"
     assert (node_root / "node_modules/npm/package.json").read_bytes() == b"{}\n"

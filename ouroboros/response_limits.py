@@ -202,14 +202,14 @@ def response_limit_for_target(target: dict) -> ResponseLimit:
         base_url=target.get("base_url", ""), options=target.get("capability_options"))
 
 
-def dispatch_target(model: str) -> dict:
+def dispatch_target(model: str, settings: Any = None) -> dict:
     """The provider target dispatch resolves for ``model``; resolving it builds no model client."""
     from ouroboros.llm_routing import _ProviderRoutingMixin
 
     class _Routing(_ProviderRoutingMixin):
         _api_key_override, _base_url = None, "https://openrouter.ai/api/v1"  # LLMClient's defaults
 
-    return _Routing()._resolve_remote_target(model)
+    return _Routing()._resolve_remote_target(model, settings=settings)
 
 
 def _dispatch_route(route: dict) -> tuple:

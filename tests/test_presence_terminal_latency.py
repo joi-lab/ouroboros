@@ -57,6 +57,8 @@ def test_native_agent_returns_durable_result_before_synthesis_and_retry_reuses_i
 
     def factory(**_kwargs):
         actual = ready_agents.pop(0)
+        from tests.presence_legacy_helpers import register_legacy_completion
+        register_legacy_completion(actual.tools)
         actual.llm = SimpleNamespace(default_model=lambda: "test-model")
 
         def prepare(task, _refusal):

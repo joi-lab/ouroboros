@@ -84,8 +84,9 @@ class DecisionResponse(TypedDict, total=False):
     time and delivery: a winner still owed is retried under its request_id); a card
     that changed since it was drawn answers 409 ``card_stale`` with its ``revision``).
     ``delivery`` says where it went: ``delivered`` into the authoring task's
-    mailbox, ``forwarded`` as the owner's message after that task ended, or
-    ``owed`` (202 with ``reason_code``; resend the same ``request_id``).
+    mailbox (``reason_code`` ``awaiting_recipient_read`` while a paused, held or
+    queued author has not read it), ``forwarded`` as the owner's message after
+    that task ended, or ``owed`` (202 with ``reason_code``; resend the same ``request_id``).
     """
 
     ok: bool

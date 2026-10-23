@@ -23,16 +23,16 @@ import {
     buildAvailableSubagentsSetting,
     createAvailableSubagentsEditor,
     generatedPreviewCanReplace,
-    lastReviewRunText,
     parseAvailableSubagentsSetting,
     destroySubagentsSection,
     renderSubagentsSection,
-    reviewCostText,
     reviewerTickCaption,
     subagentSettingsFingerprint,
     validateAvailableSubagentsSetting,
 } from '../modules/subagents_settings.js';
-import { reviewTwinAllowed, rowMeta, rowStatus, rowTaskRun, sessionRouteVerdict } from '../modules/subagent_status_primitives.js';
+import {
+    lastReviewRunText, reviewCostText, reviewTwinAllowed, rowMeta, rowStatus, rowTaskRun, sessionRouteVerdict,
+} from '../modules/subagent_status_primitives.js';
 import { revealNewRow } from '../modules/ui_helpers.js';
 import { accessEditorDom, apiRow, sessionRow, setting } from './helpers/subagents_editor.js';
 

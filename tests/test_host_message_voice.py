@@ -32,7 +32,7 @@ EXCEPTIONS = {
     ("ouroboros/agent_task_pipeline.py", "emit_task_results", "envelope"): (1, "Final model output; prepare_terminal_send_event applies host terminal provenance separately."),
     ("ouroboros/agent.py", "OuroborosAgent._emit_progress", "envelope"): (1, "Explicit narration fact selects model versus host; end-to-end voice test pins both branches."),
     ("ouroboros/tools/control_runtime.py", "_send_user_message", "envelope"): (1, "The model authors this nonterminal reply; proactive_message is not a System voice."),
-    ("ouroboros/owner_relay.py", "publish_relay", "call"): (1, "One Ouroboros bubble (relay shape F): the teller's own note under the owner's host-held quoted words; no host-authored text."),
+    ("ouroboros/owner_relay.py", "publish_relay", "call"): (1, "One relay row, drawn as a note card: the teller's own note and summary under the owner's host-held quoted words; no host-authored text."),
 }
 
 
@@ -173,6 +173,7 @@ HOST_ROW_CLASSES = {
     "host_progress": ("card_row", 1),
     "initialization_notice": ("not_started", 1),
     "managed_update_notice": ("runtime_state", 2),
+    "model_capability_notice": ("runtime_state", 1),
     "owner_pause_notice": ("card_row", 1),
     "project_completion_summary": ("main_lifecycle", 1),
     "project_handoff": ("main_lifecycle", 1),
@@ -195,14 +196,15 @@ HOST_ROW_CLASSES = {
     "subagent_started": ("card_row", 1),
     "subagent_terminal_notice": ("card_row", 1),
     "supervisor_failure": ("no_mind", 1),
-    "task_admission_notice": ("not_started", 5),
+    "task_admission_notice": ("not_started", 3),
     "task_error": ("no_mind", 1),
-    "task_not_started": ("not_started", 2),
+    "task_not_started": ("not_started", 3),
     "task_pause_notice": ("card_row", 1),
     "task_reaper_notice": ("card_row", 4),
     "task_scheduled": ("card_row", 1),
     "task_start_unconfirmed": ("not_started", 1),
     "terminal_incident": ("no_mind", 2),
+    "ui_hold": ("runtime_state", 1),
     "worker_failure": ("no_mind", 2),
     "worker_readiness_notice": ("runtime_state", 2),
 }

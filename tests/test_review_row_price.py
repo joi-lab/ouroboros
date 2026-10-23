@@ -21,7 +21,7 @@ from tests.test_review_price import MODEL, _history
 REPO = Path(__file__).resolve().parents[1]
 RENDER = """
 import fs from 'node:fs';
-import { reviewCostText } from './web/modules/subagents_settings.js';
+import { reviewCostText } from './web/modules/subagent_status_primitives.js';
 const { rows, costs } = JSON.parse(fs.readFileSync(0, 'utf8'));
 console.log(JSON.stringify(rows.map((row) => reviewCostText(row, costs[row.subagent_id] || null))));
 """

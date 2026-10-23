@@ -22,13 +22,13 @@ from typing import Iterator
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 WEB = REPO_ROOT / "web"
 SHEETS = ("web/ui.css", "web/style.css", "web/settings.css", "web/model_roles.css", "web/model_wait.css",
-          "web/room_work.css", "web/onboarding.css", "web/cards.css")
+          "web/room_work.css", "web/onboarding.css", "web/cards.css", "web/consciousness.css")
 CATEGORIES = ("owner", "warning", "system", "data", "palette")
 
 # category | sheet | [at-rule context » ]selector | properties
 AMBER_REGISTRY = """
 # The owner's move: a question to answer or an action only the owner can take (sign in, a spending limit, a
-# suggested trust to confirm, local changes before an update, an Evolution pill that needs the owner).
+# suggested trust to confirm, local changes before an update, an Evolution chip that needs the owner).
 owner | web/ui.css | .status-mark[data-hue="owner"] | color
 owner | web/style.css | .chat-budget-pill[data-attention="1"] .chat-budget-bar | background
 owner | web/style.css | .chat-budget-pill[data-attention="1"] .chat-budget-bar-fill | background
@@ -36,9 +36,9 @@ owner | web/style.css | .chat-budget-pill[data-attention="1"] .chat-budget-text 
 owner | web/style.css | .chat-live-phase[data-chip-tone="owner"] | background, border-color, color
 owner | web/style.css | .chat-question-nav | background, border, color
 owner | web/style.css | .chat-question-nav:hover | border-color
-owner | web/style.css | .evo-runtime-pill.owner | background, border-color, color
 owner | web/style.css | .skills-trust-value.is-suggested | color
-owner | web/style.css | .update-pill.has-local | background, border-color, color
+owner | web/style.css | :root[data-theme] .update-pill:is(.has-local, [data-tone="warn"]):not(:disabled) | background, color
+owner | web/style.css | @media (hover: hover) » :root[data-theme] .update-pill:is(.has-local, [data-tone="warn"]):not(:disabled):hover | background
 owner | web/style.css | :root[data-theme] .chat-budget-pill.ui-chrome-control[data-attention="1"] | background
 owner | web/style.css | :root[data-theme] .chat-question-nav | background, color
 owner | web/style.css | :root[data-theme] .chat-question-nav:hover | background
@@ -98,21 +98,20 @@ warning | web/onboarding.css | .settings-inline-status[data-tone="warn"] | color
 warning | web/onboarding.css | .wizard-inline-note[data-tone="warn"] | color
 warning | web/onboarding.css | .wizard-test-result[data-tone="warn"] | border-color, color
 # The System voice: its bubble, sender and text, quotes of a System message, the skill review it shows.
-system | web/style.css | .chat-bubble.system | background, border-left
+system | web/style.css | .chat-bubble.system | background
 system | web/style.css | .chat-bubble.system .message | color
 system | web/style.css | .chat-bubble.system .sender | color
-system | web/style.css | .chat-input-wrap > .chat-quote--composer | background
+system | web/style.css | .chat-field > .chat-quote--composer | background
 system | web/style.css | .chat-quote | background
 system | web/style.css | .chat-quote-author | color
 system | web/style.css | .chat-quote::before | background
 system | web/style.css | .chat-quote[data-author="system"] | --quote-ink, --quote-tint
 system | web/style.css | .skill-review-full | color
-system | web/style.css | .skill-review-retry | border, color
-system | web/style.css | .skill-review-retry:hover | background
 system | web/style.css | .skill-review-summary-button:hover | background
 system | web/style.css | .skill-review-summary-main | color
 system | web/style.css | .skill-review-toggle-label | color
 system | web/style.css | :root[data-theme="light"] .skill-review-summary-main | color
+system | web/consciousness.css | .place-sheet-section p.place-silent-card | background, color
 # Data categories, not statuses: the Logs task category, code highlighting, the Storage temporary segment.
 data | web/style.css | .log-type.tasks | color
 data | web/style.css | .md-code-block .hljs-class .hljs-title | color
@@ -120,15 +119,15 @@ data | web/style.css | .md-code-block .hljs-type | color
 data | web/style.css | :is(.storage-bar-seg, .storage-key)[data-group="temporary"] | background
 data | web/style.css | :root[data-theme="light"] .md-code-block .hljs-class .hljs-title | color
 # The palette that defines the amber tokens and their aliases.
-palette | web/ui.css | :root | --amber, --mark-owner, --status-warn-fg, --status-warn-word, --system-border, --system-sender
+palette | web/ui.css | :root | --amber, --mark-owner, --status-warn-fg, --status-warn-word, --system-sender
 palette | web/ui.css | :root[data-theme="light"] | --amber, --amber-dim, --status-warn-bg, --status-warn-border, --status-warn-fg
-palette | web/ui.css | :root[data-theme="light"] | --system-border, --system-bubble-bg, --system-sender, --system-text, --tone-amber
+palette | web/ui.css | :root[data-theme="light"] | --system-bubble-bg, --system-sender, --system-text, --tone-amber
 palette | web/ui.css | :root[data-theme="light"] | --tone-amber-hover
 """
 
-# How many amber references each first-party script may hold, all data categories: a chart series colour (Evolution's
-# knowledge-base series, a widget chart's palette) and Logs' task category.
-SCRIPT_AMBER = {"web/modules/evolution.js": 1, "web/modules/log_events.js": 1, "web/modules/widget_chart.js": 2}
+# How many amber references each first-party script may hold, all data categories: a chart series colour (a widget
+# chart's palette) and Logs' task category.
+SCRIPT_AMBER = {"web/modules/log_events.js": 1, "web/modules/widget_chart.js": 2}
 
 
 def _decommented(css: str) -> str:

@@ -72,7 +72,7 @@ def test_turn_refusals_keep_legacy_facts_and_semantic_disposition(tmp_path, code
 def test_admission_dispositions(tmp_path, monkeypatch, code, disposition):
     app, binding, _ctx = _presence_app(tmp_path, _answer)
 
-    def refuse(*args):
+    def refuse(*args, **kwargs):
         raise PresenceAdmissionError(code, "binding_id")
 
     monkeypatch.setattr(host_service, "_admit_presence", refuse)
@@ -337,6 +337,7 @@ def test_terminal_pipeline_stamps_no_effect_certificate_only_on_typed_proof(tmp_
     event = incoming()
     admission = admitted()
     task = _build_task(admission, event, drive_root=tmp_path, staged_files=())
+    task["_skip_post_task_synthesis"] = True
     reset = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
     usage = {"execution_status": "infra_failed", "reason_code": "resource_refusal_no_resend",
              "resource_refusal": {"temporary": True, "reset_at": reset},
@@ -561,7 +562,8 @@ def test_unknown_outcome_fallback_terminal_never_acknowledges_the_event(tmp_path
         def handle_task(self, task):
             invoked.append(task["id"])
             task["_skip_post_task_synthesis"] = True
-            agent_ctx = SimpleNamespace(task_contract=task["task_contract"], task_metadata=task["metadata"])
+            agent_ctx = SimpleNamespace(task_contract=task["task_contract"], task_metadata=task["metadata"],
+                                        task_id=task["id"], drive_root=tmp_path)
             _finish_swarm_handoff(agent_ctx, {"task_id": child_id}, "Admission receipt", status="scheduled")
             pending = []
             pipeline.emit_task_results(
@@ -643,6 +645,7 @@ def test_inline_turn_recovers_lost_response_without_replaying_event(tmp_path, mo
     monkeypatch.setattr(call_mod, "_sleep_within_deadline", lambda sec, _deadline, **_kw: (sleeps.append(sec), True)[1])
     monkeypatch.setattr("ouroboros.presence_runner._write_unresolved_notice",
                         lambda _root, task_id: notices.append(task_id))
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *_a, **_kw: (True, ""))
 
     def spoken():
         rows = dialogue_test.chat_rows(tmp_path)
@@ -652,9 +655,12 @@ def test_inline_turn_recovers_lost_response_without_replaying_event(tmp_path, mo
         """Every send records the host state it left from: what ran and what was spoken before it."""
 
         def chat(self, **kwargs):
+            assert self.calls < 2, "the recovered author must select completion without another send"
             sends.append({"messages": [dict(row) for row in kwargs["messages"]],
                           "tools_executed": list(executed), "spoken": spoken()})
-            return super().chat(**kwargs)
+            response, usage = super().chat(**kwargs)
+            return {**response, "tool_calls": [{"id": "finish-recovered", "type": "function", "function": {
+                "name": "finish_task", "arguments": json.dumps({"action": "finish", "answer": "done"})}}]}, usage
 
     llm = ObservedLLM(tmp_path, lambda: httpx.ReadError("socket died after dispatch"), "ok")
     captured = {}
@@ -701,7 +707,7 @@ def test_inline_turn_recovers_lost_response_without_replaying_event(tmp_path, mo
     assert sends[1]["messages"][0] == sends[0]["messages"][0]
     recovery = [str(row.get("content") or "") for row in sends[1]["messages"] if "[Transport recovery]" in str(row.get("content"))]
     assert len(recovery) == 1 and attempts[0]["attempt_id"] in recovery[0]
-    assert [send["tools_executed"] for send in sends] == [[], []] and executed == []
+    assert [send["tools_executed"] for send in sends] == [[], []] and executed == ["finish_task"]
     assert [send["spoken"] for send in sends] == [[], []] and spoken() == ["done"]
     assert sleeps == []  # no Presence-only same-request paid repeat
     api_errors = _events(tmp_path / "logs", "llm_api_error")
@@ -784,3 +790,9 @@ def test_terminal_refusal_keys_on_provenance_not_on_the_infra_failed_axis(row, e
     from ouroboros.presence_runner import _terminal_refusal
 
     assert _terminal_refusal(row) == expected
+
+
+@pytest.fixture(autouse=True)
+def _focus_admission_enabled(monkeypatch):
+    monkeypatch.setattr("ouroboros.presence_admission.focus_enabled", lambda _root: True)
+    monkeypatch.setattr("ouroboros.presence_admission.focus_allowance", lambda _root: {"status": "available", "remaining_usd": 10})

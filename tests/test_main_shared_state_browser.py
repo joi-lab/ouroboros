@@ -5,7 +5,6 @@ feed (a census-only one is mounted at its own date by the waiting pill) and a ta
 owner is one System message there, with the task's own controls.
 """
 import json
-import re
 import socket
 
 import pytest
@@ -499,7 +498,9 @@ def test_genuine_socket_close_withdraws_main_authority_until_a_fresh_census(dire
             census["current_questions_complete"] = True
             page.evaluate("window.__refuseSockets = true; window.__ouroWs.ws.close()")
             expect(status).to_have_text("Reconnecting…")
-            expect(page.locator("#reconnect-overlay")).to_have_class(re.compile(r"\bvisible\b"))
+            # The room says it in its own bar; no veil covers the app (owner 20.10, 4A): drafts stay in sight.
+            expect(page.locator("#reconnect-overlay")).to_have_count(0)
+            expect(composer).to_be_visible()
             expect(resume).to_be_disabled()
             expect(stop).to_be_disabled()
             expect(cached).to_have_attribute("data-state", "unknown")
@@ -550,7 +551,6 @@ def test_genuine_socket_close_withdraws_main_authority_until_a_fresh_census(dire
             assert page.evaluate("window.__closesAtOpen") == closes, \
                 "a close fell between the offline body and the reopen"
             expect(status).not_to_have_text("Reconnecting…")
-            expect(page.locator("#reconnect-overlay")).not_to_have_class(re.compile(r"\bvisible\b"))
             page.wait_for_timeout(1_500)
             views["reopened_census_held"] = authority()
             page.screenshot(path=str(evidence / "reopened-census-held.png"))

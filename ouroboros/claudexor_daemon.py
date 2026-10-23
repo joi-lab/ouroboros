@@ -1265,13 +1265,9 @@ def ensure_owned_gateway(*, admission_wait_sec: Optional[float] = None,
                          startup_wait_sec: Optional[float] = None) -> Any:
     """Return an authenticated gateway to the lazily ensured owned daemon.
 
-    This is the explicit start/probe seam — the ONE funnel every consumer
-    (delegation, review sessions, account surfaces, login) passes through,
-    which is why the rotation reconcile rides it: spawn AND owned-attach paths,
-    on every ensure, best-effort (see ``reconcile_rotation``); never attach-only.
-    The gateway transport itself stays pure I/O; callers own ``close()`` (or
-    use it as a context manager). ``stop()`` owns the separate marker, transport
-    and process-identity checks for stopping an attached daemon.
+    Every consumer starts/probes here; rotation reconciliation covers spawn
+    and owned-attach paths (best-effort), never attach-only.
+    Callers close the pure I/O gateway; ``stop()`` separately verifies custody.
 
     ADMISSION is waited for here — outside the daemon manager's lock, the same
     way for a fresh spawn and an attach. A daemon whose handshake explicitly
@@ -1293,12 +1289,16 @@ def ensure_owned_gateway(*, admission_wait_sec: Optional[float] = None,
     Ordinary attach probes retain their transport ceiling; runtime preparation
     is separate from both waits. Neither zero-wait parameter promises zero
     total latency or permission to stop the process.
-    An expired/failed admission also skips the reconcile: the recovering
-    daemon 503s settings reads anyway, and the next ensure retries it.
+    Failed admission skips reconciliation until the next ensure.
     """
     from ouroboros.gateways.claudexor import (
         SHORT_POLL_TIMEOUT_SEC, ClaudexorGateway, ClaudexorUnavailable,
     )
+
+    from ouroboros.delegate_recovery import owner_restart_in_progress
+    from ouroboros.config import DATA_DIR
+    if owner_restart_in_progress(DATA_DIR):
+        raise ClaudexorUnavailable("owner_restart", "The owning generation is restarting.")
 
     wait = _ADMISSION_WAIT_SEC if admission_wait_sec is None else max(
         0.0, float(admission_wait_sec))

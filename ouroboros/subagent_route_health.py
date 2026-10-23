@@ -10,6 +10,19 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ouroboros.subagents import DelegatedRunShape
 
+# The thread answer/implement contract verified against the serving engine.
+PLAN_THREAD_MIN_VERSION = "4.5.0"
+
+
+def plan_capability(gateway: Any, catalog: dict, entry: dict, *, promotion: bool = False) -> str:
+    """A plan needs the advertised mode and the versioned thread-turn contract."""
+    from ouroboros.gateways.claudexor import engine_at_least
+
+    supported = (engine_at_least(str(getattr(gateway, "engine_version", "") or ""), PLAN_THREAD_MIN_VERSION)
+                 and "plan" in catalog.get("modes", [])
+                 and ("modes" not in entry or "plan" in entry["modes"]))
+    return "" if supported else ("same_session_promotion_unsupported" if promotion else "plan_thread_unsupported")
+
 
 def route_health(
     gateway: Any, route_id: str, shape: DelegatedRunShape, *, route_model: str = "",
@@ -34,6 +47,8 @@ def route_health(
         return "route_not_in_capability_catalog", ""
     if not pinned_profile and entry.get("enabled") is False:
         return "route_disabled", ""
+    if shape.mode == "plan" and (reason := plan_capability(gateway, catalog, entry)):
+        return reason, ""
     supported = [str(v) for v in entry.get("accessProfilesSupported") or []]
     # Old engines translate delegated workspace_write to their confined full
     # adapter profile. Full itself must be advertised literally.

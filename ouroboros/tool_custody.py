@@ -290,7 +290,8 @@ def claim_still_owns_effect(root: Any, claim: dict) -> bool:
         else:
             observed = wait_for_routing_annotation(Path(root), receipt.get("client_message_id", ""),
                                                    token, timeout_sec=0)
-        if observed.get("status") not in {"scheduled", "delivered", "rejected", "needs_manual_target"}:
+        # ``read`` follows the receiver's durable acknowledgement: delivered and acknowledged.
+        if observed.get("status") not in {"scheduled", "delivered", "read", "rejected", "needs_manual_target"}:
             return True
     return False
 

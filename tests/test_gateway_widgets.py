@@ -41,7 +41,6 @@ _PASSIVE_SEAMS = (
     ("ouroboros.gateway.extensions", "discover_skills"),
     ("ouroboros.gateway.extensions", "find_skill"),
     ("ouroboros.skill_review_runner", "reconcile_stale_review_jobs"),
-    ("supervisor.queue", "sync_skill_schedules"),
 )
 
 

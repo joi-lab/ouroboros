@@ -1003,6 +1003,13 @@ def _press(page, task_id, action, url_suffix):
     menu = page.locator("body > .task-control-menu")
     with page.expect_response(lambda r: r.url.endswith(url_suffix) and r.request.method == "POST", timeout=30_000) as answer:
         menu.locator(f'[data-task-control="{action}"]').click()
+    if action in {"hurry", "finalize"}:
+        # Let the acknowledgement expire away from the pointer, keeping the Work list open (#2193).
+        notice = page.locator('#toast-stack .toast').filter(has_text=("Hurry up: accepted" if action == "hurry"
+            else f"The owner asked task {task_id} to summarize and stop"))
+        notice.wait_for(state="visible")
+        page.mouse.move(0, 0)
+        notice.wait_for(state="detached")
     return {"status": answer.value.status, "body": answer.value.json(), "request": answer.value.request.post_data_json}
 
 
@@ -1111,6 +1118,20 @@ def test_real_row_hurry_wrap_up_stop_and_restart_with_page_open(direct_server_wi
                     observations.append("a queued root's row offered no ⋯ (its card has no Stop predicate yet)")
                 evidence.shot(page, "03-after-stops")
 
+                # Working is admission, not a saved continuation. Stop only after
+                # this exact attempt has real recovery bytes, never a seeded source.
+                assert model.entered[marks[bravo]].wait(90), "BRAVO never reached its first model call"
+                from ouroboros.working_checkpoint import read_working
+
+                def saved_bravo():
+                    detail = backend._http(url, "GET", f"/api/tasks/{bravo}")
+                    attempt = int(detail.get("task_attempt") or 0)
+                    raw, state = read_working(data_dir, bravo, attempt)
+                    return ({"task_id": state["task_id"], "attempt": attempt,
+                             "bytes": len(raw), "working": state["working"]} if raw else None)
+
+                evidence.record("bravo_checkpoint_before_restart", backend._wait(
+                    saved_bravo, 90, "BRAVO's current attempt checkpoint"))
                 # A server restart with the page and the list open.
                 page.evaluate(ROWS_RECORDER, ["main", 120_000])
                 sockets = page.evaluate("() => window.__testSockets.length")
@@ -1161,6 +1182,17 @@ def test_real_row_hurry_wrap_up_stop_and_restart_with_page_open(direct_server_wi
                 assert backend._decision_posts(log) == []
                 assert log["pageerrors"] == [], log["pageerrors"]
             except Exception:
+                for label, path in (("census_on_failure", "/api/state"),
+                                    ("bravo_detail_on_failure", f"/api/tasks/{bravo}")):
+                    try:
+                        evidence.record(label, backend._http(url, "GET", path))
+                    except Exception as exc:
+                        evidence.record(label, {"read_error": str(exc)})
+                for relative in ("logs/supervisor.jsonl", "logs/server.log", "state/queue_snapshot.json"):
+                    try:
+                        evidence.record(relative, (data_dir / relative).read_text(encoding="utf-8"))
+                    except (OSError, UnicodeError) as exc:
+                        evidence.record(relative, {"read_error": str(exc)})
                 evidence.shot(page, "failure")
                 raise
             finally:

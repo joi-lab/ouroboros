@@ -17,7 +17,7 @@ from ouroboros.contracts.chat_id_policy import project_chat_id
 from ouroboros.composer_cognition import ensure_project_cognition, main_cognition, project_cognition
 from ouroboros.contracts.schema_versions import with_schema_version
 from ouroboros.project_facts import sanitize_project_id
-from ouroboros.store import open_store
+from ouroboros.store import StoreBusy, open_store
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso, strip_markdown
 
 log = logging.getLogger(__name__)
@@ -597,14 +597,21 @@ _LINEAGE_SELECT = ("SELECT t.task_id, t.parent_task_id, t.root_task_id, t.delega
                    "WHERE t.task_id IN (SELECT value FROM json_each(?))")
 
 
-def _read_lineage(drive_root: Any, task_ids: Any) -> Optional[Dict[str, Dict[str, Any]]]:
+def _read_lineage(drive_root: Any, task_ids: Any, *, strict: bool = False) -> Optional[Dict[str, Dict[str, Any]]]:
     """ONE indexed read of the lineage facts of ``task_ids`` (parent, root, role and the
     admitted ``chat_id``), remembered per task id for the process (an existing task's
     lineage never changes); an id the store does not hold is absent from the answer
-    (admission creates it later); ``None`` when the store cannot answer right now."""
+    (admission creates it later); ``None`` when the store cannot answer right now, except
+    that a ``strict`` reader keeps positive contention typed (``StoreBusy``) for its
+    acquisition owner to wait out: contention is not unknown lineage."""
     try:
         with open_store(drive_root, write=False) as txn:
             records = txn.conn.execute(_LINEAGE_SELECT, (json.dumps(sorted(task_ids)),)).fetchall()
+    except StoreBusy as exc:
+        if strict and exc.reason == "contention":
+            raise
+        log.debug("task lineage read failed", exc_info=True)
+        return None
     except Exception:
         log.debug("task lineage read failed", exc_info=True)
         return None
@@ -651,7 +658,7 @@ class RoomResolver:
         """Cached or read facts; ``{}`` for a known miss; ``None`` when unavailable now."""
         facts = _TASK_LINEAGE.get((str(self.root), task_id))
         if facts is None and task_id not in self.misses:
-            read = _read_lineage(self.root, [task_id])
+            read = _read_lineage(self.root, [task_id], strict=self.strict)
             if read is None:
                 if self.strict:
                     raise ValueError("project_source_unknown")
@@ -939,7 +946,7 @@ def mirrored_answer(result: Any, phase: str) -> Dict[str, str]:
     """The typed key Main's completion row carries, or nothing.
 
     Present only for a MODEL-AUTHORED final answer of a settled task: host
-    salvage and host notices are not Ouroboros's words, and a row sent while the
+    salvage, internal quiet results and host notices are not published answers; a row sent while the
     task still reads ``working`` is frozen by the outbox and must stay a pointer.
     """
     from ouroboros.task_finalization import TERMINAL_ORIGIN_MODEL_FINAL
@@ -947,6 +954,7 @@ def mirrored_answer(result: Any, phase: str) -> Dict[str, str]:
     row = result if isinstance(result, dict) else {}
     answer = row["result"].strip() if isinstance(row.get("result"), str) else ""
     if (str(row.get("terminal_origin") or "") != TERMINAL_ORIGIN_MODEL_FINAL
+            or row.get("wake_silent") is True
             or str(phase or "") not in _TERMINAL_MIRROR_PHASES
             or not answer or len(answer) > MIRRORED_ANSWER_MAX_CHARS):
         return {}

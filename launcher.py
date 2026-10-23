@@ -20,6 +20,22 @@ import webbrowser
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
+
+def _rehome_legacy_handoff() -> None:
+    """Before package adoption can wait: repair a recognized legacy GUI handoff once."""
+    marked, args = os.environ.pop("OUROBOROS_LAUNCHER_HANDOFF", ""), sys.argv[1:]
+    if sys.platform == "win32" and not getattr(sys, "frozen", False) and not marked and "--no-ui" not in args \
+            and any(arg.split("=", 1)[0] == "--seed-bundle" for arg in args):
+        # This existing Windows leaf is stdlib-only; importing its package would run adoption first.
+        import runpy
+
+        runpy.run_path(str(pathlib.Path(__file__).parent / "ouroboros" / "launcher_windows_runtime.py"))[
+            "rehome_legacy_handoff"](args)
+
+
+if __name__ == "__main__":
+    _rehome_legacy_handoff()
+
 # Seal-safe imports: the current interpreter needs the flag before project imports;
 # PYTHONDONTWRITEBYTECODE alone only affects later child interpreters. Bundle writes
 # would invalidate a macOS signature and trigger AppTranslocation.
@@ -54,7 +70,7 @@ from ouroboros.launcher_bootstrap import (
     automatic_launch_allowed,
     sync_existing_repo_from_bundle as _sync_existing_repo_from_bundle_impl,
 )
-from ouroboros.desktop_media import attach_media_permissions, display_ready as _display_ready
+from ouroboros.desktop_media import attach_media_permissions, display_ready as _display_ready, host_environment, route_gtk_browser
 from ouroboros.runtime_venv import PREPARATION_DEPS_TIMEOUT_SEC, RuntimeVenvRefused, mark_ready, prepare_runtime_venv
 from ouroboros.launcher_onboarding import (
     prepare_first_run_settings as _prepare_first_run_settings,
@@ -62,7 +78,7 @@ from ouroboros.launcher_onboarding import (
     setup_recovery_menu,
 )
 from ouroboros.launcher_background import (Background, DesktopApi, activate_running_instance, background_env,
-                                           request_tray_cleanup, stop_tray_before_exit)
+                                           request_tray_cleanup, restore_tray_after_handoff, stop_tray_before_exit)
 from ouroboros.launcher_server_reaper import (
     reap_same_install_strays as _reap_same_install_strays_impl,
 )
@@ -85,7 +101,6 @@ from ouroboros.platform_layer import (
     install_shutdown_signal_handlers,
     kill_pid_tree,
     kill_process_group_id,
-    kill_process_on_port,
     kill_process_tree,
     merge_hidden_kwargs,
     open_path_external,
@@ -106,8 +121,6 @@ CRASH_WINDOW_SEC = 120
 MACOS_SOURCE_ENTRY_PROTOCOL = 1
 # One bounded visible retry when dependency installation fails.
 _DEPS_RETRY_DELAY_SEC = 5
-_CREATE_SUSPENDED = getattr(subprocess, "CREATE_SUSPENDED", 0x4) if IS_WINDOWS else 0
-_CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if IS_WINDOWS else 0
 
 # WA6: globally suppress bytecode writes for the launcher process itself and any
 # naive os.environ.copy() child it spawns. A signed+notarized macOS .app must not
@@ -159,12 +172,22 @@ def _server_process_record_path() -> pathlib.Path:
 
 
 def _hidden_run(command, **kwargs):
-    """subprocess.run() with platform-appropriate hidden-window flags."""
-    return subprocess.run(command, **merge_hidden_kwargs(kwargs))
+    """Hidden bootstrap commands keep their own Job/lifeline until cleanup."""
+    from ouroboros.launcher_bootstrap import run_bootstrap_command
+
+    if IS_LINUX:
+        kwargs.setdefault("env", host_environment())
+    return run_bootstrap_command(command, _shutdown_event, **merge_hidden_kwargs(kwargs))
 
 
-def _hidden_popen(command, **kwargs):
+def _hidden_popen(command, *, bootstrap=False, **kwargs):
     """subprocess.Popen() with platform-appropriate hidden-window flags."""
+    if IS_LINUX:
+        kwargs.setdefault("env", host_environment())
+    if bootstrap:
+        from ouroboros.launcher_bootstrap import spawn_bootstrap_command
+
+        return spawn_bootstrap_command(command, _shutdown_event, interactive=True, **merge_hidden_kwargs(kwargs))["proc"]
     return subprocess.Popen(command, **merge_hidden_kwargs(kwargs))
 
 
@@ -176,7 +199,9 @@ def _bundle_dir() -> pathlib.Path:
 
 def _exec_source_launcher() -> None:
     exec_source_launcher(_bootstrap_context(), _launch_argv, release_lock=release_pid_lock,
-                         desktop=not _external_ui, macos=IS_MACOS)
+                         acquire_lock=acquire_pid_lock, before_release=lambda: stop_tray_before_exit(lambda: None),
+                         on_failure=restore_tray_after_handoff, desktop=not _external_ui, macos=IS_MACOS,
+                         cancelled=_shutdown_event.is_set)
 
 
 def _shell_facts() -> dict:
@@ -218,6 +243,7 @@ def _install_deps() -> bool:
 _agent_proc: Optional[subprocess.Popen] = None
 _agent_job: Optional[object] = None
 _agent_lock = threading.Lock()
+_server_record_retire_lock = threading.Lock()  # the two retirers of state/server_process.json
 _shutdown_event = threading.Event()
 # Set by _request_agent_restart(): the next agent exit is a REQUESTED recycle
 # (first-run configuration adopted), not a crash — same shape as the exit-code-42
@@ -382,44 +408,39 @@ def _cleanup_recorded_server_group_for_pid(pid: int, reason: str = "agent_exit")
     Nothing is signalled: once the root is reaped, its PID and group id are names a later process may
     hold, so a group that still has members is reported, never killed. Workers end through their parent
     lifeline, ledgered children through the next generation's custody sweep."""
-    try:
-        record_path = _server_process_record_path()
-        if not record_path.exists():
-            return True
-        record = json.loads(record_path.read_text(encoding="utf-8"))
-        if not isinstance(record, dict) or int(record.get("pid") or 0) != int(pid):
-            return True
-        pgid = int(record.get("pgid") or 0)
-        if not IS_WINDOWS and pgid > 0:
-            from ouroboros.process_containment import process_group_has_live_members
-
-            if process_group_has_live_members(pgid):
-                log.warning("Server pid=%d exited while its former process group %d still has members; "
-                            "not signalled after the reap (%s)", pid, pgid, reason)
-        record_path.unlink(missing_ok=True)
-    except Exception:
-        log.warning("Failed to retire the recorded server process (%s)", reason, exc_info=True)
-        return False
+    with _server_record_retire_lock:  # stop_agent and the lifecycle thread: Windows refuses a delete beside a read
+        try:
+            record_path = _server_process_record_path()
+            if not record_path.exists():
+                return True  # the other caller already retired it
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            if not isinstance(record, dict) or int(record.get("pid") or 0) != int(pid):
+                return True
+            if not IS_WINDOWS and (pgid := int(record.get("pgid") or 0)) > 0:
+                from ouroboros.process_containment import process_group_has_live_members
+                if process_group_has_live_members(pgid):
+                    log.warning("Server pid=%d exited while its former process group %d still has members; "
+                                "not signalled after the reap (%s)", pid, pgid, reason)
+            record_path.unlink(missing_ok=True)
+        except Exception:
+            log.warning("Failed to retire the recorded server process (%s)", reason, exc_info=True)
+            return False
     return True
 
 
 def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     """Start server.py as the managed agent subprocess."""
     global _agent_proc, _agent_job
-    # Stdlib-only, so it loads even when the server's own imports are broken; imported
-    # before the spawn, because an undrained pipe would block the server.
+    # Stdlib-only; import before spawning so broken server imports cannot leave its pipe undrained.
     from ouroboros.process_logging import copy_capped_output
 
     settings = _load_settings()
     _apply_settings_to_env(settings)
-    env = embedded_python_env(DATA_DIR, os.environ.copy())
+    env = embedded_python_env(DATA_DIR, host_environment() if IS_LINUX else os.environ.copy())
     env["PYTHONPATH"] = str(REPO_DIR)
-    # ENV IS THE AUTHORITY for the bind host (config.SETTINGS_KEYS_NOT_EXPORTED_TO_ENV):
-    # `settings` here is the MERGED view, so it usually carries the shipped
-    # 127.0.0.1 default that no owner ever authored. Stamping it over an
-    # operator-provided environment host reintroduced the exact regression the
-    # export exclusion closed — setdefault lets the settings value stand in
-    # only when the environment says nothing.
+    # Environment owns the bind host (config.SETTINGS_KEYS_NOT_EXPORTED_TO_ENV).
+    # Merged settings include the unauthored 127.0.0.1 default: setdefault supplies
+    # it only when absent, preserving the operator override the export exclusion protects.
     saved_host = str(settings.get("OUROBOROS_SERVER_HOST") or "").strip()
     host_source = "environment" if str(env.get("OUROBOROS_SERVER_HOST") or "").strip() else "settings"
     if saved_host:
@@ -431,9 +452,8 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     env["OUROBOROS_MANAGED_BY_LAUNCHER"] = "1"
     env["OUROBOROS_MANAGED_REPO_DIR"] = str(REPO_DIR.resolve())
     env["OUROBOROS_LAUNCH_INTENT"] = _launch_intent  # this launcher's parsed intent, never an inherited one
-    # Launcher-owned presentation is re-stamped for every generation; other hosts default
-    # to web. After a killed launcher it can remain stale until the next owned reap.
-    # Env-only: a SETTINGS_DEFAULTS entry would pop an injected value when absent on disk.
+    # Re-stamp presentation each generation (other hosts: web); a killed launcher's value stays until reap.
+    # Env-only: SETTINGS_DEFAULTS would pop an injected value absent on disk.
     env["OUROBOROS_PRESENTATION"] = (
         str(os.environ.get("OUROBOROS_PRESENTATION") or "web")
         if _external_ui else "browser_fallback" if _headless else "desktop_window"
@@ -459,15 +479,8 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
     }
-    if IS_WINDOWS:
-        popen_kwargs["creationflags"] = (
-            popen_kwargs.get("creationflags", 0)
-            | _CREATE_NEW_PROCESS_GROUP
-            | _CREATE_SUSPENDED
-        )
-    else:
-        popen_kwargs.update(subprocess_new_group_kwargs())
-
+    popen_kwargs.update(subprocess_new_group_kwargs(suspended=IS_WINDOWS))  # Windows resumes it once its Job owns it
+    # Hidden-window flags: the server starts without a console window (CREATE_NO_WINDOW on Windows).
     proc = _hidden_popen([EMBEDDED_PYTHON, str(server_py)], **popen_kwargs)
     _agent_proc = proc
 
@@ -643,39 +656,10 @@ def _await_generation_endpoint(proc, *, port_file_cleared: bool, abort_event=Non
 
 
 def _kill_orphaned_children(reason: str = "window_close") -> None:
-    """Final safety net: the recorded server, companions and multiprocessing children.
+    """Shared close/Panic final cleanup (not the startup stray sweep)."""
+    from ouroboros.launcher_server_reaper import kill_runtime_orphans
 
-    Module-level so both the window-close handler (_on_closing, main thread) and
-    the panic-stop branch (agent_lifecycle_loop, supervisor thread) tear down the
-    exact same way. ``reason`` names the actual trigger, journalled HERE because
-    stop_agent() usually consumed the recorded-process row already. No port is swept: the main and
-    Host Service listeners end with their server; companion PIDs/ports stay the disclosed exception.
-    """
-    log.info("Tearing down runtime orphans (%s)", reason)
-    _cleanup_recorded_server_process(reason)
-    try:
-        companions = json.loads((DATA_DIR / "state" / "extension_companions.json").read_text(encoding="utf-8"))
-        if isinstance(companions, dict):
-            for item in companions.values():
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    force_kill_pid(int(item.get("pid") or 0))
-                except (TypeError, ValueError, ProcessLookupError, PermissionError, OSError):
-                    pass
-                for companion_port in item.get("ports") or []:
-                    try:
-                        kill_process_on_port(int(companion_port))
-                    except (TypeError, ValueError, OSError):
-                        pass
-    except Exception:
-        pass
-    for child in __import__("multiprocessing").active_children():
-        try:
-            force_kill_pid(child.pid)
-            log.info("Killed orphaned child pid=%d", child.pid)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+    kill_runtime_orphans(DATA_DIR, _cleanup_recorded_server_process, reason=reason, log=log)
 
 
 def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
@@ -703,7 +687,6 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
         _external_host_result = update_external_host(_external_host_update, EMBEDDED_PYTHON, log, _shutdown_event)
         if _shutdown_event.is_set():
             break  # Native preparation has reaped its owned processes before returning.
-        remember_loaded_checkout(REPO_DIR)  # the checkout at first start, unless main() recorded macOS's generation
         proc = start_agent(port)
         if _shutdown_event.is_set():
             stop_agent()
@@ -744,7 +727,7 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
                 close_job(_agent_job)
                 _agent_job = None
 
-        if _shutdown_event.is_set():
+        if _shutdown_event.is_set() and exit_code != PANIC_EXIT_CODE:
             break
 
         if exit_code == PANIC_EXIT_CODE:
@@ -772,6 +755,9 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
 
         time.sleep(2)
 
+        if _shutdown_event.is_set():
+            break
+
         if _agent_restart_requested.is_set():
             # Launcher-requested recycle (first-run configuration): deliberate,
             # so it skips crash accounting exactly like the agent's own code-42
@@ -798,8 +784,8 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
                         "import them — see the pip output above for the cause.",
                         MAX_CRASH_RESTARTS, CRASH_WINDOW_SEC,
                     )
-            if _external_seed_bundle is not None or launcher_sources_changed(REPO_DIR, bundle_dir=_bundle_dir()):
-                _exec_source_launcher()
+            if launcher_sources_changed(REPO_DIR, bundle_dir=_bundle_dir(), source_root=pathlib.Path(__file__).parent):
+                _exec_source_launcher()  # a refused successor: this launcher starts the next generation itself
             continue
 
         now = time.time()
@@ -971,19 +957,19 @@ def _request_skill_key_grant(skill: str, keys: list, confirm_fn, *, enable_after
 def _webview_ready() -> tuple[bool, str]:
     """Probe whether pywebview can actually run a GUI window here.
 
-    pywebview 5.x picks its backend LAZILY inside webview.start(), so
-    `import webview` succeeds without GTK/QT and the process would only die
-    later, at the first window site (#56). initialize() reuses pywebview's
-    own backend selection as the SSOT (PYWEBVIEW_GUI, session detection);
-    its second run inside webview.start() is cheap. On Linux the import
-    answer is then refined by `_display_ready`; macOS/Windows keep the
-    import-only answer — `_detect_headless` never calls this there.
+    Lazy backend selection lets import succeed without GTK/QT (#56). initialize()
+    uses PYWEBVIEW_GUI/session selection and is safe to repeat at start(). Linux
+    also checks `_display_ready`; macOS/Windows stay import-only and `_detect_headless` skips them.
     """
     if IS_LINUX and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         # BEFORE initialize(): even SELECTING a Qt backend constructs a
         # QGuiApplication, which can ABORT on a display-less box.
         return False, "no DISPLAY or WAYLAND_DISPLAY in the environment"
     try:
+        if IS_LINUX:
+            from ouroboros.desktop_media import prepare_linux_bundle
+
+            prepare_linux_bundle(_bundle_dir())
         import webview  # noqa: F401  (can itself fail on bare source checkouts)
         from webview.guilib import initialize
 
@@ -992,6 +978,8 @@ def _webview_ready() -> tuple[bool, str]:
         return False, f"{type(exc).__name__}: {exc}"
     if not IS_LINUX:
         return True, ""
+    route_gtk_browser(backend, lambda url, new=0, autoraise=True: bool(
+        _open_browser_detached(url, new=new, autoraise=autoraise)))
     return _display_ready(backend)
 
 
@@ -1019,26 +1007,25 @@ def _headless_signal_handler(signum, frame) -> None:
     _shutdown_event.set()
 
 
-def _open_browser_detached(url: str, outcome: Optional[list] = None) -> threading.Thread:
-    """Open the default browser without ever blocking the caller.
-    `webbrowser.open` waits for the child on a stdlib-resolved console
-    browser (w3m/lynx or an unrecognized $BROWSER), which would stall the
-    keep-alive loop for that browser's lifetime; the URL is already printed,
-    so the open is best-effort and rides a daemon thread. Returns the thread
-    so a short-lived caller (the already-running notice) can bound-join it
-    before process exit would kill the daemon thread under the opener.
-    An ``outcome`` list, when given, receives exactly one entry — True/False
-    from ``webbrowser.open`` or the raised exception — so a bounded-join
-    caller (the desktop bridge) can report failure honestly.
-    DELIBERATE (owner-approved): the opened browser is the USER'S own
-    application, intentionally outside process custody and launcher teardown —
-    the Emergency-Stop invariant governs the AGENT'S tree, and killing the
-    owner's browser would be hostile. A stdlib-resolved console browser
-    (w3m/lynx) may outlive the launcher; the printed URL is primary.
+def _open_browser_detached(url: str, outcome: Optional[list] = None, *, new=0, autoraise=True) -> threading.Thread:
+    """Best-effort open on a daemon thread: console browsers can wait indefinitely.
+    The printed URL is primary. Return the thread for short-lived callers to
+    bound-join; ``outcome`` receives one bool or exception for honest bridge errors.
+    Owner-approved: the user's browser, including a surviving console browser, is
+    outside launcher custody/teardown. Emergency Stop governs only the agent tree.
     """
     def _open() -> None:
         try:
-            result: object = bool(webbrowser.open(url))
+            if IS_LINUX and os.environ.get("OUROBOROS_DESKTOP_ENV_SAVED") == "1":
+                # webbrowser has no env argument: resolve BROWSER/defaults in a clean child, never swap GUI env.
+                opened = subprocess.run([
+                    EMBEDDED_PYTHON, "-I", "-S", "-c",
+                    "import sys, webbrowser; sys.exit(0 if webbrowser.open(sys.argv[1], int(sys.argv[2]), sys.argv[3]=='1') else 1)",
+                    url, str(new), '1' if autoraise else '0',
+                ], **merge_hidden_kwargs({"env": host_environment()}))
+                result: object = opened.returncode == 0
+            else:
+                result = bool(webbrowser.open(url) if new == 0 and autoraise else webbrowser.open(url, new, autoraise))
         except Exception as exc:
             result = exc
             log.info("Could not open the default browser for %s", url, exc_info=True)
@@ -1116,6 +1103,9 @@ def _run_headless_main(url: str, port: int, lifecycle_thread: threading.Thread) 
 def main(argv=()):
     global _headless, _external_ui, _external_host_update, _external_seed_bundle, _launch_argv, _launch_intent, \
         _runtime_venv, EMBEDDED_PYTHON
+    from ouroboros.delegate_recovery import observe_restart_parent
+    if IS_WINDOWS and observe_restart_parent().get("exit_code") == PANIC_EXIT_CODE:
+        return  # source handoff may be running before its parent's Popen returns
     options = parse_launch_options(argv)
     _launch_argv, _launch_intent = list(argv), options.launch_intent
     _external_ui = options.no_ui
@@ -1149,14 +1139,9 @@ def main(argv=()):
         if options.launch_intent == "automatic" or (not _headless and activate_running_instance(PID_FILE)):
             return  # a sign-in start stays quiet; a manual launch showed the running window
         if _headless:
-            # The lock loss usually races the FIRST launcher's bootstrap
-            # (repeated Open clicks): the port file may be absent (unlinked
-            # pre-start) or stale from an older run on another port. Poll
-            # briefly for a healthy server, re-reading the file between
-            # probes, so Open during bootstrap lands on the live UI; on
-            # timeout fall back to the last-read port (best-effort notice;
-            # the bound is soft — a probe straddling the deadline may run
-            # its own urlopen timeout, a couple of seconds of overshoot).
+            # A second Open may race bootstrap's absent/stale port. Re-read
+            # between health probes; a final probe can overshoot this soft
+            # deadline by its own urlopen timeout. The last port is best-effort.
             port = _read_port_file()
             deadline = time.time() + 10.0
             while time.time() < deadline and not _wait_for_server(port, timeout=1.0):
@@ -1187,17 +1172,49 @@ def main(argv=()):
         return
 
     import atexit
-    atexit.register(release_pid_lock)
+    finalizer = lambda: stop_tray_before_exit(release_pid_lock)
+    atexit.register(finalizer)
 
     if not automatic_launch_allowed(options.launch_intent, DATA_DIR, log):
         return
-    if IS_MACOS:  # the code actually imported, before bootstrap can advance the checkout (elsewhere: first start)
-        remember_loaded_checkout(pathlib.Path(__file__).parent,
-                                 bundle_dir=_bundle_dir() if getattr(sys, "frozen", False) else None)
-    # Listen before the long boot: a manual second launch meanwhile is kept and opens the window once it exists.
-    background = None if _headless else Background(lambda: _on_closing(), _read_port_file, _shutdown_event).listen(PID_FILE)
+    # Record the loaded generation before bootstrap can advance the managed checkout.
+    remember_loaded_checkout(REPO_DIR, bundle_dir=_bundle_dir() if getattr(sys, "frozen", False) or pathlib.Path(
+        __file__).resolve() != (REPO_DIR / "launcher.py").resolve() else None)
 
-    if not check_git():
+    def _on_closing() -> None:
+        log.info("Window closing — graceful shutdown.")
+        _shutdown_event.set()
+        from ouroboros.launcher_bootstrap import stop_bootstrap_commands
+        stop_bootstrap_commands(include_interactive=False)
+        if background is not None and background.panic.is_set():
+            return  # Panic owns persistence and hard exit, never ordinary teardown over it
+        if _webview_window is None:
+            if _agent_proc is not None:
+                stop_agent()
+                _cleanup_recorded_server_process("startup_quit")
+            if not _headless:
+                for window in list(webview.windows):
+                    window.destroy()  # release Git/setup's webview.start before main returns
+            return  # startup owns its return; no stale companion rows or hard exit
+        stop_agent()
+        _kill_orphaned_children()
+        stop_tray_before_exit(release_pid_lock)
+        os._exit(0)
+
+    # Listen before the long boot: a manual second launch meanwhile is kept and opens the window once it exists.
+    background = None if _headless else Background(_on_closing, _read_port_file, _shutdown_event,
+        panic_child=lambda: (_agent_proc, _agent_job))
+    if background is not None:
+        background.listen(PID_FILE)
+        atexit.unregister(finalizer)  # after CLR's unload registration: dispose the icon while CLR still lives
+        atexit.register(finalizer)
+    if _shutdown_event.is_set():
+        return  # Early Panic owns persistence and exit; bootstrap must not start beside it.
+
+    git_found = check_git()
+    if _shutdown_event.is_set():
+        return
+    if not git_found:
         log.warning("Git not found.")
         if _headless:
             # No headless sudo flows: print the platform hint and stop.
@@ -1225,10 +1242,10 @@ def main(argv=()):
         class GitApi:
             def install_git(self):
                 if IS_MACOS:
-                    subprocess.Popen(["xcode-select", "--install"])
+                    _hidden_popen(["xcode-select", "--install"], bootstrap=True)
                 elif IS_WINDOWS:
                     _hidden_popen(
-                        ["winget", "install", "Git.Git", "--source", "winget", "--accept-source-agreements"]
+                        ["winget", "install", "Git.Git", "--source", "winget", "--accept-source-agreements"], bootstrap=True
                     )
                 else:
                     for cmd in (
@@ -1236,12 +1253,13 @@ def main(argv=()):
                         ["sudo", "dnf", "install", "-y", "git"],
                     ):
                         try:
-                            _hidden_popen(cmd)
+                            _hidden_popen(cmd, bootstrap=True)
                             break
                         except FileNotFoundError:
                             continue
                 for _ in range(300):
-                    time.sleep(3)
+                    if _shutdown_event.wait(3):
+                        return "stopped"
                     if shutil.which("git"):
                         return "installed"
                 return "timeout"
@@ -1275,9 +1293,13 @@ def main(argv=()):
             height=300,
         )
         webview.start(func=_git_page, args=[git_window], private_mode=False)
+        if _shutdown_event.is_set():
+            return
         if not check_git():
             sys.exit(1)
 
+    if _shutdown_event.is_set():
+        return
     if options.runtime_venv is not None:  # under the PID lock, before bootstrap and world generation
         try:
             _runtime_venv = prepare_runtime_venv(options.runtime_venv, run=_hidden_run, log=log,
@@ -1305,28 +1327,34 @@ def main(argv=()):
             print(f"Ouroboros did not start: {refusal}", file=sys.stderr, flush=True)
             sys.exit(1)
 
-    if IS_MACOS and getattr(sys, "frozen", False):
-        # Cold launch loads updated helpers, including any it would import later from the seed, before a server
-        # or normal window; no source entry returns to this frozen bootstrap. Preserve an Open received during boot.
-        if macos_source_entry(_bundle_dir()) is None:
-            log.warning("This app lacks the macOS source entry; source restarts need a new app installation "
-                        "to preserve the app profile and notification identity.")
-        elif launcher_sources_changed(REPO_DIR, bundle_dir=_bundle_dir(), packaged=True):
-            if background is not None and background._open_pending:
-                _launch_argv += ["--launch-intent", "owner"]
-            _exec_source_launcher()
+    if _shutdown_event.is_set():
+        return  # Panic during bootstrap must not hand off or start an owner-intent server.
 
-    # D-8: decide here, PRESENT after the gateway is healthy. Everything above
-    # (single-instance lock, Git, managed-repo bootstrap/seed validation) is a
-    # precondition of the server itself and deliberately still precedes it.
+    # Cold handoff includes helpers imported later from the seed. An old macOS app keeps its identity;
+    # a current one uses the signed source entry. Preserve an Open received during boot on every desktop.
+    if IS_MACOS and getattr(sys, "frozen", False) and macos_source_entry(_bundle_dir()) is None:
+        log.warning("This app lacks the macOS source entry; source restarts need a new app installation "
+                    "to preserve the app profile and notification identity.")
+    elif launcher_sources_changed(REPO_DIR, bundle_dir=_bundle_dir(), packaged=True,
+                                  source_root=pathlib.Path(__file__).parent):
+        if background is not None and background._open_pending:
+            _launch_argv += ["--launch-intent", "owner"]
+        _exec_source_launcher()
+
+    if _shutdown_event.is_set():
+        return
+
+    # Decide setup here; present only after the gateway serves. Lock/Git/bootstrap precede the server.
     onboarding_settings, onboarding_required = _prepare_first_run_settings()
+    if _shutdown_event.is_set():
+        return
 
     global _webview_window
     port = _requested_server_port()  # the lifecycle loop clears the previous generation first
 
     # Headless: handlers BEFORE the lifecycle thread spawns server.py — a
     # SIGTERM while the server still boots must reach our teardown.
-    _abort = None
+    _abort = _shutdown_event
     if _headless:
         install_shutdown_signal_handlers(_headless_signal_handler)
         _abort = _shutdown_event
@@ -1349,20 +1377,18 @@ def main(argv=()):
                 "(the blocking onboarding overlay and Settings remain available)."
             )
         if onboarding["restart_required"] and not _shutdown_event.is_set():
-            # The completion changed something this process pinned at boot (its
-            # runtime-mode baseline). The launcher owns the process, so it
-            # recycles it instead of leaving the owner with a restart nag.
+            # Recycle the owned server to adopt boot-pinned settings instead of leaving a restart nag.
             _request_agent_restart()
             server_ready, actual_port = _await_server_ready(port, _abort, lifecycle_thread)
 
-    if (_headless or options.launch_intent == "automatic") and _shutdown_event.is_set():
-        # Shutdown during startup: same teardown the keep-alive loop performs
-        # (an aborted wait, or an automatic start meeting Panic, is no startup failure).
+    if _shutdown_event.is_set():
+        if background is not None and background.panic.is_set():
+            return  # the non-daemon Panic owner, not a startup-failure window, owns exit
+        # Startup shutdown is no failure; stop owned/proven servers, never stale companion rows.
         log.info("Shutdown requested during startup; tearing down.")
         stop_agent()
-        _kill_orphaned_children(reason="startup_abort")
-        # atexit owns release_pid_lock on sys.exit (a second release would
-        # unlink a newer launcher's lock).
+        _cleanup_recorded_server_process("startup_abort")
+        # atexit releases on sys.exit; a second release could unlink a newer launcher's lock.
         sys.exit(0)
 
     if not server_ready:
@@ -1371,12 +1397,10 @@ def main(argv=()):
         stop_agent()
         lifecycle_thread.join(timeout=5)
         if _headless:
-            _kill_orphaned_children(reason="startup_failure")
+            _cleanup_recorded_server_process("startup_failure")
             print(
-                "Ouroboros failed to start: the local agent server did not "
-                "become ready.\n"
-                f"See {_log_dir / 'launcher.log'} and "
-                f"{_log_dir / 'agent_stdout.log'} for details.",
+                "Ouroboros failed to start: the local agent server did not become ready.\n"
+                f"See {_log_dir / 'launcher.log'} and {_log_dir / 'agent_stdout.log'} for details.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -1543,14 +1567,6 @@ def main(argv=()):
         # Never returns: keep-alive loop + teardown + sys.exit inside.
         _run_headless_main(url, actual_port, lifecycle_thread)
 
-    def _on_closing() -> None:
-        log.info("Window closing — graceful shutdown.")
-        _shutdown_event.set()
-        stop_agent()
-        _kill_orphaned_children()
-        stop_tray_before_exit(release_pid_lock)
-        os._exit(0)
-
     window = webview.create_window(
         f"Ouroboros v{APP_VERSION}",
         url=url,
@@ -1574,9 +1590,7 @@ if __name__ == "__main__":
     if sys.platform == "darwin":
         try:
             shell_path = subprocess.check_output(
-                ["/bin/bash", "-l", "-c", "echo $PATH"],
-                text=True,
-                timeout=5,
+                ["/bin/bash", "-l", "-c", "echo $PATH"], **merge_hidden_kwargs({"text": True, "timeout": 5}),
             ).strip()
             if shell_path:
                 os.environ["PATH"] = shell_path

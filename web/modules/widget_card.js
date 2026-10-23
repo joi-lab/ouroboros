@@ -113,6 +113,18 @@ export function setWidgetCardFault(card, text) {
 }
 
 /**
+ * A stopped card's one line about why it did not start by itself (the start ledger, holds.js), in its status slot
+ * until the next lifecycle transition rewrites it. An empty `text` leaves the slot as the transition left it.
+ */
+export function setWidgetCardNote(card, text) {
+    const status = card?.querySelector('[data-widget-status]');
+    if (!status || !text) return;
+    status.hidden = false;
+    status.dataset.tone = 'neutral';
+    status.textContent = text;
+}
+
+/**
  * Keep the head controls truthful. `state` is one of stopped | starting |
  * running | stopping — expressed through the button label, `disabled` while a
  * transition is in flight, and the status sentence; no state machine object.

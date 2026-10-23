@@ -13,7 +13,7 @@ from pathlib import Path
 from ouroboros.contracts.skill_manifest import SkillManifestError, parse_skill_manifest_text
 from ouroboros.skill_loader import (
     _ManifestUnreadable, _classify_skill_source, _manifest_text_for_dir, _native_platform_visible,
-    _skill_location_inventory, load_enabled,
+    _SkillLocationCandidate, _skill_location_inventory, load_enabled,
 )
 
 
@@ -28,15 +28,19 @@ class SkillPeer:
     manifest_error: str = ""
 
 
-def discover_skill_peers(drive_root: Path, *, repo_path: str | None = None) -> tuple[SkillPeer, ...]:
+def discover_skill_peers(
+    drive_root: Path, *, repo_path: str | None = None,
+    locations: tuple[_SkillLocationCandidate, ...] | None = None,
+) -> tuple[SkillPeer, ...]:
     """Match discover_skills' peer semantics, without opening payload files.
 
     Collisions and malformed/unreadable manifests are disabled placeholders.
     A valid manifest retains its enablement and conflicts even if its payload
     would be unreadable: that is exactly how load_skill projects such a peer.
+    Locations may be shared within an observation; manifest/state reads stay fresh.
     Missing manifests are omitted by the ordinary location inventory.
     """
-    inventory = _skill_location_inventory(drive_root, repo_path=repo_path)
+    inventory = locations if locations is not None else _skill_location_inventory(drive_root, repo_path=repo_path)
     counts: dict[str, int] = {}
     for candidate in inventory:
         counts[candidate.name] = counts.get(candidate.name, 0) + 1

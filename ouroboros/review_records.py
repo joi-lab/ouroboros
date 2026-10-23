@@ -106,6 +106,11 @@ def validate_author_disposition(
             normalized["review_reference"] = json.loads(json.dumps(record["review_reference"], allow_nan=False))
         except (TypeError, ValueError):
             return None
+    from ouroboros.review_doctrine import carry_recorded_doctrine
+
+    normalized = carry_recorded_doctrine(normalized, record)
+    if normalized is None:
+        return None
     expected = str(subject_hash or "").strip()
     if expected and normalized["subject_hash"] != expected and not allow_stale:
         return None
@@ -134,13 +139,18 @@ def recorded_author_stop(decision: Any) -> bool:
 def build_author_disposition_from_mapping(
     value: Any, *, subject_hash: str, reviewer_signal: str = "", enforcement: str = "",
 ) -> Dict[str, Any]:
-    """Parse the public two-field author finish envelope."""
-    if not isinstance(value, dict) or set(value) - {"disposition", "rationale"}:
+    """Parse the public author finish envelope, including an optional helper claim."""
+    if not isinstance(value, dict) or set(value) - {"disposition", "rationale", "subagent_check"}:
         raise ValueError("AUTHOR_DISPOSITION_INVALID: envelope fields are invalid")
-    return build_author_disposition(
+    built = build_author_disposition(
         disposition=value.get("disposition", ""), rationale=value.get("rationale", ""),
         subject_hash=subject_hash, reviewer_signal=reviewer_signal, enforcement=enforcement,
     )
+    if "subagent_check" in value:
+        from ouroboros.review_doctrine import parse_subagent_check
+
+        built["subagent_check"] = parse_subagent_check(value.get("subagent_check"))
+    return built
 
 
 def review_outcome_received(actors: Any, *, findings: Any = (), terminal: bool = False) -> bool:
@@ -332,6 +342,8 @@ class ReviewActorRecord:
     status: str
     raw_text: str = ""
     parsed: Any = None
+    # The declared contract is finalized once, before producer persistence.
+    outcome: Dict[str, Any] = field(default_factory=dict)
     # Per-actor parsed verdict (PASS/FAIL/DEGRADED/UNKNOWN). Carried here so a
     # reader can take only the actors that CONTRIBUTED to the aggregate
     # (``review_verdict._contributing_actors``) instead of re-deriving the verdict.

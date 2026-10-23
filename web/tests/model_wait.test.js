@@ -111,7 +111,8 @@ test('auto-continue and explicit retry are distinct text-free actions', () => {
 });
 
 test('role labels distinguish human-facing roles without model-name inference', () => {
-    assert.equal(modelWaitRoleLabel('consciousness'), 'Background consciousness');
+    assert.equal(modelWaitRoleLabel('consciousness'), 'Consciousness');
+    assert.equal(modelWaitRoleLabel('safety'), 'Safety Supervisor');
     assert.equal(modelWaitRoleLabel('fallback:2'), 'Fallback 3');
     assert.equal(modelWaitRoleLabel('reviewer:scope-a'), 'Reviewer · scope-a');
     assert.equal(modelWaitRoleLabel('subagent:writer'), 'Subagent · writer');

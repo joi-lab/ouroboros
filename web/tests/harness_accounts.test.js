@@ -25,6 +25,7 @@ import {
     refreshActionLabel,
     runtimeActionLabel,
     serviceBannerLine,
+    renderAgentsServiceBanner,
     startLogin,
     unreadFacets,
     harnessFamilyMarkup,
@@ -63,6 +64,12 @@ test('account actions stack at the app shell compact breakpoint', () => {
         grid-template-columns: minmax(0, 1fr);
         grid-template-areas: "main" "meta" "actions";`),
     'account actions must drop below status before the persistent sidebar squeezes the row');
+});
+
+test('service Diagnostics shares the touch hit area and token keyboard focus', () => {
+    assert.match(renderAgentsServiceBanner(), /class="settings-disclosure ui-hit-area"/);
+    const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
+    assert.match(css, /\.settings-disclosure:focus-visible\s*\{\s*outline: 2px solid var\(--focus-accent-border\);\s*outline-offset: 2px;/);
 });
 
 test('managed runtime keeps one contextual Connect intent across install, repair, and update', () => {
@@ -107,7 +114,9 @@ test('a slow first read says it is checking, and an idle daemon is not dressed a
         { checking: true },
     );
     assert.equal(known.tone, 'ok');
-    assert.ok(known.text.includes('3.3.13'));
+    // The verdict leads; the engine version is the quiet fact beside it.
+    assert.equal(known.text, 'Claudexor ready');
+    assert.equal(known.version, 'engine 3.3.13');
 
     const idle = daemonStatusLine({ daemon: { state: 'stale', runtime: { state: 'ready', version: '3.3.13' } } });
     assert.equal(idle.tone, 'muted', 'a lazy daemon is not a warning');
@@ -1521,7 +1530,7 @@ function mountSection() {
     // `harness-daemon-status` were the pre-tab markup; building them here let
     // the refusal below "reach the owner" through a node production no longer
     // has, so an empty, silently unmounted panel passed as a warning shown.
-    for (const id of ['agents-service-banner', 'harness-login-card',
+    for (const id of ['agents-service-banner', 'agents-service-version', 'harness-login-card',
         'btn-harness-refresh']) elements[id] = fakeElement(id);
     const doc = {
         hidden: false,
@@ -2061,7 +2070,9 @@ test('a wake error reaches the banner and expires only when the daemon is proven
         await store.refresh();
         assert.ok(!/Could not start the agent daemon/i.test(banner()),
             'the stale wake error outlived the daemon that came up anyway');
-        assert.match(banner(), /3\.3\.14/);
+        assert.equal(banner(), 'Claudexor ready');
+        assert.equal(elements['agents-service-version'].textContent, 'engine 3.3.14');
+        assert.equal(elements['agents-service-version'].hidden, false);
 
         // …and a refusal that lands while the daemon is ALREADY answering is
         // moot and never shown (the failure is real; it stopped mattering).
@@ -2234,18 +2245,26 @@ test('a refused facet read keeps the engine stop and heap facts in the service b
             statusUnavailableNote(reads[facet], { error: '', facet, subject }),
     };
     const line = serviceBannerLine(store);
+    const facts = (view) => Object.fromEntries(view.facts || []);
     assert.match(line.text, /Your subscription limits could not be read/);
-    assert.match(line.text, /Last stop: heap exhausted while serving \(signal 6\)/);
-    assert.match(line.text, /headroom 13\.0 GiB/);
-    // A healthy read shows the facts once, never twice.
+    // A refused quota read beside a serving engine is no stop: the stop it recovered from and the heap are
+    // Diagnostics, never words of the line (the engine's own state decides, not the line's tone).
+    assert.doesNotMatch(line.text, /Last stop|Heap/);
+    assert.equal(facts(line)['Last stop'], 'heap exhausted while serving (signal 6)');
+    assert.match(facts(line).Heap, /headroom 13\.0 GiB/);
+    // A healthy read is ready: the stop it recovered from moves to Diagnostics, once, never twice.
     reads.quota = 'ok';
-    const healthy = serviceBannerLine(store).text;
-    assert.equal(healthy.split('Last stop:').length, 2);
-    // Without recorded facts the banner is unchanged.
+    const healthy = serviceBannerLine(store);
+    assert.equal(healthy.text, 'Claudexor ready');
+    assert.equal(facts(healthy)['Last stop'], 'heap exhausted while serving (signal 6)');
+    assert.equal(healthy.facts.filter(([label]) => label === 'Last stop').length, 1);
+    // Without recorded facts the banner and its Diagnostics carry none.
     reads.quota = 'failed';
     store.snapshot.daemon.last_exit = null;
     store.snapshot.daemon.memory = null;
-    assert.doesNotMatch(serviceBannerLine(store).text, /Last stop|Heap/);
+    const bare = serviceBannerLine(store);
+    assert.doesNotMatch(bare.text, /Last stop|Heap/);
+    assert.deepEqual(bare.facts.map(([label]) => label).filter((label) => /Last stop|Heap/.test(label)), []);
 });
 
 test('daemon status appends observed stop and measured heap without changing readiness', () => {
@@ -2254,15 +2273,18 @@ test('daemon status appends observed stop and measured heap without changing rea
         memory: { heapUsedBytes: 3 * 2 ** 30, heapLimitBytes: 16 * 2 ** 30 },
     } };
     const line = daemonStatusLine(payload);
+    const facts = (view) => Object.fromEntries(view.facts || []);
     assert.equal(line.tone, 'ok');
-    assert.match(line.text, /Last stop: heap exhausted while serving \(signal 6\)/);
-    assert.match(line.text, /Heap 3\.0 of 16\.0 GiB; headroom 13\.0 GiB/);
+    // Ready: the stop it recovered from and the heap are Diagnostics, not the verdict's words.
+    assert.equal(line.text, 'Claudexor ready');
+    assert.equal(facts(line)['Last stop'], 'heap exhausted while serving (signal 6)');
+    assert.equal(facts(line).Heap, '3.0 of 16.0 GiB; headroom 13.0 GiB');
     payload.daemon.memory.heapUsedBytes = null;
-    assert.match(daemonStatusLine(payload).text, /Heap limit 16\.0 GiB; use unknown/);
-    assert.doesNotMatch(daemonStatusLine(payload).text, /headroom|Heap 0\.0/);
+    assert.equal(facts(daemonStatusLine(payload)).Heap, 'limit 16.0 GiB; use unknown');
+    assert.doesNotMatch(JSON.stringify(daemonStatusLine(payload).facts), /headroom|0\.0 of/);
     payload.daemon.memory = null;
     payload.daemon.last_exit = null;
-    assert.equal(daemonStatusLine(payload).text, 'Claudexor ready (engine 3.22.1) · home ');
+    assert.deepEqual(daemonStatusLine(payload), { tone: 'ok', text: 'Claudexor ready', version: 'engine 3.22.1', facts: [] });
     payload.daemon.state = 'stale';
     payload.daemon.last_exit = { classification: 'unclassified', phase: 'startup', exit_code: 1 };
     assert.match(daemonStatusLine(payload).text, /Last stop: unclassified during startup \(exit code 1\)/);

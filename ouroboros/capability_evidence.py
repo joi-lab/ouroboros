@@ -26,6 +26,10 @@ from training metadata or the persistent probe cache.
 
 from __future__ import annotations
 
+from ouroboros.density_probe import (  # noqa: F401 — public compatibility surface
+    cold_start_density_probe, DENSITY_PROBE_MAX_TOKENS, DENSITY_PROBE_EFFORT, DENSITY_PROBE_SYSTEM_PROMPT,
+)
+
 import hashlib
 import json
 import logging
@@ -38,7 +42,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.utils import (
     atomic_write_json,
-    estimate_tokens,
     is_credential_header_name,
     read_json_dict,
     utc_now_iso,
@@ -207,6 +210,7 @@ class CapabilityEvidence:
     account_fingerprint: str = ""
     provenance: str = ""
     response_limit: Dict[str, Any] = field(default_factory=dict)
+    window_kind: str = "total"  # metadata may explicitly state an input-only limit
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -224,6 +228,7 @@ class CapabilityEvidence:
             "account_fingerprint": self.account_fingerprint,
             "provenance": self.provenance,
             "response_limit": self.response_limit,
+            "window_kind": self.window_kind,
         }
 
 
@@ -637,7 +642,7 @@ MAIN_DENSITY_BASIS = "bounded_proxy_v2"
 COLD_START_TOKEN_DENSITY = 1.65
 MEASURED_DENSITY_SAFETY_FACTOR = 1.05
 
-_DENSITY_MEMO: Dict[str, Tuple[float, str]] = {}
+_DENSITY_MEMO: Dict[str, Tuple[float, str, int]] = {}
 
 
 def _density_observation_seq(pair: Dict[str, Any]) -> int:
@@ -678,6 +683,7 @@ def record_token_density(
     source: str = "dispatch_usage",
     route_fp: str = "",
     basis: str = "raw",
+    view_kind: str = "",
 ) -> None:
     """Persist one timestamped raw witness, best-effort and write-throttled.
 
@@ -696,11 +702,12 @@ def record_token_density(
     # the same numeric density must not throttle the FIRST witness as "no drift" —
     # that left the resolver cold for the whole freshness window on an
     # upgraded store (final-lane finding, probe-reproduced).
-    memo_key = f"{fp}\0{route}\0{basis}"
+    memo_key = f"{drive_root}\0{fp}\0{route}\0{basis}\0{view_kind}"
     memo = _DENSITY_MEMO.get(memo_key)
     if (
         memo and _age_seconds(memo[1]) < _TOKEN_DENSITY_FRESH_SEC
         and abs(density - memo[0]) <= _TOKEN_DENSITY_DRIFT_TOLERANCE * memo[0]
+        and int(prompt_chars) / 2 <= memo[2] <= int(prompt_chars) * 2
     ):
         return
     try:
@@ -718,6 +725,7 @@ def record_token_density(
                 pair for pair in pairs
                 if str(pair.get("route_fp") or "") == route
                 and str(pair.get("basis") or "raw") == str(basis or "raw")
+                and str(pair.get("view_kind") or "") == view_kind
             ]
             newest = max(
                 enumerate(route_pairs),
@@ -731,8 +739,9 @@ def record_token_density(
                 newest is not None
                 and _age_seconds(str(newest.get("observed_at") or "")) < _TOKEN_DENSITY_FRESH_SEC
                 and abs(density - known) <= _TOKEN_DENSITY_DRIFT_TOLERANCE * known
+                and int(prompt_chars) / 2 <= int(newest["prompt_chars"]) <= int(prompt_chars) * 2
             ):
-                _DENSITY_MEMO[memo_key] = (known, str(newest.get("observed_at") or ""))
+                _DENSITY_MEMO[memo_key] = (known, str(newest.get("observed_at") or ""), int(newest["prompt_chars"]))
                 return
             observed_at = utc_now_iso()
             observation_seq = max(
@@ -746,8 +755,10 @@ def record_token_density(
                 "source": str(source or "dispatch_usage"),
                 "route_fp": route,
                 "basis": str(basis or "raw"),
+                "view_kind": view_kind,
             })
-            indexed_pairs = list(enumerate(pairs))
+            other_views = [pair for pair in pairs if str(pair.get("view_kind") or "") != view_kind]
+            indexed_pairs = list(enumerate(pair for pair in pairs if str(pair.get("view_kind") or "") == view_kind))
             densest_index, densest = max(
                 indexed_pairs,
                 key=lambda item: (
@@ -765,9 +776,9 @@ def record_token_density(
                 )
                 if index != densest_index
             ][:_TOKEN_DENSITY_MAX_PAIRS - 1]
-            store[fp] = {"pairs": [densest, *newest_rest]}
+            store[fp] = {"pairs": [*other_views, densest, *newest_rest]}
             if _save(drive_root, data):
-                _DENSITY_MEMO[memo_key] = (density, observed_at)
+                _DENSITY_MEMO[memo_key] = (density, observed_at, int(prompt_chars))
     except Exception:
         log.debug("record_token_density failed", exc_info=True)
 
@@ -800,10 +811,8 @@ def _normalized_density_model(model_id: str) -> str:
 def _fresh_density_pairs(
     store: Dict[str, Any], model_id: str = "", *, basis: str = "",
 ) -> List[Tuple[Dict[str, Any], float]]:
-    # Without ``model_id`` every model's rows are returned — ONLY for the main
-    # resolver's exact-route lookup (a route fingerprint belongs to one model;
-    # the caller filters on it). No resolver reduces over other models' rows:
-    # another tokenizer's density is no evidence about this route.
+    # Exact-route lookup spans storage keys: the local lane records "local-model"
+    # while the route fingerprint binds the configured model name.
     # ``basis`` filters to rows measured on one named basis. The MAIN fit
     # resolver passes MAIN_DENSITY_BASIS — its multiplier must match the fit
     # estimator's own measure: a pre-basis row (no stamp) or a legacy ``raw``
@@ -824,31 +833,38 @@ def _fresh_density_pairs(
     ]
 
 
-def resolve_main_token_density(drive_root: Any, route_fp: str, model_id: str) -> Tuple[float, str]:
-    """Newest fresh exact-route witness, then exact-model witness, then neutral."""
+def resolve_main_token_density(
+    drive_root: Any, route_fp: str, model_id: str, *, estimate_tokens: Optional[int] = None,
+    view_kind: str = "",
+) -> Tuple[float, str]:
+    """Newest comparable witness of this exact route and view, else the cold family estimate.
+
+    View kinds are exact: unclassified legacy rows never calibrate a classified
+    focus, own wake or owner turn. When sizing a candidate, compare raw input with raw input (``prompt_chars / 4``),
+    within a factor of two. A small helper cannot calibrate a large conversation.
+    """
     try:
         store = _load(drive_root).get("token_density", {}) or {}
         route = str(route_fp or "").strip()
+
+        def comparable(item):
+            return str(item[0].get("view_kind") or "") == view_kind and (estimate_tokens is None
+                or estimate_tokens / 2 <= int(item[0]["prompt_chars"]) / 4 <= estimate_tokens * 2)
+
         route_pairs = [
             item for item in _fresh_density_pairs(store, basis=MAIN_DENSITY_BASIS)
-            if route and str(item[0].get("route_fp") or "") == route
+            if route and str(item[0].get("route_fp") or "") == route and comparable(item)
         ]
         if route_pairs:
             return max(
                 enumerate(route_pairs),
                 key=lambda item: (*_density_recency_key(item[1][0]), item[0]),
             )[1][1], "fresh_route_usage"
-        model_pairs = _fresh_density_pairs(
-            store, _normalized_density_model(model_id), basis=MAIN_DENSITY_BASIS,
-        )
-        if model_pairs:
-            return max(
-                enumerate(model_pairs),
-                key=lambda item: (*_density_recency_key(item[1][0]), item[0]),
-            )[1][1], "fresh_model_usage"
     except Exception:
         pass
-    return 1.0, "cold_estimate"
+    # Empirical tokenizer classes (audit D8), never a per-model window table.
+    native = str(model_id).lower().removeprefix("claudexor::")
+    return (4 / 2.7 if "claude" in native else 1.0), "cold_estimate"
 
 
 def resolve_review_token_density(drive_root: Any, model_id: str) -> Tuple[float, str]:
@@ -879,115 +895,6 @@ def resolve_review_token_density(drive_root: Any, model_id: str) -> Tuple[float,
 def resolve_token_density(drive_root: Any, model_id: str) -> Tuple[float, str]:
     """Compatibility alias for the conservative review reducer."""
     return resolve_review_token_density(drive_root, model_id)
-
-
-# Cold-start density probe (owner decisions R60/R61 for the packed deep
-# self-review; the commit gate runs the same rung since 2026-09-05): when a
-# review pack is refused or degraded under the COLD floor, ONE bounded send on
-# the exact model sources a real witness for the store above.
-# Room for a reasoning model to finish thinking AND answer: a cap that ends the
-# call mid-reasoning comes back with no content and no usage — no witness.
-DENSITY_PROBE_MAX_TOKENS = 256
-DENSITY_PROBE_EFFORT = "low"
-DENSITY_PROBE_SYSTEM_PROMPT = "Token-density calibration probe: reply with the single word OK."
-
-
-def cold_start_density_probe(
-    drive_root: Any,
-    llm: Any,
-    emit_progress: Any,
-    model: str,
-    sample: str,
-    *,
-    task_id: str,
-    call_type: str,
-    source: str,
-    model_role: str = "", model_account_override: Optional[str] = None,
-) -> str:
-    """The cold-start density rung for the commit triad packet.
-    Returns a typed outcome:
-
-    ``"warm"`` — a fresh exact-model witness already governs: nothing is sent;
-    ``"no_sample"`` — nothing to measure on; ``"failed"`` / ``"no_usage"`` /
-    ``"unrecorded"`` — the probe sent but yielded no governing witness (the
-    cold cap stands, disclosed on progress); ``"measured"`` — the witness is
-    recorded and now governs, so the caller recomputes the cap and rebuilds
-    ONCE.
-
-    The calibrated input cap is the density-form bound over a FRESH exact-model
-    witness, else the cold floor ``COLD_START_TOKEN_DENSITY`` — which lies
-    above every measured density, so a repository whose required set fits warm
-    is refused cold, and the refusal happens before any send, so the model
-    never records the witness that would have admitted it. This rung breaks
-    that loop with ONE bounded send on the exact model (``sample``: a slice of
-    the real pack, a few output tokens) through the ordinary observed call,
-    under ``physical_attempt_limit(1)`` so the transport ladder's own retries
-    (a body-error reroute, an encrypted-reasoning strip) cannot turn the ONE
-    send into several paid attempts. It never runs on a warm store and never
-    retries. ``BudgetExceeded`` propagates:
-    the paid ledger's refusal is budget vocabulary the caller discloses in its
-    own terms (the deep review lets it reach the agent's budget rail; the
-    commit gate records a typed disclosure and keeps its existing refusal)."""
-    from ouroboros.llm_observability import chat_observed
-    from ouroboros.usage_accounting import BudgetExceeded, physical_attempt_limit
-
-    _density, density_source = resolve_review_token_density(drive_root, model)
-    if density_source == "measured":
-        return "warm"
-    if not sample:
-        return "no_sample"
-    emit_progress(
-        f"No fresh token-density witness for {model}: one bounded probe "
-        f"(~{estimate_tokens(sample):,} estimated tokens) calibrates the input cap..."
-    )
-    try:
-        with physical_attempt_limit(1):
-            _response, usage = chat_observed(
-                llm,
-                drive_root=drive_root,
-                task_id=task_id,
-                call_type=call_type,
-                messages=[
-                    {"role": "system", "content": DENSITY_PROBE_SYSTEM_PROMPT},
-                    {"role": "user", "content": sample},
-                ],
-                model=model,
-                model_role=model_role, model_account_override=model_account_override,
-                tools=None,
-                reasoning_effort=DENSITY_PROBE_EFFORT,
-                max_tokens=DENSITY_PROBE_MAX_TOKENS,
-                temperature=None,
-                no_proxy=True,
-            )
-    except BudgetExceeded:
-        raise
-    except Exception as exc:
-        from ouroboros.llm_claudexor import propagate_model_error
-        propagate_model_error(exc)
-        log.warning("Token-density probe failed (%s): %s", call_type, exc, exc_info=True)
-        emit_progress(f"Density probe failed ({type(exc).__name__}); the cold input cap stands.")
-        return "failed"
-    real = int((usage or {}).get("prompt_tokens") or 0)
-    if real <= 0:
-        emit_progress("Density probe returned no usage (prompt_tokens=0); the cold input cap stands.")
-        return "no_usage"
-    actual_model = str(((usage or {}).get("model_role_route") or {}).get("model")
-                       or (usage or {}).get("resolved_model") or model)
-    record_token_density(
-        drive_root,
-        _normalized_density_model(actual_model),
-        prompt_chars=len(DENSITY_PROBE_SYSTEM_PROMPT) + len(sample),
-        prompt_tokens=real,
-        source=source,
-    )
-    if _normalized_density_model(actual_model) != _normalized_density_model(model):
-        emit_progress(f"Density witness belongs to the switched model {actual_model}; the original pack cap is unchanged.")
-        return "unrecorded"
-    density, density_source = resolve_review_token_density(drive_root, model)
-    emit_progress(f"Token density for {model}: {density:.2f} ({density_source}).")
-    # A witness the store refused (too few chars, an insane ratio) leaves the
-    # cold cap standing — disclosed above by the unchanged source.
-    return "measured" if density_source == "measured" else "unrecorded"
 
 
 # --- Owner acknowledgement (asserted) -----------------------------------------
@@ -1067,6 +974,7 @@ def _cached_evidence(record: Dict[str, Any], fp: str, model: str, provider: str,
         credential_profile_id=str(record.get("credential_profile_id") or ""),
         account_fingerprint=str(record.get("account_fingerprint") or ""),
         provenance=str(record.get("provenance") or ""),
+        window_kind=str(record.get("window_kind") or "total"),
     )
 
 
@@ -1444,7 +1352,7 @@ def probe(drive_root: Any, **route) -> CapabilityEvidence:
 # excluding it would starve the route of density witnesses entirely.
 _CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS = frozenset({
     "openrouter", "openai", "openai-compatible", "cloudru", "local", "anthropic",
-    "deepseek", "zai",
+    "deepseek", "zai", "claudexor",
 })
 
 
@@ -1492,14 +1400,25 @@ def observe_token_density(request: Any, usage: Optional[Dict[str, Any]], *, driv
             return
         from ouroboros.provider_models import normalize_model_identity
 
+        physical = request.physical_context
+        main = bool(getattr(physical, "view_kind", ""))
+        route = str(getattr(physical, "route_fp", "") or "")
+        bound = provider != "claudexor" and bool(getattr(physical, "window_witness_bound", True))
+        if main and bound and route:
+            from ouroboros.context_window import record_observation
+            record_observation(drive_root_resolver(request.drive_root),
+                getattr(physical, "window_observation_fp", ""), accepted=real, kind="input",
+                reserve=int(getattr(physical, "response_reserve_tokens", 0) or 0),
+                transmitted=int(getattr(request, "max_completion_tokens", 0) or 0))
         record_token_density(
             drive_root_resolver(request.drive_root),
             normalize_model_identity(str(request.model or "")),
             prompt_chars=estimate * 4,
             prompt_tokens=real,
             source="dispatch_usage",
-            route_fp=str(request.physical_context.route_fp if request.physical_context else ""),
+            route_fp=route if main and bound else "",
             basis=basis,
+            **({"view_kind": physical.view_kind} if main and bound else {}),
         )
     except Exception:
         log.debug("token-density observation skipped", exc_info=True)

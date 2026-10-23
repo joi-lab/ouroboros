@@ -1,7 +1,8 @@
 """What each SQLite journal mode makes busy, and what a reader leaves behind, for store tests.
 
-``store.connect`` gives a store WAL where the engine, the lock tier and the filesystem allow it,
-else the rollback journal (PERSIST; ``store._journal_mode``). The two modes block different things:
+A store is built in WAL where the engine, the lock tier and the filesystem allow it, else in the
+rollback journal (PERSIST; ``store._journal_mode``), and an ordinary ``store.connect`` keeps whichever
+the file has (``ouroboros/store_journal.py``). The two modes block different things:
 
 * a held write lock (``BEGIN IMMEDIATE``) makes another writer's acquisition busy in both;
 * a held read makes a rollback-journal COMMIT wait for it to drain; a WAL COMMIT waits for no reader;
@@ -12,8 +13,8 @@ else the rollback journal (PERSIST; ``store._journal_mode``). The two modes bloc
 
 A WAL reader also writes SQLite's own bookkeeping, none of it a commit: the ``-shm`` index on every
 read, the ``-wal``/``-shm`` pair its first open creates and the last close removes (that close's
-checkpoint also moves the log's frames into the file), and the header's journal-format fields a
-rollback-journal file gets at its first WAL open (sqlite.org/fileformat2.html). A store held open
+checkpoint also moves the log's frames into the file); the header's journal-format fields change only
+when a build or lifecycle owner opens a file into WAL (sqlite.org/fileformat2.html). A store held open
 across a window (``held_open``) keeps all of that outside it.
 """
 from __future__ import annotations
@@ -37,13 +38,22 @@ _WAL_OPEN_FIELDS = (slice(18, 20), slice(24, 28), slice(92, 100))
 
 
 def use_journal(monkeypatch, mode: str) -> None:
-    """Every store this test opens from now on runs in MODE ("PERSIST" or "WAL"), whatever this
-    interpreter's SQLite would choose: for a subject that exists in one mode only (a reader holding
-    a COMMIT is the rollback journal's), or a test that compares the two. The idle handles opened
-    so far close, so the next open turns an existing file into MODE (a lease an earlier test's late
-    thread still holds on its own store stays with that thread)."""
+    """Every store this test builds from now on is created in MODE ("PERSIST" or "WAL"), whatever
+    this interpreter's SQLite would choose: for a subject that exists in one mode only (a reader holding
+    a COMMIT is the rollback journal's), or a test that compares the two. An ordinary open never moves a
+    file's WAL/rollback boundary, so the stores this process already holds idle handles to are brought
+    to MODE the way a boot owner does (``store_journal.configure_journal``), once those handles close; a
+    lease an earlier test's late thread still holds on its own store stays with that thread."""
+    from ouroboros.store_journal import configure_journal
+
+    with store._CONNECTION_GUARD:
+        idle = {(held.path, held.tier) for pool in list(store._CONNECTION_POOLS)
+                for held in pool.entries.values() if not held.active}
     monkeypatch.setattr(store, "_journal_mode", lambda *_args: mode)
     store._close_cached(lambda _name: True, idle_only=True)
+    for path, tier in idle:
+        if path.is_file():
+            configure_journal(path, tier)
 
 
 def exclusive_hold(path: Any, *, wait_sec: float = 5.0) -> sqlite3.Connection:

@@ -3,8 +3,7 @@
 Every consumer of a named predecessor — a Continue root, a delegated child, an
 external work order — carries the same compact brief
 (``project_helper_predecessor_authority``): identity and digest, status and cause,
-the answer whole-or-pointer, the operative conditions (contract core, accepted plan
-core, terminal notice), the owner's words verbatim and every omitted field with its
+the terminal notice, the owner's words verbatim and every omitted field with its
 size, beside the exact reader of the complete record. The predecessor mind's
 surviving authored notes travel separately, as one foldable conversation row after
 the assignment (``predecessor_notes_message``), never inside the frozen Runtime
@@ -38,7 +37,7 @@ def project_helper_predecessor_authority(
     The existing contract normalizer handles legacy bodies. Keep its envelope
     kind: a bounded preview's wrapper can exceed the per-field wire allowance,
     and relabelling it would make a rebuild collapse the preview and its digest
-    again. Answers/core fields keep that producer's whole-or-pointer semantics.
+    again. Answers, contracts and review history stay behind the exact reader.
     Omission sizes count serialized characters (without a string's quotes);
     old name-only omissions have unknown sizes, represented by null.
 
@@ -57,11 +56,9 @@ def project_helper_predecessor_authority(
     keep = {"kind", "source", "task_id", "previous_task_id", "authority_sha256", "authority_chars",
             "digest_semantics", "plan_review_source_gap"}
     if not declared:
-        # The operative conditions: how the work stood and ended (status, cause, the
-        # host's terminal notice), its answer, its contract core, its accepted plan
-        # core and record, and the owner's words.
+        # Keep how the work ended and the owner's words; history stays at its source.
         keep.update({"status", "execution_status", "reason_code", "terminal_origin", "terminal_host_notice",
-                     "outcome_axes", "result", "task_contract", "plan_review_state", "plan_record",
+                     "outcome_axes",
                      "origin_message_text", "origin_message_ref"})
     prior = envelope.get("omitted_fields")
     omitted = {}
@@ -95,34 +92,43 @@ def _authority_identity(value: Any) -> str:
     return str(value.get("task_id") or "").strip()
 
 
+def _shown_elsewhere(text: str, representation: str, rule: str) -> Dict[str, Any]:
+    return {"representation": representation, "chars": len(text),
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "rule": rule}
+
+
 def project_main_task_authority(task: Mapping[str, Any]) -> Dict[str, Any]:
     """Build the provider-only authority section without mutating ``task``.
 
     The materialized predecessor (the brief) appears once, at the top level; an
     equal copy nested in the task's own contract is dropped from this view. A
     contract objective byte-identical to the assignment — the first user turn of
-    the conversation — is shown as a typed reference, so the work order appears
-    once per request.
+    the conversation — and a contract context byte-identical to the task block's
+    own ``context`` are shown as typed references, so the work order and its
+    context appear once per request.
     """
     projection: Dict[str, Any] = {}
     predecessor = task.get("predecessor_authority")
     contract = task.get("task_contract")
     if isinstance(predecessor, Mapping) and predecessor:
-        projection["predecessor_authority"] = copy.deepcopy(dict(predecessor))
+        projection["predecessor_authority"] = project_helper_predecessor_authority(predecessor)
     if isinstance(contract, Mapping):
         projected_contract = copy.deepcopy(dict(contract))
         nested = projected_contract.get("predecessor_authority")
         if (isinstance(nested, Mapping) and isinstance(predecessor, Mapping)
                 and _authority_identity(nested) == _authority_identity(predecessor)):
             projected_contract.pop("predecessor_authority", None)
+        elif isinstance(nested, Mapping):
+            projected_contract["predecessor_authority"] = project_helper_predecessor_authority(nested)
         objective = projected_contract.get("objective")
         if isinstance(objective, str) and objective and objective == str(task.get("text") or ""):
-            projected_contract["objective"] = {
-                "representation": "assignment", "chars": len(objective),
-                "sha256": hashlib.sha256(objective.encode("utf-8")).hexdigest(),
-                "rule": "The objective is this task's assignment, the first user turn of this conversation; "
-                        "it is not repeated here.",
-            }
+            projected_contract["objective"] = _shown_elsewhere(objective, "assignment", (
+                "The objective is this task's assignment, the first user turn of this conversation; "
+                "it is not repeated here."))
+        context = projected_contract.get("context")
+        if isinstance(context, str) and context and context == task.get("context"):
+            projected_contract["context"] = _shown_elsewhere(context, "task_context", (
+                "The caller's context is the `context` field of the task block above; it is not repeated here."))
         projection["task_contract"] = projected_contract
     origin_ref = task.get("origin_message_ref")
     origin_text = task.get("origin_message_text")

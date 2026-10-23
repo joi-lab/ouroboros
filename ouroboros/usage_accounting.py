@@ -23,6 +23,7 @@ import uuid
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Dict, Iterator, Literal, Optional, Tuple, get_args
 
+from ouroboros.physical_attempt_context import PhysicalAttemptContext
 from ouroboros.pricing import estimate_cost_optional
 from ouroboros._usage_response import (
     _normalized_input_token_usage, _reported_token_count, processing_receipt, observed_processing_mode, usage_from_response,
@@ -35,6 +36,7 @@ from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
     UsageLedgerCorrupt, UsageLockUnavailable, _drive_root, _named_lock, _number, _TERMINAL,
 )
 from ouroboros import usage_store
+from ouroboros.usage_origin import UsageScope
 from ouroboros.usage_store import hold as _locked  # noqa: F401 — the money acquisition primitive
 from ouroboros.utils import append_jsonl, atomic_write_json, utc_now_iso  # noqa: F401 -- the accounting module keeps its historical import surface for the L-C2 leaf
 from ouroboros._usage_rows import (  # noqa: F401  (re-exported substrate vocabulary)
@@ -46,7 +48,6 @@ from ouroboros._usage_rows import (  # noqa: F401  (re-exported substrate vocabu
     _with_integrity,
     _with_limit,
 )
-from ouroboros.skill_review_usage import skill_review_usage
 log = logging.getLogger(__name__)
 __all__ = (
     "AttemptRequest", "AttemptReservation", "BillingAuthorityUnavailable", "BudgetExceeded", "ControlAuthorityUnavailable", "PhysicalAttemptCapture",
@@ -63,7 +64,7 @@ __all__ = (
     "record_unmetered_external_dispatch", "refresh_root_accounting",
     "release_attempt", "reserve_attempt", "settle_attempt",
     "apply_provider_price_receipt", "bind_provider_generation",
-    "skill_review_usage", "usage_breakdown", "usage_from_response", "usage_projection", "usage_scope",
+    "usage_breakdown", "usage_from_response", "usage_projection", "usage_scope",
     "usage_writer_snapshot", "read_usage_records",
     "review_wave_admission",
 )
@@ -240,50 +241,6 @@ class _AttemptLimit:
     claimed_ids: set[str] = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
 @dataclass(frozen=True)
-class UsageScope:
-    drive_root: pathlib.Path | str | None = None
-    task_id: str = ""
-    root_task_id: str = ""
-    parent_task_id: str = ""
-    category: str = "task"
-    source: str = "llm"
-    # Explicitly attributed system probes/one-shots have no task control owner.
-    non_task_operation: bool = False
-    review_skill: str = ""
-    review_wave_id: str = ""
-    review_slot_id: str = ""
-    global_limit_usd: Optional[float] = None
-    root_limit_usd: Optional[float] = None
-    root_cost_ceiling_usd: Optional[float] = None
-    global_limit_source: str = ""
-    global_limit_revision: Optional[str] = None
-    # Whole-work billing group (owner Batch4, ``usage_admission``): empty = this
-    # root is its own group under its own cap; a Continue's successor carries the
-    # ORIGINAL root's group and that root's original cap.
-    billing_group_id: str = ""
-    billing_group_limit_usd: Optional[float] = None
-    billing_group_limit_source: str = ""
-    billing_group_limit_revision: Optional[str] = None
-    root_limit_source: str = ""  # Original None + provenance is unlimited, not a new default.
-    root_limit_revision: Optional[str] = None
-    # The wave a caller named to own its prompt-cache split (skill, plan review). A round the review
-    # derives (#1544: retry_key or a fresh id) is attribution only; the split stays per task.
-    cache_wave: str = ""
-@dataclass(frozen=True)
-class PhysicalAttemptContext:
-    profile: Literal["owner_max", "owner_low", "owner_nano", "task_local_low", "task_local_nano"]
-    rendered_mode: Literal["max", "low", "nano"]
-    measurement_basis: Literal["fresh_route_usage", "fresh_model_usage", "cold_estimate"]
-    route_fp: str
-    round_id: str
-    target_total_tokens: Optional[int]
-    capacity_total_tokens: Optional[int]
-    context_target_miss: bool
-    automatic_pass_used: bool
-    # Main's calibration (real tokens per estimated token) of the measurement above;
-    # the send finalizer sizes the reply with it. None on rows written before it existed.
-    measurement_density: Optional[float] = None
-@dataclass(frozen=True)
 class AttemptRequest:
     model: str
     provider: str
@@ -324,6 +281,9 @@ class AttemptRequest:
     effort: Optional[Dict[str, Any]] = None
     allow_live_fetch: bool = True  # False only for a price display: cached tariffs, never a fetch
     provider_receipt_binding: Optional[Dict[str, str]] = None
+    # The local serving tokenizer's observation of this candidate, never a density forecast.
+    prompt_tokens_exact: Optional[int] = None
+    context_window_tokens_exact: Optional[int] = None
 @dataclass(frozen=True)
 class AttemptReservation:
     attempt_id: str
@@ -478,6 +438,7 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
         category=str(request.category or bound.category or "task"),
         source=str(request.source or bound.source or "llm"),
         non_task_operation=bound.non_task_operation and same_root,
+        consciousness_cause=bound.consciousness_cause if same_root else "",
         **{key: str(getattr(bound, key, "") or "") for key in REVIEW_ATTRIBUTION_KEYS},
         global_limit_usd=(
             request.global_limit_usd if request.global_limit_usd is not None else bound.global_limit_usd
@@ -762,6 +723,7 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                         "billing_group_limit_source": scope.billing_group_limit_source,
                         "billing_group_limit_revision": scope.billing_group_limit_revision,
                         "category": scope.category,
+                        **({"consciousness_cause": scope.consciousness_cause} if scope.consciousness_cause else {}),
                         **({"non_task_operation": True} if scope.non_task_operation else {}),
                         "source": scope.source,
                         **{key: str(getattr(scope, key, "") or "") for key in REVIEW_ATTRIBUTION_KEYS},
@@ -799,7 +761,8 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                     root_limit,
                     reservation={
                         "attempt_id": attempt_id, "task_id": scope.task_id,
-                        "category": scope.category, "review_slot_id": scope.review_slot_id,
+                        "category": scope.category,
+                        **({"consciousness_cause": scope.consciousness_cause} if scope.consciousness_cause else {}), "review_slot_id": scope.review_slot_id,
                     },
                 )
 
@@ -852,6 +815,8 @@ def record_unmetered_external_dispatch(
         "completion_tokens": max(0, int(completion_tokens or 0)),
         "task_id": real_task,
         "root_task_id": real_root,
+        **({"consciousness_cause": bound.consciousness_cause}
+           if bound.consciousness_cause and real_root == (bound.root_task_id or bound.task_id) else {}),
         "parent_task_id": str(parent_task_id or bound.parent_task_id or ""),
         **{key: value for key, value in billing.items() if key.startswith("billing_group_")},
         "category": str(category or bound.category or "external"),
@@ -939,6 +904,8 @@ def record_subscription_session(
         "cached_tokens": None if cached_tokens is None else max(0, int(cached_tokens)),
         "task_id": real_task,
         "root_task_id": real_root,
+        **({"consciousness_cause": bound.consciousness_cause}
+           if bound.consciousness_cause and real_root == (bound.root_task_id or bound.task_id) else {}),
         "parent_task_id": str(parent_task_id or bound.parent_task_id or ""),
         **{key: value for key, value in billing.items() if key.startswith("billing_group_")},
         "category": str(category or bound.category or "subagent"),
@@ -1228,7 +1195,8 @@ def bind_provider_generation(generation_id: str, *, reservation: Optional[Attemp
 
 
 def _retain_physical_failure(reservation, *, exc=None, response=None):
-    """Failure source is durable before a caller can retry or replace its capture."""
+    """Failure source is durable before a caller can retry or replace its capture.
+    With ``exc`` only once the answer path ended: ``ended_unbound_model_request`` reads that."""
     payload = None
     try:
         payload = provider_failure_payload(exc) if exc is not None else _plain(response)

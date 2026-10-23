@@ -333,7 +333,7 @@ def test_bundled_telegram_reseed_delivers_the_current_version(tmp_path, monkeypa
     installed = _write_skill(drive_root / "skills" / "native", "telegram", version="1.2.0")
     (installed / ".seed-origin").write_text("seeded_from=test\n", encoding="utf-8")
     assert _reseed(seed_dir, drive_root) == 1
-    assert "version: 1.3.4" in (installed / "SKILL.md").read_text(encoding="utf-8")
+    assert "version: 1.3.7" in (installed / "SKILL.md").read_text(encoding="utf-8")
     for path in ("plugin.py", "lib/telegram_api.py", "lib/telegram_quiz.py", "lib/telegram_state.py"):
         assert (installed / path).read_bytes() == (seed_dir / "telegram" / path).read_bytes()
 
@@ -345,6 +345,7 @@ def test_bundled_telegram_reseed_delivers_the_current_version(tmp_path, monkeypa
     ("telegram", "08ed0f824df498a1c43c8ff9e04dd42e5c64ee76", "1.3.3"),
     ("unix_computer_use", "ec3fc6e5b5ae5ee99a746b5e1a0f6343a41926d4", "0.4.2"),
     ("unix_computer_use", "1e237c1bc89f0600a7362f69eddafdff4ddd1f2d", "0.4.3"),
+    ("unix_computer_use", "9e2bd962903044a6516917bcb10a933b2d1acafd", "0.5.0"),
 ])
 def test_reseed_from_a_real_previous_seed(tmp_path, monkeypatch, name, source, old_version):
     """Full preceding payload from history: the re-seed delivers the bundled bytes,

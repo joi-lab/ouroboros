@@ -22,6 +22,8 @@ import { createHostStart } from './host_starting_status.js';
 import { createModelWaitController, isModelWaitReference } from './model_wait.js';
 import { syncSettledItems } from './settled_card.js';
 import { createChatReadingPosition } from './chat_reading_position.js';
+import { createRowSleep } from './chat_row_sleep.js';
+import { onRefit } from './text_fit.js';
 import { createChatHistoryPager, historyCoverage, historyIslandAtEdge } from './chat_history.js';
 import { createProjectReadReceipt, isAtNewestMessage, newestMessageOffset } from './project_read_state.js';
 import { mergeHistoricalTimelineItem, historyNodeIsProtected, historyRowIds, historyStamps, stampHistoryNode, compareHistoryPosition } from './chat_history_replay.js';
@@ -112,7 +114,7 @@ import {
     chatMediaMessageKey,
     chatThreadAccepts,
     clearStickyCardState,
-    confirmAndSendPanic,
+    sendPanic,
     confirmAndSendRestart,
     computeHydratedDirectActivities,
     documentMessageKey,
@@ -140,9 +142,8 @@ import {
     rawTimestampEpoch,
     stampNodeTimestamp,
     reconcileHydratedDirectActivities,
-    reconnectBannerText,
+    restartNoticeText,
     senderLabel,
-    shouldFirePanic,
     taskCostMeta,
     taskCostProjection,
     unconfirmedForegroundCardIds,
@@ -164,7 +165,7 @@ export {
     chatMediaMessageKey,
     clearStickyCardState,
     clearTransientRoutingAnnotations,
-    confirmAndSendPanic,
+    sendPanic,
     computeHydratedDirectActivities,
     headerBudgetPresentation,
     insertTimelineNode,
@@ -179,7 +180,6 @@ export {
     reconcileHydratedDirectActivities,
     taskCostMeta,
     taskCostProjection,
-    shouldFirePanic,
 };
 
 // Host placement: custody warns; settled reviews show results.
@@ -226,8 +226,7 @@ export function createChatInstance({
             actionsHtml: mainHeaderActionsHtml(),
             showMobileNav: false,  // a room's ☰ is its composer row's first control
         });
-    // Main: the history note (gaps, a failed read, an approximate position) floats UNDER the bar as its own
-    // strip, never as a second row of it; the Project panel keeps its in-flow status bar.
+    // Main: a failed read or approximate restoration floats under the bar; Project keeps its status bar.
     page.innerHTML = `
         ${headerHtml}${asPanel ? '' : '<div class="chat-page-note"></div>'}
         <div id="chat-messages"></div>
@@ -258,7 +257,7 @@ export function createChatInstance({
     const inputArea = byId('input-area');
     const statusBadge = byId('status');
     const headerActions = byId('header-actions');
-    const pageHeader = page.querySelector('.chat-page-header');
+    const pageHeader = page.querySelector('.chat-page-header') || (asPanel ? container?.closest?.('.project-panel')?.querySelector?.('.project-panel-bar') : null);
     const pageNote = page.querySelector('.chat-page-note');
     const budgetPill = byId('budget-pill');
     const disposeHeaderPlacement = asPanel ? () => {} : bindHeaderControlPlacement({ headerActions, budgetPill });
@@ -352,8 +351,10 @@ export function createChatInstance({
     // One derived physical coverage/status for the mounted reading window.
     let historyWindow = null;
     let _hasNewActivity = false;
+    // A Project room app.js retired is leaving the screen (it fades out inside the room card): not shown, not read.
+    let leaving = false;
     const isInstanceVisible = () =>
-        Boolean(messagesDiv) && messagesDiv.offsetParent !== null && !document.hidden;
+        !leaving && Boolean(messagesDiv) && messagesDiv.offsetParent !== null && !document.hidden;
     const LIVE_CARD_CAP = 200;
     const liveCardBound = createLiveCardBound(LIVE_CARD_CAP);
     const liveCardRecords = new Map();
@@ -449,13 +450,53 @@ export function createChatInstance({
             }).catch(() => {}).finally(() => managedTaskDetailReads.delete(childId));
         }
     }
+    // Root census rows omit children; complete work membership can admit their own
+    // result read before the root ends. Unknown/nonterminal replies retry on the
+    // existing refresh; a confirmed 404 waits for new card evidence or reconnect.
+    function settleAbsentChildren(snapshotRequestedAt) {
+        for (const [childId, record] of liveCardRecords) {
+            if (!record.isSubagent || record.finished || !record.root?.isConnected) continue;
+            if (workState.members.has(childId)) {
+                record.childDetailRead = undefined;
+                if (record.historicalUnavailable) withStableViewport(() => {
+                    setHistoricalUnavailable(record, false);
+                    renderLiveCardMeta(record);
+                    return true;
+                });
+                continue;
+            }
+            const observedAt = record.lastLiveObservedAt || 0;
+            const updates = record.updates;
+            if (!workState.complete || observedAt >= snapshotRequestedAt
+                    || (record.childDetailRead?.missing && record.childDetailRead.updates === updates)
+                    || managedTaskDetailReads.has(childId)
+                    || !subagentChildParents.has(childId)) continue;
+            // Queue departure and membership share this read; keep the visible hold
+            // until actual recovery or terminal evidence, not just absence.
+            record.projectHoldQueued = false;
+            const observation = record.childDetailRead = { updates };
+            managedTaskDetailReads.add(childId);
+            fetchTaskDetailStrict(childId).then((detail) => {
+                if (destroyed || ws.isConnected?.() === false || !workState.complete
+                        || liveCardRecords.get(childId) !== record || record.finished
+                        || workState.members.has(childId) || record.updates !== updates
+                        || record.childDetailRead !== observation) return;
+                if (detail === null) {
+                    observation.missing = true;
+                    withStableViewport(() => settleMissingTaskRecord(record));
+                } else if (isTerminalTaskDetail(detail)) {
+                    withStableViewport(() => routeSubagentTerminalToCard(childId, { ...detail, task_id: childId }));
+                }
+            }).catch(() => {}).finally(() => managedTaskDetailReads.delete(childId));
+        }
+    }
     let activeLiveGroupId = '';
     let pendingReconnectSync = false;  // Set when a fromReconnect sync arrives while one is already in-flight.
-    let pendingReconnectBannerText = '';
+    let pendingRestartNotice = '';
     try {
-        pendingReconnectBannerText = reconnectBannerText(new URL(window.location.href).searchParams.get('_ouro_reason') || '');
+        pendingRestartNotice = restartNoticeText(new URL(window.location.href).searchParams.get('_ouro_reason') || '');
     } catch {}
-    function clearPendingReconnectBanner() {
+    function clearReloadParams() {
         try {
             const url = new URL(window.location.href);
             if (!url.searchParams.has('_ouro_reason') && !url.searchParams.has('_ouro_refresh')) return;
@@ -565,6 +606,7 @@ export function createChatInstance({
         if (data) void refreshChildProjectHolds();
         const before = workState;
         workState = reconcileWorkState(workState, data, chatId, ws.isConnected?.() !== false);
+        if (Array.isArray(data?.works)) settleAbsentChildren(snapshotRequestedAt);
         applyCardWorkViews(liveCardRecords, workState);
         changedOffers(liveCardRecords, before, workState).forEach(syncCancelRunButton);
         syncHeaderControlState(data ?? { accounting: { available: false } });
@@ -614,9 +656,16 @@ export function createChatInstance({
 
     const { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor, serializeTimelineAnchor, anchorOwnersReady } =
         createTimelineAnchors({ messagesDiv, liveCardRecords });
+    // Far rows skipped once laid out (style.css); after a restyle every row's size may change at once, and the reading
+    // owner places the passage again.
+    const rowSleep = createRowSleep({ feed: messagesDiv, onRestyle: () => reading.reflow() });
+    // A fitted line re-fits on the frame after its width changed (text_fit.js): a reader at the newest message is placed
+    // there again once the room's lines have their size (Main shown again laid out its newest message before).
+    const offRefit = onRefit((els) => { if (reading.stick && els.some((el) => messagesDiv.contains(el))) reading.reflow(); });
     const reading = createChatReadingPosition({
         feed: messagesDiv, alive: () => !destroyed,
-        afterWrite: () => roomWork?.update(), activity: () => { _hasNewActivity = true; },
+        // A row asleep that the write changed is laid out before the place is restored (chat_row_sleep.js).
+        afterWrite: () => { rowSleep.flush(); roomWork?.update(); }, activity: () => { _hasNewActivity = true; },
         updateButton: updateScrollButton,
         visible: () => !destroyed && isInstanceVisible(),
         ready: () => historyLoaded && anchorOwnersReady(reading.target?.historyAnchor, reviewHydrator.ready),
@@ -969,6 +1018,18 @@ export function createChatInstance({
         syncCancelRunButton(record);
     }
 
+    function settleMissingTaskRecord(record) {
+        const historical = record.historicalTerminal;
+        if (historical) {
+            const changed = applyHistoricalModelExecution(record, historical) && renderLiveCardMeta(record);
+            return finishLiveCard(record.groupId, historical.phase) || changed;
+        }
+        const changed = setHistoricalUnavailable(record, true);
+        renderLiveCardMeta(record);
+        syncChatStatus();
+        return changed;
+    }
+
     function markTaskCancelable(taskId = '') {
         const id = taskKey(taskId);
         if (!id) return false;
@@ -1157,7 +1218,8 @@ export function createChatInstance({
             : Boolean(options.isSubagent && nestedSubagentsExpanded);
         root.dataset.expanded = initialExpanded ? '1' : '0';
         // The summary band is reading content (selectable, never a control); its one disclosure is the
-        // "N notes · Show details" button (DESIGN §5 "A task card's summary outranks its details").
+        // "Details" button, its notes count kept in the button's name (DESIGN §5 "A task card's summary
+        // outranks its details").
         root.innerHTML = `
             <div class="chat-live-summary-button" data-live-summary-button>
                 <div class="chat-live-summary">
@@ -1169,7 +1231,7 @@ export function createChatInstance({
                     <span class="chat-live-title" data-live-title>Waiting for work</span>
                     <button type="button" class="chat-live-summary-side ui-hit-area" data-live-disclosure aria-expanded="false" aria-controls="${escapeHtmlAttr(timelineId)}">
                         <span class="chat-live-count" data-live-count hidden></span>
-                        <span class="chat-live-toggle" data-live-toggle>Show details</span>
+                        <span class="chat-live-toggle" data-live-toggle>Details</span>
                         <svg class="chat-live-chevron" width="14" height="14" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                             <path d="M5 7.5 10 12.5 15 7.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path>
                         </svg>
@@ -1186,6 +1248,7 @@ export function createChatInstance({
             </div>
             <div class="chat-live-details">
                 <div data-live-phase-detail hidden></div>
+                <dl class="chat-live-facts" data-live-facts hidden></dl>
                 <div data-live-cost-detail hidden></div>
             </div>
             <div class="chat-live-timeline" data-live-timeline id="${escapeHtmlAttr(timelineId)}"></div>
@@ -1485,7 +1548,7 @@ export function createChatInstance({
         if (event?.detail?.page === 'chat') void showLatest();
         else if (event?.type !== 'visibilitychange') return;
         else if (document.hidden) reading.land(() => 0, reading.arriving);
-        else reading.request();
+        else { reading.request(); historyControls.showNotice(); }
     };
     window.addEventListener('ouro:page-shown', handlePageShown);
     document.addEventListener('visibilitychange', handlePageShown);
@@ -1589,6 +1652,7 @@ export function createChatInstance({
         }
         record.updates += 1;
         const wasFinished = record.finished;
+        if (summary.terminal && typeof summary.quietEffective === 'boolean') record.quietEffective = summary.quietEffective;
         // Empty frames name nothing (#1369).
         const headline = summary.headline || record.lastHumanHeadline || '';
         const syntheticKey = summary.dedupeKey || dedupeKey || `${summary.phase || 'working'}|${headline}|${summary.body || ''}`;
@@ -1720,7 +1784,7 @@ export function createChatInstance({
         const wasFinished = record.finished;
         record.finished = true;
         record.finalizingHold = false;
-        const presentation = taskPresentation(phase || 'done');
+        const presentation = taskPresentation(phase || 'done', record.quietEffective ?? record.historicalTerminal?.quiet_effective);
         const activePhase = presentation.phase;
         setLiveCardPhase(record, activePhase, presentation.headline);
         if (record.isSubagent) record.titleEl.textContent = childTitle(record);
@@ -1745,13 +1809,12 @@ export function createChatInstance({
         }
         let changed = false;
         // Restore historical task name.
-        if (msg?.suggested_name) {
-            changed = applySuggestedName(taskId, msg.suggested_name) || changed;
-        }
+        if (msg?.suggested_name) changed = applySuggestedName(taskId, msg.suggested_name) || changed;
         const finalizing = msg?.task_phase === 'finalizing' || msg?.outcome_final === false;
         changed = noteToolMetrics(taskId, msg, rawTs, { suppressDomInsert }) || changed;
-        const summary = taskTerminalSummary({ ...msg, task_id: taskId });
         const record = getLiveCardRecord(taskId);
+        msg = { quiet_effective: record.quietEffective ?? record.historicalTerminal?.quiet_effective, ...msg };
+        const summary = taskTerminalSummary({ ...msg, task_id: taskId });
         changed = noteTaskDetails(record, msg) || changed;
         syncSettledItems(record, msg);
         changed = Boolean(record.reviewController?.updateMany(reviewGroupsFromTaskDetail(msg, taskId))) || changed;
@@ -2117,6 +2180,7 @@ export function createChatInstance({
             persistedHistory.push({
                 text, role, ts, markdown: !!markdown, ...meta, narration: opts.narration,
                 originProjected: !!opts.originProjected, terminalTime: opts.terminalTime || null,
+                completionNotice: opts.completionNotice || null,
                 skillReview: opts.skillReview || null, evidenceRef: opts.evidenceRef || null,
                 attachments: attachments.length ? attachments : null,
                 textPlaceholder: opts.textPlaceholder === true,
@@ -2426,7 +2490,7 @@ export function createChatInstance({
                         originId: msg.origin_id || '',
                         chatAnnotation: msg.chat_annotation || null,
                         skillReview: msg.system_type === 'skill_review' && msg.skill && msg.job_id
-                            ? { skill: msg.skill, jobId: msg.job_id }
+                            ? { skill: msg.skill, jobId: msg.job_id, ...(msg.record_id ? { recordId: msg.record_id } : {}) }
                             : null,
                     });
                     if (msg.role === 'user') { markIngressSaved(messagesDiv, msg); replies.adopt(msg); unconfirmed.settle(msg); }
@@ -2613,7 +2677,7 @@ export function createChatInstance({
             return lastHistorySyncSucceeded;
         },
         // A destroyed page reports hidden===false, hence the lifecycle flag.
-        isShown: () => !destroyed && !page.hidden,
+        isShown: () => !destroyed && !leaving && !page.hidden,
         // A place still being restored is not where the reader is.
         isReadingLatest: latest => !destroyed && !reading.pending && !replies.revealing && isInstanceVisible() && isAtNewestMessage(latest, {
             ...newestFacts, atBottom: () => isNearBottom() && !historyPager.getState().canNewer,
@@ -2662,7 +2726,7 @@ export function createChatInstance({
     function showSent({ text, frame, result, views }) {
         const sentTs = new Date().toISOString();
         reading.cancel(); // an accepted Send supersedes any saved place
-        addMessage(text, 'user', false, sentTs, false, {
+        const row = addMessage(text, 'user', false, sentTs, false, {
             pending: result?.status === 'queued',
             source: 'web',
             senderSessionId: chatSessionId,
@@ -2687,6 +2751,7 @@ export function createChatInstance({
         syncChatStatus();
         composer.resize();
         reading.followAfterLayout();
+        return row;  // the sent draft rises into it (send_flight.js)
     }
     // Dynamic CSS reserve keeps the absolute composer from covering messages.
 
@@ -2728,12 +2793,36 @@ export function createChatInstance({
         }
         if (destroyed || !current()) return;
         reading.stick = true;
+        for (const record of liveCardRecords.values()) record.childDetailRead = undefined;
         reading.followAfterLayout();
         updateScrollButton();
+        historyControls.showNotice();
     }
     scrollBottomBtn?.addEventListener('click', showLatest);
 
+    // The composer's height once its reply strip has finished moving (chat_reply.js `data-motion`): opening, the strip
+    // counts at its full height (`--reply-h`) and the wrap's gap; leaving, not at all. The reserve then moves once per
+    // motion, not on every frame of it: each write restyles the whole room (~90 ms a write on a 34k-element Main in
+    // WebKit, where four in a row made the strip's close stutter).
+    function composerHeightAtRest() {
+        const strips = inputArea.querySelectorAll('.chat-quote--composer[data-motion]');
+        if (!strips.length) return inputArea.offsetHeight || 0;
+        // Mid-motion heights are fractional: whole pixels would differ by one from frame to frame and write again.
+        let height = inputArea.getBoundingClientRect().height;
+        for (const strip of strips) {
+            // The room a strip takes is its box and its margins (style.css): opening it ends at --reply-room, shut at none.
+            const { marginTop, marginBottom } = getComputedStyle(strip);
+            const now = strip.getBoundingClientRect().height + (parseFloat(marginTop) || 0) + (parseFloat(marginBottom) || 0);
+            const end = strip.dataset.motion === 'open' ? (parseFloat(strip.style.getPropertyValue('--reply-room')) || 0) : 0;
+            height += end - now;
+        }
+        return height;
+    }
+
     function updateMessagesPadding(preserveStickiness = true) {
+        // A room not displayed (Main behind a page) measures its bars as 0: it keeps the reserves it was laid out
+        // with, or it would come back with its newest message under the composer.
+        if (!page.getClientRects().length) return false;
         const mutate = () => {
             let changed = false;
             if (pageHeader && messagesDiv) {
@@ -2752,7 +2841,7 @@ export function createChatInstance({
                 }
             }
             if (inputArea && messagesDiv) {
-                const reserve = Math.max(92, Math.ceil(inputArea.offsetHeight || 0) + 16);
+                const reserve = Math.max(92, Math.ceil(composerHeightAtRest()) + 16);
                 const value = `${reserve}px`;
                 if (page.style.getPropertyValue('--chat-input-reserve') !== value) {
                     page.style.setProperty('--chat-input-reserve', value);
@@ -2814,15 +2903,7 @@ export function createChatInstance({
             await confirmAndSendRestart({ openConfirmDialog, ws });
             return;
         }
-        if (command === 'panic') {
-            // CRITICAL CONTROL: the whole confirm-and-send flow lives in the
-            // node-tested confirmAndSendPanic (dialog options + strict
-            // shouldFirePanic gate + the exact /panic command); this handler
-            // only injects the real deps. Manual check on release: click
-            // Panic → dialog → "Kill all workers" sends /panic;
-            // Cancel/Escape/backdrop send nothing.
-            await confirmAndSendPanic({ openConfirmDialog, ws });
-        }
+        if (command === 'panic') sendPanic({ ws });
     });
 
     // Native <details> needs outside-click/Escape dismissal; destroy removes
@@ -2856,8 +2937,11 @@ export function createChatInstance({
 
     let headerControlInterval = null;
     if (asPanel) {
-        // Late panels missed socket open; seed from the socket and latest snapshot.
-        hostStart.read(stateSnapshots.latest?.());
+        // Late panels missed socket open; seed from the socket and latest snapshot, its works included: a working
+        // Project opened from its row said Online until its own first read (owner 20.10).
+        const latest = stateSnapshots.latest?.();
+        hostStart.read(latest);
+        workState = reconcileWorkState(workState, latest, chatId, ws.isConnected?.() !== false);
         const seed = deriveChatStatus();
         if (ws.isConnected?.()) setStatus(seed);
     } else headerControlInterval = setInterval(refreshHeaderControlState, 3000);
@@ -2962,7 +3046,11 @@ export function createChatInstance({
         }
     }
 
-    const historyControls = createHistoryControls(messagesDiv, pageNote || page.querySelector('.chat-panel-statusbar'));
+    const historyControls = createHistoryControls(messagesDiv, pageNote || page.querySelector('.chat-panel-statusbar'), {
+        isVisible: () => isInstanceVisible() && !messagesDiv.closest('[inert]')
+            && !document.body.classList.contains('nav-drawer-open') && (asPanel || (!isProjectOpening?.()
+            && !document.body.classList.contains('project-panel-open'))),
+    });
     const { olderButton: loadOlderBtn } = historyControls;
 
     const historyPager = createChatHistoryPager({
@@ -3009,6 +3097,8 @@ export function createChatInstance({
             return true;
         });
     }
+    const handleHistoryLanguage = () => syncLoadOlderControl();
+    window.addEventListener('ouro:language-changed', handleHistoryLanguage);
     async function loadOlderHistory() {
         if (historyControls.recentFailed()) {
             const owned = onHistoryRetry?.();
@@ -3128,17 +3218,7 @@ export function createChatInstance({
                 const vouched = !missingManagedTaskIds.has(taskId) || activeDirectActivities.has(taskId);
                 if (!vouched && detail === null) {
                     revokeManagedTaskCancelAuthority(taskId);
-                    const historical = currentRecord.historicalTerminal;
-                    if (historical) {
-                        if (applyHistoricalModelExecution(currentRecord, historical)) {
-                            changed = renderLiveCardMeta(currentRecord) || changed;
-                        }
-                        return finishLiveCard(taskId, historical.phase) || changed;
-                    }
-                    changed = setHistoricalUnavailable(currentRecord, true) || changed;
-                    renderLiveCardMeta(currentRecord);
-                    syncChatStatus();
-                    return changed;
+                    return settleMissingTaskRecord(currentRecord) || changed;
                 }
                 if (cancelPending || (!vouched && !isTerminalTaskDetail(detail))) {
                     if (currentRecord.isSubagent && detail?.status) missingManagedTaskIds.delete(taskId);
@@ -3423,29 +3503,20 @@ export function createChatInstance({
         const isReconnect = typeof msg?.previouslyConnected === 'boolean'
             ? msg.previouslyConnected
             : wsHasConnectedOnce;
-        const reconnectBanner =
-            pendingReconnectBannerText
-            || (isReconnect ? 'Reconnected' : '');
-        const shouldClearReconnectParams = Boolean(pendingReconnectBannerText);
-        pendingReconnectBannerText = '';
+        // Room status carries the outage; only a reload onto changed code adds a restart notice.
+        const restartNotice = isReconnect ? '' : pendingRestartNotice;
+        pendingRestartNotice = '';
         wsHasConnectedOnce = true;
         updateMessagesPadding();
+        const settled = () => {
+            if (restartNotice) addMessage(restartNotice, 'system', false, null, false, { ephemeral: true, systemType: 'reconnect' });
+            clearReloadParams();
+        };
         loadUiPreferences()
             // Reconnect refetches lost task_done; first open shares idle-gated hydration.
             .then(() => (isReconnect ? syncHistory({ fromReconnect: true })
                 : waitForHydrationWindow().then(awaitInitialHydration)))
-            .then(() => {
-                if (reconnectBanner) {
-                    addMessage(reconnectBanner, 'system', false, null, false, { ephemeral: true, systemType: 'reconnect' });
-                    if (shouldClearReconnectParams) clearPendingReconnectBanner();
-                }
-            })
-            .catch(() => {
-                if (reconnectBanner) {
-                    addMessage(reconnectBanner, 'system', false, null, false, { ephemeral: true, systemType: 'reconnect' });
-                    if (shouldClearReconnectParams) clearPendingReconnectBanner();
-                }
-            });
+            .then(settled, settled);
     });
 
     onWs('close', () => {
@@ -3457,6 +3528,7 @@ export function createChatInstance({
             }
             let changed = false;
             for (const [id, record] of liveCardRecords) {
+                record.childDetailRead = undefined;
                 changed = syncParkedPhase(record, 'unknown', activeDirectActivities.get(id)) || changed;
             }
             return changed;
@@ -3487,6 +3559,8 @@ export function createChatInstance({
         // Called by app.js when a kept panel is shown again: a room reopens at its
         // newest message (owner decision 2026-10-05).
         showLatest,
+        // Shell exposure after its motion: present retained notice state, without fetching or scrolling.
+        showHistoryNotice: () => { if (!destroyed) historyControls.showNotice(); },
         refreshHistory: readReceipt.refresh,
         revealQuestion,
         revealSource: replies.reveal,
@@ -3505,6 +3579,10 @@ export function createChatInstance({
         // modal a file card opened (reader, file dialog) closes and its read
         // stops; staged attachments and uploads are untouched.
         closeTransient: () => { reading.cancel(); roomWork?.leave(); chatMedia.closeTransient(); },
+        // app.js retires a room that is leaving the screen and keeps it whole for its exit: its paint receipt, its
+        // reading and its transients stop at once, it is neither shown nor read; `stay` is a reopen meanwhile.
+        leave: () => { leaving = true; readReceipt.cancel(); reading.cancel(); roomWork?.leave(); chatMedia.closeTransient(); },
+        stay: () => { leaving = false; },
         // Full teardown (P3): release every resource this instance acquired —
         // ws subscriptions, window/document listeners, the ResizeObserver, all
         // timers — then drop the buffered collections and remove the DOM last.
@@ -3515,6 +3593,8 @@ export function createChatInstance({
             composer.destroy();
             replies.destroy();
             rowMenu.destroy();
+            rowSleep.destroy();
+            offRefit();
             unconfirmed.release();
             emptyWelcome?.dispose();
             readReceipt.cancel();
@@ -3523,6 +3603,8 @@ export function createChatInstance({
             }
             wsDisposers.length = 0;
             historyControls.endRecent();
+            historyControls.destroy();
+            window.removeEventListener('ouro:language-changed', handleHistoryLanguage);
             historyPager.destroy();
             disposeReadingGestures();
             document.removeEventListener('selectionchange', retryHistoricalUpserts);

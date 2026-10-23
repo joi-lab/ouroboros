@@ -18,6 +18,7 @@ def file_tools(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     ctx = ToolContext(repo_dir=system, drive_root=data, workspace_root=workspace,
                       workspace_mode="external", task_id="edit-owner-scope")
     registry = ToolRegistry(repo_dir=system, drive_root=data)

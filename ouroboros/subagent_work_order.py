@@ -321,24 +321,22 @@ def compile_external_work_order(task: Mapping[str, Any]) -> str:
     return _render_external_work_order(task)
 
 
-def session_design_navigation(ctx: Any, *, target_root: str, source_root: str) -> str:
-    """Pin body navigation in the prepared session request, beside its work order.
+def _own_body_source(ctx: Any, target_root: str, source_root: str) -> tuple[Any, bool]:
+    """``(root, prepared)``: where a session reads the author's own body, or ``(None, False)``.
 
-    The canonical work order is reconstructed for source-range validation and
-    cannot depend on mutable files. Session instructions instead ride the durable
-    start request and its byte-identical retry. Identity comes from the selected
-    task source; bytes come from the prepared copy, never a foreign target's doc.
-    """
+    Identity comes from the selected task source; bytes come from the prepared copy
+    (``prepared``), never a foreign target's file. Declared folderless body work
+    reads the system docs, not its scratch."""
     from pathlib import Path
 
-    from ouroboros.context_layout import design_navigation, task_design_source
+    from ouroboros.context_layout import task_design_source
 
     metadata = getattr(ctx, "task_metadata", {})
     task = dict(metadata) if isinstance(metadata, Mapping) else {}
     task["task_contract"] = getattr(ctx, "task_contract", {})
     selected = task_design_source(ctx, task)
     if selected is None:
-        return ""
+        return None, False
     try:
         folder = Path(target_root).resolve().relative_to(selected.resolve())
     except ValueError:
@@ -346,12 +344,26 @@ def session_design_navigation(ctx: Any, *, target_root: str, source_root: str) -
         from ouroboros.workspace_copies import same_directory
 
         if not same_directory(target_root, active_repo_dir_for(ctx)):
-            return ""  # e.g. a payload session launched by an own-body task
-        source = selected  # declared folderless body work reads system docs, not scratch
-    else:
-        source = Path(source_root).resolve()
-        for _part in folder.parts:
-            source = source.parent  # an investigation can start below the copied repo root
+            return None, False  # e.g. a payload session launched by an own-body task
+        return selected, False
+    source = Path(source_root).resolve()
+    for _part in folder.parts:
+        source = source.parent  # an investigation can start below the copied repo root
+    return source, True
+
+
+def session_design_navigation(ctx: Any, *, target_root: str, source_root: str) -> str:
+    """Pin body navigation in the prepared session request, beside its work order.
+
+    The canonical work order is reconstructed for source-range validation and
+    cannot depend on mutable files. Session instructions instead ride the durable
+    start request and its byte-identical retry (``_own_body_source`` selects the bytes).
+    """
+    from ouroboros.context_layout import design_navigation
+
+    source, _prepared = _own_body_source(ctx, target_root, source_root)
+    if source is None:
+        return ""
     path = source / "docs/DESIGN.md"
     try:
         raw = path.read_bytes()
@@ -364,12 +376,56 @@ def session_design_navigation(ctx: Any, *, target_root: str, source_root: str) -
             + navigation + digest)
 
 
-def session_host_references(ctx: Any, *, target_root: str, source_root: str) -> str:
-    """Host references pinned in a session's start request: own-body DESIGN navigation, then the
-    installed instruction-skill index for any workspace."""
-    from ouroboros.skill_catalogue import session_skill_index  # lazy, like the other skill reads here
+def session_service_directories(ctx: Any, gateway: Any, route: Any, authority: Any, *, snapshot: Any,
+                                payload: bool, execution_root: str) -> Any:
+    """What ONE first start's private copy may write outside it, prepared before the binding, the host
+    references and the request name it (``workspace_preflight.session_service_directories``).
 
-    return session_design_navigation(ctx, target_root=target_root, source_root=source_root) + session_skill_index(ctx)
+    The delegating task's drive owns the short scratch, keyed by the snapshot. A same-tree
+    continuation from another task can receive a different scratch. A skill payload, an engine
+    directory copy and a session without a copy get none; a retry replays recorded old paths and
+    never comes here, even if the original task's drive or the OS already retired them."""
+    from ouroboros.tool_access_paths import canonical_data_root
+    from ouroboros.workspace_preflight import ServiceDirectories, session_service_directories as prepare
+
+    if snapshot is None or payload:
+        return ServiceDirectories()
+    return prepare(gateway, route.route_id, access=authority.access, mode=authority.mode,
+                   data_root=canonical_data_root(ctx), drive_root=getattr(ctx, "drive_root", ""),
+                   task_id=str(getattr(ctx, "task_id", "") or ""), key=snapshot.snapshot_id,
+                   execution_root=execution_root)
+
+
+def session_host_references(ctx: Any, *, target_root: str, source_root: str,
+                            private_copy: bool = False, payload_skill: str = "", service: Any = None) -> str:
+    """Host references pinned in a session's start request, computed once at first start.
+
+    Own-body DESIGN navigation and the installed instruction-skill index for any workspace;
+    a skill-payload builder also gets the serving host's skill contract, whatever its input
+    selection, and any other private copy its environment facts: dependency files read at the
+    copy's repository root, the environment placed where the session may write (``source_root``,
+    possibly a folder below that root, or the scratch ``service`` grants); a read-only session
+    has no copy, so it gets neither. A retry replays the recorded bytes."""
+    from ouroboros.skill_catalogue import session_skill_index, skill_contract_references  # lazy skill reads
+
+    text = session_design_navigation(ctx, target_root=target_root, source_root=source_root) + session_skill_index(ctx)
+    if payload_skill:
+        from ouroboros.body_candidate import serving_repo_dir_for
+
+        return text + skill_contract_references(serving_repo_dir_for(ctx))
+    if private_copy:
+        from pathlib import Path
+
+        from ouroboros.test_environment import git_ancestor
+        from ouroboros.tool_access_paths import canonical_data_root
+        from ouroboros.workspace_preflight import session_environment_facts
+
+        start = Path(source_root).resolve()  # the session's execution root: its only write place in the copy
+        root, body = _own_body_source(ctx, target_root, source_root)  # the copy's repository root
+        root = root if body else git_ancestor(start) or start
+        return text + session_environment_facts(root, data_root=canonical_data_root(ctx), body=body, write_root=start,
+                                                **({"service": service} if service is not None else {}))
+    return text
 
 
 def start_binding_fingerprints(ctx: Any, prompt: str) -> tuple[str, str]:

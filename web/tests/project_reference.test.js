@@ -53,7 +53,8 @@ test('one intent, one control: both forms are the same node with the same name a
         const inline = projectReference(project);
         const footer = projectReference(project, { layout: 'footer' });
         // The callers pick one of two forms; the classes are the door's own business.
-        assert.equal(inline.className, 'chat-live-project-card-btn chat-quiz-project');
+        // The capsule keeps a finger's target wherever its row makes it shorter (a question's voice line).
+        assert.equal(inline.className, 'chat-live-project-card-btn chat-quiz-project ui-hit-area');
         assert.equal(footer.className, 'chat-live-project-card-btn chat-live-bound-pointer');
         assert.deepEqual(shape(inline), shape(footer));
         assert.deepEqual(shape(inline), {
@@ -86,7 +87,7 @@ test('a question reference opens that exact question; any other layout or a stat
         // Two forms only: the retired `bar` layout and `background` words, or any other, read as the inline capsule.
         for (const [layout, state] of [['bar', 'background'], ['sidebar', 'paused']]) {
             const odd = projectReference({ id: 'launch', name: 'Launch' }, { layout, state });
-            assert.equal(odd.className, 'chat-live-project-card-btn chat-quiz-project');
+            assert.equal(odd.className, 'chat-live-project-card-btn chat-quiz-project ui-hit-area');
             assert.equal(odd.children[2].textContent, '↗');
             assert.equal(odd.attributes['aria-label'], 'Open project Launch');
             assert.equal(odd.dataset.state, undefined);
@@ -145,8 +146,10 @@ test('one recipe in two forms: no outline, hairline, ring or tile, no width of i
         assert.doesNotMatch(body, /text-decoration\s*:\s*underline/, `${sel}: no underline-only state`);
         if (sel.includes('chat-live-project-icon')) assert.doesNotMatch(body, /background/, `${sel}: one fill, no tile`);
     }
-    // Only the recipe's own selectors size the capsule: no ancestor restyles it.
-    assert.deepEqual([...new Set(rules.map(({ sel }) => sel).filter((sel) => /^\.(system-message-actions|msg-routing-annotation|chat-bubble)/.test(sel)))], []);
+    // Only the recipe's own selectors size the capsule; the one placement that does is a question's voice line,
+    // whose 28px row and meta size it takes beside `Ouroboros` (owner 19.10, A). No other ancestor restyles it.
+    assert.deepEqual([...new Set(rules.map(({ sel }) => sel).filter((sel) => /^\.(system-message-actions|msg-routing-annotation|chat-bubble)/.test(sel)))],
+        ['.chat-bubble-voice > .chat-quiz-project.chat-live-project-card-btn', '.chat-bubble-voice > .chat-quiz-project .chat-live-project-name']);
     for (const { index } of css.matchAll(/\.(chat-live-project-card-btn|chat-quiz-project|chat-live-bound-pointer)[^{},]*:hover/g)) {
         const before = css.slice(0, index);
         const media = before.lastIndexOf('@media');

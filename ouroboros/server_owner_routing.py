@@ -78,6 +78,15 @@ def _stage_mailbox_attachments(
                 log.debug("Unable to remove routed attachment staging source", exc_info=True)
 
 
+def _start_order(row: Dict[str, Any]) -> tuple:
+    """Heads of one thread in start order; the task id breaks an equal start."""
+    try:
+        started = float(row.get("started_at") or 0.0)
+    except (TypeError, ValueError):
+        started = 0.0
+    return started, str(row.get("task_id") or "")
+
+
 def _route_project_chat_to_running_task(
     ctx: Any,
     chat_id: int,
@@ -86,20 +95,28 @@ def _route_project_chat_to_running_task(
     *,
     task_metadata: Any = None,
     image_data: Any = None,
+    thread_of: str = "",
 ) -> str:
     """Deliver ordinary room input to its sole live reader, under admission locks.
 
     Queued or paused roots remain explicit tell_task targets, never implicit
     readers. Zero or several readers starts a fresh head in this room; the
-    model chooses whether to relay, move, detach, answer or start work.
+    model chooses whether to relay, move, detach, answer or start work. A late
+    answer or a press on a finished author's card (``thread_of``: that author)
+    reads only a head that a late answer or press of the same author started,
+    in a Project or Main, the earliest of several: one author's late input is
+    one thread. No other reader receives it.
     """
     try:
-        if not _project_id_for_registered_chat(ctx, chat_id):
+        if not thread_of and not _project_id_for_registered_chat(ctx, chat_id):
             return ""
     except Exception:
         return ""
     try:
-        steerable = [row for row in _addressable_root_tasks(ctx, chat_id) if row.get("room_reader")]
+        steerable = [row for row in _addressable_root_tasks(ctx, chat_id) if row.get("room_reader")
+                     and (not thread_of or row.get("late_input_of") == thread_of)]
+        if thread_of:
+            steerable = sorted(steerable, key=_start_order)[:1]
         # Exactly one candidate => unambiguous transport. Zero or many => a routing
         # decision the AGENT must make (P5/WS1), so do not deliver here.
         if len(steerable) != 1:
@@ -255,6 +272,7 @@ def _route_project_chat_to_running_task(
                 late_answer=(
                     task_metadata.get("late_answer") if isinstance(task_metadata, dict) else None
                 ),
+                card_press=task_metadata.get("card_press") if isinstance(task_metadata, dict) else None,
             ):
                 return ""
             message_written = True
@@ -537,7 +555,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         return
     # An owner message never wakes consciousness (owner decision В13): Main answers it itself.
     task_metadata = _scoped_task_metadata(project_id, task_metadata)
-    task_metadata = {**(task_metadata or {}), "client_message_id": client_message_id}
+    task_metadata = {**(task_metadata or {}), "client_message_id": client_message_id, "work_kind": "owner"}
     # The turn's origin identity rides UNCONDITIONALLY (not only when the
     # decision lane runs): a bare direct turn with no projects/roots yet — the
     # first-ever project creation — must still carry it so promote/route/bind
@@ -619,7 +637,12 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
             event["origin_suppressed"] = True
         _handle_promote_chat_to_task(event, ctx)
         return
-    if project_id and not task_metadata.get("late_answer"):
+    from ouroboros.card_store import late_press_ref
+    from ouroboros.owner_quiz import late_answer_ref
+
+    late = task_metadata.get("late_answer")
+    thread_of = (late_answer_ref(late) or late_press_ref(task_metadata.get("card_press")) or {}).get("task_id", "")
+    if (project_id and not late) or thread_of:
         routed_to_task = _route_project_chat_to_running_task(
             ctx,
             chat_id,
@@ -627,6 +650,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
             client_message_id,
             task_metadata=task_metadata,
             image_data=image_data,
+            thread_of=thread_of,
         )
         if routed_to_task:
             _record_routing_receipt(

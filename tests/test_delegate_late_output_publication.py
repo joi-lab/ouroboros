@@ -137,8 +137,24 @@ def test_late_retry_wait_republishes_discharged_owner_receipt(tmp_path, monkeypa
     assert set(new) == set(old)
     assert new["old-failed"] == old["old-failed"]
     assert new["old-cancelled"] == old["old-cancelled"]
-    assert {k: v for k, v in new[held.run_id].items() if k != "staged_output"} == old[held.run_id]
+    assert {k: v for k, v in new[held.run_id].items()
+            if k not in {"staged_output", "terminal_observation"}} == old[held.run_id]
     assert new[held.run_id]["staged_output"]["sha256"] == artifact["sha256"]
+    # The late wait also retains the exact engine observation on the physical
+    # owner's canonical drive; both published sources survive the retry drive.
+    observed = new[held.run_id]["terminal_observation"]
+    source = delegate_custody_current.run(data, held.run_id).terminal_source
+    assert observed == {
+        **{key: value for key, value in source.items() if key != "read"},
+        "complete": True, "content_kind": "terminal_observation",
+        "source_read": {"tool": "get_task_result", "arguments": {
+            "task_id": held.task_id, "delegated_output_sha256": source["sha256"]}},
+    }
+    observation_page = source_page(reader, held.task_id, observed)
+    assert observation_page["status"] == "available"
+    assert observation_page["content_kind"] == "terminal_observation"
+    assert observation_page["staging_task_id"] == held.task_id
+    assert observation_page["source_complete"] is True
     assert [row for row in custody.custody_rows(data) if row["type"] == custody.SETTLED] == settled
     assert not receipts(ctx), "digest publication/read grants no D7 receipt"
     assert obligations.members(data, "custody_open") == {}

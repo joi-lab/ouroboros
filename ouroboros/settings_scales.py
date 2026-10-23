@@ -28,7 +28,7 @@ OWNER_EFFORT_TIERS: tuple[str, ...] = tuple(tier for tier in EFFORT_SCALE if tie
 # Who decided one actor's effort (``choose_effort``); task records and chat frames carry it verbatim.
 EFFORT_SOURCES: tuple[str, ...] = ("auto", "pin", "model_name", "cyber")
 # The lane-era global review effort, kept ONLY as the frozen legacy skill-review fingerprint
-# literal (``skill_review_cycles``): an empty reviewer row reviews at the range's top, never here.
+# literal: an empty reviewer row reviews at the range's top, never here.
 REVIEW_POOL_DEFAULT_EFFORT = "high"
 
 
@@ -199,6 +199,7 @@ def resolve_prompt_cache_ttl() -> str:
     Validated like ``resolve_effort``: an unknown value falls back to the shipped default.
     Consumed ONLY by the finalizer (``llm.LLMClient._normalize_payload_cache_ttl``), by
     ``review_helpers.cached_prompt_blocks`` (its marker gets stamped to the same value anyway),
+    by ``effort_evidence.session_prompt_cache_ttl_request`` for native session starts,
     and by ``usage_accounting._reservation_cost`` as the payload-free admission fallback
     (payload-carrying sites use the finalizer's applied TTL) — never by per-builder marking
     sites (docs/DEVELOPMENT.md cache-friendliness invariant)."""

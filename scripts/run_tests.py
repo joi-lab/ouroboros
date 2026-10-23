@@ -4,6 +4,7 @@
     python scripts/run_tests.py                  full battery (node lane + every default-lane test)
     python scripts/run_tests.py --sequential     full battery exactly as the commit gate and CI split it
     python scripts/run_tests.py --selected --base HEAD  commit/PR floor + affected tests, with both lanes
+    python scripts/run_tests.py --selected --keep-going ...  the same, but a red lane does not skip the next
     python scripts/run_tests.py --node            only the complete Node lane (CI runs it as its own step)
     python scripts/run_tests.py --evidence-dir DIR  pytest diagnostics in DIR/<phase>, passed by argv
     python scripts/run_tests.py tests/test_x.py  focused run; every argument is forwarded to pytest
@@ -71,13 +72,13 @@ def _with(flags: list[str], option: str, value: str) -> list[str]:
 
 
 def battery_commands(sequential: bool) -> list[tuple[str, list[str]]]:
-    from ouroboros.preflight_runner import LANE_EXCLUSION_EXPR, PARALLEL_PASS_FLAGS
+    from ouroboros.preflight_runner import LANE_EXCLUSION_EXPR, PARALLEL_PASS_FLAGS, SERIAL_PASS_FLAGS
 
     base = [sys.executable, "-m", "pytest", "tests/"]
     if sequential:
         return [
             ("parallel", [*base, "-m", f"not serial and {LANE_EXCLUSION_EXPR}", *PARALLEL_PASS_FLAGS]),
-            ("serial", [*base, "-m", f"serial and {LANE_EXCLUSION_EXPR}"]),
+            ("serial", [*base, "-m", f"serial and {LANE_EXCLUSION_EXPR}", *SERIAL_PASS_FLAGS]),
         ]
     overlapped = _with(PARALLEL_PASS_FLAGS, "--dist", "loadgroup")
     return [(
@@ -186,12 +187,14 @@ def _selected(args, evidence) -> int:
         record = {**selection.record(), "inventory": {}, "outcomes": record["outcomes"], "deferred_full": True}
         output.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     code = _node_lane()
+    record["node"] = "success" if code == 0 else "failure"
+    red = code  # with --keep-going a later lane runs on, but never hides an earlier red
     previous = os.environ.get("PYTHONPATH")
     completed = False
     os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, (str(_probe_dir(root)), previous)))
     try:
         probe = _install_worker_probe(root)
-        for spec in selection_passes(selection, probe_module=probe, temp_root=root) if code == 0 else []:
+        for spec in selection_passes(selection, probe_module=probe, temp_root=root) if code == 0 or args.keep_going else []:
             command = [sys.executable, "-m", "pytest", *spec.args,
                        "--ci-evidence-dir", str(root / spec.label)]
             code = _run(spec.label, command, REPO)
@@ -200,11 +203,17 @@ def _selected(args, evidence) -> int:
             record["outcomes"][spec.label] = "success" if code in (0, _PYTEST_EXIT_NO_TESTS) and not problem else "failure"
             output.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
             if code not in (0, _PYTEST_EXIT_NO_TESTS):
-                break
+                red = red or code
+                if not args.keep_going:
+                    break
+                continue
             code = int(bool(problem))
             if problem:
                 print(f"inventory failed: {problem}", file=sys.stderr)
-                break
+                red = red or code
+                if not args.keep_going:
+                    break
+        code = red or code
         if code == 0 and (problem := inventory_problem(selection, record["inventory"])):
             print(problem, file=sys.stderr)
             code = 1
@@ -254,6 +263,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--test-reason", default="", help="reason for authored widening")
     parser.add_argument("--defer-full", action="store_true",
                         help="with --selected: on a full escalation run only the floor and Node lane, and say so")
+    parser.add_argument("--keep-going", action="store_true",
+                        help="with --selected: a red lane does not skip the next one (the post-merge check "
+                             "wants every failure of the run, not the first)")
     parser.add_argument("--node", action="store_true", help="only the complete Node lane, owned like every pass")
     parser.add_argument("--evidence-dir", type=pathlib.Path,
                         help="write pytest diagnostics under DIR/<phase>; never inherited by nested pytest",
@@ -274,8 +286,8 @@ def main(argv: list[str] | None = None) -> int:
         if pytest_args:
             parser.error("--selected cannot be combined with arbitrary pytest arguments")
         return _selected(args, evidence)
-    if args.base or args.extra_test or args.full_tests or args.test_reason or args.defer_full:
-        parser.error("--base, --defer-full and widening options require --selected")
+    if args.base or args.extra_test or args.full_tests or args.test_reason or args.defer_full or args.keep_going:
+        parser.error("--base, --defer-full, --keep-going and widening options require --selected")
     if pytest_args:
         if args.sequential:
             parser.error("--sequential selects the full two-pass battery; drop it or drop the pytest arguments")

@@ -367,8 +367,7 @@ def test_relay_quotes_the_owners_words_and_files_above_the_note_verbatim(bridge)
     assert not data.get("parse_mode"), "his words are sent verbatim, never re-read as markup"
     bridge.calls.clear()
     asyncio.run(bridge.plugin._make_outbound(bridge.api)({**event, "relay": {"relay_id": "r2", "text": "", "quotes": []}}))
-    [(_method, plain)] = bridge.calls
-    assert plain["text"] == "Apply this constraint.", "a relay without quoted words is just its note"
+    assert not bridge.calls, "a note between works without his words stays in its room, off the phone"
 
 
 _MAP_FAULTS = [("write_text", 28), ("write_text", 13), ("replace", 28), ("replace", 13)]  # ENOSPC, EACCES

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
+from ouroboros.model_concurrency import limit_physical_send
+
 from ouroboros.usage_accounting import (
     UsageScope,
     current_usage_scope,
@@ -54,7 +56,7 @@ def _accounted_send(
     request = _attempt_request(target, final_candidate, source=source)
     return _execute_candidate(
         request,
-        lambda: send(final_candidate),
+        limit_physical_send(target, lambda: send(final_candidate)),
         _candidate_before_dispatch(final_candidate, request),
     )
 

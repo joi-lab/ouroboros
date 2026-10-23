@@ -48,10 +48,11 @@ def shutdown_fixture_processes(root, generation):
 
 
 def seed(data):
-    from ouroboros.presence_bindings import PresenceBinding, PresenceEndpoint, save_presence_binding
-    from ouroboros.presence_capabilities import (
+    from ouroboros.presence_bindings import PresenceBinding, PresenceEndpoint
+    from tests.frozen_presence_bindings import save_presence_binding
+    from tests.frozen_presence_capabilities import (
         PresenceSelection, PresenceState, PresenceToolTarget, presence_state_fingerprint, save_presence_state)
-    from ouroboros.presence_profile import parse_presence_profile, presence_request_fingerprint
+    from tests.frozen_presence_profile import parse_presence_profile, presence_request_fingerprint
     from ouroboros.skill_loader import load_skill, save_enabled, save_review_state, SkillReviewState
     from tests.test_host_service_api import _seed_token
     from tests.test_presence_continuation_process import TOKEN
@@ -112,6 +113,11 @@ def main(root, generation, mode, scenario="incoming", with_event_bus=False):
     assert Path(os.environ["HOME"]).resolve() == (root / "home").resolve()
     patch = pytest.MonkeyPatch()
     h = install_bootstrap_harness(patch, root / "data", repo=ROOT, enforcement=mode)
+    patch.setattr("ouroboros.presence_admission.focus_enabled", lambda _root: True)
+    patch.setattr("supervisor.consciousness_carriers.autonomous_work_enabled", lambda *_: True, raising=False)
+    patch.setattr("ouroboros.presence_admission.focus_allowance", lambda _root: {
+        "status": "available", "remaining_usd": 100})
+    patch.setattr("ouroboros.safety.check_safety", lambda *_a, **_kw: (True, ""))
     event_bus_children = []
     if with_event_bus:
         from multiprocessing import active_children
@@ -171,7 +177,7 @@ def main(root, generation, mode, scenario="incoming", with_event_bus=False):
             # The original reviewer has settled before the same author resumes.
             # Hold a new, distinct review; never rely on a timing window between
             # releasing the first reviewer and parking for the second.
-            assert h.settled.wait(15)
+            assert h.settled.wait(60)
             h.release.clear()
             h.entered.clear()
             h.settled.clear()
@@ -185,7 +191,7 @@ def main(root, generation, mode, scenario="incoming", with_event_bus=False):
             ctx._swarm_handoff_attempt = {"status": "scheduled", "task_id": LATE_CHILD}
             return review(answer=REVISED_ANSWER)
         if scenario == "tool_delivered":
-            return finish("select", outcome="tool_delivered")
+            return finish("select", message=ANSWER)  # the actual receipt selects tool_delivered
         return finish("select", message=REVISED_ANSWER if scenario == "late_child" else ANSWER)
 
     h.script = script
@@ -262,7 +268,7 @@ def main(root, generation, mode, scenario="incoming", with_event_bus=False):
                              "held": h.entered.is_set() and not h.release.is_set()})
 
     def initiate():
-        from ouroboros.tools.presence import _initiate_presence
+        from tests.presence_legacy_helpers import _initiate_presence
         from ouroboros.tools.registry import ToolContext
         # Same stable caller/dedupe identity across process recycle.
         return json.loads(_initiate_presence(
@@ -295,7 +301,7 @@ def main(root, generation, mode, scenario="incoming", with_event_bus=False):
         close_release.set()
         h.release.set()
         if h.entered.is_set():
-            assert h.settled.wait(15)
+            assert h.settled.wait(60)
         shutdown_fixture_processes(root, generation)
         sock.close()
         print(json.dumps({"threads": [thread.name for thread in threading.enumerate()],

@@ -5,7 +5,7 @@
    widgets.js keeps the page host, the mountTab dispatcher, the card registry and the
    declarative renderer; every mount here returns its disposer to that dispatcher. */
 
-import { apiFetch, extensionRoutePath, extensionRoutePrefix } from './api_client.js';
+import { apiClient, apiFetch, extensionRoutePath, extensionRoutePrefix } from './api_client.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 import { bridgeChunkBuffer, moduleBridgeScript, moduleResizeScript } from './widget_frame.js';
 import { boundedNumber, WIDGET_DISPOSE_ACK_TIMEOUT_MS, WIDGET_REQUEST_TIMEOUT_MS } from './widget_job.js';
@@ -16,6 +16,11 @@ import { downloadViaHostBridge, downloadBlobViaHostBridge, openExternalViaHostBr
 export const WIDGET_FRAME_DEFAULT_HEIGHT = 320;
 export const WIDGET_FRAME_MAX_HEIGHT = 8192;
 export const WIDGET_FRAME_BORDER_RESERVE = 2;
+// Faults one mount sends to the host log (POST /api/widgets/fault); the frame's own cap is not a bound, since the
+// widget's code can read the nonce and post directly. The kinds and clips are the frame's (widget_frame.js).
+export const WIDGET_FAULT_REPORTS_PER_MOUNT = 10;
+const FAULT_KINDS = ['error', 'rejection', 'csp'];
+const faultText = (value, max) => (typeof value === 'string' ? value.slice(0, max) : '');
 
 // One capability set for both framed mounts (route iframe and module srcdoc):
 // scripts, pointer lock and downloads; autoplay, fullscreen and clipboard
@@ -165,6 +170,20 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
     let appliedHeight = frameHeight(render);
     if (inline) inline.fit(autoHeight ? 0 : appliedHeight);
     else setFrameHeight(iframe, appliedHeight);
+    // The fault a card shows also reaches the host's event log once per kind+message, under this mount's own
+    // identity (captured now, never the frame's words). Best effort: no retry, and a failed report changes nothing.
+    const faultIdentity = { skill: String(tab.skill || ''), tab_id: String(tab.tab_id || ''),
+        revision: String(tab.revision ?? ''), where: inline ? 'message' : 'board' };
+    const reportedFaults = new Set();
+    const reportFault = (msg) => {
+        const message = faultText(msg.message, 500);
+        const key = `${msg.kind}\u0000${message}`;
+        if (!FAULT_KINDS.includes(msg.kind) || reportedFaults.has(key) || reportedFaults.size >= WIDGET_FAULT_REPORTS_PER_MOUNT) return;
+        reportedFaults.add(key);
+        const line = Number.isInteger(msg.line) && msg.line >= 0 && msg.line <= 1e7 ? msg.line : 0;
+        const payload = { ...faultIdentity, kind: msg.kind, message, source: faultText(msg.source, 200), line };
+        Promise.resolve().then(() => apiClient.reportWidgetFault(payload)).catch(() => {});
+    };
     const pendingRequests = new Map();
     let disposed = false;
     let disposing = null;
@@ -332,6 +351,7 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
             const detail = msg.kind === 'csp' ? (msg.source || msg.message) : msg.message;
             if (inline) inline.fault(`${label}: ${detail || 'unknown'}`);
             else setWidgetCardFault(mount.closest('[data-widget-key]'), `${label}: ${detail || 'unknown'}`);
+            reportFault(msg);
             return;
         }
         if (msg.type === 'ouro-widget-theme') {

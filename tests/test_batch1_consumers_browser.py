@@ -353,13 +353,11 @@ def _wait_menu(page, bg_text, evolve_text, timeout=45000):
 def _evolution_pills(page):
     page.locator('[data-nav-page="dashboard"]').click()
     page.locator('[data-dashboard-tab="evolution"]').click()
-    page.locator("#evo-mode-pill").wait_for(state="visible", timeout=30000)
-    page.wait_for_function("() => !/^Evolution$/.test(document.querySelector('#evo-mode-pill')?.textContent || '')",
-                           timeout=30000)
-    return {"evolution": page.locator("#evo-mode-pill").inner_text(),
-            "consciousness": page.locator("#evo-bg-pill").inner_text(),
-            "evolution_class": page.locator("#evo-mode-pill").get_attribute("class"),
-            "consciousness_class": page.locator("#evo-bg-pill").get_attribute("class")}
+    page.locator("#evo-campaign-chip").wait_for(state="visible", timeout=30000)  # shown once the state answered
+    return {"evolution": page.locator("#evo-campaign-chip").inner_text(),
+            "consciousness": page.locator("#evo-consciousness").inner_text(),
+            "evolution_tone": page.locator("#evo-campaign-chip").get_attribute("data-tone"),
+            "consciousness_tone": page.locator("#evo-consciousness").get_attribute("data-tone")}
 
 
 def _to_chat(page):
@@ -471,7 +469,7 @@ def test_batch1_unknown_controls_and_tool_history_reach_the_real_spa(batch1_clon
                     page.screenshot(path=str(shots / "01-boot1-unknown-controls-menu.png"), animations="disabled")
                     passed("chat_menu_unknown", menu=menu)
                     pills = _evolution_pills(page)
-                    assert pills["evolution"] == "Evolution unknown" and pills["consciousness"] == "Consciousness unknown", pills
+                    assert pills["evolution"] == "Unknown" and pills["consciousness"] == "Consciousness unknown", pills
                     page.screenshot(path=str(shots / "02-boot1-unknown-evolution-panel.png"), animations="disabled")
                     passed("evolution_panel_unknown", pills=pills)
                     # A narrow viewport: the longer unknown labels must still fit the menu.

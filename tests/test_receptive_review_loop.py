@@ -374,7 +374,7 @@ def test_a_new_turn_waits_on_no_left_review(main_loop):
 # --- Negative controls: each switches one seam off and shows the old behavior. ---
 
 def test_negative_a_deaf_wait_holds_the_owner_message_until_every_reviewer_answers(main_loop, monkeypatch):
-    monkeypatch.setattr(review_pause, "receptive_binding", lambda ctx: None)  # the pre-#1741 author
+    monkeypatch.setattr(review_pause, "receptive_binding", lambda ctx, **_kw: None)  # the pre-#1741 author
     f, a = main_loop, main_loop.a
 
     def started(messages):

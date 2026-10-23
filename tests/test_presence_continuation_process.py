@@ -95,7 +95,7 @@ def tmp_path(tmp_path):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(path, target)
         except OSError as exc:
-            diagnostics_incomplete(str(exc))
+            diagnostics_incomplete(str(exc), root)
     print(f"Presence fixture tree {'owned by outer test run' if boundary else 'retained (no outer owner)'}: {root}")
 
 

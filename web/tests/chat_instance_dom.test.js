@@ -1339,8 +1339,11 @@ for (const order of ['final-first', 'done-first', 'cold']) {
             assert.ok(card);
             assert.equal(card.dataset.finished, '1');
             assert.equal(card.querySelector('[data-live-title]').textContent, 'Task activity');
-            assert.match(card.querySelector('[data-live-meta]').innerHTML, /2 tool calls/);
-            assert.match(card.querySelector('[data-live-meta]').innerHTML, /model-b/);
+            assert.match(card.querySelector('[data-live-facts]').innerHTML, /<dt>Tool calls<\/dt><dd>2<\/dd>/);
+            // The compact line names the model the solve response reported; the details keep the route and request.
+            assert.match(card.querySelector('[data-live-meta]').innerHTML, />model-b-provider</);
+            assert.match(card.querySelector('[data-live-facts]').innerHTML,
+                /<dt>Last solve response<\/dt><dd>model-b-provider \(initial request: model-a\) · provider · route: provider\/model-b<\/dd>/);
             if (card.dataset.expanded !== '1') card.querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });
             const nodes = (node) => [node, ...node.children.flatMap(nodes)];
             const notes = nodes(card).filter((n) => n.classList.contains('chat-live-line') && n.classList.contains('done'));

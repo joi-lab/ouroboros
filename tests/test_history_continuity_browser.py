@@ -91,6 +91,7 @@ def test_deep_reopen_delay_retry_and_live_arrival(direct_server_with_data, brows
                 read_back()
                 _screenshot(page, tmp_path, f"continuity-before-{mode}-{browser_engine}")
                 page.locator('#project-panel-close').click()
+                page.locator(feed).wait_for(state='detached')  # the exit ends before this cold reopen
                 page.evaluate("fault => { window.__continuityFault = fault; }", {
                     "chatId": project["chat_id"], "delay": 800 if mode == "delayed" else 0,
                     "fail": mode if mode in {"recent", "saved"} else None,
@@ -101,6 +102,12 @@ def test_deep_reopen_delay_retry_and_live_arrival(direct_server_with_data, brows
                     retry = page.locator(f'{feed} .chat-load-older button')
                     page.wait_for_function("feed => document.querySelector(`${feed} .chat-load-older button`)?.textContent === 'Retry loading messages'", arg=feed)
                     assert 'could not be loaded' in page.locator(feed).locator('..').locator('.chat-load-older-note').inner_text()
+                    # The failed read leaves the CSS-visible feed off screen until the panel's entrance.
+                    page.wait_for_function("""() => {
+                        const panel = document.getElementById('project-panel');
+                        return panel.classList.contains('open')
+                            && !panel.getAnimations().some(a => a.pending || a.playState === 'running');
+                    }""")
                     retry.evaluate("node => node.addEventListener('click', () => { window.__continuityFault = null; }, {once:true, capture:true})")
                     retry.click()
                 _idle(page, feed)
@@ -117,6 +124,7 @@ def test_deep_reopen_delay_retry_and_live_arrival(direct_server_with_data, brows
             # other room; opened again, the room is at its newest message.
             read_back()
             page.locator('#project-panel-close').click()
+            page.locator(feed).wait_for(state='detached')
             page.evaluate("fault => { window.__continuityFault = fault; }", {
                 "chatId": project["chat_id"], "delay": 800})
             _click_project(page, project)
@@ -312,6 +320,7 @@ def test_latest_supersedes_a_held_question_reveal_and_a_later_reveal_lands(direc
             }""")
             page.evaluate(_FRAMES)
             page.locator('#project-panel-close').click()
+            page.locator(feed).wait_for(state='detached')  # reopening mid-exit would keep its loaded pages
             page.evaluate("""project => {
                 window.__holdQuestion = true;
                 window.dispatchEvent(new CustomEvent('ouro:open-project', {

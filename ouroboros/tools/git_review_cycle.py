@@ -302,9 +302,16 @@ def _finalize_pending_review(
     from ouroboros.tools.commit_gate import watch_left_commit_review
 
     if watch_left_commit_review(ctx):
-        message += " An addressed message ended your wait; a [Review settled] notice follows the whole wave."
+        event = ("A selected outcome or wake time" if any(row.get("reason") in {"helper_result", "review_result", "wake_at"} for row in
+                 getattr(ctx, "_review_detached_operations", []) or []) else "An addressed message")
+        message += f" {event} ended your wait; a [Review settled] notice follows the whole wave."
     # The index is part of this live wave's identity. Retain it for exact
     # reconciliation; rebuilding it from the worktree could review new bytes.
+    from ouroboros.tools.review_collection import reference_for
+    from ouroboros.review_ledger import ledger_root, load_record
+    record = load_record(ledger_root(ctx), str(getattr(ctx, "_current_review_record_id", "") or ""))
+    if record:
+        message += "\n" + json.dumps({"review_reference": {**reference_for(record), "surface": "commit"}})
     return _publish_pending_review(ctx, message, custody_lost)
 
 
@@ -507,15 +514,16 @@ def _stage_candidate_for_review(
 
 
 def _receptive_wave(ctx: ToolContext, wave: contextlib.ExitStack, *, review_only: bool) -> tuple:
-    """Bind this panel wave's receptive author over an immutable reading root
-    (``review_pause.receptive_author``, ``review_subject.gate_reading_checkout``).
-    The operator's review-only cycle and a managed resolution keep the live
-    synchronous read; a subject that could not be frozen keeps it too, disclosed."""
+    """Bind receptive custody over frozen bytes; managed/read-only calls stay synchronous."""
     from ouroboros import review_pause
     from ouroboros.tools.review_subject import gate_reading_checkout
 
     binding = (None if review_only or _git()._authorized_managed_update_resolver(ctx)
-               else review_pause.receptive_binding(ctx))
+               else review_pause.receptive_binding(ctx, state=getattr(ctx, "_review_wait_selection", None)))
+    if binding is not None and getattr(ctx, "_review_reconcile_only", False):
+        with review_pause.receptive_author(binding):
+            binding = review_pause.rejoin_binding(ctx, str(getattr(ctx, "_current_review_record_id", "") or
+                                                           getattr(ctx._pending_review_attempt, "review_record_id", "")))
     subject, unfrozen = None, ""
     try:
         subject = wave.enter_context(gate_reading_checkout(
@@ -547,6 +555,7 @@ def _reset_commit_review_state(ctx):
     ctx._last_review_slot_executions = {}
     ctx._review_custody_lost = False
     ctx._current_review_attempt_number = None
+    ctx._collect_commit_source = None
     ctx._author_commit_source = None
     ctx._author_commit_decision = None
     ctx._author_commit_record = None
@@ -945,18 +954,9 @@ def _run_non_committing_review_cycle(
     unstage_warning = ""
     try:
         outcome = _git()._run_reviewed_stage_cycle(
-            ctx,
-            commit_message,
-            commit_start,
-            paths=paths,
-            skip_advisory_pre_review=skip_advisory_pre_review,
-            goal=goal,
-            scope=scope,
-            review_rebuttal=review_rebuttal,
-            preflight_reviewer=preflight_reviewer,
-            panel=panel,
-            review_only=True,
-        )
+            ctx, commit_message, commit_start, paths=paths,
+            skip_advisory_pre_review=skip_advisory_pre_review, goal=goal, scope=scope,
+            review_rebuttal=review_rebuttal, preflight_reviewer=preflight_reviewer, panel=panel, review_only=True)
         if outcome.get("status") == "passed":
             pre_fingerprint = outcome.get("pre_fingerprint", {}) or {}
             post_fingerprint = outcome.get("post_fingerprint", {}) or {}

@@ -362,6 +362,24 @@ def _golden() -> dict[str, dict]:
 # unavailable. Keep the historical corpus intact and assert the new observed
 # outcome explicitly rather than manufacture old evidence (04-AGENCY S1/S3).
 CURRENT_PRODUCER_CONTRACTS = {
+    # D1 per-target mutation custody: the existing INTEGRATE_ family reports a
+    # busy target as a substrate refusal; no historical answer is fabricated.
+    "INTEGRATE_DELEGATED_TARGET_BUSY": (True, "integration_blocked"),
+    # Q: the bare warning is legacy ok; the native error keeps a sent write unknown and says do not resend.
+    "GH_WRITE_UNKNOWN": (False, "ok"),
+    "native:TOOL_ERROR:GH_WRITE_UNKNOWN": (True, "error"),
+    # Q: the bare warning is legacy ok; the native error attests GitHub refused the write with no effect.
+    "GH_WRITE_NOT_APPLIED": (False, "ok"),
+    "native:TOOL_ERROR:GH_WRITE_NOT_APPLIED": (True, "error"),
+    # Q: a failed precondition is an error in both forms; the native refusal attests no write was sent.
+    "GH_EXPECTATION_FAILED": (True, "error"),
+    "native:TOOL_ERROR:GH_EXPECTATION_FAILED": (True, "error"),
+    # Q: the bare warning is legacy ok; the native argument refusal redirects the mutation to github_write.
+    "GH_API_READ_ONLY": (False, "ok"),
+    "native:TOOL_ARG_ERROR:GH_API_READ_ONLY": (True, "argument_error"),
+    # Q: readback differs after a confirmed write; keep completed/ok with its warning so no retry duplicates the effect.
+    "GH_WRITE_READBACK_MISMATCH": (False, "ok"),
+    "native:OK:GH_WRITE_READBACK_MISMATCH": (False, "ok"),
     # #1657: only missing logs are unavailable; status/stop retain warnings.
     "SERVICE_NOT_FOUND": (False, "ok"),
     "native:LEGACY_UNAVAILABLE:SERVICE_NOT_FOUND": (True, "unavailable"),
@@ -448,6 +466,9 @@ CURRENT_PRODUCER_CONTRACTS = {
     # #1969: an apply that had to prepare the capture returns it for inspection;
     # nothing is applied, recorded or released, so it is its peers' answer.
     "INTEGRATE_DELEGATED_INSPECT_CAPTURE": (True, "integration_blocked"),
+    # #2070: named evidence that could not all be retained keeps its surviving copy;
+    # apply and reject record nothing and change nothing, so it is its peers' answer.
+    "INTEGRATE_DELEGATED_EVIDENCE_UNRETAINED": (True, "integration_blocked"),
     # A reject request cannot undo direct effects already in the folder.
     # The refusal belongs to this disposition, not to the earlier write.
     "INTEGRATE_DIRECTORY_ALREADY_APPLIED": (True, "integration_blocked"),

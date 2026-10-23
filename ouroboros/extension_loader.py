@@ -139,6 +139,7 @@ from ouroboros.extension_surface_names import (
     parse_extension_surface_name,  # noqa: F401
 )
 from ouroboros.skill_loader import _SKILL_DIR_CACHE_NAMES, _sanitize_skill_name, LoadedSkill, SkillPayloadUnreadable, compute_content_hash, discover_skills, discover_selected_skill_candidates, discover_skill_identity, find_skill, grant_status_for_skill, requested_core_setting_keys, skill_conflict_status, skill_review_gate, skill_state_dir, skill_state_dir_path  # noqa: F401
+from ouroboros.skill_loader import _skill_location_inventory
 from ouroboros.skill_token import SkillToken  # noqa: F401
 from ouroboros.tools.skill_exec import _scrub_env  # noqa: F401
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso  # noqa: F401
@@ -332,8 +333,9 @@ def reconcile_extension(
         from ouroboros.config import get_skills_repo_path
 
         resolved_repo_path = get_skills_repo_path() if repo_path is None else repo_path
+        locations = None if skills is not None else _skill_location_inventory(drive_root, repo_path=resolved_repo_path)
         peers = list(skills) if skills is not None else discover_skill_identity(
-            drive_root, skill_name, repo_path=resolved_repo_path
+            drive_root, skill_name, repo_path=resolved_repo_path, locations=locations
         )
         if selected_skill is not None:
             peers = [item for item in peers if item.name != selected_skill.name]
@@ -351,6 +353,7 @@ def reconcile_extension(
             repo_path=resolved_repo_path,
             skills=peers if skills is not None else None,
             selected_skill=subject,
+            locations=locations,
         )
         loaded_present = bool(state.get("loaded_present"))
         was_live = bool(state.get("live_loaded"))
@@ -363,6 +366,7 @@ def reconcile_extension(
                 repo_path=resolved_repo_path,
                 skills=peers if skills is not None else None,
                 selected_skill=subject,
+                locations=locations,
             )
             loaded_present = bool(state.get("loaded_present"))
             was_live = bool(state.get("live_loaded"))

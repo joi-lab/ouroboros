@@ -49,14 +49,16 @@ def _owner_mail(tmp_path, task_id="pred-1"):
     write_owner_message(tmp_path, "peer says hi", task_id, msg_id="peer-1", kind=KIND_TASK_MESSAGE)
 
 
-def test_continue_admits_a_new_root_with_exact_owner_sources_and_replays_it_forever(tmp_path, monkeypatch):
+# ``accounting_wait_expired``: a running direct turn whose accounting wait outlived its idle window.
+@pytest.mark.parametrize("reason_code", ["", "accounting_wait_expired"], ids=["restart", "accounting_expiry"])
+def test_continue_admits_a_new_root_with_exact_owner_sources_and_replays_it_forever(tmp_path, monkeypatch, reason_code):
     from ouroboros.task_results import load_task_result, write_task_result
     from supervisor.continuation_admission import admit_continuation
 
     queue, _state, workers = _install_queue(tmp_path, monkeypatch)
     returns = {"relay-1": {"relay_id": "relay-1", "source": {"chat_id": 1, "address": "held-row"}}}
     held = {"held-row": {"direction": "in", "chat_id": 1, "text": "quoted words"}}
-    _interrupted(tmp_path, open_relays=returns, held_owner_messages=held)
+    _interrupted(tmp_path, reason_code=reason_code, open_relays=returns, held_owner_messages=held)
     _owner_mail(tmp_path)
 
     first = admit_continuation("pred-1", action_nonce=NONCE)
@@ -129,6 +131,27 @@ def test_continue_is_refused_after_a_stop_a_panic_or_an_unrecorded_cause(tmp_pat
     assert "continued_by" not in load_task_result(tmp_path, "pred-1") and workers.PENDING == []
 
 
+@pytest.mark.parametrize("terminal,refusal", [
+    ({"cancel_origin": {"source": "http_single", "reason": "Stop now"}}, "stopped_by_owner"),
+    ({"cancel_origin": {"source": "panic"}}, "stopped_by_owner"),
+    ({"deadline_at": "2000-01-01T00:00:00+00:00"}, "hard_limit_reached"),
+    ({"reason_code": "budget_exhausted"}, "hard_limit_reached"),
+    ({"status": "completed"}, "author_finished"),
+], ids=["stop", "panic", "deadline", "money", "answered"])
+def test_an_accounting_expiry_never_outranks_a_stop_or_a_whole_work_bound(tmp_path, monkeypatch, terminal, refusal):
+    """The new technical cause admits only what it names: a recorded owner Stop or Panic, the work's own
+    reached deadline or money, and a finished answer still refuse, write no claim and queue nothing."""
+    from ouroboros.task_results import load_task_result
+    from supervisor.continuation_admission import admit_continuation
+
+    _queue, _state, workers = _install_queue(tmp_path, monkeypatch)
+    _interrupted(tmp_path, reason_code="accounting_wait_expired")
+    seed_result(tmp_path, "pred-1", {**load_task_result(tmp_path, "pred-1"), **terminal})
+    outcome = admit_continuation("pred-1", action_nonce=NONCE)
+    assert outcome["ok"] is False and outcome["error"] == refusal
+    assert workers.PENDING == [] and "continued_by" not in load_task_result(tmp_path, "pred-1")
+
+
 def test_a_finished_answer_and_a_live_task_refuse_while_a_technical_limit_admits(tmp_path, monkeypatch):
     from ouroboros.task_results import STATUS_RUNNING, write_task_result
     from supervisor.continuation_admission import admit_continuation
@@ -174,7 +197,8 @@ def test_crash_after_the_claim_or_after_the_snapshot_converges_on_one_identity(t
         == "continuation_identity_conflict"
 
 
-def test_an_unsettled_writer_holds_the_same_continue_until_a_fresh_check_releases_it(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reason_code", ["", "accounting_wait_expired"], ids=["restart", "accounting_expiry"])
+def test_an_unsettled_writer_holds_the_same_continue_until_a_fresh_check_releases_it(tmp_path, monkeypatch, reason_code):
     """A child of the interrupted root still RUNS: the Continue is admitted but
     HELD (no diagnostic successor, no second writer). Resume refuses while it
     runs; the child's terminal reconciles and releases the SAME task."""
@@ -183,7 +207,7 @@ def test_an_unsettled_writer_holds_the_same_continue_until_a_fresh_check_release
     from supervisor.events_budget import HOLD_CONTINUATION_WRITER, budget_hold_fact
 
     queue, _state, workers = _install_queue(tmp_path, monkeypatch)
-    _interrupted(tmp_path)
+    _interrupted(tmp_path, reason_code=reason_code)
     write_task_result(tmp_path, "pred-child", STATUS_RUNNING, chat_id=7)
     workers.RUNNING["pred-child"] = {"task": {"id": "pred-child", "root_task_id": "pred-1",
                                               "parent_task_id": "pred-1"}, "worker_id": 0, "attempt": 1}
@@ -232,7 +256,8 @@ def test_an_unreadable_owner_mailbox_refuses_instead_of_inventing_owner_text(tmp
     assert outcome["gaps"] == ["owner_mailbox_unreadable"]
 
 
-def test_the_continue_endpoint_and_the_detail_offer(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reason_code", ["", "accounting_wait_expired"], ids=["restart", "accounting_expiry"])
+def test_the_continue_endpoint_and_the_detail_offer(tmp_path, monkeypatch, reason_code):
     from starlette.applications import Starlette
     from starlette.routing import Route
     from starlette.testclient import TestClient
@@ -242,7 +267,7 @@ def test_the_continue_endpoint_and_the_detail_offer(tmp_path, monkeypatch):
     from ouroboros.task_results import load_task_result
 
     _install_queue(tmp_path, monkeypatch)
-    _interrupted(tmp_path)
+    _interrupted(tmp_path, reason_code=reason_code)
     assert continuation_offer(load_task_result(tmp_path, "pred-1"), "pred-1")["eligible"] is True
     client = TestClient(Starlette(routes=[Route("/api/tasks/{task_id}/continue", api_task_continue,
                                                 methods=["POST"])]))

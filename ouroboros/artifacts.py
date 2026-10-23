@@ -11,7 +11,7 @@ import pathlib
 import re
 import shutil
 import zipfile
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Dict, Iterable, List, Optional, Union
@@ -716,36 +716,48 @@ def store_actor_source_bytes(
 
 
 def read_actor_source_bytes(
-    drive_root: Union[pathlib.Path, str], task_id: str, ref: Any, *, retained: bool = True,
+    drive_root: Union[pathlib.Path, str], task_id: str, ref: Any, *, retained: bool = True, anchor: Any = None,
 ) -> bytes:
-    """Resolve and verify one task-local actor source ref (loose, else this root's evidence pack,
-    else the retained placements unless ``retained`` is off) or raise explicitly."""
+    """Verify a task source: loose, packed, then (unless disabled) retained; errors stay explicit."""
 
     if not isinstance(ref, dict) or ref.get("kind") != "task_source":
         raise ValueError("actor source ref has an unexpected kind")
     if ref.get("root") != "artifact_store":
         raise ValueError("actor source ref has an unexpected root")
-    rel = pathlib.PurePosixPath(str(ref.get("path") or ""))
-    if not rel.parts or rel.parts[0] != _SOURCE_HANDLES_SUBDIR or rel.is_absolute():
+    from ouroboros.confined_files import open_confined_file, physical_path, relative_parts, root_spellings
+
+    parts = relative_parts(ref.get("path"))
+    rel = pathlib.PurePosixPath(*parts)
+    if not parts or parts[0] != _SOURCE_HANDLES_SUBDIR:
         raise ValueError("actor source ref has an invalid path")
-    base = task_artifact_dir_path(drive_root, task_id, create=False).resolve(strict=False)
-    target = base.joinpath(*rel.parts)
-    if target.is_symlink():
-        raise ValueError("actor source ref may not be a symlink")
-    try:
+    placement, root = pathlib.Path(drive_root), None
+    if anchor is not None:  # placement readers below receive the configured anchor
+        spellings = root_spellings(anchor)
+        root, placement = spellings[0], physical_path(spellings, placement.absolute())
+        target = task_artifact_dir_path(placement, task_id, create=False).joinpath(*rel.parts)
+    else:  # Existing internal callers retain their placement-cache and scope/error contracts.
+        base = task_artifact_dir_path(placement, task_id, create=False).resolve(strict=False)
+        target = base.joinpath(*rel.parts)
+        if target.is_symlink():
+            raise ValueError("actor source ref may not be a symlink")
         target = target.resolve(strict=False)
-        target.relative_to(base)
-    except ValueError as exc:
-        raise ValueError("actor source ref escapes its task artifact root") from exc
+        if not target.is_relative_to(base):
+            raise ValueError("actor source ref escapes its task artifact root")
     from ouroboros.evidence_packs import handle_bytes
     try:
-        raw = (handle_bytes(drive_root, task_id, rel.as_posix())
-               if rel.parts[:2] == ("source_handles", "context_checkpoints") else target.read_bytes())
+        if rel.parts[:2] == ("source_handles", "context_checkpoints"):
+            raw = handle_bytes(placement, task_id, rel.as_posix(), anchor=anchor)
+        elif root is not None:
+            handle, _ = open_confined_file(root, target.relative_to(root).parts)
+            with handle:
+                raw = handle.read()
+        else:
+            raw = target.read_bytes()
     except FileNotFoundError:
         if not retained:
             raise
         from ouroboros.source_retention import read_retained_task_source
-        return read_retained_task_source(drive_root, task_id, ref)
+        return read_retained_task_source(placement, task_id, ref, anchor=anchor)
     try:
         expected_size = int(ref["size"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -770,7 +782,7 @@ def read_task_result_source_bytes(
             refs.append(value.get("source_ref"))
     for ref in refs:
         if isinstance(ref, dict) and ref.get("path") == source_path and pathlib.PurePosixPath(source_path).name == name:
-            return read_actor_source_bytes(drive_root, validate_task_id(result.get("task_id")), ref)
+            return read_actor_source_bytes(drive_root, validate_task_id(result.get("task_id")), ref, anchor=drive_root)
     raise ValueError("the requested source is not published by this task result")
 
 
@@ -925,19 +937,14 @@ def resolve_chat_media_path(
     match = _CHAT_MEDIA_NAME_RE.fullmatch(str(name or ""))
     if not match:
         return None
+    from ouroboros.confined_files import open_confined_file
+
     try:
-        artifact_root = task_artifact_dir_path(drive_root, task_id, create=False).resolve(strict=False)
-        media_dir = artifact_root / _CHAT_MEDIA_SUBDIR
-        if media_dir.is_symlink():
-            return None
-        candidate = media_dir / name
-        if candidate.is_symlink():
-            return None
-        path = candidate.resolve(strict=False)
-        path.relative_to(artifact_root)
+        root = pathlib.Path(drive_root).resolve()
+        path = task_artifact_dir_path(root, task_id, create=False) / _CHAT_MEDIA_SUBDIR / name
+        handle, _ = open_confined_file(root, path.relative_to(root).parts)
+        handle.close()
     except (OSError, ValueError):
-        return None
-    if not path.is_file():
         return None
     return path
 
@@ -1195,8 +1202,11 @@ def _register_task_artifact_records(artifact_dir: pathlib.Path, records: Iterabl
 
 def registered_task_artifact(drive_root: Any, task_id: str, name: str) -> Optional[Dict[str, Any]]:
     """Read one host registration, including an output published before task finality."""
-    root = task_artifact_dir_path(drive_root, task_id)
-    manifest = (read_json_dict(root / _ARTIFACT_MANIFEST) or {}).get("artifacts")
+    from ouroboros.confined_files import read_confined_json
+
+    root = pathlib.Path(drive_root).resolve()
+    path = task_artifact_dir_path(root, task_id) / _ARTIFACT_MANIFEST
+    manifest = (read_confined_json(root, path.relative_to(root).parts) or {}).get("artifacts")
     row = manifest.get(name) if isinstance(manifest, dict) else None
     return dict(row) if isinstance(row, dict) else None
 
@@ -1389,62 +1399,74 @@ def copy_directory_to_task_artifacts(
 
 def collect_task_artifact_records(
     drive_root: Union[pathlib.Path, str], task_id: str, *, measure: bool = True, strict: bool = False,
-    require_registered: bool = False,
+    require_registered: bool = False, anchor: Any = None,
 ) -> List[Dict[str, Any]]:
-    """List deliverables (nested ones carry ``relpath``), excluding metadata/inputs.
-    ``measure=False`` uses lstat/recorded identities, with ``measured: False``. Strict
-    listing raises on unreadable files; review's ``require_registered`` requires all entries."""
+    """List deliverables by handle, excluding metadata, inputs and SQLite WAL indexes (refused unread:
+    ``ConfinedDirectory.open_for_read``). Unmeasured rows keep registered identities; measurement
+    hashes the open file. Strict reads raise on unreadable files/metadata; ``anchor`` confines child stores."""
+    from ouroboros.confined_files import confined_directory, read_confined_json
+    from ouroboros.outcome_receipt_store import verification_receipts_path
+    from ouroboros.store import WalIndexRefused
+
     try:
-        artifact_dir = task_artifact_dir_path(pathlib.Path(drive_root), validate_task_id(task_id), create=False)
+        store = task_artifact_dir_path(drive_root, validate_task_id(task_id), create=False)
     except ValueError:
         return []
-    records: List[Dict[str, Any]] = []
-    if not artifact_dir.exists():
-        return records
-    manifest_path = artifact_dir / _ARTIFACT_MANIFEST
-    data = read_json_dict(manifest_path)
-    if data is None and strict and (manifest_path.exists() or manifest_path.is_symlink()):
-        raise OSError(f"artifact registration is unreadable: {manifest_path}")
-    raw_manifest = (data or {}).get("artifacts") if isinstance((data or {}).get("artifacts"), dict) else {}
-    manifest = {str(key): dict(value) for key, value in raw_manifest.items() if isinstance(value, dict)}
-    artifact_root = artifact_dir.resolve(strict=False)
-    if require_registered:
-        for name in manifest:
-            path = artifact_dir / name
-            if path.is_symlink() or not path.resolve().is_relative_to(artifact_root) or not path.is_file():
-                raise OSError(f"registered artifact is unavailable or outside its owner: {name}")
-    members = iter_artifact_tree(artifact_dir) if strict else artifact_dir.rglob("*")
-    for path in sorted(p for p in members if p.is_file() and not p.is_symlink()):
-        # Metadata (manifests, the registration lock) and the receipt stream (its own
-        # union writer) are not deliverables.
-        if (path.name in (_ARTIFACT_MANIFEST, SCRATCH_MANIFEST_NAME) or path == artifact_dir / (_ARTIFACT_MANIFEST + ".lock")
-                or is_verification_receipts_path(drive_root, task_id, path)):
-            continue
-        try:
-            rel_parts = path.resolve(strict=False).relative_to(artifact_root).parts
-        except (OSError, ValueError):
-            continue  # reached through a link: not this store's material
-        # Staged inputs, chat media and source handles are not deliverables.
-        if rel_parts and rel_parts[0] in {_ATTACHMENTS_SUBDIR, _CHAT_MEDIA_SUBDIR, _SOURCE_HANDLES_SUBDIR}:
-            continue
-        manifest_record = manifest.get(path.name) if path.parent == artifact_dir else None
-        nested = {"relpath": "/".join(rel_parts)} if len(rel_parts) > 1 else {}
-        try:
-            if not measure:  # an immutable registration keeps its recorded identity; nothing else is claimed
-                registered = manifest_record or {}
-                records.append({"kind": str(registered.get("kind") or "task_artifact"), "name": path.name,
-                                "path": str(path), **nested, "size": path.lstat().st_size, "measured": False,
-                                **({key: registered.get(key) for key in ("immutable", "size", "sha256")}
-                                   if registered.get("immutable") else {})})
+    root = pathlib.Path(anchor if anchor is not None else drive_root).absolute()
+    parts = store.absolute().relative_to(root).parts
+    receipts = verification_receipts_path(drive_root, task_id, create=False)
+    document = read_confined_json(root, (*parts, _ARTIFACT_MANIFEST), strict=strict) or {}
+    entries = document.get("artifacts") or {}
+    manifest = {str(k): v for k, v in entries.items() if isinstance(v, dict)} if isinstance(entries, dict) else {}
+    rows, opened = [], False
+
+    def walk(directory, relative=()):
+        for name, is_directory in sorted(directory.entries()):
+            path = store.joinpath(*relative, name)
+            if (name in {_ARTIFACT_MANIFEST, SCRATCH_MANIFEST_NAME}
+                    or path in {receipts, store / (_ARTIFACT_MANIFEST + ".lock")}
+                    or not relative and name in {_ATTACHMENTS_SUBDIR, _CHAT_MEDIA_SUBDIR, _SOURCE_HANDLES_SUBDIR}):
                 continue
-            record = artifact_record(path) | nested
-            if manifest_record:
-                record = merge_artifact_records([{**manifest_record, "path": str(path)}], [record])[0]
-            records.append(record)
-        except OSError:
-            if strict:
-                raise
-    return records
+            try:
+                if is_directory:
+                    with directory.child(name) as child:
+                        walk(child, (*relative, name))
+                    continue
+                handle, observed = directory.open_for_read(name)
+                registered = manifest.get(name) if not relative else None
+                nested = {"relpath": "/".join((*relative, name))} if relative else {}
+                with handle:
+                    if measure:
+                        row = {"kind": "task_artifact", "name": name, "path": str(path), **nested,
+                               **stream_artifact_file(handle), "status": ARTIFACT_STATUS_READY, "errors": []}
+                        if registered:
+                            row = merge_artifact_records([{**registered, "path": str(path)}], [row])[0]
+                    else:
+                        registered = registered or {}
+                        row = {"kind": str(registered.get("kind") or "task_artifact"), "name": name,
+                               "path": str(path), **nested, "size": observed.st_size, "measured": False,
+                               **({key: registered.get(key) for key in ("immutable", "size", "sha256")}
+                                  if registered.get("immutable") else {})}
+                rows.append(row)
+            except OSError as exc:  # a WAL index, refused unread, is left out as copies and settlement leave it
+                if strict and not isinstance(exc, WalIndexRefused):
+                    raise
+
+    try:
+        with confined_directory(root, parts) as directory:
+            opened = True
+            if require_registered:
+                for name in manifest:
+                    with suppress(WalIndexRefused):  # a registered index is present, and never read
+                        directory.open_for_read(name)[0].close()
+            walk(directory)
+    except FileNotFoundError:
+        if opened and strict:
+            raise
+    except OSError:
+        if strict:
+            raise
+    return sorted(rows, key=lambda row: row["path"])
 
 
 def merge_artifact_records(*groups: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:

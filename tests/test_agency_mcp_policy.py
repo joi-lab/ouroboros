@@ -115,3 +115,9 @@ def test_live_http_mcp_discovery_call_and_remote_failure(tmp_path, monkeypatch, 
         server.server_close()
         thread.join(timeout=5)
         assert not thread.is_alive()
+
+
+@pytest.fixture(autouse=True)
+def _private_mcp_catalog_root(tmp_path, monkeypatch):
+    from ouroboros import config
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)

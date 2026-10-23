@@ -364,9 +364,12 @@ test('task-detail healing reuses the full terminal-summary projection', () => {
     // A retained typed historical lifecycle may finish the card only in the
     // proven-absent result branch after complete fresh activity excluded it.
     assert.match(missingHeal, /if \(!vouched && detail === null\)/);
-    assert.match(missingHeal, /applyHistoricalModelExecution\(currentRecord, historical\)/);
-    assert.match(missingHeal, /return finishLiveCard\(taskId, historical\.phase\)/);
-    assert.match(missingHeal, /setHistoricalUnavailable\(currentRecord, true\)/);
+    assert.match(missingHeal, /return settleMissingTaskRecord\(currentRecord\)/);
+    const fallback = chatSource.slice(chatSource.indexOf('function settleMissingTaskRecord'),
+        chatSource.indexOf('function markTaskCancelable'));
+    assert.match(fallback, /applyHistoricalModelExecution\(record, historical\)/);
+    assert.match(fallback, /return finishLiveCard\(record\.groupId, historical\.phase\)/);
+    assert.match(fallback, /setHistoricalUnavailable\(record, true\)/);
 });
 
 test('history replay keeps open summaries live and terminal fallbacks factual', () => {

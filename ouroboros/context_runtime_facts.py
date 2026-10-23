@@ -16,12 +16,24 @@ from __future__ import annotations
 
 import logging
 import pathlib
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from ouroboros.task_pacing import in_task_cost_ceiling_disclosure as _in_task_cost_ceiling
 from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
+
+
+def schedule_store_fact(env: Any) -> Dict[str, Any]:
+    """Observed schedule controls for context; an unreadable table is not empty."""
+    from supervisor.followup_policy import observed_store
+    from supervisor.queue import ScheduleStoreUnreadable, load_schedule_store
+
+    root = getattr(env, "drive_root", None) or pathlib.Path(env.drive_path("state/scheduled_tasks.json")).parent.parent
+    try:
+        return observed_store(root, load_schedule_store(root))
+    except ScheduleStoreUnreadable as exc:
+        return {"unavailable": str(exc), "pointer": "manage_schedules(action='list')"}
 
 
 def task_schedule_fact(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -34,9 +46,12 @@ def task_schedule_fact(task: Dict[str, Any]) -> Dict[str, Any]:
     occurrence = metadata.get("schedule_occurrence")
     if not isinstance(occurrence, dict):
         return {}
-    return {"schedule_occurrence": {
+    fact = {
         key: occurrence.get(key) for key in ("schedule_id", "due_at", "claimed_at")
-    }}
+    }
+    if "previous" in occurrence:
+        fact["previous"] = occurrence["previous"]
+    return {"schedule_occurrence": fact}
 
 
 def task_execution_clock_fact(task: Dict[str, Any], ctx: Any) -> Dict[str, Any]:
@@ -354,90 +369,27 @@ def storage_fact(data_root: Any) -> Optional[Dict[str, Any]]:
 
 
 def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
-    """B4-lite: honestly-labeled HISTORICAL delegation observations.
-
-    Deliberately NOT live health — receipts prove what the last execution did,
-    not what a lane can do now; live lane facts arrive from plan-review wave
-    rows and typed delegate refusals. Pure bounded file reads over the existing
-    receipt projections: no daemon probes, no new health authority. Absent
-    receipt files mean absent observations, never "healthy". Fail-soft on its
-    own (None on any failure) so a problem here never drops the surrounding
-    capabilities digest.
-    """
+    """Historical identities and readers; execution bodies are chosen reads."""
     try:
-        from ouroboros.reviewer_slot_config import reviewer_slot_last_executions
-        from ouroboros.subagent_history import recorded_handle
+        from ouroboros.reviewer_slot_config import reviewer_slot_last_executions, LAST_EXECUTION_FILENAME
+        from ouroboros.subagent_history import recorded_handle, LAST_DELEGATION_FILENAME
         from ouroboros.subagents import subagent_last_delegation
 
-        def _observed_label(ts: Any) -> str:
-            # Timestamp only: the verbatim "historical, not live health" disclaimer
-            # lives ONCE in the note below, never repeated per row.
-            return f"last observed at {str(ts or '').strip() or 'unknown time'}"
-
-        delegation: Dict[str, Any] = {
-            "note": (
-                "Every row here is historical, not live health (the last "
-                "recorded execution per reviewer slot / delegated run): "
-                "live lane facts arrive from plan-review wave rows and typed "
-                "delegate refusals. A missing row means no observation on "
-                "record — never healthy."
-            ),
-        }
-        slot_rows: List[Dict[str, Any]] = []
-        for slot_id, row in sorted(reviewer_slot_last_executions().items()):
-            if not isinstance(row, dict):
-                continue
-            status = str(row.get("status") or "").strip()
-            fact: Dict[str, Any] = {
-                "slot": str(slot_id),
-                "outcome": (("ok" if status == "ok" else "failed") if status
-                            else "unknown"),
-                "observed": _observed_label(row.get("ts")),
-            }
-            requested = row.get("requested") if isinstance(row.get("requested"), dict) else {}
-            effective = row.get("effective") if isinstance(row.get("effective"), dict) else {}
-            if requested.get("profile_id"):
-                fact["requested_profile"] = str(requested["profile_id"])
-            if effective.get("profile_id"):
-                fact["applied_profile"] = str(effective["profile_id"])
-            # B1's typed failure facts, forwarded only when recorded (a dated
-            # window carries reset_at without a code and an undated one the
-            # code without a reset — read both independently).
-            for key in ("failure_code", "reset_at"):
-                if row.get(key):
-                    fact[key] = row[key]
-            slot_rows.append(fact)
-        if slot_rows:
-            delegation["reviewer_slots_last"] = slot_rows
-        last = subagent_last_delegation()
-        if isinstance(last, dict) and last:
-            last_fact = {
-                "route": str(last.get("route") or ""),
-                "requested_model": str(last.get("requested_model") or ""),
-                "applied_model": str(last.get("applied_model") or ""),
-                "observed": _observed_label(last.get("ts")),
-            }
-            if last.get("requested_profile"):
-                last_fact["requested_profile"] = str(last["requested_profile"])
-            if last.get("applied_profile"):
-                last_fact["applied_profile"] = str(last["applied_profile"])
-            # Model-facing actor names are handles computed from each record's
-            # OWN facts; the stored key stays in the durable receipt file.
-            if last.get("selected_subagent_id"):
-                last_fact["selected_subagent_id"] = recorded_handle(last)
-            for key in ("outcome", "failure_code", "reset_at", "occurred_at", "observed_at"):
-                if key in last:
-                    last_fact[key] = last[key]
-            delegation["subagent_last_delegation"] = last_fact
-            rows = last.get("latest_by_subagent")
-            if isinstance(rows, dict) and rows:
-                delegation["subagents_last_executions"] = [
-                    {**row, "selected_subagent_id": recorded_handle(row)}
-                    for row in rows.values() if isinstance(row, dict)
-                ]
-        if len(delegation) == 1:
+        slots = reviewer_slot_last_executions()
+        last = subagent_last_delegation() or {}
+        if not slots and not last:
             return None
-        return delegation
+        records = last.get("latest_by_subagent")
+        records = list(records.values()) if isinstance(records, dict) and records else ([last] if last else [])
+        return {"note": "Historical observations, not live health; read the records for details.",
+                "reviewer_slots_last": [{"slot": str(slot), "outcome": row.get("status", "unknown"),
+                    "observed": row.get("ts")} for slot, row in sorted(slots.items()) if isinstance(row, dict)],
+                "subagents_last_executions": [{"selected_subagent_id": recorded_handle(row),
+                    "outcome": row.get("outcome", "unknown"), "observed": row.get("observed_at") or row.get("ts"),
+                    **{key: row[key] for key in ("task_id", "run_id", "attempt_id") if row.get(key)}}
+                    for row in records if isinstance(row, dict)],
+                "readers": [{"tool": "read_file", "arguments": {"root": "runtime_data", "path": "state/" + name}}
+                            for name in (LAST_EXECUTION_FILENAME, LAST_DELEGATION_FILENAME)]}
     except Exception:
         log.debug("Failed to build delegation capability fact", exc_info=True)
         return None

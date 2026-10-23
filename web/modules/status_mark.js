@@ -67,3 +67,25 @@ export function paintStatusMark(node, view = {}) {
     node.hidden = hidden;
     return true;
 }
+
+/**
+ * One wave for every moving mark on the page. A mark's dots start their animation when the mark is painted, so marks
+ * painted apart (a sidebar row and the room's header, a chip drawn again from markup) bobbed out of step down the
+ * column. As the moving dots' animation starts, it is set to the document timeline's origin: each dot keeps its own
+ * delay (the wave's stagger) and a mark painted later joins the wave where it is. An equal repaint makes no new
+ * animation and restarts nothing; reduced motion runs none. Returns the disposer.
+ */
+const WAVE = 'status-mark-bounce';
+export function syncMarkPhases(doc = globalThis.document) {
+    if (!doc?.addEventListener) return () => {};
+    const align = (animation) => {
+        if (animation?.animationName === WAVE && animation.startTime !== 0) animation.startTime = 0;
+    };
+    const onStart = (event) => {
+        if (event.animationName !== WAVE) return;
+        for (const dot of event.target?.parentElement?.children || []) dot.getAnimations?.().forEach(align);
+    };
+    doc.getAnimations?.().forEach(align);
+    doc.addEventListener('animationstart', onStart, true);
+    return () => doc.removeEventListener('animationstart', onStart, true);
+}

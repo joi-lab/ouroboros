@@ -215,7 +215,7 @@ def test_presence_context_loads_declared_topic_and_completion_contract(tmp_path)
     )
     assert "Participate helpfully." in section
     assert "Alex prefers concise replies." in section
-    assert "presence_finish" in section
+    assert "finish_task" in section
 
 
 def test_configured_presence_parallelism_is_bounded(monkeypatch, tmp_path):
@@ -442,7 +442,10 @@ def test_previous_turn_is_per_conversation_and_never_rewritten_by_a_replay(tmp_p
 
 def test_previous_turn_shows_what_a_transport_tool_delivered(tmp_path):
     from ouroboros.presence_delivery import PresenceDeliveryRecorder
+    from ouroboros.places import connect_place
 
+    connect_place(tmp_path, place_id=_admission().binding_id, connector="telegram-bot", provider="telegram",
+                  account_id="bot-1", conversation_id="room-1")
     recorder = PresenceDeliveryRecorder(tmp_path)
 
     def send(task):

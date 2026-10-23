@@ -150,12 +150,15 @@ def test_two_pass_specs_mirror_ci(monkeypatch):
     parallel, serial = specs
 
     assert parallel.args[:3] == ["tests/", "-m", f"not serial and {pr.LANE_EXCLUSION_EXPR}"]
-    for flag in ("-n", "auto", "--dist", "loadscope", "--max-worker-restart=0",
-                 "--timeout=300", "--timeout-method=thread"):
+    for flag in ("-n", "auto", "--dist", "loadscope", "--max-worker-restart=0", "--timeout=300"):
         assert flag in parallel.args, f"parallel pass lost {flag}"
+    # pytest-timeout picks its own method: SIGALRM fails one test; the thread method (Windows) stops a worker.
+    assert not any(arg.startswith("--timeout-method") for arg in parallel.args)
 
-    # The serial pass is flag-free like CI: no -n, no --dist, no per-test timeout.
-    assert serial.args == ["tests/", "-m", f"serial and {pr.LANE_EXCLUSION_EXPR}", "-q", "--tb=line", "--no-header"]
+    # The serial pass carries the same per-test hang bound like CI, and no xdist flag.
+    # It forces the timeout plugin against a candidate `-p no:timeout`, as the parallel pass does.
+    assert serial.args == ["tests/", "-m", f"serial and {pr.LANE_EXCLUSION_EXPR}", "--timeout=300",
+                           "-p", "timeout", "-q", "--tb=line", "--no-header"]
 
     # `parallel` is read off the argv, not the label: it gates the xdist-only
     # diagnoses so they cannot fire on a pass that never ran a worker.
@@ -188,9 +191,10 @@ def test_the_parallel_pass_forces_the_plugins_and_the_worker_probe(monkeypatch):
     assert " ".join(pr._FORCED_PLUGIN_FLAGS) in joined, "the parallel pass does not force its plugins"
     assert f"-p {pr._WORKER_PROBE_MODULE}" in joined, "the parallel pass carries no worker probe"
 
-    # The serial/legacy passes use neither plugin, so forcing them there would
-    # make a lane that deliberately needs nothing fail on a missing dependency.
-    assert "-p" not in serial.args
+    # The serial pass carries the per-test timeout, so it forces only the timeout
+    # plugin; it never uses xdist and needs no worker probe.
+    assert serial.args.count("-p") == 1 and "timeout" in serial.args
+    assert "xdist" not in serial.args and pr._WORKER_PROBE_MODULE not in serial.args
     assert "-p" not in pr._preflight_pass_specs(["tests/", "-n", "2"])[0].args, (
         "an explicit caller argv must be forwarded verbatim"
     )
@@ -242,8 +246,10 @@ def _ci_pytest_suite_commands(job: str) -> list[tuple[str, str]]:
     )
     assert block, f"ci.yml has no `{job}:` job"
     # `tests/` only — the per-file guard steps run one file and are not the split.
-    # Each pass runs under the owned runner, which forwards its pytest arguments unchanged.
-    return re.findall(r'run: python (?:-m pytest|scripts/run_tests\.py) tests/ -m "([^"]+)"(.*)', block.group(1))
+    # Each pass runs under the owned runner, which forwards its pytest arguments unchanged,
+    # behind scripts/ci_retry.py (one retry per failed test, FLAKY recorded).
+    return re.findall(r'run: python (?:scripts/ci_retry\.py .*? -- python )?(?:-m pytest|scripts/run_tests\.py) '
+                      r'tests/ -m "([^"]+)"(.*)', block.group(1))
 
 
 @pytest.mark.parametrize("job", ["quick-test", "full-test-runs"])
@@ -270,9 +276,11 @@ def test_each_ci_job_runs_the_same_split_the_gate_runs(job, monkeypatch):
     assert " ".join(pr.PARALLEL_PASS_FLAGS) in ci_parallel_tail, (
         f"{job}'s parallel pass no longer runs PARALLEL_PASS_FLAGS verbatim: {ci_parallel_tail!r}"
     )
-    # ...and the serial pass stays flag-free, or CI's serial lane would carry a
-    # per-test timeout the gate's serial pass does not.
-    for flag in pr.PARALLEL_PASS_FLAGS:
+    # ...and the serial pass carries the gate's serial flags and none of the xdist ones.
+    assert " ".join(pr.SERIAL_PASS_FLAGS) in ci_serial_tail, (
+        f"{job}'s serial pass no longer runs SERIAL_PASS_FLAGS verbatim: {ci_serial_tail!r}"
+    )
+    for flag in set(pr.PARALLEL_PASS_FLAGS) - set(pr.SERIAL_PASS_FLAGS):
         assert flag not in ci_serial_tail.split(), f"{job}'s serial pass carries {flag}"
 
 
@@ -687,12 +695,11 @@ def test_hard_block_remediation_survives_caller_truncation(
 
 
 def test_per_test_timeout_kill_is_not_told_to_mark_the_test_serial():
-    """`--timeout-method=thread` does not FAIL a slow test — it `os._exit`s the
-    whole worker, which xdist reports with its crash phrasing. The generic
-    remediation would then tell the author to mark a merely-slow test
-    `@pytest.mark.serial`, and the serial pass carries NO per-test timeout, so
-    obeying it moves the hang into the one pass that cannot bound it. Same hard
-    block, different instruction."""
+    """pytest-timeout's thread method (Windows) does not FAIL a slow test — it
+    `os._exit`s the whole worker, which xdist reports with its crash phrasing.
+    The generic remediation would then tell the author to mark a merely-slow
+    test `@pytest.mark.serial`, which only moves the hang: the serial pass
+    carries the same per-test timeout. Same hard block, different instruction."""
     from ouroboros.preflight_runner import _classify_pass_result
 
     output = (
@@ -711,7 +718,7 @@ def test_per_test_timeout_kill_is_not_told_to_mark_the_test_serial():
     assert "300s per-test limit" in result
     assert "faster or split" in result
     assert "Do NOT mark it @pytest.mark.serial" in result, (
-        "the serial pass has no per-test timeout, so the wrong instruction relocates the hang"
+        "the serial pass carries the same per-test timeout, so the wrong instruction only relocates the hang"
     )
     assert "Find the test that spawns a real process" not in result, (
         "the generic crash remediation must not be emitted for a timeout kill"
@@ -722,8 +729,8 @@ def test_per_test_timeout_kill_is_not_told_to_mark_the_test_serial():
 
 
 def test_signal_method_timeout_banner_also_avoids_the_serial_remediation():
-    """The signal method spells the same event `Failed: Timeout >300.0s`. Pinned
-    so the diagnosis stays right if `--timeout-method` is ever changed."""
+    """The signal method (the default with SIGALRM) spells the same event
+    `Failed: Timeout >300.0s`; a crash beside it keeps the timeout diagnosis."""
     from ouroboros.preflight_runner import _classify_pass_result
 
     output = "E   Failed: Timeout >300.0s\nworker gw2 crashed while running 'tests/test_slow.py::test_slow'\n"
@@ -2580,8 +2587,8 @@ def test_the_pre_commit_baseline_is_head_only_after_a_deliberate_removal(tmp_pat
 
 
 def test_a_timed_out_pass_reports_what_the_killed_child_had_already_flushed(tmp_path, two_pass_env, stub_passes):
-    """The serial pass carries no per-test timeout, so a serial hang is exactly
-    the case with no other evidence of WHICH test hung — and the post-kill
+    """A hang the per-test timeout cannot interrupt (blocked C code under SIGALRM)
+    leaves no other evidence of WHICH test hung — and the post-kill
     `communicate` already collects that evidence. Discarding it left the operator
     with "the serial pass timed out" and nothing else."""
     from ouroboros.preflight_runner import run_hermetic_pytest

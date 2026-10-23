@@ -54,6 +54,7 @@ def offline_main(monkeypatch, provider_catalog_offline):
     monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "max")
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     monkeypatch.setenv("MCP_ENABLED", "false")
 
 
@@ -136,7 +137,7 @@ def send_next(env, task):
     return ctx, assembled, sent[0], cap
 
 
-def test_owner_continue_sends_two_local_notes_grouped_reviews_and_exact_dialogue(harness, monkeypatch):
+def test_owner_continue_sends_two_local_notes_review_readers_and_exact_dialogue(harness, monkeypatch):
     from ouroboros.context import _task_authority_projection
     from ouroboros.owner_mailbox import KIND_OWNER_TEXT, write_owner_message
     from ouroboros.tools.control_runtime import _send_user_message
@@ -188,8 +189,9 @@ def test_owner_continue_sends_two_local_notes_grouped_reviews_and_exact_dialogue
     env = Env(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
     successor, assembled, request, _ = send_next(env, task)
     text = message_text(request["messages"])
-    for retained in (FIRST, SECOND, CURRENT, ANSWER):
+    for retained in (FIRST, SECOND, ANSWER):
         assert retained in text and retained in message_text(assembled)
+    assert CURRENT not in text, "the predecessor's review state stays behind its reader"
     # Peer mail is a count plus the exact reader, never bodies; the work order appears once
     # (the contract objective inside the frozen prefix is a typed reference to the assignment).
     from ouroboros.context_compaction import context_units, unit_kind
@@ -200,9 +202,11 @@ def test_owner_continue_sends_two_local_notes_grouped_reviews_and_exact_dialogue
     prefix = json.loads(runtime_block.split("## Runtime context\n\n", 1)[1].split("\n\n## ", 1)[0])
     assert prefix["task_contract"]["objective"]["representation"] == "assignment"
     assert "historical_review_context" not in json.dumps(prefix) and "previous_review_context" not in json.dumps(prefix)
-    brief = prefix["predecessor_authority"]  # the conditions and the exact reader, once
+    brief = prefix["predecessor_authority"]  # status and the exact reader, once
     assert brief["source"]["arguments"] == {"task_id": ctx.task_id, "include_authority": True}
-    assert brief["status"] == "cancelled" and brief["task_contract"] and brief["plan_review_state"]
+    assert brief["status"] == "cancelled"
+    for field in ("task_contract", "plan_review_state"):
+        assert field not in brief and brief["omitted_fields"][field] > 0
     assert "omitted_fields" in brief and "predecessor_authority" not in prefix["task_contract"]
     assert json.dumps(prefix).count(f'"task_id": "{ctx.task_id}"') >= 1 and OWNER in task["text"]
     # The notes row is a foldable dialogue unit of the mind's own view; the assignment is not.
@@ -231,6 +235,8 @@ def test_owner_continue_sends_two_local_notes_grouped_reviews_and_exact_dialogue
     assert f"get_task_result(task_id={ctx.task_id!r}, include_authority=True)" in note["content"]
     payload = json.loads(_get_task_result(successor, ctx.task_id, include_authority=True))
     assert payload["authority"][review_history_view.SELECTED_VIEW_FIELD] == pointer
+    assert payload["authority"]["task_contract"] and payload["authority"]["plan_review_state"]
+    assert CURRENT in json.dumps(payload["authority"]["plan_review_state"])
     covered = [read_actor_source_bytes(ctx.drive_root, ctx.task_id, item["source_ref"]).decode("utf-8")
                for item in selected["covered"]]
     assert covered and any(RATIONALE in source for source in covered), "the exact decision source stays readable"

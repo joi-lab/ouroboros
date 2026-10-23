@@ -342,7 +342,8 @@ test('the letter body goes through the sanitizing markdown pipeline and is dispo
 test('the letter rides the existing render path and never writes the verdict surfaces', () => {
     // No listener, timer or poll of its own: render() already runs on every
     // phase change and status load.
-    assert.match(SOURCE, /\]\.includes\(verdict\.state\);\s*\n\s*renderLetter\(\);/);
+    const renderBody = SOURCE.slice(SOURCE.indexOf('function render()'), SOURCE.indexOf('async function reconcileRestartStatus'));
+    assert.match(renderBody, /renderLetter\(\);/); // Same render owner; attempt details may render before the letter.
     assert.equal((SOURCE.match(/renderLetter\(\)/g) || []).length, 3, 'ordinary render and explicit refresh share one renderer');
 
     const letterCode = SOURCE.slice(SOURCE.indexOf('function releaseLetterBody()'), SOURCE.indexOf('function render()'));

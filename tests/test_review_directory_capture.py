@@ -13,7 +13,7 @@ from ouroboros import review_checking as rc
 from ouroboros.review_execution import ReviewRouteKind
 from ouroboros.review_substrate import run_review_request
 from ouroboros.skill_loader import compute_content_hash
-from ouroboros.skill_review_passes import skill_checking_source
+from ouroboros.skill_review_packs import skill_checking_source
 from tests._review_session_route_shared import (  # noqa: F401 - transport fixtures
     FakeGateway,
     FakeLLM,

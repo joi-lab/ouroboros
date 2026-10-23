@@ -20,6 +20,7 @@ import {
     isRetainedWidget,
     renderWidgetCardControls,
     renderWidgetFacade,
+    setWidgetCardNote,
     syncWidgetCardControls,
     WIDGET_START_MODES,
     withWidgetStartMode,
@@ -34,6 +35,7 @@ import {
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 import { collectSafeFieldValues, downloadViaHostBridge } from './ui_helpers.js';
 import { mountPinnedCard, setCardPinned } from './card_components.js';
+import { getHolds, HELD_LINES, settleAfterFrameLoad } from './holds.js';
 import {
     filenameFromWidgetUrl, indexComponentTree, patchWidgetChildren, renderComponent, syncWidgetCharts,
 } from './widget_render.js';
@@ -50,7 +52,7 @@ function pageTemplate() {
             ${renderPageHeader({
                 page: 'widgets',
             })}
-            <div class="widgets-scroll scroll-fade-y">
+            <div class="widgets-scroll">
                 <div id="widgets-list-error" class="skills-load-error" hidden><span data-widget-list-error></span> <button type="button" class="btn btn-default btn-sm" data-widget-list-retry>Retry</button></div>
                 <div id="widgets-list" class="widgets-list"></div>
                 <div class="widgets-arrange-status ui-status" data-tone="neutral" data-widget-arrange-status role="status" aria-live="polite"></div>
@@ -111,11 +113,14 @@ const widgetMounting = new Map();
 const widgetMountControllers = new Set();
 const widgetMessageHandlers = new Set();
 const widgetSessionState = new Map();
-// Owner pressed Stop on this card in this page session: re-entering Widgets
-// shows its facade instead of auto-starting it again. Start and a launch-policy
-// change to Auto / Keep running clear it. Never persisted, so a window reload
-// forgets it.
-const stoppedByOwner = new Set();
+// The start ledger (holds.js) keeps two facts for a framed card on this device:
+// the owner's Stop (`board:<key>`, until Start or a launch-policy change to Auto /
+// Keep running) and a start of its code the page did not outlive
+// (`widget:<skill>:<tab_id>` at its revision). Either shows the facade instead
+// of starting the card by itself.
+const holds = getHolds();
+const stopHoldKey = (tab) => `board:${widgetKey(tab)}`;
+const codeHoldKey = (tab) => `widget:${tab.skill}:${tab.tab_id}`;
 let widgetsWsBridgeBound = false;
 
 async function callWidgetRoute(tab, spec, values, signal) {
@@ -764,7 +769,6 @@ function patchWidgetCards(list, previousTabs, nextTabs) {
         const card = liveCardFor(list, key);
         const settling = disposeWidgetByKey(key);
         widgetSessionState.delete(key);
-        stoppedByOwner.delete(key);
         if (!card) continue;
         if (settling) retireCard(card, settling);
         else card.remove();
@@ -812,17 +816,23 @@ async function mountTabOnce(card, tab, key, isCurrent) {
     if (!isCurrent() || !card.isConnected) return;
     const mountController = new AbortController();
     widgetMountControllers.add(mountController);
+    // A frame's start goes into the ledger before its first byte runs; its load and one host second clear it.
+    const settle = isFramedWidget(tab) && !tab.pinned_card ? holds.starting(codeHoldKey(tab), tab.revision) : () => {};
     try {
-        const dispose = await mountTab(card, tab, mountController.signal);
-        if (typeof dispose === 'function') {
-            // Stale (page left, list rebuilt, card replaced meanwhile): stop it in
-            // order instead of registering a frame nobody can reach.
-            if (!isCurrent() || !card.isConnected) {
-                trackSettling(key, dispose());
-                return;
-            }
-            widgetDisposers.set(key, dispose);
+        const mounted = await mountTab(card, tab, mountController.signal);
+        if (typeof mounted !== 'function') { settle(); return; }
+        const cancelSettle = settleAfterFrameLoad(card.querySelector('[data-widget-mount]'), settle);
+        const dispose = () => { cancelSettle(); settle(); return mounted(); };
+        // Stale (page left, list rebuilt, card replaced meanwhile): stop it in
+        // order instead of registering a frame nobody can reach.
+        if (!isCurrent() || !card.isConnected) {
+            trackSettling(key, dispose());
+            return;
         }
+        widgetDisposers.set(key, dispose);
+    } catch (err) {
+        settle();
+        throw err;
     } finally {
         widgetMountControllers.delete(mountController);
     }
@@ -978,16 +988,14 @@ export function initWidgets(ctx = {}) {
                     // Same eviction the keyed patch performs for a vanished card,
                     // for the transition the patch never sees (the last card
                     // leaving, or the first list arriving): a key that is gone must
-                    // not leave its declarative session state or the owner's
-                    // page-session Stop behind, or re-enabling the skill would
-                    // restore values the owner never re-entered and keep a card
-                    // suppressed. It runs after disposal, because a declarative
-                    // disposer writes that snapshot on its way out.
+                    // not leave its declarative session state behind, or re-enabling
+                    // the skill would restore values the owner never re-entered (the
+                    // owner's Stop stays: it holds until Start). It runs after
+                    // disposal, because a declarative disposer writes that snapshot
+                    // on its way out.
                     const live = new Set(tabs.map(widgetKey));
                     for (const key of (lastTabs || []).map(widgetKey)) {
-                        if (live.has(key)) continue;
-                        widgetSessionState.delete(key);
-                        stoppedByOwner.delete(key);
+                        if (!live.has(key)) widgetSessionState.delete(key);
                     }
                     renderShell(list, tabs);
                 }
@@ -1042,9 +1050,10 @@ export function initWidgets(ctx = {}) {
     }
 
     // Framed card, effective policy `auto` or `retain` (both start on show; only
-    // `retain` survives leaving), and the owner has not stopped it this session.
+    // `retain` survives leaving), and the ledger holds neither the owner's Stop
+    // nor a start of this revision the page did not outlive (nor `?hold=all`).
     const startsOnShow = (tab) => effectiveStartMode(tab, uiPreferences) !== 'manual'
-        && !stoppedByOwner.has(widgetKey(tab));
+        && !holds.reason(stopHoldKey(tab)) && !holds.reason(codeHoldKey(tab), tab.revision);
 
     // Mount one card and keep its head controls truthful: the facade stands in
     // while it starts (idempotent — never over a settling frame), a failed mount
@@ -1079,17 +1088,19 @@ export function initWidgets(ctx = {}) {
         if (widgetDisposers.has(key) || !card.isConnected) return;
         renderWidgetFacade(card.querySelector('[data-widget-mount]'), tab);
         syncWidgetCardControls(card, 'stopped', mode);
+        setWidgetCardNote(card, HELD_LINES[holds.reason(codeHoldKey(tab), tab.revision)] || '');
     }
 
     async function stopWidgetByOwner(card, tab) {
-        stoppedByOwner.add(widgetKey(tab));
+        holds.stop(stopHoldKey(tab));
         syncWidgetCardControls(card, 'stopping', effectiveStartMode(tab, uiPreferences));
         await disposeWidgetByKey(widgetKey(tab));
         await settleStopped(card, tab);
     }
 
     async function startWidgetByOwner(card, tab) {
-        stoppedByOwner.delete(widgetKey(tab));
+        holds.release(stopHoldKey(tab));
+        holds.release(codeHoldKey(tab));
         await startWidget(card, tab, isCurrentFor(renderGeneration));
     }
 

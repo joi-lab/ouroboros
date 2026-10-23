@@ -510,13 +510,27 @@ def _acknowledge_staged_output(ctx: ToolContext, read_view: Any, original: str,
         log.warning("coverage acknowledgement for a staged delegated output failed", exc_info=True)
 
 
+def published_output_ref(result: Any, sha256: str) -> tuple:
+    """``(row, ref)`` of the one ``staged_output``, ``terminal_observation`` or ``other_*`` ref that
+    ``result``'s own ``delegate_terminal_reconciliation.terminal_runs`` publishes under exactly this
+    digest, else ``(None, None)``. The ref names its ACTUAL staging task; the caller reads it there."""
+    audit = result.get("delegate_terminal_reconciliation") if isinstance(result, dict) else None
+    rows = audit.get("terminal_runs") if isinstance(audit, dict) else None
+    return next(((row, ref) for row in (rows if isinstance(rows, list) else []) if isinstance(row, dict)
+                 for others in [row.get("other_staged_outputs")]
+                 for observations in [row.get("other_terminal_observations")]
+                 for ref in (row.get("staged_output"), row.get("terminal_observation"),
+                             *(others if isinstance(others, list) else ()),
+                             *(observations if isinstance(observations, list) else ()))
+                 if isinstance(ref, dict) and str(ref.get("sha256") or "") == sha256), (None, None))
+
+
 def delegated_output_source_projection(drive_root: Any, result: Any, sha256: Any,
                                        start_char: Any = None, end_char: Any = None) -> Dict[str, Any]:
     """Read one retained full delegated output that ``result`` itself publishes (#1573).
 
-    Only a ``staged_output`` or ``other_staged_outputs`` ref already published in this task
-    result's own ``delegate_terminal_reconciliation.terminal_runs`` qualifies, selected by its
-    exact sha256: no digest search, filesystem scan or engine call. The bytes come from the
+    Only a ref ``published_output_ref`` finds in this task result's own receipts qualifies,
+    selected by its exact sha256: no digest search, filesystem scan or engine call. The bytes come from the
     ACTUAL staging task's store on the canonical root, verified against the published
     size and hash, so a reader on any drive gets the same exact source. Discovery, never
     consumption: this read is not the D7 acknowledgement and records nothing.
@@ -527,16 +541,13 @@ def delegated_output_source_projection(drive_root: Any, result: Any, sha256: Any
     wanted = str(sha256 or "").strip().lower()
     if len(wanted) != 64 or wanted.strip("0123456789abcdef"):
         return {**unavailable, "reason": "source_ref_invalid"}
-    audit = result.get("delegate_terminal_reconciliation") if isinstance(result, dict) else None
-    rows = audit.get("terminal_runs") if isinstance(audit, dict) else None
-    row, staged = next(((row, ref) for row in (rows if isinstance(rows, list) else []) if isinstance(row, dict)
-                        for others in [row.get("other_staged_outputs")]
-                        for ref in (row.get("staged_output"), *(others if isinstance(others, list) else ()))
-                        if isinstance(ref, dict) and str(ref.get("sha256") or "") == wanted), (None, None))
+    row, staged = published_output_ref(result, wanted)
     if row is None:
         return {**unavailable, "reason": "source_not_published", "requested_sha256": wanted}
     facts = {"run_id": str(row.get("run_id") or ""), "staging_task_id": str(staged.get("task_id") or ""),
              "sha256": wanted, "source_complete": staged.get("complete") is True}
+    if staged.get("content_kind") == "terminal_observation":
+        facts["content_kind"] = "terminal_observation"  # exact read-back, not proof of full engine output
     ref = {key: staged.get(key) for key in ("kind", "root", "path", "size", "sha256")}
     try:
         raw = read_actor_source_bytes(drive_root, facts["staging_task_id"], ref)

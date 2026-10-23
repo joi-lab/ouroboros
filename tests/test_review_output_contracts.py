@@ -83,13 +83,13 @@ class TestReviewRunFailureReason:
 
 
 class TestReviewContractModes:
-    """Findings-only mode offers an all-clear; required-matrix mode must not,
-    because its parser rejects an empty array as missing every row."""
+    """One findings-only contract for every seat asked one question (a packet change seat, a result
+    seat, a skill seat): it offers the all-clear, and no second answer form exists beside it."""
 
-    def test_matrix_contract_has_no_all_clear_branch(self):
-        from ouroboros.triad_review import (
-            REVIEW_JSON_ARRAY_CONTRACT, REVIEW_JSON_MATRIX_CONTRACT,
-        )
+    def test_the_findings_contract_offers_the_all_clear_and_no_matrix_form_exists(self):
+        import ouroboros.triad_review as triad
+        from ouroboros.triad_review import REVIEW_JSON_ARRAY_CONTRACT
+
         assert "NO_FINDINGS" in REVIEW_JSON_ARRAY_CONTRACT
-        assert "NO_FINDINGS" not in REVIEW_JSON_MATRIX_CONTRACT
-        assert "one entry per required checklist item" in REVIEW_JSON_MATRIX_CONTRACT
+        assert not hasattr(triad, "REVIEW_JSON_MATRIX_CONTRACT")
+        assert not hasattr(triad, "parse_model_review_results")

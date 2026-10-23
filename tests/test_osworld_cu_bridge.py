@@ -226,12 +226,12 @@ def test_denylist_is_allowlist_complement_blocks_all_host_surfaces():
     assert denied == core - rcb._ALLOWED_CORE_TOOLS
     for t in ("run_command", "run_script", "write_file", "edit_text",
               "start_service", "stop_service", "verify_and_record", "commit_reviewed",
-              "integrate_subagent_patch", "create_github_issue", "schedule_subagent",
+              "integrate_subagent_patch", "github_write", "schedule_subagent",
               "skill_exec", "toggle_skill", "submit_skill_to_hub", "vcs_pull_ff",
               "vcs_restore", "vcs_revert", "vcs_rollback", "update_identity",
               "update_scratchpad", "knowledge_write", "journal_write", "send_user_message",
               "toggle_evolution", "toggle_consciousness", "request_deep_self_review",
-              "comment_on_pr", "comment_on_issue", "promote_to_stable", "get_github_checks",
+              "github_read", "promote_to_stable",
               "browse_page", "browser_action", "web_search", "plan_task",
               # host filesystem/code reads are denied too — the isolated settings.json
               # holds provider API keys a prompt-injected task could exfiltrate.
@@ -1396,14 +1396,14 @@ def test_module_grandfather_matcher_uses_exact_repo_relative_paths():
     # a DIFFERENT plugin.py (future skill) is NOT exempted by the path-qualified entry
     assert not module_is_grandfathered("skills/other_skill/plugin.py")
     assert not module_is_grandfathered("repo/skills/other_skill/plugin.py")
-    # Root server.py is an exact manifest path; a nested same-basename is not.
-    assert module_is_grandfathered("server.py")
+    # The Restart extraction retired server.py's debt; no same-basename is exempt.
+    assert not module_is_grandfathered("server.py")
     assert not module_is_grandfathered("repo/server.py")
     assert not module_is_grandfathered("ouroboros/server.py")
     assert not module_is_grandfathered("repo/ouroboros/server.py")
     # tools/control.py's debt was retired by the v7 split (2110->492 lines);
     # basename exactness still holds - NEITHER control.py is grandfathered now
-    # (the positive+negative exact-path pair above is server.py).
+    # (the positive+negative exact-path pair above is the skill plugin).
     assert not module_is_grandfathered("ouroboros/tools/control.py")
     assert not module_is_grandfathered("ouroboros/gateway/control.py")
 

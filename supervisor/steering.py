@@ -353,7 +353,7 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             from ouroboros.owner_relay import write_relay
             relay_entry, newly_written = write_relay(
                 drive, target, relay_id=str(evt.get("relay_id") or routing_token or msg_id),
-                note=message, quotes=list(evt.get("quotes") or []), chat_id=chat_id,
+                note=message, quotes=list(evt.get("quotes") or []), chat_id=chat_id, summary=str(evt.get("summary") or ""),
                 teller_task_id=issuer_task_id, canonical_root=ctx.DRIVE_ROOT, sender_origin=evt.get("sender_origin"),
                 client_surface=evt.get("client_surface"))
             delivered = True

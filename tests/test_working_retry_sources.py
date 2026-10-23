@@ -26,6 +26,7 @@ def restored(tmp_path, monkeypatch, request):
     # Startup and the registry are real; only external metadata/model calls are doubled.
     monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "low")
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     monkeypatch.setenv("MCP_ENABLED", "false")
     monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
     monkeypatch.setattr("ouroboros.llm.LLMClient.chat", lambda *a, **k: pytest.fail("No model call"))

@@ -363,7 +363,7 @@ def test_owner_commands_keep_dispatch_when_replying_to_quiz(tmp_path, monkeypatc
     api = _send_card(plugin, tmp_path, monkeypatch)
     _settings(tmp_path, TELEGRAM_COMMAND_MODE="full_access")
     message = {"message_id": 602, "chat": {"id": 42, "type": "private"},
-               "from": {"id": 42}, "text": command}
+               "from": {"id": 42}, "text": command, "date": int(plugin._POLL_GENERATION_STARTED) + 1}
     if reply_to_quiz:
         message["reply_to_message"] = {"message_id": 555}
     Client.updates = [{"update_id": 89, "message": message}]

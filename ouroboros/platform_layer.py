@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from typing import Any, Callable, List, Optional
+from ouroboros.platform_peer import local_connection_peer  # noqa: F401 — platform facade
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ IS_MACOS = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
 
 PATH_SEP = ";" if IS_WINDOWS else ":"
+SHUTDOWN_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 _SUBPROCESS_NO_WINDOW = (
     getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if IS_WINDOWS else 0
 )
@@ -481,7 +483,9 @@ def open_path_external(path: pathlib.Path) -> None:
     elif IS_WINDOWS:
         os.startfile(str(target))  # type: ignore[attr-defined]
     else:
-        subprocess.Popen(["xdg-open", str(target)])
+        from ouroboros.desktop_media import host_environment
+
+        subprocess.Popen(["xdg-open", str(target)], env=host_environment())
 
 
 def is_unstable_macos_app_path(path: pathlib.Path) -> bool:
@@ -559,12 +563,13 @@ def pid_lock_acquire(path: str) -> bool:
 def pid_lock_release(path: str) -> None:
     """Release the PID lock."""
     global _lock_fd
-    if _lock_fd is not None:
-        with contextlib.suppress(Exception):
-            file_unlock(_lock_fd.fileno())
-        with contextlib.suppress(Exception):
-            _lock_fd.close()
-        _lock_fd = None
+    if _lock_fd is None:
+        return  # already released, or another launcher owns the new PID file
+    with contextlib.suppress(Exception):
+        file_unlock(_lock_fd.fileno())
+    with contextlib.suppress(Exception):
+        _lock_fd.close()
+    _lock_fd = None
     with contextlib.suppress(Exception):
         os.unlink(path)
 
@@ -1056,11 +1061,13 @@ def kill_process_on_port(port: int) -> None:
     """Kill any process listening on the given TCP port."""
     try:
         if IS_WINDOWS:
-            res = _hidden_run(["netstat", "-ano"], capture_output=True, text=True, timeout=5)
-            listeners = [
-                line.split()[-1] for line in res.stdout.splitlines()
-                if f":{port}" in line and "LISTENING" in line and line.split()
-            ]
+            # psutil's socket table, not netstat's text, whose state words and code page are localized.
+            import psutil
+
+            listeners = list(dict.fromkeys(  # a dual-stack listener has an IPv4 and an IPv6 row
+                conn.pid for conn in psutil.net_connections(kind="tcp")
+                if conn.status == psutil.CONN_LISTEN and conn.laddr and conn.laddr.port == port and conn.pid
+            ))
         else:
             # -sTCP:LISTEN scopes the sweep to the listener (a bare tcp:PORT
             # selector also matches ESTABLISHED client sockets — on browser
@@ -1070,12 +1077,8 @@ def kill_process_on_port(port: int) -> None:
                 ["lsof", "-nP", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
                 capture_output=True, text=True, timeout=5,
             )
-            listeners = res.stdout.split()
-        for pid_str in listeners:
-            try:
-                pid = int(pid_str)
-            except ValueError:
-                continue
+            listeners = [int(pid) for pid in res.stdout.split() if pid.isdigit()]
+        for pid in listeners:
             if pid != os.getpid():
                 force_kill_pid(pid)
     except Exception:
@@ -1300,9 +1303,8 @@ def install_shutdown_signal_handlers(handler) -> None:
     """Install SIGINT and POSIX SIGTERM handlers that only set a flag/event.
 
     The caller's main thread owns teardown, never the signal frame."""
-    signal.signal(signal.SIGINT, handler)
-    if not IS_WINDOWS:
-        signal.signal(signal.SIGTERM, handler)
+    for signum in SHUTDOWN_SIGNALS[:1] if IS_WINDOWS else SHUTDOWN_SIGNALS:
+        signal.signal(signum, handler)
 
 
 def subprocess_hidden_kwargs() -> dict:
@@ -1318,6 +1320,12 @@ def merge_hidden_kwargs(kwargs: dict) -> dict:
     if hidden := subprocess_hidden_kwargs():
         result["creationflags"] = result.get("creationflags", 0) | hidden.get("creationflags", 0)
     return result
+
+
+def inherited_console_kwargs() -> dict:
+    """A successor keeps this process's console (a terminal run); Windows hides it only when there is none (GUI)."""
+    attached = not IS_WINDOWS or _kernel32.GetConsoleProcessList((ctypes.wintypes.DWORD * 1)(), 1)
+    return {} if attached else subprocess_hidden_kwargs()
 
 
 # Git installation hint.

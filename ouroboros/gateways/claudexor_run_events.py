@@ -9,9 +9,11 @@ identity, which is why a caller that must say exactly which events it showed rea
 
 One call is one bounded read inside an existing wait: it opens the stream at a cursor, reads
 to a caller-given ``seq`` fence, the stream's own end, a byte bound or a wall-clock bound,
-and closes it. It never subscribes, retries or polls. Only whole frames count as read, so
-``through_seq`` is always a cursor the next read can resume from exactly. Presence of the
-route is negotiated from the engine's own catalog, like every other optional route.
+and closes it. It never subscribes, retries or polls. A line ends only at CR, LF or CRLF,
+so U+0085, U+2028 and U+2029 inside a served JSON line stay text. Only whole frames count
+as read, so ``through_seq`` is always a cursor the next read can resume from exactly.
+Presence of the route is negotiated from the engine's own catalog, like every other
+optional route.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import httpx
 
@@ -112,7 +114,7 @@ def read_run_events(gateway: Any, run_id: str, *, after_seq: int, through_seq: O
                 raise _refusal(response)
             opened = True
             frame: Dict[str, str] = {}
-            for line in response.iter_lines():
+            for line in _lines(response.iter_text()):
                 result.bytes_read += len(line) + 1
                 if line:
                     if not line.startswith(":"):
@@ -135,6 +137,35 @@ def read_run_events(gateway: Any, run_id: str, *, after_seq: int, through_seq: O
             "daemon_unreachable", f"Claudexor run event stream unreachable: {type(exc).__name__}: {exc}",
         ) from exc
     return result
+
+
+def _lines(chunks: Iterable[str]) -> Iterator[str]:
+    """Event-stream lines from decoded text chunks, scanning each chunk once.
+
+    Only CRLF, LF and CR end a line; ``str.splitlines`` and HTTPX ``iter_lines`` also
+    cut at U+0085, U+2028 and U+2029, which JSON leaves unescaped inside a string. A CR
+    that ends one chunk ends its line at once; an LF opening the next chunk is its CRLF
+    pair, not an empty line. An unterminated tail is yielded at EOF as HTTPX did:
+    without the blank line after it, it never completes a frame.
+    """
+    pending: List[str] = []
+    after_cr = False
+    for chunk in chunks:
+        if after_cr and chunk.startswith("\n"):
+            chunk, after_cr = chunk[1:], False
+        if not chunk:
+            continue
+        after_cr = chunk.endswith("\r")
+        lines = chunk.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if len(lines) > 1:
+            pending.append(lines[0])
+            yield "".join(pending)
+            yield from lines[1:-1]
+            pending = []
+        if lines[-1]:
+            pending.append(lines[-1])
+    if pending:
+        yield "".join(pending)
 
 
 def _dispatch(frame: Dict[str, str], result: RunEventsRead, through_seq: Optional[int]) -> bool:

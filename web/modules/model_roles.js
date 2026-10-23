@@ -50,10 +50,10 @@ export function sourceFromChoice(choice) {
  *   catalogKnown?: boolean, accountsKnown?: boolean, providerProfiles?: object}} args
  *   `providers` is `configuredApiProviders()` output, `current` a stored row source.
  */
-export function modelSourceGroups({ sources = [], providers = [], current = '',
+export function modelSourceGroups({ sources = [], providers = [], current = '', inheritLabel = 'Uses Main',
     catalogKnown = false, accountsKnown = false, providerProfiles = {}, hasConfiguredAccounts = false } = {}) {
     return [
-        ...(current === 'inherit' ? [{ options: [{ value: 'inherit', label: 'Uses Main' }] }] : []),
+        ...(current === 'inherit' ? [{ options: [{ value: 'inherit', label: inheritLabel }] }] : []),
         ...routeChoiceGroups({ modelSources: sources, providers, providerProfiles,
             currentChoice: current === 'inherit' ? '' : sourceChoice(current),
             catalogKnown, accountsKnown, hasConfiguredAccounts, includeSessions: false }),
@@ -66,6 +66,11 @@ export function modelContextNote(item, override = 0) {
     return window > 0 ? `Auto: ${window.toLocaleString('en-US')} tokens · advertised for this route.`
         : 'Auto: context limit not known for this route.';
 }
+
+// The slot an empty role uses: Main, except the Safety Supervisor, which checks with the Light model (and so
+// with Main when Light is empty too). A contract row may name its own (`inherits`).
+const INHERITS = Object.freeze({ safety: 'light' });
+export const inheritTargetOf = (slot) => String(slot?.inherits || INHERITS[slot?.slot] || 'main');
 
 export function modelRolesHost(id) {
     return `<div id="${escapeHtml(id)}" class="model-role-editor"></div>`;
@@ -150,9 +155,24 @@ export function createModelRolesEditor({ hostId, store = claudexorStatus,
         ...(processingPreference && !PROCESSING_CHOICES.includes(processingPreference) ? ['Choose Standard, Fast, Economy or route defaults for Processing.'] : []),
         ...rows.flatMap((row) => rowErrors(row).map(({ message }) => message)),
     ]; }
-    function effectiveSource(row) { return row.source === 'inherit' ? rows.find((entry) => entry.slot.slot === 'main')?.source || 'openrouter' : row.source; }
+    // The row an empty role resolves to, along its inherit chain (safety → light → main).
+    function inheritedRow(row) {
+        let current = row;
+        for (let step = 0; step < 4 && current?.source === 'inherit'; step += 1) {
+            const target = inheritTargetOf(current.slot);
+            current = rows.find((entry) => entry.slot.slot === target && entry !== current)
+                || rows.find((entry) => entry.slot.slot === 'main');
+        }
+        return current;
+    }
+    const inheritName = (row) => {
+        const target = slots.find((slot) => slot.slot === inheritTargetOf(row.slot));
+        return String(target?.label || 'Main').replace(/ Model$/, '');
+    };
+    const emptyUsesText = (row) => (inheritTargetOf(row.slot) === 'main' ? 'Empty uses Main' : `Empty uses the ${inheritName(row)} model`);
+    function effectiveSource(row) { return row.source === 'inherit' ? inheritedRow(row)?.source || 'openrouter' : row.source; }
     function responseModel(row) {
-        const selected = row.source === 'inherit' ? rows.find((entry) => entry.slot.slot === 'main') : row;
+        const selected = row.source === 'inherit' ? inheritedRow(row) : row;
         return selected ? composeModelSource(selected.source, selected.model) : '';
     }
     function sourceId(row) { const source = effectiveSource(row); return source.startsWith('subscription:') ? source.slice(13) : ''; }
@@ -161,14 +181,14 @@ export function createModelRolesEditor({ hostId, store = claudexorStatus,
     // only widens the list, it never rewrites the owner's assignment.
     function sourceGroupsFor(row, facts = {}) {
         return modelSourceGroups({ sources: catalog.model_sources, providers: apiProviders,
-            providerProfiles, current: row.source, ...facts });
+            providerProfiles, current: row.source, inheritLabel: `Uses ${inheritName(row)}`, ...facts });
     }
     function itemsFor(row) {
         return sourceId(row) ? (catalogs.get(catalogKey(row))?.items || [])
             : catalog.items.filter((item) => parseModelSource(item.value || item.id).source === row.source);
     }
     function currentItem(row) {
-        const model = row.source === 'inherit' ? rows.find((entry) => entry.slot.slot === 'main')?.model : row.model;
+        const model = row.source === 'inherit' ? inheritedRow(row)?.model : row.model;
         const matches = itemsFor(row).filter((item) => (parseModelSource(item.value || item.id).model === model
             || item.id === model) && (!row.account || item.credential_profile_id === row.account));
         return matches.length === 1 ? matches[0] : undefined;
@@ -203,7 +223,7 @@ export function createModelRolesEditor({ hostId, store = claudexorStatus,
         return `<div class="model-role-row" data-model-role="${escapeHtml(row.id)}">
             <div class="model-role-controls">
                 ${selectHtml(`data-model-role-source aria-label="${escapeHtml(row.slot.label)} source"`, sourceGroupsFor(row), sourceChoice(row.source))}
-                ${modelChooserHtml(`id="${escapeHtml(inputId)}" data-model-role-model aria-label="${escapeHtml(row.slot.label)}${isFallback ? ` ${index + 1}` : ''}"`, row.model, `${hostId}-${row.id}-models`, [], { placeholder: row.slot.slot === 'main' ? 'Choose a model' : 'Empty uses Main' })}
+                ${modelChooserHtml(`id="${escapeHtml(inputId)}" data-model-role-model aria-label="${escapeHtml(row.slot.label)}${isFallback ? ` ${index + 1}` : ''}"`, row.model, `${hostId}-${row.id}-models`, [], { placeholder: row.slot.slot === 'main' ? 'Choose a model' : emptyUsesText(row) })}
                 <select class="ui-control" data-model-role-account aria-label="${escapeHtml(row.slot.label)} account" ${sourceId(row) ? '' : 'hidden'}></select>
                 ${isFallback ? `<span class="model-role-order"><button type="button" class="btn btn-default" data-model-up aria-label="Move fallback up" ${index === 0 ? 'disabled' : ''}>↑</button><button type="button" class="btn btn-default" data-model-down aria-label="Move fallback down" ${index === total - 1 ? 'disabled' : ''}>↓</button><button type="button" class="btn btn-default" data-model-remove aria-label="Remove fallback">Remove</button></span>` : ''}
             </div>
@@ -282,7 +302,7 @@ export function createModelRolesEditor({ hostId, store = claudexorStatus,
             const own = Boolean(sourceId(row) && rowCatalog);
             const note = catalogReadNote(own ? rowCatalog : catalog, { compact: !own });
             status.textContent = row.local ? 'Uses the local runtime.'
-                : note || (!row.model ? (row.slot.slot === 'main' ? 'Choose a model to continue.' : 'Uses Main.')
+                : note || (!row.model ? (row.slot.slot === 'main' ? 'Choose a model to continue.' : `Uses ${inheritName(row)}.`)
                     : sourceId(row) ? (rowCatalog?.read_state === 'ok' && !rowCatalog.items.length
                         ? 'No models were listed for this source. Your selection is kept.'
                         : 'Uses your subscription. No API key required.') : '');

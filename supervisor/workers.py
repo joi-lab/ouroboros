@@ -1330,10 +1330,7 @@ def kill_workers(
                     return None
                 task_id = str(task.get("id") or "").strip()
                 retry_claim = _prepare_retry_claim(task, task_id)
-                if retry_claim is None:
-                    terminalization_retry_ids.append(task_id or "<missing-task-id>")
-                    return False
-                if _settle_terminalization_retry_task(task, retry_claim):
+                if retry_claim is not None and _settle_terminalization_retry_task(task, retry_claim):
                     return True
                 terminalization_retry_ids.append(task_id or "<missing-task-id>")
                 return False
@@ -1363,6 +1360,8 @@ def kill_workers(
                     successor = dict(task)
                     continuing_wait = isinstance(successor.get("_owner_wait_resume"), dict)
                     successor["_attempt"] = int(meta.get("attempt") or task.get("_attempt") or 1) + (0 if continuing_wait else 1)
+                    retention.attach_preserved_successor_source(
+                        DRIVE_ROOT, str(task_id), successor, task, successor["_attempt"] - 1)
                     stamp_execution_handoff(successor, meta)  # #939: no fresh explicit time
                     try:
                         from ouroboros.owner_hurry import retry_reset
@@ -1727,12 +1726,14 @@ def _settle_cancelled_pending_row(
             "accounted_upper_bound_usd": None,
         }
     try:
+        from supervisor.cancel_publication import queued_address
         stored = write_task_result(
             DRIVE_ROOT, task_id, status_cancelled,
             strict_existing_dict=True,
             result=("Cancelled before this continuation started." if int(task.get("_attempt") or 1) > 1
                     else "Cancelled before start."), **cost_fields,
             **intent_outcome_fields(intent),
+            _field_projector=lambda existing, patch: {**queued_address(task, existing), **patch},
         ) or {}
         stored_status = str(stored.get("status") or "").strip()
         if not stored_status:

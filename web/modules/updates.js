@@ -2,7 +2,7 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { showToast } from './toast.js';
 import { apiClient, apiFetch } from './api_client.js';
-import { verifiedUpdatePlan } from './update_status.js';
+import { UPDATE_STAGE_LABELS, attemptTime, dismissUpdateAttempt, dismissedUpdateAttempt, updateAttemptView, verifiedUpdatePlan } from './update_status.js';
 import { destroyChatMarkdown, enhanceChatMarkdown, mountChatMarkdown } from './chat_markdown.js';
 
 // Known non-state warnings are folded into their verdict states; everything
@@ -59,20 +59,10 @@ function statusReadFailed(data) {
         && data.warnings.some((warning) => String(warning).startsWith('status_error:'));
 }
 
-const UPDATE_STAGE_LABELS = {
-    draining_writers: 'Finishing current work…',
-    stopping_workers: 'Stopping worker processes…',
-    stopping_services: 'Stopping services…',
-    preparing: 'Preparing the update…',
-    applying: 'Applying the update…',
-    checking: 'Checking the update and dependencies…',
-    rolling_back: 'Restoring the previous version…',
-    restart_requested: 'Restart requested…',
-};
 
 function progressVerdict(data, base) {
     const progress = data.update_progress;
-    if (!progress?.operation_id) return null;
+    if (!progress?.operation_id || progress.current_generation === false) return null;
     if (progress.active || progress.result === 'restart_requested') {
         return {
             ...base, state: progress.result === 'restart_requested' ? 'restarting' : 'updating',
@@ -88,13 +78,12 @@ function progressVerdict(data, base) {
             hint: progress.error || 'Restart Ouroboros to finish.',
             action: { id: 'restart', label: 'Restart now' } };
     }
-    if (progress.result === 'failed') {
-        return { ...base, state: progress.restart_required ? 'restart_needed' : 'update_failed', tone: 'error',
-            headline: 'The update did not complete.', hint: progress.error || 'Check the update status before trying again.',
-            action: progress.restart_required ? { id: 'restart', label: 'Restart now' }
-                : { id: 'check', label: 'Check for updates' } };
+    if (progress.result === 'failed' && progress.restart_required) {
+        return { ...base, state: 'restart_needed', tone: 'error',
+            headline: 'The update did not complete.', hint: progress.error || 'Restart Ouroboros before trying again.',
+            action: { id: 'restart', label: 'Restart now' } };
     }
-    return null; // Assisted work and boot recovery have their existing durable owner.
+    return null; // Retained conclusions do not hide the next explicitly requested action.
 }
 
 export function applyFailureText(err) {
@@ -377,7 +366,7 @@ export function updateLetterView(data = {}, phase = '') {
         ? 'Description needs refreshing.'
         : 'This description was written for an earlier update.';
     if (failure) {
-        const when = letterTimestamp(failure.failedAt);
+        const when = attemptTime(failure.failedAt);
         note = `Refresh failed${when ? ` on ${when}` : ''}. ${markdown
             ? 'Previous description kept.' : 'No description is available yet.'}`;
     }
@@ -392,14 +381,6 @@ export function updateLetterView(data = {}, phase = '') {
         label: LETTER_LABELS[relation],
         note,
     };
-}
-
-function letterTimestamp(value) {
-    const date = new Date(value);
-    if (!value || Number.isNaN(date.getTime())) return '';
-    return new Intl.DateTimeFormat('en-GB', {
-        day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
-    }).format(date);
 }
 
 /** Content identity of a rendered letter: re-render only when this changes.
@@ -485,6 +466,20 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
                     <span class="updates-headline" id="updates-summary">Loading update status...</span>
                 </div>
                 <div class="updates-hint" id="updates-hint" hidden></div>
+                <section class="updates-attempt" id="updates-attempt" aria-labelledby="updates-attempt-headline" hidden>
+                    <div class="updates-status">
+                        <span class="updates-status-dot" id="updates-attempt-dot" data-tone="neutral"></span>
+                        <span class="updates-attempt-headline" id="updates-attempt-headline"></span>
+                    </div>
+                    <div class="updates-hint" id="updates-attempt-text"></div>
+                    <div class="updates-attempt-foot">
+                        <details class="updates-attempt-details" id="updates-attempt-details">
+                            <summary><time id="updates-attempt-time">Last attempt</time></summary>
+                            <dl class="updates-attempt-facts" id="updates-attempt-facts"></dl>
+                        </details>
+                        <button type="button" class="btn btn-ghost btn-sm" id="updates-attempt-dismiss">Dismiss indicator result</button>
+                    </div>
+                </section>
                 <div class="updates-meta" id="updates-meta"></div>
                 <div class="settings-action-row updates-action-row">
                     <span class="updates-action-note" id="updates-action-note"></span>
@@ -535,6 +530,13 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
     const dot = page.querySelector('#updates-dot');
     const summary = page.querySelector('#updates-summary');
     const hint = page.querySelector('#updates-hint');
+    const attemptSection = page.querySelector('#updates-attempt');
+    const attemptDot = page.querySelector('#updates-attempt-dot');
+    const attemptHeadline = page.querySelector('#updates-attempt-headline');
+    const attemptWhen = page.querySelector('#updates-attempt-time');
+    const attemptText = page.querySelector('#updates-attempt-text');
+    const attemptFacts = page.querySelector('#updates-attempt-facts');
+    const attemptDismiss = page.querySelector('#updates-attempt-dismiss');
     const meta = page.querySelector('#updates-meta');
     const actionNote = page.querySelector('#updates-action-note');
     const current = page.querySelector('#updates-current');
@@ -602,7 +604,7 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
         letterSection.hidden = false;
         letterSection.setAttribute('aria-busy', String(letterRefreshing));
         letterLabel.textContent = view.label;
-        const written = letterTimestamp(view.meta.writtenAt);
+        const written = attemptTime(view.meta.writtenAt);
         letterMeta.textContent = written ? `Written ${written}` : '';
         letterMeta.dateTime = view.meta.writtenAt;
         letterMeta.hidden = !written;
@@ -621,7 +623,7 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             ? ` ${view.meta.authorVersion}` : ''}${view.meta.targetVersion
             ? ` about ${view.meta.targetVersion}` : ''}.${source}`;
         const lastFailure = letterRefreshError?.text || letter.error_text || letter.error_kind || '';
-        const failedAt = letterTimestamp(letterRefreshError?.at || letter.failed_at);
+        const failedAt = attemptTime(letterRefreshError?.at || letter.failed_at);
         // Failed-attempt provenance must never borrow the shown
         // body's range, which may describe an earlier, already-applied update.
         const failedKey = letterRefreshError ? null : letter.latest_failed_key;
@@ -678,6 +680,28 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
         }
     });
 
+    // The retained last attempt (#1818), apart from the primary action and kept until the next attempt.
+    // While this server's attempt runs or awaits its restart, the headline above already names it.
+    function renderAttempt(verdict) {
+        const view = updateAttemptView(latestStatus?.update_progress);
+        const above = !view?.terminal && ['updating', 'restarting', 'restart_required'].includes(verdict.state);
+        attemptSection.hidden = !view || (above && !view.text);
+        if (attemptSection.hidden) return;
+        attemptDot.dataset.tone = view.tone;
+        attemptHeadline.textContent = view.headline;
+        attemptHeadline.hidden = above || view.headline === verdict.headline;
+        attemptDot.hidden = attemptHeadline.hidden;
+        const when = attemptTime(view.when);
+        attemptWhen.textContent = when ? `Last attempt · ${when}` : 'Last attempt';
+        attemptWhen.dateTime = view.when;
+        attemptText.textContent = view.text;
+        attemptText.hidden = !view.text;
+        attemptFacts.innerHTML = view.details.map((row) => (
+            `<dt>${escapeHtml(row.label)}</dt><dd>${escapeHtml(row.value)}</dd>`)).join('');
+        attemptDismiss.dataset.attempt = view.id;
+        attemptDismiss.hidden = !view.terminal || dismissedUpdateAttempt() === view.id;
+    }
+
     function render() {
         const verdict = updateVerdict(latestStatus || {}, phase);
         dot.dataset.tone = verdict.tone;
@@ -706,6 +730,7 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             'loading', 'checking', 'updating', 'preflighting', 'restarting',
             'restart_required', 'restart_needed', 'resolving', 'unmanaged',
         ].includes(verdict.state);
+        renderAttempt(verdict);
         renderLetter();
     }
 
@@ -940,11 +965,11 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
                 showToast('Update landed, but automatic restart failed. Restart Ouroboros to finish.', 'error');
                 setPhase('restart_required');
             } else {
-                showToast('Update applied. Server is restarting.', 'success');
+                showToast('Restart requested to finish the update.', 'success');
                 enterRestarting();
             }
         } catch (err) {
-            showToast('Update failed: ' + applyFailureText(err), 'error');
+            showToast('Update request did not complete: ' + applyFailureText(err), 'error');
             // An error carrying restart_required does NOT mean the update
             // landed (a failed writer fence or a failed rollback also sets
             // it): re-read the durable transaction state, and when no marker
@@ -1029,6 +1054,11 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
         }
     });
     replaceBtn.addEventListener('click', replaceWithOfficial);
+    attemptDismiss.addEventListener('click', () => {
+        // The indicator only: no request is sent, and this section keeps the attempt until the next one.
+        dismissUpdateAttempt(attemptDismiss.dataset.attempt);
+        render();
+    });
     meta.addEventListener('click', (event) => {
         if (event.target.closest?.('[data-open-settings-advanced]')) {
             openSettingsTab?.('advanced');

@@ -66,3 +66,15 @@ def test_peer_projection_keeps_collision_and_malformed_as_disabled_placeholders(
     assert broken.manifest_error
     assert broken.enabled is False
     assert broken.conflicts == ()
+
+
+def test_explicit_empty_locations_do_not_repeat_discovery(tmp_path, monkeypatch):
+    import ouroboros.skill_peer_inventory as peer_inventory
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("known-empty locations must not fall back to discovery")
+
+    monkeypatch.setattr(skill_loader, "_skill_location_inventory", unexpected)
+    monkeypatch.setattr(peer_inventory, "_skill_location_inventory", unexpected)
+    assert skill_loader.discover_skill_identity(tmp_path, "missing", locations=()) == []
+    assert discover_skill_peers(tmp_path, locations=()) == ()

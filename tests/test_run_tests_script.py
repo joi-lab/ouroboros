@@ -7,7 +7,7 @@ import types
 
 import pytest
 
-from ouroboros.preflight_runner import LANE_EXCLUSION_EXPR, PARALLEL_PASS_FLAGS
+from ouroboros.preflight_runner import LANE_EXCLUSION_EXPR, PARALLEL_PASS_FLAGS, SERIAL_PASS_FLAGS
 from ouroboros.safe_test_supervisor import _GRACE_SEC as SAFE_TEST_INT_WINDOW_SEC
 from tests import conftest
 
@@ -57,7 +57,7 @@ def test_sequential_mode_keeps_the_gate_marker_split_and_xdist_flags(run_tests, 
     (parallel_label, parallel), (serial_label, serial) = run_tests.battery_commands(sequential=True)
     assert (parallel_label, serial_label) == ("parallel", "serial")
     assert parallel[3:] == ["tests/", "-m", f"not serial and {LANE_EXCLUSION_EXPR}", *PARALLEL_PASS_FLAGS]
-    assert serial[3:] == ["tests/", "-m", f"serial and {LANE_EXCLUSION_EXPR}"]
+    assert serial[3:] == ["tests/", "-m", f"serial and {LANE_EXCLUSION_EXPR}", *SERIAL_PASS_FLAGS]
 
 
 def test_default_mode_is_one_run_over_both_lanes(run_tests, monkeypatch, standalone_budget):

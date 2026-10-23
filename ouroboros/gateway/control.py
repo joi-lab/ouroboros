@@ -16,15 +16,12 @@ from ouroboros import get_version
 from ouroboros.gateway._helpers import json_error, json_exception, request_drive_root, request_json_or, request_repo_dir
 from ouroboros.gateway.ws import broadcast_ws_sync
 from ouroboros.gateway import update_progress
-from ouroboros.outcomes import public_task_result
 from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
 _RECENT_VISIBLE_COMMANDS: Dict[str, float] = {}
 _VISIBLE_COMMAND_DEDUPE_SEC = 5.0
-_evo_cache: Dict[str, Any] = {}
-_evo_task: asyncio.Task | None = None
 
 
 def _request_restart(request: Request) -> bool:
@@ -71,7 +68,7 @@ def _managed_update_payload(*, fetch: bool, include_tags: bool) -> dict[str, Any
     try:
         tx = active_update_tx()
     except Exception:
-        tx = {}
+        tx = None  # Unread is not absent for the retained attempt.
     update_tx = (
         {
             "active": True,
@@ -100,7 +97,7 @@ def _managed_update_payload(*, fetch: bool, include_tags: bool) -> dict[str, Any
         "latest_version": latest_version,
         "official_tags": official_tags,
         "update_tx": update_tx,
-        "update_progress": update_progress.snapshot(),
+        "update_progress": update_progress.snapshot(tx),
         "letter": letter,
         **status,
     }
@@ -180,6 +177,12 @@ async def api_command(request: Request) -> JSONResponse:
     try:
         body = await request.json()
         cmd = body.get("cmd", "")
+        if str(cmd).strip().lower().startswith("/panic"):
+            from ouroboros.panic_source import source_evidence
+            surface = body.get("client_surface")
+            kind = "web_ui_http" if isinstance(surface, dict) else "other_http"
+            panic_evidence = source_evidence(request, kind, client_surface=surface)
+
         if not isinstance(body.get("reply_to", ""), str):
             return json_error("reply_to must be an address string", 400)
         if cmd:
@@ -189,6 +192,13 @@ async def api_command(request: Request) -> JSONResponse:
                 bridge = get_bridge()
             except AssertionError:
                 bridge = None
+            if str(cmd).strip().lower().startswith("/panic"):
+                from ouroboros.server_control import request_panic
+
+                if request_panic(bridge, cmd, evidence=panic_evidence,
+                                 startup_owner_command=getattr(request.app.state, "startup_owner_command", None)):
+                    return JSONResponse({"status": "ok"})
+                return json_error("Panic emergency owner is unavailable.", 503)
             visible_text = str(body.get("visible_text") or "").strip()
             task_constraint = body.get("task_constraint") if isinstance(body.get("task_constraint"), dict) else None
             visible_task_id = str(body.get("visible_task_id") or "").strip()
@@ -394,8 +404,8 @@ async def api_update_check(_request: Request) -> JSONResponse:
             include_tags=True,
         )
         if payload.get("check_ok") is True:
-            update_progress.acknowledge_failure()
-            payload["update_progress"] = update_progress.snapshot()
+            # Availability may have changed for every client; the retained attempt has not (#1818).
+            update_progress.notify_changed()
         return JSONResponse(payload)
     except Exception as exc:
         return json_exception(exc)
@@ -513,7 +523,7 @@ def _stop_repo_writers(reason: str) -> list[str]:
             return_ids = prepare_restart_returns(DRIVE_ROOT, worker_state.RUNNING, list(worker_state.PENDING),
                                                 transaction_id=restart_transaction_id,
                                                 direct=worker_state.direct_chat_turns(),
-                                                owner_wait_ids=preserve_running_task_ids)
+                                                owner_wait_ids=owner_wait_ids)
         except Exception as exc:
             open_repo_writer_admission()
             log.warning("Managed update owner-wait handoff preparation failed", exc_info=True)
@@ -556,13 +566,23 @@ def _stop_repo_writers(reason: str) -> list[str]:
 
 
 def _fence_failure(blockers: list[str], stash_note: str = "") -> JSONResponse:
-    restart_required = not all(str(item).startswith("active:") for item in blockers)
+    active_only = bool(blockers) and all(str(item).startswith("active:") for item in blockers)
+    restart_required = not active_only
+    if active_only:
+        names = ", ".join(str(item)[len("active:"):] for item in blockers)
+        error = (
+            f"Active work is still running or finishing review ({names}). "
+            "No work was stopped and the repository was not changed; wait for it to finish, "
+            "pause it, or restart Ouroboros to clear the blocker."
+        )
+    else:
+        error = (
+            "Could not prove every repository writer stopped. The repository was not "
+            "changed, but runtime shutdown may be incomplete."
+        )
     return JSONResponse(
         {
-            "error": (
-                "Could not prove every repository writer stopped. The repository was not "
-                "changed, but runtime shutdown may be incomplete."
-            ),
+            "error": error,
             "reason": "update_writer_fence_blocked",
             "blockers": blockers,
             "restart_required": restart_required,
@@ -623,7 +643,7 @@ def _abandon_replace_refused_before_tree(tx: Dict[str, Any], exc: BaseException)
                                      cmd=cmd, stderr=detail)
 
 
-def _restart_response(request: Request, *, strategy: str, plan: dict) -> JSONResponse:
+def _restart_response(request: Request, *, strategy: str, plan: dict, keep_branch: str = "") -> JSONResponse:
     try:
         restarting = _request_restart(request)
     except Exception as exc:
@@ -646,11 +666,13 @@ def _restart_response(request: Request, *, strategy: str, plan: dict) -> JSONRes
                 "error": restart_error,
                 "strategy": strategy,
                 "merge_plan": plan,
+                **({"keep_branch": keep_branch} if keep_branch else {}),
             }
         )
     update_progress.advance("restart_requested")
     return JSONResponse(
-        {"status": "ok", "restarting": True, "strategy": strategy, "merge_plan": plan}
+        {"status": "ok", "restarting": True, "strategy": strategy, "merge_plan": plan,
+         **({"keep_branch": keep_branch} if keep_branch else {})}
     )
 
 
@@ -689,6 +711,7 @@ def _stash_local_work_fenced(
         "local_work_carrier": "none",
         "requested_at": utc_now_iso(),
     }
+    update_progress.link(tx)  # bound before this transaction can be written
     rc_ds, dirty_now, dirty_error = git_capture(["git", "status", "--porcelain"])
     if rc_ds != 0:
         _respawn_workers_after_failed_update()
@@ -1033,7 +1056,7 @@ def _apply_smart_update_fenced(
     try:
         if active_update_tx():
             return JSONResponse({"error": "a managed update is already in progress"}, status_code=409)
-        update_progress.begin()
+        update_progress.begin(base_sha=expected_base_sha, target_sha=expected_target_sha)
         blockers = _quiesce_repo_writers("smart")
         if blockers:
             return _fence_failure(blockers)
@@ -1173,7 +1196,7 @@ def _apply_replace_recovery_fenced(
     try:
         if active_update_tx():
             return JSONResponse({"error": "a managed update is already in progress"}, status_code=409)
-        update_progress.begin()
+        update_progress.begin(base_sha=expected_base_sha, target_sha=expected_target_sha)
         blockers = _quiesce_repo_writers("replace_recovery")
         if blockers:
             return _fence_failure(blockers)
@@ -1212,6 +1235,7 @@ def _apply_replace_recovery_fenced(
             "attempt_id": uuid.uuid4().hex[:12],
             "strategy": "replace",
         }
+        update_progress.link(tx, keep_branch=str(payload.get("keep_branch") or ""))
         write_update_tx(tx)
         _write_update_intent(dict(payload["update_intent"]))
         try:
@@ -1253,7 +1277,7 @@ def _apply_replace_recovery_fenced(
                 )
             tx["pre_restart_smoke"] = "passed"
             write_update_tx(tx)
-        return _restart_response(request, strategy="replace", plan=plan2)
+        return _restart_response(request, strategy="replace", plan=plan2, keep_branch=str(payload.get("keep_branch") or ""))
     except Exception as exc:
         log.error("managed replace recovery failed after writer fence", exc_info=True)
         if active_update_tx():
@@ -1334,53 +1358,18 @@ async def api_update_apply(request: Request) -> JSONResponse:
 
 
 async def api_evolution_data(request: Request) -> JSONResponse:
-    """Collect evolution metrics for each git tag."""
-    from ouroboros.utils import collect_evolution_metrics
+    """The saved version history at once (``evolution_history``), never waiting for a measurement;
+    ``force`` re-measures in the background. The refresh status says whether a newer copy is coming."""
+    from ouroboros.evolution_history import history
 
-    global _evo_task
-    now = time.time()
     force_refresh = str(request.query_params.get("force") or "").strip().lower() in {"1", "true", "yes"}
-    if not force_refresh and _evo_cache.get("ts") and now - _evo_cache["ts"] < 60:
-        return JSONResponse({
-            "points": _evo_cache["points"],
-            "checkpoints": _evo_cache.get("checkpoints", []),
-            "generated_at": _evo_cache.get("generated_at", ""),
-            "cached": True,
-        })
-    if _evo_task is None or _evo_task.done():
-        _evo_task = asyncio.create_task(
-            collect_evolution_metrics(
-                str(request_repo_dir(request)),
-                data_dir=str(request_drive_root(request)),
-            )
-        )
-    data_points = await _evo_task
-    try:
-        from ouroboros.evolution_checkpoints import CHECKPOINTS_REL
-        from ouroboros.utils import iter_jsonl_objects
-
-        checkpoints = []
-        rows = [
-            row for row in iter_jsonl_objects(request_drive_root(request) / CHECKPOINTS_REL)
-            # cycle_outcome rows are solve-capability digest fodder (different
-            # schema: no git_sha/identity hashes); the Dashboard checkpoints
-            # view renders absorb checkpoints only.
-            if isinstance(row, dict) and row.get("kind") != "cycle_outcome"
-        ]
-        for row in rows[-100:]:
-            checkpoints.append(public_task_result(row))
-    except Exception:
-        checkpoints = []
-    _evo_cache["ts"] = time.time()
-    _evo_cache["points"] = data_points
-    _evo_cache["checkpoints"] = checkpoints
-    _evo_cache["generated_at"] = utc_now_iso()
-    return JSONResponse({
-        "points": data_points,
-        "checkpoints": checkpoints,
-        "generated_at": _evo_cache["generated_at"],
-        "cached": False,
-    })
+    drive_root = request_drive_root(request)
+    payload = await asyncio.to_thread(
+        history.projection, str(request_repo_dir(request)), str(drive_root), force=force_refresh)
+    # Older clients' newest absorb checkpoints: one stat while the journal is unchanged (evolution_history).
+    payload["checkpoints"] = await asyncio.to_thread(history.checkpoints, str(drive_root))
+    payload["generated_at"] = utc_now_iso()
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
 __all__ = [

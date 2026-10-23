@@ -158,7 +158,7 @@ def test_reading_settings_writes_nothing_to_disk(isolated_settings):
     from ouroboros import config as cfg
     from ouroboros.gateway.owner_settings import _owner_read_settings_raw
 
-    _seed(isolated_settings, LEGACY_OWNER_DOCUMENT)
+    _seed(isolated_settings, {**LEGACY_OWNER_DOCUMENT, "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full"})
     before = isolated_settings.read_bytes()
     before_mtime = isolated_settings.stat().st_mtime_ns
 
@@ -389,9 +389,10 @@ def test_every_owner_endpoint_reaches_the_same_normalized_read(isolated_settings
         "_api_owner_runtime_mode_sync",
         "_api_owner_auto_grant_sync",
         "_api_owner_context_mode_sync",
-        "_api_owner_safety_mode_sync",
         "_api_settings_post_locked",
     }, readers
+    from ouroboros.gateway import safety_settings
+    assert _callers(safety_settings, "_owner_update_settings") == {"_persist"}
 
 
 def test_normalize_settings_raw_is_idempotent(isolated_settings):
@@ -439,6 +440,7 @@ def test_wakeup_bounds_read_normalization_preserves_valid_values_and_does_not_wr
     from ouroboros import config as cfg
 
     _seed(isolated_settings, {
+        "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full",
         "OUROBOROS_BG_WAKEUP_MIN": minimum,
         "OUROBOROS_BG_WAKEUP_MAX": maximum,
     })

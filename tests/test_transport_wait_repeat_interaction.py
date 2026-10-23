@@ -372,7 +372,7 @@ def test_context_overflow_with_no_episode_keeps_the_overflow_salvage(tmp_path, m
     assert result == loop_transport.provider_terminal_fallback_text(
         usage, is_context_overflow=True, is_transport_wait=False, waited_sec=0.0, is_deadline_exhausted=False,
     )
-    assert "context exceeded the selected model window" in result
+    assert "Context-size recovery" in result and "exact transcript" in result
     # Nothing substantive could leave the view, so no renewal was sent and the refusal names the frame.
     assert "a renewed view could not make it fit (largest parts: " in result
 

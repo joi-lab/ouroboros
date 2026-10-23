@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pathlib
 import types
 
@@ -42,6 +43,26 @@ def _ctx(tmp_path, *, pending=None, running=None, direct=None):
             AssertionError("routing receipts must not create assistant bubbles")
         ),
     )
+
+
+def _read_result_reference(tmp_path, row):
+    from ouroboros.tools.control import _get_task_result
+    from ouroboros.tools.registry import ToolContext
+
+    source = row["authority_source"]
+    assert source["tool"] == "get_task_result" and source["arguments"]["include_authority"]
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    return json.loads(_get_task_result(ctx, **source["arguments"]))["authority"]
+
+
+def _read_dialogue_reference(tmp_path, row):
+    from ouroboros.tools.chronicle import _memory_read
+    from ouroboros.tools.registry import ToolContext
+
+    assert "text" not in row and row["reader"]["tool"] == "memory_read"
+    arguments = row["reader"]["arguments"]
+    assert arguments["from"] == arguments["to"]
+    return _memory_read(ToolContext(repo_dir=tmp_path, drive_root=tmp_path), **arguments)
 
 
 def test_project_single_pending_root_starts_a_new_head(tmp_path, monkeypatch):
@@ -454,10 +475,8 @@ def test_project_room_manual_options_are_room_scoped(tmp_path):
 
 
 def test_project_room_decision_turn_carries_last_task_result_ground_truth(tmp_path):
-    """Q8-A: a project-room decision turn receives the thread's most recent task
-    result as a BOUNDED typed projection (identity/outcome/workspace facts/
-    artifact refs, no raw result text) — the ground truth a 'continue' promotion
-    must read instead of chat memory."""
+    """A project room receives its latest result's identity and reader; choosing
+    that source returns the original workspace facts, artifacts and result."""
     import server
     from ouroboros.projects_registry import create_project
     from ouroboros.task_results import write_task_result
@@ -490,11 +509,17 @@ def test_project_room_decision_turn_carries_last_task_result_ground_truth(tmp_pa
     last = metadata["project_last_task_result"]
     assert last["task_id"] == "new1"  # most recent for THIS project, not "boat"
     assert last["status"] == "completed"
-    assert last["workspace_root"] == str(tmp_path / "racer-tree")
-    assert last["workspace_mode"] == "external"
-    assert last["workspace_git_at_start"]["head"] == "abc123"
-    assert last["artifact_refs"] == [str(tmp_path / "racer-tree" / "index.html")]
+    assert "workspace_root" not in last and "artifact_refs" not in last
     assert "result" not in last and "RAW TEXT" not in str(last)
+    saved = _read_result_reference(tmp_path, last)
+    assert saved["workspace_root"] == str(tmp_path / "racer-tree") and saved["workspace_mode"] == "external"
+    from ouroboros.tools.query_data import _query_data
+    from ouroboros.tools.registry import ToolContext
+    observation = _query_data(ToolContext(repo_dir=tmp_path, drive_root=tmp_path), op="json", kind="task_result",
+                              ids=[last["task_id"]], select="metadata.workspace_preflight")
+    assert json.loads(observation)["data"]["git"]["head"] == "abc123"
+    assert saved["artifact_bundle"]["artifacts"] == [{"path": str(tmp_path / "racer-tree" / "index.html")}]
+    assert saved["result"] == "RAW TEXT MUST NOT LEAK"
 
 
 @pytest.mark.parametrize("shape", ["many_foreign_rows", "equal_ts", "empty_ts"])
@@ -585,9 +610,8 @@ def test_project_last_task_result_lookup_is_bounded(tmp_path, monkeypatch):
     assert opened == ["newracer1"]
 
 
-def test_main_manifest_carries_working_dir_and_workspace_facts(tmp_path):
-    """Q8-A: Main-lane router ground truth — registry working_dir on project rows
-    and workspace facts on the recent-result projections."""
+def test_main_manifest_carries_working_dir_and_result_readers(tmp_path):
+    """Registry working_dir is current; prior workspace facts stay in the named result."""
     import server
     from ouroboros.projects_registry import create_project, update_project
     from ouroboros.task_results import write_task_result
@@ -605,8 +629,9 @@ def test_main_manifest_carries_working_dir_and_workspace_facts(tmp_path):
 
     assert manifest["projects"][0]["working_dir"] == str(tmp_path / "racer-tree")
     final = next(row for row in manifest["final_results"] if row["task_id"] == "done1")
-    assert final["workspace_root"] == str(tmp_path / "racer-tree")
-    assert final["workspace_mode"] == "external"
+    assert "workspace_root" not in final and "workspace_mode" not in final
+    saved = _read_result_reference(tmp_path, final)
+    assert saved["workspace_root"] == str(tmp_path / "racer-tree") and saved["workspace_mode"] == "external"
 
 
 def test_main_manifest_offers_owner_roots_not_swarm_children(tmp_path):
@@ -665,10 +690,9 @@ def _recent_dialogue(tmp_path):
     return server._main_routing_manifest(_ctx(tmp_path))["recent_canonical_dialogue"]
 
 
-def test_main_window_shows_the_owners_quiz_choice_past_a_long_question(tmp_path):
-    """The window clipped each row's raw text at 500 chars, and a quiz answer's text is
-    the host frame that puts the whole question before the choice: past a long question
-    the owner's choice was always cut. The window now renders a row as memory does."""
+def test_main_window_addresses_the_owners_quiz_choice_past_a_long_question(tmp_path):
+    """The routing window names a reader; it returns the whole choice and comment
+    even when the original quiz frame puts them past a long question."""
     from ouroboros.owner_quiz import quiz_answer_frame
     from supervisor.message_bus import log_chat
 
@@ -688,14 +712,14 @@ def test_main_window_shows_the_owners_quiz_choice_past_a_long_question(tmp_path)
     [row] = _recent_dialogue(tmp_path)
 
     assert len(block["comment"]) > 500
-    assert row["text"] == (
-        f'[answer q-tower] chose (1) Keep the tower and repaint it — "{block["comment"]}"')
+    assert row["chars"] == len(frame.strip())
+    shown = _read_dialogue_reference(tmp_path, row)
+    assert f'[answer q-tower] chose (1) Keep the tower and repaint it — "{block["comment"]}"' in shown
     assert (row["direction"], row["task_id"]) == ("system", "root-q")
 
 
-def test_main_window_keeps_people_whole_and_bounds_every_other_row(tmp_path):
-    """People's words ride whole, as memory keeps them; a child's long report keeps the
-    disclosed bound, its omission note inside the 500 chars; a row without text stays out."""
+def test_main_window_addresses_people_and_reports_without_copying_their_words(tmp_path):
+    """Both spoken rows stay whole at their exact readers; empty rows stay out."""
     from supervisor.message_bus import log_chat
 
     owner = "w" * 595 + " end."
@@ -709,10 +733,10 @@ def test_main_window_keeps_people_whole_and_bounds_every_other_row(tmp_path):
     rows = _recent_dialogue(tmp_path)
 
     assert [(row["direction"], row["task_id"]) for row in rows] == [("in", ""), ("out", "child-1")]
-    assert rows[0]["text"] == owner and len(owner) == 600
-    report = rows[1]["text"]
-    assert len(report) <= 500 and report.startswith("R" * 400)
-    assert report.endswith("OMISSION NOTE: truncated at 500 chars; original length 2000")
+    assert [row["chars"] for row in rows] == [600, 2000]
+    assert owner in _read_dialogue_reference(tmp_path, rows[0])
+    report = _read_dialogue_reference(tmp_path, rows[1])
+    assert "R" * 2000 in report and "truncated at 500" not in report
 
 
 def test_project_routing_facts_keep_host_scope_when_registry_recheck_is_unavailable(
@@ -1024,8 +1048,10 @@ def test_project_completion_enqueues_once_for_root_and_never_for_child_or_direct
             "project_id": "launch",
             "project_name": "Launch 🚀",
             "target_label": "Launch 🚀 › Ship release",
+            "task_name": "Ship release",
             "status": "completed",
-            "completion_notice": {"neutral": False, "detail": "", "phase": "done", "salvage": ""},
+            "completion_notice": {"neutral": False, "detail": "", "phase": "done", "salvage": "",
+                                  "cause": "", "undescribed": []},
             "terminal_time": {"v": 1, "occurred_at": None, "source": "unknown",
                               "attempt": dict.fromkeys(("task_attempt", "_attempt", "started_at",
                                                         "metadata_attempt", "metadata_task_attempt"))},

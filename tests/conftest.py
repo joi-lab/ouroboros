@@ -654,10 +654,19 @@ def pytest_runtest_protocol(item, nextitem):  # noqa: ARG001
         loops.append(asyncio.new_event_loop())
         loops.append(asyncio.new_event_loop())
         item.stash[_PHASE_EVENT_LOOPS] = loops
+        if _SAFE_TEMP_ROOT:
+            item.stash[_RETENTION_BEFORE_ITEM] = _basetemp_witness(item)
         yield
     finally:
+        # The call and teardown hooks close their loops and fail that phase if a close raises;
+        # this pass only guarantees the close. A loop whose close already raised is left half
+        # closed (on Windows a proactor without its self-pipe), and raising again here, after
+        # the reports, would end the whole session as an INTERNALERROR.
         for loop in loops:
-            loop.close()
+            try:
+                loop.close()
+            except Exception:  # noqa: BLE001
+                pass
         asyncio.set_event_loop(None)
         if _PHASE_EVENT_LOOPS in item.stash:
             del item.stash[_PHASE_EVENT_LOOPS]
@@ -697,14 +706,27 @@ def _rebind_runtime_roots_between_tests():
 
 
 @pytest.fixture(autouse=True)
+def _launcher_no_real_network(request):
+    from tests.launcher_network_guard import deny_real_network, launcher_unit_module
+
+    if not launcher_unit_module(request.node.path.name):
+        yield
+        return
+    with deny_real_network() as attempts:
+        yield
+    assert not attempts, f"Launcher test tried real network I/O, even if caught: {attempts}"
+
+
+@pytest.fixture(autouse=True)
 def _isolate_restart_generation(monkeypatch):
     """Panic and parent observation belong to one process generation, not later tests;
     so do a returning stop's named queue and the launch/schedule process memory."""
-    from ouroboros import delegate_recovery, server_control
+    from ouroboros import delegate_recovery, launcher_bootstrap, server_control
     from supervisor import queue, schedule_occurrence, worker_assignment
 
     monkeypatch.setattr(server_control, "_restart_successors", [])
     monkeypatch.setattr(server_control, "_restart_stop_requested", False)
+    monkeypatch.setattr(launcher_bootstrap, "source_handoff", launcher_bootstrap._SourceHandoff())
     monkeypatch.setattr(delegate_recovery, "_restart_parent", None)
     monkeypatch.setattr(queue, "RETURNS_NAMED", {})
     monkeypatch.setattr(schedule_occurrence, "_DEFERRED", {})
@@ -1270,6 +1292,7 @@ def pytest_runtest_teardown(item, nextitem):  # noqa: ARG001
     """
     teardown_loop = item.stash[_PHASE_EVENT_LOOPS][1]
     asyncio.set_event_loop(teardown_loop)
+    tmp = (getattr(item, "funcargs", None) or {}).get("tmp_path")
     try:
         yield  # fixture finalizers and teardown run here
     finally:
@@ -1277,6 +1300,7 @@ def pytest_runtest_teardown(item, nextitem):  # noqa: ARG001
         asyncio.set_event_loop(None)
         _fail_if_the_password_resolver_leaked(item)
         _fail_if_a_thread_leaked(item)
+        _fail_if_retention_was_left(item, tmp)
 
 
 _PRISTINE_PASSWORD_RESOLVER = None
@@ -1361,6 +1385,45 @@ def _fail_if_a_thread_leaked(item):
                 f"was torn down: {', '.join(leaked)} — stop/join it at its owner (a fixture "
                 f"finalizer or the test's own missing stop), do not widen the tolerance of the "
                 f"test it pollutes", pytrace=False)
+
+
+# ---- retention hygiene: name the test whose marker keeps the whole run (#1908) ----
+#
+# Under an owner that releases its scratch (scripts/safe_test.py, run_tests.py, the native
+# preflight) one retention marker anywhere beneath its root keeps all of it: 7-11 GB per full
+# battery. A test that manufactures one (an injected fault, a stubbed reap) retires it; one that
+# forgot kept every green battery's root and nothing named it. retain_tree touches the scratch
+# declaration above the tree it marks, so one stat clears a test under an unmoved declaration.
+_RETENTION_BEFORE_ITEM = pytest.StashKey()
+_BASETEMP_DECLARATION: list = []  # this process's, looked up once
+
+
+def _basetemp_witness(item):
+    try:
+        if not _BASETEMP_DECLARATION:
+            from ouroboros.test_environment import SCRATCH_MARKER
+            base = pathlib.Path(item.config._tmp_path_factory.getbasetemp())
+            _BASETEMP_DECLARATION.append(next((path / SCRATCH_MARKER for path in (base, *base.parents)
+                                               if (path / SCRATCH_MARKER).is_file()), None))
+        return _BASETEMP_DECLARATION[0].stat().st_mtime_ns
+    except (AttributeError, OSError):  # no basetemp or declaration: the tmp_path top check remains
+        return None
+
+
+def _fail_if_retention_was_left(item, tmp):
+    from ouroboros.test_environment import RETENTION_MARKER
+    from tests._shared import retention_left_in
+
+    if _RETENTION_BEFORE_ITEM not in item.stash or not isinstance(tmp, pathlib.Path):
+        return
+    moved = _basetemp_witness(item) != item.stash[_RETENTION_BEFORE_ITEM]
+    left = retention_left_in(tmp) if moved or (tmp / RETENTION_MARKER).exists() else ""
+    if left:
+        pytest.fail(f"{item.nodeid} left retention in its tmp_path, which keeps the whole run root "
+                    f"{_SAFE_TEMP_ROOT} with every test's scratch: {left} — retire what this test "
+                    "manufactured (an injected fault, a stubbed reap) with "
+                    "tests._shared.retire_synthetic_retention; a real one means its teardown was never proven",
+                    pytrace=False)
 
 
 @pytest.hookimpl(optionalhook=True, trylast=True)

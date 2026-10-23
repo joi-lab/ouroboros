@@ -26,6 +26,7 @@ TS = "2026-09-16T12:00:00Z"
 WAKE_META = {
     "initiator": "consciousness", "usage_category": "consciousness", "wake_reason": "heartbeat",
     "consciousness_autonomy": "act", "model_role": "consciousness",
+    "wake_cause": "own_clock", "consciousness_cause": "own", "work_kind": "consciousness",
 }
 
 
@@ -399,7 +400,6 @@ def test_prepare_task_context_applies_the_role_slot_through_the_tool_context_sea
 
 
 def test_handle_task_ledger_category_comes_from_usage_category(monkeypatch, tmp_path):
-    from ouroboros import agent as agent_module
     from ouroboros import config, model_wait, subagent_runtime, usage_accounting
 
     captured: list = []
@@ -416,11 +416,9 @@ def test_handle_task_ledger_category_comes_from_usage_category(monkeypatch, tmp_
     monkeypatch.setattr(subagent_runtime, "apply_task_start_settings_or_disclose",
                         lambda *a, **k: task_settings_snapshot({}, os.environ))
     monkeypatch.setattr(config, "task_settings_scope", lambda snapshot: contextlib.nullcontext())
-    monkeypatch.setattr(agent_module.OuroborosAgent, "_handle_task_scoped", lambda self, task: [])
-    agent = object.__new__(agent_module.OuroborosAgent)
-    agent.env = SimpleNamespace(drive_root=tmp_path)
-    agent._emit_live_log = lambda *a, **k: None
-    agent._event_queue = None
+    from tests._agent_entry_helpers import task_entry_agent
+
+    agent = task_entry_agent(tmp_path, lambda task: [])
     agent.handle_task({"id": "w1", "type": "task", "chat_id": 1, "text": "wake", "metadata": dict(WAKE_META)})
     agent.handle_task({"id": "o1", "type": "task", "chat_id": 1, "text": "hello"})
     agent.handle_task({"id": "e1", "type": "evolution", "chat_id": 1, "text": "evolve", "metadata": {"initiator": "consciousness"}})

@@ -4,16 +4,20 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createChatInstance } from '../modules/chat.js';
+import { WS } from '../modules/ws.js';
 import { ElementStub, installDom, restoreDom } from './chat_dom_fixture.js';
 
-function composer({ chatId = 1, projectId = '' } = {}) {
+function composer({ chatId = 1, projectId = '', transport = null, reply = null } = {}) {
     const env = installDom(async (url) => ({ ok: true, json: async () =>
         String(url).startsWith('/api/chat/history') ? { messages: [], window: { complete: true } }
             : { active_chat_activities: [], active_chat_activities_complete: true, supervisor_ready: true } }));
+    env.prior.WebSocket = globalThis.WebSocket;
+    globalThis.WebSocket = { OPEN: 1, CONNECTING: 0 };  // constants only; no native socket can open
     const frames = [];
+    if (reply) sessionStorage.setItem(chatId === 1 ? 'ouro_chat_reply' : `ouro_chat_reply:${chatId}`, JSON.stringify(reply));
     let generation = 0;
     const instance = createChatInstance({
-        ws: { on: () => () => {}, isConnected: () => true,
+        ws: transport || { on: () => () => {}, isConnected: () => true,
             send: (frame) => { frames.push(frame); return { status: 'sent', clientMessageId: `cm-${frames.length}` }; } },
         state: { activePage: 'chat', projectChatIds: new Set(chatId === 1 ? [] : [chatId]), unreadCount: 0 },
         updateUnreadBadge() {}, chatId, projectId, idPrefix: 'chat', mountEl: env.mount, asPanel: chatId !== 1,
@@ -28,7 +32,9 @@ function composer({ chatId = 1, projectId = '' } = {}) {
         for (const listener of input.listeners.get('keydown')) listener(event);
         return event;
     };
-    return { frames, input, byId, press, close() { instance.destroy(); restoreDom(env.prior); } };
+    return { frames, input, byId, press, instance,
+        draft(text) { input.value = text; for (const fn of input.listeners.get('input')) fn(); },
+        close() { instance.destroy(); restoreDom(env.prior); } };
 }
 
 for (const [room, options] of [['Main', {}], ['a Project', { chatId: 7, projectId: 'p7' }]]) {
@@ -71,6 +77,112 @@ test('Enter follows Send: Swarm arms the next message, the existing chords send,
     } finally { c.close(); }
 });
 
+test('typed Panic bypasses a busy Send but still respects composition and held Enter', () => {
+    const c = composer();
+    try {
+        c.byId('send').disabled = true;
+        c.input.value = '/panic';
+        c.press({ isComposing: true });
+        c.press({ repeat: true });
+        assert.equal(c.frames.length, 0);
+        c.press();
+        assert.equal(c.frames.length, 1);
+        assert.equal(c.frames[0].content, '/panic');
+        assert.equal(c.input.value, '/panic', 'unconfirmed emergency keeps the draft');
+    } finally { c.close(); }
+});
+
+test('production WS interception reaches the composer without a chat bubble or submission', async (t) => {
+    const ws = new WS('ws://unused');
+    let stopped = 0;
+    const priorSocket = globalThis.WebSocket;
+    globalThis.WebSocket = { OPEN: 1, CONNECTING: 0 };
+    t.after(() => {
+        if (priorSocket === undefined) delete globalThis.WebSocket;
+        else globalThis.WebSocket = priorSocket;
+    });
+    globalThis.pywebview = { api: { panic_stop: async () => { stopped++; return { status: 'stopping' }; } } };
+    ws.connect = () => assert.fail('Panic must not reconnect');
+    const c = composer({ transport: ws });
+    try {
+        c.draft('/panic');
+        c.press();
+        assert.equal(stopped, 1);
+        assert.equal(c.input.value, '/panic');
+        await Promise.resolve();
+        assert.equal(c.input.value, '', 'bridge acceptance consumes only the sent command');
+        assert.equal(sessionStorage.getItem('ouro_chat_draft'), null);
+        assert.equal(c.byId('messages').querySelectorAll('.chat-bubble.user').length, 0);
+        assert.deepEqual(ws._pendingMessages, []);
+    } finally {
+        c.close();
+        delete globalThis.pywebview;
+    }
+    assert.equal(Object.values(ws.listeners).reduce((n, listeners) => n + listeners.size, 0), 0);
+});
+
+for (const door of ['socket', 'bridge']) for (const newer of [false, true]) {
+    test(`typed Panic ${door} acceptance preserves files/reply and ${newer ? 'newer text' : 'clears sent text'}`, async (t) => {
+        const ws = new WS('ws://unused');
+        const socket = new EventTarget();
+        const sent = [];
+        Object.assign(socket, { readyState: 1, bufferedAmount: 0, send: text => sent.push(JSON.parse(text)) });
+        ws.ws = socket;
+        ws.connect = () => assert.fail('no reconnect');
+        let accept;
+        if (door === 'bridge') {
+            globalThis.pywebview = { api: { panic_stop: () => new Promise(resolve => { accept = () => resolve({ status: 'stopping' }); }) } };
+            t.after(() => delete globalThis.pywebview);
+        } else accept = () => {
+            const event = new Event('message');
+            event.data = JSON.stringify({ type: 'panic_accepted' });
+            socket.dispatchEvent(event);
+        };
+        const reply = { address: 'row:1@a#1', role: 'assistant', snippet: 'Kept reply', kind: 'message' };
+        const c = composer({ transport: ws, chatId: 7, projectId: 'p7', reply });
+        try {
+            const files = c.byId('file-input');
+            files.files = [{ name: 'kept.txt', type: 'text/plain' }];
+            for (const fn of files.listeners.get('change')) fn({ target: files });
+            const keptReply = sessionStorage.getItem('ouro_chat_reply:7');
+            assert.ok(keptReply);
+            c.draft(' /PaNiC  ');
+            c.press();
+            assert.equal(c.input.value, ' /PaNiC  ', 'unknown keeps the exact draft');
+            assert.equal(sessionStorage.getItem('ouro_chat_draft:7'), ' /PaNiC  ');
+            if (newer) c.draft('my next message');
+            accept();
+            await Promise.resolve();
+            assert.equal(c.input.value, newer ? 'my next message' : '');
+            assert.equal(sessionStorage.getItem('ouro_chat_draft:7'), newer ? 'my next message' : null);
+            assert.equal(sessionStorage.getItem('ouro_chat_reply:7'), keptReply);
+            assert.equal(c.instance.hasPendingWork(), true, 'the staged file remains');
+            assert.equal(c.byId('messages').querySelectorAll('.chat-bubble.user').length, 0);
+            assert.equal(sent.length, door === 'socket' ? 1 : 0);
+            assert.deepEqual(ws._pendingMessages, []);
+        } finally { c.close(); }
+    });
+}
+
+test('unconfirmed typed Panic retains its saved draft after socket close', async () => {
+    const ws = new WS('ws://unused');
+    const socket = new EventTarget();
+    Object.assign(socket, { readyState: 1, bufferedAmount: 0, send: () => {} });
+    ws.ws = socket;
+    const c = composer({ transport: ws });
+    document.body = new ElementStub('body', document);
+    try {
+        c.draft('/panic');
+        c.press();
+        assert.equal(c.input.value, '/panic');
+        socket.dispatchEvent(new Event('close'));
+        await Promise.resolve();
+        assert.equal(c.input.value, '/panic');
+        assert.equal(sessionStorage.getItem('ouro_chat_draft'), '/panic');
+        assert.deepEqual(ws._pendingMessages, []);
+    } finally { c.close(); }
+});
+
 // An effort change made just before Send is the setting the next root would start with, so
 // Send and Enter wait for that save; a refused save keeps the draft in the field.
 test('Send waits for a pending effort-range save; a refused save keeps the draft', async () => {
@@ -106,6 +218,10 @@ test('Send waits for a pending effort-range save; a refused save keeps the draft
         instance.hydrateStateSnapshot({ effort_range: { min: 'low', recommended: 'medium', max: 'high' } });
         for (const listener of rec.listeners.get('keydown')) listener({ key: 'ArrowRight', currentTarget: rec, preventDefault() {} });
         assert.equal(pending.length, 1, 'the save left at the gesture end');
+        input.value = '/panic';
+        press();
+        assert.equal(frames.length, 1, 'Panic is delivered before the settings save resolves');
+        assert.equal(frames.pop().content, '/panic');
         input.value = 'use the new level';
         press();
         await new Promise((resolve) => setTimeout(resolve, 0));

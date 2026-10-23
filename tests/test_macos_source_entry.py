@@ -28,8 +28,8 @@ _CHECKOUT_SHA = boot.checkout_sha  # the real Git read; the launch fixture repla
 
 
 class Handoff(BaseException):
-    def __init__(self, executable, argv):
-        self.executable, self.argv = executable, argv
+    def __init__(self, executable, argv, env):
+        self.executable, self.argv, self.env = executable, argv, env
 
 
 class FrozenContinues(BaseException):
@@ -40,6 +40,8 @@ class FrozenContinues(BaseException):
 def launch(monkeypatch, tmp_path):
     import launcher
 
+    monkeypatch.setattr(platform, "IS_WINDOWS", False)  # select POSIX Python paths even on a Windows host
+    monkeypatch.setattr(launcher, "_shutdown_event", threading.Event())
     seed = tmp_path / "Ouroboros app.app" / "Contents" / "Frameworks"
     seed.mkdir(parents=True)
     entry = seed.parent / "MacOS" / "ouroboros-shell"
@@ -63,6 +65,7 @@ def launch(monkeypatch, tmp_path):
         monkeypatch.setattr(launcher, key, value)
     monkeypatch.setattr(launcher.sys, "frozen", True, raising=False)
     monkeypatch.setattr(launcher.sys, "_MEIPASS", str(seed), raising=False)
+    monkeypatch.setattr(launcher, "__file__", str(repo / "launcher.py"))
     monkeypatch.setattr(boot, "_LOADED_CHECKOUT_SHA", "")
     monkeypatch.setattr(boot, "checkout_sha", lambda root: "updated-generation")
     monkeypatch.setattr(atexit, "register", lambda *a: None)
@@ -70,10 +73,12 @@ def launch(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher, "_detect_headless", lambda: None)
     monkeypatch.setattr(launcher, "acquire_pid_lock", lambda: calls.append("lock") or True)
     monkeypatch.setattr(launcher, "release_pid_lock", lambda: calls.append("release"))
+    monkeypatch.setattr(launcher, "stop_tray_before_exit", lambda release: (calls.append("teardown"), release()))
+    monkeypatch.setattr(launcher, "restore_tray_after_handoff", lambda: calls.append("restore"))
     monkeypatch.setattr(launcher, "check_git", lambda: calls.append("git") or True)
-    background = types.SimpleNamespace(_open_pending=False)
+    background = types.SimpleNamespace(_open_pending=False, panic=threading.Event())
     background.listen = lambda path: calls.append("listen") or background
-    monkeypatch.setattr(launcher, "Background", lambda *args: background)
+    monkeypatch.setattr(launcher, "Background", lambda *args, **kwargs: background)
     monkeypatch.setattr(launcher, "bootstrap_repo", lambda: calls.append("bootstrap") or True)
     monkeypatch.setattr(boot, "source_launcher_importable", lambda *a, **kw: calls.append("probe") or True)
     monkeypatch.setattr(launcher, "launcher_sources_changed", lambda *a, **kw: True)
@@ -82,12 +87,12 @@ def launch(monkeypatch, tmp_path):
         calls.append("frozen-server-boundary")
         raise FrozenContinues()
 
-    def execv(executable, argv):
+    def execve(executable, argv, env):
         calls.append("exec")
-        raise Handoff(executable, argv)
+        raise Handoff(executable, argv, env)
 
     monkeypatch.setattr(launcher, "_prepare_first_run_settings", stop_before_server)
-    monkeypatch.setattr(launcher.os, "execv", execv)
+    monkeypatch.setattr(launcher.os, "execve", execve)
     yield types.SimpleNamespace(module=launcher, seed=seed, entry=entry, python=python, repo=repo,
                                 calls=calls, background=background)
 
@@ -96,11 +101,39 @@ def test_cold_changed_helpers_handoff_after_bootstrap_before_server_or_window(la
     l = launch
     with pytest.raises(Handoff) as stopped:
         l.module.main(["--launch-intent", "automatic", "-psn_0_123"])
-    assert l.calls == ["lock", "listen", "git", "bootstrap", "probe", "release", "exec"]
+    assert l.calls == ["lock", "listen", "git", "bootstrap", "probe", "teardown", "release", "exec"]
     assert stopped.value.executable == str(l.entry)
     assert stopped.value.argv == [str(l.entry), str(l.repo / "launcher.py"), "--launch-intent", "automatic",
                                   "-psn_0_123", "--seed-bundle", str(l.seed)]
+    assert stopped.value.env[boot.LAUNCHER_HANDOFF_ENV] == "1"
+    assert stopped.value.env["PYTHONUSERBASE"] == str(l.module.DATA_DIR / "state/python-userbase")
+    assert "PYTHONHOME" not in stopped.value.env and "CFProcessPath" not in stopped.value.env
     assert boot._LOADED_CHECKOUT_SHA == "bundle-generation", "frozen helpers are never labelled updated-generation"
+
+
+def test_panic_during_cold_change_detection_cannot_replace_the_launcher(launch, monkeypatch):
+    def changed(*a, **kw):
+        launch.module._shutdown_event.set()
+        return True
+
+    monkeypatch.setattr(launch.module, "launcher_sources_changed", changed)
+    try:
+        launch.module.main([])
+    except (Handoff, FrozenContinues):
+        pass
+    assert "exec" not in launch.calls and "frozen-server-boundary" not in launch.calls, \
+        "Panic during the change check must fence both successor and local server"
+
+
+def test_macos_fixture_on_a_simulated_windows_host(request, monkeypatch):
+    import launcher  # import before simulating the host; no Windows native API is available here
+
+    monkeypatch.setattr(platform, "IS_WINDOWS", True)
+    l = request.getfixturevalue("launch")
+    assert l.python == l.seed / "python-standalone/bin/python3", "the fixture must create macOS Python on Windows too"
+    with pytest.raises(Handoff) as stopped:
+        launcher.main([])
+    assert stopped.value.executable == str(l.entry)
 
 
 @pytest.mark.parametrize("reason", ["same-generation", "server-only", "imports-broken", "legacy-bundle", "source"])
@@ -116,11 +149,12 @@ def test_cold_fallback_and_source_never_loop_into_frozen(launch, monkeypatch, re
     else:
         monkeypatch.setattr(l.module.sys, "frozen", False)
         monkeypatch.setattr(l.module.sys, "executable", str(l.entry))
+        monkeypatch.setattr(l.module, "launcher_sources_changed", boot.launcher_sources_changed)
         argv = ["--seed-bundle", str(l.seed)]
     with pytest.raises(FrozenContinues):
         l.module.main(argv)
     assert l.calls[-1] == "frozen-server-boundary"
-    assert "exec" not in l.calls and "release" not in l.calls
+    assert "exec" not in l.calls and "release" not in l.calls and "teardown" not in l.calls
     assert l.module.EMBEDDED_PYTHON == str(l.python), "the app entry is never the body interpreter"
 
 
@@ -165,7 +199,58 @@ def test_shell_and_body_interpreters_are_separate_even_with_runtime_venv(launch,
     assert not any(arg.startswith("--runtime-venv") for arg in legacy)
 
 
-def _lifecycle(l, monkeypatch, *, returncode=42, landed=lambda: None):
+@pytest.mark.parametrize("frozen", [True, False])
+def test_runtime_venv_preparation_keeps_plain_python_as_its_base(launch, monkeypatch, tmp_path, frozen):
+    l = launch
+    seen = []
+    venv = types.SimpleNamespace(python=str(tmp_path / "venv/bin/python"), bin_dir=tmp_path / "venv/bin", ready=True)
+
+    def prepare(path, **kwargs):
+        seen.append(kwargs["base_python"])
+        return venv
+
+    monkeypatch.setattr(l.module.sys, "frozen", frozen)
+    monkeypatch.setattr(l.module.sys, "_base_executable", "/plain/base/python", raising=False)
+    monkeypatch.setattr(l.module, "prepare_runtime_venv", prepare)
+    argv = ["--runtime-venv", str(tmp_path / "venv")]
+    if not frozen:
+        monkeypatch.setattr(l.module.sys, "executable", str(l.entry))
+        argv += ["--seed-bundle", str(l.seed)]
+    with pytest.raises(Handoff) as stopped:
+        l.module.main(argv)
+    assert seen == [str(l.python) if frozen else "/plain/base/python"]
+    assert l.module.EMBEDDED_PYTHON == venv.python
+    assert stopped.value.executable == str(l.entry)
+    assert boot.parse_launch_options(stopped.value.argv[2:]).runtime_venv == tmp_path / "venv"
+
+
+@pytest.mark.parametrize("acquired", [True, False])
+def test_signed_entry_exec_refusal_restores_only_after_reacquiring_the_lock(launch, monkeypatch, acquired):
+    l = launch
+    commands = []
+
+    def refuse(executable, argv, env):
+        l.calls.append("refused")
+        commands.append((executable, argv, env))
+        raise PermissionError("entry refused")
+
+    monkeypatch.setattr(l.module.os, "execve", refuse)
+    monkeypatch.setattr(l.module, "acquire_pid_lock", lambda: l.calls.append("reacquire") or acquired)
+    monkeypatch.setattr(l.module.os, "_exit", lambda code: (_ for _ in ()).throw(SystemExit(code)))
+    if acquired:
+        l.module._exec_source_launcher()
+    else:
+        with pytest.raises(SystemExit) as stopped:
+            l.module._exec_source_launcher()
+        assert stopped.value.code == 1
+    assert l.calls == ["probe", "teardown", "release", "refused", "reacquire"] + (["restore"] if acquired else [])
+    executable, argv, env = commands[0]
+    assert executable == argv[0] == str(l.entry)
+    assert argv[1:] == [str(l.repo / "launcher.py"), "--seed-bundle", str(l.seed)]
+    assert env["PYTHONUSERBASE"] == str(l.module.DATA_DIR / "state/python-userbase")
+
+
+def _lifecycle(l, monkeypatch, *, returncode=42, landed=lambda: None, waited=lambda: None):
     """The real lifecycle loop with its process, port and sync boundaries replaced; a second start stops it.
     ``landed`` is what the server lands before it exits ``returncode``."""
     module = l.module
@@ -175,7 +260,7 @@ def _lifecycle(l, monkeypatch, *, returncode=42, landed=lambda: None):
     monkeypatch.setattr(module, "_pre_generation_cleanup", lambda: [])
     monkeypatch.setattr(module, "_clear_port_file", lambda: True)
     monkeypatch.setattr(module, "update_external_host", lambda *a: {})
-    monkeypatch.setattr(module, "_await_generation_endpoint", lambda *a, **kw: 8765)
+    monkeypatch.setattr(module, "_await_generation_endpoint", lambda *a, **kw: 1)
     monkeypatch.setattr(module, "_update_server_process_record_port", lambda *a: None)
     monkeypatch.setattr(module, "_wait_for_server", lambda *a, **kw: True)
     monkeypatch.setattr(module, "_cleanup_recorded_server_group_for_pid", lambda *a: None)
@@ -190,12 +275,12 @@ def _lifecycle(l, monkeypatch, *, returncode=42, landed=lambda: None):
             raise FrozenContinues()
         l.calls.append("server")
         landed()
-        return types.SimpleNamespace(pid=4242, returncode=returncode, wait=lambda: None)
+        return types.SimpleNamespace(pid=4242, returncode=returncode, wait=waited)
 
     monkeypatch.setattr(module, "start_agent", start)
 
 
-@pytest.mark.parametrize("mode", ["helper-change", "server-only", "source", "legacy", "panic"])
+@pytest.mark.parametrize("mode", ["helper-change", "server-only", "source", "legacy", "panic", "tray-panic"])
 def test_lifecycle_restart_and_panic_keep_the_existing_owners(launch, monkeypatch, mode):
     l = launch
     module = l.module
@@ -206,8 +291,10 @@ def test_lifecycle_restart_and_panic_keep_the_existing_owners(launch, monkeypatc
     elif mode == "legacy":
         l.entry.unlink()
     monkeypatch.setattr(module, "launcher_sources_changed", lambda *a, **kw: mode != "server-only")
-    _lifecycle(l, monkeypatch, returncode=module.PANIC_EXIT_CODE if mode == "panic" else 42)
-    if mode == "panic":
+    panic = mode in {"panic", "tray-panic"}
+    _lifecycle(l, monkeypatch, returncode=module.PANIC_EXIT_CODE if panic else 42,
+               waited=lambda: module._shutdown_event.set() if mode == "tray-panic" else None)
+    if panic:
         monkeypatch.setitem(sys.modules, "ouroboros.process_scope",
                             types.SimpleNamespace(complete_pending_panic_sweep=lambda *a, **kw: None))
         monkeypatch.setattr(module, "request_tray_cleanup", lambda: l.calls.append("tray"))
@@ -229,43 +316,32 @@ def test_lifecycle_restart_and_panic_keep_the_existing_owners(launch, monkeypatc
         assert l.calls[:3] == ["server", "sync", "deps"] and l.calls[-2:] == ["release", "exec"]
 
 
-@pytest.mark.parametrize("system", ["windows", "linux"])
-@pytest.mark.parametrize("in_session", [False, True])
-def test_other_frozen_platforms_keep_the_checkout_at_first_start_as_their_generation(launch, monkeypatch, system,
-                                                                                     in_session):
-    """The seed generation is macOS-only. Elsewhere a frozen launcher counts from the checkout at its first
-    start, as before, so exit 42 hands off to source (plain Python) only after an in-session change."""
+@pytest.mark.parametrize("stop_at", ["sleep", "sync", "deps", "change-check"])
+def test_panic_during_exit_42_cannot_handoff(launch, monkeypatch, stop_at):
     l = launch
-    module = l.module
-    monkeypatch.setattr(module, "IS_MACOS", False)
-    monkeypatch.setattr(module, "IS_WINDOWS", system == "windows")
-    monkeypatch.setattr(module, "_prepare_windows_webview_runtime", lambda: (True, ""))
-    monkeypatch.setattr(module, "launcher_sources_changed", boot.launcher_sources_changed)
-    head = {"sha": "updated-generation"}  # the managed checkout, newer than the seed
-    monkeypatch.setattr(boot, "checkout_sha", lambda repo: head["sha"])
-    monkeypatch.setattr(boot.subprocess, "run", lambda cmd, **kw: types.SimpleNamespace(returncode=1))  # differs
-    with pytest.raises(FrozenContinues):
-        module.main([])
-    assert boot._LOADED_CHECKOUT_SHA == "", "no seed generation is recorded off macOS"
-    l.calls.clear()
-    _lifecycle(l, monkeypatch, landed=lambda: in_session and head.update(sha="adopted-generation"))
-    if in_session:
-        with pytest.raises(Handoff) as stopped:
-            module.agent_lifecycle_loop()
-        assert stopped.value.executable == str(l.python), "the previous plain-Python handoff, no entry probe"
-        assert l.calls == ["server", "sync", "deps", "release", "exec"]
-    else:
-        with pytest.raises(FrozenContinues):
-            module.agent_lifecycle_loop()
-        assert l.calls == ["server", "sync", "deps"], "the same process starts the next generation"
-    assert boot._LOADED_CHECKOUT_SHA == "updated-generation"
+    _lifecycle(l, monkeypatch, returncode=42)
+
+    def stop(*a, **kw):
+        l.module._shutdown_event.set()
+        return True
+
+    target, name = {
+        "sleep": (l.module.time, "sleep"), "sync": (l.module, "_sync_existing_repo_from_bundle"),
+        "deps": (l.module, "_install_deps"), "change-check": (l.module, "launcher_sources_changed"),
+    }[stop_at]
+    monkeypatch.setattr(target, name, stop)
+    try:
+        l.module.agent_lifecycle_loop()
+    except (Handoff, FrozenContinues):
+        pass
+    assert "exec" not in l.calls and l.calls.count("server") == 1, "Panic must outlive an in-flight exit-42 handoff"
 
 
-def test_other_frozen_platforms_report_the_checkout_not_the_seed_as_loaded_source(launch, monkeypatch):
-    """Shell facts read before the first start (nothing recorded yet) keep that basis off macOS too."""
+def test_other_frozen_platforms_report_the_seed_as_loaded_source(launch, monkeypatch):
+    """Shell facts read before main cannot mistake the newer checkout for frozen imported code."""
     monkeypatch.setattr(launch.module, "IS_MACOS", False)
     facts = launch.module._shell_facts()
-    assert facts["source_revision"] == "updated-generation" and facts["macos_source_entry"] is None
+    assert facts["source_revision"] == "bundle-generation" and facts["macos_source_entry"] is None
     assert facts["bundle_version"] == "7.7.0", "the installed seed is still reported as installed"
 
 
@@ -275,11 +351,14 @@ def _git(repo, *args):
 
 
 @pytest.mark.parametrize("changed", ["ouroboros/process_scope.py", "supervisor/queue.py", "server.py", None])
-def test_cold_open_counts_packaged_helpers_the_frozen_launcher_has_not_imported_yet(launch, monkeypatch, changed):
+@pytest.mark.parametrize("macos", [True, False])
+def test_cold_open_counts_packaged_helpers_the_frozen_launcher_has_not_imported_yet(launch, monkeypatch, changed,
+                                                                                macos):
     """Real Git and the real detector. A frozen launcher imports more helpers from its seed later (Panic sweep,
     restart acknowledgement, server records, Claudexor custody): none is loaded at the cold check, so it compares
     every packaged tree. A server.py-only or no update keeps the frozen launcher."""
     l = launch
+    monkeypatch.setattr(l.module, "IS_MACOS", macos)
     monkeypatch.setattr(boot, "checkout_sha", _CHECKOUT_SHA)
     monkeypatch.setattr(l.module, "launcher_sources_changed", boot.launcher_sources_changed)
     for rel in ("launcher.py", "server.py", "ouroboros/process_scope.py", "supervisor/queue.py"):
@@ -295,8 +374,9 @@ def test_cold_open_counts_packaged_helpers_the_frozen_launcher_has_not_imported_
     if changed in ("ouroboros/process_scope.py", "supervisor/queue.py"):
         with pytest.raises(Handoff) as stopped:
             l.module.main([])
-        assert stopped.value.executable == str(l.entry)
-        assert l.calls[-3:] == ["probe", "release", "exec"], "before any server or normal window"
+        assert stopped.value.executable == str(l.entry if macos else l.python)
+        assert l.calls[-3:] == ["teardown", "release", "exec"], "before any server or normal window"
+        assert "probe" in l.calls, "every packaged platform probes imports before losing the frozen recovery shell"
     else:
         with pytest.raises(FrozenContinues):
             l.module.main([])
@@ -490,7 +570,7 @@ def test_entry_handoff_requires_source_capability_in_a_real_plain_python_probe(l
                 invoke()
         else:
             invoke()
-        assert "release" not in l.calls and "exec" not in l.calls
+        assert "teardown" not in l.calls and "release" not in l.calls and "exec" not in l.calls
         assert len(probes) == 1 and probes[0].returncode != 0
         assert ("damaged helper" if source == "damaged-helper" else "macOS source entry protocol 1") in probes[0].stderr
     assert (l.repo / "launcher.py").read_bytes() == before, "old source remains recoverable"

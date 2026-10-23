@@ -234,7 +234,7 @@ def test_an_unreadable_queue_snapshot_is_a_stated_gap_not_absent_queued_work(tmp
         assert page["read_gap"] == {"queue_snapshot": "unreadable"}, torn
         assert [row["task_id"] for row in page["tasks"]] == ["done-here"]
     section = build_presence_context_section(tmp_path, {**_presence(), "instructions": "Be useful."}, "turn-x")
-    assert "unreadable now: the queue snapshot (queued work); this binding's work may be among them" in section
+    assert "unreadable now: the queue snapshot (queued work); this place's work may be among them" in section
 
     _queue(tmp_path, pending=[{"id": "queued-only", "delegation_role": "root",
                                "metadata": {"presence": _presence(key=THREAD)}}])

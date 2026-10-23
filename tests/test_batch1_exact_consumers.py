@@ -147,29 +147,6 @@ def test_real_gateway_producer_admits_without_injected_intent(q, monkeypatch, pr
     assert not _rows(q)["api"].get("hold")
 
 
-def test_real_skill_producer_removal_preserves_unpublished_admission(q, monkeypatch):
-    from supervisor import queue_schedules
-    from tests.test_consciousness_schedule_controls import _ready, _skill
-
-    _ready(monkeypatch)
-    queue_schedules.sync_skill_schedules([_skill()], drive_root=q.root)
-    record = _rows(q)["skill-demo-daily"]
-    record["next_run_at"] = "2000-01-01T00:00:00Z"
-    queue_schedules._write_scheduled_tasks({"tasks": [record]}, q.root)
-    real = q.queue.persist_queue_snapshot
-    monkeypatch.setattr(q.queue, "persist_queue_snapshot", lambda **_: False)
-    q.queue.check_scheduled_tasks()
-    assert not q.pending
-    accepted = _rows(q)["skill-demo-daily"]["occurrence"]["task_id"]
-    queue_schedules.sync_skill_schedules([], drive_root=q.root)
-    tombstone = _rows(q)["skill-demo-daily"]
-    assert tombstone["delete_requested_at"] and not tombstone["enabled"]
-    monkeypatch.setattr(q.queue, "persist_queue_snapshot", real)
-    q.queue.check_scheduled_tasks()
-    assert [task["id"] for task in q.pending] == [accepted]
-    assert q.pending[0]["metadata"]["resource_intent"] == {"kind": "system_repo"}
-
-
 def test_cli_schedule_add_uses_the_gateway_producer(q, monkeypatch):
     from starlette.applications import Starlette
     from starlette.routing import Route

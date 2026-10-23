@@ -25,7 +25,8 @@ Boundaries (tags in the output):
   every step that waits on the store's publication (``store_switch.when_ready``) wherever it runs,
   snapshotted when the chat bus is initialized (``B2_dialogue``) and when the supervisor reports
   ready (``B2_ready``); the supervisor is held there, before its first tick, while the requests
-  below are measured;
+  below are measured. ``B2_child_headers`` separately counts the boot's required directory/header
+  compatibility pass; both publication snapshots retain it for its own bounded-work guard;
 - ``B4``/``B4w``: an owner chat frame over ``/ws`` on the cold process, then a second one;
 - ``B3``/``B3w``: ``GET /api/state``, cold then warm;
 - ``R_active``/``R_late`` (+``w``): ``GET /api/chat/history`` of the active and the late-bound room;
@@ -125,12 +126,23 @@ def _mark(result: Dict[str, Any], name: str) -> None:
 def _install_checkpoints(meter: CostMeter, srv: Any, result: Dict[str, Any]) -> Dict[str, threading.Event]:
     import functools
 
-    from ouroboros import server_liveness, store_switch
+    from ouroboros import server_liveness, store_journal, store_switch
     from supervisor import message_bus
     from tests._cost_meter import tagged
 
     events = {"ready": threading.Event(), "release": threading.Event()}
     when_ready = store_switch.when_ready
+    prepare_children = store_journal.prepare_children
+
+    def child_headers(root):
+        # Compatibility must precede producers. Measure its directory/header work
+        # separately; test_cost_contract bounds it and still forbids history payloads.
+        return tagged("B2_child_headers", lambda: prepare_children(root))
+
+    store_journal.prepare_children = child_headers
+
+    def publication_cost():
+        return {**_summary(meter, "B2"), "child_headers": _summary(meter, "B2_child_headers")}
 
     def publication_steps(root, *steps):
         # What waits on the store's publication is B2 wherever it runs: on the import thread, or on
@@ -144,7 +156,7 @@ def _install_checkpoints(meter: CostMeter, srv: Any, result: Dict[str, Any]) -> 
     def init(*args, **kwargs):
         value = bus_init(*args, **kwargs)
         _mark(result, "dialogue")
-        result["B2_dialogue"] = _summary(meter, "B2")
+        result["B2_dialogue"] = publication_cost()
         result["B2_dialogue_tag"] = BOUNDARY.get() or getattr(threading.current_thread(), "_cost_tag", None)
         return value
 
@@ -153,7 +165,7 @@ def _install_checkpoints(meter: CostMeter, srv: Any, result: Dict[str, Any]) -> 
 
     def ready(*args, **kwargs):
         _mark(result, "ready")
-        result["B2_ready"] = _summary(meter, "B2")
+        result["B2_ready"] = publication_cost()
         result["B2_ready_tag"] = getattr(threading.current_thread(), "_cost_tag", None)
         result["B2_ready_flag"] = srv._supervisor_ready.is_set()
         events["ready"].set()
@@ -214,6 +226,11 @@ def run(spec: Dict[str, Any]) -> Dict[str, Any]:
 
         _mark(result, "imported")
         _stub_external_effects(srv, result)
+        # The install root is resolved once per process, in whichever boundary's thread asks first:
+        # a race the history size tips, not history work. Resolve it before any boundary starts.
+        from ouroboros import install_identity
+
+        install_identity.canonical_root()
         events = _install_checkpoints(meter, srv, result)
         client = TestClient(_Tagger(srv.app, meter, result))
         with client:

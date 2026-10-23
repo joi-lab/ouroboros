@@ -287,6 +287,7 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+    min-width: 0;
 }
 
 .mcp-server-card-actions,
@@ -299,6 +300,9 @@
 
 .mcp-server-status {
     width: fit-content;
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
     padding: 3px 8px;
     font-size: var(--type-meta);
     line-height: var(--line-meta);

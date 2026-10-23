@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from ouroboros.consciousness_authority import (
     CONSCIOUSNESS_CATEGORY,
     CONSCIOUSNESS_INITIATOR,
+    WAKE_CAUSE_OWN_CLOCK,
+    WORK_KIND_CONSCIOUSNESS,
     disabled_tools_for,
     is_consciousness_origin,
     normalize_level,
@@ -46,11 +48,11 @@ WAKE_OBSERVATION_KEY = "wake_observation"  # task metadata: the bound observatio
 OBSERVATION_BOUNDARY_VERSION = 1
 TRANSITIONS_VERSION = 2  # complete per-task transition inventory, including closed tasks
 PLACEHOLDERS = ("reason", "last_wake_ago", "events", "level", "level_line", "withheld_tools",
-                "spent_usd", "daily_usd", "running", "max_tasks", "interval")
+                "spent_usd", "daily_usd", "running", "max_tasks", "interval", "spend_by_cause", "counted_roots", "places")
 LEVEL_LINES = {
-    "observe": "research and internal work, memory, project notes, your own children and schedules, owner delivery; no shell, user-file, source, skill/settings or publication changes",
-    "act": "everything your runtime mode allows except editing your own code/prompts, evolution, restart and settings",
-    "full": "everything your runtime mode allows, including evolution",
+    "observe": "On its own it studies, keeps its memory and tells you; it changes nothing outside.",
+    "act": "Also acts on its own: starts work, runs commands, speaks and acts in places. It does not change itself.",
+    "full": "Also changes itself: its own code, its settings, connecting new places.",
 }
 _FALLBACK_TEMPLATE = "[Wake-up · {reason}] No one wrote to you: this turn is yours. Wake context (last wake {last_wake_ago}): {events}"
 
@@ -67,6 +69,8 @@ def wake_task_metadata(level: Any, reason: str, *, root_cost_ceiling_usd: Option
     normalized = normalize_level(level)
     metadata: Dict[str, Any] = {
         "initiator": CONSCIOUSNESS_INITIATOR, "usage_category": CONSCIOUSNESS_CATEGORY,
+        "wake_cause": WAKE_CAUSE_OWN_CLOCK, "consciousness_cause": "own",
+        "work_kind": WORK_KIND_CONSCIOUSNESS,
         "wake_reason": str(reason or "heartbeat"), "consciousness_autonomy": normalized,
         "model_role": "consciousness", "disabled_tools": disabled_tools_for(normalized),
         "runtime_mode_cap": runtime_mode_cap_for(normalized),
@@ -731,9 +735,11 @@ def bind_wake_observation(drive_root: Any, task: Dict[str, Any], observation: Wa
 
 def render_wake_message(repo_dir: Any, *, reason: str, last_wake_at: float, now: float, level: Any,
                         disabled_tools: List[str], spent_usd: Any, daily_usd: Any, running: int,
-                        max_tasks: int, interval: int, events: str, spent_is_floor: bool = False) -> str:
+                        max_tasks: int, interval: int, events: str, spent_is_floor: bool = False,
+                        spend_by_cause=None, counted_roots=None, places=None) -> str:
     """Fill ``prompts/CONSCIOUSNESS.md`` for one wake; every placeholder is substituted."""
     template = safe_read(pathlib.Path(repo_dir) / PROMPT_REL) or _FALLBACK_TEMPLATE
+    from ouroboros.consciousness_view import places_text, roots_text, spend_text
     normalized = normalize_level(level)
     spent = f"{float(spent_usd):.2f}" if isinstance(spent_usd, (int, float)) else "unknown"
     if spent_is_floor and spent != "unknown":
@@ -742,10 +748,13 @@ def render_wake_message(repo_dir: Any, *, reason: str, last_wake_at: float, now:
         "reason": str(reason or "heartbeat"),
         "last_wake_ago": _ago(now - last_wake_at) if last_wake_at else "no wake since this process started",
         "events": events or "nothing new",
-        "level": normalized, "level_line": LEVEL_LINES[normalized],
+        "level": {"observe": "Advises", "act": "Acts", "full": "Evolves"}[normalized],
+        "level_line": LEVEL_LINES[normalized],
         "withheld_tools": ", ".join(disabled_tools) if disabled_tools else "none",
         "spent_usd": spent, "daily_usd": f"{float(daily_usd):.2f}",
         "running": str(int(running)), "max_tasks": str(int(max_tasks)), "interval": str(int(interval)),
+        "spend_by_cause": spend_text(spend_by_cause), "counted_roots": roots_text(counted_roots),
+        "places": places_text(places),
     }
     # One pass: a fact (a task title inside {events}) that happens to contain "{daily_usd}"
     # is never substituted again.

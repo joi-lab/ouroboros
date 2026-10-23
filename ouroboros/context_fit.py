@@ -19,11 +19,12 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Mapping, O
 
 if TYPE_CHECKING:
     from ouroboros.context_anchor import InputAnchor
+    from ouroboros.physical_attempt_context import PhysicalAttemptContext
 
 from ouroboros.context_layout import reference_doc_sections
 from ouroboros.reference_books import ReferenceBook
-# Tool-result delivery (the whole-batch projection under the measured frame)
-# lives in ``tool_result_delivery``; the consolidator imports its contract here.
+from ouroboros import context_budget
+from ouroboros.context_window import WindowRecord, resolve_window, route_observation_scope
 from ouroboros.tool_result_delivery import project_tool_result_batch  # noqa: F401
 from ouroboros.utils import estimate_tokens
 
@@ -100,14 +101,16 @@ class MainFitMeasurement:
     # the send finalizer computes the sent value on the sealed candidate with the same rule.
     reply_allowance_tokens: int = 0
     # Provenance of the estimate (``InputAnchor``): the provider-reported input of the last request this
-    # model accepted in this conversation and its round, or None for a cold chars/4 estimate.
+    # model accepted in this conversation and its round, or None before this task has an anchor.
     anchor_input_tokens: Optional[int] = None
     anchor_round: Optional[int] = None
     anchor_rewritten: bool = False
-    # The largest input this model accepted in this task; a stated window below it is no window
-    # (``capacity_total_tokens`` is then None and ``window_reading_tokens`` keeps the stated number).
+    # The largest accepted input on this task's exact route: a planning lower bound, not reply room.
     accepted_input_tokens: Optional[int] = None
     window_reading_tokens: Optional[int] = None
+    view_kind: str = ""
+    window_witness_bound: bool = False
+    window_observation_fp: str = ""
 
 
 @dataclass(frozen=True)
@@ -120,12 +123,7 @@ class MainFitDisposition:
 
 @dataclass(frozen=True)
 class ContextFitPlan:
-    """Task-local context fit decision for the ordinary Main agent path.
-
-    The two projections are rendered from the same captured core.  The plan is
-    deliberately data-only: it neither owns provider routing nor changes the
-    owner-selected global context mode.  P3 review calls do not use this path.
-    """
+    """Task-local Main fit from one immutable capture; no global mode or review authority."""
 
     core_sha256: str
     preferred_mode: str
@@ -133,10 +131,6 @@ class ContextFitPlan:
     model: str
     provider: str
     route_fp: str
-    # Named for ``capability_evidence.CapabilityEvidence``, not paraphrased: the plan
-    # is an evidence-shaped record, so ``is_known`` applies to it DIRECTLY instead of
-    # each reader restating the three-clause freshness boolean (the wire keys stay
-    # ``evidence_status`` / ``evidence_stale``).
     status: str
     stale: bool
     window_tokens: int
@@ -149,26 +143,23 @@ class ContextFitPlan:
     evidence_source: str = ""
     nano_projection: Optional[ContextFitProjection] = None
     core: Optional["ContextCore"] = None  # the capture a new route re-renders the memory view from
+    view_kind: str = ""
+    window_record: Optional[WindowRecord] = None
+    window_witness_bound: bool = True
+    route_base_url: str = ""
 
     def reproject_for_route(self, *, window_tokens: int, known_window: bool, ratio: float, output_reserve: int,
                             tool_schemas: Optional[List[Dict[str, Any]]], start_mode: Optional[str] = None,
                             current_messages: Optional[List[Dict[str, Any]]] = None,
                             refused_tokens: int = 0, select_mode: Optional[str] = None) -> "ContextFitPlan":
-        """This plan on another route's window: fit and starting mode measured anew, shown views kept while they fit.
-
-        Measured on the actual running tail and resident schemas from ``start_mode`` (the task's mode; default
-        ``preferred_mode``). While that mode's request with its reply reserve fits a known fresh window -- a
-        smaller one included -- or the window is unknown, every view keeps its bytes: a larger window or a
-        shorter tail unfolds nothing (owner decision 2026-10-11, 2A). A request the window cannot hold, or
-        ``refused_tokens`` (an actual size refusal's calibrated deficit, at least 1), narrows each view from the
-        level it shows against the window alone (``memory_floor.render_view_for_mode``), from
-        ``core.memory_view_json`` (chronicle and chat not read again). Current Max books stay full until actual
-        refusal recovery selects another mode (``select_mode``: rendered from the level ``start_mode`` shows, never
-        its own unsent one); lower starts keep their mode. Only the owner's mode carries a target.
-        """
+        """Keep fitting shown bytes; narrow on physical deficit from the same snapshot and selected forms."""
         from dataclasses import replace
 
         contents, start, books = {}, start_mode or self.preferred_mode, ("max", "low")
+        reserve = context_budget.context_mode_limits(start, self.preferred_mode, output_reserve)[1]
+        record = resolve_window(self, reserve, bound=self.window_witness_bound) if self.window_record else None
+        if record is not None and (not known_window or record.total_equivalent != window_tokens):
+            record = None  # the caller supplied a different physical route frame
         if current_messages is None:
             retained = self.projection(start).continuation_messages_json
             if retained is not None:
@@ -198,6 +189,7 @@ class ContextFitPlan:
                     self.user_content_json, preferred=self.preferred_mode, start=start_mode, select=select_mode,
                     tool_schemas=tool_schemas,
                     window_tokens=window_tokens, known_window=known_window, output_reserve=output_reserve, ratio=ratio,
+                    window_record=record,
                     resident=True, current_messages=current_messages,  # actual running tail, enable_tools included
                     kept={mode: memory_floor.kept_level(snapshot, self.projection(mode).memory_facts)
                           for mode in memory_floor.MODES},
@@ -225,7 +217,8 @@ class ContextFitPlan:
             calibrated = int(int(projection.estimated_tokens or 0) * ratio) if projection is not None else 0
             return projection and replace(projection, calibrated_tokens=calibrated, calibration_ratio=ratio)
 
-        return replace(self, initial_mode=select_mode or start, window_tokens=window_tokens,
+        return replace(self, initial_mode=start if contents else select_mode or start, window_tokens=window_tokens,
+                       window_record=record,
                        output_reserve_tokens=output_reserve,
                        max_projection=project(self.max_projection), low_projection=project(self.low_projection),
                        nano_projection=project(self.nano_projection))
@@ -324,17 +317,13 @@ def _render_context_system_content(
     """``[A'▸, D?▸, B▸, C]``: common governance, optional handbook, identity/story, changing facts.
 
     ``story`` and ``room`` are the memory view rendered for this projection's mode and
-    window (``memory_floor.mode_views``); empty without a view.
+    selected forms; empty without a view.
     """
     return _system_blocks(core, _governance_blocks(env, core, mode=mode), story, room)
 
 
 def _governance_blocks(env: Any, core: ContextCore, *, mode: str) -> Tuple[str, ...]:
-    # D-ARCH (owner, 2026-08-08): the reference-doc form follows the RENDERED
-    # mode directly — ARCHITECTURE is full in max for every task class and the
-    # nav map in low; DEVELOPMENT inclusion is the caller's mode-independent
-    # decision carried on the core (the former per-task force_low_docs lever is
-    # gone: workspace binding no longer shapes the docs).
+    # Max carries whole reference books; Low carries chapter maps.
     static_parts = [core.base_prompt, "## BIBLE.md\n\n" + core.bible_md]
     sections, development = reference_doc_sections(
         env,
@@ -359,99 +348,63 @@ def _system_blocks(core: ContextCore, governance: Tuple[str, ...], story: str = 
     ]
 
 
-def seal_task_transcript(
-    messages: List[Dict[str, Any]],
-    keep_active: int = 5,
-    min_prefix_tokens: int = 2048,
-) -> None:
+def seal_task_transcript(messages: List[Dict[str, Any]], min_prefix_tokens: int = 2048) -> None:
     """Mark ONE stable message-side boundary for provider prompt caching.
 
-    Until enough tool results exist to seal a rolling boundary among them, the
-    boundary is the task message itself: without it everything after the
-    SYSTEM markers -- the mutable context block and the task contract -- is
-    re-sent uncached every round, which is exactly the short-lived nanny and
-    leaf shape. The marker MIGRATES to the rolling tool seal in the same call
-    that first qualifies. Anthropic permits four breakpoints: A', optional D,
-    B and this one. The finalizer marks schemas only if a slot remains; keeping
-    both message boundaries could exceed the cap and lose the rolling seal.
+    The boundary is the newest user or tool row with text, so no tool result
+    waits outside it (#596) and a tool-free stretch advances it too (#1186).
+    Assistant turns, replayed native content included, never carry it; an
+    empty or opaque tool result is skipped (``logical_tool_result_text``). The
+    loop normally seals before fresh facts, clock and answer; a recovery
+    reseal can include existing facts. Until that prefix is worth a breakpoint the
+    task message is the anchor: without it everything after the SYSTEM markers
+    -- the mutable context block and the task contract -- is re-sent uncached
+    every round, the short-lived nanny and leaf shape. A message without text
+    is never marked: Anthropic rejects a marker on an empty text block.
+
+    The mark is host-only, a message-level ``cache_control``: the send copies
+    of marker-carrying routes render it on the row's last non-empty text block
+    and every other copy drops it, so canonical content, host-row bindings and
+    a marker-free route's bytes never change. Anthropic permits four
+    breakpoints: A', optional D, B and this one; the finalizer marks schemas
+    only if a slot remains. The old in-place seal is undone without another
+    shape change: a text-only tool list flattens to its exact text, as every
+    seal has done, and a block-list task message only loses its markers.
     """
     from ouroboros.tool_result_record import logical_tool_result_text
 
     for msg in messages:
-        if msg.get("role") != "tool":
-            continue
+        msg.pop("cache_control", None)  # this function's previous boundary
         content = msg.get("content")
-        if isinstance(content, list) and (plain := logical_tool_result_text(content)) is not None:
-            # Flatten the old sealed boundary before choosing a new one.
+        if msg.get("role") == "tool" and isinstance(content, list) and (
+                plain := logical_tool_result_text(content)) is not None:
             msg["content"] = plain
     first_user = next((m for m in messages if m.get("role") == "user"), None)
     if isinstance(first_user, dict) and isinstance(first_user.get("content"), list):
-        # Drop this function's own previous task-message marker, so exactly one
-        # message-side breakpoint survives whichever branch runs below.
         for block in first_user["content"]:
             if isinstance(block, dict):
                 block.pop("cache_control", None)
 
-    tool_indices = [
-        i for i, m in enumerate(messages)
-        if m.get("role") == "tool"
-    ]
-    if len(tool_indices) <= keep_active:
-        _mark_task_message(first_user)
-        return
+    def has_text(message: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(message, dict) or message.get("role") not in {"user", "tool"}:
+            return False
+        content = message.get("content")
+        if message["role"] == "tool":
+            return bool((logical_tool_result_text(content) or "").strip())
+        if isinstance(content, str):
+            return bool(content.strip())
+        return isinstance(content, list) and any(
+            isinstance(block, dict) and block.get("type") == "text" and str(block.get("text") or "").strip()
+            for block in content)
 
-    seal_candidate_idx = next((i for i in reversed(tool_indices[:len(tool_indices) - keep_active])
-                               if (logical_tool_result_text(messages[i].get("content")) or "").strip()), None)
-    if seal_candidate_idx is None:
-        _mark_task_message(first_user)
-        return
-
-    prefix_text_len = sum(
-        len(extract_plain_text_from_content(m.get("content", "")))
-        for m in messages[: seal_candidate_idx + 1]
-    )
-    prefix_tokens = prefix_text_len // 4  # rough 4-chars-per-token estimate
-
-    if prefix_tokens < min_prefix_tokens:
-        # Not yet a worthwhile rolling boundary: the task message stays the anchor.
-        _mark_task_message(first_user)
-        return
-
-    candidate = messages[seal_candidate_idx]
-    # An empty output remains exact; provider-only padding belongs to the send copy.
-    plain_text = logical_tool_result_text(candidate.get("content"))
-    candidate["content"] = [
-        {
-            "type": "text",
-            "text": plain_text,
-            "cache_control": {"type": "ephemeral"},
-        }
-    ]
-
-def _mark_task_message(message: Optional[Dict[str, Any]]) -> None:
-    """Anchor the prefix on the task message's last non-empty text block.
-
-    Anthropic rejects a marker on an empty text block, so a task message with
-    no text at all is left unmarked rather than padded: the same rule the
-    rolling tool seal enforces on empty tool output."""
-    if not isinstance(message, dict):
-        return
-    content = message.get("content")
-    if isinstance(content, str):
-        if not content.strip():
-            return
-        content = [{"type": "text", "text": content}]
-        message["content"] = content
-    if not isinstance(content, list):
-        return
-    for block in reversed(content):
-        if (
-            isinstance(block, dict)
-            and block.get("type") == "text"
-            and str(block.get("text") or "").strip()
-        ):
-            block["cache_control"] = {"type": "ephemeral"}
-            return
+    index = next((i for i in range(len(messages) - 1, -1, -1) if has_text(messages[i])), None)
+    boundary = messages[index] if index is not None else None
+    if boundary is not None and boundary is not first_user and sum(
+            len(extract_plain_text_from_content(m.get("content", ""))) for m in messages[:index + 1]
+    ) // 4 < min_prefix_tokens:  # rough 4-chars-per-token estimate
+        boundary = first_user  # not yet a worthwhile rolling boundary: the task message anchors
+    if has_text(boundary):
+        boundary["cache_control"] = {"type": "ephemeral"}
 
 
 def tool_schema_tokens(tools: Optional[List[Dict[str, Any]]]) -> int:
@@ -562,8 +515,10 @@ def _route_calibration_ratio(
     drive_root: Optional[pathlib.Path],
     route_fp: str,
     model: str,
+    estimate_tokens: Optional[int] = None,
+    *, view_kind: str = "",
 ) -> float:
-    """Fresh exact-route/model witness, never an event-tail or orphan maximum.
+    """Fresh comparable-input exact-route/model witness, never an orphan maximum.
 
     ``None`` reads the canonical host evidence root (one observation store).
     """
@@ -573,7 +528,8 @@ def _route_calibration_ratio(
         )
 
         root = drive_root if drive_root is not None else canonical_evidence_root()
-        return float(resolve_main_token_density(root, route_fp, model)[0])
+        return float(resolve_main_token_density(root, route_fp, model, estimate_tokens=estimate_tokens,
+                                               view_kind=view_kind)[0])
     except Exception:
         log.debug("Fresh route token calibration unavailable", exc_info=True)
         return 1.0
@@ -611,21 +567,23 @@ def measure_main_fit(
     """Measure one sealed Main candidate against owner target T and route W.
 
     The estimate is this conversation's own: ``anchor`` (``context_anchor.main_input_anchor``) scales the raw
-    estimate by the last accepted request of this model, and without one it is the cold raw
-    estimate. A stated window below ``accepted_input_tokens`` is no window (unknown). The deficits,
+    estimate by the last accepted request on this route. Without one, a fresh exact-route/model/view witness
+    of comparable input size calibrates it; absent that, it stays cold. Acceptance raises a planning lower bound. The deficits,
     the reclaim goal (deficit + ``reclaim_low_water_margin``) and the reply allowance are facts for
-    the round and for refusal recovery; a prediction never starts a pass by itself (owner 7A).
+    the round and recovery. A known window with no tool-result room starts the same refusal
+    passes before sending (owner revision, 20 October 2026); an unknown window never does.
     Both deficits count the reply floor the fit leaves (Nano: ``min(8192, C)``); the reply the
     candidate will actually get is ``reply_allowance_tokens``.
     """
-    from ouroboros.capability_evidence import is_known
+    from ouroboros.capability_evidence import canonical_evidence_root, is_known, resolve_main_token_density
     from ouroboros.context_budget import (
         OWNER_LOW_TARGET_TOKENS, OWNER_NANO_TARGET_TOKENS, NANO_MIN_HEADROOM_TOKENS, reply_allowance_tokens,
     )
 
-    density = float(anchor.density) if anchor is not None else 1.0
-    basis: MeasurementBasis = "fresh_route_usage" if anchor is not None else "cold_estimate"
     raw_input = int(estimate_context_prompt_tokens(messages, tools, provider=plan.provider, reasoning_effort=reasoning_effort))
+    density, basis = ((float(anchor.density), "fresh_route_usage") if anchor is not None else
+                      resolve_main_token_density(canonical_evidence_root(), plan.route_fp, plan.model,
+                                                 estimate_tokens=raw_input, view_kind=plan.view_kind))
     estimated_input = int(math.ceil(raw_input * density))
     ceiling = int(plan.output_reserve_tokens or 0)
     nano = profile.endswith("_nano")
@@ -633,11 +591,12 @@ def measure_main_fit(
     total = estimated_input + reserve
     target = (OWNER_NANO_TARGET_TOKENS if profile == "owner_nano"
               else OWNER_LOW_TARGET_TOKENS if profile == "owner_low" else None)
-    from ouroboros.context_anchor import floored_window
-
     reading = int(plan.window_tokens or 0) if is_known(plan, require_fresh=True) else None
-    floored, known = floored_window(reading, reading is not None, accepted_input_tokens)
-    capacity = floored if known else None
+    current = resolve_window(plan, reserve, bound=plan.window_witness_bound,
+                             accepted_input_tokens=accepted_input_tokens)
+    capacity = current.total_equivalent if current.usable is not None else None
+    if capacity is None:
+        reading = None
     target_deficit = max(0, total - target) if target is not None else None
     capacity_deficit = max(0, total - capacity) if capacity is not None else None
     deficit = max(
@@ -647,6 +606,7 @@ def measure_main_fit(
     margin = reclaim_low_water_margin(target, capacity) if deficit > 0 else 0
     goal = deficit + margin
     measurement = MainFitMeasurement(
+        view_kind=plan.view_kind,
         route_fp=str(plan.route_fp or ""),
         round_id=str(round_id or ""),
         profile=profile,
@@ -670,6 +630,8 @@ def measure_main_fit(
         anchor_rewritten=bool(anchor is not None and anchor.rewritten),
         accepted_input_tokens=accepted_input_tokens,
         window_reading_tokens=reading,
+        window_witness_bound=plan.window_witness_bound,
+        window_observation_fp=current.route_fp,
     )
     action: Literal["send", "send_target_miss"] = (
         "send_target_miss" if target_deficit and target_deficit > 0 else "send")
@@ -706,6 +668,7 @@ def _context_route(task: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]
             credential_profile_id=account,
             model_route=task.get("model_route"),
         )
+    route["window_observation_fp"] = route_observation_scope(route, settings)
     return route, settings
 
 
@@ -736,6 +699,10 @@ def resolve_context_fit_route(
         allow_fetch=allow_fetch,
         options=route["options"] or None,
     )
+    if route["provider"] == "claudexor" and getattr(evidence, "account_fingerprint", ""):  # the account receipts name
+        route["options"] = {**route["options"], **{key: getattr(evidence, key) for key in (
+            "source_id", "credential_profile_id", "account_fingerprint")}}
+        route["window_observation_fp"] = route_observation_scope(route, settings)
     window = int(model_role_option(MODEL_CONTEXT_WINDOWS_KEY, route["model_role"],
                                    settings=settings))
     if window:
@@ -786,40 +753,91 @@ def _request_tokens(system_content: List[Dict[str, Any]], user_content_json: str
     return estimate_context_prompt_tokens([{"role": "system", "content": system_content}, *tail])
 
 
+class MinimumViewUnfit(ValueError):
+    """The core, assignment, resident tools and work room cannot fit this route."""
+    physical = True  # False: the request itself fits the window, only the start work room beside it does not
+
+
 def _view_projections(core: ContextCore, governance: Mapping[str, Tuple[str, ...]], user_content_json: str, *, preferred: str,
                       tool_schemas: Optional[List[Dict[str, Any]]], window_tokens: int, known_window: bool, output_reserve: int,
                       ratio: float, start: Optional[str] = None, resident: bool = False,
                       current_messages: Optional[List[Dict[str, Any]]] = None,
                       kept: Optional[Mapping[str, Any]] = None, saving: Optional[Mapping[str, int]] = None,
-                      select: Optional[str] = None,
+                      select: Optional[str] = None, window_record: Optional[WindowRecord] = None, work_room_levels: int = 1,
                       ) -> Tuple[Dict[str, Tuple[List[Dict[str, Any]], Dict]], str]:
-    """Each mode's ``(system content, view receipt)`` and the mode the task starts in.
-
-    ``governance`` is A' and optional D by book form. A mode's fixed part is its request without my memory
-    plus the schemas it sends: the owner-mode selection of ``tool_schemas`` on the first request,
-    or, ``resident``, the list a running task already sends (an ``enable_tools`` addition counts,
-    whatever the mode). View and starting mode are ``memory_floor.mode_views`` of the core's
-    snapshot, so a new route re-renders both from the same capture; ``kept``/``saving`` narrow
-    the shown views from their own levels and ``select`` is a mode an actual refusal chose
-    (``ContextFitPlan.reproject_for_route``).
-    """
-    form = {mode: "low" if core.compact_reference_docs or mode == "nano" else mode for mode in ("max", "low", "nano")}
-    if not core.memory_view_json:
-        return {mode: (_system_blocks(core, governance[form[mode]]), {}) for mode in form}, start or preferred
-    from ouroboros import memory_floor
-    from ouroboros.memory_view import snapshot_from_json
+    """Select books once, walk memory once. Unsent book forms share the selected memory, not another budget."""
+    from dataclasses import replace
+    from ouroboros import memory_floor as floor
+    from ouroboros.memory_view import snapshot_from_json, render_story
     from ouroboros.tool_policy import select_tool_schemas
+
+    mode = select or start or preferred
+    form = {m: "low" if core.compact_reference_docs or m == "nano" else m for m in floor.MODES}
+    snapshot = snapshot_from_json(core.memory_view_json) if core.memory_view_json else None
     names = [schema["function"]["name"] for schema in tool_schemas or []] if resident else None
-    sent = {mode: select_tool_schemas(tool_schemas or [], context_mode=mode, schema_names=names) for mode in form}
-    fixed = {mode: _request_tokens(_system_blocks(core, governance[form[mode]]), user_content_json,
-                supplementary_messages_json=core.supplementary_messages_json, current_messages=current_messages)
-             + tool_schema_tokens(list(sent[mode].schemas)) for mode in form}
-    views, start = memory_floor.mode_views(snapshot_from_json(core.memory_view_json), preferred=preferred, start=start,
-        fixed_tokens_by_mode=fixed, tool_names=None if tool_schemas is None else {m: sent[m].chosen for m in form},
-        window_tokens=window_tokens, known_window=known_window, output_reserve=output_reserve, ratio=ratio,
-        allow_mode_lowering=preferred != "max" or start in {"low", "nano"}, kept=kept, saving=saving, select=select)
-    return {mode: (_system_blocks(core, governance[form[mode]], story, room), receipt)
-            for mode, (story, room, receipt) in views.items()}, start
+
+    def frame(selected):
+        sent = select_tool_schemas(tool_schemas or [], context_mode=selected, schema_names=names)
+        fixed = _request_tokens(_system_blocks(core, governance[form[selected]]), user_content_json,
+            supplementary_messages_json=core.supplementary_messages_json, current_messages=current_messages)
+        fixed += tool_schema_tokens(list(sent.schemas))
+        target, reserve = context_budget.context_mode_limits(selected, preferred, output_reserve)
+        record = replace(window_record, reserve=reserve) if window_record else None
+        window = record.total_equivalent if record and record.usable is not None else window_tokens
+        boundary = record.boundary if record else None
+        allowances = floor.floor_allowances(window_tokens=window if known_window else None,
+            output_reserve_tokens=reserve, non_memory_tokens=fixed, target_tokens=target if kept is None else None,
+            calibration_ratio=ratio, work_room_levels=snapshot.spec.work_room_levels if snapshot else work_room_levels,
+            boundary_tokens=boundary)
+        return sent, fixed, reserve, window, boundary, allowances
+
+    sent, fixed, reserve, window, boundary, allowances = frame(mode)
+    original_fixed, original_reserve = fixed, reserve
+    if kept is not None and known_window:
+        minimum = floor.minimal_view_tokens(snapshot, window_tokens=window) if snapshot else 0
+        while mode != "nano" and math.ceil((fixed + minimum) * ratio) + reserve > window:
+            mode = "low" if mode == "max" else "nano"
+            sent, fixed, reserve, window, boundary, allowances = frame(mode)
+    def work():
+        target = context_budget.context_mode_limits(mode, preferred, output_reserve)[0]
+        return math.ceil(min(boundary or window, target or window) / context_budget.RECLAIM_LOW_WATER_DIVISOR) * (
+            snapshot.spec.work_room_levels if snapshot else work_room_levels)
+
+    # Max names whole books. Story is the last rung: change books before taking its pages.
+    whole_story = render_story(snapshot) if snapshot else ""
+    if kept is None and mode == "max" and allowances["margin"] is not None:
+        if floor.view_tokens(whole_story) > allowances["margin"] or math.ceil(fixed * ratio) + reserve + work() > window:
+            mode = "low"
+            sent, fixed, reserve, window, boundary, allowances = frame(mode)
+    if kept is None and known_window and math.ceil(fixed * ratio) + reserve + work() > window:
+        unfit = MinimumViewUnfit(f"Core, assignment, resident control tools and work room cannot fit: "
+                                 f"{math.ceil(fixed * ratio)} input + {reserve} reply + {work()} work > {window} tokens")
+        minimum = floor.minimal_view_tokens(snapshot, window_tokens=window) if snapshot else 0
+        unfit.physical = math.ceil((fixed + minimum) * ratio) + reserve > window  # with my shortest memory view
+        raise unfit
+
+    def render():
+        saved = max(0, (saving or {}).get(start or preferred, 0) - (original_fixed - fixed)
+                    - math.floor((original_reserve - reserve) / max(ratio, 0.01)))
+        return floor.render_view_for_mode(snapshot, mode=mode, owner_mode=preferred,
+            window_tokens=window, known_window=known_window, output_reserve=output_reserve, ratio=ratio,
+            non_memory_tokens=fixed, lowered_from=preferred if mode != preferred else None,
+            tool_names=None if tool_schemas is None else sent.chosen,
+            kept=None if kept is None else kept.get(start or preferred), saving=saved, boundary_tokens=boundary)
+    if snapshot:
+        story, room, facts = render()
+        # Judged on the completed start view: Max keeps whole books only beside the whole story and the work room.
+        if kept is None and mode == "max" and allowances["margin"] is not None and (
+                story != whole_story or floor.view_tokens(story) + floor.view_tokens(room) > allowances["margin"]):
+            mode = "low"
+            sent, fixed, reserve, window, boundary, allowances = frame(mode)
+            story, room, facts = render()
+        if kept is None and known_window and math.ceil((fixed + floor.view_tokens(story) + floor.view_tokens(room)) * ratio) + reserve > window:
+            raise MinimumViewUnfit("Protected owner words and the minimum view cannot fit the usable input")
+        receipt = floor.view_receipt(snapshot, story, room, facts)
+    else:
+        story, room, receipt = "", "", {}
+    return {m: (_system_blocks(core, governance[form[m]], story, room), receipt) for m in floor.MODES}, mode
 
 
 def build_context_fit_plan(
@@ -831,13 +849,7 @@ def build_context_fit_plan(
     route_resolver: Callable[..., Tuple[Dict[str, Any], Any]],
     tool_schemas: Optional[List[Dict[str, Any]]] = None,
 ) -> ContextFitPlan:
-    """Deterministically project one captured core into ordinary-task Max, Low and Nano.
-
-    Each mode renders the captured memory view against its own fixed part: the books
-    of its view, the tool schemas it would send (``tool_schemas``, Nano's selection of
-    them) and its reply reserve; the physical floor decides what of my memory that
-    mode shows only by address (``memory_floor.render_view_for_mode``).
-    """
+    """Capture route facts, choose books and fit one start view."""
     preferred = str(preferred_mode or "max").strip().lower()
     if preferred not in {"low", "max", "nano"}:
         preferred = "max"
@@ -856,69 +868,51 @@ def build_context_fit_plan(
     # Keep the fit projection tied to the physical dispatch contract instead of
     # duplicating its output reservation.  The lazy import avoids coupling the
     # data-only fit representation to the high-level model loop.
-    from ouroboros.capability_evidence import is_known
-
-    output_reserve = main_output_reserve_tokens(use_local=bool(route.get("use_local")), evidence=evidence)
-    # One observation store: witnesses are written at settlement into the
-    # canonical host root, so a child task's own drive must not be consulted.
-    ratio = _route_calibration_ratio(
-        None,
-        str(evidence.route_fp or ""),
-        str(route["model"] or ""),
-    )
-    known_window = is_known(evidence, require_fresh=True)
-    input_source = None
-    contents, initial_mode = _view_projections(
-        core, {form: _governance_blocks(env, core, mode=form) for form in ("max", "low")}, core.user_content_json,
-        preferred=preferred, tool_schemas=tool_schemas, window_tokens=int(evidence.window_tokens or 0),
-        known_window=known_window, output_reserve=output_reserve, ratio=ratio)
-
-    from ouroboros.context_budget import context_mode_limits
     from ouroboros.tool_policy import select_tool_schemas
 
-    # The task-input pointer is decided on the calibrated Nano request: the schemas it sends and its reply floor.
-    nano_sent_tokens = tool_schema_tokens(list(select_tool_schemas(tool_schemas or [], context_mode="nano").schemas))
-    nano_reserve = context_mode_limits("nano", preferred, output_reserve)[1]
-    window = int(evidence.window_tokens or 0) if known_window else 0
+    output_reserve = main_output_reserve_tokens(use_local=bool(route.get("use_local")), evidence=evidence)
+    scope = route.get("window_observation_fp", evidence.route_fp)
+    bound = bool(scope) and (route.get("provider") != "claudexor" or bool((route.get("options") or {}).get("account_fingerprint")))
+    window_record = resolve_window(evidence, output_reserve, bound=bound, observation_fp=scope)
+    known_window = window_record.usable is not None
+    view_args = dict(
+        preferred=preferred, tool_schemas=tool_schemas, window_tokens=window_record.total_equivalent,
+        known_window=known_window, output_reserve=output_reserve, window_record=window_record)
+    governance = {form: _governance_blocks(env, core, mode=form) for form in ("max", "low")}
+    from ouroboros.memory_view import start_room, view_role
 
-    def nano_total(tokens: int) -> int:
-        return math.ceil((tokens + nano_sent_tokens) * ratio) + nano_reserve
-
+    view_task = {**task, "metadata": task.get("metadata") or meta}
+    role = view_role(view_task)
+    view_kind = {"consciousness": "own_wake", "presence": "focus", "integrator": "owner_turn"}.get(role, role)
+    # Select the route/view density from the whole capture before making one floor decision.
+    from ouroboros.memory_view import render_story, render_room, snapshot_from_json
+    snapshot = snapshot_from_json(core.memory_view_json) if core.memory_view_json else None
+    full = _system_blocks(core, governance["low" if preferred == "nano" else preferred],
+                          render_story(snapshot) if snapshot else "", render_room(snapshot) if snapshot else "")
+    ratio = _route_calibration_ratio(None, str(evidence.route_fp or ""), str(route["model"] or ""),
+        estimate_context_prompt_tokens([{"role": "system", "content": full}, {"role": "user", "content": user_content},
+            *json.loads(core.supplementary_messages_json)],
+            list(select_tool_schemas(tool_schemas or [], context_mode=preferred).schemas),
+            provider=str(route.get("provider") or "")), view_kind=view_kind)
+    levels, pointer = start_room(view_task, role), None
+    try:
+        contents, initial_mode = _view_projections(core, governance, core.user_content_json, **view_args, ratio=ratio,
+                                                   work_room_levels=levels)
+    except MinimumViewUnfit as unfit:
+        # Physical rescue only (owner 2026-10-13, #1527): the exact source pointer replaces the whole input only when the
+        # owner-Nano request itself overflows; a room-only shortfall or an unfit pointer request names the start (7A).
+        from ouroboros.context_input_selection import task_input_pointer
+        pointer = task_input_pointer(env, task, core.user_content_json) if preferred == "nano" and unfit.physical else None
+        if pointer is None:
+            raise
+        contents, initial_mode = _view_projections(core, governance, pointer, **view_args, ratio=ratio,
+                                                   work_room_levels=levels)
     def _projection(mode: str) -> ContextFitProjection:
-        nonlocal input_source
-
         system_content, memory_facts = contents[mode]
         system_content_json = json.dumps(system_content, ensure_ascii=False, sort_keys=True)
-        estimated = _request_tokens(system_content, core.user_content_json,
+        user_projection = pointer if mode == "nano" else None
+        estimated = _request_tokens(system_content, user_projection or core.user_content_json,
                                     supplementary_messages_json=core.supplementary_messages_json)
-        user_projection = None
-        # Physical rescue only: the owner's words are delivered whole unless a known fresh window cannot hold
-        # this request and the pointer request fits it. The Nano target never hides them, and neither does
-        # an unknown window (owner decision 2026-10-13, #1527).
-        if preferred == "nano" and mode == "nano" and window and nano_total(estimated) > window:
-            # The original owner input stays exact in the captured core and
-            # existing source store. Only its initial Nano delivery changes;
-            # this is neither the external-assignment compiler nor a summary.
-            try:
-                from ouroboros.artifacts import store_actor_source_bytes
-                if input_source is None:
-                    input_source = store_actor_source_bytes(env.drive_root, str(task["id"]),
-                        category="context_checkpoints", source_id="task_input",
-                        data=core.user_content_json.encode("utf-8"), extension="json")
-                source_content = (
-                    "[Exact task input source]\nThe complete original user input is stored as JSON at this source. "
-                    "Read its full content through the given reader in ranges before substantive decisions. "
-                    "This pointer is not a summary or a change to the task.\n"
-                    + json.dumps(input_source, ensure_ascii=False, sort_keys=True)
-                )
-                source_estimate = estimate_context_prompt_tokens([
-                    {"role": "system", "content": json.loads(system_content_json)},
-                    {"role": "user", "content": source_content}, *json.loads(core.supplementary_messages_json)])
-                if nano_total(source_estimate) <= window:
-                    user_projection = json.dumps(source_content, ensure_ascii=False)
-                    estimated = source_estimate
-            except (OSError, ValueError, KeyError):
-                log.warning("Exact task input source could not be retained; preserving complete input", exc_info=True)
         return ContextFitProjection(
             mode=mode,
             system_content_json=system_content_json,
@@ -932,9 +926,6 @@ def build_context_fit_plan(
     max_projection = _projection("max")
     low_projection = _projection("low")
     nano_projection = _projection("nano")
-    # Prediction fits memory granularity but never removes current Max books, even when
-    # the shortest estimated view misses the window. Actual refusal recovery selects Low;
-    # owner Low/Nano and already-lowered starts retain their existing sizing behavior.
 
     core_payload = json.dumps(
         {
@@ -959,15 +950,16 @@ def build_context_fit_plan(
         sort_keys=True,
     )
     return ContextFitPlan(
+        view_kind=view_kind,
         core_sha256=hashlib.sha256(core_payload.encode("utf-8")).hexdigest(),
         preferred_mode=preferred,
         initial_mode=initial_mode,
         model=str(route["model"] or ""),
         provider=str(route["provider"] or ""),
         route_fp=str(evidence.route_fp or ""),
-        status=str(evidence.status or ""),
-        stale=bool(evidence.stale),
-        window_tokens=int(evidence.window_tokens or 0),
+        status="confirmed" if known_window else str(evidence.status or ""),
+        stale=False if known_window else bool(evidence.stale),
+        window_tokens=window_record.total_equivalent,
         output_reserve_tokens=output_reserve,
         user_content_json=core.user_content_json,
         max_projection=max_projection,
@@ -980,6 +972,29 @@ def build_context_fit_plan(
             "credentialProfileId": str(getattr(evidence, "credential_profile_id", "") or ""),
             "accountFingerprint": str(getattr(evidence, "account_fingerprint", "") or ""),
         } if route["provider"] == "claudexor" else {},
-        evidence_source=str(getattr(evidence, "source", "") or ""),
+        evidence_source=window_record.source, window_record=window_record, window_witness_bound=bound,
+        route_base_url=str(route.get("base_url") or ""),
         core=core,
+    )
+
+
+def _physical_context_for_fit(disposition: Any) -> PhysicalAttemptContext:
+    from ouroboros.usage_accounting import PhysicalAttemptContext
+
+    measurement = disposition.measurement
+    return PhysicalAttemptContext(
+        view_kind=measurement.view_kind,
+        profile=measurement.profile,
+        rendered_mode=measurement.rendered_mode,
+        measurement_basis=measurement.measurement_basis,
+        route_fp=measurement.route_fp,
+        round_id=measurement.round_id,
+        target_total_tokens=measurement.target_total_tokens,
+        capacity_total_tokens=measurement.capacity_total_tokens,
+        context_target_miss=disposition.action == "send_target_miss",
+        automatic_pass_used=disposition.automatic_pass_used,
+        measurement_density=measurement.measurement_density,
+        response_reserve_tokens=measurement.response_reserve_tokens,
+        window_witness_bound=getattr(measurement, "window_witness_bound", False),
+        window_observation_fp=measurement.window_observation_fp,
     )

@@ -452,11 +452,12 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         "promotion_admission_token": admission_token,
         **_promoted_force_plan_metadata(evt),
     }
-    origin = consciousness_origin_metadata(evt)
+    origin = consciousness_origin_metadata({"origin_message_ref": evt.get("source_ref"), **evt})
     if origin:
         # A root consciousness started keeps its origin/category/level by value (В9':
         # ordinary Main flow, no presence-style project/workspace/source stripping).
-        task["actor_id"] = "consciousness"
+        if origin.get("initiator") == "consciousness":
+            task["actor_id"] = "consciousness"
         task.setdefault("metadata", {}).update(origin)
         apply_consciousness_authority(task)
     inherited_attachment_manifest = _pool()._apply_presence_promotion_authority(
@@ -643,7 +644,7 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
         workspace_repair_hint,
     )
 
-    if _presence_promotion(evt):
+    if _presence_promotion(evt) and "capability_ceiling" in (task.get("task_contract") or {}):
         # Keep the admitted folder from the inherited contract, never a public
         # event's replacement. Presence retains its canonical shared memory.
         workspace = task["task_contract"].get("workspace") or {}
@@ -803,6 +804,11 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
             )
             + "[END_HEADLESS_WORKSPACE]"
         )
+    if _presence_promotion(evt):
+        # Ordinary admission owns this root's folder, including no folder.
+        # Do not let the promoter's retained workspace override it on attachment.
+        task["task_contract"] = {key: value for key, value in task["task_contract"].items()
+                                 if key not in {"workspace", "workspace_root", "workspace_mode"}}
     return None
 
 

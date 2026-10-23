@@ -182,13 +182,13 @@ def test_presence_rows_of_one_room_share_one_label_from_transport_facts():
     initiated = {"chat_id": chat_id, "direction": "in", "transport": dict(base)}
     summary = {"chat_id": chat_id, "direction": "system", "type": "task_summary",
                "presence_provenance": {**base, "binding_id": "1" * 32}}  # the turn's summary row carries no transport
-    expected = f"Presence telegram -100 [chat_id={chat_id}]"
+    expected = f"Place telegram -100 [chat_id={chat_id}]"
     # One room, four row types, one label: the correspondent-controlled title never enters it.
     assert {resolver.label(inbound), resolver.label(receipt), resolver.label(initiated), resolver.label(summary)} == {expected}
     assert resolver.label({**summary, "presence_provenance": {**base, "conversation_id": "-101"}}) == f"Unknown room [chat_id={chat_id}]"
     topic_chat = _stable_numeric_id("presence-conversation", conversation_key("telegram", "900", "-100", "42"))
     assert resolver.label({"chat_id": topic_chat, "transport": {**base, "thread_id": "42"}}) == (
-        f"Presence telegram -100 topic 42 [chat_id={topic_chat}]"
+        f"Place telegram -100 topic 42 [chat_id={topic_chat}]"
     )
     # Transport facts that do not re-derive this exact chat id never name the room.
     assert resolver.label({"chat_id": chat_id + 1, "transport": dict(base)}) == f"Unknown room [chat_id={chat_id + 1}]"
@@ -196,7 +196,7 @@ def test_presence_rows_of_one_room_share_one_label_from_transport_facts():
     # Brackets in a provider fact can never break the [room=...] marker.
     weird_chat = _stable_numeric_id("presence-conversation", conversation_key("telegram", "900", "x]y[z", ""))
     assert resolver.label({"chat_id": weird_chat, "transport": {**base, "conversation_id": "x]y[z"}}) == (
-        f"Presence telegram x y z [chat_id={weird_chat}]"
+        f"Place telegram x y z [chat_id={weird_chat}]"
     )
 
 
@@ -218,7 +218,7 @@ def test_terminal_projection_row_of_a_presence_turn_carries_the_room_facts(tmp_p
     row = next(json.loads(line) for line in dialogue_test.log_text(tmp_path / "logs" / "chat.jsonl").splitlines()
                if json.loads(line).get("type") == "task_summary")
     assert row["presence_provenance"]["conversation_id"] == "-100"
-    assert RoomLabelResolver(projects=[]).label(row) == f"Presence telegram -100 [chat_id={chat_id}]"
+    assert RoomLabelResolver(projects=[]).label(row) == f"Place telegram -100 [chat_id={chat_id}]"
     # A non-presence terminal row carries no presence facts at all.
     write_task_result(tmp_path, "plain-task", "completed", result="Done")
     plain = __import__("ouroboros.task_results", fromlist=["load_task_result"]).load_task_result(tmp_path, "plain-task")

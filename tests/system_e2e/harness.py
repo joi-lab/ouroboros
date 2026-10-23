@@ -146,6 +146,7 @@ SCENARIOS = {
     "S39": ("container lifecycle: the managed image boots a released seed into a body checkout and runtime venv on volumes (parent and split layouts), keeps code, packages and data across recreation, stays stopped after Panic until an owner start, refuses a mounted repository and a second container on shared data; the immutable image admits one server per data volume and, networkless, serves onboarding, a project, a task with a child and an artifact across a restart; an Update adding a local-wheel dependency survives an offline recreation, a task imports it, and rollback restores the old lock with the package disclosed", LANE_CONTAINER),
     # #1729/#1730 in real processes: one worker frozen past the idle window is reaped by a real kill.
     "S40": ("idle retry under the owner's Pause: after a Pause and a consumed Resume (and without them) a real worker frozen past the idle window is reaped by a real kill; its new-ID retry dispatches with no spent Resume and continues the saved work; a Pause of that running retry fences its logical root, a model write served after the acceptance never lands while one before it did, one Resume reopens the tree and Stop ends it", LANE_MOCK),
+    "S41": ("live skill-smoke adapter: ordinary author, one independent rebuttal, immutable payload, true/unknown criticism red, tool-policy and identity controls", LANE_MOCK),
 }
 
 MOCK_SLUG = "openai-compatible::mock-model"
@@ -206,7 +207,7 @@ _NATIVE_SURFACE_KINDS = {
 MARKER_SOURCES = {
     REVIEWER_SLOT_MARKER: "ouroboros/review_execution.py",
     TRIAD_USER_MARKER: "ouroboros/tools/review_multi_model.py",   # TRIAD_USER_TURN: the one literal the send and the admission share
-    SKILL_REVIEW_MARKER: "ouroboros/skill_review_prompt.py",
+    SKILL_REVIEW_MARKER: "ouroboros/tools/review_skill.py",
     PLAN_REVIEW_MARKER: "ouroboros/tools/plan_packet.py",
     NATIVE_EPISODE_MARKER: "ouroboros/review_native_episode.py",
 }
@@ -323,11 +324,9 @@ def canned_review_answer(kind: str) -> dict | None:
     if kind == "safety":
         return {"role": "assistant",
                 "content": json.dumps({"status": "SAFE", "reason": "stub"})}
-    if kind == "skill_review":
-        return {"role": "assistant", "content": skill_review_clean_text()}
     if kind == "two_part_review":
         return {"role": "assistant", "content": two_part_clean_text()}
-    if kind == "triad_review":
+    if kind in ("triad_review", "skill_review"):
         return {"role": "assistant", "content": TRIAD_CLEAN_TEXT}
     if kind == "reviewer_slot":
         return {"role": "assistant", "content": reviewer_slot_clean_text()}
@@ -347,13 +346,13 @@ def canned_review_answer(kind: str) -> dict | None:
 def skill_review_clean_text() -> str:
     """All-PASS skill-review verdict over the tree's OWN checklist items.
 
-    The item list is imported from the prompt module (its ``_SKILL_REVIEW_ITEMS``
-    is both the prompt's expected-items contract and the parser's required set),
+    The item list is imported from the skill subject module (its ``SKILL_REVIEW_ITEMS``
+    is the closed list a finding may name),
     so an upstream checklist change re-derives the canned verdict instead of
     silently failing coverage. Lazy import: the skill-review module tree is heavy
     and only skill scenarios pay for it.
     """
-    from ouroboros.skill_review_prompt import _SKILL_REVIEW_ITEMS
+    from ouroboros.tools.review_skill import SKILL_REVIEW_ITEMS
 
     return json.dumps([
         {
@@ -362,7 +361,7 @@ def skill_review_clean_text() -> str:
             "severity": "advisory",
             "reason": "Stub skill reviewer: checked and clean for the scripted E2E payload.",
         }
-        for item in _SKILL_REVIEW_ITEMS
+        for item in SKILL_REVIEW_ITEMS
     ])
 
 

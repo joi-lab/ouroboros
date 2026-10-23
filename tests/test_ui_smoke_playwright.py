@@ -195,7 +195,7 @@ def test_ui_projects_sidebar_unread_and_keyboard_menu(direct_server_with_data):
                 kebab = page.locator('.nav-project-kebab[aria-label="Actions for Alpha project"]')
                 kebab.focus()
                 kebab.press("Enter")
-                menu = page.locator('.project-row-menu[role="menu"]')
+                menu = page.locator('.project-row-menu:not([data-leaving])[role="menu"]')
                 menu.wait_for(state="visible", timeout=5_000)
                 assert page.locator(':focus').get_attribute("data-prm") == "pin"  # the menu's first action
                 box = menu.bounding_box()
@@ -720,8 +720,8 @@ def test_ui_smoke_phase3_declarative_widgets_and_settings(direct_server_with_dat
                 callout = card.locator('.widget-callout')
                 assert metric.get_attribute("data-tone") == "ok"
                 assert callout.get_attribute("data-tone") == "warn"
-                assert metric.evaluate("element => getComputedStyle(element).borderLeftColor") == "rgb(130, 234, 185)"
-                assert callout.evaluate("element => getComputedStyle(element).borderLeftColor") == "rgb(242, 212, 65)"
+                assert metric.evaluate("e => getComputedStyle(e).borderLeftColor") == "rgb(131, 228, 153)"
+                assert callout.evaluate("e => getComputedStyle(e).borderLeftColor") == "rgb(247, 203, 88)"
 
                 emitted = page.evaluate(
                     """async (skill) => {
@@ -1253,7 +1253,7 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                     " && window.__ouroWs._lastSha.length > 0",
                     timeout=30_000,
                 )
-                page.evaluate("() => { window.__chronologyDocument = {}; }")
+                page.evaluate("() => { window.__chronologyDocument = {socket: window.__ouroWs.ws}; }")
 
                 t1 = {
                     "ts": "2025-07-18T10:00:01+00:00",
@@ -1330,8 +1330,8 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                 assert scroll_before["remaining"] > 160
                 direct_server_with_data["restart_server"]()
                 page.wait_for_function(
-                    "() => [...document.querySelectorAll('.chat-bubble.system')]"
-                    ".some((node) => node.textContent.includes('Reconnected'))",
+                    "() => window.__ouroWs.ws !== window.__chronologyDocument.socket"
+                    " && window.__ouroWs.ws?.readyState === WebSocket.OPEN",
                     timeout=20_000,
                 )
                 page.wait_for_selector(
@@ -1347,8 +1347,7 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                     # timestamp of its own: it is chrome, not a transcript row.
                     """() => [...document.querySelector('#chat-messages').children]
                         .filter((node) => !node.classList.contains('typing-bubble')
-                            && !node.classList.contains('chat-load-older')
-                            && !node.textContent.includes('Reconnected'))
+                            && !node.classList.contains('chat-load-older'))
                         .map((node) => ({
                             text: node.textContent,
                             ts: node.dataset.ts || '',
@@ -1372,25 +1371,16 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                 assert page.locator(".final-answer-chip").count() == 0
                 assert "FINAL ANSWER: 41" in page.locator("#chat-messages").inner_text()
                 assert "FINAL ANSWER: 42" in page.locator("#chat-messages").inner_text()
-                # Its last note's day in the chat's clock (formatMsgTime, #1959; a UTC page), not the reload's.
-                assert "updated Jul 18," in page.locator(
-                    '.chat-live-card[data-task-id="chronology-progress-only"]'
-                ).inner_text()
-                scroll_after = page.evaluate(
-                    """() => {
-                        const messages = document.querySelector('#chat-messages');
-                        const anchor = messages.querySelector(
-                            '.chat-live-card[data-task-id="chronology-anchor"]'
-                        );
-                        return {
-                            top: messages.scrollTop,
-                            height: messages.scrollHeight,
-                            anchorTop: anchor?.getBoundingClientRect().top,
-                        };
-                    }"""
-                )
+                anchor_after = page.locator('.chat-live-card[data-task-id="chronology-anchor"]').evaluate(
+                    "el => el.getBoundingClientRect().top")
                 assert page.evaluate("() => Boolean(window.__chronologyDocument)")
-                assert abs(scroll_after["anchorTop"] - scroll_before["anchorTop"]) <= 6
+                assert abs(anchor_after - scroll_before["anchorTop"]) <= 6
+                # Settled clocks live in Details (#2188): the last note's day in this UTC chat, not the reload's.
+                settled = page.locator('.chat-live-card[data-task-id="chronology-progress-only"]')
+                settled.locator('[data-live-disclosure]').click()
+                updated = settled.locator('.chat-live-fact').filter(has=page.get_by_text("Updated", exact=True)).locator('dd')
+                assert updated.is_visible() and "Jul 18," in updated.inner_text()
+                settled.locator('[data-live-disclosure]').click()
                 page.locator("#chat-messages").evaluate("(messages) => { messages.scrollTop = 0; }")
                 page.screenshot(
                     path=str(evidence_dir / "phase3-chat-chronology-desktop.png"),
@@ -2467,7 +2457,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
         assert all(card["activityTitle"] is None for card in facts["cardFacts"]), facts
         deepest = page.locator('.chat-live-card[data-task-id="layout-child-10"]')
         assert deepest.locator(':scope > .chat-live-summary-button [data-live-title]').inner_text() == "pty-tests"
-        assert "Agent model: gemini-3.6-flash" in deepest.locator(
+        assert "gemini-3.6-flash" in deepest.locator(
             ':scope > .chat-live-foot [data-live-meta]').inner_text()
         deepest.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
         line_toggle = deepest.locator(":scope > [data-live-timeline] .chat-live-line-toggle").last

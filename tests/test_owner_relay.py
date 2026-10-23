@@ -188,3 +188,30 @@ def test_quoted_file_is_staged_on_the_recipient_drive_with_its_original_hash(tmp
         reader = ToolContext(repo_dir=tmp_path, drive_root=child, task_id="receiver")
         assert "exact attached words" in _read_file(reader, "attachments/" + ref["upload"], root="artifact_store")
         assert "read_file" in str(messages)
+
+
+def test_note_carries_the_tellers_summary_and_the_card_names_its_room(tmp_path, monkeypatch):
+    """The teller writes one line for the owner; the saved row names the room the note came from."""
+    from ouroboros.owner_relay import publish_relay, relay_sender_facts
+    from ouroboros.task_results import write_task_result
+    from ouroboros.tools.control_relay import _tell_task
+    events = []
+    monkeypatch.setattr("ouroboros.tools.control_routing._emit_and_wait_for_routing",
+                        lambda ctx, evt: (events.append(evt) or "live", {"status": "delivered"}))
+    _tell_task(context(tmp_path), "receiver", "a0e1:research-done,no-safe-restore", summary="  Research is done; no safe fix yet  ")
+    assert events[0]["summary"] == "Research is done; no safe fix yet"
+    entry, _ = write_relay(tmp_path, "receiver", relay_id="s1", note=events[0]["message"], quotes=[], chat_id=1,
+                           teller_task_id="teller", summary=events[0]["summary"])
+    assert entry["relay"]["summary"] == "Research is done; no safe fix yet"
+    assert "summary" not in write_relay(tmp_path, "receiver", relay_id="s2", note="plain", quotes=[], chat_id=1,
+                                        teller_task_id="teller")[0]["relay"], "no summary, no key: older readers see today's shape"
+    write_task_result(tmp_path, "teller", "running", origin_message_text="Teller work")
+    write_task_result(tmp_path, "receiver", "running", origin_message_text="Receiver work")
+    sent = []
+    publish_relay(tmp_path, "receiver", entry, SimpleNamespace(send_message=lambda chat_id, text, **kw: sent.append(kw)))
+    relay = sent[0]["progress_meta"]["relay"]
+    assert relay["summary"] == "Research is done; no safe fix yet"
+    assert relay["sender"] == {"task_id": "teller", "chat_id": 1, "name": "Main"}
+    saved = next(found.row for found in dialogue_store.rows_by_client_id(tmp_path, entry["msg_id"]))
+    assert saved["relay"]["sender"]["name"] == "Main", "history draws the same card as the live frame"
+    assert relay_sender_facts(tmp_path, "ghost") == {} and relay_sender_facts(tmp_path, "") == {}

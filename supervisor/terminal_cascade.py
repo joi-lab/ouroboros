@@ -51,9 +51,25 @@ def deliver_cascade_summary(
     event each attempt).
     """
     try:
+        from ouroboros.cancel_intents import STOP_POLICY_FINALIZE, active_intent, stop_policy
         from ouroboros.observability import preserved_salvage_path
+        from ouroboros.owner_stop_receipt import capture_receipt, has_wrap_up_receipt, resolve_receipt_target
         from ouroboros.task_results import load_task_result
         from ouroboros.task_status import SETTLED_STATUSES
+
+        try:
+            intent = active_intent(pathlib.Path(drive_root), task_id) or {}
+        except Exception:
+            intent = {}
+        stop = (task_id, str(intent.get("request_id") or ""))
+        physical_task_id, _pred_ids, retry_root_ids = resolve_receipt_target(
+            pathlib.Path(drive_root), task_id, stop=stop,
+        )
+        wrap_up = (
+            stop_policy(intent) == STOP_POLICY_FINALIZE
+            or bool(intent.get("hardened_at"))
+            or has_wrap_up_receipt(pathlib.Path(drive_root), physical_task_id, stop=stop)
+        )
 
         def _durable_child_outcome(tid: str, sweep_outcome: str) -> str:
             # GR4-4: each child's line reports its CURRENT durable status at
@@ -84,13 +100,15 @@ def deliver_cascade_summary(
         merged: Dict[str, str] = {
             str(tid): str(outcome) for tid, outcome in outcomes.items()
         }
+        membership_gap = ""
         try:
             for tid, status in _cascade_descendant_rows(
-                pathlib.Path(drive_root), task_id,
+                pathlib.Path(drive_root), task_id, strict=wrap_up,
             ).items():
                 if tid and tid not in merged:
                     merged[tid] = status
         except Exception:
+            membership_gap = "descendant_enumeration_unavailable"
             log.debug(
                 "cascade digest durable-tree enumeration failed for %s",
                 task_id, exc_info=True,
@@ -99,11 +117,32 @@ def deliver_cascade_summary(
             {"task_id": tid, "outcome": _durable_child_outcome(tid, outcome),
              "salvaged": bool(preserved_salvage_path(pathlib.Path(drive_root), tid))}
             for tid, outcome in sorted(merged.items())
-            if tid != task_id
+            if tid not in retry_root_ids
         ]
-        root_result = load_task_result(pathlib.Path(drive_root), task_id) or {}
+        root_result = (
+            load_task_result(pathlib.Path(drive_root), physical_task_id)
+            or load_task_result(pathlib.Path(drive_root), task_id)
+            or {}
+        )
+        # Expiry/crash may precede the final control. The same receipt (one row
+        # identity per intent) still accompanies this fallback, without another
+        # model turn; a failed capture never holds the tree's one summary.
+        if wrap_up:
+            try:
+                capture_receipt(pathlib.Path(drive_root), physical_task_id, merged, gap=membership_gap,
+                                stop=stop)
+            except Exception:
+                log.warning("Wrap up receipt capture failed for %s", task_id, exc_info=True)
+            root_result = (
+                load_task_result(pathlib.Path(drive_root), physical_task_id)
+                or load_task_result(pathlib.Path(drive_root), task_id)
+                or root_result
+            )
         root_status = str(root_result.get("status") or "")
-        salvage_path = preserved_salvage_path(pathlib.Path(drive_root), task_id)
+        salvage_path = (
+            preserved_salvage_path(pathlib.Path(drive_root), physical_task_id)
+            or preserved_salvage_path(pathlib.Path(drive_root), task_id)
+        )
         salvage_text = ""
         if root_status == "completed":
             # Completion-wins root: its own completed result is the answer.
@@ -157,7 +196,7 @@ def deliver_cascade_summary(
         return False
 
 
-def _cascade_descendant_rows(drive_root: pathlib.Path, task_id: str) -> Dict[str, str]:
+def _cascade_descendant_rows(drive_root: pathlib.Path, task_id: str, *, strict: bool = False) -> Dict[str, str]:
     """``{descendant_id: status}`` for every task whose ancestry reaches ``task_id``.
 
     GR6-2: the digest's membership walk. Rows come from the durable task
@@ -186,6 +225,8 @@ def _cascade_descendant_rows(drive_root: pathlib.Path, task_id: str) -> Dict[str
                 if tid:
                     queued.append({**task, "task_id": tid, "status": status})
     except Exception:
+        if strict:
+            raise
         log.debug("cascade digest snapshot scan failed for %s", target, exc_info=True)
 
     try:
@@ -193,6 +234,8 @@ def _cascade_descendant_rows(drive_root: pathlib.Path, task_id: str) -> Dict[str
 
         rows = tree_facts(drive_root, target, descendants=True, queue_rows=queued)
     except Exception:
+        if strict:
+            raise
         log.debug("cascade digest durable-row selection failed for %s", target, exc_info=True)
         rows = {row["task_id"]: row for row in reversed(queued)}
 

@@ -1,14 +1,10 @@
 """The usage store: ``state/usage.sqlite``, the one monetary authority.
 
-Design contract: docs/USAGE_STORE.md. ONE row per physical attempt id
-(``attempts``), UPDATEd on every transition, plus the current facts every
-ordinary reader asks (``summaries``: the exact ``_summary``/``_breakdown_bucket``
-state per scope and key), maintained in the writing transaction by the one
-reducer (``_usage_rows.summary_delta``: subtract the old row, add the new one,
-Decimal arithmetic on decimal text). ``bindings`` holds the earliest root/group
-cap binding, ``dirty_owners`` the task/root ids whose stored cost projection is
-behind, ``one_shots`` the identity of single-row kinds, ``meta`` the schema,
-the installation's lock tier, the import provenance and the publication marker.
+Contract: docs/USAGE_STORE.md. One ``attempts`` row per physical id, updated on transitions.
+``summaries`` holds exact scope/key buckets, maintained transactionally by
+``_usage_rows.summary_delta`` (subtract old, add new; Decimal arithmetic on decimal text).
+``bindings`` holds earliest root/group caps; ``dirty_owners`` holds stale projections;
+``one_shots`` holds single-row identities; ``meta`` holds schema, tier, import and publication facts.
 
 Nothing on an ordinary path aggregates the ``attempts`` table: admission, sends,
 displays and status read summary rows and addressed rows (one attempt by id,
@@ -43,8 +39,9 @@ from ouroboros._usage_money import (
     render_cash, rounded_cash,
 )
 from ouroboros._usage_rows import (
-    BINDING_KEYS, REVIEW_ATTRIBUTION_KEYS, _BINDING_CAPS, BindingIndex, Bucket, row_ts_epoch, summary_delta,
+    REVIEW_ATTRIBUTION_KEYS, BindingIndex, Bucket, row_ts_epoch, summary_delta,
 )
+from ouroboros.usage_origin import bind_root_attribution
 from ouroboros import store as _core
 from ouroboros.store import (
     TIER_ENFORCED, TIER_NAME, busy as _busy, file_identity as _identity, fsync_directory as _fsync_directory,
@@ -62,10 +59,8 @@ log = logging.getLogger(__name__)
 STORE_REL = pathlib.Path("state/usage.sqlite")
 IMPORT_LOCK_NAME = "usage_import.lock"
 SCHEMA_VERSION = 1
-# The database header's application id names the lock protocol every process
-# must use, so a process selects it BEFORE opening (``meta.lock_tier`` is the
-# same fact, recorded by the import that chose it). The connection, tier and
-# transaction core is ``ouroboros.store``, shared with the current-facts store.
+# The header selects the lock protocol BEFORE opening (also recorded in meta.lock_tier).
+# Connection, tier and transaction core are shared with the current store (ouroboros.store).
 _APPLICATION_ID = {TIER_ENFORCED: 0x4F555345, TIER_NAME: 0x4F55534E}
 _OPEN_STATES = ("reserved", "dispatched", "unresolved")
 _OPEN_PREDICATE = ("(state IN ('reserved','dispatched','unresolved') "
@@ -340,6 +335,7 @@ class Txn:
         self._handoff = False
         self._buckets: Dict[Tuple[str, str], Bucket] = {}
         self._marker: Optional[list] = None
+        self._receipt_tasks: set[str] = set()
 
     # -- reads
     def attempt(self, attempt_id: str) -> Optional[Dict[str, Any]]:
@@ -528,6 +524,8 @@ class Txn:
         revision = int(previous["revision"]) + 1 if previous else 1
         materialized = durable_literals({**{key: value for key, value in row.items() if key != "revision"},
                                          "seq": seq, "ts": str(row.get("ts") or utc_now_iso())})
+        from ouroboros.usage_origin import stamp_root_cause
+        stamp_root_cause(self, materialized)
         validate_row_fields(materialized, seq)
         validate_transition(materialized, None if previous is None else str(previous.get("state") or ""),
                             late_receipt_eligible(previous), seq, previous_row=previous)
@@ -561,9 +559,10 @@ class Txn:
                     f"VALUES ({','.join('?' * len(_SUMMARY_COLUMNS))})", _bucket_record(scope, key, bucket))
             else:
                 self.conn.execute("DELETE FROM summaries WHERE scope=? AND key=?", (scope, key))
-        self._bind(stored)
+        bind_root_attribution(self.conn, stored)
         for owner in dict.fromkeys((str(stored.get("task_id") or ""), str(stored.get("root_task_id") or ""))):
             if owner:
+                self._receipt_tasks.add(owner)
                 self.conn.execute("INSERT INTO dirty_owners (owner_id, revision) VALUES (?, ?) ON CONFLICT(owner_id) "
                                   "DO UPDATE SET revision=excluded.revision", (owner, seq))
         if previous is None and is_one_shot_kind(str(stored.get("kind") or "")):
@@ -585,17 +584,6 @@ class Txn:
             self.bucket(scope, key).add(delta, sign, cap=cap if scope in {"root", "group"} else None)
             touched.add((scope, key))
         return touched
-
-    def _bind(self, row: Dict[str, Any]) -> None:
-        """The earliest ORIGINAL row carrying a cap binds its root and group
-        (``BindingIndex.fold`` for an original row)."""
-        if not any(cap in row for cap in _BINDING_CAPS):
-            return
-        binding = _json(durable_literals({key: row[key] for key in BINDING_KEYS if key in row}))
-        for scope, key in (("root", monetary_scope_key(row)), ("group", billing_group_key(row))):
-            if key:
-                self.conn.execute("INSERT OR IGNORE INTO bindings (scope, key, binding) VALUES (?, ?, ?)",
-                                  (scope, key, binding))
 
     def recorded_one_shot(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """The stored one-shot of ``row``'s id when its identity is identical;
@@ -677,7 +665,9 @@ def store_tier(root: pathlib.Path, *, wait_sec: float, migrate: bool = True) -> 
         forget(root)
     lock = _process_lock(path)
     if not lock.acquire(timeout=max(0.0, wait_sec)):
-        raise UsageLockUnavailable("usage store migration in progress", reason="contention")
+        error = UsageLockUnavailable("usage store migration in progress", reason="contention")
+        error.rollback_confirmed = True  # this caller acquired neither lock nor transaction
+        raise error
     try:
         if _identity(path) is None:
             if not migrate:
@@ -705,7 +695,9 @@ def _stored_meta(path: pathlib.Path, tier: str, wait_sec: float) -> Dict[str, An
             records = conn.execute("SELECT key, value FROM meta WHERE key IN ('import', 'export')").fetchall()
         except sqlite3.OperationalError as exc:
             if _busy(exc):
-                raise UsageLockUnavailable(f"usage store busy: {exc}", reason="contention") from exc
+                error = UsageLockUnavailable(f"usage store busy: {exc}", reason="contention")
+                error.rollback_confirmed = not conn.in_transaction
+                raise error from exc
             return {}
         except sqlite3.DatabaseError:
             return {}
@@ -722,13 +714,11 @@ def _sha256_file(path: pathlib.Path) -> Optional[str]:
 @contextlib.contextmanager
 def hold(root: pathlib.Path | str, *, timeout_sec: float = USAGE_LOCK_TIMEOUT_SEC,
          write: bool = True, migrate: bool = True, exporting: bool = False) -> Iterator[Txn]:
-    """One store transaction within ``timeout_sec`` of waiting, else
-    ``UsageLockUnavailable(reason="contention")``. A write takes the write lock
-    at BEGIN (``BEGIN IMMEDIATE``); its COMMIT waits for readers to drain. This
-    is the primitive the money acquisitions slice (``_usage_wait``). A store
-    carrying an export mark refuses every write typed (``UsageExportInProgress``)
-    inside the transaction it would have made; only the export itself and its
-    abandonment write under ``exporting=True``."""
+    """Bounded money acquisition (``_usage_wait``); timeout raises UsageLockUnavailable.
+    Writes use BEGIN IMMEDIATE and wait for readers at COMMIT. An export mark
+    refuses writes with UsageExportInProgress; only export/abandonment use exporting=True.
+    Receipt callbacks run after the transaction and name lock have closed.
+    """
     root = pathlib.Path(root)
     tier = store_tier(root, wait_sec=timeout_sec, migrate=migrate)
     with contextlib.ExitStack() as stack:
@@ -759,6 +749,11 @@ def hold(root: pathlib.Path | str, *, timeout_sec: float = USAGE_LOCK_TIMEOUT_SE
                         raise UsageLockUnavailable(str(exc), reason=exc.reason) from exc
                     except sqlite3.Error as exc:
                         raise _typed(exc) from exc
+
+
+    if txn._receipt_tasks:
+        from ouroboros.swarm_receipt import usage_changed
+        usage_changed(root, txn._receipt_tasks)
 
 
 def _typed(exc: sqlite3.Error) -> UsageAccountingError:
@@ -810,8 +805,11 @@ def read_usage_records(root: pathlib.Path | str) -> List[Dict[str, Any]]:
 
 # ---- migration: the one-time import of the retired journal ------------------
 
-def migrate_from_journal(root: pathlib.Path | str) -> Dict[str, Any]:
+def migrate_from_journal(root: pathlib.Path | str, *, initialize_journal: bool = False) -> Dict[str, Any]:
     """Create the store from the live journal (a lifecycle job; writers quiescent).
+
+    ``initialize_journal`` is the lifespan boot's alone: it brings a completed store to this
+    runtime's journal (``store_journal``); the supervisor's revival and lazy readers keep it.
 
     Idempotent through ``meta.import.status``: a completed store is never
     re-imported (an interrupted journal rename is retried); an unfinished
@@ -839,10 +837,15 @@ def migrate_from_journal(root: pathlib.Path | str) -> Dict[str, Any]:
                     stale.unlink()  # an unfinished import never published: redone from scratch
             if _identity(path) is not None:
                 tier = _header_tier(path)
-                status = _stored_meta(path, tier, USAGE_LOCK_TIMEOUT_SEC).get("import") if tier else None
+                if initialize_journal and tier and _core.wal_file(path):
+                    _select_journal(root, path, tier)  # leave WAL this runtime must not share before reading it
+                stored = _stored_meta(path, tier, USAGE_LOCK_TIMEOUT_SEC) if tier else {}
+                status = stored.get("import")
                 if not status or status.get("status") != "completed":
                     raise UsageLedgerCorrupt(f"usage store unreadable or without a completed import: {path}")
                 report = {"status": "already_completed", **_retire_journal(root, status)}
+                if initialize_journal and not stored.get("export"):  # an exporting store stays as it is handed off
+                    report["journal_selected"] = _select_journal(root, path, tier)
             else:
                 tier = TIER_ENFORCED if kernel_file_locks_enforced(root / LOCK_REL) else TIER_NAME
                 report = _import(root, path, tier)
@@ -854,6 +857,15 @@ def migrate_from_journal(root: pathlib.Path | str) -> Dict[str, Any]:
     except Exception:
         log.warning("usage store migration report not recorded", exc_info=True)
     return report
+
+
+def _select_journal(root: pathlib.Path, path: pathlib.Path, tier: str) -> bool:
+    """``store_journal.configure_journal`` for the lifespan boot, a name-tier file under the money lock."""
+    from ouroboros.store_journal import configure_journal
+
+    with _named_lock(root, LOCK_REL.name, timeout_sec=USAGE_LOCK_TIMEOUT_SEC, stale_sec=90.0) \
+            if tier == TIER_NAME else contextlib.nullcontext():
+        return configure_journal(path, tier, wait_sec=USAGE_LOCK_TIMEOUT_SEC)
 
 
 def _import(root: pathlib.Path, path: pathlib.Path, tier: str) -> Dict[str, Any]:
@@ -899,9 +911,12 @@ def _build(tmp: pathlib.Path, tier: str, records: Sequence[Dict[str, Any]], prov
     stamps: Dict[str, Dict[str, str]] = {}
     revisions: Dict[str, int] = {}
     bindings = BindingIndex()
+    causes = {}
     header = None
     for row in records:
         bindings.fold(row)
+        if row.get("root_task_id") and row.get("consciousness_cause"):
+            causes.setdefault(str(row["root_task_id"]), {"cause": row["consciousness_cause"]})
         attempt_id, state = str(row["attempt_id"]), str(row.get("state") or "")
         if str(row.get("kind") or "") == "usage_baseline":
             header = row
@@ -915,9 +930,9 @@ def _build(tmp: pathlib.Path, tier: str, records: Sequence[Dict[str, Any]], prov
     last_seq = max((int(row["seq"]) for row in records), default=0)
     conn = _connect(tmp, tier, create=True)
     try:
-        conn.executescript(_SCHEMA)
+        # BEGIN belongs inside executescript, which first commits any pending transaction.
+        conn.executescript("BEGIN IMMEDIATE;\n" + _SCHEMA)
         conn.execute(f"PRAGMA application_id = {_APPLICATION_ID[tier]}")
-        conn.execute("BEGIN IMMEDIATE")
         buckets: Dict[Tuple[str, str], Bucket] = {}
         for attempt_id, row in sorted(last.items(), key=lambda item: int(item[1]["seq"])):
             materialized = durable_literals(row)
@@ -938,7 +953,8 @@ def _build(tmp: pathlib.Path, tier: str, records: Sequence[Dict[str, Any]], prov
                          f"VALUES ({','.join('?' * len(_SUMMARY_COLUMNS))})",
                          [_bucket_record(scope, key, bucket) for (scope, key), bucket in buckets.items() if bucket.rows])
         bound = [(scope, key, _json(durable_literals(binding))) for scope, index in (
-            ("root", bindings.roots), ("group", bindings.groups)) for key, binding in index.items()]
+            ("root", bindings.roots), ("group", bindings.groups), ("consciousness", causes))
+                 for key, binding in index.items()]
         conn.executemany("INSERT INTO bindings (scope, key, binding) VALUES (?, ?, ?)", bound)
         # The visible one-time import also seeds stale completed projections.
         from ouroboros.terminal_cost_reconciliation import imported_projection_debt

@@ -72,7 +72,7 @@ def test_census_uses_one_body_free_transaction_at_20_and_2000_rows(tmp_path, mon
             assert transactions == [False]
             phases = {row["activity_id"]: row["phase"] for row in rows}
             assert phases == {"working": "working", "finalizing": "finalizing", "pausing": "budget_pausing",
-                              "queued": "queued", "paused": "budget_paused", "direct": "budget_pausing"}
+                              "queued": "queued", "paused": "budget_paused", "direct": "budget_paused"}
             assert next(row for row in rows if row["activity_id"] == "paused")["finishing_reviews"] is True
             measurements.append(cost)
     assert measurements[0] == measurements[1]
@@ -158,7 +158,7 @@ def test_phase_controls_preserve_attempt_and_warm_pause_predicates(tmp_path, mon
         monkeypatch.setattr(store.Txn, "body_text", lambda *_: pytest.fail("control read a body"))
         assert state._managed_task_budget_pausing(tmp_path, {"_attempt": 2}, "pausing") is True
         assert state._managed_task_budget_pausing(tmp_path, {"_attempt": 1}, "pausing") is False
-        assert state._direct_activity_pause_projection(tmp_path, {"activity_id": "direct", "phase": "working"}, {})["phase"] == "budget_pausing"
+        assert state._direct_activity_pause_projection(tmp_path, {"activity_id": "direct", "phase": "working"}, {})["phase"] == "budget_paused"
 
 
 def test_late_owner_registry_failure_preserves_queue_census(tmp_path, monkeypatch):

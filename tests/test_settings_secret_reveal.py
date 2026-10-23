@@ -33,7 +33,8 @@ def reveal_settings(tmp_path, monkeypatch):
     for key in config.SETTINGS_DEFAULTS:
         monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("OUROBOROS_SETTINGS_SHA256", raising=False)
-    settings = {
+    settings = {  # an install that already carries the consciousness level: loading runs no one-time copy
+        "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full",
         "ANTHROPIC_API_KEY": "sk-ant-api03-fixture-complete-tail",
         "CUSTOM_BRIDGE_TOKEN": "custom-fixture-kept-complete",
         "MCP_SERVERS": [

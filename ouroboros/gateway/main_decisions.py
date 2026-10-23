@@ -78,7 +78,11 @@ def owner_actions(activity: dict) -> tuple[dict, bool]:
     attempt = int(activity.get("task_attempt") or 1)
     current = {} if phase in {"budget_paused", "budget_pausing"} else activity.get("model_waits") or {}
     waits = {key: row for key, row in current.items() if isinstance(row, dict) and human_required_model_wait(row, attempt)}
-    return waits, phase == "budget_paused" and activity.get("can_resume") is True
+    from ouroboros.work_stop import activity_stop_view
+
+    view = activity_stop_view(activity)
+    return waits, (phase in {"budget_paused", "budget_pausing"} and not activity.get("live")
+                   and view["resumable"] and activity.get("can_resume") is True)
 
 
 def _question_sources(drive_root: Any, candidates: dict) -> dict:
@@ -225,7 +229,8 @@ def main_decisions_snapshot(drive_root: Any, activities: list[dict], bindings: d
         waits, can_resume = owner_actions(activity)
         if not waits and not can_resume:
             continue
-        cause = str(activity.get("pause_cause") or "")
+        from ouroboros.work_stop import activity_stop_view
+        cause = activity_stop_view(activity)["pause_cause"]
         attention.append({**activity, "task_id": task_id, "project_name": project.get("name") or "Project",
                           "model_waits": waits, "can_resume": can_resume,
                           "cancelable": activity.get("cancelable") is True,

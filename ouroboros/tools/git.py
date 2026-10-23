@@ -109,10 +109,7 @@ def _free_cycle_gate(
     goal: str = "",
     scope: str = "",
 ) -> Optional[Dict[str, Any]]:
-    """Before preflight or paid dispatch, collect an exact pending attempt or
-    apply the identical-verdict and per-root paid-cycle limits. Blocking limits
-    refuse for free; advisory limits disclose a replay without another review.
-    Pending identity uses its paid contract; only new work reads today's pool."""
+    """Collect paid identity before preflight; only new work reads today's pool or cycle limits."""
     from ouroboros.config import get_review_enforcement
 
     if getattr(ctx, "_review_cyber_pending", "") and not review_enforcement_blocks("blocking"):
@@ -120,8 +117,6 @@ def _free_cycle_gate(
     fp = pre_fingerprint.get("fingerprint", "")
     rebuttal_sha = compute_rebuttal_sha256(review_rebuttal)
     pending = getattr(ctx, "_pending_review_attempt", None)
-    # A pending attempt keeps its paid contract; a legacy row that recorded none is
-    # matched under today's, which only its exact retry key below can then prove.
     contract_fp = ((str(getattr(pending, "review_contract_fingerprint", "") or "")
                     if bool(getattr(ctx, "_review_resume_pending", False)) else "")
                    or commit_review_contract_fingerprint())
@@ -137,6 +132,10 @@ def _free_cycle_gate(
         ctx._current_review_attempt_number = int(peer.attempt or 0)
         ctx._current_review_contract_fingerprint = contract_fp = str(peer.review_contract_fingerprint or contract_fp)
         ctx._current_review_retry_key = retry_key = str(peer.review_retry_key)
+    from ouroboros.tools.review_collection import bind_commit_collection
+    error, retry_key = bind_commit_collection(ctx, fp, retry_key)
+    if error:
+        return error
     if bool(getattr(ctx, "_review_resume_pending", False)):
         if pending is not None and str(getattr(pending, "review_retry_key", "") or "") == retry_key:
             ctx._review_reconcile_only = True
@@ -597,26 +596,26 @@ def _auto_tag_on_version_bump(
         log.warning("Auto-tag check failed: %s", e)
         return ""
 
-def _auto_push(repo_dir: pathlib.Path) -> str:
+def _auto_push(repo_dir: pathlib.Path, *, created_tag: str = "", expected_commit_sha: str = "") -> str:
     try:
         from supervisor.git_ops import push_to_remote
-        ok, msg = push_to_remote()
+        ok, msg = push_to_remote(created_tag=created_tag, expected_commit_sha=expected_commit_sha)
         if ok:
             return f" [pushed: {msg}]"
         return f" [push skipped: {msg}]"
     except Exception as e:
         log.debug("Auto-push failed (non-fatal): %s", e)
-        return " [push failed — will retry later]"
+        return " [push failed — no automatic retry]"
 
 
-def _auto_push_after_review(ctx: ToolContext, *, publication_paused: bool = False) -> str:
+def _auto_push_after_review(ctx: ToolContext, *, publication_paused: bool = False, created_tag: str = "", expected_commit_sha: str = "") -> str:
     """A completed commit remains completed when Pause refuses its later push."""
     from ouroboros.owner_pause import OwnerPauseRefused, run_operation
 
     try:
         if publication_paused:
             raise OwnerPauseRefused("owner_pause")
-        return run_operation(ctx, _auto_push, ctx.repo_dir)
+        return run_operation(ctx, _auto_push, ctx.repo_dir, created_tag=created_tag, expected_commit_sha=expected_commit_sha)
     except OwnerPauseRefused as exc:
         return f" [push not started: owner pause ({exc})]"
 
@@ -653,7 +652,7 @@ def _run_pre_push_tests(ctx: ToolContext, force: bool = False) -> Optional[str]:
         return run_hermetic_pytest(
             pathlib.Path(ctx.repo_dir),
             max_output=MAX_TEST_OUTPUT,
-            ctx=ctx, **commit_test_options(ctx, force=force),
+            ctx=ctx, **commit_test_options(ctx, force=force, post_commit=True),
         )
     except Exception as e:
         log.warning(f"Pre-push tests failed with exception: {e}", exc_info=True)
@@ -833,7 +832,7 @@ def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
         if not red:
             if all(state in settled for state in states.values()):
                 return f"\n\n✅ CI: registered push runs passed for this commit — {summary}."
-            return f"\n\n⏳ CI: push runs in progress — {summary}. Read the results later: get_github_checks(sha='{local_sha}', repo='{repo}')."
+            return f"\n\n⏳ CI: push runs in progress — {summary}. Read the results later: github_read(method='checks', target='{local_sha}', repo='{repo}')."
         broken = [name for name in red if states[name] == "failure"]
         first = latest[(broken or red)[0]]  # The run whose number, jobs and URL the note carries.
         headline = f"{', '.join(broken)} FAILED" if broken else f"{red[0]} {states[red[0]].upper()}"
@@ -1040,11 +1039,12 @@ def _publish_reviewed_commit(
     return _publish_post_commit_test_fact(ctx, result + ci_note, test_warning)
 
 
-def _commit_reviewed(ctx: ToolContext, commit_message: str, *args: Any, **kwargs: Any) -> str:
+def _commit_reviewed(ctx: ToolContext, commit_message: str = "", *args: Any, **kwargs: Any) -> str:
     """The public commit handler: an outcome of a call that wrote a review record names it."""
     if error := bind_commit_test_request(ctx, kwargs):
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=error))
-    return name_review_record(ctx, _repo_commit_push(ctx, commit_message, *args, **kwargs))
+    from ouroboros.tools.review_collection import publish_commit_delivery
+    return publish_commit_delivery(ctx, name_review_record(ctx, _repo_commit_push(ctx, commit_message, *args, **kwargs)))
 
 
 _COMMIT_ROOT_REFUSAL = (
@@ -1055,35 +1055,33 @@ _COMMIT_ROOT_REFUSAL = (
 
 def _commit_request_refusals(ctx: ToolContext, *, root: str, preflight_reviewer: str, skipped: bool,
                              continuation: bool, reviewers: Optional[List[str]], reason: str,
-                             goal: str = "", scope: str = "", review_rebuttal: str = "", collecting: bool = False) -> tuple:
-    """Validate root/preflight choices and compose a new panel; a pending wave
-    keeps its paid panel. Return ``(panel, refusal_text)`` before staging."""
-    from ouroboros.tools.commit_gate import compose_commit_panel
-    from ouroboros.tools.review_change import ReviewChangeArgumentError
+                             goal: str = "", scope: str = "", review_rebuttal: str = "", collecting: bool = False,
+                             wake_on: Any = None) -> tuple:
+    """Validate before staging; a paid wave keeps its recorded panel."""
+    from ouroboros.tools.commit_gate import compose_commit_panel, bind_commit_wake
 
     if str(root or "system_repo") != "system_repo":  # no id to name
         return None, _COMMIT_ROOT_REFUSAL
-    # A paid wave collects its recorded seats. Current catalog membership cannot
-    # revoke that custody; mutually exclusive request arguments still fail.
+    if continuation and wake_on is not None:
+        return None, "TOOL_ARG_ERROR: wake_on belongs to a new ask; collection retains its saved selection"
     selector = "" if collecting and not (skipped or continuation) else preflight_reviewer
     error = _commit_preflight_choice_error(selector, skipped=skipped, continuation=continuation,
                                          ctx=ctx, goal=goal, scope=scope, review_rebuttal=review_rebuttal)
     if collecting and not error:
+        bind_commit_wake(ctx, None, None)
         return None, ""
     if not error:
         try:
-            return compose_commit_panel(ctx, list(reviewers or []), str(reason or "")), ""
-        except ReviewChangeArgumentError as exc:
+            panel = compose_commit_panel(ctx, list(reviewers or []), str(reason or ""))
+            bind_commit_wake(ctx, wake_on, panel)
+            return panel, ""
+        except ValueError as exc:
             error = str(exc)
     return None, f"⚠️ TOOL_ARG_ERROR: {error} Nothing was staged, reviewed or recorded."
 
 
 def _commit_reviewed_candidate(ctx, commit_message, started_at, managed_tx):
-    """Admit the reviewed Git commit and return its SHA or its recorded refusal/error.
-
-    A completed review grants no later effect. The command joins outside the
-    launch lock, so Pause stays prompt and an admitted command keeps its result.
-    """
+    """Admit the reviewed commit; join outside the launch lock so Pause stays prompt."""
     from ouroboros.owner_pause import OwnerPauseRefused, run_operation
 
     try:
@@ -1122,7 +1120,8 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                        goal: str = "",
                        scope: str = "", review_reference: Optional[dict] = None,
                        author_disposition: Optional[dict] = None, root: str = "",
-                       preflight_reviewer: str = "", reviewers: Optional[List[str]] = None, reason: str = "") -> str:
+                       preflight_reviewer: str = "", reviewers: Optional[List[str]] = None, reason: str = "",
+                       wake_on: Any = None) -> str:
     """Stage, review, and commit files with unified pre-commit review."""
     from ouroboros import body_candidate  # lazy: the Git tools reach the candidate owner only when committing
     skip_advisory_pre_review = bool(skip_advisory_review or skip_advisory_pre_review)
@@ -1130,26 +1129,34 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
     _reset_commit_review_state(ctx)
     ctx._left_review_wait = None  # a new commit act is the author's explicit next choice
     continuation = review_reference is not None or author_disposition is not None
+    collecting_reference = review_reference is not None and author_disposition is None
+    if collecting_reference:
+        from ouroboros.tools.review_collection import prepare_commit_collection
+        try:
+            source = prepare_commit_collection(ctx, review_reference, commit_message=commit_message,
+                mutations=(review_rebuttal, goal, scope, reviewers, reason, preflight_reviewer))
+            commit_message = source.commit_message
+        except ValueError as exc:
+            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=str(exc)))
     # A managed marker authorizes exactly one reviewed two-parent resolution.
     from supervisor.update_merge import managed_assisted_tx_for
     _managed_tx, _managed_block = managed_assisted_tx_for(getattr(ctx, "task_id", ""), getattr(ctx, "task_metadata", None))
-    # The retained managed commit resumes its gates only: the review-custody lookup
-    # and the attribution check belong to a NEW commit, never to this one.
     managed_resume = bool(_managed_tx and _managed_tx.get("postcommit_resume"))
-    overlap_err, collecting = None, False
+    overlap_err, collecting = None, collecting_reference
     # An empty message is refused below as an argument error before any state read.
     if (commit_message.strip() and str(root or "system_repo") == "system_repo"
             and not (preflight_reviewer and (skip_advisory_pre_review or continuation))):
-        error = prepare_author_commit_request(ctx, review_reference, author_disposition, review_rebuttal)
+        error = None if collecting_reference else prepare_author_commit_request(
+            ctx, review_reference, author_disposition, review_rebuttal)
         if error:
             return error
-        if not managed_resume:
+        if not managed_resume and not collecting_reference:
             overlap_err = _check_overlapping_review_attempt(ctx)
             collecting = bool(getattr(ctx, "_review_resume_pending", False))
     panel, refusal = _commit_request_refusals(  # before any staging, review or record
         ctx, root=root, preflight_reviewer=preflight_reviewer, skipped=skip_advisory_pre_review,
         continuation=continuation, reviewers=reviewers, reason=reason,
-        goal=goal or commit_message, scope=scope, review_rebuttal=review_rebuttal, collecting=collecting)
+        goal=goal or commit_message, scope=scope, review_rebuttal=review_rebuttal, collecting=collecting, wake_on=wake_on)
     if refusal:
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=refusal))
     _commit_start = time.time()
@@ -1215,20 +1222,11 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             if authority_error:
                 return authority_error
         outcome = _run_reviewed_stage_cycle(
-            ctx,
-            commit_message,
-            _commit_start,
-            paths=paths,
-            skip_advisory_pre_review=skip_advisory_pre_review,
-            skip_tests=skip_tests,
-            goal=goal,
-            scope=scope,
-            review_rebuttal=review_rebuttal,
+            ctx, commit_message, _commit_start, paths=paths,
+            skip_advisory_pre_review=skip_advisory_pre_review, skip_tests=skip_tests,
+            goal=goal, scope=scope, review_rebuttal=review_rebuttal,
             came_from_detached_checkout=came_from_detached_checkout,
-            require_release_tag=not bool(_managed_tx),
-            preflight_reviewer=preflight_reviewer,
-            panel=panel,
-        )
+            require_release_tag=not bool(_managed_tx), preflight_reviewer=preflight_reviewer, panel=panel)
         if outcome.get("status") != "passed":
             if _managed_tx:
                 # A blocked review's index reset can clear the live MERGE_HEAD; re-establish it so
@@ -1367,7 +1365,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             if receipt_error:
                 return receipt_error
         if not _managed_tx and not publication_paused:
-            # Evolution publication requires full even when the author skipped preflight.
+            # Evolution always runs this gate, full outside a body candidate, even after skip_tests.
             try:
                 run_operation(ctx, _post_commit_result, ctx, commit_message, skip_tests, test_warning_ref, force=bool(evolution_claim))
             except OwnerPauseRefused as exc:
@@ -1382,9 +1380,9 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             if publication_error:
                 return publication_error
             push_status = (_evolution_test_publication_stop(ctx, commit_sha, test_warning_ref[0])
-                           or (_auto_push_after_review(ctx, publication_paused=publication_paused) if not body_candidate.is_bound(ctx) else body_candidate.publication_note(ctx)))
+                           or (_auto_push_after_review(ctx, publication_paused=publication_paused, created_tag=created_tag, expected_commit_sha=commit_sha) if not body_candidate.is_bound(ctx) else body_candidate.publication_note(ctx)))
         ctx.last_reviewed_commit_sha = commit_sha
-        body_candidate.record_reviewed_commit(ctx, commit_sha)
+        body_candidate.record_reviewed_commit(ctx, commit_sha, created_tag=created_tag)
         if attribution_binding is not None:
             # The task's own commit moved HEAD: open the next attributed-staging
             # epoch so a follow-up commit does not read as ``baseline_stale``.
@@ -1408,21 +1406,14 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             ctx, _managed_tx, commit_sha, commit_message, _commit_start, test_warning_ref,
             (pre_fingerprint, post_fingerprint))
     if not evolution_claim:
-        push_status = _auto_push_after_review(ctx, publication_paused=publication_paused) if not body_candidate.is_bound(ctx) else body_candidate.publication_note(ctx)
+        push_status = _auto_push_after_review(ctx, publication_paused=publication_paused, created_tag=created_tag, expected_commit_sha=commit_sha) if not body_candidate.is_bound(ctx) else body_candidate.publication_note(ctx)
     return _publish_reviewed_commit(
         ctx, commit_message, commit_sha, tag_info, test_warning_ref[0], paths, push_status,
     )
 
 
 def _run_git_network_cmd(cmd: List[str], cwd: pathlib.Path) -> str:
-    """``run_cmd``-shaped adapter for network git commands (fetch/push).
-
-    Routes through the shared bounded git runner (wall-clock ceiling, process
-    tree kill, ``GIT_TERMINAL_PROMPT=0``, low-speed abort) with the caller's
-    repository as the explicit cwd, so a dead network cannot hang the tool
-    forever. Keeps ``run_cmd``'s contract: stdout on success, ``RuntimeError``
-    with the same message shape on failure.
-    """
+    """Bounded network git, returning stdout or raising with stdout/stderr."""
     from supervisor.update_source import _git_network_bounded
 
     rc, out, err = _git_network_bounded(list(cmd[1:]), cwd=cwd)
@@ -1434,6 +1425,8 @@ def _run_git_network_cmd(cmd: List[str], cwd: pathlib.Path) -> str:
 
 
 def get_tools() -> List[ToolEntry]:
+    from ouroboros.review_doctrine import AUTHOR_DISPOSITION_SCHEMA
+    from ouroboros.review_waiting import wake_on_schema
     reviewed_commit_description = (
         "Commit already-changed files through the unified reviewed commit workflow: free deterministic checks, "
         "the tests preflight, then the review panel (both questions). Blocking gates on its verdict; under Advisory or "
@@ -1449,6 +1442,7 @@ def get_tools() -> List[ToolEntry]:
         "checks, the tests (see skip_tests) and the panel still run; the opposite of preflight_reviewer."
     )
     commit_properties = {
+        "wake_on": wake_on_schema(),
         **widening_properties(),
         "root": {"type": "string", "enum": ["system_repo"], "default": "system_repo", "description": "The reviewed commit lands in Ouroboros's own body only; review any other root with review_change and commit it with ordinary git."},
         "commit_message": {"type": "string"},
@@ -1461,15 +1455,13 @@ def get_tools() -> List[ToolEntry]:
         "skip_advisory_review": {"type": "boolean", "default": False, "description": skip_advisory_description},
         "goal": {"type": "string", "default": "", "description": "High-level goal of this change. Used by the panel's coupling questions to judge completeness."}, "scope": {"type": "string", "default": "", "description": "Declared scope boundary. Without a goal it is the intended transformation the panel's coupling questions judge the change against (completeness, forgotten adjacent surfaces)."},
         "review_reference": {"type": "object", "description": "Exact reference a prior commit call of this task returned, for the free explicit Advisory or Cyber Pro continuation."},
-        "author_disposition": {"type": "object", "additionalProperties": False,
-            "properties": {"disposition": {"type": "string", "enum": ["accepted", "rejected", "partial", "deferred"]}, "rationale": {"type": "string"}},
-            "required": ["disposition", "rationale"], "description": "Explicitly accept the current attributed candidate after reading the referenced outcome. Never overrides Blocking."},
+        "author_disposition": AUTHOR_DISPOSITION_SCHEMA,
     }
     return [
         ToolEntry("commit_reviewed", {"name": "commit_reviewed", "description": reviewed_commit_description,
-            "parameters": {"type": "object", "properties": commit_properties, "required": ["commit_message"]}}, _commit_reviewed, is_code_tool=True),
+            "parameters": {"type": "object", "properties": commit_properties, "required": []}}, _commit_reviewed, is_code_tool=True),
         ToolEntry("vcs_commit_reviewed", {"name": "vcs_commit_reviewed", "description": reviewed_commit_description,
-            "parameters": {"type": "object", "properties": commit_properties, "required": ["commit_message"]}}, _commit_reviewed, is_code_tool=True),
+            "parameters": {"type": "object", "properties": commit_properties, "required": []}}, _commit_reviewed, is_code_tool=True),
         ToolEntry("vcs_status", {
             "name": "vcs_status",
             "description": "git status --porcelain for the selected repository.",

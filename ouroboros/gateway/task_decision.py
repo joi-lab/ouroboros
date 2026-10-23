@@ -60,7 +60,7 @@ def _parse_quiz_decision_id(decision_id: str) -> Tuple[str, str, str]:
     return family, parts[1], parts[2]
 
 
-def _live_root_task(task_id: str) -> Tuple[Optional[Dict[str, Any]], str]:
+def _live_root_task(task_id: str, *, holds_mail: bool = False) -> Tuple[Optional[Dict[str, Any]], str]:
     """Queue-lock read: the live task row, or a refusal reason.
 
     ``task_not_live`` is NOT a hard refusal for a quiz answer — the caller
@@ -68,7 +68,9 @@ def _live_root_task(task_id: str) -> Tuple[Optional[Dict[str, Any]], str]:
     ``task_settled``, a RUNNING worker whose result already settled (its
     mailbox is no longer drained, TZ-2 D15). ``task_not_reading`` is alive
     (queued, held, owner- or money-paused) but reads no question mail now; an
-    unheld cold sleep still reads it here, never in room intake (D6)."""
+    unheld cold sleep still reads it here, never in room intake (D6). With
+    ``holds_mail`` that living row comes back too: addressed question mail
+    waits in its mailbox until it reads, and no hold is released."""
     from supervisor import queue as q
 
     with q._queue_lock:
@@ -117,8 +119,13 @@ def _live_root_task(task_id: str) -> Tuple[Optional[Dict[str, Any]], str]:
     drive = _task_drive_for_task(task, task_id)
     running = task_id in q.RUNNING or direct_chat_turn(task_id) is not None
     if not (is_reading(drive, task_id, task, running=running) or unheld_cold_sleep(drive, task_id, task)):
-        return None, "task_not_reading"
+        return (task if holds_mail else None), "task_not_reading"
     return task, ""
+
+
+def _mail_holder(task_id: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """The living work an addressed answer waits for: reading now, or paused, held or queued."""
+    return _live_root_task(task_id, holds_mail=True)
 
 
 def _quiz_answer_frame(
@@ -248,8 +255,9 @@ def _forward_late_quiz_answer(
     rebuilds the FULL frame from the stored block for the model
     (``owner_quiz.late_answer_model_text``), so the model still reads the card.
 
-    The typed late_answer metadata bypasses the room's ordinary-reader route.
-    A fresh head receives the complete frame and the asker keeps its holds.
+    The typed late_answer metadata routes only to a live head that an earlier
+    late answer to this asker started, never to another reader; otherwise a
+    fresh head receives the complete frame.
     """
     chat_id, reason = _late_answer_destination(drive_root, task_id, block)
     if chat_id is None:
@@ -596,7 +604,7 @@ async def answer_decision(drive_root: pathlib.Path, body: Any, *, source: str = 
                                            "The answer was recorded. Its history and delivery remain pending.")
             from ouroboros.question_answers import deliver_answer
             forwarded, forward_reason = await run_sync_to_completion(
-                deliver_answer, drive_root, task_id, quiz_id, block, _live_root_task, _forward_late_quiz_answer)
+                deliver_answer, drive_root, task_id, quiz_id, block, _mail_holder, _forward_late_quiz_answer)
             late_delivery = late_delivery or bool(forwarded)
             forward_reason = pending_reason or forward_reason
             if forward_reason:

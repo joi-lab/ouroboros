@@ -48,8 +48,7 @@ def _read_source(root, entry, ref):
 def observe_run(root, entry, detail: dict) -> bool:
     """Publish exact execution/question facts, never collection, control or consumption."""
     summary = c.summary_of(detail)
-    named = summary.get("runId") or summary.get("id") or detail.get("runId")
-    if named and str(named) != entry.run_id:
+    if c.names_another_run(detail, entry.run_id):  # a run held by its job id is still this run
         raise ValueError("execution observation belongs to another run")
     state = str(summary.get("state") or "")
     seq = detail.get("lastSeq", 0)
@@ -119,7 +118,7 @@ def record_terminal_money(root, entry, detail: dict, *, failures=None) -> dict:
             from ouroboros.install_identity import require_owned_root
 
             require_owned_root(entry.ledger_root or root)  # the usage store is not behind ``open_store``'s check
-            record_subscription_session(entry.run_id, drive_root=pathlib.Path(entry.ledger_root or root),
+            attempt_id = record_subscription_session(entry.run_id, drive_root=pathlib.Path(entry.ledger_root or root),
                 route=entry.route_id, model=observed.get("model", ""), task_id=entry.task_id,
                 root_task_id=entry.root_task_id, parent_task_id=entry.parent_task_id,
                 category=entry.category, source=entry.source,
@@ -140,6 +139,8 @@ def record_terminal_money(root, entry, detail: dict, *, failures=None) -> dict:
             entry.ledger_recorded = True
             c.emit(root, c.LEDGER_RECORDED, {"run_id": entry.run_id, "task_id": entry.task_id,
                 "root_task_id": entry.root_task_id, "parent_task_id": entry.parent_task_id, "route": entry.route_id})
+            if not entry.review_owned:
+                _emit_session_usage(root, entry, summary, observed, attempt_id)
     if entry.ledger_recorded:
         failure = summary.get("failure") if isinstance(summary.get("failure"), dict) else {}
         facts = summary.get("outcomeFacts") if isinstance(summary.get("outcomeFacts"), dict) else {}
@@ -163,6 +164,36 @@ def record_terminal_money(root, entry, detail: dict, *, failures=None) -> dict:
             except Exception:
                 log.debug("Session history unavailable", exc_info=True)
     return {"settled": entry.settled, "ledger_recorded": entry.ledger_recorded, "retried": True}
+
+
+def _emit_session_usage(root, entry, summary, observed, attempt_id):
+    """Best-effort telemetry after money; a missing event never repeats inference.
+
+    The custody event already represents unknown/legacy sessions. Only a valid
+    native split adds token facts. Recollection can repeat this row; consumers
+    key it by run, while the ledger remains the sole monetary authority.
+    """
+    from ouroboros.review_session_usage import session_usage_facts
+    from ouroboros.contracts.record_contract import RECORD_CONTRACT_VERSION
+    from ouroboros.event_usage import event_token_counts
+    from ouroboros.utils import append_jsonl, utc_now_iso
+
+    facts = session_usage_facts(entry.run_id, requested_route=entry.route_id,
+                                observed_attempt=observed, summary=summary)
+    if "input_token_usage" not in facts:
+        return
+    try:
+        append_jsonl(c.event_log_path(root), {
+            "type": "llm_usage", "ts": utc_now_iso(), "record_contract_version": RECORD_CONTRACT_VERSION,
+            "task_id": entry.task_id, "root_task_id": entry.root_task_id or entry.task_id,
+            "parent_task_id": entry.parent_task_id, "delegation_role": "subagent" if entry.parent_task_id else "",
+            "source": entry.source, "category": entry.category, "provider": "claudexor", "api_key_type": "claudexor",
+            "model": "", "claudexor": facts["claudexor"], "input_token_usage": facts["input_token_usage"],
+            **event_token_counts(facts),
+            "accounting_authority": "physical_attempt_ledger", "ledger_attempt_ids": [attempt_id],
+        })
+    except Exception:
+        log.warning("Delegated usage event unavailable for %s", entry.run_id, exc_info=True)
 
 
 def _retain_output(root, entry, detail, gateway, staging_task_id="", output_authority=None):
@@ -201,7 +232,7 @@ def _retain_output(root, entry, detail, gateway, staging_task_id="", output_auth
 def collect_terminal(root, run_id: str, *, gateway=None, detail: dict | None = None,
                      allow_review: bool = False, staging_task_id: str = "", stopped=None, failures=None,
                      output_authority=None) -> dict:
-    """One nonblocking result-owner entry for foreground, runtime and orphan recovery.
+    """One result-owner entry for foreground collection and the body, including recovered debt.
 
     A contending caller reads committed facts; it never times out an integration
     or evicts a live collector. No queue/root/money lock is held at this entry.
@@ -209,7 +240,7 @@ def collect_terminal(root, run_id: str, *, gateway=None, detail: dict | None = N
     from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
     from ouroboros.delegate_continuation import disposition_refusal
     from ouroboros.tools.delegate_integration import capture_terminal_patch_for_drive
-    from ouroboros.tools.subagent_integration_delegated import retain_investigation_evidence
+    from ouroboros.tools.subagent_integration_delegated import retain_run_evidence
 
     root = pathlib.Path(root)
     if stopped is not None and stopped():
@@ -265,13 +296,13 @@ def collect_terminal(root, run_id: str, *, gateway=None, detail: dict | None = N
             closing = stopped is not None and stopped()
             money = ({"settled": entry.settled, "ledger_recorded": entry.ledger_recorded}
                      if closing else record_terminal_money(root, entry, detail, failures=failures))
-            # Existing evidence-only cleanup is explicit and comes AFTER full
-            # output retention. Mutating results remain the author's decision.
+            # Named evidence and evidence-only cleanup come AFTER full output
+            # retention. Mutating results remain the author's decision.
             if not closing and capture and entry.output_complete and entry.output_source:
-                capture = retain_investigation_evidence(root, entry, capture, gateway)
+                capture = retain_run_evidence(root, entry, capture, gateway)
             if not closing and entry.project_persistent and entry.project_owned:
                 c.retire_project(root, gateway, entry)  # records kept, never deletes the project
-            return {"status": "collected" if not collection_pending(current.run(root, run_id)) else "pending",
+            return {"status": "collected" if not collection_pending(current.run(root, run_id), root) else "pending",
                     "settlement": money, "workspace_capture": capture, "output_retention": retention, "errors": errors}
         return {"status": "unavailable", "reason": "custody_missing"}
     finally:
@@ -290,8 +321,22 @@ def retained_payload(root, entry, *, require_complete: bool = True) -> dict | No
         return None
 
 
+def saved_named_evidence(root, entry) -> tuple[pathlib.Path, dict]:
+    """Where a Git run's retained ``.review-evidence/`` summary lives and what it last said (``{}``
+    when none): one addressed read, never a recapture (#2070)."""
+    path = c.delegated_capture_dir(root, entry.task_id, c.capture_key(entry)) / "evidence" / "summary.json"
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    return path, saved if isinstance(saved, dict) else {}
+
+
 def capture_projection(root, entry, *, reader_task_id="") -> dict | None:
-    """Existing captured manifest or an honest pending fact; never triggers capture."""
+    """Existing captured manifest or an honest pending fact; never triggers capture.
+
+    A Git run's saved named-evidence summary rides along, so saved-result and
+    retry-successor delivery keep its status and reader."""
     directory = entry.resource_ref.get("workspace_kind") == "directory"
     if not entry.execution_root and not directory:
         return None
@@ -307,13 +352,18 @@ def capture_projection(root, entry, *, reader_task_id="") -> dict | None:
         return {"status": "pending", "note": "Body capture is still owed; no patch was applied. integrate_delegated_patch "
                 "prepares a finished run's capture itself and returns it for inspection first.",
                 "patch_disposition": entry.patch_disposed or "pending"}
+    other_reader = bool(reader_task_id and reader_task_id != entry.task_id)
     if directory:
         from ouroboros.delegate_directory import directory_capture_block
         block = directory_capture_block(root, entry, manifest)
     else:
         from ouroboros.tools.delegate_integration import _capture_block
         block = _capture_block(entry, cap_dir, manifest, manifest.get("authority_drift") or {})
-    if reader_task_id and reader_task_id != entry.task_id:
+        summary, named = saved_named_evidence(root, entry)
+        if named:  # another task reads it by absolute artifact path, as the patch and manifest below
+            block["named_evidence"] = ({**named, "summary_read": {"root": "artifact_store", "path": str(summary)}}
+                                       if other_reader and named.get("summary_read") else named)
+    if other_reader:
         for kind in ("patch", "manifest"):
             if block.get(f"{kind}_read") and block.get(f"{kind}_artifact"):
                 block[f"{kind}_read"] = {"root": "artifact_store", "path": block[f"{kind}_artifact"]}
@@ -332,13 +382,14 @@ def _collection_facts(entry):
 
 class BodyRuntime:
     """One generation's owned physical jobs. No background job grants actor authority."""
-    def __init__(self, root, *, stop_event=None, gateway_factory=None, max_workers=None):
+    def __init__(self, root, *, stop_event=None, gateway_factory=None, max_workers=None, collection_ready=None):
         from ouroboros.config import get_max_workers
         from ouroboros.platform_layer import process_start_time
 
         self.root = pathlib.Path(root).resolve()
         self.external_stop = stop_event
         self.gateway_factory = gateway_factory
+        self.collection_ready = collection_ready or (lambda: True)
         self.stop = threading.Event()
         self.changed = threading.Event()
         self.lock = threading.RLock()
@@ -542,9 +593,9 @@ class BodyRuntime:
         with self.lock:
             self.retry_requested.intersection_update(
                 rid for rid in self.retry_requested
-                if rid in self.collections or collection_pending(entries.get(rid)))
+                if rid in self.collections or collection_pending(entries.get(rid), self.root))
             for rid in list(self.collection_attempts):
-                if rid not in self.collections and not collection_pending(entries.get(rid)):
+                if rid not in self.collections and not collection_pending(entries.get(rid), self.root):
                     self.collection_attempts.pop(rid, None)
                     self.collection_failures.pop(rid, None)
                     self.retry_requested.discard(rid)
@@ -556,7 +607,7 @@ class BodyRuntime:
                     previous = self.reads.get(entry.run_id)
                     if (previous is None or previous.done()) and self.observation_gaps.get(entry.run_id) != self._observation_key(entry):
                         self.reads[entry.run_id] = self.observers.submit(self._observe, entry)
-                if collection_pending(entry):
+                if self.collection_ready() and collection_pending(entry, self.root):
                     previous = self.collections.get(entry.run_id)
                     facts, now = _collection_facts(entry), time.monotonic()
                     old, ended = self.collection_attempts.get(entry.run_id, (None, 0.0))
@@ -636,13 +687,14 @@ def current_activity(root, task_id: str, run_id: str, invocation_id: str = ""):
     return run_activity(fact)
 
 
-def start_body_runtime(root, *, stop_event=None, gateway_factory=None, max_workers=None) -> BodyRuntime:
+def start_body_runtime(root, *, stop_event=None, gateway_factory=None, max_workers=None, collection_ready=None) -> BodyRuntime:
     key = str(pathlib.Path(root).resolve())
     with _RUNTIME_LOCK:
         existing = _RUNTIMES.get(key)
         if existing is not None:
             return existing  # A closing generation is not replaced while its jobs remain.
-        runtime = BodyRuntime(key, stop_event=stop_event, gateway_factory=gateway_factory, max_workers=max_workers)
+        runtime = BodyRuntime(key, stop_event=stop_event, gateway_factory=gateway_factory, max_workers=max_workers,
+                              collection_ready=collection_ready)
         _RUNTIMES[key] = runtime
         return runtime
 

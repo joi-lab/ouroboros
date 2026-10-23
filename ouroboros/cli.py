@@ -147,7 +147,7 @@ def _server_command(args: argparse.Namespace) -> int:
 
     try:
         sys.argv = [old_argv[0]]
-        return int(server.main())
+        return server.executable_main()
     finally:
         sys.argv = old_argv
 

@@ -64,6 +64,47 @@ def test_plain_reply_and_voluntary_selection_need_one_round(turn):
     assert 'task_completion' not in trace
 
 
+@pytest.mark.parametrize('statement', [None, 'Solo would have avoided coordination; parallel checks helped.'])
+def test_accepted_completion_retains_only_an_authored_swarm_comparison(turn, tmp_path, statement):
+    from ouroboros.swarm_receipt import publish
+    from ouroboros.task_results import write_task_result
+
+    registry, calls, notes, run = turn
+    write_task_result(tmp_path, 'author-task', 'running')
+    schema = registry.get_schema_by_name('finish_task')['function']['parameters']['properties']
+    assert schema['swarm_comparison']['type'] == 'string'
+    kwargs = {'swarm_comparison': statement} if statement is not None else {}
+    text, usage, trace = run([finish('Done.', **kwargs)])
+    assert text == 'Done.' and len(calls) == 1
+    comparison = publish(tmp_path, 'author-task')['mind_comparison']
+    if statement is None:
+        assert comparison['state'] == 'not_recorded'
+    else:
+        assert comparison == {'source': 'task.swarm_comparison', 'author': 'mind', 'value': statement}
+    assert registry.get_schema_by_name('finish_task')['function']['parameters']['properties'] == schema
+
+
+def test_held_completion_does_not_publish_its_swarm_comparison(turn, tmp_path, monkeypatch):
+    from ouroboros.task_results import load_task_result, write_task_result
+
+    registry, calls, notes, run = turn
+    write_task_result(tmp_path, 'author-task', 'running')
+    hold_first_delivery(monkeypatch)
+    text, usage, trace = run([finish('Held answer', swarm_comparison='An unaccepted comparison'), finish('Done.')])
+    assert text == 'Done.' and len(calls) == 2
+    assert 'swarm_comparison' not in load_task_result(tmp_path, 'author-task')
+
+
+@pytest.mark.parametrize('statement, accepted', [('An authored comparison', True), (17, False)])
+def test_swarm_comparison_argument_is_text_without_deciding_completion(turn, statement, accepted):
+    from ouroboros.tools.control_runtime import _finish_task
+
+    registry, calls, notes, run = turn
+    result = _finish_task(registry._ctx, action='finish', answer='Done.', swarm_comparison=statement)
+    assert ('completion_requested' in result) is accepted
+    assert ('swarm_comparison must be text' in result) is not accepted
+
+
 def test_retained_report_interim_then_short_complete_selection(turn, monkeypatch):
     registry, calls, notes, run = turn
     review_calls = hold_first_delivery(monkeypatch)
@@ -202,6 +243,8 @@ def test_reply_later_is_consumed_once_then_a_hold_needs_new_selection(turn, monk
     from tests.test_presence_runner import _admission
     registry, calls, notes, run = turn
     registry._ctx.task_contract = {'capability_ceiling': presence_ceiling_payload(_admission().capability_ceiling)}
+    from tests.presence_legacy_helpers import register_legacy_completion
+    register_legacy_completion(registry)
     checked = hold_first_delivery(monkeypatch)
     text, _, _ = run([_call('message', ''), {'content': 'Chosen reply-later'},
         {'content': 'Interim, unselected'}, _call('message', 'Deliberately selected')])

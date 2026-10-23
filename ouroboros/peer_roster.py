@@ -200,8 +200,12 @@ def _pause_fact(pause: Dict[str, Any], fence: Any) -> Dict[str, Any]:
     before the field existed). A newer stated reason is ``unknown`` with that
     reason, never silently money.
     """
+    from ouroboros.work_stop import reason_policy, stop_presentation
     reason = _recorded_reason(pause)
-    kind = {"sleep": "sleep", "owner": "owner_pause", "budget": "budget", "": "budget"}.get(reason, "unknown")
+    view = stop_presentation({"_budget_pause": {**pause, "reason": reason or "budget"}}, {"owner": fence or {}})
+    cause = view["stop"].get("cause")
+    kind = ("sleep" if reason_policy(reason)["cause"] == "wait" else
+            {"pause": "owner_pause", "money": "budget"}.get(cause, "unknown"))
     fact: Dict[str, Any] = {"kind": kind, "state": str(pause["state"])}
     if kind == "sleep":
         fact.update(_sleep_facts(pause.get("sleep")))
@@ -252,40 +256,30 @@ def _waiting_facts(stored: Dict[str, Any], attempt: Any) -> List[Dict[str, Any]]
     return facts
 
 
-_HOLD_CODES = {"continuation_writer_unsettled": "earlier_work_unconfirmed", "saved_work_hold": "saved_on_stop",
-               "owner_restart_hold": "after_restart", "panic_hold": "after_panic",
-               "root_fence_lifted_pending_selection": "awaiting_selection",
-               "root_fence_member_pending_selection": "awaiting_selection"}
-
-
 def _queue_hold_facts(task: Dict[str, Any], stored: Dict[str, Any], waiting: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """What holds a listed root that its own result records do not say: the queue row's typed hold
-    (a Continue waiting for the earlier attempt's writers, work saved by a stop, a Panic, a member awaiting
-    selection) and a Pause over its tree still settling or parked warm, named by its declared author and dated
-    by its press, as the owner's card says it (gateway/work_status.py)."""
-    from ouroboros.gateway.work_status import REASON_TEXT  # D01->D11 is lazy-only
+    """The owner's current stop and words, including tree precedence and release authority."""
+    from ouroboros.work_stop import stop_presentation
 
-    facts: List[Dict[str, Any]] = []
-    hold = task.get("_budget_pause_hold") if isinstance(task.get("_budget_pause_hold"), dict) else {}
-    if hold and not hold.get("selected"):
-        reason = str(hold.get("reason") or "")
-        code = _HOLD_CODES.get(reason) or ("restore_failed" if reason.startswith("restore_refused:") else "held")
-        text = REASON_TEXT.get(code, code)
-        fact = {"kind": "hold", "reason": code, "text": text if isinstance(text, str) else code,
-                "since": _iso_text(hold.get("held_at")) or None}
-        predecessor = ((task.get("metadata") or {}).get("continuation") or {}).get("predecessor_task_id")
-        if code == "earlier_work_unconfirmed" and predecessor:
-            fact["tasks"] = [str(predecessor)]
-        facts.append(fact)
-    fence = stored.get("owner_pause") if isinstance(stored.get("owner_pause"), dict) else {}
-    if fence.get("state") in {"requested", "paused"} and not any(wait.get("kind") == "owner_pause" for wait in waiting):
-        fact = {"kind": "owner_pause", "state": str(fence["state"]),
-                # A settling fence restamps ``paused_at``; the Pause began at its press.
-                "since": _iso_text(fence.get("requested_at")) or _iso_text(fence.get("paused_at")) or None}
-        if by := _pause_by(fence):
+    view = stop_presentation({**stored, **task}, {"owner": stored.get("owner_pause") or {}})
+    stop, entry = view["stop"], view["reason"]
+    if not stop and not view["refusal"] and entry["code"] != "earlier_work_unconfirmed":
+        return []
+    kind = {"pause": "owner_pause", "money": "budget", "authority": "budget"}.get(stop.get("cause"), "hold")
+    prior = next((fact for fact in waiting if fact.get("kind") == kind), {})
+    # The exact marker's wait fact is replaced by this one current decision.
+    waiting[:] = [fact for fact in waiting if fact.get("kind") not in {"owner_pause", "budget", "hold", "unknown"}]
+    fact = {**prior, "kind": kind, "reason": entry["code"], "text": entry["text"],
+            "release": view["release"], "since": (_iso_text(entry.get("since")) or iso_from_epoch(entry.get("since"))
+                                                  or prior.get("since")),
+            **({"refusal": view["refusal"]} if view["refusal"] else {})}
+    if kind == "owner_pause":
+        fact["state"] = str(stop.get("state") or "")
+        if by := _pause_by(stop):
             fact["by"] = by
-        facts.append(fact)
-    return facts
+    predecessor = ((task.get("metadata") or {}).get("continuation") or {}).get("predecessor_task_id")
+    if view["waiting"] and predecessor:
+        fact["tasks"] = [str(predecessor)]
+    return [fact]
 
 
 def _live_trees(root: pathlib.Path, snapshot: Dict[str, Any], gaps: Optional[List[str]] = None,
@@ -326,7 +320,7 @@ def _live_trees(root: pathlib.Path, snapshot: Dict[str, Any], gaps: Optional[Lis
     return trees
 
 
-def _tree_tails(root: Any, tree: Optional[Dict[str, Any]], fence: Any) -> List[Dict[str, Any]]:
+def _tree_tails(root: Any, tree: Optional[Dict[str, Any]], fence: Any, root_task_id: str = "") -> List[Dict[str, Any]]:
     """What of a tree still runs, typed and worded as the owner's card says it (``work_status.work_tails``):
     helpers the queue runs that its Pause has not parked, open runs typed by ``work_status.run_tail`` from their
     own task's stored result, and the review work a settled Pause lets finish."""
@@ -346,8 +340,12 @@ def _tree_tails(root: Any, tree: Optional[Dict[str, Any]], fence: Any) -> List[D
         stops = unconfirmed_stops(root, str(entry.task_id), owner) if entry.task_id else frozenset()
         kind, state = ws.run_tail(getattr(entry, "source", ""), owner, stop_unknown=str(entry.run_id) in stops)
         runs.append({"run_id": str(entry.run_id), "kind": kind, "state": state})
-    return ws.work_tails([task for task in tree["running"] if task not in parked], runs,
-                         reviewing=fence.get("state") == "paused" and bool(fence.get("finishing_reviews")))
+    from supervisor.continuation_admission import model_handoffs
+    root_task_id = root_task_id or str(fence.get("root_task_id") or "")
+    tails = ws.work_tails([task for task in tree["running"] if task not in parked], runs,
+                          reviewing=fence.get("state") == "paused" and bool(fence.get("finishing_reviews")))
+    return tails + (ws.model_tails(model_handoffs(root, root_task_id)) if root_task_id else [])
+
 
 
 def _compact_root(task_id: str, task: Dict[str, Any], *, status: str, direct: bool = False,
@@ -416,11 +414,15 @@ def _compact_root(task_id: str, task: Dict[str, Any], *, status: str, direct: bo
     waiting = [] if settled else _waiting_facts(stored, queue_row.get("attempt") or task.get("_attempt"))
     if not settled:
         waiting += _queue_hold_facts(task, stored, waiting)
+    from ouroboros.work_stop import stop_presentation
+    view = stop_presentation({**stored, **task}, {"owner": stored.get("owner_pause") or {}})
+    if view["stop"] or view["refusal"]:
+        row.update(stop=view["stop"], release=view["release"], refusal=view["refusal"])
     if waiting:
         row["waiting"] = waiting
         # A root that waits also says what of its tree still runs: a review its Pause lets finish, a run nobody can
         # confirm. A running root's own status already says it runs (its helpers' churn stays out of every roster).
-        tails = _tree_tails(canonical_root, (trees or {}).get(task_id), stored.get("owner_pause"))
+        tails = _tree_tails(canonical_root, (trees or {}).get(task_id), stored.get("owner_pause"), task_id)
         if tails:
             row["tails"] = tails
     return row
@@ -483,6 +485,7 @@ def unlisted_live_work(drive_root: pathlib.Path, listed: set) -> List[Dict[str, 
     target (``independent_roots`` stays the address book). Never raises; an unreadable source yields no rows (the
     roster discloses freshness)."""
     from ouroboros.task_results import load_task_result
+    from ouroboros.work_stop import stop_presentation
 
     root = pathlib.Path(drive_root)
     try:
@@ -499,10 +502,14 @@ def unlisted_live_work(drive_root: pathlib.Path, listed: set) -> List[Dict[str, 
             stored = load_task_result(root, root_id, strict=True) or {}
         except Exception as exc:
             stored, unavailable = {}, {"task_result": type(exc).__name__}
+        view = stop_presentation({**stored, "id": root_id}, {"owner": stored.get("owner_pause") or {}})
         rows.append({"work_id": root_id, "title": str(stored.get("suggested_name") or stored.get("title") or ""),
                      "room": {"chat_id": stored.get("chat_id"), "project_id": str(stored.get("project_id") or "")},
+                     **({"waiting": waiting} if (waiting := _queue_hold_facts({"id": root_id}, stored, [])) else {}),
+                     **({"stop": view["stop"], "release": view["release"], "refusal": view["refusal"]}
+                        if view["stop"] or view["refusal"] else {}),
                      "root_status": str(stored.get("status") or "unknown"), "helpers_running": len(tree["running"]),
-                     "helpers_waiting": tree["pending"], "tails": _tree_tails(root, tree, stored.get("owner_pause")),
+                     "helpers_waiting": tree["pending"], "tails": _tree_tails(root, tree, stored.get("owner_pause"), root_id),
                      **({"unavailable": unavailable} if unavailable else {})})
     return rows
 
@@ -581,7 +588,7 @@ def roster_fingerprint(roster: Dict[str, Any], *, exclude: str = "") -> tuple:
 
 _WAIT_LABELS = {"owner": "owner answer", "review": "review", "model": "model access", "budget": "budget pause",
                 "sleep": "sleep", "owner_pause": "owner Pause", "hold": "held", "unknown": "unknown wait"}
-_WAIT_DETAILS = ("quiz_id", "reason", "text", "by", "role", "mode", "retained", "state", "settlement", "rail", "until",
+_WAIT_DETAILS = ("quiz_id", "reason", "text", "by", "release", "role", "mode", "retained", "state", "settlement", "rail", "until",
                  "reset_at", "wake_at", "senders", "tasks", "runs", "services", "any_mail")
 
 

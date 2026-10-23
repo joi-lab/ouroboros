@@ -721,6 +721,10 @@ def _stamp_read_view(ctx: ToolContext, target: Any, opened: str, opened_root: st
     before every dispatch (these are the ONLY writers — a static test pins the
     writer set). Disclosure only — never gates or alters the read."""
     if "body_start" in extent:
+        if opened_root == "runtime_data" and opened == "memory/identity.md" and extent.get("source_revision"):
+            revision_line = f"revision={extent['source_revision']}\n"
+            rendered = revision_line + rendered
+            extent["body_start"] += len(revision_line)
         view = {"target": str(target), "opened_path": str(opened), "opened_root": str(opened_root), **extent}
         ctx.last_read_view = view
         from ouroboros.delegate_output import acknowledge_staged_output_read

@@ -111,6 +111,9 @@ class TestCustodyAggregation:
             "subscription_cost_estimated": False,
             "harness_models": [],
             "applied_access_profiles": [],
+            "initial_execution": {},
+            "delegated_obligations": {"open_run_ids": [], "pending_invocation_ids": [],
+                                      "undisposed_patch_run_ids": []},
         }
 
     def test_started_and_settled_runs_aggregate_with_disclosed_spend(self, tmp_path):
@@ -121,6 +124,7 @@ class TestCustodyAggregation:
         evidence = custody.task_execution_evidence(drive, "child-1")
         assert evidence["delegated_runs_started"] == 2
         assert evidence["delegated_runs_settled"] == 1
+        assert evidence["delegated_obligations"]["open_run_ids"] == ["run-2"]
         assert evidence["subscription_cost_usd"] == 0.0
         assert evidence["harness_models"] == ["claude-sonnet"]
 
@@ -263,6 +267,9 @@ class TestEnvelopeReconciliation:
             "subscription_cost_estimated": False,
             "harness_models": [],
             "applied_access_profiles": [],
+            "initial_execution": {},
+            "delegated_obligations": {"open_run_ids": [], "pending_invocation_ids": [],
+                                      "undisposed_patch_run_ids": []},
         }
 
     def test_settled_delegate_rows_read_as_harness_evidence(self, tmp_path):

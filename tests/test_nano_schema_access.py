@@ -16,6 +16,7 @@ def test_nano_child_can_select_only_its_existing_capabilities(tmp_path, monkeypa
         path.mkdir()
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     ctx = ToolContext(repo_dir=repo, drive_root=data, workspace_root=workspace,
                       workspace_mode="external", task_id="nano-schema", active_context_mode=mode,
                       task_constraint=TaskConstraint(mode=profile, surface="external_workspace", write_root=str(workspace)))

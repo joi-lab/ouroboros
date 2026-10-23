@@ -15,12 +15,12 @@ import pytest
 
 from tests import test_subscription_setup_browser as setup_browser
 from tests._work_projection_shared import work_fields
-from tests.test_design_system_gate_browser import PROJECTS, save_evidence, seed_page, settle
+from tests.test_design_system_gate_browser import PROJECTS, rest, save_evidence, seed_page, settle
 
 subscription_ui = setup_browser.subscription_ui
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 CHATS = {p['id']: p['chat_id'] for p in PROJECTS}
-MENU = 'body > .project-row-menu'
+MENU = 'body > .project-row-menu:not([data-leaving])'  # the open one: a closed menu's picture fades a moment
 
 
 @pytest.fixture(params=['webkit', 'chromium'])
@@ -134,8 +134,7 @@ def test_the_menu_button_says_what_waits_behind_it_in_both_places(nav_ui, tmp_pa
         page.locator('#page-chat [data-mobile-nav-toggle]').click()
         page.locator('#primary-sidebar [data-nav-page="files"]').click()
         page.locator('#page-files.active').wait_for()
-        setup_browser.wait_drawer_closed(page)  # the room slides back over the drawer before its ☰ is measured
-        settle(page)
+        rest(page)  # the card has come home: its ☰ is measured at its own size, not mid-glide
         facts['header_owner'] = toggle(header)
         # Main's own new messages (its room revision past the shared cursor), away from Main, light the ☰ too.
         sync(snapshot(main_revision=1))
@@ -161,6 +160,34 @@ def test_the_menu_button_says_what_waits_behind_it_in_both_places(nav_ui, tmp_pa
         assert button['right'] - 9 <= mark['box']['right'] <= button['right'] + 1, (case, mark, button)
         assert button['top'] - 1 <= mark['box']['top'] <= button['top'] + 9, (case, mark, button)
     assert facts['unread']['fill'] == facts['crimson'] and facts['owner']['fill'] == facts['amber'], facts
+
+
+def test_the_closed_drawer_rests_its_moving_dots_and_opening_it_starts_them(nav_ui, tmp_path):
+    """On a phone the room card covers the closed drawer: its rows' moving dots rest instead of running unseen, and
+    run again, on the page's one wave, while the drawer is open. Docked they always run."""
+    ui = nav_ui
+    working = PROJECTS[0]['id']
+    page, _sync = open_app(ui, 390, 844, snapshot(work=[working]))
+    dots = f'#primary-sidebar [data-project-id="{working}"] .status-mark > i'
+    running = f"""() => [...document.querySelectorAll('{dots}')].map((i) => getComputedStyle(i).animationName)"""
+    facts = {'engine': ui['engine']}
+    try:
+        page.wait_for_function(f"() => document.querySelector('{dots}')?.parentElement.dataset.shape === 'moving'")
+        facts['closed'] = page.evaluate(running)
+        page.locator('#page-chat [data-mobile-nav-toggle]').click()
+        page.wait_for_function("() => document.getElementById('primary-sidebar').classList.contains('open')")
+        settle(page)
+        facts['open'] = page.evaluate(running)
+        page.set_viewport_size({'width': 1280, 'height': 844})
+        page.wait_for_function("() => document.documentElement.dataset.layout === 'docked'")
+        settle(page)
+        facts['docked'] = page.evaluate(running)
+    finally:
+        save_evidence(tmp_path, f'nav-drawer-dots-{ui["engine"]}', facts)
+        page.close()
+    assert facts['closed'] == ['none'] * 3, facts
+    assert facts['open'] == ['status-mark-bounce'] * 3, facts
+    assert facts['docked'] == ['status-mark-bounce'] * 3, facts
 
 
 def test_a_closed_project_whose_row_the_collapse_hides_gives_the_focus_to_the_toggle(nav_ui, tmp_path):
@@ -490,6 +517,9 @@ def test_a_long_press_opens_a_rows_menu_on_touch_where_the_dots_take_no_column(c
         with page.expect_request(lambda request: request.url.endswith(update)) as pressed:
             page.locator(f'{MENU} [data-prm="pin"]').tap()
         facts['pressed'] = pressed.value.post_data_json
+        # The shared fake returns {} for this POST, so the save settles as unconfirmed.
+        # While it is pending, Pin is disabled and Rename correctly receives the menu's focus.
+        expect()(page.locator('#toast-stack')).to_contain_text('Pin state was not confirmed')
         # The keyboard still has the ⋯: focused, it is drawn again with its column.
         kebab = page.locator(f'[data-nav-project-id="{sending}"] .nav-project-kebab')
         kebab.focus()

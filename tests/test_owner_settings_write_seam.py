@@ -814,6 +814,7 @@ def test_settings_get_reads_a_legacy_actor_through_the_seam_without_materializin
     # gateway test pins the real reader it is meant to exercise.
     monkeypatch.setattr(settings_mod, "load_settings", cfg.load_settings)
     original = {
+        "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full",
         "OUROBOROS_SUBAGENT_HARNESS": "codex=gpt-5.6-sol:high",
         "OUROBOROS_SUBAGENT_PROFILE": "owner-profile",
     }
@@ -846,6 +847,7 @@ def test_settings_get_reads_the_factory_reviewers_in_place_of_an_unsaved_api_can
         settings_mod, "apply_runtime_provider_defaults", apply_runtime_provider_defaults,
     )
     original = {
+        "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full",
         "OPENROUTER_API_KEY": "configured",
         "OUROBOROS_MODEL": "openai/gpt-5.6-sol",
         "OUROBOROS_MODEL_LIGHT": "openai/gpt-5.6-luna",
@@ -895,6 +897,8 @@ _OWNER_SETTINGS_WRITERS = [
 
 def _owner_app(handler_name, route, isolated_settings):
     from ouroboros.gateway import settings as settings_mod
+    if handler_name == "api_owner_safety_mode":
+        from ouroboros.gateway import safety_settings as settings_mod
 
     app = Starlette(routes=[
         Route(route, endpoint=getattr(settings_mod, handler_name), methods=["POST"])])
@@ -1068,14 +1072,12 @@ def test_settings_save_body_runs_off_the_event_loop():
         "_api_owner_runtime_mode_sync",
         "_api_owner_auto_grant_sync",
         "_api_owner_context_mode_sync",
-        "_api_owner_safety_mode_sync",
     }
     # The loop must NEVER hold the document lock: every async settings writer
     # delegates its locked body to a worker thread.
     for node in ast.walk(ast.parse(src)):
         if isinstance(node, ast.AsyncFunctionDef) and node.name in {
             "api_owner_runtime_mode", "api_owner_auto_grant", "api_owner_context_mode",
-            "api_owner_safety_mode",
         }:
             # Off the loop through the ONE writer seam (itself pinned above to
             # asyncio.to_thread + the typed busy mapping), never inline.

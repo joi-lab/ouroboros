@@ -509,43 +509,6 @@ _SKILL_ATTEMPT_FIELDS = (
 )
 
 
-def _skill_review_usage_bucket(
-    rows: Sequence[Dict[str, Any]], *, review_skill: str, review_wave_id: str,
-    integrity_degraded: bool,
-) -> Dict[str, Any]:
-    """Project one exact Skill Review wave from canonical final attempt rows."""
-    selected = sorted(
-        (
-            row for row in rows
-            if str(row.get("review_skill") or "") == review_skill
-            and str(row.get("review_wave_id") or "") == review_wave_id
-        ),
-        key=lambda row: str(row.get("attempt_id") or ""),
-    )
-    grouped: Dict[str, list[Dict[str, Any]]] = {}
-    for row in selected:
-        grouped.setdefault(str(row.get("review_slot_id") or "(unattributed)"), []).append(row)
-    by_slot = {
-        slot: _with_integrity(_breakdown_bucket(grouped[slot]), integrity_degraded)
-        for slot in sorted(grouped)
-    }
-    result = _with_integrity(_breakdown_bucket(selected), integrity_degraded)
-    result.update({
-        "review_skill": review_skill,
-        "review_wave_id": review_wave_id,
-        "attempt_ids": [str(row.get("attempt_id") or "") for row in selected],
-        "attempts": [
-            {key: row.get(key) for key in _SKILL_ATTEMPT_FIELDS if key in row}
-            for row in selected
-        ],
-        "by_slot": by_slot,
-        "attribution_complete": bool(selected) and all(
-            str(row.get("review_slot_id") or "") for row in selected
-        ),
-    })
-    return result
-
-
 _VIEW_AXES = ("model", "provider", "category")
 _VIEW_LEGACY_UNATTRIBUTED = frozenset({"legacy_metadata", "legacy_delta"})
 

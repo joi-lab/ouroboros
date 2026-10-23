@@ -22,7 +22,7 @@ The context-delivery registry:
 | Background consciousness wake-up (`consciousness.py` → `handle_wake_direct`) | = Main task context | = Main task context | = Main task context |
 | Preflight (`review_change(surface=preflight)`: one named row over the system repository's worktree) | the `review_change` body row | as BIBLE | as BIBLE |
 | The coupling question (Part 2 of the retrieving seat's brief, `tools/review_brief_coupling.py`) | full tier 1 beside the `Coupling questions` section, in every context mode | tier 3 navigation | tier 2 within the usable-window share |
-| Skill review (`skill_review.py`) | full inline (packet) / declared mandatory full read (retrieving) | same two classes | same two classes |
+| Skill review (`review_change(subject="skill")`) | full inline (packet) / declared mandatory full read (retrieving) | tier 3 navigation | tier 2: owed chapters + selected contracts |
 | Plan review (`tools/plan_review.py`) | full for a body plan (`api_chat` inline, `agent_session` mandatory full read); otherwise none, no map | as BIBLE | not delivered or pointed at; the mind may attach it |
 | Deep self-review (`deep_self_review.py`) | full tier 1 on both deliveries | tier 3 navigation | tier 2 within the row's share (ARCHITECTURE §6 "Deep self-review") |
 
@@ -32,7 +32,7 @@ Planning resolves targets against `active_repo_dir_for(ctx)`, attachments agains
 
 Review history keeps the operative contract, current author/critic statuses and open/deferred/pending facts explicit. Actor `review_notes` may shorten individual reasons or group exact historical decisions, retaining membership and lineage in the existing selected view. No grouping by age or terminal status. Producers project decisions once with mirror references; unknown legacy content stays full. Recheck versions through publication, cold context, new packets and Continue; source gaps preserve recoverable bodies. Invalid optional transfers leave their own attachments full. Unchanged views retain their prefix; all surviving accounts cross continuations. Notes grant no verdict and rewrite no paid replay. Enforcement: `tests/test_review_local_accounts.py`, `tests/test_review_cold_history.py`, `tests/test_review_view_integration.py`. Plan objections: ARCHITECTURE §6 "Plan construction and review".
 
-**Context mode (Nano / Low / Max).** Follow the Main row. Max binds Development to the active repository, never inferred intent, keeping books at startup/rebind until actual size-refusal recovery lowers them after earlier steps. Preserve owner Low/Nano sizing, lower starts, tier-0 and P3; estimates permit no quality reduction. Targets cut no chosen read or owner words; rebinds re-cut no fitting sent view (`tests/test_context_economy_window.py`). Mechanism: ARCHITECTURE §6 “Context fitting, retry, and compaction”.
+**Context mode (Nano / Low / Max).** Use the Main row. Max binds Development to the active repository, keeping books until recovery's earlier steps fall short. Known-window no-result-room predictions and provider refusals share recovery; unknown windows send full. Preserve owner Low/Nano sizing, lower starts, tier-0 and P3. Targets cut no chosen read or owner words; rebinds re-cut no fitting sent view (`tests/test_context_economy_window.py`). Mechanism: ARCHITECTURE §6 “Context fitting, retry, and compaction”.
 
 ### Invariant: Exact premises with explicit source ownership
 
@@ -42,7 +42,7 @@ Plan from the complete retained room — both speakers, options and answers exac
 
 Treat the task's dated focus as data, not owner instructions. Strictly read its canonical result, distinguishing absence/failure; update same-round facts and remeasure (`tests/test_self_focus_context.py`).
 
-Predicted pressure buys no fold; a typed size refusal is measured and recovered by the two model-free passes (ARCHITECTURE §6). No helper summarizer: `compact_context` without `working_note` is `authored_note_required`. Actor notes may fold completed working prose/tools without shrinking, preserving governing human words, recorded outward speech, newer arrivals and opaque protocol. Local notes keep positions unless selected for merging; exposure uses physical evidence, not call IDs. Test final sealed requests, cold restoration and both sides of dialogue: `tests/test_compaction.py`, `tests/test_main_authored_context.py`, `tests/test_context_source_view.py`, `tests/test_delivery_dialogue_context.py`.
+Known-window no-result-room predictions and typed size refusals use two model-free recovery passes (ARCHITECTURE §6). No helper summarizer: `compact_context` without `working_note` is `authored_note_required`. Actor notes may fold completed working prose/tools without shrinking, preserving governing human words, recorded outward speech, newer arrivals and opaque protocol. Local notes keep positions unless selected for merging; exposure uses physical evidence, not call IDs. Test final sealed requests, cold restoration and both sides of dialogue: `tests/test_compaction.py`, `tests/test_main_authored_context.py`, `tests/test_context_source_view.py`, `tests/test_delivery_dialogue_context.py`.
 
 ### Invariant: No silent truncation
 

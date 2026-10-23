@@ -122,6 +122,9 @@ def test_emit_task_results_queues_restart_after_final_events(tmp_path, monkeypat
         "effort_level": "",
         "effort_requested": "",
         "effort_source": "",
+        "coordinator_billing": "unknown",
+        "coordinator_route": "unknown",
+        "use_local_model": False,
     }
     assert memory_calls == []
 

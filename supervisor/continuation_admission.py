@@ -43,7 +43,8 @@ from ouroboros.task_store import patch_document
 
 log = logging.getLogger(__name__)
 
-from supervisor.events_budget import HOLD_CONTINUATION_WRITER  # noqa: E402 -- the one hold vocabulary
+from supervisor.events_budget import HOLD_CONTINUATION_WRITER  # noqa: E402 -- record writer
+from ouroboros.work_stop import pause_marker, writer_wait
 from ouroboros.store import StoreError
 
 
@@ -62,7 +63,7 @@ def _recorded_admission(result: Dict[str, Any], predecessor: str, nonce: str) ->
 
 
 def _replay(q: Any, predecessor: str, nonce: str, successor: str) -> Optional[Dict[str, Any]]:
-    from ouroboros.budget_pause import budget_hold_fact
+    from ouroboros.work_stop import hold_fact as budget_hold_fact
     from ouroboros.owner_continue import binding_sha, mark_claim_admitted
     from ouroboros.task_results import load_task_result, write_task_result
 
@@ -145,8 +146,8 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
     panel still finishes and attaches its verdict. Missing or unknown
     provenance, ordinary delegations, author research copies, author model
     attempts, tool/process/merge/executor custody and unreadable custody keep
-    holding. Retained terminal HTTP failures without a receiver are not writers,
-    even with unresolved cost; this pure classification applies to every consumer.
+    holding. Retained raised sends without a receiver are not writers, even
+    with unresolved cost; this pure classification applies to every consumer.
     The empty default is the complete census for every other consumer.
     """
     from ouroboros.budget_pause import observe_task_runs
@@ -191,7 +192,7 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
             if owner_latched and queued_admitted_dispatch(task):
                 continue
             if budget_pause_fact(task, fences) is None or (task.get("admitted_dispatch") == "possible"
-                                                   and not task.get("_budget_pause")):
+                                                   and not pause_marker(task)):
                 blockers.append({"kind": "dispatchable_member", "task_id": tid})
     try:
         member_results = tree_member_results(custody_root, predecessor)
@@ -234,12 +235,23 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
                     blockers.append({"kind": "owned_process", "task_id": row.get("owner_task"), "pid": pid})
     except Exception as exc:
         blockers.append({"kind": "process_custody_unreadable", "detail": str(exc)[:200]})
+    blockers.extend(model_handoffs(custody_root, predecessor, member_results=member_results,
+                                   for_continue=for_continue))
+    return blockers
+
+
+def model_handoffs(custody_root, predecessor, *, member_results=None, for_continue=False):
+    """Read the same unresolved model recipients for admission and display. Never repairs."""
+    blockers = []
     try:
         from ouroboros import usage_store
         from ouroboros.local_custody_repair import ended_unbound_model_request
         # The root's open attempts only (the store's open-set index).
         with usage_store.read(custody_root) as txn:
             attempts = txn.open_attempts(root_task_id=predecessor)
+        if attempts and member_results is None:
+            from ouroboros.owner_pause import tree_member_results
+            member_results = tree_member_results(custody_root, predecessor)
         for attempt in attempts:
             if attempt.get("state") in {"dispatched", "unresolved"}:
                 consumer = attempt.get("local_answer_consumer_id")
@@ -261,6 +273,7 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
                 if for_continue and review_owned:
                     continue
                 blockers.append({"kind": "model_handoff", "attempt_id": attempt.get("attempt_id"),
+                                 "task_id": attempt.get("task_id"),
                                  "review_owned": review_owned})
     except Exception as exc:
         blockers.append({"kind": "attempt_custody_unreadable", "detail": str(exc)[:200]})
@@ -374,6 +387,7 @@ def _work_identity(q: Any, predecessor: str, result: Dict[str, Any]) -> tuple[st
 def _successor_task(q: Any, predecessor: str, result: Dict[str, Any], binding: Dict[str, Any],
                     verdict: Dict[str, Any], sources: Dict[str, Any], admission: Dict[str, Any]) -> Dict[str, Any]:
     from ouroboros.owner_continue import owner_corpus_rows, recorded_system_checkout, work_order_text
+    from ouroboros.consciousness_authority import consciousness_origin_metadata
 
     authority_source: Dict[str, Any] = {}
     try:
@@ -428,6 +442,10 @@ def _successor_task(q: Any, predecessor: str, result: Dict[str, Any], binding: D
         **({"deadline_at": deadline_at} if deadline_at else {}),
         **{key: binding[key] for key in ("workspace_root", "workspace_mode") if binding.get(key)},
         "metadata": {
+            # Legacy results may keep their verified owner reference only on
+            # the source row. Explicit kind/origin stamps still take priority.
+            **consciousness_origin_metadata({**metadata, **(
+                {"origin_message_ref": origin_ref} if isinstance(origin_ref, dict) and origin_ref else {})}),
             **({"project_id": binding["project_id"]} if binding.get("project_id") else {}),
             **({"model_role": model_role} if model_role else {}),
             **({"resource_intent": dict(intent)} if isinstance(intent, dict) and intent.get("kind") else {}),
@@ -442,7 +460,8 @@ def _successor_task(q: Any, predecessor: str, result: Dict[str, Any], binding: D
             "continuation": {
                 "predecessor_task_id": predecessor, "work_id": work_id, "work_name": work_name,
                 "cause": verdict["cause"],
-                "owner_sources": {"original": sources.get("original"), "later": sources.get("later") or [],
+                "owner_sources": {"original": sources.get("original"), "schedule": sources.get("schedule"),
+                                  "later": sources.get("later") or [],
                                   "held_owner_messages": sources.get("held_owner_messages") or {},
                                   "open_relays": sources.get("open_relays") or {}},
                 "peer_context": sources.get("peer_context") or [],
@@ -608,7 +627,7 @@ def admit_continuation(predecessor_task_id: str, *, action_nonce: str) -> Dict[s
             return {"ok": False, "error": "continuation_claim_unwritable", "detail": str(exc)[:200]}
         binding = dict(claim["binding"])
     blockers = action_writers(q, predecessor, purpose=CONTINUE_PURPOSE)
-    admission = {**{key: claim[key] for key in ("actor", "actor_task_id", "reason") if key in claim},
+    admission = {"by": claim.get("by") or {},
                  "binding": binding, "binding_sha256": binding_sha(binding), "admitted_at": utc_now_iso(),
                  "held": bool(blockers)}
     task = _successor_task(q, predecessor, result, binding, verdict, sources, admission)
@@ -701,14 +720,14 @@ def release_settled_continuations(tree_root: str) -> List[str]:
     released: List[str] = []
     with q._queue_lock:
         task_ids = [str(task.get("id") or "") for task in q.PENDING if isinstance(task, dict)
-                and (budget_hold_fact(task) or {}).get("reason") == HOLD_CONTINUATION_WRITER
+                and writer_wait(task)
                 and ((task.get("metadata") or {}).get("continuation") or {}).get("predecessor_task_id") == tree_root]
     for task_id in task_ids:
         observation = observe_held_budget_selection(q, task_id)
         with q._queue_lock:
             task = next((row for row in q.PENDING if str(row.get("id") or "") == task_id), None)
             hold = budget_hold_fact(task)
-            if task is None or (hold or {}).get("reason") != HOLD_CONTINUATION_WRITER:
+            if task is None or not writer_wait(task):
                 continue
             outcome = select_held_budget_row(q, task, hold, selected_by="reconciliation", observation=observation)
             if outcome.get("ok"):
@@ -718,11 +737,9 @@ def release_settled_continuations(tree_root: str) -> List[str]:
 
 def held_continuation_predecessors(pending: Any) -> List[str]:
     """Each predecessor whose Continue still waits under its own writer hold, once."""
-    from supervisor.events_budget import budget_hold_fact
-
     return sorted({str(((task.get("metadata") or {}).get("continuation") or {}).get("predecessor_task_id") or "")
                    for task in list(pending or ()) if isinstance(task, dict)
-                   and (budget_hold_fact(task) or {}).get("reason") == HOLD_CONTINUATION_WRITER} - {""})
+                   and writer_wait(task)} - {""})
 
 
 def recheck_held_continuations(*, stop_requested: Any = None) -> List[str]:

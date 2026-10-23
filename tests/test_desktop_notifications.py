@@ -2,9 +2,9 @@
 
 Owner decisions 1A (the OS owns the sound), 2A (sent while the window is in front) and 3A (an
 older app falls back and says so) — DESIGN §9. Every operating-system surface here is a stand-in:
-no test asks for a permission, shows a banner or plays a sound. The Windows pumps run for real on
-a Python thread whose stand-in WinForms ``Application.Run`` is a message loop; only the shell's own
-balloon call is replaced. The one real-PyObjC check loads the UserNotifications framework and builds
+no test asks for a permission, shows a banner or plays a sound. The Windows icon's pump runs for real
+on a Python thread whose stand-in WinForms ``Application.Run`` is a message loop; only the shell's
+own balloon call is replaced. The one real-PyObjC check loads the UserNotifications framework and builds
 objects, but never touches the notification center.
 """
 from __future__ import annotations
@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import types
 from types import SimpleNamespace
 
@@ -74,7 +75,7 @@ def pywebview_exposed(api):
 
 def test_the_bridge_exposes_the_alert_methods_and_hides_its_background():
     api = bridge(Recorder())
-    assert pywebview_exposed(api) == ["notify_owner", "request_attention", "request_native_notifications",
+    assert pywebview_exposed(api) == ["notify_owner", "panic_stop", "request_attention", "request_native_notifications",
                                       "set_native_appearance", "shell_info", "show_native_notification"]
     assert api.notify_owner(True, "Task finished", "", False) == {"ok": True, "args": (True, "Task finished", "", False)}
 
@@ -185,15 +186,17 @@ def test_the_platform_click_never_waits_on_the_callback_thread():
     assert clicked == [("n9-z", "ouroboros-notification-click")]
 
 
-def test_the_background_owns_the_platform_adapter(monkeypatch):
+@pytest.mark.parametrize("indicator", [None, launcher_tray.WindowsTray])
+def test_the_background_owns_the_platform_adapter(monkeypatch, indicator):
     seen = {}
-    monkeypatch.setattr(lb, "indicator_class", lambda: None)
-    monkeypatch.setattr(lb, "_notifier", None)
-    monkeypatch.setattr(lb, "native_notifier", lambda on_click: seen.update(click=on_click) or "adapter")
+    monkeypatch.setattr(lb, "indicator_class", lambda: indicator)
+    monkeypatch.setattr(lb, "native_notifier",
+                        lambda on_click, shown_on: seen.update(click=on_click, shown_on=shown_on) or "adapter")
     background = lb.Background(lambda: None, lambda: 8765, threading.Event())
     assert background.notifications == "adapter"
     assert seen["click"] == background.open_notification, "only the click route: no sound of its own"
-    assert lb._notifier == "adapter", "the exit and Panic paths reach it"
+    assert seen["shown_on"] is background.indicator, "Windows' balloons ride the launcher's one icon"
+    assert not hasattr(lb, "_notifier"), "nothing of a notifier outlives the process: exit and Panic stop the icon"
 
 
 @pytest.mark.parametrize(("platform", "kind"), [("darwin", dn.MacNotifier), ("win32", dn.WindowsNotifier),
@@ -534,7 +537,7 @@ class NetEvent:
 
 
 class StaForms:
-    """Stand-in pythonnet and WinForms modules around a real STA pump.
+    """Stand-in pythonnet and WinForms modules around the production pump.
 
     ``Thread.Start`` runs the pump on a Python thread whose ``Application.Run`` is a message loop: its
     timers tick and the events posted to it (a click, a close) run there, as on Windows. Only the
@@ -619,6 +622,7 @@ class StaForms:
                 if forms.run_error:
                     raise forms.run_error
                 me = threading.get_ident()
+                forms._exited.discard(me)  # a new STA may reuse an OS thread id
                 inbox = forms._inbox.setdefault(me, queue.SimpleQueue())
                 while not forms.stop.is_set() and me not in forms._exited:
                     if not forms.paused.is_set():
@@ -677,110 +681,122 @@ def forms(monkeypatch):
     stand_in.shutdown()
 
 
-def recorded(clicks):
-    return lambda token: clicks.append(token)
+def start_icon(forms):
+    """The launcher's one Windows icon around the stand-in WinForms, as ``Background.run`` brings it up;
+    ``background.opened`` records what a click opened (a token, or "window")."""
+    background = SimpleNamespace(shutdown=threading.Event(), window=None, opened=[], exit_launcher=lambda: None)
+    background.show_window = lambda: background.opened.append("window")
+    background.open_notification = lambda token: background.opened.append(token)
+    tray = launcher_tray.WindowsTray(background)
+    background._indicator_up = lambda: tray.start()
+    assert tray.start()
+    wait_for(tray.ready.is_set)
+    return tray
 
 
-def test_windows_a_balloon_counts_only_once_the_shell_accepted_it(forms):
-    notifier = dn.WindowsNotifier(lambda token: None)
+@pytest.fixture
+def icon(forms, monkeypatch):
+    monkeypatch.setattr(lb, "_active", None)
+    tray = start_icon(forms)
+    yield tray
+    tray.stop(wait=2.0)
+
+
+def left_click(icon):
+    for handler in icon.MouseClick.handlers:
+        handler(icon, SimpleNamespace(Button="left"))
+
+
+def test_setup_window_exit_reopens_the_single_tray_owner(icon, forms):
+    from System.Windows.Forms import Application
+
+    first = icon._icon
+    forms.post(first.sta, Application.ExitThread)  # pywebview's setup window ends the shared loops
+    wait_for(lambda: len(forms.icons) == 2 and icon.ready.is_set())
+    assert first.disposed and not first.Visible
+    assert sum(bool(item.Visible) for item in forms.icons) == 1
+    assert icon._icon is forms.icons[-1]
+
+
+def test_windows_a_balloon_counts_only_once_the_shell_accepted_it(forms, icon):
+    notifier = dn.WindowsNotifier(lambda token: None, icon)
     assert notifier.notify("Task finished", "", True, "n1-a") == {
         "ok": True, "status": "submitted", "platform": "windows", "sound": "os"}
-    (icon,) = forms.icons
-    assert forms.balloons == [(0x5000 + icon.id, icon.id, "Task finished", "Open Ouroboros to see it.", False)], \
-        "sent to its own icon's window and id, so that icon's click and close events are its own"
+    (tray_icon,) = forms.icons
+    assert forms.balloons == [(0x5000 + tray_icon.id, tray_icon.id, "Task finished", "Open Ouroboros to see it.",
+                               False)], "sent to the one icon's window and id, so its click comes back to that icon"
 
     forms.shell_answer = lambda *call: False  # Shell_NotifyIconW said FALSE
     assert notifier.notify("Task finished", "", True, "n2-a") == {
         "ok": False, "status": "failed", "platform": "windows", "reason": "balloon_not_submitted"}
     forms.settle()
-    assert forms.icons[1].disposed, "a refused balloon's icon leaves at once"
+    assert forms.icons == [tray_icon] and tray_icon.Visible and not tray_icon.disposed, "a refusal keeps the one icon"
 
 
-def test_windows_sound_off_asks_the_shell_for_a_silent_balloon(forms):
-    answer = dn.WindowsNotifier(lambda token: None).notify("Task finished", "Report ready", False, "n1-a")
+def test_windows_sound_off_asks_the_shell_for_a_silent_balloon(forms, icon):
+    answer = dn.WindowsNotifier(lambda token: None, icon).notify("Task finished", "Report ready", False, "n1-a")
     assert answer["sound"] == "off"
     assert forms.balloons[-1][2:] == ("Task finished", "Report ready", True), "NIIF_NOSOUND"
 
 
-def test_windows_missing_icon_identity_never_turns_a_silent_request_into_sound(forms):
+def test_windows_missing_icon_identity_never_turns_a_silent_request_into_sound(forms, icon):
     forms.private_fields = False
-    clicks = []
-    notifier = dn.WindowsNotifier(recorded(clicks))
+    notifier = dn.WindowsNotifier(lambda token: None, icon)
     assert notifier.notify("Task finished", "", False, "n1-a")["status"] == "failed"
     assert forms.balloons == [] and forms.winforms_balloons == []
     # WinForms' ShowBalloonTip returns nothing and discards the shell's answer: handed over, unconfirmed.
     assert notifier.notify("Task finished", "", True, "n2-a") == {
         "ok": None, "status": "unknown", "platform": "windows", "reason": "balloon_unconfirmed"}
     assert [title for _id, title, _body in forms.winforms_balloons] == ["Task finished"]
-    forms.click(forms.icons[-1])
-    wait_for(lambda: clicks)
-    assert clicks == ["n2-a"], "its click still opens its own source"
+    forms.click(forms.icons[0])
+    wait_for(lambda: icon.background.opened)
+    assert icon.background.opened == ["n2-a"], "it may still show, so it is what a click opens"
 
 
-def test_windows_a_failed_balloon_never_takes_another_ones_click(forms):
-    """A shown, B refused, click A: A's own source, never B's (Astra P1)."""
-    clicks = []
-    notifier = dn.WindowsNotifier(recorded(clicks))
+def test_windows_a_balloon_click_opens_the_newest_source_never_a_refused_one(forms, icon):
+    """Owner decision 1A: one icon, so a click (an older entry in Windows' list included) opens the newest
+    balloon the shell took; a refused balloon never takes the click from it."""
+    notifier = dn.WindowsNotifier(lambda token: None, icon)
     assert notifier.notify("A", "", True, "n1-a")["status"] == "submitted"
+    assert notifier.notify("B", "", True, "n2-b")["status"] == "submitted"
     forms.shell_answer = lambda *call: False
-    assert notifier.notify("B", "", True, "n2-b")["status"] == "failed"
-    first, second = forms.icons
-    forms.click(first)
-    wait_for(lambda: clicks)
-    assert clicks == ["n1-a"]
-    forms.settle()
-    assert first.disposed and second.disposed, "a clicked balloon leaves with its icon"
+    assert notifier.notify("C", "", True, "n3-c")["status"] == "failed"
+    (tray_icon,) = forms.icons
+    forms.click(tray_icon)
+    wait_for(lambda: icon.background.opened)
+    assert icon.background.opened == ["n2-b"]
+    forms.post(tray_icon.sta, lambda: left_click(tray_icon))
+    wait_for(lambda: len(icon.background.opened) == 2)
+    assert icon.background.opened[-1] == "window", "a left click on the icon opens the window, not a source"
 
 
-def test_windows_each_notification_keeps_its_own_click(forms):
-    clicks = []
-    notifier = dn.WindowsNotifier(recorded(clicks))
-    for token in ("n1-a", "n2-b", "n3-c"):
-        assert notifier.notify(token, "", True, token)["status"] == "submitted"
-    first, second, third = forms.icons
-    forms.close(second)  # timed out or dismissed: it stays, and so does its entry in Windows' list
-    forms.click(third)
-    forms.click(first)
-    wait_for(lambda: len(clicks) == 2)
-    assert sorted(clicks) == ["n1-a", "n3-c"]
-    forms.settle()
-    assert [icon.disposed for icon in forms.icons] == [True, False, True], "a clicked balloon leaves with its icon"
-    forms.click(second)  # opened later from Windows' list
-    wait_for(lambda: len(clicks) == 3)
-    assert clicks[-1] == "n2-b"
-    assert len(forms.balloons) == 3, "nothing is shown again"
-
-
-def test_windows_unclicked_icons_are_bounded_a_newer_one_retires_the_oldest(forms):
-    notifier = dn.WindowsNotifier(lambda token: None)
+def test_windows_notifications_never_add_an_icon(forms, icon):
+    notifier = dn.WindowsNotifier(lambda token: None, icon)
     for number in range(5):
         assert notifier.notify("t", "", True, f"n{number}-a")["status"] == "submitted"
-        forms.close(forms.icons[-1])  # timed out unseen: kept, only the bound retires it
+        forms.close(forms.icons[0])  # timed out or dismissed: nothing to retire, nothing added
     forms.settle()
-    assert [icon.Visible for icon in forms.icons] == [False, False, True, True, True]
-    assert forms.icons[0].disposed and forms.icons[1].disposed
+    assert len(forms.icons) == 1 and forms.icons[0].Visible and not forms.icons[0].disposed
+    assert len(forms.balloons) == 5, "nothing is shown again"
 
 
-def test_windows_an_unanswered_balloon_is_unknown_and_its_late_click_still_opens_its_source(forms, monkeypatch):
-    """Timeout, then late success: no fallback (it may still appear) and the click target survives."""
+def test_windows_an_unanswered_balloon_is_unknown_and_its_late_success_takes_the_click(forms, icon, monkeypatch):
+    """Timeout, then late success: no fallback (it may still appear), and it becomes the click target."""
     monkeypatch.setattr(launcher_tray, "SUBMIT_WAIT", 0.2)
-    release, clicks = threading.Event(), []
+    release = threading.Event()
     forms.shell_answer = lambda *call: release.wait(5)  # the shell call outlasts the caller's wait
-    notifier = dn.WindowsNotifier(recorded(clicks))
-    assert notifier.notify("Task finished", "", True, "n1-late") == {
+    assert dn.WindowsNotifier(lambda token: None, icon).notify("Task finished", "", True, "n1-late") == {
         "ok": None, "status": "unknown", "platform": "windows", "reason": "balloon_unconfirmed"}
     release.set()
     forms.settle()
-    (icon,) = forms.icons
-    assert icon.Visible, "the late balloon stands"
-    forms.click(icon)
-    wait_for(lambda: clicks)
-    assert clicks == ["n1-late"]
+    forms.click(forms.icons[0])
+    wait_for(lambda: icon.background.opened)
+    assert icon.background.opened == ["n1-late"]
 
 
-def test_windows_a_balloon_the_pump_never_took_is_refused_and_never_shown(forms, monkeypatch):
+def test_windows_a_balloon_the_pump_never_took_is_refused_and_never_the_click(forms, icon, monkeypatch):
     monkeypatch.setattr(launcher_tray, "SUBMIT_WAIT", 0.2)
-    notifier = dn.WindowsNotifier(lambda token: None)
+    notifier = dn.WindowsNotifier(lambda token: None, icon)
     assert notifier.notify("first", "", True, "n0-a")["status"] == "submitted"
     forms.paused.set()  # the STA thread is busy elsewhere: no tick reaches the queue
     assert notifier.notify("Task finished", "", True, "n1-a") == {
@@ -788,54 +804,140 @@ def test_windows_a_balloon_the_pump_never_took_is_refused_and_never_shown(forms,
     forms.paused.clear()
     forms.settle()
     assert [call[2] for call in forms.balloons] == ["first"], "given up on, so the page's fallback is the only alert"
+    forms.click(forms.icons[0])
+    wait_for(lambda: icon.background.opened)
+    assert icon.background.opened == ["n0-a"]
 
 
-def test_windows_an_unreadable_icon_asset_keeps_the_pump(forms, monkeypatch, tmp_path):
-    """Like ``WindowsTray``: a broken ``icon.ico`` falls back to the system's application icon."""
+def test_windows_an_unreadable_icon_asset_keeps_the_icon(forms, monkeypatch, tmp_path):
+    """A broken ``icon.ico`` falls back to the system's application icon."""
     from ouroboros import platform_layer
 
     (tmp_path / "assets").mkdir()
     (tmp_path / "assets" / "icon.ico").write_bytes(b"not an icon")
     monkeypatch.setattr(platform_layer, "bundled_resource_bases", lambda: [tmp_path])
+    monkeypatch.setattr(lb, "_active", None)
 
     def unreadable(path):
         raise OSError(f"bad icon: {path}")
 
     monkeypatch.setattr(sys.modules["System.Drawing"], "Icon", unreadable)
-    assert dn.WindowsNotifier(lambda token: None).notify("t", "", True, "n1-a")["status"] == "submitted"
-    assert forms.icons[0].Icon == "app-icon"
+    tray = start_icon(forms)
+    try:
+        assert dn.WindowsNotifier(lambda token: None, tray).notify("t", "", True, "n1-a")["status"] == "submitted"
+        assert forms.icons[0].Icon == "app-icon"
+    finally:
+        tray.stop(wait=2.0)
 
 
-def test_windows_a_dead_pump_is_unavailable(forms):
+def test_windows_without_a_live_icon_a_notification_is_unavailable_and_starts_nothing(forms):
+    unavailable = {"ok": False, "status": "unavailable", "platform": "windows", "reason": "notification_area_unavailable"}
+    assert dn.WindowsNotifier(lambda token: None).notify("t", "", True, "n1-a") == unavailable
+    background = SimpleNamespace(shutdown=threading.Event(), window=None)
+    assert dn.WindowsNotifier(lambda token: None, launcher_tray.WindowsTray(background)).notify(
+        "t", "", True, "n2-b") == unavailable
+    assert forms.threads == [] and forms.icons == [], "a notification never starts the icon"
+
+
+def test_windows_a_dead_pump_is_unavailable(forms, monkeypatch):
+    monkeypatch.setattr(lb, "_active", None)
     forms.run_error = RuntimeError("no message loop")
-    answer = dn.WindowsNotifier(lambda token: None).notify("t", "", True, "n1-a")
-    assert answer == {"ok": False, "status": "unavailable", "platform": "windows",
-                      "reason": "notification_area_unavailable"}
+    background = SimpleNamespace(shutdown=threading.Event(), window=None, exit_launcher=lambda: None)
+    tray = launcher_tray.WindowsTray(background)
+    tray.start()
+    wait_for(lambda: tray._idle.is_set())  # the pump ended without showing anything
+    assert dn.WindowsNotifier(lambda token: None, tray).notify("t", "", True, "n1-a") == {
+        "ok": False, "status": "unavailable", "platform": "windows", "reason": "notification_area_unavailable"}
 
 
-def test_windows_exit_removes_every_icon_its_timer_and_its_pump(forms):
-    """The launcher's exit and Panic (``launcher_background.stop_tray_before_exit``): no icon may outlive
-    the process in the notification area, and the 200 ms timer and the STA loop end with it."""
-    notifier = dn.WindowsNotifier(lambda token: None)
-    for token in ("n1-a", "n2-b"):
-        assert notifier.notify("t", "", True, token)["status"] == "submitted"
+def test_windows_exit_removes_the_icon_its_timer_and_its_pump_and_never_brings_it_back(forms, icon):
+    """The launcher's exit (``launcher_background.stop_tray_before_exit``): the one icon may not outlive the
+    process in the notification area, the timer and the STA loop end with it, and no notification
+    afterwards starts another icon."""
+    notifier = dn.WindowsNotifier(lambda token: None, icon)
+    assert notifier.notify("t", "", True, "n1-a")["status"] == "submitted"
     (timer,) = forms.timers
-    notifier.stop(wait=2.0)
-    assert all(icon.disposed and not icon.Visible for icon in forms.icons)
-    assert timer.disposed and not any(forms._timers.values()), "the timer is stopped and disposed"
+    released = []
+    lb.stop_tray_before_exit(lambda: released.append(True))  # waits for the icon's removal, bounded
+    assert released == [True] and all(item.disposed and not item.Visible for item in forms.icons)
     for thread in forms.threads:
         thread.join(2)
     assert not any(thread.is_alive() for thread in forms.threads), "the STA loop ended"
-    assert notifier.notify("t", "", True, "n3-c") == {
+    assert timer.disposed and not any(forms._timers.values()), "then the timer is stopped and disposed"
+    assert notifier.notify("t", "", True, "n2-b") == {
         "ok": False, "status": "unavailable", "platform": "windows", "reason": "notification_area_unavailable"}
-    assert len(forms.icons) == 2, "no new pump or icon after the exit began"
+    assert len(forms.icons) == 1, "no icon after the exit began"
 
 
-def test_a_notifier_that_never_showed_anything_stops_at_once(forms):
-    notifier = dn.WindowsNotifier(lambda token: None)
-    notifier.stop(wait=2.0)
-    assert forms.threads == [], "no pump was ever started, none is started to stop"
-    assert notifier.notify("t", "", True, "n1-a")["status"] == "unavailable"
+@pytest.mark.parametrize("refused,acquired", [(False, True), (True, True), (True, False)])
+def test_launcher_handoff_removes_the_live_icon_before_unlock_and_restores_only_when_locked(
+        forms, monkeypatch, tmp_path, refused, acquired):
+    """Real launcher → transport → Background → WindowsTray, with WinForms/OS effects stood in.
+    A spawn sees zero old icons. Refusal restores one usable icon only after retaking the lock."""
+    import launcher
+    from ouroboros import platform_layer
+    from tests.test_launcher_source_handoff import context, Exited
+
+    monkeypatch.setattr("ouroboros.launcher_bootstrap.source_launcher_importable", lambda *a, **kw: True)
+    events = []
+    monkeypatch.setattr(lb, "_active", None)
+    monkeypatch.setattr(lb.Background, "_watch", lambda self: None)
+    background = lb.Background(lambda: events.append("quit"), lambda: 1, threading.Event())
+    background.window = SimpleNamespace(show=lambda: events.append("show"))
+    background._window_shown()
+    assert background._indicator_up()
+    old_icon = forms.icons[0]
+    background.indicator.begin_hidden()
+
+    def release():
+        events.append("release")
+        assert old_icon.disposed and not old_icon.Visible, "old icon removed while the PID lock is held"
+
+    def spawn(*args, **kwargs):
+        events.append("spawn")
+        assert not any(icon.Visible for icon in forms.icons), "no overlapping icons at successor spawn"
+        if refused:
+            raise OSError("definite spawn refusal")
+
+    def leave(code):
+        events.append(("exit", code))
+        raise Exited(code)
+
+    monkeypatch.setattr(launcher, "_bootstrap_context", lambda: context(tmp_path))
+    monkeypatch.setattr(launcher, "release_pid_lock", release)
+    monkeypatch.setattr(launcher, "acquire_pid_lock", lambda: events.append("acquire") or acquired)
+    monkeypatch.setattr(platform_layer, "IS_WINDOWS", True)
+    monkeypatch.setattr(platform_layer, "inherited_console_kwargs", lambda: {})
+    monkeypatch.setattr(launcher.subprocess, "Popen", spawn)
+    monkeypatch.setattr(launcher.os, "_exit", leave)
+    if refused and acquired:
+        launcher._exec_source_launcher()
+        assert events == ["release", "spawn", "acquire"]
+        assert len(forms.icons) == 2 and sum(icon.Visible for icon in forms.icons) == 1
+        assert background.notifications.notify("restored", "", False, "n1-restored")["status"] == "submitted"
+        background.show_window()
+        assert events[-1] == "show" and not background.indicator.hidden
+    else:
+        with pytest.raises(Exited) as exited:
+            launcher._exec_source_launcher()
+        assert exited.value.code == (1 if refused else 0)
+        assert len(forms.icons) == 1 and not old_icon.Visible, "an unlocked old shell never restores an icon"
+    background.indicator.stop(wait=1)
+
+
+def test_windows_a_balloon_still_queued_when_the_icon_goes_is_refused_at_once(forms, icon, monkeypatch):
+    monkeypatch.setattr(launcher_tray, "SUBMIT_WAIT", 30.0)  # without the refusal its caller would wait this long
+    forms.paused.set()  # the STA tick is busy: the request stays queued
+    answers = []
+    caller = threading.Thread(target=lambda: answers.append(icon.balloon("t", "b", True, "n1-a")), daemon=True)
+    caller.start()
+    wait_for(lambda: not icon._balloons.empty())
+    started = time.monotonic()
+    icon.stop()
+    forms.paused.clear()
+    caller.join(5)
+    assert answers == [False] and time.monotonic() - started < 5, "never shown now, so its caller falls back at once"
+    assert forms.balloons == []
 
 
 def test_windows_without_winforms_is_unavailable(monkeypatch):
@@ -846,25 +948,17 @@ def test_windows_without_winforms_is_unavailable(monkeypatch):
     assert notifier.status()["reason"].startswith("no_winforms")
 
 
-def test_the_tray_banner_reports_the_shells_answer_and_honours_sound_off(forms, monkeypatch):
-    """The background icon's attention banner: the caller learns the shell's answer (a refused banner leaves
-    the sound to the caller), Sound off is silent, and its click opens the window as it was left."""
-    monkeypatch.setattr(lb, "_active", None)
-    background = SimpleNamespace(shutdown=threading.Event(), window=None, shown=[], exit_launcher=lambda: None)
-    background.show_window = lambda: background.shown.append("show")
-    tray = launcher_tray.WindowsTray(background)
-    assert tray.start()
-    try:
-        wait_for(tray.ready.is_set)
-        assert tray.notify("Task finished", "Something needs your attention.", False) is True
-        assert forms.balloons[-1][2:] == ("Task finished", "Something needs your attention.", True)
-        forms.shell_answer = lambda *call: False
-        assert tray.notify("Task finished", "Something needs your attention.", True) is False
-        forms.click(forms.icons[0])
-        wait_for(lambda: background.shown)
-        assert background.shown == ["show"]
-    finally:
-        tray.stop(wait=2.0)
+def test_the_tray_banner_reports_the_shells_answer_and_honours_sound_off(forms, icon):
+    """The hidden window's attention banner rides the same icon: the caller learns the shell's answer (a
+    refused banner leaves the sound to the caller), Sound off is silent, and as the newest balloon its click
+    opens the window as it was left (no source to navigate to)."""
+    assert icon.notify("Task finished", "Something needs your attention.", False) is True
+    assert forms.balloons[-1][2:] == ("Task finished", "Something needs your attention.", True)
+    forms.shell_answer = lambda *call: False
+    assert icon.notify("Task finished", "Something needs your attention.", True) is False
+    forms.click(forms.icons[0])
+    wait_for(lambda: icon.background.opened)
+    assert icon.background.opened == [""]
 
 
 def test_balloon_text_fits_the_shells_fields_in_utf16_units():

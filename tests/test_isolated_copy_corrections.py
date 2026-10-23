@@ -142,8 +142,9 @@ def test_parent_returns_named_source_under_existing_write_rights(case, monkeypat
 @pytest.mark.parametrize("restriction", ["readonly", "acting", "presence", "owner_store"])
 def test_named_source_never_mints_parent_write_authority(case, monkeypatch, restriction):
     from ouroboros.contracts.task_constraint import TaskConstraint
-    from ouroboros.presence_authority import build_presence_capability_ceiling, presence_ceiling_payload
-    from ouroboros.presence_capabilities import PresenceResourceTarget
+    from ouroboros.presence_authority import presence_ceiling_payload
+    from tests.frozen_presence_authority import build_presence_capability_ceiling
+    from tests.frozen_presence_capabilities import PresenceResourceTarget
     from tests.test_presence_authority import _resolution
 
     monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(case[1].parent))
@@ -189,7 +190,8 @@ def test_actual_body_policy_survives_false_child_label(case, monkeypatch):
 
 def test_apply_rechecks_presence_after_lock(case, monkeypatch):
     from ouroboros.tools import git as git_tools
-    from ouroboros.presence_authority import build_presence_capability_ceiling, presence_ceiling_payload
+    from ouroboros.presence_authority import presence_ceiling_payload
+    from tests.frozen_presence_authority import build_presence_capability_ceiling
     from tests.test_presence_authority import _resolution
     child, task = admit(case, "child", "parent")
     (child / "a.txt").write_bytes(b"child\n"); capture(case, child, task)

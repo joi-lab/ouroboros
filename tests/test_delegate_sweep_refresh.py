@@ -353,7 +353,7 @@ def test_same_boot_sweep_settlement_is_cleared_in_the_same_generation(tmp_path, 
     monkeypatch.setattr(server_mod, "DATA_DIR", tmp_path)
 
     def fake_reconcile(drive_root, *, running_task_ids, gateway_factory,
-                       recoverable_task_ids, replay_pending):
+                       recoverable_handles, replay_pending):
         _emit_settled(tmp_path, "run-5", "t-late")
         return []
 

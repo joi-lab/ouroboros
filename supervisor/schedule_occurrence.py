@@ -10,7 +10,7 @@ result and the queue snapshot — never a second ledger or scheduler:
   schedule list show it, and the mind decides whether to say anything;
 - task result ``schedule_admission``: ``{schedule_id, token, due_at, status,
   dispatch: none|possible, task}`` — the frozen task an accepted occurrence runs;
-- queued task ``metadata.schedule_occurrence``: ``{schedule_id, token, due_at, claimed_at}``.
+- queued task ``metadata.schedule_occurrence``: identity/timing plus the matching previous-run outcome.
 
 A pass claims under the queue+table locks (briefly), prepares everything
 expensive WITHOUT them (resource intent, folder checks, preflight, memory fork,
@@ -32,7 +32,7 @@ survive restart; no process-local witness is needed. Unreadable or foreign
 results and admitted rows with missing receipts remain unknown. Dispatch
 possibility lives monotonically on the row and receipt, so a first attempt whose
 receipt still says none never reached a worker (``first_dispatch_unsent``); restore
-holds a positive one visibly (``restore_verdict``). Deletion reads the
+holds a positive one visibly (``restore_verdict``). Retention removal reads the
 receipt from the table's exact root and preserves accepted or unknown obligations.
 
 A refusal at admission is a hold, not a stored witness. An older admission
@@ -61,10 +61,11 @@ from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
-# Host-owned row fields: never authored by a payload, never copied into a task.
-OCCURRENCE_FIELDS = ("occurrence", "hold", "continuation_of", "delete_requested_at")
+# Host-owned row fields: never authored by a template; admission mints task facts.
+OCCURRENCE_FIELDS = ("occurrence", "hold", "continuation_of", "delete_requested_at",
+                     "delete_requested_by", "delete_reason", "last_outcome", "previous_run_open")
 _FINGERPRINT_FIELDS = ("task", "trigger", "timezone", "cron", "name", "description", "enabled", "manual_override",
-                       "followup_origin", "followup_relation")
+                       "followup_origin", "followup_relation", "writer_kind", "writer_origin")
 _SETTLED = "settled"
 
 
@@ -130,6 +131,7 @@ def set_hold(record: Dict[str, Any], reason: str, detail: str = "", *, retry_sec
 
 def claim(record: Dict[str, Any], due_at: str) -> Dict[str, Any]:
     """A new occurrence for a due row: one token, one task id, kept across retries."""
+    record.pop("previous_run_open", None)
     record["occurrence"] = {"token": uuid.uuid4().hex[:16], "task_id": uuid.uuid4().hex[:8],
                             "due_at": str(due_at), "phase": "claimed", "claimed_at": utc_now_iso(),
                             "fingerprint": fingerprint(record)}
@@ -242,8 +244,8 @@ def work_settled(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] =
     """Occurrence settlement is not task settlement: keep its control row until both.
 
     A receipt-less claim positively never started, and a row that never admitted
-    anything owes nothing: neither needs the queue, so a worker without a fresh
-    snapshot deletes it at once. Otherwise the admitted task must be absent from
+    anything owes nothing: neither needs a queue observation to prove settlement.
+    Otherwise the admitted task must be absent from
     the queue and settled; a collected result of a task no occurrence still
     names is settled history. Unreadable or unknown evidence keeps the row.
     """
@@ -272,7 +274,7 @@ def work_settled(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] =
 
 
 def deletion_settled(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None) -> bool:
-    """Whether a deferred delete/GC may drop the row: nothing retained still needs it.
+    """Whether withdrawal/GC has settled work: nothing retained still needs the row.
 
     An independent schedule's row has no role once its accepted run starts. A
     continuation (related, or an unrecorded published relationship) is the
@@ -336,14 +338,10 @@ def repair_followup_binding(record: Dict[str, Any]) -> bool:
         return False
 
 
-def discard_claim(record: Dict[str, Any], data: Dict[str, Any]) -> bool:
-    """Drop unaccepted work and finish any earlier deferred delete atomically."""
+def discard_claim(record: Dict[str, Any]) -> None:
+    """Drop only unaccepted work; the audited retention pass owns row removal."""
     record.pop("occurrence", None)
     record.pop("hold", None)
-    if record.get("delete_requested_at") and deletion_settled(record):
-        data["tasks"] = [row for row in data.get("tasks") or [] if row is not record]
-        return True
-    return False
 
 
 def settle(record: Dict[str, Any]) -> None:
@@ -411,6 +409,9 @@ def prepare(claimed: Dict[str, Any]) -> Dict[str, Any]:
 
     Always resolved fresh (room folder, explicit folder, usability, Project basis); a
     deferred preparation of the same claim and fingerprint only lends its fork, once."""
+    from supervisor.queue_schedules import load_schedule_store
+    restart = (load_schedule_store(_queue().DRIVE_ROOT).get("followup_restart") or {}).get("control_id", "")
+    claimed = {**claimed, "prepared_restart_episode": restart}
     key = _occurrence_key(claimed)
     if claimed.get("stored_task") or (_DEFERRED.get(key) or {}).get("fingerprint") != claimed["fingerprint"]:
         _DEFERRED.pop(key, None)
@@ -435,10 +436,22 @@ def _prepare(claimed: Dict[str, Any]) -> Dict[str, Any]:
         return {**claimed, "task": {}, "hold": ("followup_binding_unavailable", str(exc))}
     if task.get("chat_id") is None:
         return {**claimed, "task": task, "hold": ("owner_chat_unknown", "the owner destination is not currently known")}
+    task["metadata"]["schedule_basis"] = {
+        "author": (record.get("followup_relation") or {}).get("declared_by") or record.get("source") or "unknown",
+        "origin": copy.deepcopy(record.get("followup_origin") or {}),
+    }
     task["metadata"]["schedule_occurrence"] = {
         "schedule_id": claimed["schedule_id"], "token": occ["token"],
         "due_at": str(occ.get("due_at") or ""), "claimed_at": str(occ.get("claimed_at") or ""),
     }
+    previous_id = str(record.get("last_task_id") or "")
+    if previous_id:
+        outcome = record.get("last_outcome") or {}
+        task["metadata"]["schedule_occurrence"].update(
+            previous_task_id=previous_id,
+            previous=(copy.deepcopy(outcome) if outcome.get("task_id") == previous_id
+                      else {"task_id": previous_id, "state": "pending_observation"}),
+        )
     try:
         hold, basis = resolve_resource(task, record)
     except Exception as exc:
@@ -653,7 +666,7 @@ def admit(prepared: List[Dict[str, Any]], *, stop: Optional[Callable[[], bool]] 
                 continue
             changed = True
             if verdict == "reconsider":
-                discard_claim(record, data)
+                discard_claim(record)
                 continue
             if verdict not in {"prepare", "republish"}:
                 continue
@@ -661,11 +674,15 @@ def admit(prepared: List[Dict[str, Any]], *, stop: Optional[Callable[[], bool]] 
                 continue  # accepted/held facts changed: prepare their frozen task on the next pass
             fresh_claim = verdict == "prepare"
             if fresh_claim and (not record.get("enabled", True) or fingerprint(record) != item["fingerprint"]):
-                discard_claim(record, data)  # disabled/edited during prepare: future only
+                discard_claim(record)  # disabled/edited during prepare: future only
                 continue
             if item.get("hold"):
                 set_hold(record, *item["hold"])
                 continue
+            if ("prepared_restart_episode" in item and item["prepared_restart_episode"] !=
+                    (data.get("followup_restart") or {}).get("control_id", "")):
+                record["followup_wait"] = "owner_restart_in_progress"
+                continue  # Retain the exact owed claim; re-prepare next pass, without a future hold.
             from supervisor.followup_policy import control_guard, refresh_policy
             prepared_task, enqueued = item["task"], False
             try:
@@ -687,7 +704,7 @@ def admit(prepared: List[Dict[str, Any]], *, stop: Optional[Callable[[], bool]] 
                         defer(item)
                         continue
                     if block:
-                        _refused(record, block, outcome, data)
+                        _refused(record, block, outcome)
                         continue
                     enqueued = True
                     item["task"] = outcome  # preserve host-stamped continuation and admission facts
@@ -722,13 +739,12 @@ def admit(prepared: List[Dict[str, Any]], *, stop: Optional[Callable[[], bool]] 
             log.error("Queue snapshot failed after scheduled admission; %d task(s) withdrawn", len(admitted))
 
 
-def _refused(record: Dict[str, Any], block: str, outcome: Dict[str, Any], data: Dict[str, Any]) -> None:
+def _refused(record: Dict[str, Any], block: str, outcome: Dict[str, Any]) -> None:
     detail = str(outcome.get("_admission_detail") or outcome.get("_worker_pool_disabled_reason") or "")
     trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
     if block == "project_routing_fence" and outcome.get("_project_lifecycle") == "tombstoned":
         message = f"Scheduled task was not queued: the project {outcome.get('_project_id') or ''} was deleted."
-        if discard_claim(record, data):
-            return
+        discard_claim(record)
         record["last_error"] = message
         if str(trigger.get("type") or "cron") == "once":
             record.update(enabled=False, completed_at=utc_now_iso(), next_run_at="")

@@ -186,6 +186,15 @@ export function installDom(fetchImpl = async () => ({ ok: true, json: async () =
         byId: new Map(), hidden: false, activeElement: null,
         createElement(tag) { return new ElementStub(tag, document); },
         createTextNode(data) { return new TextStub(data); },
+        createTreeWalker(root) {
+            const texts = [];
+            const collect = node => { for (const child of node.children || []) {
+                if (child.nodeType === 3) texts.push(child); else collect(child);
+            } };
+            collect(root);
+            let index = 0;
+            return { nextNode: () => texts[index++] || null };
+        },
         createDocumentFragment() {
             const fragment = new ElementStub('#document-fragment', document);
             fragment.isDocumentFragment = true;
@@ -194,8 +203,14 @@ export function installDom(fetchImpl = async () => ({ ok: true, json: async () =
         getElementById(id) { return document.byId.get(id) || null; },
         addEventListener() {}, removeEventListener() {},
     };
+    // A mounted chat has a body (room visibility/toasts) and a document root
+    // (language changes). The overlay walks text nodes, not the HTML strings.
+    document.documentElement = new ElementStub('html', document);
+    document.documentElement.isConnected = true;
+    document.body = new ElementStub('body', document);
+    document.documentElement.appendChild(document.body);
     const mount = new ElementStub('div', document);
-    mount.isConnected = true;
+    document.body.appendChild(mount);
     document.byId.set('content', mount);
     const storage = new Map();
     globalThis.document = document;

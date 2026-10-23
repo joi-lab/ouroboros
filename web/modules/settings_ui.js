@@ -1,9 +1,11 @@
-import { renderPageHeader, renderSegmentedField, renderTabStrip, bindTabStrip } from './page_header.js';
+import { bindPageHeader, renderPageHeader, renderSegmentedField, renderTabStrip, bindTabStrip } from './page_header.js';
 import { renderAgentAccountsSection, renderAgentsServiceBanner } from './harness_accounts.js';
 import { renderSubagentsSection } from './subagents_settings.js';
 import { languageBlockHtml } from './settings_language.js';
 import { modelRolesHost } from './model_roles.js';
 import { bindSecretReveal } from './settings_secrets.js';
+import { safetySectionHtml } from './settings_safety.js';
+import { consciousnessSectionHtml } from './settings_consciousness.js';
 
 // Reads as a sequence: keys → secrets → which API models → who among the agents
 // does what → behavior → technical. "Agents", not "Coding agents" (D-10): the
@@ -456,28 +458,7 @@ export function renderSettingsPage() {
 
                     <div class="form-section">
                         <h3>Safety Supervisor</h3>
-                        <div class="settings-section-copy">
-                            Coverage of the LLM safety-supervisor layer (a separate axis from Runtime Mode).
-                            <code>Full</code> &mdash; every guarded tool call gets the LLM safety check.
-                            <code>Light</code> keeps the LLM check only for integration-policy tools; conditional shell/verify fall to the deterministic guards. Light is the default for new DESKTOP setups (authored by the first-run wizard); existing installs, web and Docker keep Full.
-                            <code>Off</code> makes no LLM safety calls. In every mode the deterministic registry sandbox, protected-path policy, and light-mode guards STAY ON &mdash; the LLM supervisor is a layer, not the floor. Lowering coverage emits a durable audit event per waved-through call.
-                            <br><strong>Configuration authority:</strong> outside Cyber Pro, the agent cannot lower its own supervision. Cyber Pro also lets the agent configure Supervisor coverage. Changes apply on the next task.
-                        </div>
-                        <div class="settings-effort-card">
-                            <label>Safety Supervisor</label>
-                            <input id="s-safety-mode" type="hidden" value="full">
-                            ${renderSegmentedField({
-                                target: 's-safety-mode',
-                                title: 'Lowering coverage here prompts for confirmation.',
-                                options: [
-                                    { value: 'full', label: 'Full' },
-                                    { value: 'light', label: 'Light' },
-                                    { value: 'off', label: 'Off' },
-                                ],
-                            })}
-                            <div class="settings-inline-note" data-policy-state="supervisor" role="status" aria-live="polite"></div>
-                            <div id="s-safety-skip-counter" class="settings-section-copy"></div>
-                        </div>
+                        ${safetySectionHtml()}
                     </div>
 
                     <div class="form-section">
@@ -520,36 +501,9 @@ export function renderSettingsPage() {
                         </div>
                     </div>
 
-                    <div class="form-section">
-                        <h3>Background Cognition</h3>
-                        <div class="settings-section-copy">When Ouroboros wakes up on its own, what a wake-up is allowed to do, and what it may spend doing it.</div>
-                        <div class="settings-effort-card">
-                            <label>Consciousness Autonomy</label>
-                            <input id="s-consciousness-autonomy" type="hidden" value="act">
-                            ${renderSegmentedField({ target: 's-consciousness-autonomy', options: [{ value: 'observe', label: 'Observe' }, { value: 'act', label: 'Act' }, { value: 'full', label: 'Full' }] })}
-                            <div class="settings-inline-note"><strong>Observe:</strong> research, internal memory and task/project notes, read-only research children it can also stop, schedule controls and replies to you; no shell, user-file, source, skill/settings or publication changes. <strong>Act (default):</strong> everything the runtime mode allows except editing Ouroboros's own code and prompts, evolution, restart and settings. <strong>Full:</strong> everything the runtime mode allows, evolution included.</div>
-                        </div>
-                        <div class="form-row">
-                            <div class="form-field ui-field">
-                                <label for="s-consciousness-daily-usd">Daily Allowance (USD)</label>
-                                <input id="s-consciousness-daily-usd" placeholder="20" class="ui-control" name="s-consciousness-daily-usd" type="text" aria-describedby="s-consciousness-daily-usd-help">
-                                <div class="settings-inline-note ui-field-help" id="s-consciousness-daily-usd-help">Spending cap for consciousness over a rolling 24-hour window: the wake-ups plus the tasks they start. When it is exhausted, no new wake-up or task starts until spend leaves the window. <code>0</code> = consciousness may not spend.</div>
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-consciousness-max-tasks">Max Concurrent Tasks</label>
-                                <input id="s-consciousness-max-tasks" type="number" min="0" step="1" placeholder="2" class="ui-control" name="s-consciousness-max-tasks" aria-describedby="s-consciousness-max-tasks-help">
-                                <div class="settings-inline-note ui-field-help" id="s-consciousness-max-tasks-help">How many tasks started by consciousness may run at once. <code>0</code> = it never starts tasks.</div>
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-bg-wakeup-min">Wake-Up Interval Min (sec)</label>
-                                <input id="s-bg-wakeup-min" type="number" min="60" step="1" placeholder="900" class="ui-control" name="s-bg-wakeup-min">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-bg-wakeup-max">Wake-Up Interval Max (sec)</label>
-                                <input id="s-bg-wakeup-max" type="number" min="60" step="1" placeholder="14400" class="ui-control" name="s-bg-wakeup-max">
-                            </div>
-                        </div>
-                        <div class="settings-inline-note">Ouroboros chooses the interval between its own wake-ups; the two values above are the lower and upper bound it must stay within. All four settings apply without a restart: the alarm clock reads them at each decision.</div>
+                    <div class="form-section" id="settings-consciousness">
+                        <h3>Consciousness</h3>
+                        ${consciousnessSectionHtml()}
                     </div>
 
                     <div class="form-section">
@@ -652,8 +606,9 @@ export function renderSettingsPage() {
                             <a href="https://clawhub.ai" target="_blank" rel="noopener">clawhub.ai</a>.
                             The Skills page exposes a Marketplace tab; every install is
                             staged, OpenClaw frontmatter is translated into the
-                            Ouroboros manifest shape, and the standard tri-model review runs
-                            automatically before the skill becomes executable. Plugins (Node)
+                            Ouroboros manifest shape, and the skill review (the panel the current
+                            review mode composes) runs automatically before the skill becomes
+                            executable. Plugins (Node)
                             are filtered out — only skill packages are installable.
                         </div>
                         <div class="form-row">
@@ -830,10 +785,6 @@ export function renderSettingsPage() {
                             <div class="form-field ui-field">
                                 <label for="s-task-lifetime">Task Lifetime Limit (s)</label>
                                 <input id="s-task-lifetime" type="text" inputmode="numeric" value="unlimited" placeholder="unlimited" class="ui-control" name="s-task-lifetime">
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="s-presence-max-active">Concurrent Presence Conversations</label>
-                                <input id="s-presence-max-active" type="number" min="1" max="20" value="2" class="ui-control" name="s-presence-max-active">
                             </div>
                             <div class="form-field ui-field">
                                 <label for="s-tool-timeout">Tool Timeout (s)</label>
@@ -1062,7 +1013,9 @@ export function bindSettingsTabs(root, options = {}) {
 
     root.activateSettingsTab = activate;
     activate(state?.settingsActiveSubtab || 'providers', false);
-    return () => { tabs.destroy(); delete root.activateSettingsTab; };
+    // On a desk the eight tabs are the bar's start, scrolling inside it (docs/DESIGN.md "Page header").
+    const disposeBar = bindPageHeader(root.querySelector('.app-page-header'));
+    return () => { tabs.destroy(); disposeBar(); delete root.activateSettingsTab; };
 }
 
 export function bindSecretInputs(root) {

@@ -86,6 +86,17 @@ def history_repo(tmp_path):
 # material
 # ---------------------------------------------------------------------------
 
+
+def test_local_history_preview_is_bounded_and_names_the_complete_range():
+    local = [{'sha': f'{i:040x}', 'date': '2026-10-21', 'subject': f'local subject {i}'} for i in range(50)]
+    material = {'base_sha': 'f' * 40, 'target_sha': 'e' * 40, 'local_commits': local}
+    text = ul.material_text(material)
+    assert text.count('- ') == ul.LOCAL_SUBJECT_PREVIEW
+    assert '30 older local subjects omitted' in text
+    assert f"git log {material['target_sha']}..{material['base_sha']}" in text
+    assert 'not incoming changes' in text and 'do not prove unique code' in text
+    assert len(material['local_commits']) == 50  # the collector's complete input is not changed
+
 def test_material_recovers_rows_from_commit_diffs_and_lists_range_commits(history_repo):
     repo = history_repo["repo"]
     material = ul.collect_range_material(history_repo["base"], history_repo["c4"], git=_capture_for(repo))
@@ -103,7 +114,9 @@ def test_material_recovers_rows_from_commit_diffs_and_lists_range_commits(histor
     assert material["versions"] == {"base": "1.0.0", "target": "1.4.0"}
     assert set(material) == {"base_sha", "target_sha", "commits", "bodies_omitted",
                              "omitted_commit_chunks", "releases", "omitted_rows",
-                             "omitted_row_commits", "rows_summarized", "versions"}
+                             "omitted_row_commits", "rows_summarized", "versions",
+                             "local_commits", "omitted_local_chunks"}
+    assert material["local_commits"] == [] and material["omitted_local_chunks"] == 0
 
 
 def test_material_keeps_every_commit_subject_and_bounds_only_the_bodies(history_repo):
@@ -380,7 +393,7 @@ def test_write_letter_shares_one_ceiling_between_the_slot_wait_and_the_call(lett
         yield
 
     real_now = ul.time.time()
-    monkeypatch.setattr(mc, "model_call_slot", slow_slot)
+    monkeypatch.setattr(mc, "model_call_scope", slow_slot)
     seen = {}
 
     def fake_chat(client, *, drive_root, **kwargs):
@@ -405,7 +418,7 @@ def test_write_letter_reports_a_ceiling_spent_on_the_slot_as_a_timeout(letter_en
         monkeypatch.setattr(ul.time, "time", lambda: real_now + 11.0)
         yield
 
-    monkeypatch.setattr(mc, "model_call_slot", exhausting_slot)
+    monkeypatch.setattr(mc, "model_call_scope", exhausting_slot)
     monkeypatch.setattr(ul, "_chat", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no call past the ceiling")))
     record = ul.write_letter(_status(), _material(), drive_root=letter_env["drive"])
     assert record["state"] == "failed" and record["error_kind"] == "timeout"

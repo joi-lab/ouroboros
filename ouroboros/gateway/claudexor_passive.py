@@ -10,35 +10,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
+from ouroboros.claudexor_observations import passive_read_error as _read_error
+
 log = logging.getLogger(__name__)
-
-
-# Never project arbitrary engine error codes or exception prose: either can
-# contain paths, credential material or an unbounded upstream response body.
-_SAFE_ERROR_CODES = frozenset({
-    "daemon_not_discovered", "daemon_descriptor_unreadable",
-    "daemon_descriptor_incomplete", "daemon_token_unreadable",
-    "daemon_endpoint_not_loopback", "daemon_unreachable",
-    "malformed_response", "protocol_incompatible", "daemon_recovery_only",
-})
 
 
 def _elapsed_ms(start: float) -> int:
     return min(2_147_483_647, max(0, round((time.monotonic() - start) * 1000)))
-
-
-def _read_error(exc: Exception) -> dict[str, Any]:
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
-
-    if not isinstance(exc, ClaudexorUnavailable):
-        return {"code": "read_failed"}
-    code = exc.code if exc.code in _SAFE_ERROR_CODES else "read_refused"
-    if exc.observation_reason == "observation_read_timeout":
-        code = "observation_read_timeout"
-    result: dict[str, Any] = {"code": code}
-    if 400 <= exc.status_code <= 599:
-        result["status_code"] = exc.status_code
-    return result
 
 
 def _object_lists(value: Any, required: tuple[str, ...], optional: tuple[str, ...] = ()) -> bool:

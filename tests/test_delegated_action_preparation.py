@@ -98,6 +98,8 @@ def test_the_inspection_answer_is_a_typed_refusal_not_an_integration_effect(tmp_
     from ouroboros.outcomes import reviewable_effect_projection
     from ouroboros.tools.registry import ToolRegistry
 
+    # Either work kind may integrate; this test isolates the capture-inspection guard.
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     _target, ctx, _root, rid, _handle = _finished_unsettled(tmp_path, monkeypatch)
     try:
         registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)

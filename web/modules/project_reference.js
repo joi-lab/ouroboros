@@ -8,14 +8,15 @@
  * call still "reused the shared chip".
  *
  *   inline  the capsule wherever content points at a Project: under a message or a
- *           System row, at the end of a routing receipt, in a mirrored question's head
+ *           System row, at the end of a routing receipt, in a mirrored question's voice line
  *   footer  the strip that closes a work portal (a task card bound to a Project)
  */
 import { PAGE_ICONS } from './page_icons.js';
 import { tr } from './i18n.js';
 
-// Two forms only: anything else a caller names is the inline capsule. The arrow alone says "opens".
-const LAYOUT_CLASS = { inline: 'chat-quiz-project', footer: 'chat-live-bound-pointer' };
+// Two forms only: anything else a caller names is the inline capsule. The arrow alone says "opens". The capsule
+// keeps a finger's target wherever its row makes it shorter (a question's 28px voice line): `.ui-hit-area`.
+const LAYOUT_CLASS = { inline: 'chat-quiz-project ui-hit-area', footer: 'chat-live-bound-pointer' };
 
 // What a press opens, per mounted reference: a name that arrives later reaches the payload too.
 const targets = new WeakMap();

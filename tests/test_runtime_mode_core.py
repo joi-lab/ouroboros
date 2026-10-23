@@ -22,6 +22,7 @@ import subprocess
 import sys
 
 import pytest
+from tests._safety_fixtures import disable_safety, owner_registry as _registry
 
 from ouroboros.onboarding_wizard import build_onboarding_html
 from ouroboros.runtime_mode_policy import protected_path_category
@@ -510,10 +511,6 @@ def test_api_settings_post_silently_drops_runtime_mode_changes(monkeypatch):
 # ===========================================================================
 # Part 6: ToolRegistry runtime-mode gating
 # ===========================================================================
-
-
-def _registry(tmp_path):
-    return ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
 
 
 class _CommitCtx:
@@ -1056,7 +1053,7 @@ def test_default_lane_allows_minusC_retarget_from_default_cwd(tmp_path, monkeypa
 def test_shell_python_writer_reaches_the_selected_process(tmp_path, tmp_path_factory, monkeypatch, mode):
     """Source text is executed under selected supervision without guessed targets."""
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
-    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    disable_safety(monkeypatch)
     # Only an argv LIST is interpreter-resolved; this string form launches the bare
     # `python` from PATH, which a host shipping only `python3` (stock macOS) lacks.
     # Put the running interpreter there under that name, outside the repo root.
@@ -1106,7 +1103,7 @@ def test_runtime_identity_deletion_uses_the_selected_mode(tmp_path, monkeypatch,
     from ouroboros.tools.registry import ToolContext
 
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
-    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    disable_safety(monkeypatch)
     repo, data = tmp_path / "repo", tmp_path / "data"
     repo.mkdir()
     (data / "memory").mkdir(parents=True)
@@ -1245,7 +1242,7 @@ def test_run_shell_allows_readonly_mentions_of_protected_paths(cmd, tmp_path, mo
 ])
 def test_light_mode_preserves_direct_repo_write_authority(cmd, tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    disable_safety(monkeypatch)
     reg = _registry(tmp_path)
     result = reg.execute("run_command", {"cmd": cmd})
     assert "LIGHT_MODE_BLOCKED" in result, result

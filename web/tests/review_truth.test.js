@@ -268,8 +268,32 @@ test('the chip is layered truth: decision before evidence, receipt only from evi
     assert.equal(dispatched.label, 'Claude Code');
     assert.match(dispatched.title, /Dispatched to Claude Code/);
     assert.match(dispatched.title, /run evidence arrives with the terminal receipt/);
-    assert.match(dispatched.title, /itself runs on the API/);
+    assert.match(dispatched.title, /this subagent runs on its coordinator route \(bills as unknown\)/);
+    assert.doesNotMatch(dispatched.title, /itself runs on the API/);
     assert.doesNotMatch(dispatched.title, /Ran on your/);
+
+    const dispatchedSub = executorChip({
+        executor_route: 'claude',
+        model: 'claudexor::claude=sonnet-4-6',
+        coordinator_billing: 'subscription',
+        parent_cognitive_route: { model: 'claudexor::claude=sonnet-4-6', chosen_by: 'inherited' },
+    });
+    assert.match(
+        dispatchedSub.title,
+        /this subagent itself runs on claudexor::claude=sonnet-4-6 \(bills as subscription\)/,
+    );
+    assert.equal(dispatchedSub.coordinatorProvenance, 'inherited');
+
+    const dispatchedMeasured = executorChip({
+        executor_route: 'codex',
+        model: 'openai/gpt-5.6-sol',
+        cost_usd: 0.02,
+        coordinator_billing: 'measured',
+    });
+    assert.match(
+        dispatchedMeasured.title,
+        /this subagent itself runs on openai\/gpt-5\.6-sol \(bills as measured\)/,
+    );
 
     // EVIDENCE with settled runs: the completion-seam reconciliation proved the
     // delegation happened, so the chip may finally say so — with the count and

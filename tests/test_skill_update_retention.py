@@ -183,7 +183,7 @@ def test_review_exception_restores_previous_without_waiting_for_restart(release)
 def test_owner_skip_during_review_keeps_new_bytes(release, edited):  # noqa: F811
     from ouroboros.skill_lifecycle_actions import run_skill_action
     from ouroboros.skill_lifecycle_queue import lend_lifecycle_lane
-    from ouroboros.skill_review import _persist_reviewed_outcome
+    from ouroboros.skill_review import _persist_projection
 
     drive, _folder, _row, item = release
     _pending(release)
@@ -194,10 +194,9 @@ def test_owner_skip_during_review_keeps_new_bytes(release, edited):  # noqa: F81
         with lend_lifecycle_lane():
             waiting.set()
             assert finish.wait(60)
-        return _persist_reviewed_outcome(
-            ctx, reviewed, drive,
-            SkillReviewOutcome(skill_name=name, status="blockers", content_hash=item["digest"]),
-            history=[], review_rebuttal="", contract_fp="", rebuttal_sha="")
+        outcome = SkillReviewOutcome(skill_name=name, status="blockers", content_hash=item["digest"])
+        _persist_projection(ctx, reviewed, drive, outcome)
+        return outcome
     ctx = SimpleNamespace(drive_root=drive, repo_dir=drive.parent, messages=[])
     def run():
         try:

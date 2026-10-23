@@ -47,6 +47,9 @@ class RowAddressError(LookupError):
 
 def source_row_id(row: Dict[str, Any]) -> str:
     """Identity of an original raw chat row, before any room/view projection adds fields."""
+    from ouroboros.place_arrivals import SourceProjection
+    if isinstance(row, SourceProjection):
+        row = row.source_body
     payload = json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 

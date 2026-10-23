@@ -96,21 +96,30 @@ class ProcessLifeline:
         if proc is None:
             return ""
         error = ""
+        gone = False  # EPIPE: the guardian's read end is closed, so it has already exited
         try:
             if proc.stdin is not None and not proc.stdin.closed:
                 try:
                     if released:
                         proc.stdin.write(b'{"release":true}\n')
                         proc.stdin.flush()
-                except (BrokenPipeError, OSError) as exc:
+                except BrokenPipeError:
+                    gone = True
+                except OSError as exc:
                     error = f"process lifeline lost: {exc}"
                 finally:
-                    proc.stdin.close()
+                    try:
+                        proc.stdin.close()  # retries a release still buffered after EPIPE
+                    except BrokenPipeError:
+                        gone = True
             # EOF asks for cleanup; normal release asks for stand-down. Wait
             # either way, so successful test runs never accumulate guardians.
             try:
                 code = proc.wait(timeout=_GUARDIAN_EXIT_SEC)
-                if code:
+                # A guardian stopped from outside (a harness ending the whole tree)
+                # before a release protected nothing more: the owner has itself
+                # reaped and confirmed the workload. Its own container is reaped below.
+                if code and not (gone and released):
                     error = error or f"process lifeline exited {code}"
             except subprocess.TimeoutExpired:
                 error = "process lifeline did not exit after pipe closure"

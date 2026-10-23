@@ -189,8 +189,8 @@ def execution_elapsed_seconds(meta: dict, now: float) -> float:
 def execution_consumed_seconds(meta: dict) -> float:
     """Execution spent BEFORE this clock's origin (#939), never queue time.
 
-    Only a fresh-origin successor of an explicitly bounded task carries one
-    (``settle_execution_carry``); a preserved original start already spans
+    A fresh-origin successor or a pre-body Pause carries one (``settle_execution_carry``);
+    a preserved original start already spans
     every earlier attempt, so its offset never grows. Reads a RUNNING row's
     ``task`` or a task row itself.
     """
@@ -709,8 +709,6 @@ class TaskModelWait:
         ceiling = resolve_task_execution_timeout_sec(self.task)  # None = unlimited; 0 = exhausted
         if ceiling is not None and self.executed_seconds() >= ceiling:
             return "absolute_ceiling"
-        if strict_current and control_gap is not None:
-            raise control_gap
         # The loop owns delivery. A private seen copy leaves that ownership
         # intact and excludes an already-drained or superseded stop control.
         from ouroboros.outcomes import REASON_OWNER_REQUESTED_FINALIZATION
@@ -724,6 +722,8 @@ class TaskModelWait:
             if reason != REASON_OWNER_REQUESTED_FINALIZATION or _owner_stop_control_is_current(
                     self.tool_context, self.canonical_root, self.task_id, entry.get("msg_id", "")):
                 return "finalize_requested"
+        if strict_current and control_gap is not None:
+            raise control_gap  # only after every control readable here: a busy store hides no local Stop
         return None
 
     def pre_dispatch_pause(self) -> str | None:
@@ -1059,8 +1059,89 @@ def task_model_wait_scope(*, task: dict, drive_root: Any, event_queue: Any,
         _CURRENT.reset(token)
 
 
+def dispatch_control_reason(owner, *, handed_off=False, before_task_start=False):
+    """Resolve readable controls before surfacing a storage gap; Pause applies only before handoff."""
+    from ouroboros.owner_pause import RAIL_OWNER_PAUSE, scope_fence, read_fence, fence_closed
+    from ouroboros.store import StoreBusy
+
+    gap = None
+    try:
+        reason = owner.control_reason(strict_current=not handed_off) if owner is not None else None
+    except StoreBusy as exc:
+        reason, gap = None, exc
+    if reason:
+        return reason
+    if handed_off:
+        if gap is not None:
+            raise gap
+        return None
+    try:
+        if before_task_start and owner is not None:
+            from ouroboros.owner_wait import governing_continuation
+            if governing_continuation(owner.task):
+                if gap is not None:
+                    raise gap
+                return None  # its existing grant consumer owns the saved fence
+            # No lifecycle row is required yet; an existing fence still binds this input.
+            meta = owner.task.get("metadata") or {}
+            root_id = str(owner.task.get("root_task_id") or meta.get("root_task_id") or owner.task_id)
+            fence = read_fence(owner.canonical_root, root_id)
+            paused = fence_closed(fence) and owner.task_id not in (fence.get("selected_members") or {})
+            if paused:
+                owner.prestart_pause_fence = dict(fence)
+        else:
+            paused = scope_fence()
+        if paused:
+            return RAIL_OWNER_PAUSE
+    except StoreBusy as exc:
+        gap = gap or exc
+    if gap is not None:
+        raise gap
+    return None
+
+
 def current_model_wait() -> TaskModelWait | None:
     return _CURRENT.get()
+
+
+def announce_capability_refusal(error: Exception, *, drive_root: Any) -> None:
+    """One owner notice per account/model episode when no account can serve a model.
+
+    An account-service fact, not a helper's answer and not a timer: the engine's
+    typed facts decide (``capability_notice``), its episode is the delivery id, and
+    the unchanged durable outbox sends one row however many helpers hit it; a
+    successful differential call never enters here. The task that first saw it is
+    named, not part of the id. A bare library caller gets the same diagnostics on
+    its error and no chat side effect.
+    """
+    from ouroboros.llm_substitution import capability_notice
+
+    owner = current_model_wait()
+    if owner is None or owner.closed:
+        return
+    notice = capability_notice(getattr(error, "problem", None) or {})
+    if notice is None:
+        return
+    delivery_id, text = notice
+    root = owner.canonical_root or drive_root
+    try:
+        from ouroboros.projects_registry import task_presentation_snapshot
+
+        label = task_presentation_snapshot(root, owner.task_id, task=owner.task).get("target_label") or ""
+    except Exception:
+        label = ""  # the notice outranks its label
+    try:
+        from supervisor.schedule_notes import owner_chat_id
+        from supervisor.terminal_delivery import enqueue_terminal_delivery_outcome
+
+        enqueue_terminal_delivery_outcome(root, {
+            "type": "send_message", "chat_id": owner_chat_id(root), "task_id": "",
+            "text": text + (f"\nFirst seen in {label}." if label else ""), "role": "system",
+            "system_type": "model_capability_notice", "delivery_id": delivery_id,
+        }, event_queue=owner.event_queue)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("Capability refusal notice could not be queued", exc_info=True)
 
 
 @contextlib.contextmanager

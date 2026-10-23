@@ -92,7 +92,7 @@ def test_contributor_trust_boundary_covers_functional_review_dependencies():
         # review_substrate_changed diagnostic, exactly as one editing
         # review_substrate.py does (XG-5R4.1).
         "ouroboros/review_execution.py",
-        "ouroboros/review_actor_aggregation.py",
+        "ouroboros/review_seat_outcome.py", "ouroboros/review_wave.py",
         "ouroboros/review_dispatch.py",
         "ouroboros/review_slot_cancel.py",
         "ouroboros/review_evidence.py",

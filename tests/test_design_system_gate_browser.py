@@ -156,6 +156,18 @@ def settle(page):
     page.evaluate('() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))')
 
 
+# The shell at rest (shell_motion.js): no room still leaving and no animation or transition running that ends (the
+# moving marks' wave loops for good). A place picked in the phone drawer changes inside the room card over a beat and
+# the drawer's close, so what a test reads next is read once that motion is over.
+AT_REST = """() => !document.querySelector('[data-leaving]') && document.getAnimations().every((a) =>
+    a.playState !== 'running' || a.effect?.getComputedTiming?.().iterations === Infinity)"""
+
+
+def rest(page, timeout=5000):
+    page.wait_for_function(AT_REST, timeout=timeout)
+    settle(page)
+
+
 def nav_pages(page):
     # The one registry of places (web/modules/pages.js): a new page is gated here with no further edit.
     ids = page.evaluate("async () => (await import('/static/modules/pages.js')).PAGES.map(p => p.id)")
@@ -172,9 +184,7 @@ def open_nav(page, name):
         toggle.click()
     row.click()
     page.locator(f'#page-{name}').wait_for(state='visible')
-    if drawer:  # the room slides back over the closing drawer: measure it once it rests at the left edge
-        setup_browser.wait_drawer_closed(page)
-    settle(page)
+    rest(page)
 
 
 def sidebar_metrics(page):

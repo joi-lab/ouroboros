@@ -73,13 +73,12 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
     }
     if isinstance(data.get("execution_observation"), dict):
         summary["execution_observation"] = dict(data["execution_observation"])
-    # R5: CURRENT delegated-custody reconciliation state next to the historical
-    # axes, on the full single-child handoff surfaces only (get_task_result /
-    # wait_task — wait_tasks' batch projection is a pinned compact contract).
-    # The frozen delegated_runs_* counters are a historical snapshot (owner
-    # Q2=B); the envelope's trigger + open_run_ids are the liveness surface a
-    # parent can trust after a refresh/backfill healed the row. One bounded
-    # entry: capped lists with an exact omitted count.
+    if isinstance(data.get("swarm_receipt"), dict):
+        summary["swarm_receipt"] = data["swarm_receipt"]
+    # R5: current custody beside historical axes, on full get_task_result/wait_task
+    # only; the compact wait_tasks contract stays pinned. Frozen delegated_runs_*
+    # counters remain historical (Q2=B); the envelope's trigger/open_run_ids show
+    # current liveness, with capped lists and exact omitted counts.
     unreconciled = data.get("delegated_runs_unreconciled")
     unreconciled = (
         [str(item) for item in unreconciled] if isinstance(unreconciled, list) else []
@@ -100,6 +99,13 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
         if envelope:
             custody["trigger"] = str(envelope.get("trigger") or "")
             custody["audit_status"] = str(envelope.get("audit_status") or "unknown")
+            if isinstance(envelope.get("owner_stop_children"), dict):
+                receipt = envelope["owner_stop_children"]
+                custody["owner_stop_children"] = {
+                    "count": len(receipt.get("children") or []),
+                    "full_source": receipt.get("full_source"),
+                    **({"gap": receipt["gap"]} if receipt.get("gap") else {}),
+                }
             for field in ("open_run_ids", "pending_invocation_ids", "undisposed_patch_run_ids", "terminal_runs"):
                 values = envelope.get(field)
                 values = list(values) if isinstance(values, list) else []
@@ -228,7 +234,7 @@ def get_task_result_entry() -> ToolEntry:
             "include_focus_source": {"type": "boolean", "default": False, "description": "Read the exact bytes this task's focus source_ref answered when the focus was authored (the retained_source of an [INDEPENDENT_ROOTS] row); same bounds contract as include_completion_source."},
             "focus_source_sha256": {"type": "string", "default": "", "description": "With include_focus_source: select the retained source by the sha256 the roster row quoted, so a later focus of the same author cannot substitute its evidence."},
             "review_source_sha256": {"type": "string", "default": "", "description": "Root turns: read only the exact acceptance-review source named by a late-evidence digest, pinned to the physical task_id even after a retry. Works across forked/empty drives. Without a range returns complete_chars/hash; then use source_start_char/source_end_char to read exact text. Does not include authority."},
-            "delegated_output_sha256": {"type": "string", "default": "", "description": "Read a retained full delegated output that this PHYSICAL task_id's own receipts publish, pinned even after a retry: call exactly the source_read of a staged_output or other_staged_outputs ref (unordered; each says complete) named in public summary delegated_custody.terminal_runs or predecessor_terminal_runs (it names the publishing task; the ref's task_id is only the staging store). Works across forked/empty drives and after drive cleanup. Omit ranges for complete_chars/hash, then use source_start_char/source_end_char. Never marks the run's result as read; does not include authority."},
+            "delegated_output_sha256": {"type": "string", "default": "", "description": "Read a retained full delegated output that this PHYSICAL task_id's own receipts publish, pinned even after a retry: call exactly the source_read of a staged_output/other_staged_outputs or terminal_observation/other_terminal_observations ref (unordered; each says complete; an observation is the exact engine read-back, not proof of full output) named in public summary delegated_custody.terminal_runs or predecessor_terminal_runs (it names the publishing task; the ref's task_id is only the staging store). Works across forked/empty drives and after drive cleanup. Omit ranges for complete_chars/hash, then use source_start_char/source_end_char. Never marks the run's result as read; does not include authority."},
             "presence_reentry_sha256": {"type": "string", "default": "", "description": "Read the exact Presence reentry observation checkpoint named in a resumed-conversation note. Includes full observed messages and transport facts plus coverage gaps. Uses the existing task scope; omit ranges for complete_chars/hash, then page with source_start_char/source_end_char."},
             "presence_reentry_offset": {"type": "integer", "description": "With presence_reentry_sha256: scan the frozen canonical interval of that checkpoint's own conversation, including rows beyond its initial scan budget. Start at history_start and follow next_offset until interval_exhausted. Small pages return complete rows and explicit gaps. Oversized pages return complete_chars/hash; use source_start_char/source_end_char with the same offset to reconstruct that page's exact JSON before advancing."},
             "source_start_char": {"type": "integer", "description": "Inclusive character offset for the requested canonical source range."},
@@ -627,6 +633,16 @@ def _wait_early_return_note(early) -> str:
     return "A child attention beacon interrupted this wait. Inspect early_return; the children keep running."
 
 
+def _terminal_probe(ctx: ToolContext, ids: list) -> Callable:
+    """Adapt the existing status poll to the common, non-consuming readiness predicate."""
+    from ouroboros.model_sleep import terminal_readiness
+
+    def probe(results):
+        ready = {row["id"] for row in terminal_readiness(ctx, {"tasks": ids}, task_results=results)}
+        return {tid: f"task:{tid}" in ready for tid in ids}
+    return probe
+
+
 def _wait_for_task(
     ctx: ToolContext, task_id: str, timeout_sec: int = 180, known_result_sha256: str = "",
 ) -> str:
@@ -649,6 +665,7 @@ def _wait_for_task(
     with in_slot_wait(ctx, timeout, "tasks"):
         waited = wait_for_effective_tasks(
             status_drive_root, [tid], timeout_sec=timeout,
+            terminal_probe=_terminal_probe(ctx, [tid]),
             on_poll=_wait_attention_poll(ctx, "", [tid]), poll_interval_sec=2.0,
         )
     early = waited.get("early_return")
@@ -742,8 +759,10 @@ def _delegated_run_facts(drive_root: Path, child_id: str) -> Any:
     record: Any = None
     try:
         path = Path(drive_root) / "state" / "delegate_supervision" / f"{child_id}.json"
-        record = json.loads(path.read_text(encoding="utf-8"))
-        reason = "" if isinstance(record, dict) else "unreadable"
+        from ouroboros.delegate_supervision_state import normalize
+
+        record = normalize(json.loads(path.read_text(encoding="utf-8")))
+        reason = ""
     except FileNotFoundError:
         reason = "no_supervision_record"
     except (OSError, ValueError):
@@ -756,12 +775,13 @@ def _delegated_run_facts(drive_root: Path, child_id: str) -> Any:
                                "age_sec": _age_sec(started_at, now), "max_seconds": max_seconds or None}
         if reason:
             row["supervision"] = {"state": "unknown", "reason": reason}
-        elif str(record.get("run_id") or "") != run.run_id:
+        elif run.run_id not in record["runs"]:
             row["supervision"] = {"state": "unknown", "reason": "record_names_another_run"}
         else:
-            observation = record.get("observation") if isinstance(record.get("observation"), dict) else None
-            entry = record.get("sleep_entry") if isinstance(record.get("sleep_entry"), dict) else {}
-            last = str(record.get("last_answered_observation_at") or "")
+            state = record["runs"][run.run_id]
+            observation = state.get("observation") if isinstance(state.get("observation"), dict) else None
+            entry = state.get("sleep_entry") if isinstance(state.get("sleep_entry"), dict) else {}
+            last = str(state.get("last_answered_observation_at") or "")
             row["supervision"] = {
                 "hold_entered_at": str(entry.get("entered_at") or "unknown"),
                 "last_answered_observation_at": last or "unknown",
@@ -770,7 +790,7 @@ def _delegated_run_facts(drive_root: Path, child_id: str) -> Any:
                 "observation_failure": (
                     "unknown" if observation is None else "" if observation.get("answered")
                     else str(observation.get("reason") or observation.get("status") or "unanswered")),
-                "journal_cursor": record.get("journal_cursor"),
+                "journal_cursor": state.get("journal_cursor"),
             }
         rows.append(row)
     return rows
@@ -844,8 +864,7 @@ def _await_messages(ctx: ToolContext, timeout_sec: int = 0, mode: str = "in_slot
     the wait for reply-preparation readers, adds no idle exemption and lends no
     slot; tests/test_await_messages.py drives that lifecycle.
     """
-    from ouroboros.loop_transport import _owner_signal_pending
-    from ouroboros.owner_mailbox import OwnerMailboxPeek
+    from ouroboros.model_sleep import wake_reason
 
     if mode != "in_slot" or senders or tasks or runs or services or wake_at or wake_after_sec:
         return _await_as_sleep(ctx, mode, senders=senders, tasks=tasks, runs=runs, services=services,
@@ -861,23 +880,19 @@ def _await_messages(ctx: ToolContext, timeout_sec: int = 0, mode: str = "in_slot
 
     window, bound = _wait_window(ctx, requested, clamp=int(get_per_call_timeout_ceiling_sec()),
                                  minimum=1, margin=1)
-    peek = OwnerMailboxPeek()
-    drive_root = getattr(ctx, "drive_root", None)
-    task_id = str(getattr(ctx, "task_id", "") or "")
-    seen = getattr(ctx, "_loop_mailbox_seen_ids", None)
-    attempt = getattr(ctx, "task_attempt", None) or 1
     start = time.monotonic()
     with in_slot_wait(ctx, window):
         while True:
             # The transport wait's non-destructive peek over a COPY of the seen
             # set; the mailbox and its acknowledgements are untouched.
-            pending = bool(_owner_signal_pending(None, drive_root, task_id, seen, attempt, peek))
+            observed = wake_reason(ctx, {"any_mail": True})
+            pending = bool(observed)
             elapsed = time.monotonic() - start
             if pending or elapsed >= window:
                 break
             time.sleep(min(_AWAIT_MESSAGES_POLL_SEC, max(0.0, window - elapsed)))
     if pending:
-        reason = "owner_mailbox_pending"
+        reason = observed if observed.startswith("run_question:") else "owner_mailbox_pending"
     else:
         reason = "deadline" if bound == "deadline" else "timeout"
     out: Dict[str, Any] = {
@@ -972,7 +987,11 @@ def await_messages_entry() -> ToolEntry:
 
 def _count_live_sibling_children(ctx: ToolContext, status_drive_root: Path, *, exclude_task_id: str) -> int:
     """Count this parent's children still running/scheduled/requested (excluding the one
-    just waited on). Advisory only — a failure returns 0 so it never breaks wait_task."""
+    just waited on). Advisory only — a failure returns 0 so it never breaks wait_task.
+
+    Select indexed, stored row facts in any role, without decoding task bodies.
+    The typed parent identity applies even when its body is padded or unreadable.
+    """
     parent_id = str(getattr(ctx, "task_id", "") or "").strip()
     if not parent_id:
         return 0
@@ -981,16 +1000,12 @@ def _count_live_sibling_children(ctx: ToolContext, status_drive_root: Path, *, e
             STATUS_REQUESTED,
             STATUS_RUNNING,
             STATUS_SCHEDULED,
-            list_task_results,
         )
+        from ouroboros.task_store import task_facts
 
-        live = 0
-        for item in list_task_results(status_drive_root, statuses=[STATUS_RUNNING, STATUS_SCHEDULED, STATUS_REQUESTED]):
-            if str(item.get("task_id") or item.get("id") or "") == exclude_task_id:
-                continue
-            if str(item.get("parent_task_id") or "") == parent_id:
-                live += 1
-        return live
+        return len(task_facts(
+            status_drive_root, where="parent_task_id=? AND task_id<>? AND status IN (?,?,?)",
+            params=(parent_id, exclude_task_id, STATUS_RUNNING, STATUS_SCHEDULED, STATUS_REQUESTED)))
     except Exception:
         return 0
 
@@ -1260,6 +1275,7 @@ def _wait_for_tasks(
     with in_slot_wait(ctx, first_window, "tasks"):
         waited = wait_for_effective_tasks(
             status_drive_root, normalized_ids, timeout_sec=first_window, mode=normalized_mode,
+            terminal_probe=_terminal_probe(ctx, normalized_ids),
             on_poll=_wait_attention_poll(ctx, _wait_since, normalized_ids), poll_interval_sec=2.0,
         )
     if _phantom_only and first_window < float(timeout) and waited.get("early_return") is None:
@@ -1269,6 +1285,7 @@ def _wait_for_tasks(
             with in_slot_wait(ctx, max(0.0, float(timeout) - elapsed), "tasks"):
                 resumed = wait_for_effective_tasks(
                     status_drive_root, normalized_ids,
+                    terminal_probe=_terminal_probe(ctx, normalized_ids),
                     timeout_sec=max(0.0, float(timeout) - elapsed), mode=normalized_mode,
                     on_poll=_wait_attention_poll(ctx, _wait_since, normalized_ids), poll_interval_sec=2.0,
                 )

@@ -76,6 +76,7 @@ def geo(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
     from ouroboros.tools import delegate
 
     delegate._READ_COVERAGE.clear()
@@ -387,6 +388,7 @@ def test_a_retry_reader_stages_into_its_own_store_and_the_starter_receipt_names_
     monkeypatch.setattr(delegate, "_CUSTODY", memo)
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
 
     ctx = retry_context(tmp_path, monkeypatch, split=True,
                         fixed_ownership_clock=True)  # retry-b on a forked drive

@@ -1,112 +1,186 @@
-"""Offline diagnostics for the live smoke's failed and successful review paths."""
+"""Offline evidence and settlement guards for the live smoke's ordinary author task.
+
+#2189 retired the direct-review helper and its automatic retry. The consumer now
+exports exact shared-ledger sources and refuses ambiguous work after one task;
+only an independent, substantive rebuttal can supply a second paid verdict.
+"""
 
 import json
 from types import SimpleNamespace
 
 import pytest
 
-from ouroboros.skill_review import _skill_quorum_failure_outcome
-from ouroboros.skill_review_prompt import _SKILL_REVIEW_ITEMS
-from ouroboros.triad_review import parse_model_review_results
+from ouroboros import review_ledger as ledger
+from ouroboros.review_state import CommitAttemptRecord, update_state
+from ouroboros.skill_loader import SkillReviewState, find_skill, save_review_state
+from tests import skill_smoke_author as author
 from tests import test_skill_smoke_official as smoke
-from tests._skill_review_shared import _make_actor
+
+NAME, TASK, MODEL = "probe", "smoke-task", smoke._REVIEW_MODEL
+
+
+def _payload(data):
+    path = data / "skills" / "ouroboroshub" / NAME
+    path.mkdir(parents=True)
+    (path / "SKILL.md").write_text(
+        "---\nname: probe\ntype: instruction\n---\nInert diagnostic fixture.\n", encoding="utf-8")
+    return find_skill(data, NAME)
+
+
+def _wave(data, raw, *, status="clean", operation="settled", record_id="rl-current", rebuttal=""):
+    """Persist the same three carriers the consumer reads: source, ledger, paid stamp."""
+    skill = find_skill(data, NAME)
+    response = ledger.retain_text_source(
+        data, TASK, record_id=record_id, seat_id="critic", role="response", part="skill", text=raw)
+    assert response["status"] == "retained"
+    record = ledger.ReviewLedgerRecord(
+        record_id=record_id, task_id=TASK, root_task_id=TASK, surface="skill", enforcement="blocking",
+        subject={"skill": NAME, "tree_sha": skill.content_hash, "root": str(skill.skill_dir.resolve())},
+        brief={"skill": {"group_id": f"task:{TASK}:{NAME}"}},
+        fingerprints={"review_contract": "contract"},
+        verdict={"aggregate": {"clean": "PASS", "pending": "QUORUM_FAILED", "blockers": "FAIL"}[status]},
+        rows=[{"seat_id": "critic", "observed_model": MODEL,
+               "status": "error" if status == "pending" else "responded",
+               "operation_state": operation, "source_refs": [response]}])
+    ledger.write_record(data, record)
+    update_state(data, lambda state: state.attempts.append(CommitAttemptRecord(
+        ts="2026-10-22T00:00:00Z", commit_message="", status="reviewed", task_id=TASK,
+        root_task_id=TASK, tool_name="review_skill", paid=True, review_record_id=record_id,
+        review_contract_fingerprint="contract", rebuttal_sha256=rebuttal,
+        attempt=1 if record_id == "rl-current" else 2)))
+    return record
+
+
+def _save_review(data, *, status="clean", record_id="rl-current"):
+    save_review_state(data, NAME, SkillReviewState(
+        status=status, content_hash=find_skill(data, NAME).content_hash, record_id=record_id,
+        reviewer_models=[MODEL], raw_actor_records=[{"model_id": MODEL, "raw_text": "persisted judgment"}]))
+
+
+def _export(tmp_path, monkeypatch, data):
+    destination = tmp_path / "diagnostics"
+    monkeypatch.setenv("OUROBOROS_TEST_EVIDENCE_ROOT", str(destination))
+    review = data / "state" / "skills" / NAME / "review.json"
+    evidence = {"task_id": TASK, "original_hash": find_skill(data, NAME).content_hash,
+                "review_history": author.load_review_waves(data, NAME),
+                "review": json.loads(review.read_text(encoding="utf-8")) if review.exists() else None}
+    assert not author.persist_author_evidence(tmp_path / "author", evidence, "unused-credential")
+    [path] = destination.glob("skill-smoke-author/*/author-evidence.json")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 @pytest.mark.parametrize("prior_review", [False, True])
 @pytest.mark.parametrize("provider_error", [False, True])
-def test_smoke_diagnostics_show_current_quorum_failure(tmp_path, monkeypatch,
-                                                     prior_review, provider_error):
-    monkeypatch.setattr(smoke, "DATA_DIR", tmp_path)
-    name = "smoke-diagnostic"
-    state = smoke._skill_state_dir(name)
+def test_smoke_diagnostics_show_current_quorum_failure(tmp_path, monkeypatch, prior_review, provider_error):
+    data = tmp_path / "data"
+    skill = _payload(data)
     if prior_review:
-        state.mkdir(parents=True)
-        (state / "review.json").write_text(json.dumps({
-            "status": "clean", "content_hash": "old-hash", "raw_actor_records": [],
-        }), encoding="utf-8")
-    # Both transport failures and malformed answers miss the same quorum. Keep
-    # enough text to expose accidental diagnostic truncation, including its end.
+        save_review_state(data, NAME, SkillReviewState(status="clean", content_hash="old-hash"))
+    review = data / "state" / "skills" / NAME / "review.json"
+    before = review.read_bytes() if prior_review else None
     raw = ("403 Inference is blocked on this account" if provider_error
            else "I have not completed the review") + " evidence" * 2000 + " END-WITNESS"
-    actor = _make_actor(smoke._REVIEW_MODEL, raw)
-    if provider_error:
-        actor["verdict"] = "ERROR"
-    result = {"results": [actor]}
-    parsed = parse_model_review_results(result, required_items=_SKILL_REVIEW_ITEMS)
-    assert not parsed.responsive_models
-    outcome = _skill_quorum_failure_outcome(
-        SimpleNamespace(name=name), findings=parsed.findings,
-        models=[smoke._REVIEW_MODEL], content_hash="current-hash", required_quorum=1,
-        result_json_text=json.dumps(result), parsed_review=parsed, advisory_evidence={},
-        single_reviewer_no_diversity=True, drive_root=tmp_path, persist=True,
-    )
-    assert outcome.status == "pending"
-    assert (state / "review.json").exists() is prior_review
-    diagnostic = smoke._review_diag(name, outcome.status, outcome.error,
-                                   {"review_findings": outcome.findings})
-    assert json.dumps(raw) in diagnostic, diagnostic
-    assert "current-hash" in diagnostic, diagnostic
+    _wave(data, raw, status="pending", operation="custody_lost" if provider_error else "settled")
+    diagnostic = _export(tmp_path, monkeypatch, data)
+    [wave] = diagnostic["review_history"]
+    assert wave["status"] == "pending" and wave["content_hash"] == skill.content_hash
+    assert wave["raw_actor_records"][0]["raw_text"] == raw
+    assert (review.read_bytes() if review.exists() else None) == before
+    with pytest.raises(AssertionError, match="pending/unknown review stays red"):
+        author.assert_review_evidence(data, NAME, skill.content_hash, TASK, MODEL)
 
 
 def test_smoke_diagnostics_keep_successful_review_actors(tmp_path, monkeypatch):
-    monkeypatch.setattr(smoke, "DATA_DIR", tmp_path)
-    state = smoke._skill_state_dir("clean")
-    state.mkdir(parents=True)
-    actors = [{"raw_text": "complete successful review"}]
-    (state / "review.json").write_text(json.dumps({
-        "reviewer_models": [smoke._REVIEW_MODEL], "raw_actor_records": actors,
-    }), encoding="utf-8")
-    diagnostic = smoke._review_diag("clean", "clean", "", {"review_findings": []})
-    assert smoke._REVIEW_MODEL in diagnostic
-    assert json.dumps(actors) in diagnostic
+    data = tmp_path / "data"
+    skill = _payload(data)
+    raw = "complete successful review" + " evidence" * 2000 + " END-WITNESS"
+    _wave(data, raw)
+    _save_review(data)
+    diagnostic = _export(tmp_path, monkeypatch, data)
+    assert diagnostic["review"]["reviewer_models"] == [MODEL]
+    assert diagnostic["review"]["raw_actor_records"] == [{"model_id": MODEL, "raw_text": "persisted judgment"}]
+    assert diagnostic["review_history"][0]["raw_actor_records"][0]["raw_text"] == raw
+    assert author.assert_review_evidence(data, NAME, skill.content_hash, TASK, MODEL)["status"] == "clean"
 
 
-@pytest.mark.parametrize("case,calls", [
-    ("in_flight", 1), ("custody_lost", 1), ("pending_dispatch", 1),
-    ("late_result_pending", 1), ("missing_history", 1), ("wrong_hash", 1),
-    ("empty_records", 1), ("unknown_record", 1), ("nested_pending", 1),
-    ("blockers", 1), ("settled_error", 2), ("late_settled_error", 2),
-    ("not_dispatched", 2), ("deps_failed", 2), ("clean", 1),
+@pytest.mark.parametrize("case,error", [
+    ("in_flight", "still unsettled"), ("custody_lost", "still unsettled"),
+    ("pending_dispatch", "still unsettled"), ("late_result_pending", "still unsettled"),
+    ("missing_history", "missing review"), ("wrong_hash", "material drift"),
+    ("empty_records", "missing independent reviewer"), ("unknown_record", "settlement is unknown"),
+    ("nested_pending", "still unsettled"), ("blockers", "criticism remains unresolved"),
+    ("settled_error", "pending/unknown"), ("late_settled_error", "pending/unknown"),
+    ("not_dispatched", "settlement is unknown"), ("unjustified_reroll", "substantive rebuttal"),
+    ("clean", ""), ("late_settled_clean", ""), ("grounded_rebuttal", ""),
 ])
-def test_smoke_retry_preserves_original_wave_and_requires_settlement(tmp_path, monkeypatch, case, calls):
-    from ouroboros.skill_review_history import append_history_once, review_history_path
+def test_smoke_author_preserves_original_wave_and_requires_settlement(tmp_path, monkeypatch, case, error):
+    source = tmp_path / "source"
+    _payload(source)
+    root = tmp_path / "author"
+    data = root / "data"
+    lifecycle, original_records = [], {}
+    original_loader = author.load_review_waves
 
-    name = "bounded-smoke"
-    monkeypatch.setattr(smoke, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(smoke, "find_skill", lambda *_: SimpleNamespace(content_hash="current-hash"))
-    status = "clean" if case in {"clean", "deps_failed"} else "blockers" if case == "blockers" else "pending"
-    state = case if case in {"in_flight", "custody_lost", "pending_dispatch", "not_dispatched"} else "settled"
-    if case == "late_settled_error":
-        state = "late_settled"
-    records = [{"operation_state": state, "late_result_pending": case == "late_result_pending"}]
-    if case == "empty_records":
-        records = []
-    elif case == "unknown_record":
-        records = [{}]
-    elif case == "nested_pending":
-        records = [{"raw_results": [{"operation_state": "in_flight"}]}]
-    path = review_history_path(tmp_path, name)
-    before, observed = None, []
+    def finish(*_args, **_kwargs):
+        lifecycle.append("wait")
+        status = ("pending" if case in {"settled_error", "late_settled_error"} else
+                  "blockers" if case in {"blockers", "grounded_rebuttal"} else "clean")
+        operation = case if case in {"in_flight", "custody_lost", "pending_dispatch", "not_dispatched"} else "settled"
+        if case in {"late_settled_error", "late_settled_clean"}:
+            operation = "late_settled"
+        if case != "missing_history":
+            record = _wave(data, "Original full judgment", status=status, operation=operation)
+            if case == "wrong_hash":
+                record.subject["tree_sha"] = "other-bytes"
+            elif case == "empty_records":
+                record.rows = []
+            elif case == "unknown_record":
+                record.rows[0]["operation_state"] = ""
+            elif case == "late_result_pending":
+                record.rows[0]["late_result_pending"] = True
+            record.revision += 1
+            ledger.write_record(data, record)
+        final_id = "rl-current"
+        if case in {"grounded_rebuttal", "unjustified_reroll"}:
+            final_id = "rl-reassessment"
+            _wave(data, "Independent reassessment", record_id=final_id, rebuttal="source-grounded-argument")
+            status = "clean"
+        _save_review(data, status=status, record_id=final_id)
+        for record_id in ("rl-current", final_id):
+            path = ledger.record_path(data, record_id)
+            if path.exists():
+                original_records[path] = path.read_bytes()
+        return {"status": "completed", "result": "Author prose claims PASS"}
 
-    def flow(slug, skill):
-        nonlocal before
-        observed.append((slug, skill))
-        if len(observed) == 1:  # the first attempt records the original wave, as review_skill does
-            if case != "missing_history":
-                assert append_history_once(tmp_path, name, {"job_id": "original-wave", "status": status,
-                    "content_hash": "old-hash" if case == "wrong_hash" else "current-hash",
-                    "raw_actor_records": records, "paid": True})
-            before = path.read_bytes() if path.exists() else None
-            return status, "" if status in {"clean", "blockers"} else "first failure", (
-                "failed" if case == "deps_failed" else "installed"), {}
-        assert (path.read_bytes() if path.exists() else None) == before  # the retry keeps the original wave
-        return "clean", "", "installed", {}
+    def waves(*args):
+        history = original_loader(*args)
+        if case == "nested_pending":
+            history[0]["raw_actor_records"][0]["raw_results"] = [{"operation_state": "in_flight"}]
+        return history
 
-    monkeypatch.setattr(smoke, "_run_review_flow", flow)
-    result = smoke._review_with_one_settled_retry("a2a", name)
-    assert len(observed) == calls
-    assert (path.read_bytes() if path.exists() else None) == before
-    if calls == 1 and case != "clean":
-        assert result[0] == status and "not retried:" in result[-1]
+    def api(_url, method, path, _body):
+        assert (method, path) == ("POST", "/api/tasks")
+        lifecycle.append("post")
+        return {"task_id": TASK}
+
+    server = SimpleNamespace(start=lambda: lifecycle.append("start"), stop=lambda: lifecycle.append("stop"),
+                             base_url="unused", wait_task=finish)
+    monkeypatch.setattr(author, "SmokeAuthorServer", lambda *_args, **_kwargs: server)
+    monkeypatch.setattr(author, "_api", api)
+    monkeypatch.setattr(author, "load_review_waves", waves)
+    monkeypatch.setenv("OUROBOROS_TEST_EVIDENCE_ROOT", str(tmp_path / "diagnostics"))
+    kwargs = dict(candidate=SimpleNamespace(path=tmp_path / "repo"), source_data=source, root=root,
+                  name=NAME, model=MODEL, timeout_sec=1, credential=("OPENROUTER_API_KEY", "synthetic-key"))
+    if error:
+        with pytest.raises(AssertionError, match=error):
+            author.run_author_review(**kwargs)
     else:
-        assert result[:3] == ("clean", "", "installed")
+        assert author.run_author_review(**kwargs)["review"]["status"] == "clean"
+    assert lifecycle == ["start", "post", "wait", "stop"], "ambiguity must never start another author task"
+    assert all(path.read_bytes() == before for path, before in original_records.items())
+    assert not author.load_enabled(data, NAME)
+    evidence = json.loads((root / "author-evidence.json").read_text(encoding="utf-8"))
+    assert evidence["server_stopped"] and not evidence["evidence_errors"]
+    assert [row["record_id"] for row in evidence["review_history"]] == (
+        [] if case == "missing_history" else ["rl-current", "rl-reassessment"]
+        if case in {"grounded_rebuttal", "unjustified_reroll"} else ["rl-current"])

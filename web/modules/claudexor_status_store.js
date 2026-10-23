@@ -86,6 +86,20 @@ export const FACET_QUOTA = 'quota';
 export const STATUS_FACETS = [FACET_CATALOG, FACET_ACCOUNTS, FACET_QUOTA];
 
 export const accountTargetKey = (target) => JSON.stringify([target.harness, target.profile_id]);
+
+/** Temporary account x model marks, only beside a successful account read; older engines have none. */
+export function accountCapabilityMarks(payload, row) {
+    if (payload?.reads?.accounts !== READ_OK) return [];
+    const marks = payload?.profiles?.routing_evidence?.capabilities;
+    return Array.isArray(marks) ? marks.filter(mark => mark?.harness_id === row.harness
+        && mark.profile_id === row.profile_id && typeof mark.requested_model === 'string') : [];
+}
+
+/** When the marks could not be read, its time: ONE fact for the whole section, never "no marks". */
+export function capabilityMarksReadFailedAt(payload) {
+    const read = payload?.reads?.accounts === READ_OK ? payload?.profiles?.routing_evidence_read : null;
+    return read?.state === READ_FAILED ? String(read.observed_at || '') : '';
+}
 const sameTarget = (a, b) => a?.harness === b?.harness && a?.profile_id === b?.profile_id;
 const quotaTarget = (row) => ({ harness: row?.subject?.harness, profile_id: row?.subject?.subject_id });
 const observationTime = values => Math.max(-Infinity, ...values.map(value => Date.parse(value || '')).filter(Number.isFinite));

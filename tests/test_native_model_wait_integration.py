@@ -73,6 +73,9 @@ def test_native_wait_controls_and_manual_restart_address_all_registered_actors(t
             assert not owner_mailbox._mailbox_path(tmp_path, "native-main").exists()
             # Reuse the new manual Restart owner, without touching a real
             # process or daemon. Each actual controller sees its own Stop.
+            from ouroboros.delegate_recovery import prepare_owner_restart
+            transaction = prepare_owner_restart(tmp_path)
+            monkeypatch.setattr(server_restart, "_LAST_RETURN_TX", {"id": transaction["transaction_id"]})
             server_restart._stop_owned_work(context)
             assert len(cancelled) == 1 and cancelled[0]["reconcile_delegate_custody"] is False
             assert all(cancel_intents.cancel_pending(tmp_path, owner.task_id) for owner in controllers)
@@ -131,7 +134,9 @@ def test_native_post_task_wait_remains_addressable_after_dialogue_closes(phase, 
     release_stop, stop_observed = threading.Event(), threading.Event()
     thread.start()
     try:
-        until(lambda: "owner" in observed and any(row.get("credential_harness") for row in observed["owner"].waits.values()))
+        # Initial durable setup precedes publication; allow it on a loaded host.
+        until(lambda: "owner" in observed and any(row.get("credential_harness")
+              for row in observed["owner"].waits.values()), timeout=15)
         owner, task_id = observed["owner"], f.task["id"]
         row = next(row for row in owner.waits.values() if row["state"] == "waiting")
         assert workers.direct_chat_turn(task_id) is None  # ordinary dialogue remains closed

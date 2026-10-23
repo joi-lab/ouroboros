@@ -51,6 +51,8 @@ def _sub():
 
 def _transport_error_status(error: Any, *, failure_phase: str = "") -> str:
     """Classify transport failures without depending on a non-empty message."""
+    if getattr(error, "review_run_state", "") in {"cancelled", "interrupted"}:
+        return "interrupted"
     if failure_phase == "authority":
         return "authority_error"
     error_type = type(error).__name__ if isinstance(error, BaseException) else ""
@@ -100,7 +102,8 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
     parsed = row.get("parsed") if isinstance(row.get("parsed"), (dict, list)) else None
     # The one decision point: a slot is awaited only while it carries no answer. A row that
     # carries one is judged by its answer, whatever its custody state says.
-    awaiting = review_slot_awaiting(row) and parsed is None and not str(row.get("raw_text") or "").strip()
+    outcome = row.get("outcome") or {}
+    awaiting = (review_slot_awaiting(row) or outcome.get("status") == "pending") and parsed is None and not str(row.get("raw_text") or "").strip()
     usage = row.get("usage") if isinstance(row.get("usage"), dict) else {}
     explicit_parse = str(row.get("parse_status") or "")
     if explicit_parse == AWAITING_PROJECTION:
@@ -157,9 +160,9 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
             )
             if reason:
                 break
-    reason = reason or error or ("Reviewer response was malformed or absent." if not valid else "")
+    reason = reason or error or ("Reviewer response was malformed or absent." if not valid and explicit_parse != "valid" else "")
     if awaiting:
-        reason = _AWAITING_REASON
+        reason = (reason or _AWAITING_REASON) if outcome else _AWAITING_REASON
     model = str(usage.get("resolved_model", row.get("model")) or "")
     provider = str(usage.get("provider") or row.get("provider") or "")
     if not provider:
@@ -203,6 +206,9 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
         # Flat, redacted pointer to the private full response artifact.
         "response_ref": _response_ref_projection(row.get("response_ref")),
     }
+    if outcome:
+        projection.update(transport_status=outcome["transport"], parse_status=outcome["parse"],
+                          semantic_verdict=outcome["verdict"])
     # Since when this row has been waiting, published only where the host wrote
     # a real instant on a row the two wait predicates still call unanswered. An
     # absent key is a hole, never a back-filled or inferred moment.
@@ -306,11 +312,12 @@ def _ledger_seat_actor(seat: Dict[str, Any], record: Dict[str, Any]) -> Dict[str
     """One ledger seat as a card reviewer: the parts it was asked, each part's answer
     with its findings COUNTED (the bodies ride once, bounded, in ``findings``), and the
     observed model, else the requested one (``panel_facts`` counts the unobserved)."""
-    status, surface = str(seat.get("status") or ""), str(record.get("surface") or "review")
+    outcome = seat.get("outcome") or {}
+    status, surface = str(outcome.get("status") or seat.get("status") or ""), str(record.get("surface") or "review")
     requested = seat.get("requested") if isinstance(seat.get("requested"), dict) else {}
     observed = str(seat.get("observed_model") or "")
     model = observed if observed not in ("", "unknown") else str(requested.get("model") or "")
-    answers = seat.get("answers") if isinstance(seat.get("answers"), dict) else {}
+    answers = outcome.get("answers") or (seat.get("answers") if isinstance(seat.get("answers"), dict) else {})
     parts = [str(part) for part in seat.get("parts") or [] if part in answers] or list(answers)
     findings: List[Dict[str, Any]] = []
     counted: Dict[str, Dict[str, Any]] = {}
@@ -328,9 +335,9 @@ def _ledger_seat_actor(seat: Dict[str, Any], record: Dict[str, Any]) -> Dict[str
         "slot_id": str(seat.get("seat_id") or ""), "model": model,
         "provider": _sub().provider_for_model(model) if model else "unknown",
         "actor_role": f"{surface} {'additional ' if seat.get('additional') else ''}reviewer",
-        "transport_status": str(seat.get("transport_status") or ("success" if status in _LEDGER_PARSE else status or "unknown")),
-        "parse_status": _LEDGER_PARSE.get(status, "none"),
-        "semantic_verdict": str(((record.get("verdict") or {}).get("per_row") or {}).get(seat.get("seat_id")) or ""),
+        "transport_status": str(outcome.get("transport") or seat.get("transport_status") or ("success" if status in _LEDGER_PARSE else status or "unknown")),
+        "parse_status": outcome.get("parse") or _LEDGER_PARSE.get(status, "none"),
+        "semantic_verdict": str(outcome.get("verdict") or "") if outcome else str(((record.get("verdict") or {}).get("per_row") or {}).get(seat.get("seat_id")) or ""),
         "quorum_contribution": contributes,
         "enforcement_impact": str(record.get("enforcement") or "unknown") if contributes else "abstains",
         "operation_state": str(seat.get("operation_state") or ""),
@@ -394,6 +401,19 @@ def _wave_cost(costs: List[Dict[str, Any]]) -> Dict[str, Any]:
             "seats": {kind: sum(1 for cost in costs if cost["kind"] == kind) for kind in ("usd", "subscription", "unknown")}}
 
 
+def _doctrine_panel(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Pass the author-check facts through. A record without them stays unchanged."""
+    decision = record.get("author_decision")
+    if not isinstance(decision, dict):
+        return {}
+    from ouroboros.review_doctrine import EVIDENCE_KIND, FACT_KIND, LANDING_KEY, public_card_decision
+
+    if not any(isinstance(decision.get(key), dict) for key in (FACT_KIND, EVIDENCE_KIND, LANDING_KEY)):
+        return {}
+    public = public_card_decision(decision)
+    return {"author_decision": public} if public else {}
+
+
 def ledger_record_panel(record: Dict[str, Any]) -> Dict[str, Any]:
     """One review-ledger record (``review_ledger.build_wave_record``) as a card panel:
     the record's ``panel`` facts (who sat and why) and every seat's answer per brief
@@ -433,6 +453,7 @@ def ledger_record_panel(record: Dict[str, Any]) -> Dict[str, Any]:
         "panel_facts": facts, "actors": actors, "superseded": False,
         "source_ref": {"kind": "review_ledger_record", "path": f"state/{LEDGER_SUBDIR}/{record_id}.json"},
         **({"cost": _wave_cost(costs)} if pooled else {}),
+        **_doctrine_panel(record),
     }
 
 

@@ -48,7 +48,7 @@ def test_the_request_keeps_my_story_before_the_changing_tail_and_the_book_separa
 
 def test_b_is_byte_identical_for_main_another_room_and_a_wake(tmp_path):
     """One story for every integrating focus; a wake's room is Main, byte for byte the Main turn's, and its
-    live rooms carry the words of people there (the Main turn's carry one line per room)."""
+    live rooms give one directory line per room without standing verbatim words."""
     env, memory, rooms = world(tmp_path)
     views = {name: blocks(env, memory, task) for name, task in (
         ("main", MAIN), ("alpha", {"id": "bound", "chat_id": 1}), ("beta", {"id": "tb", "chat_id": rooms["beta"]}),
@@ -59,8 +59,9 @@ def test_b_is_byte_identical_for_main_another_room_and_a_wake(tmp_path):
     main_c, wake_c = views["main"][2], views["wake"][2]
     assert section(wake_c, "## This room (Main)") == section(main_c, "## This room (Main)")
     assert "## This room (Main)" not in views["alpha"][2]
-    for words in ("alpha again", "beta again"):  # people's words of the other live rooms, verbatim, to the wake alone
-        assert words in section(wake_c, "## Live rooms") and words not in main_c, words
+    for words in ("alpha again", "beta again"):
+        assert words not in section(wake_c, "## Live rooms") and words not in main_c, words
+    assert "memory_read(room_id=" in section(wake_c, "## Live rooms")
 
 
 def test_full_roles_share_the_first_block_and_only_eligible_tasks_get_the_handbook(tmp_path):
@@ -133,7 +134,7 @@ def test_route_reprojection_keeps_the_captured_handbook_and_counts_it_in_the_flo
     for mode in ("max", "low", "nano"):
         facts = plan.projection(mode).memory_facts["floor"]
         delta = without.projection(mode).memory_facts["floor"]["physical_allowance_tokens"] - facts["physical_allowance_tokens"]
-        assert (delta > 5000) if book and mode == "max" else delta == 0
+        assert (delta > 5000) if book else delta == 0  # every unsent book form shares the start's one memory view
     chapter.write_text("# Rules\n\nChanged after capture.\n", encoding="utf-8")
     rebuilt = plan.reproject_for_route(window_tokens=2_000_000, known_window=True, ratio=1.0,
                                       output_reserve=plan.output_reserve_tokens, tool_schemas=None)
@@ -216,7 +217,8 @@ def test_anthropic_preserves_the_message_seal_and_gives_schemas_only_a_free_slot
     assert len(kept) == len(_deep_markers(payload)) == 4
     has_book = book and mode == "max"
     assert ("cache_control" in payload["tools"][-1]) == (not has_book)
-    assert kept[-1]["text"] == ("result 0" if long else messages[1]["content"][-1]["text"])
+    # The newest tool result, or the task message itself: the seal changed neither row.
+    assert kept[-1]["text"] == ("result 5" if long else messages[1]["content"])
     assert any(block.get("text", "").startswith("## DEVELOPMENT.md\n") for block in kept) == has_book
     assert all(block["cache_control"] == {"type": "ephemeral", "ttl": "1h"} for block in kept)
     assert messages == canonical and tools == _tools()
@@ -298,7 +300,8 @@ def test_the_tool_schemas_count_in_the_floor_of_every_mode(tmp_path):
         assert (bare.projection(mode).memory_facts["floor"]["allowance_tokens"]
                 - loaded.projection(mode).memory_facts["floor"]["allowance_tokens"]) >= 30_000
     assert (bare.projection("nano").memory_facts["floor"]["physical_allowance_tokens"]
-            == loaded.projection("nano").memory_facts["floor"]["physical_allowance_tokens"])  # none is a Nano schema
+            - loaded.projection("nano").memory_facts["floor"]["physical_allowance_tokens"]) >= 30_000
+    # Unsent book forms share the selected start view, including its resident schema allowance.
 
 
 @pytest.mark.parametrize("actor,owner", [("child", "max"), ("child", "nano"), ("root", "max")])
@@ -337,10 +340,14 @@ def test_a_nano_floor_names_only_the_path_its_own_request_sends(tmp_path, monkey
     roomy = plan(10_000_000)  # Nano's fixed part and reserve, read off a roomy plan; then a window only Nano fits
     window = (10_000_000 - roomy.projection("nano").memory_facts["floor"]["physical_allowance_tokens"]
               + minimal_view_tokens(snapshot_from_json(core.memory_view_json), window_tokens=10_000_000) + 50)
-    built = plan(window)
-    # Prediction keeps owner-Max books. The Nano projection is available only
-    # after an actual refusal; its tool/memory routing still must agree.
-    assert built.initial_mode == ("max" if owner == "max" else "nano")
+    from ouroboros.context_fit import MinimumViewUnfit
+    with pytest.raises(MinimumViewUnfit, match="Core, assignment, resident control tools and work room"):
+        plan(window)
+    sent_tools = list(select_tool_schemas(schemas, context_mode="nano").schemas)
+    built = roomy.reproject_for_route(window_tokens=window, known_window=True, ratio=1.0,
+        output_reserve=roomy.output_reserve_tokens, tool_schemas=sent_tools, start_mode="nano",
+        select_mode="nano", refused_tokens=2**31 - 1)
+    assert built.initial_mode == "nano"  # physical recovery, not an undersized start
     floor = section(built.messages_for("nano")[0]["content"][-1]["text"], "### Physical floor")
     sent = select_tool_schemas(schemas, context_mode="nano").chosen
     assert "memory_read" not in sent and ("enable_tools" in floor) == ("enable_tools" in sent), (sent, floor)
@@ -453,10 +460,12 @@ def test_direct_openai_and_openrouter_keep_all_stable_items_and_one_notice(tmp_p
 
 def test_the_task_input_pointer_is_a_physical_rescue_and_the_floor_counts_resident_schemas(tmp_path, monkeypatch):
     """A11, #1527 (owner 2026-10-13, A). The owner's words reach Nano as text whatever the 85K target: the
-    pointer replaces them only when a known fresh window cannot hold the calibrated Nano request (schemas it
-    sends and its reply floor included) and the pointer request does fit it. An unknown window, a pointer that
-    does not fit either, or a failed source write keep the words. The pointer's reader reaches the end of the
-    exact input. On a route switch the resident list (an enable_tools addition) counts in the fit and the floor."""
+    pointer replaces them only when a known fresh window cannot physically hold the Nano request (the schemas
+    it sends and its reply floor; the start work room is not part of this test) and the pointer request, work
+    room included, does fit it. A window that holds the request but not its work room names the start with the
+    words whole (7A). An unknown window keeps the words; a pointer that does not fit either, or a failed source
+    write, names the impossible start. The pointer's reader reaches the end of the exact input. Route recovery
+    still counts the current resident schemas without reapplying the start allowance."""
     import math
     from types import SimpleNamespace
 
@@ -508,12 +517,23 @@ def test_the_task_input_pointer_is_a_physical_rescue_and_the_floor_counts_reside
     page = _read_file(reader, locator["path"], root="artifact_store", start_line=1, max_lines=1,
                       start_char=at, max_chars=len(final))
     assert page.endswith(final) and at > 240_000  # the reader reaches the input's last constraint
-    # Neither a window that cannot hold the pointer request, nor an unknown or stale window, hides the words.
-    assert not pointer(plan(heavy_meta, 1.0, total(rescued, heavy_meta, 1.0) - 1))
+    # Owner 7A: a window that holds the whole request but not its start work room names the start; the words stay whole.
+    writes = []
+    store = artifacts.store_actor_source_bytes
+    monkeypatch.setattr(artifacts, "store_actor_source_bytes", lambda *a, **kw: writes.append(a) or store(*a, **kw))
+    with pytest.raises(context_fit.MinimumViewUnfit, match="Core, assignment, resident control tools and work room") as unfit:
+        plan(heavy_meta, 1.0, full + 10_000)  # holds the request, not its ~21K start work room
+    assert not unfit.value.physical and writes == []
+    assert not pointer(plan(heavy_meta, 1.0, full + 30_000)) and writes == []  # and with the room: text, as above
+    # Owner 7A: a window that cannot hold the pointer request either names the impossible frame before any send.
+    with pytest.raises(context_fit.MinimumViewUnfit, match="Core, assignment, resident control tools and work room"):
+        plan(heavy_meta, 1.0, total(rescued, heavy_meta, 1.0) - 1)
+    # An unknown or stale window never hides the words.
     assert not pointer(plan(heavy_meta, 1.0, window, status="failed"))
     assert not pointer(plan(heavy_meta, 1.0, window, stale=True))
     monkeypatch.setattr(artifacts, "store_actor_source_bytes", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("disk")))
-    assert not pointer(plan(heavy_meta, 1.0, window))  # no exact source: the words stay
+    with pytest.raises(context_fit.MinimumViewUnfit):  # no exact source: the words stay and the frame is named
+        plan(heavy_meta, 1.0, window)
     monkeypatch.undo()
 
     # The fit on a route switch counts the resident list: the same window keeps the bare view and narrows the loaded one.
@@ -524,10 +544,15 @@ def test_the_task_input_pointer_is_a_physical_rescue_and_the_floor_counts_reside
     on = lambda tools, **kw: built.reproject_for_route(window_tokens=kw.pop("window", middle), known_window=True,  # noqa: E731
                                                        ratio=1.0, output_reserve=65_536, tool_schemas=tools, start_mode="nano", **kw)
     assert on(meta).nano_projection.system_content_json == built.nano_projection.system_content_json
-    assert on(meta + big).nano_projection.system_content_json != built.nano_projection.system_content_json
-    # A narrowing floor counts the same resident schemas in its fixed part.
-    room = lambda plan_: plan_.nano_projection.memory_facts["floor"]["physical_allowance_tokens"]  # noqa: E731
-    assert room(on(meta, window=1_000_000, refused_tokens=1)) - room(on(meta + big, window=1_000_000, refused_tokens=1)) >= 30_000
+    # This owner-Nano start already addressed every eligible memory element. More resident schemas
+    # cannot create another cut; the physical measurement must still expose their complete cost.
+    loaded = on(meta + big)
+    assert loaded.nano_projection.system_content_json == built.nano_projection.system_content_json
+    def measured(tools):
+        return context_fit.measure_main_fit(on(tools), built.messages_for("nano"), tools,
+            profile="owner_nano", rendered_mode="nano", round_id="1").measurement
+    assert measured(meta + big).estimated_input_tokens - measured(meta).estimated_input_tokens >= 30_000
+    assert measured(meta + big).capacity_deficit_tokens > 0
     # The first request keeps the owner-mode selection: a full list is not what Nano sends there.
     assert (built.nano_projection.memory_facts["floor"]["physical_allowance_tokens"]
             == plan(meta + big, 1.0).nano_projection.memory_facts["floor"]["physical_allowance_tokens"])

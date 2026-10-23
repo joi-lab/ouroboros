@@ -26,9 +26,10 @@ from ouroboros.skill_conflicts import (
     enabled_skill_conflicts,  # noqa: F401
     skill_conflict_status,  # noqa: F401
 )
-from ouroboros.skill_review_status import ACCEPTANCE_REASONS, STATUS_BLOCKERS, STATUS_CLEAN, STATUS_PENDING, STATUS_WARNINGS, VALID_SKILL_REVIEW_STATUSES, aggregate_skill_review_status, normalize_skill_review_status, skill_review_gate
+from ouroboros.skill_review_status import ACCEPTANCE_REASONS, STATUS_BLOCKERS, STATUS_CLEAN, STATUS_PENDING, STATUS_WARNINGS, VALID_SKILL_REVIEW_STATUSES, normalize_skill_review_status, skill_review_gate, status_from_findings
 from ouroboros.utils import append_jsonl, atomic_write_json, read_json_dict, utc_now_iso
 from ouroboros.review_records import validate_author_disposition
+from ouroboros.skill_schedule_suggestions import suggested_schedule_fields
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +87,10 @@ class SkillReviewState:
     # (install basis + release digest, owner edit digest: skill_acceptance).
     acceptance: Dict[str, Any] = field(default_factory=dict)
     panel: Dict[str, Any] = field(default_factory=dict)
+    # The projected review ledger record (``surface="skill"``): id, governance owed, per-seat facts; absent pre-fold.
+    record_id: str = ""
+    governance: Dict[str, Any] = field(default_factory=dict)
+    seats: List[Dict[str, Any]] = field(default_factory=list)
 
     def is_stale_for(self, current_hash: str) -> bool:
         return not current_hash or (self.reviewed_content_hash or self.content_hash) != current_hash
@@ -111,6 +116,9 @@ class SkillReviewState:
         }
         if self.review_profile:
             data["review_profile"] = str(self.review_profile)
+        for key in ("record_id", "governance", "seats"):
+            if getattr(self, key):
+                data[key] = getattr(self, key)
         if self.advisory_result:
             data["advisory_result"] = dict(self.advisory_result)
         if self.author_disposition:
@@ -564,8 +572,7 @@ def _read_review_record(
     is_module_widget: bool,
     skill_dir: Optional[pathlib.Path],
 ) -> SkillReviewState:
-    # Read-only over the state root (skill_state_dir_path, never mkdir): the
-    # RC auditor reuses this admission read over a root it must not mutate.
+    # Read-only over the state root (never mkdir): the RC auditor reuses this admission read.
     data = read_json_dict(skill_state_dir_path(drive_root, name) / "review.json")
     if not isinstance(data, dict):
         return SkillReviewState()
@@ -573,32 +580,23 @@ def _read_review_record(
     # Legacy ``pending_phase4`` persisted states now normalize to pending.
     if raw_status == _REVIEW_STATUS_DEFERRED_PHASE4:
         raw_status = _REVIEW_STATUS_PENDING
+    stated_pending = raw_status == _REVIEW_STATUS_PENDING  # said so, not merely unstated (to_dict omits a derived one)
     raw_status = normalize_skill_review_status(raw_status)
     findings = data.get("findings") if isinstance(data.get("findings"), list) else []
     clean_findings = [f for f in findings if isinstance(f, dict)]
     review_profile = str(data.get("review_profile") or "").strip()
-    # The official_hub downgrade only applies to a payload whose Hub provenance is
-    # still locally intact. If the sidecar was removed or the payload moved out of
-    # the OuroborosHub bucket since review, drop the persisted profile so the
-    # severity-driven downgrade is NOT trusted on a no-longer-official payload.
+    # The official_hub downgrade holds only while the Hub sidecar is locally intact (provenance moved → dropped).
     if review_profile == "official_hub" and skill_dir is not None:
         if not (pathlib.Path(skill_dir) / ".ouroboroshub.json").is_file():
             review_profile = ""
-    # A native_seed trust verdict is valid ONLY while launcher provenance holds
-    # (.seed-origin present). The marker is hash-exempt, so its removal does not
-    # stale the hash — invalidate the verdict explicitly: removing the marker
-    # reclassifies the skill as user-managed (CHECKLISTS §Skills) and the
-    # launcher-trust verdict must not survive into that life. Provenance that
-    # CANNOT be verified (caller did not pass skill_dir) fails safe the same
-    # way: native_seed trust is meaningless without the marker check.
+    # A native_seed verdict holds only while .seed-origin is present (the marker is hash-exempt, so it is checked
+    # explicitly): removing the marker reclassifies the skill as user-managed (CHECKLISTS §Skills) and the
+    # launcher-trust verdict must not survive into that life; an unverifiable provenance (no skill_dir) fails safe.
     if review_profile == "native_seed":
         if skill_dir is None or not (pathlib.Path(skill_dir) / ".seed-origin").is_file():
             return SkillReviewState()
-    # An owner-attested verdict (C1, v6.39: the owner explicitly skipped the EXPENSIVE LLM
-    # review for their OWN skill) is valid ONLY while the owner-issued marker is present in
-    # the protected owner-state dir. Removing the marker invalidates the verdict (fail-safe:
-    # the skill drops back to pending), exactly like native_seed provenance. Content edits
-    # still stale the verdict through the normal content_hash check.
+    # An owner-attested verdict (C1, v6.39) holds only while the owner-issued marker is present in the protected
+    # owner-state dir (fail-safe: pending), exactly like native_seed; content edits stale it through the hash.
     if review_profile == "owner_attested":
         if not (skill_state_dir_path(drive_root, name) / "owner_attestation.json").is_file():
             return SkillReviewState()
@@ -606,15 +604,15 @@ def _read_review_record(
         str(f.get("verdict") or "").upper() in {"PASS", "FAIL"}
         for f in clean_findings
     )
-    if clean_findings and has_review_verdicts:
-        status = aggregate_skill_review_status(
+    if stated_pending:  # a wave without a verdict projects partial findings as evidence, never as a verdict
+        status = _REVIEW_STATUS_PENDING
+    elif clean_findings and has_review_verdicts:
+        status = status_from_findings(
             clean_findings,
             skill_type or "script",
             is_module_widget=is_module_widget,
             review_profile=review_profile,
         )
-    elif raw_status == _REVIEW_STATUS_PENDING:
-        status = _REVIEW_STATUS_PENDING
     else:
         status = raw_status if raw_status in VALID_REVIEW_STATUSES else _REVIEW_STATUS_PENDING
     reviewers = (
@@ -654,6 +652,9 @@ def _read_review_record(
         author_disposition=author_disposition,
         reviewed_content_hash=str(data.get("reviewed_content_hash") or ""),
         legacy_content_hashes=[str(item) for item in (data.get("legacy_content_hashes") or []) if item][:4],
+        record_id=str(data.get("record_id") or ""),
+        governance=dict(data.get("governance") or {}) if isinstance(data.get("governance"), dict) else {},
+        seats=[row for row in (data.get("seats") or []) if isinstance(row, dict)],
     )
 
 
@@ -1421,8 +1422,9 @@ def discover_skill_identity(
     name: str,
     *,
     repo_path: str | None = None,
+    locations: tuple[_SkillLocationCandidate, ...] | None = None,
 ) -> List[LoadedSkill]:
-    """Execution resolver: ordinary discovery/collision rules for one identity.
+    """Execution resolver, optionally sharing this observation's ordinary locations.
 
     A manifestless peer stays invisible, exactly as in passive discovery.
     Liveness, reconcile and extension children all use this resolver; the
@@ -1430,7 +1432,9 @@ def discover_skill_identity(
     its deliberately stricter manifestless ambiguity.
     """
     safe = _sanitize_skill_name(name)
-    candidates = tuple(item for item in _skill_location_inventory(drive_root, repo_path=repo_path) if item.name == safe)
+    if locations is None:
+        locations = _skill_location_inventory(drive_root, repo_path=repo_path)
+    candidates = tuple(item for item in locations if item.name == safe)
     return _load_skill_location_candidates(candidates, drive_root=drive_root)
 
 
@@ -1441,11 +1445,8 @@ def find_skill(
     repo_path: str | None = None,
 ) -> Optional[LoadedSkill]:
     """Return one skill by name, including broken manifests with ``load_error``."""
-    safe = _sanitize_skill_name(name)
-    for skill in discover_skill_identity(drive_root, name, repo_path=repo_path):
-        if skill.name == safe:
-            return skill
-    return None
+    skills = discover_skill_identity(drive_root, name, repo_path=repo_path)
+    return skills[0] if skills else None
 
 
 def list_available_for_execution(
@@ -1464,13 +1465,9 @@ def list_available_for_execution(
     return out
 
 
-# Status helpers consumed by the model-facing catalogue: the per-turn Installed
-# Skills section (context.py) and the list_skills tool.
-
-
-def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
-    """Return a compact catalogue summary for the model-facing skill catalogue."""
-    skills = discover_skills(drive_root)
+def summarize_skills(drive_root: pathlib.Path, skills: Optional[List[LoadedSkill]] = None) -> Dict[str, Any]:
+    """Compact catalogue for the installed-skills context and list_skills; ``skills`` reuses a caller's discovery."""
+    skills = discover_skills(drive_root) if skills is None else skills
     tool_surfaces_by_skill: Dict[str, List[Dict[str, str]]] = {}
     try:
         from ouroboros.extension_loader import _lock as _ext_lock, _tools as _ext_tools
@@ -1520,6 +1517,7 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
             "name": s.name,
             "description": s.manifest.description,
             "when_to_use": s.manifest.when_to_use,
+            **suggested_schedule_fields(s.manifest.scheduled_tasks),
             # CPL-7: optional Model Experience prose travels to every
             # model-visible skill surface (list_skills JSON, context section).
             "model_experience": s.manifest.model_experience,

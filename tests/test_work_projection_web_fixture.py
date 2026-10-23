@@ -120,6 +120,9 @@ CASES = {
     "paused_unattributed": (
         [_row("n", "budget_paused", pause_cause="owner", can_resume=False)], {}, {}, {},
     ),
+    "paused_model_handoff": (
+        [_row("mh", "budget_pausing", pause_cause="owner", live=False)], {}, {}, {},
+    ),
 }
 
 # The owner fence records who declared the Pause: the owner's own press, or Ouroboros with its sentence (here a
@@ -132,7 +135,7 @@ FENCES = {"o": {"by": {"actor": "owner", "text": "", "at": _PRESSED}, "requested
           "rv": {"by": {"actor": "owner", "text": "", "at": _PRESSED}, "requested_at": _PRESSED},
           "n": {"requested_by": "owner", "requested_at": _PRESSED},
           **{task: {"by": {"actor": "owner", "text": "", "at": _PRESSED}, "requested_at": _PRESSED}
-             for task in ("pr", "wa", "so")}}
+             for task in ("pr", "wa", "so", "mh")}}
 # The runs whose stop a task's live Pause could not confirm (its pause row's ``external_runs``).
 STOPS = {"so": ["run-s"]}
 
@@ -140,7 +143,8 @@ STOPS = {"so": ["run-s"]}
 def project(name):
     """The ``/api/state`` work fields the server builds for one case."""
     owners, raw, stored, held = CASES[name]
-    return work_fields(owners, raw, results=stored, fences=FENCES, held=held, stops=STOPS)
+    return work_fields(owners, raw, results=stored, fences={k: {"state": "paused", **v} for k, v in FENCES.items()},
+                       held=held, stops=STOPS, models={"mh": [{"kind": "model_handoff", "attempt_id": "attempt-mh"}]})
 
 
 def reason_sentences():
@@ -165,6 +169,7 @@ def test_the_web_fixture_is_the_servers_projection():
     ("helper_after_parent", "working"), ("paused_review_finishing", "paused"), ("unconfirmed_run", "unknown"),
     ("paused_unattributed", "paused"), ("pausing_with_queued_helper", "working"), ("two_works_one_pausing", "working"),
     ("working_with_review", "working"), ("paused_stop_unknown", "paused"),
+    ("paused_model_handoff", "paused"),
 ])
 def test_each_fixture_room_is_the_state_its_name_says(name, activity):
     """The fixture is meaningful, not merely equal: each room is the case the web tests read it as."""

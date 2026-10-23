@@ -10,7 +10,7 @@ from ouroboros.subagent_runtime import (
 )
 
 
-def inspect_subagent(subagent_id: str, *, request_kind: str = "text") -> dict:
+def inspect_subagent(subagent_id: str, *, request_kind: str = "text", drive_root=None) -> dict:
     """Saved row intent and independently dated observations, never selection policy."""
     from ouroboros.config import runtime_settings
     from ouroboros.gateway.claudexor_passive import _quota_payload
@@ -41,6 +41,9 @@ def inspect_subagent(subagent_id: str, *, request_kind: str = "text") -> dict:
     result = {"configured": actor, "inspected_at": utc_now_iso(), "request_kind": request_kind,
               "availability": {"state": "unknown", "reason": "provider_observations_unavailable"},
               "execution_guaranteed": False}
+    from ouroboros.config import DATA_DIR
+    from ouroboros.subagent_metrics import read
+    result["measurements"] = read(drive_root or DATA_DIR, row.subagent_id)
     if route.is_session:
         harness, _, model = route.target_id.partition("=")
     elif provider_for_model(route.target_id) == "claudexor":
@@ -76,7 +79,8 @@ def inspect_subagent_tool(ctx, subagent_id: str, request_kind: str = "text") -> 
     from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 
     try:
-        body = inspect_subagent(subagent_id, request_kind=request_kind)
+        body = inspect_subagent(subagent_id, request_kind=request_kind,
+                                drive_root=getattr(ctx, "budget_drive_root", None) or ctx.drive_root)
         result = ToolResult(status="ok", code="OK", text=json.dumps(body, ensure_ascii=False))
     except (ValueError, SubagentSelectionError) as exc:
         result = ToolResult(status="error", code="TOOL_ARG_ERROR", text=str(exc))

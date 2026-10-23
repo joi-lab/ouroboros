@@ -19,6 +19,8 @@ denied (capturing only the wallpaper, or dropping synthetic input), so callers
 must ensure the host has granted these. Wayland support depends on ydotool
 (input) and grim/gnome-screenshot (capture); X11 uses xdotool/scrot. Windows
 desktops use the separate windows_computer_use skill.
+
+Input receipt semantics and partial-failure limits: see SKILL.md, "Input receipts".
 """
 
 from __future__ import annotations
@@ -585,6 +587,8 @@ class _ComputerUse:
                 remote = "cliclick " + " ".join(shlex.quote(arg) for arg in cliclick_args)
                 rc, stdout, stderr = self._ssh_run(conn, remote, timeout=timeout)
                 payload = {"ok": rc == 0, "backend": backend, "returncode": rc, "output": stdout, "error": stderr}
+                if rc == 0 and input_effect:
+                    payload["observed_effect"] = True
             else:
                 return _json({"ok": False, "error": f"unsupported remote backend {backend!r}"})
         except Exception as exc:  # noqa: BLE001
@@ -1103,11 +1107,10 @@ class _ComputerUse:
             cmd = ["cliclick", f"{op}:{ix},{iy}"]
         elif plat == "linux" and _session_type() == "wayland" and _which("ydotool"):
             button_code = {"left": "0xC0", "middle": "0xC2", "right": "0xC1"}[button]
-            move = ["ydotool", "mousemove", "--absolute", "-x", str(ix), "-y", str(iy)]
-            rc, out, err = self._try(move)
-            if rc != 0:
-                return _json({"ok": False, "error": err or out or f"exit {rc}", "cmd": move})
-            cmd = ["ydotool", "click", "--repeat", str(repeat), button_code]
+            return self._exec_sequence([
+                ["ydotool", "mousemove", "--absolute", "-x", str(ix), "-y", str(iy)],
+                ["ydotool", "click", "--repeat", str(repeat), button_code],
+            ], extra=note)
         elif plat == "linux" and _which("xdotool"):
             button_id = {"left": "1", "middle": "2", "right": "3"}[button]
             cmd = ["xdotool", "mousemove", str(ix), str(iy), "click", "--repeat", str(repeat), button_id]
@@ -1390,11 +1393,13 @@ class _ComputerUse:
             for step in steps:
                 out = self.key(keys=step)
                 results.append(json.loads(out))
+                # Each step's own receipt mark survives the sequence, a failed step's included.
+                ran = {"observed_effect": True} if any(r.get("observed_effect") is True for r in results) else {}
                 if not results[-1].get("ok"):
                     return _json({"ok": False, "error": f"step {step!r} failed: "
                                                         f"{results[-1].get('error')}",
-                                  "steps_done": len(results) - 1, "steps_total": len(steps)})
-            return _json({"ok": True, "sequence": steps, "steps": len(steps)})
+                                  "steps_done": len(results) - 1, "steps_total": len(steps), **ran})
+            return _json({"ok": True, "sequence": steps, "steps": len(steps), **ran})
         plat = _platform()
         mods, base, err = self._parse_combo(combo)
         if err:
@@ -1494,16 +1499,17 @@ class _ComputerUse:
 
     def _hold_then_release(self, down_steps: list[list[str]], up_steps: list[list[str]],
                            duration_ms: int) -> str:
-        for cmd in down_steps:
+        total = len(down_steps) + len(up_steps)
+        for done, cmd in enumerate(down_steps):
             rc, out, err = self._try(cmd)
             if rc != 0:
-                return _json({"ok": False, "error": err or out or f"exit {rc}", "cmd": cmd})
+                return self._step_failure(cmd, rc, out, err, done, total)
         time.sleep(min(10.0, duration_ms / 1000.0))
-        for cmd in up_steps:
+        for done, cmd in enumerate(up_steps, len(down_steps)):
             rc, out, err = self._try(cmd)
             if rc != 0:
-                return _json({"ok": False, "error": err or out or f"exit {rc}", "cmd": cmd})
-        return _json({"ok": True, "held_ms": duration_ms})
+                return self._step_failure(cmd, rc, out, err, done, total)
+        return _json({"ok": True, "held_ms": duration_ms, **({"observed_effect": True} if total else {})})
 
     def wait(self, *, ms: int = 500) -> str:
         delay = max(0, min(10_000, int(ms or 0)))
@@ -1733,22 +1739,36 @@ end run
 
     def _exec_input(self, cmd: list[str], *, timeout: int = _TIMEOUT_SEC,
                     extra: dict[str, Any] | None = None) -> str:
+        """One input process. Its successful exit is the receipt (``observed_effect``); a
+        failed or timed-out process has an unknown outcome and carries none."""
         rc, stdout, stderr = self._try(cmd, timeout=timeout)
         if rc != 0:
             return _json({"ok": False, "error": stderr.strip() or stdout.strip() or f"exit {rc}", "cmd": cmd})
-        payload: dict[str, Any] = {"ok": True, "cmd": cmd}
+        payload: dict[str, Any] = {"ok": True, "cmd": cmd, "observed_effect": True}
         if extra:
             payload.update(extra)
         return _json(payload)
 
     def _exec_sequence(self, steps: list[list[str]], *, extra: dict[str, Any] | None = None) -> str:
-        for cmd in steps:
+        for done, cmd in enumerate(steps):
             rc, stdout, stderr = self._try(cmd)
             if rc != 0:
-                return _json({"ok": False, "error": stderr.strip() or stdout.strip() or f"exit {rc}", "cmd": cmd})
+                return self._step_failure(cmd, rc, stdout, stderr, done, len(steps))
         payload: dict[str, Any] = {"ok": True, "steps": len(steps)}
+        if steps:
+            payload["observed_effect"] = True
         if extra:
             payload.update(extra)
+        return _json(payload)
+
+    @staticmethod
+    def _step_failure(cmd: list[str], rc: int, stdout: str, stderr: str, done: int, total: int) -> str:
+        """A failed step of a multi-process input: the call failed, and the ``done`` steps
+        before it ran and reported success, so their receipt mark stays."""
+        payload: dict[str, Any] = {"ok": False, "error": stderr.strip() or stdout.strip() or f"exit {rc}",
+                                   "cmd": cmd, "steps_done": done, "steps_total": total}
+        if done:
+            payload["observed_effect"] = True
         return _json(payload)
 
     def remote_exec(self, *, command: str, timeout: int = 60) -> str:

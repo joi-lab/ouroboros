@@ -316,10 +316,12 @@ def test_valid_named_predecessor_materializes_into_first_model_request_and_actor
         predecessor_id, include_authority=True,
     ))
 
-    assert tail in rendered
-    assert "L1 asks L2 to spawn L3" in rendered
+    # The first request carries the brief and its reader; the contract stays at its source (THESIS I-7, C5).
+    assert "predecessor_authority" in rendered and predecessor_id in rendered and "include_authority" in rendered
+    assert tail not in rendered and "L1 asks L2 to spawn L3" not in rendered
     assert actor_read["status"] == "available"
     assert actor_read["authority"]["task_contract"]["objective"].endswith(tail)
+    assert actor_read["authority"]["task_contract"]["delegation_budget"]["intent_note"] == "L1 asks L2 to spawn L3"
 
 
 def test_unreadable_current_plan_review_source_returns_typed_startup_refusal(monkeypatch):

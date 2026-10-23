@@ -55,7 +55,7 @@ def test_the_ui_wait_outlives_any_deadline_while_the_generation_lives(launcher, 
             launcher._generation_port = 9876
 
     clock.sleep = sleep
-    assert launcher._await_server_ready(8765, None, alive) == (True, 9876)
+    assert launcher._await_server_ready(1, None, alive) == (True, 9876)
     assert clock.now - 1_000.0 > 120, "the simulated wait passed every former deadline"
 
 
@@ -64,7 +64,7 @@ def test_the_ui_wait_fails_at_once_when_the_child_exits_before_it_served(launche
     monkeypatch.setattr(launcher, "time", clock)
     alive = SimpleNamespace(is_alive=lambda: True)
     launcher._agent_exit_before_ready.set()
-    assert launcher._await_server_ready(8765, None, alive) == (False, 8765)
+    assert launcher._await_server_ready(1, None, alive) == (False, 1)
     assert clock.sleeps == 0, "no polling after the exit: the failure is immediate"
 
 
@@ -121,12 +121,12 @@ def test_the_health_probe_waits_while_the_child_lives_and_ends_on_its_exit(launc
 
     monkeypatch.setattr(launcher.urllib.request, "urlopen", urlopen)
     child = SimpleNamespace(poll=lambda: None)
-    assert launcher._wait_for_server(8765, proc=child) is True
+    assert launcher._wait_for_server(1, proc=child) is True
     assert len(probes) == 15 and set(probes) == {2}, "the per-probe HTTP timeout is the only clock, a transport bound"
     assert clock.now - 1_000.0 > 120
 
     probes.clear()
     exits = iter([None, None, 3])
     dead_soon = SimpleNamespace(poll=lambda: next(exits))
-    assert launcher._wait_for_server(8765, proc=dead_soon) is False
+    assert launcher._wait_for_server(1, proc=dead_soon) is False
     assert len(probes) == 2, "the probe ends with the child's exit, not with a deadline"

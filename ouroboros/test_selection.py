@@ -45,6 +45,13 @@ _APPARATUS = frozenset({
     "ouroboros/process_containment.py", "ouroboros/process_lifeline.py",
     "ouroboros/process_overload.py", "ouroboros/test_parallelism.py",
 })
+# What switches, attests, boots and restores a body: a selected run cannot qualify
+# adopting a change to the machinery that adopts it. A minimum, not a risk classifier.
+_CUTOVER = frozenset({
+    "server.py", "launcher.py", "ouroboros/__init__.py", "ouroboros/body_switch.py",
+    "ouroboros/body_adoption.py", "supervisor/update_recovery.py",
+    "ouroboros/launcher_bootstrap.py", "supervisor/git_ops_reset.py", "supervisor/update_merge.py",
+})
 
 
 def _git(repo: Path, *args: str) -> bytes:
@@ -191,6 +198,11 @@ class TestSelection:
     def targets(self) -> tuple[str, ...]:
         return ("tests/",) if self.tier == "full" else self.files
 
+    def scope(self) -> dict:
+        """The selection inputs a durable selected record binds beside its workload."""
+        return {"base": self.base, "policy": self.policy, "changed": list(self.changed),
+                "extra_tests": list(self.extra_tests), "full_tests": self.full_tests, "test_reason": self.test_reason}
+
     def record(self) -> dict:
         record = {**asdict(self), "rule": SELECTION_RULE, "omitted_files": self.available - len(self.files)}
         # A full run would list every module; its count and the rule say the same far smaller.
@@ -213,6 +225,7 @@ def select_from_paths(repo: Path, paths: Iterable[str], *, base: str,
     versions = _release_versions(repo, base) if _RELEASE_CARRIERS & set(changed) else set()
     full = [(p, "verification apparatus changed") for p in changed if apparatus_change(p)
             and not (p in _RELEASE_CARRIERS and _version_only_change(repo, base, p, versions))]
+    full += [(p, "body cutover/recovery changed") for p in changed if p in _CUTOVER]
     if full_tests:
         full.append(("*", "author requested full: " + test_reason.strip()))
     selected = set(FLOOR_TESTS)
@@ -233,16 +246,30 @@ def select_from_paths(repo: Path, paths: Iterable[str], *, base: str,
                 reasons.append((path, "direct import: " + ", ".join(bound)))
     reasons.extend((p, "author widening: " + test_reason.strip()) for p in extra)
     selected.update(extra)
-    # Source digest binds policy changes even before someone updates a version label.
-    policy = hashlib.sha256(_POLICY_SOURCE + json.dumps(FLOOR_TESTS, sort_keys=True).encode()).hexdigest()
     return TestSelection("full" if full else "selected", base, files if full else tuple(sorted(selected)),
-                         tuple(sorted(reasons + full)), changed, policy, len(files), extra, full_tests, test_reason.strip())
+                         tuple(sorted(reasons + full)), changed, policy_digest(), len(files), extra, full_tests,
+                         test_reason.strip())
+
+
+def policy_digest() -> str:
+    """The loaded selection policy; its source digest binds policy changes before any version label."""
+    return hashlib.sha256(_POLICY_SOURCE + json.dumps(FLOOR_TESTS, sort_keys=True).encode()).hexdigest()
 
 
 def select_tests(repo: Path, *, base="HEAD", extra_tests=(), full_tests=False, test_reason="") -> TestSelection:
     oid, paths = changed_paths(Path(repo), base)
     return select_from_paths(Path(repo), paths, base=oid, extra_tests=extra_tests,
                              full_tests=full_tests, test_reason=test_reason)
+
+
+def inherit_widening(repo: Path, request: dict, earlier: dict) -> dict:
+    """``request`` joined with what its unadopted predecessors declared: the indirect consumers
+    still present, any broad impact (full) and the reasons for both."""
+    kept = [p for p in earlier.get("extra_tests", ()) if is_test_module(p) and (Path(repo) / p).is_file()]
+    reasons = (str(request.get("test_reason") or "").strip(), str(earlier.get("test_reason") or "").strip())
+    return {"extra_tests": tuple(sorted({*request.get("extra_tests", ()), *kept})),
+            "full_tests": bool(request.get("full_tests") or earlier.get("full_tests")),
+            "test_reason": "; ".join(dict.fromkeys(reason for reason in reasons if reason))}
 
 
 def refresh_selection(repo: Path, selection: TestSelection) -> TestSelection:
@@ -256,7 +283,7 @@ def widening_properties() -> dict:
         "extra_tests": {"type": "array", "items": {"type": "string"}, "default": [],
                         "description": "Add test module paths for indirect/dynamic, prompt, skill or cross-language consumers beyond the floor and direct imports; explain in test_reason."},
         "full_tests": {"type": "boolean", "default": False,
-                       "description": "Request the full battery when impact is unresolved or broad qualification is needed; explain in test_reason. Adoption, managed updates and evolution publication require full regardless."},
+                       "description": "Request the full battery for broad or unresolved impact; explain in test_reason. Managed updates and adoption/evolution publication require full; local adoption may use an exact whole-delta selection. See DEVELOPMENT: The tiered commit and CI gates for publication limits."},
         "test_reason": {"type": "string", "default": "",
                         "description": "Why extra_tests or full_tests widens verification; retained with the commit's test evidence."},
     }
@@ -274,6 +301,17 @@ def bind_commit_test_request(ctx, kwargs) -> str:
     return ""
 
 
-def commit_test_options(ctx, *, force=False) -> dict:
-    request = getattr(ctx, "_commit_test_request", None)
-    return {"selected": True, **request} if request is not None and not force else {}
+def commit_test_options(ctx, *, force=False, post_commit=False) -> dict:
+    """The author's request, selected; ``{}`` (full) when forced or never requested.
+
+    A bound body candidate stays selected even when forced (its evolution run): that proof
+    can qualify only local adoption. Its post-commit run selects against the whole
+    serving→candidate delta, not ``HEAD~1``. The managed resolver is never bound.
+    """
+    from ouroboros import body_candidate
+
+    request, bound = getattr(ctx, "_commit_test_request", None), body_candidate.is_bound(ctx)
+    if request is None or (force and not bound):
+        return {}
+    return {"selected": True, **(body_candidate.qualification_request(ctx, request) if bound and post_commit
+                                 else request)}

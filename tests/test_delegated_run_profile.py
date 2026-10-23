@@ -141,10 +141,20 @@ def test_real_geometry_on_a_read_only_child_refuses_before_the_daemon(
     assert blocked[0]["task_id"] == "t-geometry"
 
 
-def test_the_host_states_its_prohibitions_on_every_delegated_run(tmp_path, monkeypatch):
-    request, _ = _started_request(tmp_path, acting=True, monkeypatch=monkeypatch)
+@pytest.mark.parametrize("access", ["readonly", "workspace_write"])
+def test_the_host_states_its_prohibitions_on_every_delegated_run(tmp_path, monkeypatch, access):
+    request, _ = _started_request(tmp_path, acting=True, monkeypatch=monkeypatch, access=access)
     instructions = request["instructions"].lower()
-    assert "git commit" in instructions and "outside this root" in instructions
+    assert "do not run git commit, tag, push, rebase, reset" in instructions
+    assert "explicit task constraints and the assigned edit target still bind" in instructions
+    if access == "readonly":
+        assert "inside this root, and make no edits or writes" in instructions
+    else:
+        # #2190 permits verification scratch and the named cache, without
+        # granting writes to another project or the operator's files.
+        assert ("you may edit inside this root, and outside it write only disposable process state "
+                "outside every git working tree and the shared download cache your host names, "
+                "never another project or the operator's files") in instructions
 
 
 def test_the_model_has_no_argument_that_could_widen_the_profile():
@@ -158,16 +168,20 @@ def test_the_model_has_no_argument_that_could_widen_the_profile():
     # root/bucket/skill_name are a SELECTOR resolved through the same
     # ResolvedResourceBinding authorizer as ordinary writes (R1 item 9); `effort` is reasoning
     # depth inside the owner's effort range (a pin or a level in the model name keeps its own).
+    # D2 exposes ask/plan/agent and explicit readiness override; the retained ceiling still governs.
     assert properties == {
         "prompt", "subagent_id", "max_seconds", "retry_of", "continue_from", "continue_carrier", "root",
-        "bucket", "skill_name", "directory_strategy", "scope_paths", "access", "effort",
+        "bucket", "skill_name", "directory_strategy", "scope_paths", "access", "effort", "mode",
+        "override_plan_readiness",
     }
     from ouroboros.settings_scales import EFFORT_SCALE
     assert entry.schema["parameters"]["properties"]["effort"]["enum"] == ["auto", *EFFORT_SCALE]
     assert entry.schema["parameters"]["properties"]["continue_carrier"]["enum"] == ["auto", "packet"]
     assert entry.schema["parameters"]["properties"]["root"]["enum"] == ["active_workspace", "skill_payload"]
     assert entry.schema["parameters"]["properties"]["access"]["enum"] == ["readonly", "workspace_write"]
-    assert not properties & {"mode", "isolation", "scope", "write_surface", "cwd"}
+    assert entry.schema["parameters"]["properties"]["mode"]["enum"] == ["ask", "plan", "agent"]
+    assert entry.schema["parameters"]["properties"]["override_plan_readiness"]["type"] == "boolean"
+    assert not properties & {"isolation", "scope", "write_surface", "cwd"}
 
 
 def test_a_task_without_write_authority_gets_an_evidence_only_investigation_never_a_writer(tmp_path):

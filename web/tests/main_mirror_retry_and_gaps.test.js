@@ -45,7 +45,8 @@ test('replacing an unknown mirror releases its material listeners and reader whi
         enhanceMarkdown: node => () => markdownDisposed.push(node),
         renderMaterial: fx.controller.buildDocumentBubble,
         releaseMaterials: node => { released.push(node); fx.controller.release(node); },
-        frameNode: (_msg, card) => { const bubble = document.createElement('div'); bubble.append(card); return bubble; },
+        // The production frame: a copy's Project reference joins its voice line, its host facts its time line.
+        frameNode: fx.controller.bubbleFrameNode,
     });
     t.after(() => decision.destroy());
     const rows = [question('recover', 'unknown'), question('draft')];

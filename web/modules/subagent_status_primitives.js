@@ -18,6 +18,7 @@ import {
     accountScopedModelCatalog,
     sessionModelMatches,
     CLAUDE_BASE_QUALIFIER,
+    routeSupportsAccount,
 } from './route_editor_primitives.js';
 
 /**
@@ -279,4 +280,29 @@ export function rowTaskRun(row, state) {
     const qualifier = identityComplete ? (sameRoute ? '' : 'Earlier settings')
         : identity ? 'Settings not fully reported' : 'Settings not reported';
     return [qualifier, evidence].filter(Boolean).join(' · ');
+}
+
+/** What one review by this row actually cost — the median of its measured reviews with their count
+ * and range (the words `## Review` prints) — or its non-money equivalent; unknown is never zero. */
+export function reviewCostText(row, cost = null) {
+    if (routeSupportsAccount(row?.route || {})) return 'uses a session seat and time';
+    if (!cost) return 'price appears after saving';
+    if (cost.basis === 'local_route') return 'no API cost per review';
+    const usd = cost.usd_per_review;
+    if (cost.basis !== 'observed_reviews' || typeof usd !== 'number' || !Number.isFinite(usd)) return 'cost unknown';
+    const high = Number(cost.high);
+    if (usd === 0 && !(high > 0)) return 'no API cost per review';
+    const money = (value) => `$${value < 0.01 ? value.toFixed(4) : value.toFixed(2)}`;
+    const reviews = Number(cost.reviews) || 0;
+    return reviews < 2 ? `≈${money(usd)} per review (1 measured)`
+        : `≈${money(usd)} per review (median of ${reviews} measured, ${money(Number(cost.low))}–${money(high)})`;
+}
+
+/** What actually ran the last time this row reviewed, with its review record (the card's "Last review"). */
+export function lastReviewRunText(entry) {
+    const text = describeExecutionEvidence(entry?.effective || !entry?.observed_model ? entry
+        : { ...entry, effective: { model: entry.observed_model } });
+    if (!text) return '';
+    const record = String(entry?.review_record_id || entry?.record_id || '');
+    return `${text}${record ? ` · record ${record}` : ''}`;
 }

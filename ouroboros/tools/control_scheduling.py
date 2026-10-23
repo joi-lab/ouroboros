@@ -220,6 +220,31 @@ def _capability_mismatch_message(selected_profile: str, missing_caps: Any) -> st
     )
 
 
+def _schedule_commitment(ctx: ToolContext, route_kind: str, emission: Dict[str, Any]) -> str:
+    if route_kind == "api_model":
+        return "ordinary recursive API actor"
+    from ouroboros.subagent_runtime import cognitive_route_billing_basis, current_cognitive_route_and_billing
+    from ouroboros.supervisor_route import cognitive_route_provenance
+
+    nanny_spec = emission.get("parent_cognitive_route")
+    if isinstance(nanny_spec, dict) and str(nanny_spec.get("model") or "").strip():
+        nanny_route, nanny_billing = cognitive_route_billing_basis(
+            str(nanny_spec.get("model") or ""),
+            use_local=bool(nanny_spec.get("use_local_model")),
+            ctx=ctx,
+        )
+    else:
+        nanny_route, nanny_billing = current_cognitive_route_and_billing(
+            getattr(ctx, "task_metadata", None), ctx=ctx,
+        )
+    provenance = cognitive_route_provenance(nanny_spec)
+    return (
+        f"recursive nanny on {nanny_route} (bills as {nanny_billing})"
+        + (f", {provenance}" if provenance else "") + "; "
+        "exact route/work-order authority is frozen before its first model call"
+    )
+
+
 def _finalize_schedule_emission(ctx: ToolContext, emission: Dict[str, Any]) -> str:
     """Record the scheduled wave, emit swarm_fanout telemetry, and build the
     tool-result string. Extracted from _schedule_task to keep that function
@@ -310,11 +335,7 @@ def _finalize_schedule_emission(ctx: ToolContext, emission: Dict[str, Any]) -> s
             )
         except Exception:
             coop_note = f"\nshared coop tree: {coop_shared_tree}"
-    commitment = (
-        "ordinary recursive API actor"
-        if route_kind == "api_model"
-        else "recursive nanny; exact route/work-order authority is frozen before its first model call"
-    )
+    commitment = _schedule_commitment(ctx, route_kind, emission)
     legacy_note = (
         "\nDEPRECATED_LEGACY_SELECTOR: deterministically mapped to this exact configured row; "
         "future calls must pass subagent_id."
@@ -789,17 +810,26 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     if execution_left is not None and execution_left <= 0:
         return _publish_scheduling_refusal(ctx, "error", "TOOL_ERROR", _EXECUTION_SPENT, reason="task_lifetime_exhausted")
     try:
+        from ouroboros.supervisor_route import capture_cognitive_route
+
+        settings = effective_runtime_subagent_settings(runtime_settings(settings_reader=_ctl().load_settings))
         configured_subagent, legacy_selection = select_subagent_snapshot(
-            effective_runtime_subagent_settings(runtime_settings(settings_reader=_ctl().load_settings)),
+            settings,
             subagent_id=str(params.get("subagent_id") or ""), access=params.get("access"),
             legacy_model_lane=params.get("model_lane"),
             legacy_executor=params.get("executor"),
             legacy_model_lane_supplied="model_lane" in params,
             legacy_executor_supplied="executor" in params,
         )
+        parent_cognitive_route = capture_cognitive_route(
+            ctx, configured_subagent, settings, **({"supervisor": params["supervisor"]} if "supervisor" in params else {}))
     except SubagentSelectionError as exc:
-        return _publish_scheduling_refusal(ctx, "error", "TOOL_ARG_ERROR", f"⚠️ {exc.code}: {exc.detail}")
+        return _publish_scheduling_refusal(ctx, "error", "TOOL_ARG_ERROR", f"⚠️ {exc.code}: {exc.detail}", reason=exc.code)
     route = configured_subagent.get("route") if isinstance(configured_subagent.get("route"), dict) else {}
+    if fields.get("delegated_mode") and route.get("kind") != "agent_session":
+        return _publish_scheduling_refusal(ctx, "error", "TOOL_ARG_ERROR",
+            "⚠️ delegated_mode_unsupported: mode requires an agent_session row; API children keep their ordinary task execution.",
+            reason="delegated_mode_unsupported")
     if fields.get("directory_strategy") == "copy" and route.get("kind") != "agent_session":
         return _publish_scheduling_refusal(
             ctx, "error", "TOOL_ARG_ERROR",
@@ -887,11 +917,6 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     tid = uuid.uuid4().hex[:8]
     created_at = utc_now_iso()
     root_task_id = root_task_id_seed or tid
-    parent_cognitive_route = {
-        "model": str(getattr(ctx, "active_model", "") or metadata.get("model") or ""),
-        "effort": str(getattr(ctx, "active_effort", "") or metadata.get("reasoning_effort") or ""),
-        "use_local_model": bool(getattr(ctx, "active_use_local", metadata.get("use_local_model", False))),
-    }
     child_drive, _drive_err = _prepare_child_drive(
         tid, status_drive_root, memory_mode, parent_project_id)
     if _drive_err:
@@ -950,7 +975,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "requested_effort": fields["requested_effort"],
         "configured_subagent": configured_subagent,
         "parent_cognitive_route": parent_cognitive_route,
-        **{key: fields[key] for key in ("directory_strategy", "scope_paths") if key in fields},
+        **{key: fields[key] for key in ("directory_strategy", "scope_paths", "delegated_mode") if key in fields},
     }
     owner_origin = governing_words_for_schedule(ctx)  # the owner's words that caused this tree, by value
     child_facts = {
@@ -986,7 +1011,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "write_surface": requested_surface,
         "resource_intent": ({"kind": "explicit_none"} if folderless_scratch_dir(ctx) is not None
                             else dict(metadata.get("resource_intent") or {})),
-        "origin_metadata": {**consciousness_origin_metadata(metadata), **owner_origin},  # tree origin: consciousness label/level + owner words
+        "origin_metadata": {**consciousness_origin_metadata({**metadata, "task_id": str(getattr(ctx, "task_id", "") or "")}), **owner_origin},  # tree origin: consciousness label/level + owner words
         **presence_binding_authority_metadata(metadata, task_contract=getattr(ctx, "task_contract", None)),  # never speaker
     }
     _populate_subagent_event_extras(
@@ -1034,7 +1059,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "root_task_id": root_task_id_seed or current_task_id,
         "emitted_modes": [_emit_control_event(ctx, evt)],
         "write_surface": requested_surface,
-        "configured_subagent": configured_subagent,
+        "configured_subagent": configured_subagent, "parent_cognitive_route": parent_cognitive_route,
         "legacy_selection": legacy_selection,
         "requested_access": params.get("access"),
         "requested_effort": fields["requested_effort"],

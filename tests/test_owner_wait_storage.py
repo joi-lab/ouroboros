@@ -230,7 +230,8 @@ def test_worker_obeys_existing_controls_before_park_ack(tmp_path, monkeypatch, c
     if control == "cancelled":
         request_cancel(tmp_path, env.task["id"], source="pre-ack-test")
     elif control == "panic":
-        (tmp_path / "state/panic_stop.flag").write_text("panic", encoding="utf-8")
+        from ouroboros import model_wait
+        monkeypatch.setattr(model_wait, "current_model_wait", lambda: SimpleNamespace(control_reason=lambda: "panic"))
     else:
         env.ctx.model_wait_context.task["deadline_at"] = "2000-01-01T00:00:00+00:00"
     polls = []

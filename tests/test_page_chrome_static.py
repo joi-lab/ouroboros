@@ -170,7 +170,8 @@ def test_skills_and_widgets_use_inner_scroll_regions():
     widgets = _read("web/modules/widgets.js")
     css = _read("web/style.css")
     assert 'class="skills-scroll scroll-fade-y"' in skills
-    assert 'class="widgets-scroll scroll-fade-y"' in widgets
+    # The board's live cards keep crisp edges: no shared scroll fade (DESIGN "Widgets board").
+    assert 'class="widgets-scroll"' in widgets and "scroll-fade" not in widgets
     assert ".skills-scroll" in css and "overflow-y: auto" in css
     assert ".widgets-scroll" in css and "overflow-y: auto" in css
 
@@ -242,16 +243,17 @@ def test_sidebar_is_three_zones_with_the_projects_list_as_the_one_scroller():
 # ---------------------------------------------------------------------------
 
 
-def test_evolution_page_supports_refresh_and_runtime_state():
+def test_evolution_page_reads_runtime_and_history_independently():
     source = _read("web/modules/evolution.js")
 
-    assert 'id="evo-refresh"' in source
-    assert "Runtime Status" in source
-    assert "apiFetch(`/api/evolution-data${suffix}`" in source
-    assert "ws.on('open', () => {" in source
+    # Two reads, neither waiting for the other: the campaign paints from the state, the history from its saved copy.
+    assert "apiFetch('/api/state', { cache: 'no-store' })" in source
+    assert "apiFetch(`/api/evolution-data${force ? '?force=1' : ''}`, { cache: 'no-store' })" in source
+    assert "Promise.all" not in source
+    assert "loadHistory({ force: !historyError })" in source  # Try again re-measures after a failed refresh
+    assert "ws.on('open', loadAll)" in source
     assert "window.addEventListener('ouro:page-shown'" in source
     assert "document.addEventListener('visibilitychange'" in source
-    assert "renderRuntimeState(runtime, data.generated_at || '');" in source
     assert "evolution_state" in source
     assert "bg_consciousness_state" in source
 
@@ -273,7 +275,7 @@ def test_server_navigation_and_chat_static_contracts():
     assert '"bg_consciousness_state": bg_state,' in state_source
     assert 'request.query_params.get("force")' in control_source
     assert "window.dispatchEvent(new CustomEvent('ouro:page-shown', { detail: { page: pageName } }));" in app_source
-    assert "evo-runtime-detail" in evo_source
+    assert "evo-consciousness-detail" in evo_source
     assert "data?.evolution_state?.detail" in chat_source
     assert "data?.bg_consciousness_state?.detail" in chat_source
     # The composer's markup and send path live in composer.js, mounted by chat.js.

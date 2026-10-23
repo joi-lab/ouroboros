@@ -88,27 +88,14 @@ RECLAIM_LOW_WATER_DIVISOR = 8
 #: An unknown reclaim target: the step takes everything its category can give (the refusal passes).
 WHOLE_CATEGORY = 2**31 - 1
 
-# Working room the memory view's physical floor leaves under a known route
-# window: two low-water levels of the reclaim pass above, ceil(W / divisor)
-# each. One is the level an in-task reclaim pass lands on (its goal is the
-# deficit plus one level), the other is room for the work between two passes;
-# with less, the first tool results of a task would re-arm a paid reclaim. The
-# floor turns host facts, room headers, legacy pointers and old pages into
-# addresses only when the view does not fit the window minus the reply reserve
-# and this room; my own replies and people's words become addresses only when
-# the window minus the reply reserve cannot hold them. It never adds memory to
-# fill the room. Structural constant, not a setting;
-# tests/test_context_budget_ssot.py pins it.
-MEMORY_VIEW_WORKING_MARGINS = 2
+def start_room_levels(role: str, *, focus_wake: bool = False, direct_chat: bool = False) -> int:
+    """Roots and wakes leave two eighths; direct chat turns, other Presence turns and helpers leave one.
 
-# Low-water levels left to the work under an owner-selected Low or Nano target
-# (the target bounds the view the way a window does, with the full reply
-# reserve). One level keeps a Low view at most 250 000 - 65 536 - 31 250 =
-# 153 214 estimated input tokens and a Nano view 85 000 - 8 192 - 10 625 =
-# 66 183, so an in-task reclaim pass still has a level to land on below the
-# target; 0 makes the target a plain frame. The owner chose one level; the
-# value changes here and only here (tests/test_context_budget_ssot.py pins it).
-MODE_TARGET_WORKING_MARGINS = 1
+    Decided from task facts, never the task type (``memory_view.start_room`` reads them).
+    """
+    if role == "consciousness" or (role == "presence" and focus_wake):
+        return 2
+    return 2 if role == "integrator" and not direct_chat else 1
 
 
 def context_mode_limits(mode: str, owner_mode: str, output_reserve_tokens: int) -> Tuple[Optional[int], int]:
@@ -168,7 +155,7 @@ def exact_reply_shortfall(*, caller_max_tokens: int, nano: bool, input_tokens: i
 
 def request_context_budget(
     *, window_tokens: Optional[int], output_reserve_tokens: Optional[int], non_memory_tokens: int,
-    target_tokens: Optional[int] = None, calibration_ratio: float = 1.0, margin_count: int = 1,
+    target_tokens: Optional[int] = None, calibration_ratio: float = 1.0, margin_count: int = 1, boundary_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """One measured frame: the memory allowance with and without the working margins.
 
@@ -185,7 +172,7 @@ def request_context_budget(
     ratio = max(float(calibration_ratio or 1), 0.01)
     reserve = max(0, int(output_reserve_tokens or 0))
     measured = math.ceil(max(0, int(non_memory_tokens)) * ratio)
-    margin = (math.ceil(boundary / RECLAIM_LOW_WATER_DIVISOR) * margin_count
+    margin = (math.ceil((min(boundary, boundary_tokens) if boundary_tokens else boundary) / RECLAIM_LOW_WATER_DIVISOR) * margin_count
               if boundary is not None else 0)
     free = boundary - reserve - measured if boundary is not None else None
 
@@ -361,14 +348,16 @@ LARGE_CONTEXT_SECTION_CHARS = 200_000
 # Char-equivalent for ONE image block in chars/4 token estimates (~1.1K tokens):
 # vision models bill per tile, not per base64 char.
 IMAGE_BLOCK_CHAR_EQUIVALENT = 4_400
-# Live image blocks kept in the transcript (single counter across owner
-# uploads, browser screenshots, and transport injections). Older images are
-# replaced by a caption placeholder pointing to the re-view path.
+# Initial image cap and batch-eviction target, across owner uploads, browser
+# screenshots and transport injections. Running history grows to the high-water
+# mark, then replaces oldest images with caption/re-view placeholders down to 5.
 # 3 -> 5 (v6.81.1, owner decision 2026-07-29): with tool-result images now
 # auto-attached (screenshots arrive every observation round), 3 kept too little
 # visual history for compare-two-screens reasoning; 5 costs at most ~2.2K extra
 # estimated tokens per request and only when that many images are actually live.
 MAX_LIVE_IMAGE_BLOCKS = 5
+# Owner decision 2026-10-21: batch eviction above 10 back to the 5-image floor of 2026-07-29.
+LIVE_IMAGE_BLOCKS_HIGH_WATER = 10
 
 # --- Scratchpad size thresholds (SSOT; previously scattered literals) -------
 # Context-section soft budget for the rendered scratchpad (warn-only).

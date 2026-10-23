@@ -126,14 +126,11 @@ def test_failed_mcp_reconfigure_becomes_a_save_warning(monkeypatch, tmp_path):
     report "took effect immediately" without saying so."""
     import types
 
+    from ouroboros import mcp_client
     from ouroboros.gateway import settings as settings_mod
 
-    fake_mcp = types.SimpleNamespace(
-        reconfigure_from_settings=lambda *_a, **_k: (_ for _ in ()).throw(
-            RuntimeError("mcp exploded")),
-        refresh_all_background=lambda *_a, **_k: None,
-    )
-    monkeypatch.setitem(__import__("sys").modules, "ouroboros.mcp_client", fake_mcp)
+    monkeypatch.setattr(mcp_client, "configuration_changed", lambda *_a, **_k:
+                        (_ for _ in ()).throw(RuntimeError("mcp exploded")))
 
     class _Req:
         app = types.SimpleNamespace(state=types.SimpleNamespace(drive_root=str(tmp_path)))

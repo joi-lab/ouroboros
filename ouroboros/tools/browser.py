@@ -81,8 +81,9 @@ def _runtime_mode_for_browser(ctx: Any) -> str:
     """Read the effective mode for owner-control browser operations."""
     try:
         from ouroboros.config import get_runtime_mode
+        from ouroboros.consciousness_authority import effective_runtime_mode
 
-        return get_runtime_mode()
+        return effective_runtime_mode(get_runtime_mode(), getattr(ctx, "task_metadata", None))
     except Exception:
         return "advanced"
 
@@ -752,7 +753,7 @@ def _inject_native_screenshot(ctx: ToolContext, b64: str) -> str:
                 "_caption": caption,
                 "_source_path": str(shot_path),
             },
-        ])
+        ], stamp=ctx)  # a batch eviction of sent images names its origin
         return ("The screenshot is in your context as an image; the image-input mode and this route decide "
                 "whether you receive its pixels, a caption or a marker. ")
     except Exception:

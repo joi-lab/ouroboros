@@ -475,7 +475,27 @@ def _candidate_symlink_escapes(
     return sorted(set(escapes)), ""
 
 
-def integrate_payload_patch(
+def integrate_payload_patch(ctx: ToolContext, **params: Any) -> str:
+    """Serialize the live target's CAS, mutation and disposition publication across captures."""
+    from hashlib import sha256
+    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
+
+    if params.get("decision") != "apply":
+        return _integrate_payload_patch(ctx, **params)
+    target = pathlib.Path(params["entry"].target_root).resolve()
+    key = sha256(str(target).encode("utf-8")).hexdigest()
+    path = pathlib.Path(params["drive"]) / "state" / "delegate_payload_mutations" / f"{key}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = acquire_exclusive_file_lock(path, timeout_sec=20.0, owner_aware_stale=True)
+    if fd is None:
+        return "⚠️ INTEGRATE_DELEGATED_TARGET_BUSY: payload mutation lock unavailable; capture retained."
+    try:
+        return _integrate_payload_patch(ctx, **params)
+    finally:
+        release_exclusive_file_lock(path, fd)
+
+
+def _integrate_payload_patch(
     ctx: ToolContext, *, drive: pathlib.Path, entry: _RunCustody, rid: str,
     decision: str, reason: str, cap_dir: pathlib.Path,
     manifest: Dict[str, Any], patch_path: pathlib.Path,

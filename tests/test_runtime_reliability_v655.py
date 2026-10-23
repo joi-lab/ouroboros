@@ -101,6 +101,7 @@ def _run_gate(monkeypatch, tmp_path, *, mode: str, tool: str):
 
     monkeypatch.setattr(safety_mod, "_run_llm_check", _fake_llm_check)
     ctx = _ctx(tmp_path)
+    ctx.task_metadata = {"work_kind": "owner"}
     # A non-whitelisted command so CONDITIONAL does not take the deterministic
     # safe-subject bypass on its own.
     allowed, msg = safety_mod.check_safety(
@@ -134,6 +135,7 @@ def test_safety_mode_light_safe_subject_emits_no_skip_audit(tmp_path, monkeypatc
 
     monkeypatch.setattr(safety_mod, "_run_llm_check", _fake_llm_check)
     ctx = _ctx(tmp_path)
+    ctx.task_metadata = {"work_kind": "owner"}
     allowed, msg = safety_mod.check_safety(ctx=ctx, tool_name="run_command", arguments={"cmd": "ls -la"})
     assert allowed is True and msg == ""
     assert calls == []
@@ -491,6 +493,7 @@ def test_shell_cwd_block_message_names_resolved_paths(tmp_path):
     from ouroboros.tool_access import shell_cwd_block_message
 
     ctx = _ctx(tmp_path)
+    ctx.task_metadata = {"work_kind": "owner"}
     msg = shell_cwd_block_message(ctx, "/nonexistent/guessed", operation="shell")
     assert "SHELL_CWD_BLOCKED" in msg
     # Labels are rendered as label=<resolved path>, not bare labels.
@@ -525,6 +528,7 @@ def test_resolve_user_file_path_rejects_absolute_outside_home(tmp_path, monkeypa
     fake_home.mkdir()
     monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(fake_home))
     ctx = _ctx(tmp_path)
+    ctx.task_metadata = {"work_kind": "owner"}
     outside = tmp_path / "elsewhere" / "app" / "main.go"
     # Non-external ctx: the NEW actionable early rejection (not the later
     # opaque relative_to crash class).
@@ -562,6 +566,7 @@ def test_dispatch_auto_routes_user_files_read_under_workspace(tmp_path):
     from ouroboros.tools.registry import _normalize_dispatch_path_args
 
     ctx = _ctx(tmp_path)
+    ctx.task_metadata = {"work_kind": "owner"}
     target = tmp_path / "system" / "src" / "x.py"
     args = {"root": "user_files", "path": str(target)}
     note = _normalize_dispatch_path_args(ctx, "read_file", args)
@@ -573,6 +578,7 @@ def test_dispatch_redirects_user_files_write_under_workspace(tmp_path):
     from ouroboros.tools.registry import _normalize_dispatch_path_args
 
     ctx = _ctx(tmp_path)
+    ctx.task_metadata = {"work_kind": "owner"}
     target = tmp_path / "system" / "src" / "x.py"
     args = {"root": "user_files", "path": str(target)}
     note = _normalize_dispatch_path_args(ctx, "write_file", args)
@@ -584,6 +590,7 @@ def test_dispatch_leaves_query_code_and_true_user_files_alone(tmp_path, monkeypa
     from ouroboros.tools.registry import _normalize_dispatch_path_args
 
     ctx = _ctx(tmp_path)
+    ctx.task_metadata = {"work_kind": "owner"}
     target = tmp_path / "system" / "src" / "x.py"
     assert _normalize_dispatch_path_args(ctx, "query_code", {"root": "user_files", "path": str(target)}) == ""
     fake_home = tmp_path / "home"
@@ -606,6 +613,7 @@ def _clamp(tools_ctx, name, base):
 
 def test_deadline_clamp_is_inert_without_deadline(tmp_path):
     ctx = _ctx(tmp_path)
+    ctx.task_metadata = {"work_kind": "owner"}
     assert _clamp(ctx, "web_search", 540) == 540
     assert _clamp(ctx, "run_command", 540) == 540
 
@@ -692,6 +700,7 @@ def test_subagent_slot_note_reads_snapshot(tmp_path):
     from ouroboros.tools.control import _subagent_slot_note
 
     ctx = _ctx(tmp_path)
+    ctx.task_metadata = {"work_kind": "owner"}
     state = tmp_path / "data" / "state"
     state.mkdir(parents=True, exist_ok=True)
     snap = {
@@ -743,6 +752,7 @@ def test_list_files_hard_failure_is_first_class_error(tmp_path, monkeypatch):
     from ouroboros.tools import core_file_tools as core_mod
 
     ctx = _ctx(tmp_path)
+    ctx.task_metadata = {"work_kind": "owner"}
     boom = tmp_path / "data" / "task_drives" / "t-v655"
     boom.mkdir(parents=True, exist_ok=True)
 

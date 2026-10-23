@@ -5,7 +5,8 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
-    browseCardState, categoryCounts, matchesQuery, recommendedMissing, renderBrowseCard, shelfItems, sortCatalogItems,
+    CONNECTORS, browseCardState, categoryCounts, isConnector, matchesQuery, recommendedMissing, renderBrowseCard, shelfItems,
+    sortCatalogItems,
 } from '../modules/skill_browse.js';
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/skills_v4/${name}`, import.meta.url), 'utf8'));
@@ -184,4 +185,23 @@ test('a card: name opens the sheet, Official only on endorsed entries, unknown p
     const long = renderBrowseCard({ ...item('ouroboros/weather'), description: 'x '.repeat(400) }, { state: { status: '', action: '' } });
     assert.match(long, /data-clamped/);
     assert.match(long, />Read more ›</);
+});
+
+test('a connector is known by its place declaration, never a typed tag: icon, «Connects …», the Connectors filter', () => {
+    const slack = { ...item('ouroboros/duckduckgo'), connects: ['Slack'], icon: { name: 'chat' } };
+    assert.equal(isConnector(slack), true);
+    assert.equal(isConnector(item('ouroboros/duckduckgo')), false);
+    assert.equal(isConnector({ category: [CONNECTORS] }), true, 'a catalog category of the same id joins it');
+    const card = renderBrowseCard(slack, { source: SOURCES.get(slack.source_id), state: browseCardState(slack) });
+    assert.match(card, /<div class="skills-head-title"><span class="skills-card-icon" aria-hidden="true"><svg/);
+    assert.match(card, /<div class="skills-card-cats"><span class="ui-chip skills-chip" data-tone="neutral">Connects Slack<\/span>/);
+    const plain = renderBrowseCard(item('ouroboros/duckduckgo'), { source: SOURCES.get('ouroboros'), state: browseCardState(item('ouroboros/duckduckgo')) });
+    assert.doesNotMatch(plain, /skills-card-icon|Connects /);
+});
+
+test('a skill that writes into your chat without a place says its messages count as yours', () => {
+    const bridge = { ...item('ouroboros/duckduckgo'), permissions: ['net', 'inject_chat'] };
+    assert.match(renderBrowseCard(bridge, { state: browseCardState(bridge) }), /<div class="skills-card-facts">Messages from here count as yours<\/div>/);
+    const place = { ...bridge, connects: ['A2A'] };
+    assert.doesNotMatch(renderBrowseCard(place, { state: browseCardState(place) }), /count as yours/);
 });

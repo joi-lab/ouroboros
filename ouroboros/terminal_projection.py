@@ -214,7 +214,9 @@ def completion_event_view(root: Any, event: dict, record: dict) -> dict:
 def _project_row(tid: str, row: dict, event: dict, ready: dict, *, delivery: dict | None = None) -> dict:
     from ouroboros import project_dialogue as dialogue
     from ouroboros.project_facts import resolve_project_id
+    from ouroboros.task_finalization import terminal_host_notice_text
 
+    quiet = row.get("wake_silent") is True and not terminal_host_notice_text(row)
     lineage = _lineage(tid, row)
     is_root = lineage["is_root_task"]
     role = str(row.get("role") or ("root" if is_root else "child"))
@@ -246,7 +248,7 @@ def _project_row(tid: str, row: dict, event: dict, ready: dict, *, delivery: dic
     ])
     notice = completion_notice({**event, **row, "terminal_delivery": delivery})
     excerpt = dialogue._completion_excerpt(row, chat_id=chat_id, salvage_only=True)
-    text += "".join(f" {part}" for part in (verdict, excerpt) if part)
+    text = dialogue.QUIET_RUN_HEADLINE if quiet else text + "".join(f" {part}" for part in (verdict, excerpt) if part)
     from ouroboros.dialogue_provenance import presence_provenance_fields
 
     result = {
@@ -260,6 +262,7 @@ def _project_row(tid: str, row: dict, event: dict, ready: dict, *, delivery: dic
         "project_id": resolve_project_id(row), "chat_id": chat_id,
         "delegation_role": str(row.get("delegation_role") or ""), "role": role,
         "status": row["status"], "outcome": outcome, "outcome_phase": phase, "outcome_final": True,
+        "wake_silent": row.get("wake_silent") is True, "quiet_effective": quiet,
         "outcome_authority": "canonical_task_result_after_finalization",
         "outcome_axes": row.get("outcome_axes") or {}, "reason_code": str(row.get("reason_code") or ""),
         "result_ref": {"kind": "task_result", "task_id": tid, "reader": "get_task_result"}, "text": text,
@@ -586,9 +589,14 @@ def settle_terminal_projection(drive_root: Any, task_id: str, *, task: dict | No
                 return SETTLEMENT_DEFERRED
             effective = {**(task or {}), **stored, "id": tid}
             done = {**(event or {}), **stored, "ts": ready["task_done_ts"], "chat_id": ready["chat_id"]}
-            disposition, _queued = dialogue.project_completion_delivery_outcome(
-                drive_root, done, tid, effective, stored, done, event_queue=event_queue,
-                source_delivery=source_delivery)
+            from ouroboros.task_finalization import terminal_host_notice_text
+
+            if stored.get("wake_silent") is True and not terminal_host_notice_text(stored):
+                disposition = dialogue.MAIN_MIRROR_INELIGIBLE
+            else:
+                disposition, _queued = dialogue.project_completion_delivery_outcome(
+                    drive_root, done, tid, effective, stored, done, event_queue=event_queue,
+                    source_delivery=source_delivery)
             if clear_terminal_projection_obligation(drive_root, tid, stored, disposition):
                 return SETTLEMENT_SETTLED
             # Owed remains discoverable until the strict sender acknowledges it.

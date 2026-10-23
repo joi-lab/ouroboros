@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros import memory_view as mv
+from ouroboros.budget_pause import parkable_direct_task
 from tests import _memory_inventory_shared as shared
 
 NANNY_ROUTE = {"configured_subagent": {"id": "leaf", "route": {"kind": "agent_session", "harness": "claude"}}}
@@ -27,7 +28,7 @@ PRESENCE = {"presence": {"binding_id": "b1", "event": {"provider": "telegram", "
 def test_role_defaults_are_the_table_of_the_spec():
     table = {  # story, room_page, room_lanes, origin_words, live_rooms, marks, knowledge, owner_words
         "integrator": (True, True, True, True, "lines", "all", True, False),
-        "consciousness": (True, True, True, True, "lines_with_words", "all", True, False),  # Main's view + people's words
+        "consciousness": (True, True, True, True, "directory", "all", True, False),
         "presence": (True, True, True, False, "none", "room_and_global", True, False),
         "child": (True, True, False, True, "none", "room_and_global", False, True),
         "nanny": (False, True, False, True, "none", "room_and_global", False, True),
@@ -67,6 +68,31 @@ def test_a_nanny_sees_no_story_and_an_api_child_does(tmp_path):
     child = mv.view_spec_for_task({"id": "c1", "chat_id": 1, "delegation_role": "subagent", **API_ROUTE}, tmp_path)
     assert (nanny.role, nanny.story, nanny.knowledge, nanny.owner_words) == ("nanny", False, False, True)
     assert (child.role, child.story, child.knowledge, child.owner_words) == ("child", True, False, True)
+
+
+_FOCUS = {"initiator": "consciousness", "usage_category": "consciousness", "wake_cause": "focus",
+          "focus": {"room_chat_id": 7}}
+
+
+@pytest.mark.parametrize("task,levels", [  # tasks as their producers dispatch them
+    ({"id": "d1", "type": "task", "chat_id": 1, "text": "hi", "_is_direct_chat": True}, 1),  # worker_chat_lane
+    (parkable_direct_task({"id": "d2", "type": "task", "chat_id": 1, "text": "hi"}), 1),  # budget-pause parking
+    ({"id": "d3", "type": "task", "chat_id": 1, "metadata": {"_is_direct_chat": True}}, 1),
+    ({"id": "p1", "type": "presence", "source": "presence", "chat_id": 7, "_is_direct_chat": True,
+      "_presence_turn": True, "metadata": PRESENCE}, 1),
+    ({"id": "c1", "type": "task", "chat_id": 1, "delegation_role": "subagent", **API_ROUTE}, 1),
+    ({"id": "n1", "type": "task", "chat_id": 1, "delegation_role": "subagent", **NANNY_ROUTE}, 1),
+    ({"id": "r1", "root_task_id": "r1", "delegation_role": "root", "type": "task", "chat_id": 1,
+      "source": "promote_chat_to_task"}, 2),
+    ({"id": "e1", "type": "evolution", "chat_id": 1, "metadata": {"evolution_transaction": {}}}, 2),
+    ({"id": "s1", "type": "deep_self_review", "chat_id": 1, "_require_worker_pool": True}, 2),
+    ({"id": "w1", "metadata": {"initiator": "consciousness", "usage_category": "consciousness"}}, 2),
+    ({"id": "f1", "type": "presence", "source": "presence", "chat_id": 7, "_is_direct_chat": True,
+      "_presence_turn": True, "metadata": {**PRESENCE, **_FOCUS}}, 2),  # a focus wake
+])
+def test_the_start_work_room_follows_task_facts_not_the_task_type(tmp_path, task, levels):
+    shared.projects(tmp_path)
+    assert mv.view_spec_for_task(task, tmp_path).work_room_levels == levels
 
 
 # --- the current room -----------------------------------------------------------------------------
@@ -284,7 +310,7 @@ def _section(text: str, title: str) -> str:
     return text[start:start + len(title) + (min(ends) if ends else len(rest))]
 
 
-MAIN_TASK = {"id": "turn0001", "chat_id": 1}
+MAIN_TASK = {"id": "turn0001", "type": "task", "chat_id": 1, "_is_direct_chat": True}
 
 
 def test_lane_one_is_people_and_my_words_verbatim_and_nothing_else_is_signed_ouroboros(tmp_path):
@@ -315,14 +341,16 @@ def test_lane_two_is_one_host_line_per_root_task_with_typed_facts_by_address(tmp
     _snapshot, text = _view(tmp_path, MAIN_TASK)
     lane2 = _section(text, "### Task facts of this conversation").split("\n")[1:]
     by_task = {line.split("; task ", 1)[1].split("]", 1)[0]: line for line in lane2 if "; host; task " in line}
-    assert set(by_task) == {"pre1", "root1", "pres1", "root2", "root3", "root5", "root6"} and len(lane2) == 7
+    assert set(by_task) == {"pre1", "root1", "root2", "root3", "root5", "root6"} and len(lane2) == 6
     root1 = by_task["root1"]
     assert root1 == (f"[{_ts(4)}; host; task root1] Completed. Root task root1.; children 1 (failed 1); rows 5; "
                      f"get_task_result(task_id='root1'); {_addr(rows[2])}..{_addr(rows[7])}; "
                      f"late review evidence: {_addr(rows[7])}")
     assert by_task["root2"].startswith(f"[{_ts(18)}; host; task root2] host facts for root2: status=running; "
                                        "result: get_task_result(task_id=root2); rows 1;")
-    assert f"delivery failed: {_addr(rows[15])}" in by_task["pres1"]
+    assert "pres1" not in by_task  # place delivery facts belong only to their conversation
+    _place, place_text = _view(tmp_path, {"id": "p", "chat_id": 777, "metadata": PRESENCE})
+    assert f"delivery failed: {_addr(rows[15])}" in place_text
     assert by_task["root3"].startswith(f"[{_ts(21)}; host; task root3] running or unreported; last row task_started "
                                        f"by host, 12 chars, {_addr(rows[19])}")
     # A running root with a child: its status comes from fields, never from the last row's text.
@@ -417,20 +445,20 @@ def test_a_rooms_standing_facts_are_the_inventorys_in_its_header_its_live_line_a
     snapshot, text = _view(tmp_path, MAIN_TASK)
     facts = snapshot.room["facts"]
     assert facts == mi.room_facts(store, "1", mi.open_room_rows(tmp_path, "1"), row_lineage(tmp_path), 0)
-    chars = sum(len(row["text"]) for row in rows if row["chat_id"] in (1, 777))  # the transport's rows are Main's too
-    assert facts == {"rows": 22, "people": 4, "mine": 4, "task_facts": 14, "chars": chars, "earliest": _ts(2),
+    chars = sum(len(row["text"]) for row in rows if row["chat_id"] in (1, 777) and row.get("type") != "presence_delivery")  # the transport's rows are Main's too
+    assert facts == {"rows": 21, "people": 4, "mine": 4, "task_facts": 13, "chars": chars, "earliest": _ts(2),
                      "latest": _ts(27), "notes": 0, "pages": 0, "last_covered": ""}
     head = f"## This room (Main) — head {store.room_head('1')}; open 2026-09-05 10:02 → 2026-09-05 10:27; people 4, mine 4, "
-    assert f"{head}task facts 14, ~{chars} chars; my notes not yet sealed: 0; no page of this room yet\n" in text
+    assert f"{head}task facts 13, ~{chars} chars; my notes not yet sealed: 0; no page of this room yet\n" in text
     live = _section(text, "## Live rooms")
     assert (f"### Project Beta [chat_id={beta}] — open 2026-09-05 10:15 → 2026-09-05 10:16; people 1, mine 1, task facts 0, "
             f"~20 chars; my notes not yet sealed: 0; no page of this room yet\nmemory_read(room_id='{beta}', rows=true)") in live
     quiet = [room for room in snapshot.live_rooms if not room["notes"] and not room["words"]]
     assert [room["room_id"] for room in quiet] == [str(rooms["alpha"]), beta, "777"]
     assert mv._rooms_line(quiet) == (
-        "3 more open rooms without notes; open 2026-09-05 10:13 → 2026-09-05 10:20; people 3, mine 2, task facts 1, "
+        "3 open rooms; open 2026-09-05 10:13 → 2026-09-05 10:20; people 3, mine 2, task facts 1, "
         f"~{sum(room['facts']['chars'] for room in quiet)} chars; no page of these rooms yet; "
-        f"memory_read(room_id=<id>, rows=true) reads each: {rooms['alpha']}, {beta}, 777")
+        "memory_read(room_id='*', start=0)")
     # A page over rows 10:05-10:10 of Main; a note in Main; the transport's one spoken row sealed.
     covers = page_covers(tmp_path, "1", from_addr=_addr(rows[3]), to_addr=_addr(rows[8]))["covers"]
     assert store.publish_page(room_id="1", text="The middle of the morning.", covers=covers, author=shared.MIND).ok
@@ -441,15 +469,15 @@ def test_a_rooms_standing_facts_are_the_inventorys_in_its_header_its_live_line_a
     facts = snapshot.room["facts"]
     assert facts == mi.room_facts(store, "1", mi.open_room_rows(tmp_path, "1"), row_lineage(tmp_path), 1)
     sealed = sum(len(rows[i]["text"]) for i in range(3, 9))
-    assert facts == {"rows": 16, "people": 4, "mine": 2, "task_facts": 10, "chars": chars - sealed, "earliest": _ts(2),
+    assert facts == {"rows": 15, "people": 4, "mine": 2, "task_facts": 9, "chars": chars - sealed, "earliest": _ts(2),
                      "latest": _ts(27), "notes": 1, "pages": 1, "last_covered": _ts(10)}
     head = f"## This room (Main) — head {store.room_head('1')}; open 2026-09-05 10:02 → 2026-09-05 10:27; people 4, mine 2, "
-    assert (f"{head}task facts 10, ~{chars - sealed} chars; my notes not yet sealed: 1; pages of this room: 1, "
+    assert (f"{head}task facts 9, ~{chars - sealed} chars; my notes not yet sealed: 1; pages of this room: 1, "
             "last covered row 2026-09-05 10:10\n") in text
     assert "sealed up to" not in text and "sealed through" not in text and "frontier" not in text
     quiet = [room for room in snapshot.live_rooms if not room["notes"] and not room["words"]]
     assert mv._rooms_line(quiet).startswith(
-        "3 more open rooms without notes; open 2026-09-05 10:13 → 2026-09-05 10:17; people 2, mine 2, task facts 1, ")
+        "3 open rooms; open 2026-09-05 10:13 → 2026-09-05 10:17; people 2, mine 2, task facts 1, ")
     assert "; pages of these rooms: 1, last covered row 2026-09-05 10:20; memory_read(" in mv._rooms_line(quiet)
     # A child of a Main task counts the same room the same way, whatever its view prints of the rows.
     child, _text = _view(tmp_path, {"id": "kid", "chat_id": 1, "delegation_role": "subagent", "parent_task_id": "root2",
@@ -547,7 +575,8 @@ def test_each_role_sees_its_parts_of_the_live_view(tmp_path):
     assert "please look at X" in _section(wake_text, "### Open conversation since")
     assert "### Main — " not in wake_text  # Main is this room, not a live-room line
     live = _section(wake_text, "## Live rooms")
-    assert "alpha words" in live and "beta words" in live and "transport words" in live  # people's words, verbatim
+    assert "alpha words" not in live and "beta words" not in live
+    assert "transport words" not in live and wake_text.count("transport words") == 1
     assert "alpha reply" not in wake_text and "beta reply" not in wake_text  # my replies there: one read by address
     assert f"memory_read(room_id='{rooms['alpha']}', rows=true)" in live
     assert "alpha words" not in main_text and "beta words" not in main_text  # the Main turn keeps its one line per room

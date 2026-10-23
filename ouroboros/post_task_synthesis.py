@@ -3,7 +3,7 @@
 The best-effort work the post-task orchestrator
 (``agent_task_pipeline._run_post_task_processing_async``) dispatches after a
 task ends: the tool-trace summary, the free host facts row, the fallback
-memory draft (only while consciousness is off) and scratchpad compression,
+memory draft or candidate and scratchpad compression,
 plus the shared pre-synthesis usage snapshot and the compact review
 projection. No stage writes lessons, the Pattern Register or the backlog:
 the acting mind authors those (``knowledge_write``). Extracted from
@@ -401,8 +401,8 @@ def _run_memory_fallback_draft(env: Any, task: Dict[str, Any], llm: Any, drive_l
                                llm_trace: Dict[str, Any]) -> str:
     """Run the fallback memory draft (``memory_fallback``) inside the root post-task worker.
 
-    With consciousness on it reads one state and makes no call. Otherwise at most one
-    Light call, scoped and billed as consolidation; a refusal with a receipt and a
+    At most one Light call drafts an acting record (consciousness off) or an unsealed
+    failed-work candidate (on), billed as consolidation; a refusal with a receipt and a
     returned failure read ``degraded``, a budget or unknown-provider kind interrupts.
     """
     try:

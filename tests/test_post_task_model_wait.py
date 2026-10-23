@@ -214,7 +214,7 @@ def test_real_consolidation_error_controls_remaining_post_task_stages(
         {"model": task["model"], "provider": "openrouter"},
         CapabilityEvidence(100_000, "confirmed", "test", "route-test",
                            model=task["model"], provider="openrouter")))
-    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_: 1.0)
+    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_, **_kw: 1.0)
     error = BudgetExceeded("root wallet spent") if cause == "budget" else RuntimeError("provider failed")
     if cause == "api_unknown":
         error.physical_attempt_capture = SimpleNamespace(state="unresolved")

@@ -63,11 +63,11 @@ checkpoint; browser and service handles are never resurrected. Only a turn
 with no task id or no durable root is excluded, and loudly
 (``resource_limit.exact_pause_unavailable``).
 
-Every refusal to restore, grant or dispatch is typed and RETAINS the pause: a
-corrupt or missing source, an unwritable revocation, a lifted root fence over
-a zero-dispatch sibling all become a durable non-dispatch HOLD on the queue
-row (``events_budget.budget_hold_fact``) beside the saved pause, never a
-cancellation and never a silent dispatch; a grant is bound to ONE pause id
+Every refusal to restore, grant or dispatch is typed and RETAINS the pause:
+source and revocation failures live on the continuation point, read through
+``work_stop.continuation_refusal``. A lifted root fence leaves a sibling's
+selection stop (``work_stop.hold_fact``), never cancellation or silent dispatch.
+A grant is bound to ONE pause id
 and ONE resume generation, so ``pauseA -> Resume -> pauseB -> restart`` can
 never dispatch on the earlier grant. This module adds no scheduler, ledger or
 recovery framework: it reuses the queue's ``_budget_pause`` carrier, the actor
@@ -564,8 +564,8 @@ def _hold_control_reason(ctx: Any) -> str:
     """The task's EXISTING controls, read during a hold. This adds none of its own.
 
     A live model wait already owns Stop/Panic, cancel intent, owner deadlines
-    and the finite lifetime; its reader answers first. The owner-stop flags and
-    cancel intents the restore gate reads are consulted either way, so a Stop
+    and the finite lifetime; its reader answers first. The task's
+    cancel intents are consulted either way, so a Stop
     still lands when no wait is bound or when the wait reports something else.
     """
     try:
@@ -580,9 +580,6 @@ def _hold_control_reason(ctx: Any) -> str:
         log.debug("Model-wait control reader unavailable during a budget pause hold", exc_info=True)
     try:
         root = pathlib.Path(getattr(ctx, "budget_drive_root", None) or ctx.drive_root)
-        if any((root / "state" / name).exists()
-               for name in ("panic_stop.flag", "owner_restart_no_resume.flag")):
-            return "panic"
         from ouroboros.cancel_intents import cancel_pending
 
         from ouroboros.store import acquisition_budget
@@ -1034,7 +1031,7 @@ from ouroboros.model_sleep import enter_cold_sleep  # noqa: E402, F401 -- existi
 
 
 # Fields of a direct turn's task record that never travel in its pause event:
-# the inline image bytes were consumed into the checkpointed transcript, and a
+# the inline image bytes live in the checkpointed transcript or a prestart source, and a
 # multi-megabyte base64 blob has no business in the supervisor's event queue or
 # the queue snapshot (which whitelists its own fields anyway).
 _DIRECT_TASK_EVENT_OMITTED = frozenset({"image_base64"})
@@ -1052,6 +1049,37 @@ def parkable_direct_task(task: Dict[str, Any]) -> Dict[str, Any]:
     row.setdefault("_attempt", int(task.get("_attempt") or 1))
     row.setdefault("depth", 0)
     return row
+
+
+def prestart_pause_event(task: Dict[str, Any], error: BaseException, owner: Any) -> Optional[Dict[str, Any]]:
+    """Positive no-body evidence for a fresh input; never reclassify a continuation or prior attempt."""
+    from ouroboros.owner_wait import governing_continuation
+
+    if (not getattr(error, "before_task_start", False) or getattr(error, "control_reason", "") != RAIL_OWNER_PAUSE
+            or governing_continuation(task) or int(task.get("_attempt") or 1) != 1
+            or task.get("original_task_id") or task.get("timeout_retry_from")):
+        return None
+    task_id = str(task["id"])
+    root_id = str(task.get("root_task_id") or (task.get("metadata") or {}).get("root_task_id") or task_id)
+    if task.get("_is_direct_chat") and task.get("image_base64"):
+        # No transcript checkpoint exists before the body. Keep the original
+        # pixels under the existing durable source owner before omitting the
+        # inline payload from the event and the queue's restart snapshot.
+        import base64
+        from ouroboros.artifacts import store_actor_source_bytes
+
+        source = store_actor_source_bytes(owner.drive_root, task_id, category="context_checkpoints",
+                                          source_id="inline-image", extension="image",
+                                          data=base64.b64decode(task["image_base64"], validate=True))
+        task = {**task, "drive_root": str(owner.drive_root), "image_source_ref": source}
+    return {"type": "budget_pause", "task_id": task_id, "task_attempt": 1, "chat_id": task.get("chat_id"),
+            "root_task_id": root_id, "resource_limit": {
+                "before_task_start": True, "task_attempt": 1, "replay_safe": True, "physical_calls": 0,
+                "execution_consumed_sec": owner.executed_seconds(),
+                "scope": "root" if root_id == task_id else "subtree", "root_task_id": root_id,
+                "reason": "owner", "cause": "owner_pause", "auto_resume": False,
+                "fence_id": owner.prestart_pause_fence["fence_id"]},
+            **({"_is_direct_chat": True, "task": parkable_direct_task(task)} if task.get("_is_direct_chat") else {})}
 
 
 def pause_event(task: Dict[str, Any], pause: Dict[str, Any]) -> Dict[str, Any]:
@@ -1119,22 +1147,7 @@ def exact_pause_marker(row: Dict[str, Any], *, default_root: str = "") -> Dict[s
 # --- the queue row's selection against a root latch (assignment AND reservation) ----------
 
 BUDGET_HOLD_KEY = "_budget_pause_hold"
-
-
-def budget_hold_fact(task) -> Optional[Dict[str, Any]]:
-    """The durable NON-dispatch hold on one queued row (#1196), or ``None``.
-
-    Three shapes share it and none invents a checkpoint identity (no pause_id,
-    no ``exact_continuation``): a zero-dispatch sibling whose paused root's
-    admission fence was lifted by that root's Resume — lifting the fence must
-    not make it assignable, the model selects it explicitly (owner Q9) — a row
-    whose exact continuation could not be restored, and a row whose spent
-    grant could not be revoked. ``selected`` is the only release.
-    """
-    if isinstance(task, dict) and task.get("_continuation_prepared"):
-        return {"reason": "continuation_publication_unconfirmed", "selected": False, "dispatchable": False}
-    hold = task.get(BUDGET_HOLD_KEY) if isinstance(task, dict) else None
-    return hold if isinstance(hold, dict) and not hold.get("selected") else None
+"""Historical name: the current explicit stop/writer wait, removed on release; never a selection."""
 
 
 def budget_fence_selected(task: Any, fence: Any) -> bool:
@@ -1147,7 +1160,7 @@ def budget_fence_selected(task: Any, fence: Any) -> bool:
     generation it was granted against, so a later fence — a root that paused
     again — is never pre-released by an older selection (#1196, owner Q9).
 
-    The exact Resume handoff, when present, decides alone (an older selected hold
+    The exact Resume handoff, when present, decides alone (an older selection
     never rescues it): an ``explicit_resume`` grant naming its pause, its grant
     and this fence, issued by the owner or under a named root grant generation.
     Sleep readiness is never money. A row paused again, a stale consumed carrier
@@ -1156,9 +1169,11 @@ def budget_fence_selected(task: Any, fence: Any) -> bool:
     later sends. Dispatch still rechecks the live root grant
     (``events_budget.budget_resume_dispatch_allowed``).
     """
+    from ouroboros.work_stop import continuation_refusal, hold_fact
+
     fence_id = str((fence or {}).get("fence_id") or "") if isinstance(fence, dict) else ""
     if (not isinstance(task, dict) or not fence_id or isinstance(task.get("_budget_pause"), dict)
-            or task.get("_budget_pause_consumed") or budget_hold_fact(task) is not None):
+            or continuation_refusal(task) or task.get("_budget_pause_consumed") or hold_fact(task) is not None):
         return False
     handoff = task.get("_budget_pause_resume")
     if isinstance(handoff, dict):
@@ -1168,8 +1183,8 @@ def budget_fence_selected(task: Any, fence: Any) -> bool:
                     and (handoff.get("selected_by") == "owner"
                          or str(handoff.get("root_grant_id") or "").strip()
                          and int(handoff.get("root_resume_generation") or 0) > 0))
-    hold = task.get(BUDGET_HOLD_KEY)
-    return bool(isinstance(hold, dict) and hold.get("selected") and str(hold.get("fence_id") or "") == fence_id)
+    selection = task.get("_resume_selection")
+    return bool(isinstance(selection, dict) and str(selection.get("fence_id") or "") == fence_id)
 
 
 # --- resume (loop side) -----------------------------------------------------------------
@@ -1547,10 +1562,9 @@ def budget_pause_restore_refusal(root: Any, task: Dict[str, Any]) -> str:
     durable authority behind the locator (unreadable, terminal, a different
     pause id, no source, an unreadable source) — never a cancellation and never
     a reason to drop the row: the caller HOLDS it, typed and visible, so the
-    saved pause stays where the owner can see it. Stop/Panic and the no-resume
-    flag are NOT restore refusals: they are Resume refusals, read at grant time
-    by the same gate that reads them live, so a flag that clears later never
-    leaves a perfectly restorable pause held for nothing.
+    saved pause stays where the owner can see it. Release authority belongs to
+    current_stop at Resume; boot translates installation inputs into work stops.
+    Neither makes an otherwise readable continuation source unrestorable.
     """
     from ouroboros.artifacts import read_actor_source_bytes
     from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result

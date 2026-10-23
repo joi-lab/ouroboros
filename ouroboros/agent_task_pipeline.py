@@ -643,10 +643,10 @@ def _stamp_presence_terminal_facts(
 
 
 def _wake_outcome_notice(text: str, loop_outcome: Dict[str, Any]) -> str:
-    """The host notice a silent wake's non-clean outcome publishes; ``""`` when it ran clean.
+    """The host notice a silent run's non-clean outcome publishes; ``""`` when it ran clean.
 
     Errors, forced or degraded outcomes and open delegated custody are not hidden behind
-    silence, yet the words the wake selected as internal are never published for it: they
+    silence, yet the words the run selected as internal are never published for it: they
     stay the row's ``result`` beside this notice (``terminal_host_notice``).
     """
     execution = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")}).get("execution") or {}
@@ -654,7 +654,7 @@ def _wake_outcome_notice(text: str, loop_outcome: Dict[str, Any]) -> str:
     if status == EXECUTION_OK and reason != "delegated_custody_unreconciled":
         return ""
     kept = " Its internal result stays in the task details." if str(text or "").strip() else ""
-    return f"⚠️ This wake chose to finish without a message, but it ended {status or 'unknown'} ({reason or 'unspecified'}).{kept}"
+    return f"⚠️ This run chose to finish without a message, but it ended {status or 'unknown'} ({reason or 'unspecified'}).{kept}"
 
 
 def _task_cost_fields(env: Any, task: Dict[str, Any]) -> Dict[str, Any]:
@@ -860,7 +860,7 @@ def emit_task_results(
                                                    usage.get("delegate_terminal_reconciliation"))
     usage["delegate_terminal_reconciliation"] = custody_audit
     loop_outcome = _derive_host_bound_loop_outcome(env, task, text, usage, llm_trace)
-    # A silent wake's words stay internal. Clean, it publishes nothing (no chat row, owed outbox
+    # A silent run's words stay internal. Clean, it publishes nothing (no chat row, owed outbox
     # row, live send or delivery subject); otherwise only a host notice of its outcome.
     notice = _wake_outcome_notice(text, loop_outcome) if usage.get("wake_silent") is True else ""
     if notice:
@@ -915,7 +915,7 @@ def emit_task_results(
 
         send_event = project_terminal_result_event(env.drive_root, task, str(task.get("id") or ""), result_text=notice,
                                                    terminal_origin=TERMINAL_ORIGIN_HOST_NOTICE, base_event=send_event)
-    if not quiet:
+    if not quiet or _presence:
         pending_events.append(build_presence_result_event(
             task, text, ctx, terminal_origin=str(usage.get("terminal_origin") or ""),
             retain_scheduled_handoff=failed_or_forced,
@@ -936,7 +936,7 @@ def emit_task_results(
     # the heavy tail below (cost ledger, evidence capture, the result store).
     _live_delivered = _root_outbox and not quiet and _deliver_answer_first(env, task, event_queue, pending_events, register=_presence)
     # A failed live put keeps its owed/buffered answer and skips optional annotation.
-    # Children and silent wakes retain their existing buffered/no-chat lifecycle.
+    # Children and silent runs retain their existing buffered/no-chat lifecycle.
     if _live_delivered or not _root_outbox or quiet:
         with timed_phase("custody_annotation", timing=usage.get("_finalization_timing") or {}):
             record_terminal_reconciliation(custody_root, str(task.get("id") or ""), custody_audit,
@@ -1106,7 +1106,7 @@ def _dispatch_root_post_task(
         task, split_drive=split_drive, project_scoped=project_scoped, project_task=project_task,
         parent_env=parent_env, parent_task=parent_task,
     )
-    # A silent wake owes no final; the fallback scan would ship a deferred mid-turn send instead.
+    # A silent run owes no final; the fallback scan would ship a deferred mid-turn send instead.
     if blocking and event_queue is not None and not live_delivered and not wake_silent:
         # The CANONICAL data root — what the supervisor's boot/tick outbox
         # replay reads (§8-A2): the parent/budget root for split children, the

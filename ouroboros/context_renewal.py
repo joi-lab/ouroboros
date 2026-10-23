@@ -14,13 +14,12 @@ any row written before host state was bound to its text, which may hold merged o
 Ouroboros's outward dialogue; the mind's authored notes (actor capsules) and a predecessor's
 notes; the current review decisions; the address records the refusal passes wrote since the
 newest note; and the mind's own prose since its newest note, including the text it wrote beside
-a tool call. The record lists every tool unit since the newest note with its typed facts, shown
-or never shown, and the address of every source the mind restored (restored sources carry the whole
-unit, so they leave the view and restore again from there). Complete tool units, replies the notes
+a tool call. Chosen read units and explicitly restored sources stay whole. The record lists each removed
+tool unit since the newest note with its typed facts, shown or never shown. Unasked tool units, replies the notes
 already cover, host state the host sends afresh (facts, clock, roster and skill snapshots,
 bound and unchanged), superseded review copies and earlier address records leave the view;
 one host record names the checkpoint that holds them exactly. A renewal that would remove no
-tool unit, no covered reply and no restored source, or a seed not smaller than the refused request, is
+tool unit or covered reply, or a seed not smaller than the refused request, is
 never sent: the round then ends in the named refusal.
 """
 from __future__ import annotations
@@ -80,6 +79,9 @@ def units_since_note(messages: Sequence[Dict[str, Any]], observation: Any) -> st
     newest = _newest_note(messages)
     units = [unit for unit in compaction.context_units(list(messages), scope="tool")
              if unit.start > newest and compaction.unit_kind(messages, unit) == "tool"]  # calls, not records
+    from ouroboros.context_source_view import chosen_read_units
+    retained = chosen_read_units(messages, units)
+    units = [unit for unit in units if unit.unit_id not in retained]
     shown = _exposed_units(list(messages), units, observation if isinstance(observation, dict) else {})
     return "\n".join(f"{_unit_facts(messages, unit)}\n  {'shown to me' if unit.unit_id in shown else 'never shown to me'}"
                      for unit in units)
@@ -95,6 +97,12 @@ def renewal_seed(messages: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any
     from ouroboros.review_history_view import REVIEW_CONTEXT_INDEX_KEY, obsolete_review_index_positions
     from ouroboros.send_clock import CLOCK_ROW_NAME
     from ouroboros.skill_context_snapshot import SNAPSHOT_KIND
+    from ouroboros import context_compaction as cc
+    from ouroboros.context_source_view import chosen_read_units
+
+    units = cc.context_units(list(messages), scope="tool")
+    chosen = chosen_read_units(messages, units)
+    keep_read = {i for unit in units if unit.unit_id in chosen for i in range(unit.start, unit.end + 1)}
 
     resent = {CONTEXT_FACTS_NAME, CLOCK_ROW_NAME, ROSTER_SNAPSHOT_NAME, ROSTER_UPDATE_NAME, SNAPSHOT_KIND,
               RENEWAL_RECORD_NAME}
@@ -107,7 +115,7 @@ def renewal_seed(messages: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any
     left = {"tool_rows": 0, "covered_replies": 0, "host_rows": 0, "restored_sources": 0}
     for i, row in enumerate(messages):
         role, kind = row.get("role"), row.get(HOST_CONTEXT_KIND_KEY)
-        if ((i == 0 and role == "system") or i == first_user or kind in OWNER_ROW_KINDS or note(row)
+        if (i in keep_read or _restored_address(row) or (i == 0 and role == "system") or i == first_user or kind in OWNER_ROW_KINDS or note(row)
                 or kind == PREDECESSOR_NOTES_NAME or (row.get(REVIEW_CONTEXT_INDEX_KEY) and i not in superseded)):
             kept.append(row)
         elif role == "tool" or row.get("tool_calls"):
@@ -115,8 +123,6 @@ def renewal_seed(messages: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any
             prose = _plain_text(row.get("content")) if role == "assistant" and i > newest_note else None
             if prose and prose.strip():
                 kept.append({"role": "assistant", "content": prose})  # my words beside the call stay
-        elif _restored_address(row):
-            left["restored_sources"] += 1  # the whole unit the mind restored: its address goes in the record
         elif (_capsule_metadata(row)[0] or kind == RENEWAL_RECORD_NAME) and i > newest_note:
             kept.append(row)  # address records and earlier renewal indexes since my newest note: what left, with facts
         elif (_capsule_metadata(row)[0] or row.get(REVIEW_CONTEXT_INDEX_KEY)
@@ -156,9 +162,8 @@ def renew_after_refusal(limit_ctx: Any, tools: Any) -> bool:
     except (OSError, ValueError):
         return False  # no exact source, no renewal: every address must resolve (BIBLE P1)
     index = units_since_note(messages, getattr(getattr(tools, "_ctx", None), "_last_context_observation", None))
-    restored = restored_sources(messages)
     seed.append(bound_host_row(RENEWAL_RECORD_NAME, (
-        "[Host record: working view renewed after the provider refused this conversation's size. Same task; "
+        "[Host record: working view renewed during context-size recovery. Same task; "
         "nothing summarized; no model called.] Kept, in order: the assignment, every delivered message and "
         "outward dialogue, my notes, my replies since my newest note and the current review decisions. "
         f"Left the view: {left['tool_rows']} tool rows, {left['covered_replies']} replies before my newest note, "
@@ -166,8 +171,7 @@ def renew_after_refusal(limit_ctx: Any, tools: Any) -> bool:
         f"of {before} rows: {json.dumps(source, ensure_ascii=False, sort_keys=True)}."
         + (f"\nTool units since my newest note (they left the view; each stays exact there):\n{index}" if index
            else "")
-        + (f"\nSources I restored (they left the view; restore_unit_refs brings each back): "
-           f"{json.dumps(restored, ensure_ascii=False, sort_keys=True)}" if restored else ""))))
+        )))
     schemas = getattr(limit_ctx, "tool_schemas", None)
     if estimate_context_prompt_tokens(seed, schemas) >= estimate_context_prompt_tokens(messages, schemas):
         return _cannot_help(limit_ctx)  # never send a candidate that is not smaller than the refused one
@@ -186,7 +190,8 @@ def _cannot_help(limit_ctx: Any) -> bool:
     from ouroboros.loop_messages import _context_components
 
     view = SimpleNamespace(messages=limit_ctx.messages, tool_schemas=getattr(limit_ctx, "tool_schemas", None) or [],
-                           accumulated_usage=limit_ctx.accumulated_usage)
+                           accumulated_usage=limit_ctx.accumulated_usage,
+                           context_fit_plan=getattr(limit_ctx, "context_fit_plan", None))
     try:
         limit_ctx.accumulated_usage["_context_refusal_frame"] = [list(part) for part in _context_components(
             view, measured=False)]

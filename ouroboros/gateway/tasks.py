@@ -38,8 +38,9 @@ from ouroboros.gateway.task_pause import api_task_pause, owner_tree_control_rout
 from ouroboros.gateway.task_decision import api_decision_answer  # noqa: F401
 from ouroboros.gateway.task_archive import (
     chat_media_identity, directory_archives, plain_segments, serve_directory_archive, serve_task_file,
-    task_artifact_location, recorded_identity, serve_task_source,
+    task_artifact_location, recorded_identity, serve_task_source, serve_wrap_up_document,
 )
+from ouroboros.confined_files import root_spellings
 from ouroboros.task_custody import task_artifact_stores
 from ouroboros.headless import (
     ARTIFACTS_DIR,
@@ -87,6 +88,7 @@ from ouroboros.workspace_executor import normalize_executor_ref
 log = logging.getLogger(__name__)
 
 _RESERVED_METADATA_KEYS = frozenset({
+    "work_kind", "schedule_writer_kind", "wake_cause", "focus", "consciousness_cause", "origin_wake_task_id",
     "task_id",
     "parent_task_id",
     "root_task_id",
@@ -105,8 +107,7 @@ _RESERVED_METADATA_KEYS = frozenset({
     "executor_ref",
     "workspace_executor",
     "project_id",
-    # The owner door's stamp (read as ``run_origin.owner_ingress`` by the corpus
-    # label and the routing issuer) belongs to owner routing, never to a caller.
+    # Owner provenance belongs to the host, never to a caller.
     "origin_message_ref",
     "origin_suppressed",
 })
@@ -624,7 +625,7 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
         return attachment_error
     from ouroboros.artifacts import attachment_manifest_projection
     metadata.setdefault("session_id", str(body.get("session_id") or uuid.uuid4().hex))
-    metadata.setdefault("actor_id", str(body.get("actor_id") or "cli"))
+    metadata.setdefault("actor_id", str(body.get("actor_id") or "cli")); metadata["work_kind"] = "owner"
     metadata.setdefault("source", str(body.get("source") or "api_task"))
     # Owner Surface Fact: assembled at its PRODUCER. An external admission
     # carries no browser observables, and a caller-built descriptor must not
@@ -916,6 +917,9 @@ def _task_get_response(request: Request) -> JSONResponse:
     if isinstance(payload.get("artifacts"), list):  # what ``?archive=<dir>`` would stream now, per top-level dir
         payload["artifact_archives"] = directory_archives(task_artifact_stores(drive_root, task_id),
                                                           payload["artifacts"], anchor=drive_root)
+    from ouroboros.owner_stop_receipt import wrap_up_document_view  # named only: written on ``?wrap_up=``
+    if document := wrap_up_document_view(data):
+        payload["wrap_up_document"] = document
     breakdown_view = _task_cost_breakdown_view(drive_root, data)
     if breakdown_view is not None:
         payload["cost_breakdown"] = breakdown_view
@@ -926,32 +930,40 @@ def api_task_artifact(request: Request):
     """Serve one task file read-only from its canonical or OWN child store (``task_archive``): a bare
     name selects only a top-level file (several nested matches: 409 ``artifact_name_ambiguous`` naming
     their ``relpaths``), ``?relpath=a/b/{name}`` is exact, ``?archive=<dir>`` with ``{name}`` =
-    ``<basename>.zip`` streams a recorded directory; bytes leave only through ``serve_task_file``."""
+    ``<basename>.zip`` streams a recorded directory, ``?wrap_up=<Stop request>`` writes the detail's
+    ``wrap_up_document`` on read; a file's bytes leave only through ``serve_task_file``."""
     try:
         task_id = validate_task_id(request.path_params.get("task_id"))
     except ValueError as exc:
         return json_error(str(exc), 400)
     name = str(request.path_params.get("name") or "").strip()
-    if not name or "/" in name or "\\" in name or name in {".", ".."} or ".." in pathlib.PurePosixPath(name).parts:
+    if plain_segments(name) != [name]:
         return json_error("artifact name must be a simple filename", 400)
     source, relpath = request.query_params.get("source"), request.query_params.get("relpath")
+    if source and not plain_segments(source):
+        return json_error("task source is unavailable or does not match its recorded identity", 404)
     if relpath is not None and (source or plain_segments(relpath)[-1:] != [name]):
         return json_error("relpath must be store-relative plain segments ending in the name, without source",
                           400, reason_code="artifact_relpath_invalid", task_id=task_id, artifact=name)
     drive_root = request_drive_root(request)
-    if (archive := request.query_params.get("archive")) is not None:
-        return serve_directory_archive(drive_root, task_id, name, archive,
-                                       other_selectors=source is not None or relpath is not None)
-    stores = task_artifact_stores(drive_root, task_id)
+    # One selector per request: ``archive`` and ``wrap_up`` refuse each other and relpath/source.
+    archive, stop = request.query_params.get("archive"), request.query_params.get("wrap_up")
+    if archive is not None:
+        return serve_directory_archive(drive_root, task_id, name, archive, other_selectors=(
+            source is not None or relpath is not None or stop is not None))
+    if stop is not None:
+        return serve_wrap_up_document(drive_root, task_id, name, stop,
+                                      other_selectors=source is not None or relpath is not None)
+    stores, spellings = task_artifact_stores(drive_root, task_id), root_spellings(drive_root)
     path = None if relpath is not None else artifact_store.resolve_chat_media_path(drive_root, task_id, name)
     if path is not None:  # content-addressed chat media: the canonical store, bytes that hash to the name
-        media = task_artifact_location(stores[:1], path)
+        media = task_artifact_location(stores[:1], path, spellings)
         return (serve_task_file(drive_root, stores[0], media[2], name, chat_media_identity(name), task_id=task_id)
                 if media else json_error("artifact not found", 404, task_id=task_id, artifact=name))
     registered = artifact_store.registered_task_artifact(drive_root, task_id, name) if relpath in (None, name) else None
     # A registered immutable top-level file needs one identity check, not a result projection.
     fast = bool(not source and registered and registered.get("immutable")
-                and (at := task_artifact_location(stores, registered.get("path"))) and at[2] == name)
+                and (at := task_artifact_location(stores, registered.get("path"), spellings)) and at[2] == name)
     result = {} if fast else (load_effective_task_result(drive_root, task_id) or {})
     if not result and not registered:
         return json_error("task not found", 404)
@@ -960,7 +972,7 @@ def api_task_artifact(request: Request):
     rows = [] if fast else [row for row in result.get("artifacts") or [] if isinstance(row, dict) and (
         relpath is not None or str(row.get("name") or pathlib.Path(str(row.get("path") or "")).name) == name)]
     located = [(at, order, row) for order, row in enumerate(rows + ([registered] if registered else []))
-               if (at := task_artifact_location(stores, row.get("path")))]
+               if (at := task_artifact_location(stores, row.get("path"), spellings))]
     matches = [item for item in located if item[0][2] == (relpath or name)]
     nested = sorted({item[0][2] for item in located if "/" in item[0][2]})
     if relpath is None and not matches and len(nested) > 1:
@@ -1373,7 +1385,7 @@ async def api_task_resume(request: Request) -> JSONResponse:
         # exact-continuation refusals (#1196): the task stays paused
         "budget_still_exhausted", "root_hard_cap_exhausted", "cancel_intent_active",
         "deadline_passed", "lifetime_exhausted", "root_still_paused", "resume_already_granted",
-        "restart_no_resume", "pause_record_missing", "pause_source_missing", "pause_source_unreadable",
+        "restart_no_resume", "update_in_progress", "pause_record_missing", "pause_source_missing", "pause_source_unreadable",
         "pause_record_unreadable", "grant_not_recorded", "snapshot_not_persisted",
         "monetary_authority_unavailable", "cancellation_authority_unavailable", "task_terminal",
         # holds and root-grant refusals (#1196, owner Q9): the row stays paused/held
@@ -1387,8 +1399,9 @@ async def api_task_resume(request: Request) -> JSONResponse:
         # a held Continue's observed blockers (#1721): an existing successor, never Not Found
         "predecessor_writers_unsettled", "selection_owner_held",
     } else 404
-    return json_error(error, status, task_id=task_id, **{key: result[key] for key in ("action", "blockers")
-                                                          if result.get(key)})
+    return JSONResponse({"error": error, "task_id": task_id,
+                         **{key: result[key] for key in ("action", "blockers", "message") if result.get(key)}},
+                        status_code=status)
 
 
 # The task-event SSE endpoint and its follower live in gateway/task_events.py

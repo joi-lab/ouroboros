@@ -80,21 +80,15 @@ def evolution_stop_reason(campaign: Optional[Dict[str, Any]] = None) -> str:
     """Why no new evolution may be admitted regardless of state.json: a received
     Stop (latch or durable intent) or an unconsumed Panic flag. "" when none."""
     from supervisor import queue
-    from supervisor.state_initialization import confirm_absent
+    from ouroboros.installation_stop import installation_panic
 
     if _STOP_LATCH["stopped"]:
         return "stop_latched"
     if isinstance((campaign if campaign is not None else _read_evolution_campaign()).get("stop_intent"), dict):
         return "stop_intent"
-    path = pathlib.Path(queue.DRIVE_ROOT) / "state" / "panic_stop.flag"
     try:
-        try:
-            os.lstat(path)
-        except FileNotFoundError:
-            confirm_absent(path)
-            return ""
-        return "panic_flag"
-    except OSError:
+        return "panic_flag" if installation_panic(queue.DRIVE_ROOT, strict=True) else ""
+    except (OSError, UnicodeError):
         return "panic_flag_unknown"
 
 
@@ -386,6 +380,7 @@ def start_evolution_campaign(objective: str = "", *, source: str = "owner", orig
     try:
         campaign = _read_evolution_campaign()
         owner_start = str(source or "") in _OWNER_START_SOURCES
+        origin = {**(origin or {}), "work_kind": "owner"} if owner_start else origin
         if not owner_start and evolution_stop_reason(campaign):
             return {}  # a received Stop yields only to the owner's own start (#1307)
         prior_campaign_id = str(campaign.get("id") or "")
@@ -416,12 +411,11 @@ def start_evolution_campaign(objective: str = "", *, source: str = "owner", orig
             if not str(campaign.get("source") or "").strip() and source:
                 campaign["source"] = str(source)
             if (str(source or "") in ("owner", "owner_chat") and campaign.get("status") == "paused"
-                    and consciousness_origin_metadata(campaign)):
-                # The owner's explicit start ADOPTS a paused consciousness campaign: its cycles are
-                # the owner's work now, no longer bound by the consciousness allowance (BIBLE P0).
-                for key in ("initiator", "usage_category", "consciousness_autonomy"):
+                    and campaign.get("initiator") == "consciousness"):
+                # Owner adoption replaces the campaign's inherited authority (BIBLE P0).
+                for key in ("initiator", "usage_category", "consciousness_autonomy", "consciousness_cause", "origin_wake_task_id", "focus"):
                     campaign.pop(key, None)
-                campaign["adopted_by_owner_at"] = now
+                campaign.update(work_kind="owner", adopted_by_owner_at=now)
             campaign.update({k: v for k, v in consciousness_origin_metadata(origin).items() if not campaign.get(k)})
             campaign["status"] = "active"
             campaign.pop("pause_reason", None)

@@ -68,7 +68,7 @@ def test_custody_survives_the_worker_that_started_the_run(tmp_path, monkeypatch)
 
 def test_the_invocation_id_is_reused_on_retry_and_fresh_per_intended_start(
         tmp_path, monkeypatch):
-    """Only retry_of reuses an unsettled invocation; replacement waits for settlement."""
+    """Only retry_of reuses an unsettled invocation; deliberate starts get fresh identities."""
     import httpx
 
     import ouroboros.delegate_custody as dc
@@ -123,12 +123,6 @@ def test_the_invocation_id_is_reused_on_retry_and_fresh_per_intended_start(
     assert lost["status"] == "refused" and lost["reason"] == "daemon_unreachable"
     token = lost["pending_invocation_id"]
     assert token == keys[0] and "retry_of" in lost["retry_hint"]
-
-    # 2. A plain identical call is an intended replacement, but the unknown
-    # first POST has not settled. The replacement fence refuses before the wire.
-    blocked = json.loads(delegate._delegate_start(ctx, prompt).text)
-    assert blocked["reason"] == "replacement_requires_settlement"
-    assert len(keys) == 1
 
     # 3. Only the EXPLICIT token replays the invocation -- the STORED body verbatim,
     #    even though the route config drifted between the attempts.

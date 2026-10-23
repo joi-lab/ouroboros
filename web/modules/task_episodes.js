@@ -10,7 +10,7 @@
  * not a chain.
  */
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
-import { taskDoneIsTerminal, taskPresentation, taskReasonDetail, taskTerminalPhase } from './log_events.js';
+import { reasonCodesNote, taskDoneIsTerminal, taskPresentation, taskReasonCodes, taskReasonDetail, taskTerminalPhase } from './log_events.js';
 import { fmt } from './i18n.js';
 import { outcomeTone } from './task_phase_chip.js';
 import { projectCollapsedActivity, renderCollapsedActivity } from './chat_activity.js';
@@ -31,7 +31,10 @@ export function noteEpisodeFacts(previous = {}, row = {}) {
     if (terminal && (row?.outcome_axes || row?.task_terminal_status || row?.status)) {
         next.ended = String(time?.occurred_at || next.ended || row?.ts || '');
         next.phase = taskTerminalPhase(row);
-        next.cause = taskReasonDetail(row) || next.cause || '';
+        // A code no sentence describes yet rides beside its neutral cause, for the expanded card (owner 2A).
+        const cause = taskReasonDetail(row);
+        if (cause) Object.assign(next, { cause, codes: taskReasonCodes(row) });
+        else next.cause ||= '';
     } else if (time?.occurred_at && !next.ended) {
         next.ended = String(time.occurred_at);
     }
@@ -124,7 +127,9 @@ export function createTaskEpisodes({ records, reanchor, activity, follow = () =>
                 disclosure.className = 'chat-episode-history';
                 disclosure.dataset.episodeTask = previous.groupId;
                 const summary = document.createElement('summary');
-                disclosure.appendChild(summary);
+                const codes = document.createElement('p');
+                codes.className = 'chat-episode-codes';
+                disclosure.append(summary, codes);
                 const onToggle = () => { if (disclosure.open) expand(previous); };
                 disclosure.addEventListener('toggle', onToggle);
                 previous.episodeDisclosure = disclosure;
@@ -135,6 +140,9 @@ export function createTaskEpisodes({ records, reanchor, activity, follow = () =>
                 episodeSpan(facts.started, facts.ended), facts.phase && taskPresentation(facts.phase).headline,
                 facts.cause].filter(Boolean).join(' · ');
             if (disclosure.firstElementChild.textContent !== label) disclosure.firstElementChild.textContent = label;
+            const codes = disclosure.querySelector('.chat-episode-codes');
+            codes.textContent = reasonCodesNote(facts.codes);
+            codes.hidden = !codes.textContent;
             for (const content of [previous.timelineEl, previous.reviewsHostEl, previous.subagentsEl]) {
                 if (content && content.parentNode !== disclosure) disclosure.appendChild(content);
             }

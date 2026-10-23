@@ -383,7 +383,7 @@ def test_fresh_public_start_after_partial_investigation_capture_keeps_evidence(t
     ("readonly", False, False, "open_run_ids"),
     (INVESTIGATION_AUTHORITY, False, True, "pending_invocation_ids"),
 ])
-def test_fresh_public_start_still_refuses_candidate_unknown_open_and_pending(
+def test_fresh_public_start_keeps_other_candidate_open_and_pending_obligations(
         tmp_path, monkeypatch, authority, settled, pending, blocker):
     import json
 
@@ -403,14 +403,11 @@ def test_fresh_public_start_still_refuses_candidate_unknown_open_and_pending(
     try:
         custody._CUSTODY.clear()
         result = json.loads(start(ctx, prompt="Check again", subagent_id="investigation-fixture"))
-        assert result["reason"] == "replacement_requires_settlement" and result[blocker] == ["prior"]
-        assert starts == []  # before any physical POST
-        # The atomic claim repeats the same reading if debt appears after early admission.
+        assert result["status"] == "started" and starts
         claimed, refusal = claimed_start_request(
-            tmp_path, claim_target="", payload_busy=lambda *_args: "", actor_ctx=ctx,
-            enforce_actor_idle=True, task_id=ctx.task_id, invocation_id="must-not-land",
-            request={"prompt": "Check again"})
-        assert not claimed and refusal["reason"] == result["reason"] and refusal[blocker] == ["prior"]
-        assert custody.invocation_record(tmp_path, "must-not-land") is None
+            tmp_path, actor_ctx=ctx, task_id=ctx.task_id, invocation_id="new-independent",
+            request={"prompt": "Check independently"})
+        assert claimed and not refusal
+        assert custody.invocation_record(tmp_path, "new-independent")["state"] == "pending"
     finally:
         custody._CUSTODY.clear()

@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
+import { createRoomRetirement } from '../modules/room_retire.js';
 
 // The span below is delimited by line breaks; normalize CRLF so a Windows
 // checkout (core.autocrlf) reads the same bytes the delimiters expect.
@@ -337,11 +338,12 @@ for (const [name, options, refreshes] of [
 // its detail read is held, then reopening it ordinarily, is a new navigation: the old
 // reveal neither blocks nor decides that showing's read, whether the reopen reuses a
 // hidden pending-work survivor (its draft and staged files) or builds a new instance.
-function navigationHarness({ pendingWork }) {
+function navigationHarness({ pendingWork, exitAtOnce = true }) {
     const acked = [], built = [], held = [];
     const instance = () => {
         const inst = {
-            page: { hidden: false, isConnected: true, dataset: {} }, generation: 0, draft: 'Yes, after the tag',
+            page: { hidden: false, isConnected: true, dataset: {} }, generation: 0, draft: 'Yes, after the tag', leaving: false,
+            leave() { this.leaving = true; this.generation += 1; }, stay() { this.leaving = false; },
             refreshes: 0, destroyed: false, latestShown: 0, transientCloses: 0, arrivals: [],
             hasPendingWork: () => pendingWork, hasPaintedHistory: () => true,
             showLatest(options) { this.latestShown += 1; this.arrivals.push(options?.arrive === true); },
@@ -366,13 +368,17 @@ function navigationHarness({ pendingWork }) {
         projectInstances: new Map(), projectPaintRequests: new Map(), projectReveals: new Map(),
         lastProjectRows: [project], state: { projectSeenRevision: {} }, mainChat: null,
         projectPanelTitle: {}, projectPanelBody: {}, ctx: {},
-        showPage: async () => true, syncNavigationState() {}, createChatInstance: instance,
+        // The panel's exit has run by the next sync here (as under reduced motion): a retired room is put away.
+        showPage: async () => true, isStackLayout: () => false, createChatInstance: instance,
+        syncNavigationState() { if (exitAtOnce) for (const [pid, inst] of [...context.rooms.retiring]) context.rooms.settle(pid, inst); },
         markProjectViewed: async (id, revision) => { acked.push([id, revision]); },
-        console: { error() {} },
+        console: { error() {} }, createRoomRetirement,
     });
     vm.runInContext(`let projectNavigationGeneration = 0, projectPanelOpeningSince = 0;
-        ${['cancelProjectPaint', 'destroyProjectInstance', 'closeProjectPanel', 'openProjectPanel',
-        'freshProjectRow', 'revealProjectQuestion'].map(lift).join('\n')}\n${ackSource}
+        ${['cancelProjectPaint', 'destroyProjectInstance',
+        'closeProjectPanel', 'openProjectPanel', 'freshProjectRow', 'revealProjectQuestion'].map(lift).join('\n')}\n${ackSource}
+        const rooms = createRoomRetirement({ instances: projectInstances, cancelPaint: cancelProjectPaint, destroy: destroyProjectInstance });
+        Object.assign(globalThis, { rooms });
         globalThis.api = { open: (options) => openProjectPanel(lastProjectRows[0], options), close: () => closeProjectPanel() };`,
     context);
     return { acked, built, held, project, context, api: context.api };
@@ -475,4 +481,41 @@ test('a question reveal still in progress keeps withholding the read of its own 
     h.held[0](true);
     await revealed;
     assert.deepEqual(h.acked, [['p1', 5]], 'the reveal decides once it ends');
+});
+
+// A Project room that leaves the screen keeps its content for its exit (owner 20.10, 4A; the desktop panel no longer
+// fades out empty): it is retired, not destroyed, until the exit has run; its reads stop at once.
+test('a closed room is retired for its exit, reopened as the same room, and a late read of it acknowledges nothing', async () => {
+    const h = navigationHarness({ pendingWork: false, exitAtOnce: false });
+    h.context.state.activePage = 'chat';
+    await h.api.open();
+    const room = h.built[0];
+    const reads = room.refreshes;
+    h.api.close();
+    assert.deepEqual([room.destroyed, room.leaving, room.page.inert, 'leaving' in room.page.dataset], [false, true, true, true],
+        'the room stays whole and inert while it leaves, its reads stopped');
+    assert.equal(h.context.projectInstances.has('p1'), false, 'it is no longer a live instance');
+    await h.api.open();
+    assert.equal(h.built.length, 1, 'reopened during its exit, it is the same room');
+    assert.deepEqual([room.leaving, room.page.inert, 'leaving' in room.page.dataset], [false, false, false]);
+    assert.ok(room.refreshes >= reads, 'and it reads its history as any reopen does');
+    // Closed again and put away when the exit has run.
+    h.api.close();
+    h.context.rooms.settle('p1', room);
+    assert.equal(room.destroyed, true);
+    assert.equal(h.context.rooms.retiring.size, 0);
+    // A late put-away of a room another one replaced destroys only itself.
+    await h.api.open();
+    const next = h.built[1];
+    h.context.rooms.settle('p1', room);
+    assert.equal(next.destroyed, false, 'the new room is untouched by the old one\'s put-away');
+});
+
+test('the acknowledgement owner refuses a paint from a room that is no longer the live one', async () => {
+    const h = harness({ refreshHistory: async ({ revision }) => {
+        h.context.projectInstances.set('p1', { page: { hidden: false, isConnected: true } });  // replaced meanwhile
+        return { painted: true, read: true, revision };
+    } });
+    await h.open();
+    assert.deepEqual(h.acked, [], 'a retired room\'s late read never acknowledges its replacement\'s revision');
 });

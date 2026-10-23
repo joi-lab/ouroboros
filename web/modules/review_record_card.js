@@ -142,6 +142,37 @@ export function seatAnswersText(seat) {
     }).join(' · ');
 }
 
+export function authorDoctrineLines(decision) {
+    if (!decision || typeof decision !== 'object') return [];
+    const fact = decision.review_replaced_by_subagents;
+    const lines = [];
+    if (fact && typeof fact === 'object') {
+        const reports = Array.isArray(fact.reports) ? fact.reports : [];
+        const bound = reports.filter((row) => row && row.status === 'bound').length;
+        const gaps = reports.filter((row) => row && row.status === 'gap').length;
+        lines.push(`Check replaced by subagents: ${String(fact.reason || '')}`);
+        lines.push('Subagent reports are author evidence, not review seats, and do not create PASS.');
+        if (fact.selection_rationale) lines.push(`Selection: ${String(fact.selection_rationale)}`);
+        if (fact.subject_hash) lines.push(`Checked subject: ${String(fact.subject_hash)}`);
+        lines.push(`Subagent reports: ${bound} bound, ${gaps} evidence gap(s).`);
+        for (const report of reports) {
+            if (report?.actor_identity === 'mismatch') {
+                lines.push(`Actor identity mismatch: claimed ${report.ref?.subagent_id || 'unknown'}; recorded ${report.actor?.subagent_id || 'unknown'}.`);
+            } else if (report?.actor_identity === 'unknown') {
+                lines.push('Report actor identity: unknown (no retained host identity).');
+            }
+        }
+    }
+    const snapshot = decision.evidence_at_decision;
+    if (snapshot && typeof snapshot === 'object' && snapshot.feedback_at_decision) {
+        lines.push(`Evidence at decision: ${String(snapshot.feedback_at_decision)}`);
+    }
+    if (decision.landing && decision.landing.landed === true) {
+        lines.push('Landing: this commit, recorded separately from the evidence at decision.');
+    }
+    return lines;
+}
+
 export function formatReviewProjection(projection) {
     const panels = Array.isArray(projection?.panels) ? projection.panels : [];
     const lines = [];
@@ -211,6 +242,7 @@ export function formatReviewProjection(projection) {
                 lines.push(`Reviewer ${slotId} full response: observability call ${callId}`);
             }
         });
+        lines.push(...authorDoctrineLines(panel.author_decision));
     });
     return lines.join('\n');
 }

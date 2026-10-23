@@ -13,10 +13,9 @@ from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, comple
 
 import logging
 import os
-from hashlib import sha256
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.utils import append_jsonl, run_cmd, utc_now_iso, write_text
+from ouroboros.utils import run_cmd, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -82,12 +81,20 @@ def _prepare_self_change(ctx: ToolContext, resume: str = "", in_place: bool = Fa
     except body_candidate.CandidateRefused as exc:
         return _publish_tool_result(ctx, ToolResult(
             status="blocked", code=exc.code, text=f"⚠️ {exc.code}: {exc.text}"))
+    from ouroboros.tools.tool_resolution import active_repo_dir_for
+    from ouroboros.workspace_copies import same_directory
+
+    active = active_repo_dir_for(ctx)  # a room or external workspace stays this task's own folder
+    users = ("Body writes, default process cwd, child copies, review and commit_reviewed now use it"
+             if same_directory(active, bound["path"]) else
+             f"Writes and review_change with root='system_repo', commit_reviewed and self_worktree children given "
+             f"workspace_root={bound['path']} now use it, while default writes, reviews, commands without cwd and "
+             f"delegate_start runs still use {active} (pass cwd={bound['path']} for commands in the candidate)")
     return (
         f"OK: body candidate {bound['candidate_id']} is {bound['state']} — path {bound['path']}, branch "
-        f"{bound['branch']}, base {str(bound['base_sha'])[:12]}. Body writes, default process cwd, child copies, "
-        "review and commit_reviewed now use it; processes started inside it get an isolated HOME/data/settings "
-        f"environment. The running body at {bound['repo_dir']} is unchanged until an exact reviewed commit is "
-        "adopted with request_restart(adopt_commit=...), or published through the Git/PR tools."
+        f"{bound['branch']}, base {str(bound['base_sha'])[:12]}. {users}; processes started inside it get an "
+        f"isolated HOME/data/settings environment. The running body at {bound['repo_dir']} is unchanged until "
+        "an exact reviewed commit is adopted with request_restart(adopt_commit=...), or published through the Git/PR tools."
         + (f" The earlier checkout of this task was gone; its commits remain on branch {bound['previous_branch']}."
            if bound.get("previous_branch") else "")
     )
@@ -193,7 +200,7 @@ def self_change_tool_entries() -> list:
                 "restart, after the running generation's readers have stopped."),
             "parameters": {"type": "object", "properties": {
                 "reason": {"type": "string"},
-                "adopt_commit": {"type": "string", "description": "Exact reviewed candidate commit SHA to adopt at this restart; it needs a full green test run of that commit on record (commit it with full_tests=true)."},
+                "adopt_commit": {"type": "string", "description": "Exact reviewed candidate commit SHA to adopt at this restart; it needs that commit's passing post-commit run on record: selected over the whole candidate delta, or full (verifier, cutover or broad changes, Cyber Pro's unreviewed commits). Only full evidence permits this adoption's automatic branch/tag push."},
             }, "required": ["reason"]},
         }, _request_restart),
     ]
@@ -267,7 +274,7 @@ def _request_deep_self_review(ctx: ToolContext, reason: str, reviewer: str = "")
     # admission door and its spend stays inside the consciousness allowance.
     ctx.pending_events.append({"type": "deep_self_review_request", "reason": reason, "reviewer": reviewer,
                                "model": identity, "ts": utc_now_iso(),
-                               **consciousness_origin_metadata(getattr(ctx, "task_metadata", None))})
+                               **consciousness_origin_metadata({**(getattr(ctx, "task_metadata", None) or {}), "task_id": str(getattr(ctx, "task_id", "") or "")}, started_root=True)})
     return (f"Deep self-review requested (reviewer: {reviewer or 'Main'}, runs on {identity}). "
             "It will be queued and executed asynchronously.")
 
@@ -305,6 +312,7 @@ def _update_scratchpad(ctx: ToolContext, content: str) -> str:
             "This likely means the tool call was malformed — check your arguments.")))
         )
     from ouroboros.memory import Memory
+    from ouroboros.knowledge import focus_signature
     from ouroboros.tool_access import canonical_data_root
 
     # One working memory, every room (P1): the scratchpad is the same file in
@@ -319,6 +327,7 @@ def _update_scratchpad(ctx: ToolContext, content: str) -> str:
             content,
             source="task",
             metadata={
+                "focus": focus_signature(ctx)["focus"],
                 "task_id": str(getattr(ctx, "task_id", "") or ""),
                 "task_type": str(getattr(ctx, "current_task_type", "") or ""),
                 "delegation_role": str((getattr(ctx, "task_metadata", {}) or {}).get("delegation_role", "")) if isinstance(getattr(ctx, "task_metadata", {}), dict) else "",
@@ -480,7 +489,7 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "", destinatio
     return "OK: message queued for delivery."
 
 
-def _update_identity(ctx: ToolContext, content: str) -> str:
+def _update_identity(ctx: ToolContext, content: str, expected_revision: str | None = None) -> str:
     """Update identity manifest (who you are, who you want to become)."""
     if not content or not isinstance(content, str) or len(content.strip()) < 50:
         return (
@@ -498,34 +507,19 @@ def _update_identity(ctx: ToolContext, content: str) -> str:
     # _chat_history, so a forked execution drive still writes the identity the
     # canonical root reads back.
     mem = Memory(drive_root=canonical_data_root(ctx))
-    mem.ensure_files()
 
-    old_content = ""
-    path = mem.identity_path()
-    if path.exists():
-        try:
-            old_content = path.read_text(encoding="utf-8")
-        except Exception:
-            pass
+    from ouroboros.knowledge import focus_signature
+    from ouroboros.memory_publication import publish_memory_file, publication_refusal
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_text(path, content)
-
-    append_jsonl(mem.identity_journal_path(), {
-        "ts": utc_now_iso(),
-        "task_id": str(getattr(ctx, "task_id", "") or ""),
-        "source_type": str((getattr(ctx, "task_metadata", {}) or {}).get("delegation_role", "task")) if isinstance(getattr(ctx, "task_metadata", {}), dict) else "task",
-        "old_len": len(old_content),
-        "new_len": len(content),
-        "old_sha256": sha256(old_content.encode("utf-8")).hexdigest() if old_content else "",
-        "new_sha256": sha256(content.encode("utf-8")).hexdigest(),
-        "old_content": old_content,
-        "new_content": content,
-        "old_preview": old_content[:500],
-        "new_preview": content[:500],
-    })
-
-    result = f"OK: identity updated ({len(content)} chars)"
+    publication = publish_memory_file(
+        mem.identity_path(), expected_revision, lambda _old: content,
+        journal=mem.identity_journal_path(), author=focus_signature(ctx),
+        source_type=str((getattr(ctx, "task_metadata", {}) or {}).get("delegation_role") or "task"))
+    if not publication.ok:
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED",
+            text=publication_refusal(publication, "memory/identity.md")))
+    old_content = publication.old_content
+    result = f"OK: identity updated ({len(content)} chars); revision={publication.revision}"
     old_len = len(old_content)
     if old_len >= 400 and len(content) < old_len * 0.5:
         result += (
@@ -559,7 +553,7 @@ def _toggle_evolution(ctx: ToolContext, enabled: bool, objective: str = "") -> s
         "ts": utc_now_iso(),
         # A Full-level consciousness turn/tree names itself: the campaign and its
         # cycle tasks then stay inside the consciousness allowance (PLAN 5.14 п.7).
-        **consciousness_origin_metadata(getattr(ctx, "task_metadata", None)),
+        **consciousness_origin_metadata({**(getattr(ctx, "task_metadata", None) or {}), "task_id": str(getattr(ctx, "task_id", "") or "")}, started_root=True),
     })
     state_str = "ON" if enabled else "OFF"
     return f"OK: evolution mode toggled {state_str}."
@@ -652,7 +646,7 @@ def _consciousness_status_facts(ctx: ToolContext) -> str:
         if "enabled" in facts and unproven:
             facts["enabled"] = {"status": "unknown", "reason": unproven}
     if panic_blocks_wake(path.parent.parent):
-        facts["panic_flag_kept"] = "state/panic_stop.flag is present or unreadable: no wake starts while it is kept"
+        facts["panic_flag_kept"] = "state/panic_stop.flag is unreceived or unreadable: no wake starts until it is received"
     facts["configured_bounds_sec"] = {"min": get_bg_wakeup_min_sec(), "max": get_bg_wakeup_max_sec(),
                                       "source": "owner settings, not the state file"}
     facts["notes"] = [
@@ -833,23 +827,29 @@ def _effort_switch(ctx: ToolContext, requested: str) -> tuple[str, str]:
 def _finish_task(ctx: ToolContext, action: str, answer: str | None = None,
                  answer_sha256: str | None = None, rationale: str = "",
                  acceptance_subject: dict | None = None, pending_review: str | None = None,
-                 silent: bool = False) -> str:
-    """Stage an author act; only a wake's own direct turn can choose silence."""
+                 silent: bool = False, swarm_comparison: str | None = None) -> str:
+    """Stage an author act; an own-clock or focused wake, or a schedule-born root, may choose silence."""
     allow_empty = False
     if silent:
         if action != "finish":
             return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
                 text="ERROR: COMPLETION_ARGUMENT: silent requires action=finish"))
-        from ouroboros.consciousness_authority import CONSCIOUSNESS_CATEGORY, is_consciousness_origin
-        metadata = getattr(ctx, "task_metadata", None)
-        if not bool(getattr(ctx, "is_direct_chat", False)):
-            return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
-                text="ERROR: COMPLETION_ARGUMENT: silent is available only on a consciousness wake's own turn"))
-        if not (is_consciousness_origin(metadata)
-                and str((metadata or {}).get("usage_category") or "") == CONSCIOUSNESS_CATEGORY):
+        from ouroboros.consciousness_authority import is_focus_wake, is_own_clock_wake
+        from ouroboros.dialogue_provenance import presence_caller_binding
+        from ouroboros.task_results import resolve_ctx_lineage
+
+        metadata = getattr(ctx, "task_metadata", None) or {}
+        wake = bool(getattr(ctx, "is_direct_chat", False)) and (is_own_clock_wake(metadata) or is_focus_wake(metadata))
+        occurrence = metadata.get("schedule_occurrence")
+        scheduled_root = (isinstance(occurrence, dict)
+                          and str(occurrence.get("schedule_id") or "").strip()
+                          and str(occurrence.get("token") or "").strip()
+                          and resolve_ctx_lineage(ctx)["is_root_task"]
+                          and presence_caller_binding(ctx) is None)
+        if not (wake or scheduled_root):
             return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
                 text="ERROR: COMPLETION_ARGUMENT: silent is available only on a consciousness wake's own turn, "
-                     "not on the tasks it started or any other turn"))
+                     "or a schedule-born root without a Presence binding"))
         allow_empty = True
         if answer is None and not answer_sha256:
             answer = ""  # silence needs no words; complete bytes given anyway stay an internal result
@@ -857,6 +857,7 @@ def _finish_task(ctx: ToolContext, action: str, answer: str | None = None,
         "action": action, "answer": answer, "answer_sha256": answer_sha256,
         "rationale": rationale, "acceptance_subject": acceptance_subject,
         "pending_review": pending_review, "wake_silent": bool(silent) or None,
+        "swarm_comparison": swarm_comparison,
     }, allow_empty=allow_empty)
 
 
@@ -888,6 +889,8 @@ def stage_completion_request(ctx: ToolContext, request: dict, *, source: str = "
         error = "answer_sha256 must name an offered answer"
     elif request.get("pending_review") not in {None, "wait", "finish"}:
         error = "pending_review must be wait or finish"
+    elif request.get("swarm_comparison") is not None and not isinstance(request["swarm_comparison"], str):
+        error = "swarm_comparison must be text"
     elif request.get("pending_review") is not None and not resolve_task_lineage(
         getattr(ctx, "task_id", ""), metadata=getattr(ctx, "task_metadata", {}),
         parent_task_id=getattr(ctx, "parent_task_id", None),

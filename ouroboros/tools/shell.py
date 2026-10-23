@@ -752,8 +752,9 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("run_script", {
             "name": "run_script",
             "description": (
-                "Run a short task-scoped temporary script with a declared interpreter. "
-                "Use for multi-line diagnostics or harness helpers; generated scripts use a private run directory inside the mapped workspace or the task drive. "
+                "Run an inline script with a declared interpreter from a temporary script file in a private run directory inside the mapped workspace or the task drive. "
+                "For Python, this tool does not add the selected cwd to the import path. "
+                "Keep reusable scripts in a skill payload and invoke those files with run_command. "
                 "The underlying command result echoes the resolved cwd."
             ),
             "parameters": {"type": "object", "properties": {

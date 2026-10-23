@@ -114,14 +114,10 @@ def observe():
 
 
 def admitted_agent(body, events):
-    from ouroboros.agent import OuroborosAgent
+    from tests._agent_entry_helpers import task_entry_agent
 
-    agent = object.__new__(OuroborosAgent)
-    agent.env = SimpleNamespace(drive_root=config.DATA_DIR)
-    agent._event_queue = None
-    agent._emit_live_log = lambda event, **facts: events.append((event, facts))
-    agent._handle_task_scoped = body
-    return agent
+    return task_entry_agent(config.DATA_DIR, body,
+                            emit_log=lambda event, **facts: events.append((event, facts)))
 
 
 def test_two_overlapping_real_task_entries_keep_readers_and_behavior(monkeypatch):
@@ -141,7 +137,8 @@ def test_two_overlapping_real_task_entries_keep_readers_and_behavior(monkeypatch
         old_ready.set()
         assert new_ready.wait(10)
         later = observe()
-        decision = (safety.check_safety("run_command", {"cmd": ["touch", "example"]})[0],
+        decision = (safety.check_safety("run_command", {"cmd": ["touch", "example"]},
+                    ctx=SimpleNamespace(task_metadata={"work_kind": "owner"}))[0],
                     skill_review_gate("blockers")["executable_review"])
         # The owner writer executes even inside an old task; its source stays LIVE.
         from ouroboros.gateway.owner_settings import _owner_update_settings
@@ -153,14 +150,17 @@ def test_two_overlapping_real_task_entries_keep_readers_and_behavior(monkeypatch
         value = observe()
         new_ready.set()
         assert finish.wait(10)
-        decision = (safety.check_safety("run_command", {"cmd": ["touch", "example"]})[0],
+        decision = (safety.check_safety("run_command", {"cmd": ["touch", "example"]},
+                    ctx=SimpleNamespace(task_metadata={"work_kind": "owner"}))[0],
                     skill_review_gate("blockers")["executable_review"])
         return value, decision
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         old = pool.submit(admitted_agent(old_body, events).handle_task, {"id": "old-task"})
         try:
-            assert old_ready.wait(10)
+            if not old_ready.wait(10):
+                old.result(timeout=1)  # disclose an entry failure instead of masking it as a readiness timeout
+                pytest.fail("old task never reached its body")
             save_owner(document("new", safety="off", enforcement="advisory"))
             config.apply_settings_to_env(config.load_settings())  # Save-time publication.
             new = pool.submit(admitted_agent(new_body, events).handle_task, {"id": "new-task"})

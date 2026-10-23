@@ -125,6 +125,25 @@ def test_explicit_prepare_gives_processes_the_candidate_cwd_and_an_isolated_envi
     assert _shell_env_for_cwd(ctx, serving).get("HOME") == os.environ.get("HOME")
 
 
+def test_prepare_names_the_folder_that_stays_active_beside_the_candidate(body, tmp_path):
+    """A root bound to its project folder keeps that folder for default writes, commands
+    without cwd and delegate_start; the receipt said every consumer moved to the candidate,
+    and a delegated run then snapshotted the project folder the author did not expect."""
+    serving, data = body
+    room = tmp_path / "project-folder"
+    room.mkdir()
+    ctx = make_ctx(serving, data, "root-room", workspace_root=str(room), workspace_mode="external")
+    assert ctx.is_workspace_mode()
+    text = _registry(serving, data, ctx).execute("prepare_self_change", {})
+    candidate = body_candidate.descriptor(ctx)["path"]
+    assert "review_change with root='system_repo'" in text and f"workspace_root={candidate}" in text
+    assert f"delegate_start runs still use {room}" in text and "default process cwd" not in text
+    plain = make_ctx(serving, data, "root-plain")
+    text = _registry(serving, data, plain).execute("prepare_self_change", {})
+    assert "Body writes, default process cwd, child copies, review and commit_reviewed now use it" in text
+    assert "still use" not in text
+
+
 def test_acting_body_child_copies_the_candidate_and_returns_into_it(body, monkeypatch):
     serving, data = body
     ctx = make_ctx(serving, data, "root-delegate")

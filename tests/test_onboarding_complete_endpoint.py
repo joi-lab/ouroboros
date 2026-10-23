@@ -1407,7 +1407,7 @@ def test_get_onboarding_read_writes_nothing(monkeypatch, tmp_path):
     assert not settings_path.exists(), "GET /api/onboarding created settings.json"
 
     # And with a settings file present, its bytes and mtime are untouched.
-    settings_path.write_text(json.dumps({"OUROBOROS_MODEL": "openai/gpt-5.6-luna"}),
+    settings_path.write_text(json.dumps({"OUROBOROS_MODEL": "openai/gpt-5.6-luna", "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full"}),
                              encoding="utf-8")
     before_bytes = settings_path.read_bytes()
     before_mtime = settings_path.stat().st_mtime_ns

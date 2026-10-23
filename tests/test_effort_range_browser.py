@@ -458,7 +458,9 @@ def test_a_320_px_phone_scrolls_the_strip_inside_the_control(direct_server_with_
             page.tap(HEAD)
             _wait(page, "el.dataset.open === 'true'")
             _assert_strip_geometry(_facts(page))
-            page.wait_for_timeout(300)
+            # The siblings fade out during the morph. Its completion, not 300 ms on the test runner,
+            # decides when their resting display/overflow can be measured (especially in WebKit).
+            _wait(page, "!el.hasAttribute('data-morph')")
             opened = _facts(page)
             assert opened["fit"] == "overflow" and not opened["pillsShown"], opened
             assert opened["stripScrolls"] and opened["stripScroll"] in ("start", "middle"), opened

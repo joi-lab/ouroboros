@@ -30,11 +30,22 @@ def schedule_subagent_properties() -> Dict[str, Any]:
     from ouroboros.settings_scales import EFFORT_SCALE
 
     return {
+        "mode": {"type": "string", "enum": ["ask", "plan", "agent"], "description":
+            "Agent-session execution mode. Omit for access-derived behavior; ask and plan run read-only. Plan questions return as artifacts for the starter."},
         "subagent_id": {
             "type": "string",
             "description": (
                 "Exact Available subagents actor id. The child snapshots that row; later Settings "
                 "edits cannot retarget it."
+            ),
+        },
+        "supervisor": {
+            "type": "string",
+            "description": (
+                "Optional enabled API-model row id from Available subagents for an Agent-session "
+                "child's supervisor, including subscription-backed models. Captures its model, "
+                "effort, account and processing preference. Omit to inherit my actual current "
+                "send binding. Agent-session rows cannot supervise; API children have no separate supervisor."
             ),
         },
         "access": {"type": "string", "enum": ["inherit", *SESSION_ACCESS_LOWERING], "default": "inherit", "description":
@@ -160,6 +171,8 @@ def _validated_schedule_fields(params: Dict[str, Any], *, ctx: Any = None) -> tu
     the handler stays inside the method-size gate — argument validation is a coherent
     phase with one job, not a slice taken to shed lines.
     """
+    if params.get("mode") not in (None, "ask", "plan", "agent"):
+        return {}, "⚠️ TOOL_ARG_ERROR (schedule_subagent): mode must be ask, plan or agent."
     deadline_at = str(params.get("deadline_at") or "").strip()
     memory_mode = str(params.get("memory_mode") or "forked").strip().lower()
     if deadline_at:
@@ -290,6 +303,7 @@ def _validated_schedule_fields(params: Dict[str, Any], *, ctx: Any = None) -> tu
         "constraints": str(params.get("constraints") or "").strip(),
         "memory_mode": memory_mode, "may_mutate": params.get("may_mutate", False),
         "requested_effort": requested_effort,
+        **({"delegated_mode": params["mode"]} if params.get("mode") is not None else {}),
         "acceptance_claims": acceptance_claims,
         "resource_policy": resource_policy,
         "parent_contract": parent,

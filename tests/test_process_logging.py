@@ -367,7 +367,7 @@ def test_a_failed_managed_update_is_recorded_once(monkeypatch, caplog, function_
     monkeypatch.setattr(update_merge, "acquire_update_lock", lambda: object())
     monkeypatch.setattr(update_merge, "release_update_lock", lambda _value: None)
     monkeypatch.setattr(update_merge, "active_update_tx", lambda: {})
-    monkeypatch.setattr(control.update_progress, "begin", lambda: None)
+    monkeypatch.setattr(control.update_progress, "begin", lambda **_kwargs: None)  # base/target SHAs since #2159
     monkeypatch.setattr(control.update_progress, "_finish", lambda *_args: None)
     monkeypatch.setattr(control, "_respawn_workers_after_failed_update", lambda: None)
     error = RuntimeError("synthetic update failure")

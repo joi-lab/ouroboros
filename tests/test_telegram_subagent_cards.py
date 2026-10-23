@@ -96,6 +96,25 @@ def test_a_cards_placed_row_is_a_progress_note_here(tmp_path, monkeypatch, mirro
     assert [sent[1] for sent in _Rec.sent] == [row["text"]]
 
 
+@pytest.mark.parametrize("mirror", [None, "off", "on"])
+def test_wrap_up_receipt_row_goes_while_other_card_rows_follow_the_toggle(tmp_path, monkeypatch, mirror):
+    """#1564: the host types Wrap up's saved-work row as a terminal receipt, so it reaches
+    this chat with progress mirroring off; an untyped custody row and progress do not."""
+    plugin, api = _setup(tmp_path, monkeypatch, **({} if mirror is None else {"TELEGRAM_MIRROR_PROGRESS": mirror}))
+    handle = plugin._make_outbound(api)
+    row = {"role": "system", "system_type": "custody_notice", "card_row": "timeline", "task_id": "root-1"}
+    receipt = {**row, "text": "Work saved at Wrap up:\n- Subtask kid (Stopped): its text is saved",
+               "card_row_id": "cascade:root-1:ci_1:retained_work", "terminal_receipt": "retained_work"}
+    custody = {**row, "text": "Open delegated execution: run-x.", "card_row_id": "final:root-1:abc:custody_notice"}
+    for event in (receipt, custody, {"text": "Thinking...", "is_progress": True}):
+        asyncio.run(handle(event))
+    sent = [entry[1] for entry in _Rec.sent]
+    assert sent[0] == receipt["text"]
+    assert (custody["text"] in sent) is (mirror == "on")
+    if mirror != "on":
+        assert sent == [receipt["text"]]
+
+
 def test_real_reply_is_sent(tmp_path, monkeypatch):
     plugin, api = _setup(tmp_path, monkeypatch)
     handle = plugin._make_outbound(api)

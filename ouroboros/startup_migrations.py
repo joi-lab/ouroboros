@@ -163,11 +163,12 @@ def boot_admissions(root) -> dict:
     return {"pending_drives": pending, "upgrade_notices": import_upgrade_receipts(root)}
 
 
-def prepare_startup_state(root, *, rebuild=False, repo_dir=None, strict=True):
+def prepare_startup_state(root, *, rebuild=False, repo_dir=None, strict=True, initialize_journal=False):
     """Boot may continue with an unavailable store (every door then answers typed); the explicit
     repair reports its failure."""
     try:
-        return _prepare_startup_state(root, rebuild=rebuild, repo_dir=repo_dir)
+        return _prepare_startup_state(root, rebuild=rebuild, repo_dir=repo_dir,
+                                      initialize_journal=initialize_journal)
     except Exception as exc:
         log.error("Startup import failed; the current-facts store is unavailable", exc_info=True)
         try:
@@ -180,7 +181,7 @@ def prepare_startup_state(root, *, rebuild=False, repo_dir=None, strict=True):
         return {"imported": False, "status": "unavailable"}
 
 
-def _prepare_startup_state(root, *, rebuild, repo_dir=None):
+def _prepare_startup_state(root, *, rebuild, repo_dir=None, initialize_journal=False):
     from ouroboros.store_import import ensure_current_store
 
     root = Path(root)
@@ -197,7 +198,7 @@ def _prepare_startup_state(root, *, rebuild, repo_dir=None):
                               capture_output=True, text=True, check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         head = ""  # unknown current body is recorded; never substitute the previous body's SHA
-    report = ensure_current_store(root, rederive=rebuild, body_sha=head)
+    report = ensure_current_store(root, rederive=rebuild, body_sha=head, initialize_journal=initialize_journal)
     if rebuild:
         from ouroboros.delegate_custody_current import rebuild as rebuild_custody
         report["custody_open"] = rebuild_custody(root, replace=True)

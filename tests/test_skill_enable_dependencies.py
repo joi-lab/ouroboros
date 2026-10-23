@@ -46,7 +46,6 @@ def drive(tmp_path, monkeypatch):
     (drive / "skills" / "external").mkdir(parents=True)
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(tmp_path / "empty"))
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
-    monkeypatch.setattr(skill_lifecycle_actions, "_sync_schedules", lambda *a, **k: None)
     return drive
 
 

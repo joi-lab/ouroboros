@@ -104,7 +104,7 @@ def list_available_tools(
     Without ``namespace``: per-namespace counts plus the built-in view. With one
     (``builtin``, ``mcp_<server>``, an extension prefix): every callable tool of
     that namespace, an MCP row as ``raw MCP name → callable name``. It describes
-    the catalog observed now, not what an earlier request carried.
+    the current permitted catalog; MCP rows come from the published listing.
     """
     schemas = registry.schemas()
     omissions = registry.capability_omissions()
@@ -122,7 +122,7 @@ def list_available_tools(
     for row in rows:
         groups.setdefault(tool_namespace(row["name"]), []).append(row)
     selected = str(namespace or "").strip()
-    header = ("Current callable catalog (observed now); [loaded] = the schema is already in "
+    header = ("Current callable catalog (MCP rows from published listings); [loaded] = the schema is already in "
               "your tool list, enable_tools loads a not-loaded one.")
     if selected:
         chosen = groups.get(selected, [])

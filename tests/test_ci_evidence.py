@@ -547,8 +547,12 @@ def test_journal_failure_is_one_line_and_never_changes_the_producer_exit(tmp_pat
             assert _results(public)["session_exit_code"] == int(fails)
             assert not _events(public)
     finally:
-        _retire_injected_export_fault(result, {"directory": "FileExistsError", "open": "IsADirectoryError",
-                                               "write": "ValueError"}[broken])
+        # Opening the injected directory as a file raises EACCES on Windows, EISDIR on POSIX.
+        _retire_injected_export_fault(result, {
+            "directory": "FileExistsError",
+            "open": "PermissionError" if os.name == "nt" else "IsADirectoryError",
+            "write": "ValueError",
+        }[broken])
 
 
 def test_torn_and_invalid_journal_rows_are_skipped(tmp_path):

@@ -95,6 +95,9 @@ _PROGRESS_META_FIELDS = (
     # Phase 6: the resolved delegated route (a harness id), so a replayed
     # bubble keeps its executor chip instead of losing it on reload.
     "executor_route",
+    # Recorded coordinator facts only; missing facts stay absent without result enrichment.
+    "parent_cognitive_route", "coordinator_route", "use_local_model",
+    "coordinator_billing", "coordinator_provenance",
     "effort_level", "effort_requested", "effort_source",  # the effort decision's chip on replay
     "executor_observation", "delegated_activity",  # the executor's typed words/technical events (#1350)
     # The completion-seam evidence block (delegated runs started/settled,
@@ -116,7 +119,9 @@ _PROGRESS_META_FIELDS = (
 )
 
 _SKILL_REVIEW_STRING_FIELDS = (
-    "skill", "status", "content_hash", "job_id", "group_id",
+    # ``record_id``: the review ledger record a row references (a reused review has a fresh job id but the
+    # retained record; the detail reader resolves the record id, the job id only for rows of an earlier version).
+    "skill", "status", "content_hash", "job_id", "record_id", "group_id",
     "presentation_owner_task_id", "origin_task_id", "origin_root_task_id",
     "root_task_id", "source", "job_status", "terminal_reason",
     "replayed_from_ts",
@@ -311,6 +316,7 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
     """Copy terminal chat facts for task summaries."""
     if entry.get("type") != "task_summary":
         return
+    rec.update({key: entry[key] for key in ("wake_silent", "quiet_effective") if type(entry.get(key)) is bool})
     for key in ("model_execution", "review_projection", "history_retention", "terminal_time"):
         if isinstance(entry.get(key), dict):
             rec[key] = dict(entry[key])
@@ -644,13 +650,12 @@ def _make_thread_filter(
     """One per-request room predicate shared by durable stream and evidence readers."""
     from ouroboros.project_dialogue import matching_project_origin, room_membership
 
-    belongs = room_membership(thread_id if thread_id in project_chat_ids else 1,
-                              project_chat_ids, project_source_refs, rooms)
+    belongs = room_membership(thread_id, project_chat_ids, project_source_refs, rooms)
 
     def _row_matches_thread(entry_chat: int, entry: Optional[dict] = None) -> bool:
         if _question_project_chat(entry):
             return True
-        if (thread_id not in project_chat_ids and isinstance(entry, dict)
+        if (thread_id == 1 and isinstance(entry, dict)
                 and entry.get("summary_kind") in {"terminal_result_projection", "terminal_root_projection"}
                 and entry.get("type") not in {"project_started", "project_handoff", "project_completion_summary"}):
             return False
@@ -738,6 +743,8 @@ def _collect_chat_rows(
             # the final visible window are annotated with it below.
             historical = historical_terminal_projection(entry)
             if historical and historical_terminals is not None:
+                historical.update({key: entry[key] for key in ("wake_silent", "quiet_effective")
+                                   if type(entry.get(key)) is bool})
                 tid = str(entry["task_id"])
                 previous = historical_terminals.get(tid, {})
                 if historical["ts"] >= previous.get("ts", ""):
@@ -1543,13 +1550,9 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
         # garbled or non-positive `limit` means "absent"; an explicit n_human wins.
         n_human = _int_param("n_human", _int_param("limit", 0, _MAX_N_HUMAN) or _DEFAULT_N_HUMAN, _MAX_N_HUMAN)
         n_progress = _int_param("n_progress", _DEFAULT_N_PROGRESS, _MAX_N_PROGRESS)
-        # Multi-project thread filter (v6.32.0): each chat fetches its own
-        # history. Default 1 = main chat (legacy rows without chat_id are main).
-        # The filter only PARTITIONS when the requested thread is a registered
-        # project chat; for the main chat (and any non-project chat_id, e.g. an
-        # external-transport mirror) it keeps the historic behavior of showing
-        # every non-project, non-A2A row so transport conversations stay visible.
-        thread_id = _int_param("chat_id", 1, 2**31 - 1) or 1
+        # Main is 1; each other room reads its own history. Place conversation
+        # ids exceed 32 bits but remain exactly representable by the web client.
+        thread_id = _int_param("chat_id", 1, 2**53 - 1) or 1
         # ONE thread hop for the whole assembly (perf2 P3): reads, transforms,
         # slicing, annotation, and the JSON encode all run off the event loop.
         cursor, around = (request.query_params.get(name) for name in ("cursor", "around"))

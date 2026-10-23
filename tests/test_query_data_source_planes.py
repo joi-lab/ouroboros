@@ -118,10 +118,11 @@ def test_canonical_queue_reads_follow_the_same_actors_read_file_admission(planes
 
 
 def test_presence_ceiling_narrows_the_canonical_plane_like_read_file(planes, monkeypatch):
-    from ouroboros.presence_authority import build_presence_capability_ceiling, presence_ceiling_payload
-    from ouroboros.presence_capabilities import (PresenceProfileResolution, PresenceResourceTarget,
+    from ouroboros.presence_authority import presence_ceiling_payload
+    from tests.frozen_presence_authority import build_presence_capability_ceiling
+    from tests.frozen_presence_capabilities import (PresenceProfileResolution, PresenceResourceTarget,
                                                  PresenceSelection, PresenceToolTarget)
-    from ouroboros.presence_runtime import ResolvedPresenceRuntime
+    from tests.frozen_presence_runtime import ResolvedPresenceRuntime
 
     monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "cyber_pro")
     canonical = planes["canonical"]

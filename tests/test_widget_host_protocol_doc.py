@@ -78,6 +78,7 @@ def test_the_documented_numbers_are_the_builtin_ones():
     assert _js_constant(JOB, "WIDGET_REQUEST_TIMEOUT_MS") == "25000"
     assert "after 25 seconds" in DOC
     assert "faultCount >= 10" in FRAME and "at most 10 faults" in DOC
+    assert _js_constant(PAGE, "WIDGET_FAULT_REPORTS_PER_MOUNT") == "10" and "at most 10 per mount" in DOC
 
 
 def test_the_in_frame_api_is_the_one_authors_are_promised():

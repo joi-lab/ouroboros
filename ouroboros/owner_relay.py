@@ -106,17 +106,30 @@ def owner_quote(root, row: dict, *, address: str = "") -> dict:
     return quote
 
 
-def relay_envelope(relay_id: str, quotes: list, *, chat_id: int) -> dict:
+def relay_envelope(relay_id: str, quotes: list, *, chat_id: int, summary: str = "") -> dict:
     # The singular UI shape carries the first quote; the additive list retains
     # every selected source independently (never splice different owner rows).
+    # `summary` is the teller's one line for the owner, which the room shows in place of the note.
     visible = [{k: copy.deepcopy(v) for k, v in q.items() if k != "owner_row"} for q in quotes]
     first = visible[0] if visible else {"text": "", "attachments": [], "source": {
         "chat_id": chat_id, "label": "Main", "ts": "", "client_message_id": "", "address": ""}}
-    return {"relay_id": relay_id, **first, "quotes": visible}
+    return {"relay_id": relay_id, **first, "quotes": visible, **({"summary": summary} if summary else {})}
+
+
+def relay_sender_facts(root, teller_task_id: str) -> dict:
+    """Where a note was written, for the receiving room's note card: the teller's room, else its title."""
+    from ouroboros.task_results import load_task_result
+    task = load_task_result(root, teller_task_id) if teller_task_id else None
+    if not task:
+        return {}
+    facts = relay_target_facts(root, teller_task_id, task)
+    name = facts["target_titles"][0] if facts["project_chat_id"] == 0 else facts["project_name"]
+    return {"task_id": teller_task_id, "chat_id": facts["project_chat_id"], "name": name}
 
 
 def write_relay(root, task_id: str, *, relay_id: str, note: str, quotes: list, chat_id: int,
-                teller_task_id: str, canonical_root=None, sender_origin=None, client_surface=None) -> tuple[dict, bool]:
+                teller_task_id: str, canonical_root=None, sender_origin=None, client_surface=None,
+                summary: str = "") -> tuple[dict, bool]:
     """Mail lock: dedupe then append; caller bumps generation only on a new quote."""
     from ouroboros.owner_mailbox import _mailbox_path, mailbox_lines
     from ouroboros.task_custody import task_mail_lock
@@ -124,7 +137,7 @@ def write_relay(root, task_id: str, *, relay_id: str, note: str, quotes: list, c
     path = _mailbox_path(Path(root), task_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     entry = {"kind": KIND_RELAY, "msg_id": f"relay:{relay_id}:{task_id}", "ts": utc_now_iso(),
-             "text": note, "relay": relay_envelope(relay_id, quotes, chat_id=chat_id),
+             "text": note, "relay": relay_envelope(relay_id, quotes, chat_id=chat_id, summary=summary),
              "owner_rows": [q["owner_row"] for q in quotes], "source_task_id": teller_task_id,
              "relay_canonical_root": str(canonical_root or root)}
     if client_surface:
@@ -248,9 +261,12 @@ def publish_relay(root, target: str, entry: dict, bridge, task=None) -> None:
         stored = next((dict(found.row) for found in dialogue_store.rows_by_client_id(root, entry["msg_id"])
                        if found.row.get("type") == KIND_RELAY), None)
         if stored is None:
+            # The saved row also names the room the note came from (the mailbox entry keeps its identity bytes).
+            sender = relay_sender_facts(root, str(entry.get("source_task_id") or ""))
             stored = log_chat("out", facts["project_chat_id"], 0, entry["text"], ts=entry["ts"],
                               task_id=target, record_type=KIND_RELAY, client_message_id=entry["msg_id"],
-                              message_meta={"relay": entry["relay"]}, drive_root=root, require_write=True)
+                              message_meta={"relay": {**entry["relay"], **({"sender": sender} if sender else {})}},
+                              drive_root=root, require_write=True)
     if bridge is not None and stored["chat_id"]:
         try:
             bridge.send_message(stored["chat_id"], stored["text"], task_id=target, ts=stored["ts"],

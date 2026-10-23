@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import re
+import time
 from typing import Any, Dict
 
 import httpx
@@ -61,6 +62,8 @@ def _telegram_client(api, event=None, chat_id: int = 0) -> TelegramClient:
     return TelegramClient(granted.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES,
                           proxy=telegram_proxy(pathlib.Path(api.get_state_dir())),
                           **(_mirror_options(api, event, chat_id) if event is not None else {}))
+
+_POLL_GENERATION_STARTED = time.time()
 
 _SLASH_COMMAND_RE = re.compile(r"^\s*/[A-Za-z]")
 
@@ -217,15 +220,14 @@ def _load_recent_thoughts(api) -> str:
 
 
 def _bot_commands(command_mode: str, lang: str = "") -> list:
-    """Telegram '/' menu command list in the install language. Owner-control commands
-    appear only in full_access — they already forward via the raw-command path, so
-    listing them here just makes them discoverable/tappable (no new authority)."""
+    """Localized '/' menu: owner Panic in every mode; other controls in full_access."""
     t = _LOCALIZED_TEXTS[lang]
     cmds = [
         {"command": "menu", "description": t["cmd_menu"]},
         {"command": "language", "description": t["cmd_language"]},
         {"command": "status", "description": t["cmd_status"]},
         {"command": "help", "description": t["cmd_help"]},
+        {"command": "panic", "description": t["cmd_panic"]},
     ]
     if command_mode == _COMMAND_MODE_FULL:
         cmds += [
@@ -233,7 +235,6 @@ def _bot_commands(command_mode: str, lang: str = "") -> list:
             {"command": "bg", "description": t["cmd_bg"]},
             {"command": "review", "description": t["cmd_review"]},
             {"command": "restart", "description": t["cmd_restart"]},
-            {"command": "panic", "description": t["cmd_panic"]},
         ]
     return cmds
 
@@ -612,9 +613,7 @@ async def _edit_panel(api, client, chat_id: int, message_id: int, text: str, key
 async def _validate_bot(api, client, command_mode: str, lang: str) -> None:
     """Validate the token (getMe) and finish bridge startup bookkeeping."""
     await client.call("getMe")
-    # The owner-control commands (evolve/bg/review/restart/panic) only
-    # appear in full_access — they already forward via the raw-command
-    # path; listing them here just makes them discoverable/tappable.
+    # Menu discovery follows command mode; owner Panic has its own immediate door.
     try:
         await client.call("setMyCommands", data={"commands": json.dumps(_bot_commands(command_mode, lang))})
         api.log("info", "Telegram bot commands configured successfully")
@@ -903,7 +902,6 @@ async def _handle_owner_message(
     # guaranteed to equal the pinned owner chat here.
     text = str(message.get("text") or message.get("caption") or "").strip()
     caption = str(message.get("caption") or "").strip()
-
     # Handle /menu command locally — always allowed
     cleaned_text = text.lower().strip()
     is_menu_cmd = _is_exact_bot_command(cleaned_text, "/menu")
@@ -938,6 +936,26 @@ async def _handle_owner_message(
         help_text = _LOCALIZED_TEXTS[lang]["help_text"]
         await client.send_message(chat_id, help_text)
         return
+
+    if text.lower().startswith("/panic"):
+        # Compare Telegram's whole-second date with the host clock at import.
+        # This assumes aligned clocks: a host ahead rejects fresh commands until
+        # Telegram reaches that second; a host behind may admit retained ones.
+        # The boundary second is indistinguishable from fresh input; accept it.
+        if int(message.get("date") or 0) < int(_POLL_GENERATION_STARTED):
+            await client.send_message(chat_id, _LOCALIZED_TEXTS[lang]["panic_earlier"])
+            return
+        try:
+            sender_label = f"Telegram ({_extract_sender_label(sender, chat_id)})"
+            await asyncio.wait_for(_inject(api, {**_owner_ingress_fields(api, chat_id, message, update_id),
+                "text": "/panic", "chat_id": chat_id,
+                "sender_label": sender_label, "transport": {"kind": "telegram", "conversation_id": str(chat_id), "sender_label": sender_label},
+                "user_id": int(sender.get("id") or chat_id), "source": "telegram"}), timeout=2)
+        except Exception:
+            api.log("warning", "Immediate Telegram Panic was not confirmed; it will not be retried.")
+            await client.send_message(chat_id, _LOCALIZED_TEXTS[lang]["panic_unconfirmed"])
+        return
+
 
     # Translate commands to safe natural-language text.
     # _translate_command returns None when the command is rejected.
@@ -1055,7 +1073,9 @@ def _make_outbound(api, cue: TypingCue | None = None):
 
             # Progress telemetry and a root's own card rows → dropped by default (a child's row waits above,
             # then goes as before); the typing indicator already signals "working". Opt in via the toggle.
-            if (event.get("is_progress") or (event.get("card_row") and event.get("delegation_role") != "subagent")) and not _mirror_progress_enabled(local_settings):
+            # A row the host types as a terminal receipt (Wrap up's saved work) is no progress: it goes.
+            if (event.get("is_progress") or (event.get("card_row") and event.get("delegation_role") != "subagent"
+                                             and event.get("terminal_receipt") != "retained_work")) and not _mirror_progress_enabled(local_settings):
                 return
 
             # Routing receipts are typed annotations (suppress_bubble, no text). A landed act stays silent except for a
@@ -1474,8 +1494,8 @@ def register(api):
                              {"value": "safe_commands", "label": "Safe commands only"},
                              {"value": "strict", "label": "Strict"},
                          ],
-                         "help": "Full access forwards raw owner commands including /panic and /restart. "
-                                 "Safe allows /status and /bg status only. Strict blocks every slash command from Telegram.",
+                         "help": "Panic is available in every mode. Full access forwards raw owner commands. "
+                                 "Safe otherwise allows /status and /bg status only; Strict blocks other slash commands.",
                          "placeholder": "full_access"},
                         {"name": "TELEGRAM_MIRROR_MODE", "label": "Mirror mode", "type": "select",
                          "options": [

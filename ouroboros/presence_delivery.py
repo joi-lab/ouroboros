@@ -162,6 +162,8 @@ class PresenceDeliveryRecorder:
             if previous is not None:
                 if previous != digest:
                     raise PresenceDeliveryConflict("presence delivery identity already has different facts")
+                from ouroboros.place_reply import record_late_delivery
+                record_late_delivery(self.data_dir, skill, payload, client_id)
                 return {"ok": True, "recorded": True, "duplicate": True,
                         "history_coverage": "gapped" if self._history_gapped else "indexed"}
 
@@ -201,6 +203,8 @@ class PresenceDeliveryRecorder:
                 self._index = None
                 self._history_gapped = False
                 raise
+            from ouroboros.place_reply import record_late_delivery
+            record_late_delivery(self.data_dir, skill, payload, client_id)
             self._index[key] = digest
             return {"ok": True, "recorded": True, "duplicate": False,
                     "history_coverage": "gapped" if self._history_gapped else "indexed"}

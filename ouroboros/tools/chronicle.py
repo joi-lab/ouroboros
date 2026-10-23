@@ -327,7 +327,8 @@ def _write_page(ctx: Any, root: Path, store: ChronicleStore, author: Dict[str, A
     stamp = host_stamp(root, covers["task_ids"], rows=rows)
     resolver = _quote_resolver(root, lineage, {address["row_sha256"]: pos for address, _r, pos in rows})
     result = store.publish_page(room_id=room, text=a["text"], covers=covers, author=author,
-                                quotes=a["quotes"] or (), host_stamp=stamp, metadata={"coverage_facts": facts},
+                                quotes=a["quotes"] or (), host_stamp=stamp, metadata={"coverage_facts": facts,
+                                "terminal_after_pos": max((pos for _a, _r, pos in chat_chain.iter_room_rows(root, room)), default=-1)},
                                 quote_resolver=resolver, expected_sequence=a["expected_sequence"])
     if not result.ok:
         return _published(ctx, result)
@@ -831,6 +832,10 @@ def _read_node(root: Path, node_id: str, start: int, limit: int, revision: str =
     if record is None:
         raise ValueError(f"memory node {node_id} not found")
     shown, document = _node_document(store, record, revision)
+    from ouroboros.memory_sealing import terminal_links
+    links = terminal_links(root, shown)
+    if links:
+        document += "\n\nHost-linked terminal facts (outside page coverage):\n" + "\n".join(links)
     header = _record_header(shown, _periods(store, root, [shown]).get(shown["id"]))
     at = f", revision={revision}" if revision else ""
     return _window(header, document, start, limit, lambda end: f"memory_read(node_id={node_id}{at}, start={end})")
@@ -849,6 +854,17 @@ def _read_source(root: Path, ref: Any, start: int, limit: int) -> str:
                    lambda end: f"memory_read(source_ref=<same>, start={end})")
 
 
+def _read_rooms(root: Path, store: ChronicleStore, start: int, limit: int) -> str:
+    from ouroboros import memory_view as mv
+
+    spec = mv.ViewSpec("integrator", room_id=None)
+    rows, lineage = memory_inventory.open_rows_by_room(root), row_lineage(root)
+    rooms = mv._live_rooms(store, root, spec, mv._labeler(root), rows, mv._notes_by_room(store), lineage)
+    body = "\n".join(mv._directory_room(room) for room in rooms)
+    return _window(f"Live rooms: {len(rooms)}", body, start, limit,
+                   lambda n: f"memory_read(room_id='*', start={n})")
+
+
 @completed_local_read
 def _memory_read(ctx: Any, node_id: str = "", room_id: Any = None, after_seq: int = 0, rows: bool = False,
                  task_id: str = "", period: Any = None, source_ref: Any = None, start: int = 0, revision: str = "",
@@ -865,8 +881,17 @@ def _memory_read(ctx: Any, node_id: str = "", room_id: Any = None, after_seq: in
     limit = tool_result_limit("memory_read")
     try:
         root = _root(ctx)
-        _activated(root)
-        if source_ref:
+        store = _activated(root)
+        if str(room_id) == "*":
+            text = _read_rooms(root, store, start, limit)
+        elif str(room_id) == "candidates":
+            candidates = store.pending_candidates()
+            body = "\n".join(f"- {r['id']}; room {r['room_id']}; signed by {draft_signer(r['author'])}; "
+                f"memory_read(node_id='{r['id']}'); chronicle_write(kind='decision', target_id='{r['id']}', accepted=true/false, reason='...')"
+                for r in candidates)
+            text = _window(f"Drafts awaiting a decision: {len(candidates)}", body, start, limit,
+                           lambda n: f"memory_read(room_id='candidates', start={n})")
+        elif source_ref:
             text = _read_source(root, source_ref, start, limit)
         elif node_id:
             text = _read_node(root, str(node_id), start, limit, str(revision or ""))
@@ -1020,7 +1045,7 @@ def chronicle_tools() -> List[ToolEntry]:
     }
     read = {
         "node_id": {"type": "string", "description": "One record: as it acts now, its host stamp, coverage, original text, corrections and decisions."},
-        "room_id": room,
+        "room_id": {**room, "description": room["description"] + " '*' lists every live room as one directory line (label, period, counts, reader); 'candidates' lists the helper drafts awaiting my decision."},
         "after_seq": {"type": "integer", "minimum": 0, "description": "Room records and active marks after this sequence (the previous page's next_after_seq)."},
         "rows": {"type": "boolean", "description": "true: the room's chat rows verbatim, one header line each, filtered by from/to, task_id, period."},
         "from": address, "to": address,

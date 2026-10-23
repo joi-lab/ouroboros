@@ -16,7 +16,9 @@ from typing import Any, Dict, List, Optional
 from ouroboros.extension_registry_state import _extensions, _load_failures, _lock
 from ouroboros.skill_loader import (
     LoadedSkill,
+    _SkillLocationCandidate,
     _sanitize_skill_name,
+    _skill_location_inventory,
     discover_skill_identity,
     grant_status_for_skill,
     skill_conflict_status,
@@ -185,18 +187,22 @@ def runtime_state_for_skill_name(
     repo_path: str | None = None,
     skills: Optional[List[LoadedSkill]] = None,
     selected_skill: LoadedSkill | None = None,
+    locations: tuple[_SkillLocationCandidate, ...] | None = None,
 ) -> Dict[str, Any]:
     from ouroboros.config import get_skills_repo_path
 
     resolved_repo_path = get_skills_repo_path() if repo_path is None else repo_path
+    # Share only this observation's directory inventory, not manifest/state bytes.
+    if skills is None and locations is None:
+        locations = _skill_location_inventory(drive_root, repo_path=resolved_repo_path)
     if selected_skill is not None:
         selected = [selected_skill]
     elif skills is not None:
         selected = list(skills)
     else:
-        selected = discover_skill_identity(drive_root, skill_name, repo_path=resolved_repo_path)
+        selected = discover_skill_identity(drive_root, skill_name, repo_path=resolved_repo_path, locations=locations)
     peer_projection = list(skills) if skills is not None else list(
-        discover_skill_peers(drive_root, repo_path=resolved_repo_path)
+        discover_skill_peers(drive_root, repo_path=resolved_repo_path, locations=locations)
     )
     safe_name = _sanitize_skill_name(skill_name)
     skill = next((item for item in selected if item.name == safe_name), None)

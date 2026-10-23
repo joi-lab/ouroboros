@@ -69,15 +69,26 @@ def terminal_reconcile_task(
 
 def terminal_custody_disclosure(
     drive_root: Any, task_id: str, reconciliation: Optional[Mapping[str, Any]] = None,
+    *, snapshot: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Freeze this task's delivery facts without persisting or emitting an annotation."""
+    """Freeze this task's delivery facts without persisting or emitting an annotation.
+
+    Wrap up's retained-work receipt was frozen before the root's final input; it rides
+    every exit, zero-call and error ones too, independently of the model text."""
     result = {
         "task_id": str(task_id or ""),
         "trigger": str((reconciliation or {}).get("trigger") or "final_delivery"),
         "outcomes": list((reconciliation or {}).get("outcomes") or []),
         "unreconciled": [], "audit_status": "ok",
     }
-    _audit_task_custody(drive_root, result["task_id"], result, emit_evidence=False)
+    _audit_task_custody(drive_root, result["task_id"], result, snapshot=snapshot, emit_evidence=False)
+    from ouroboros.task_results import load_task_result
+    try:
+        stored = (load_task_result(drive_root, result["task_id"]) or {}).get("delegate_terminal_reconciliation")
+    except Exception:
+        stored = None
+    if isinstance(stored, Mapping) and isinstance(stored.get("owner_stop_children"), Mapping):
+        result["owner_stop_children"] = dict(stored["owner_stop_children"])
     return result
 
 
@@ -175,7 +186,7 @@ def _audit_task_custody(drive_root: Any, mine: str, result: Dict[str, Any], *,
                  "selected_subagent_id": str(row.selected_subagent_id),
                  **_answer_locators(drive_root, row)}
                 for row in state.values()
-                if row.task_id == mine and row.settled and not row.review_owned
+                if row.task_id == mine and not row.review_owned
                 and row.terminal_state in custody.TERMINAL_STATES
             ), key=lambda row: row["run_id"])
     except Exception:
@@ -206,7 +217,7 @@ def _audit_task_custody(drive_root: Any, mine: str, result: Dict[str, Any], *,
 
 
 def _answer_locators(drive_root: Any, row: Any) -> Dict[str, Any]:
-    """Where a settled run's answer lives, as recorded facts only (#1573).
+    """Where a terminal run's answer lives, as recorded facts only (#1573): no source is read.
 
     ``engine_locator`` is the engine's own run folder and primary-output metadata
     (never text; engine-owned and possibly reclaimed). ``staged_output`` is the
@@ -214,11 +225,21 @@ def _answer_locators(drive_root: Any, row: Any) -> Dict[str, Any]:
     staging task, completeness, the ``read_file`` address the existing lineage read
     admits, and ``source_read``: the exact ``get_task_result`` call that reads it
     from any drive, pinned to the PHYSICAL task publishing this receipt (the run's
-    owner, which a retry successor's staging task need not be). A row that recorded
-    neither — every run settled before these facts existed — adds no key, so its
-    stored receipt stays byte-identical.
+    owner, which a retry successor's staging task need not be). ``terminal_observation``
+    is the engine read-back the body retained (#1564), with the same pinned reader:
+    complete as an observation, never proof that the whole output was collected. A row
+    that recorded none of them adds no key, so its stored receipt stays byte-identical.
     """
     facts: Dict[str, Any] = {}
+    if row.terminal_source:
+        facts["terminal_observation"] = {
+            # Its relative ``read`` belongs to the staging task; only the pinned reader crosses drives.
+            **{key: value for key, value in row.terminal_source.items() if key != "read"},
+            "complete": True, "content_kind": "terminal_observation",
+            "source_read": {"tool": "get_task_result", "arguments": {
+                "task_id": str(row.task_id),
+                "delegated_output_sha256": str(row.terminal_source.get("sha256") or "")}},
+        }
     if row.engine_locator:
         facts["engine_locator"] = dict(row.engine_locator)
     if row.output_source and row.output_artifact:
@@ -240,33 +261,45 @@ def terminal_custody_notice(result: Mapping[str, Any], *, owner_row: bool = Fals
     """Render current stored custody beside unchanged model-authored history.
 
     No live join, lifecycle mutation or inference from a missing run: only the
-    audit's separate execution/invocation/patch and confirmed terminal facts.
+    audit's separate execution/invocation/patch and confirmed terminal facts. A run
+    confirmed terminal whose accounting is not settled stays in the audit's open
+    list (custody unchanged) and reads as terminal with that fact, never as live.
     ``owner_row`` is the owner's task-card row, which lists only the categories
-    holding something; the model, CLI and child-result-hash text keeps them all.
+    holding something and leaves Wrap up's receipt to its own row
+    (``owner_stop_receipt.retained_work_fields``); the model, CLI and
+    child-result-hash text keeps every category and the receipt.
     """
     audit = result.get("delegate_terminal_reconciliation")
     if not isinstance(audit, Mapping) or not audit:
         return ""
+    from ouroboros.owner_stop_receipt import receipt_text
+    retained = "" if owner_row else receipt_text(audit)
     if audit.get("audit_status") != "ok":
-        return "Current delegated execution could not be verified; custody remains unresolved in task details."
+        return "\n\n".join(part for part in (
+            "Current delegated execution could not be verified; custody remains unresolved in task details.",
+            retained) if part)
     terminal = [row for row in (audit.get("terminal_runs") or []) if isinstance(row, dict)]
-    non_success = [row for row in terminal if row.get("state") != "succeeded"]
+    raw_open = audit.get("open_run_ids")
+    open_ids = [str(value) for value in raw_open] if isinstance(raw_open, list) else []
+    unsettled = {str(row.get("run_id")) for row in terminal} & set(open_ids)
+    shown_runs = [row for row in terminal if row.get("state") != "succeeded" or str(row.get("run_id")) in unsettled]
     groups = [
-        ("Open delegated execution", audit.get("open_run_ids")),
+        ("Open delegated execution", [rid for rid in open_ids if rid not in unsettled]),
         ("Pending delegated invocations", audit.get("pending_invocation_ids")),
         ("Pending patch decisions", audit.get("undisposed_patch_run_ids")),
     ]
-    if not non_success and not any(values for _label, values in groups):
-        return ""
+    if not shown_runs and not any(values for _label, values in groups):
+        return retained
     lines = []
-    if non_success:
+    if shown_runs:
         # The leaf's model when the replayed row carried one, never a live join
         # and never a guess: an older row without it simply says less.
         shown = "; ".join(
             f"{row.get('run_id')}: {row.get('state')}"
             + (f" on {row.get('model')}" if row.get("model") else "")
-            for row in non_success[:10])
-        omitted = len(non_success) - 10
+            + (" (accounting not settled)" if str(row.get("run_id")) in unsettled else "")
+            for row in shown_runs[:10])
+        omitted = len(shown_runs) - 10
         lines.append("Confirmed delegated terminal receipts: " + shown
                      + (f" (+{omitted} more in task details)" if omitted > 0 else "") + ".")
     for label, raw in groups:
@@ -277,7 +310,7 @@ def terminal_custody_notice(result: Mapping[str, Any], *, owner_row: bool = Fals
         omitted = len(values) - 10
         lines.append(label + ": " + shown
                      + (f" (+{omitted} more in task details)" if omitted > 0 else "") + ".")
-    return "\n".join(lines)
+    return "\n\n".join(part for part in ("\n".join(lines), retained) if part)
 
 
 def _emit_audit_evidence(drive_root: Any, result: Mapping[str, Any]) -> None:
@@ -534,6 +567,8 @@ def _stored_disclosure_matches(
     if list(existing.get("delegated_runs_unreconciled") or []) != list(
             result.get("unreconciled") or []):
         return False
+    if stored_envelope.get("owner_stop_children") != result.get("owner_stop_children"):
+        return False
     if any(
         list(stored_envelope.get(field) or []) != list(result.get(field) or [])
         for field in _ENVELOPE_DISCLOSURE_FIELDS
@@ -549,10 +584,11 @@ def _stored_disclosure_matches(
 
 # Receipt facts a later custody row adds to an already-settled run (#1573). An
 # audit without one is older than the row that has it, never proof of removal.
-_RECEIPT_LOCATOR_KEYS = ("engine_locator", "staged_output")
+_RECEIPT_LOCATOR_KEYS = ("engine_locator", "staged_output", "terminal_observation")
 # Every other immutable ref a receipt published for its run, sorted by digest: no
 # order is known between them and ``staged_output``, which a delayed audit may set.
 _OTHER_OUTPUTS_KEY = "other_staged_outputs"
+_OTHER_OBSERVATIONS_KEY = "other_terminal_observations"
 
 
 def _published_refs(receipt: Mapping[str, Any]) -> List[Mapping[str, Any]]:
@@ -561,13 +597,26 @@ def _published_refs(receipt: Mapping[str, Any]) -> List[Mapping[str, Any]]:
             if isinstance(ref, Mapping) and ref.get("sha256")]
 
 
+def _published_observations(receipt: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    others = receipt.get(_OTHER_OBSERVATIONS_KEY)
+    return [ref for ref in (receipt.get("terminal_observation"), *(others if isinstance(others, list) else ()))
+            if isinstance(ref, Mapping) and ref.get("sha256")]
+
+
 def _keep_published_outputs(row: Dict[str, Any], old: Mapping[str, Any]) -> Dict[str, Any]:
     """``row`` plus every digest ``old`` published beside ``row``'s own ``staged_output``."""
     refs = {ref["sha256"]: ref for receipt in (old, row) for ref in _published_refs(receipt)}
     own = row.get("staged_output")
     refs.pop(own.get("sha256") if isinstance(own, Mapping) else None, None)
-    kept = {key: value for key, value in row.items() if key != _OTHER_OUTPUTS_KEY}
-    return {**kept, _OTHER_OUTPUTS_KEY: [refs[sha] for sha in sorted(refs)]} if refs else kept
+    kept = {key: value for key, value in row.items() if key not in (_OTHER_OUTPUTS_KEY, _OTHER_OBSERVATIONS_KEY)}
+    if refs:
+        kept[_OTHER_OUTPUTS_KEY] = [refs[sha] for sha in sorted(refs)]
+    observations = {ref["sha256"]: ref for receipt in (old, row) for ref in _published_observations(receipt)}
+    own_observation = row.get("terminal_observation")
+    observations.pop(own_observation.get("sha256") if isinstance(own_observation, Mapping) else None, None)
+    if observations:
+        kept[_OTHER_OBSERVATIONS_KEY] = [observations[sha] for sha in sorted(observations)]
+    return kept
 
 
 def _merge_current_receipts(
@@ -587,13 +636,21 @@ def _merge_current_receipts(
     stale debt it writes keeps its ``delegated_runs`` membership for the heal.
     """
     stored = current.get("delegate_terminal_reconciliation")
+    if isinstance(stored, Mapping) and "owner_stop_children" in stored:
+        if "owner_stop_children" not in result:
+            result = {**result, "owner_stop_children": stored["owner_stop_children"]}
+        else:
+            from ouroboros.owner_stop_receipt import merge_stop_receipt
+
+            result = {**result, "owner_stop_children": merge_stop_receipt(
+                stored["owner_stop_children"], result["owner_stop_children"])}
     rows = stored.get("terminal_runs") if isinstance(stored, Mapping) else None
     prior = {row["run_id"]: row for row in (rows if isinstance(rows, list) else [])
              if isinstance(row, Mapping) and row.get("run_id")}
     if not prior:
         return dict(result)
     receipts = {run_id: row for run_id, row in prior.items()
-                if addressed or "terminal_runs" not in result or _published_refs(row)}
+                if addressed or "terminal_runs" not in result or _published_refs(row) or _published_observations(row)}
     for row in result.get("terminal_runs") or []:
         old = prior.get(row["run_id"]) or {}
         receipts[row["run_id"]] = _keep_published_outputs(

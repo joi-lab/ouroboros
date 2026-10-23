@@ -1186,3 +1186,22 @@ def test_chat_history_replays_an_admission_notice_without_terminal_truth(tmp_pat
     assert rec["text"] == "Аудит · Not started: the working folder can't be used"
     assert "task_terminal_status" not in rec
     assert "outcome_final" not in rec
+
+
+def test_history_preserves_relay_sender_summary_quotes_and_row_identity(tmp_path):
+    """The deck receives every saved relay field, including unknown senders, unchanged."""
+    from ouroboros import dialogue_store as ds
+    from ouroboros.chat_references import projection_fields
+    relay = {'relay_id': 'deck-note', 'summary': 'Check both browser engines',
+             'sender': {'name': 'Verification', 'chat_id': 42, 'task_id': 'sender-task'},
+             'quotes': [{'text': 'Keep my words available', 'source': {'chat_id': 1, 'label': 'Main'}},
+                        {'text': '', 'attachments': [{'name': 'instructions.txt'}], 'source': {'chat_id': 1}}]}
+    row = {'chat_id': 1, 'ts': '2026-10-22T11:00:00Z', 'direction': 'out',
+           'type': 'relay_entry', 'text': 'Full note as written', 'relay': relay}
+    ds.append(tmp_path, 'chat', row, feed=True)
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={'limit': '10'})))
+    note = next(item for item in json.loads(response.body)['messages'] if item.get('relay'))
+    assert note['relay'] == relay
+    assert note['row_address'] == projection_fields(row)['row_address']
+    assert note['text'] == row['text']

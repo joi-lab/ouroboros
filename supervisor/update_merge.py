@@ -858,6 +858,35 @@ def _log_supervisor(payload: Dict[str, Any]) -> bool:
         return False
 
 
+def _observed(tx: Dict[str, Any], outcome: str) -> Dict[str, Any]:
+    """This boot branch's meaning for the attempt projection (gateway/update_progress.py): the transaction
+    it processed and the commit a server must serve for that meaning. Never read by recovery."""
+    commit = tx.get("merge_commit") if outcome == "applied" else tx.get("pre_update_sha")
+    return {"observed": {"outcome": outcome, "attempt_id": str(tx.get("attempt_id") or ""),
+                         "commit": str(commit or "")}}
+
+
+def _cleanup_observed(tx: Dict[str, Any]) -> Dict[str, Any]:
+    """Recover only meanings the completed branch already established before cleanup failed."""
+    restore = tx.get("stash_restore") or {}
+    context = restore.get("context")
+    if context == "boot_restore_resume":
+        # The restore owner preserves its one interrupted marker under this edge.
+        context = ((restore.get("evidence") or {}).get("interrupted") or {}).get("context")
+    if context == "boot_finalize":
+        return _observed(tx, "applied")
+    if context == "boot_stash_recovery":
+        return _observed(tx, "not_applied")
+    reason = tx.get("gate_blocked_reason")
+    if reason == "rollback_restart_pending":
+        return _observed(tx, "rolled_back")
+    if reason == "replace_abandon_tx_cleanup_failed":
+        return _observed(tx, "not_applied")
+    if reason == "stash_marker_cleanup_failed" and tx.get("gate_blocked_from_phase") == "pending_boot_smoke":
+        return _observed(tx, "applied")
+    return {}
+
+
 def _complete_stash_recovery(
     tx: Dict[str, Any], context: str, result: Dict[str, Any], event: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -934,7 +963,8 @@ def _finalize_pending_boot_smoke(tx: Dict[str, Any], supervisor_ready: bool) -> 
             mark_update_tx_gate_blocked("finalize_intent_cleanup_failed")
             return {"finalized": False, "reason": "could not clear update intent"}
         return _complete_stash_recovery(
-            tx, "boot_finalize", {"finalized": True}, {"type": "managed_update_finalized", "head": head},
+            tx, "boot_finalize", {"finalized": True, **_observed(tx, "applied")},
+            {"type": "managed_update_finalized", "head": head},
         )
     if (bool(supervisor_ready) and head_resolved and not merge_in_head) or attempts >= 2:
         ok, msg = _boot_smoke_rollback(tx, "post_boot_smoke_failed")
@@ -1305,7 +1335,8 @@ def _recover_replace_on_boot(tx: Dict[str, Any], supervisor_ready: bool) -> Dict
         if head == pre:
             # No target checkout is visible. Disarm replay and leave the current tree alone;
             # the rescue already exists, but a crash before reset must not erase dirty work.
-            return abandon_unapplied_replace(head)
+            abandoned = abandon_unapplied_replace(head)
+            return {**abandoned, **_observed(tx, "not_applied")} if abandoned.get("abandoned") else abandoned
         reason = "replace_apply_interrupted"
     ok, msg = rollback_managed_update(reason, reopen_writer_admission=False)
     return {"finalized": False, "rolled_back": ok, "msg": msg, "stash_note": msg}
@@ -1317,6 +1348,8 @@ def finalize_managed_update_on_boot(supervisor_ready: bool = True) -> Dict[str, 
     Every completed boot rollback retains custody for one re-exec: HEAD may
     equal pre_update_sha while imported files came from an assisted merge.
     The restored generation clears the existing handoff without another reset.
+    Explicit ``observed`` facts name that branch's transaction and expected served commit;
+    they are presentation, never read by recovery.
     """
     lock_fh = None
     try:
@@ -1367,7 +1400,7 @@ def _finalize_managed_update_locked(supervisor_ready: bool) -> Dict[str, Any]:
             tx, "boot_restore_resume",
             {"finalized": (tx.get("gate_blocked_from_phase") if phase == MARKER_CLEANUP_RETRY_PHASE
                            else phase) == "pending_boot_smoke",
-             "reason": "resumed local work recovery"},
+             "reason": "resumed local work recovery", **_cleanup_observed(tx)},
             {"type": "managed_update_stash_recovered_on_boot"},
         )
     if phase == "stashing_local_work":
@@ -1388,7 +1421,7 @@ def _finalize_managed_update_locked(supervisor_ready: bool) -> Dict[str, Any]:
             tx["stash_sha"] = sha
         return _complete_stash_recovery(
             tx, "boot_stash_recovery",
-            {"finalized": False, "reason": "recovered pre-apply stash crash"},
+            {"finalized": False, "reason": "recovered pre-apply stash crash", **_observed(tx, "not_applied")},
             {"type": "managed_update_stash_recovered_on_boot"},
         )
     if phase == "pending_boot_smoke":
@@ -1411,8 +1444,10 @@ def _finalize_managed_update_locked(supervisor_ready: bool) -> Dict[str, Any]:
         if clear_update_tx():
             _log_supervisor({"type": "managed_update_cleanup_retry_succeeded",
                              "reason": str(tx.get("gate_blocked_reason") or ""), "stash_note": stash_note})
+            # Only a completed rollback's handoff means this restored process is the previous version.
             return {"finalized": True, "reason": "marker cleanup retried",
-                    **({"stash_note": stash_note} if stash_note else {})}
+                    **({"stash_note": stash_note} if stash_note else {}),
+                    **_cleanup_observed(tx)}
         return {"finalized": False, "reason": "marker cleanup still failing",
                 **({"stash_note": stash_note} if stash_note else {})}
     if phase == GATE_BLOCKED_PHASE:

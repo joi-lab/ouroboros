@@ -43,24 +43,77 @@ runs in THAT snapshot, with the same execution root, baseline and binding, and
 takes its custody over, so the earlier work is captured once in the successor's
 cumulative patch. A predecessor whose patch was already applied or rejected is
 continued from a fresh snapshot of the target. The admission floors are unchanged:
-the continuation's access is the caller's own, never wider than the run it continues.
+omitted access keeps the run's narrower profile; explicit access never widens it.
+A writable-to-readonly continuation replaces inherited execution with the ordinary
+nondelegated envelope, no workspace override, and an empty auxiliary-roots list where
+negotiated. Its current read scope stays; the old writer's undisposed patch stays separate.
+The sole widening exception is an explicit
+plan implementation by its recorded starter, within the original and still-current ceiling
+(`delegate_plan.py`); missing legacy ceilings confer no permission. Plan answers/clarifications
+stay read-only on their thread. Git/payload plans preserve a private copy for implementation;
+plain-folder plans can implement in place under ordinary mutability admission. Selected
+folder copies need a fresh executor: the plan thread cannot retarget its workspace.
 
 The harness can execute model-generated commands under the operator's OS
 identity. It is not assumed hostile, but the host cannot review each command
 before it runs.
 
 When a private snapshot exists, the host appends a separate typed execution
-binding after the immutable inherited work order: the snapshot is the writable
-root and the stable project root is a read-only identity until explicit
-integration. Legacy engines that expose only the snapshot as `scope.root`
-receive the same binding using that root. Full native access does not make the
+binding after the immutable inherited work order: the snapshot is the root of the
+run's work product and the stable project root is a read-only identity until
+explicit integration. Legacy engines that expose only the snapshot as `scope.root`
+receive the same binding using that root. The binding, the `workspace_write`
+access line and the unproven-boundary sentence state one write rule, because
+verification needs writes no copy may hold: disposable process state (test
+scratch, package-manager temporaries) goes outside every Git working tree, the
+binding naming safe_test's default parent through the launcher's own predicate,
+so its ancestor guard stays intact (only a body copy's facts name safe_test itself);
+durable package downloads go only to the shared download cache the environment facts
+name; evidence goes under the copy's `.review-evidence/`. Where the route's catalog row
+negotiates `accessControl.auxiliaryWritableRoots` (never a guess from a harness name or
+write mechanism) and the start is an Agent `workspace_write` one, the host makes the run's
+exact short scratch under `test_environment.default_temp_parent()` (`/tmp/obs-<random>` on
+macOS, resolved physically), with its path/inode record in the ungranted task drive at
+`task_drives/<task>/session_scratch_owners/<snapshot>/scratch.json` (a reviewer seat's
+`seat-<seat>`), and the cache's `uv`/`pip`/`npm` folders, real directories outside every Git
+tree and never reached through a link, and adds only these exact directories as
+`execution.auxiliaryWritableRoots`; the binding, a seat's checking text and the facts then
+name that scratch instead of the default parent (`workspace_preflight.session_service_directories`).
+The native profile's existing temporary-directory permissions are unchanged. Directory grants do
+not grant IPC or process inspection: a blocked check stays unverified, with its command and
+diagnostics retained. After inspecting the candidate, the integrating mind may run it through
+existing host tools under its own authority. This runs candidate code with ordinary OS-user rights;
+safe_test isolates environment and process custody, not the OS. No automatic Full, network change,
+new verifier or weakened check follows from a refusal.
+Any other route gets no such field and a typed limitation in its facts; read-only, full
+access and a `tool_policy` route (an unconfined shell) keep their on-demand behavior; an exact
+retry replays its recorded request, without recreating paths the OS or the original task's
+drive may already have retired. A continuation binds its own start's rights; one from another
+task need not reuse prior scratch; a new start replaces scratch removed by OS aging, never a
+directory with a different identity. The drive's custody trash removal retires short scratch
+too. Retention markers, unreadable/replaced ownership or failed removal keep the trash and
+pointer; they may require manual resolution, not just another pass. A hard kill before record publication may leave an
+unrecorded empty temp directory. No temp-root sweep or retry-time fallback is provided. A review
+thread, whose turns carry geometry only, claims no grant.
+Capture keeps files new there since the baseline, untracked, staged or committed, out of
+the patch, disclosed, and retains them whole beside it before apply or reject releases the
+copy, again whenever the folder changed since. Baseline-owned entries, including symlinks,
+stay product and are neither followed nor retained as host evidence; while a surviving copy still holds
+an unretained entry the disposition refuses, so the undisposed copy stays in custody
+as its last copy (`subagent_integration_delegated.run_named_evidence`). A skill-payload
+or engine directory product copy is captured whole and names no evidence folder; a
+folder investigation's copy is itself its retained evidence. A writable Git copy or
+reviewer seat also gets candidate-derived environment facts
+(`workspace_preflight.session_environment_facts`), never an install; a read-only
+session gets neither a write place nor those facts. Full native access does not make the
 binding enforceable by itself, so terminal capture records authority-tree drift
 as diagnostic evidence. A ready-no-changes result remains a normal no-change
 capture even when the shared authority tree moved; the evidence names the
 changed paths and keeps authorship unknown. A ready-with-changes result retains
 its private artifact and the existing locked apply check decides whether
 integration is safe. Excluded nested repositories remain outside the snapshot
-inventory and are disclosed as an untracked residual.
+inventory, are named on the start receipt and disclosed as an untracked residual
+(an ignored clone is not inventoried, and a tracked submodule is not populated).
 
 A child or reviewer without write authority but with configured
 `workspace_write`/`full` access is an evidence-only investigation: the same
@@ -82,8 +135,8 @@ lineage file, a scheduled origin's whole `task_drive`/`artifact_store` included
 unreadable or nonregular file refuses the start before opening it (`readonly_inputs_unavailable`). A folder no private copy serves (a data-drive subfolder, an
 ignored starting folder) refuses typed, naming `access='readonly'`. A read-only child
 (an explicit `readonly` lowering, Observe, or a Presence ceiling without a
-delegated write grant) requests `mode: ask`, `access: readonly` under Claudexor's
-ordinary envelope. Its parent-selected starting folder is the session project
+delegated write grant) defaults to `mode: ask`, `access: readonly`. Explicit
+`mode: plan` is also read-only; omitted mode preserves access-derived execution. Its parent-selected starting folder is the session project
 root, not a read boundary; omitting it preserves inherited/folderless behavior.
 The host reads effective access back for both shapes;
 the delegated HOME/boundary checks below apply only to marker-carrying runs.
@@ -183,8 +236,8 @@ Two floors, because they gate two different lanes, and one evidence reader, beca
 one question left that a floor cannot answer:
 
 - `CLAUDEXOR_MIN_VERSION` (3.2.0) — the TRANSPORT floor, checked at handshake. It gates
-  read-only delegation and must be the lowest engine that serves it. Read-only sends no
-  `execution` block at all.
+  read-only delegation and must be the lowest engine that serves it. Fresh read-only starts
+  omit `execution`; lowering a writable continuation explicitly replaces it (§2).
 - `CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION` (3.3.0) — the MARKER floor, checked in
   `route_health` against the run SHAPE, before a token is spent. An engine below it would
   reject the request with a 400, so the lane refuses it with a typed reason
@@ -292,3 +345,44 @@ The disclosure reaches three places:
 3. **the parent-facing result** — `delegate_wait`'s terminal payload carries `containment`
    with `os_boundary`, `verified`, and `disclosed`/`attempts`, and a note naming what was
    reachable rather than merely saying a check failed.
+
+## Independent runs under one focus
+
+A root or configured-session nanny may own any number of delegated runs, on the
+same configured row or different rows. Admission has no concurrency cap or
+quota-derived team limit. Each deliberate prompt gets a fresh immutable invocation;
+`retry_of` reuses the unresolved invocation's original body and binding. Existing
+runs and undisposed patches remain custody obligations, not start refusals.
+
+The initial leaf-first bootstrap alone uses the saved assignment and row. Its
+identity is persisted under the actor decision lock before transport, so restarting
+cannot bootstrap a second leaf. Omitted selectors retain the assigned-row behavior;
+an explicit later selector and prompt describe independent work. Empty-prompt
+replacement requires verified settlement. Zero-run race checks and unreadable
+custody/billing refusals remain. A continuation inside the same snapshot still
+requires an unambiguous predecessor disposition and a single writer.
+
+Supervision schema 2 stores each run's cursor, pending wake and interaction ACKs
+separately; mail and coordination cursors belong to the task. `delegate_wait` takes
+one `run_id` or an exclusive `runs` array and wakes on any selected run. Exact
+receipt incorporation alone ACKs a wake. An unknown-provider nanny hold may name
+several positively live leaves, without resending the lost cognitive request.
+
+Recovery schema 2 holds all run and pending-invocation bindings. Adoption reports
+adopted, deferred or refused per holder, restoring a settled wake alongside live
+and pending work. Saved cognition defers pending replay; other recovery replays
+only the invocation's saved binding. Root-direct recovery uses the same path.
+Orphan protection and registration retention name exact handles, not every run of a
+reserved task. Stop reaches all owned runs and late pending starts; no new POST.
+Windows transfer needs observed parent exit 42 and measured parent/successor identity.
+Schema-1 checkpoints migrate in memory, writing v2 on mutation without rewriting events
+or issuing requests. Corruption stays unknown; live v2 custody prevents downgrade.
+
+Private skill-payload captures may coexist. The target mutation lock spans the
+whole-payload content-hash check, apply and publication; a stale second capture
+refuses with evidence retained. Git integration retains its target lock and
+per-path baselines: disjoint changes can apply, overlapping drift conflicts.
+Each starter still disposes each capture. There is no automatic merge arbiter.
+These rules apply to API-only, subscription-only and mixed installations and to
+Advisory, Blocking and Cyber Pro; configured route availability and review floors
+remain independent.

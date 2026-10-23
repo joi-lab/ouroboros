@@ -9,7 +9,7 @@
     "id": "test_degraded_outcomes_render_with_typed_severity",
     "path": "web/modules/log_events.js",
     "kind": "contains",
-    "value": "const presentation = taskPresentation(terminal || outcome === 'error' ? outcome : 'working');"
+    "value": "const presentation = taskPresentation(terminal || outcome === 'error' ? outcome : 'working',"
   },
   {
     "id": "test_degraded_outcomes_render_with_typed_severity",
@@ -45,7 +45,7 @@
     "id": "test_chat_progress_updates_route_into_live_card",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "Show details"
+    "value": "<span class=\"chat-live-toggle\" data-live-toggle>Details</span>"
   },
   {
     "id": "test_chat_progress_updates_route_into_live_card",
@@ -237,7 +237,7 @@
     "id": "test_live_card_recovery_keeps_step_failures_non_terminal",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "const presentation = taskPresentation(phase || 'done');"
+    "value": "const presentation = taskPresentation(phase || 'done',"
   },
   {
     "id": "test_live_card_recovery_keeps_step_failures_non_terminal",
@@ -660,22 +660,70 @@
     "value": "bar.value"
   },
   {
-    "id": "test_evolution_tags_table_escapes_untrusted_tag_names",
+    "id": "test_evolution_history_escapes_untrusted_tag_names_and_release_words",
     "path": "web/modules/evolution.js",
     "kind": "contains",
-    "value": "escapeHtmlText(p.tag || '')"
+    "value": "import { escapeHtmlAttr as esc } from './ui_primitives.js';"
   },
   {
-    "id": "test_evolution_tags_table_escapes_untrusted_tag_names",
+    "id": "test_evolution_history_escapes_untrusted_tag_names_and_release_words",
     "path": "web/modules/evolution.js",
     "kind": "contains",
-    "value": "escapeHtmlText(dateStr)"
+    "value": "${esc(version.version)}"
   },
   {
-    "id": "test_evolution_tags_table_escapes_untrusted_tag_names",
+    "id": "test_evolution_history_escapes_untrusted_tag_names_and_release_words",
+    "path": "web/modules/evolution.js",
+    "kind": "contains",
+    "value": "${esc(fullDate(version.t))}"
+  },
+  {
+    "id": "test_evolution_history_escapes_untrusted_tag_names_and_release_words",
+    "path": "web/modules/evolution.js",
+    "kind": "contains",
+    "value": "Source: ${esc(sourceLabel(version))}"
+  },
+  {
+    "id": "test_evolution_history_escapes_untrusted_tag_names_and_release_words",
+    "path": "web/modules/evolution.js",
+    "kind": "contains",
+    "value": ">${esc(words.title)}</h4>"
+  },
+  {
+    "id": "test_evolution_history_escapes_untrusted_tag_names_and_release_words",
+    "path": "web/modules/evolution.js",
+    "kind": "contains",
+    "value": ">${esc(words.body)}</p>"
+  },
+  {
+    "id": "test_evolution_history_escapes_untrusted_tag_names_and_release_words",
+    "path": "web/modules/evolution.js",
+    "kind": "contains",
+    "value": ">${esc(label.text)}</text>"
+  },
+  {
+    "id": "test_evolution_history_escapes_untrusted_tag_names_and_release_words",
     "path": "web/modules/evolution.js",
     "kind": "not_contains",
-    "value": "<td><code>${p.tag}</code></td>"
+    "value": ">${words.title}<"
+  },
+  {
+    "id": "test_evolution_history_escapes_untrusted_tag_names_and_release_words",
+    "path": "web/modules/evolution.js",
+    "kind": "not_contains",
+    "value": ">${words.body}<"
+  },
+  {
+    "id": "test_evolution_history_escapes_untrusted_tag_names_and_release_words",
+    "path": "web/modules/evolution.js",
+    "kind": "not_contains",
+    "value": ">${label.text}<"
+  },
+  {
+    "id": "test_evolution_history_escapes_untrusted_tag_names_and_release_words",
+    "path": "web/modules/evolution.js",
+    "kind": "not_contains",
+    "value": ">${version.version}<"
   },
   {
     "id": "test_skill_lifecycle_terminal_progress_can_finish_live_card",

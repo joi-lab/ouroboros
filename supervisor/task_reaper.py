@@ -739,7 +739,6 @@ def _enqueue_retry(
     unreconciled_runs: Optional[list] = None,
     salvage_note: str = "",
     custody_audit: Optional[Dict[str, Any]] = None, clock_meta: Optional[Dict[str, Any]] = None,
-    spent_resume: bool = False,
 ) -> tuple[bool, int, str, Dict[str, str]]:
     """Publish retry and reciprocal lineage under queue->cancel locks, unless cancelled/terminal.
     A later cancel resolves the admitted chain to its physical leaf under the same lock."""
@@ -768,12 +767,9 @@ def _enqueue_retry(
     fold_consumed_resume(clock_meta, q.DRIVE_ROOT)  # consumption may follow RUNNING's capture/removal
     fold_running_clock(retried, clock_meta)
     stamp_execution_handoff(retried, clock_meta)
-    # #1729: authority the dead attempt consumed is spent — its exact grant, and a hold selection its
-    # own dispatch used (``selected`` is a hold's only release); only its saved work continues.
-    if spent_resume:
-        retried.pop("_budget_pause_resume", None)
-    if isinstance(retried.get("_budget_pause_hold"), dict) and retried["_budget_pause_hold"].get("selected") is True:
-        retried.pop("_budget_pause_hold")
+    # #1729: a new attempt continues saved work, never a copied grant or selection.
+    retried.pop("_budget_pause_resume", None)
+    retried.pop("_resume_selection", None)
     if retry_task_id and retry_task_id != task_id:
         from ouroboros.artifacts import handoff_task_attachments_for_retry
         from ouroboros.owner_mailbox import copy_owner_mailbox_for_retry
@@ -1412,7 +1408,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                     runtime_sec=runtime_sec,
                     unreconciled_runs=unreconciled,
                     salvage_note=salvage_note,
-                    custody_audit=custody_audit, clock_meta=job.get("meta"), spent_resume=pause == "spent",
+                    custody_audit=custody_audit, clock_meta=job.get("meta"),
                 )
                 will_retry = requeued
             except Exception:

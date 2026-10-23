@@ -126,8 +126,9 @@ def isolate(monkeypatch, root: pathlib.Path) -> pathlib.Path:
 def make_ctx(serving: pathlib.Path, data: pathlib.Path, task_id: str, **overrides):
     from ouroboros.tools.registry import ToolContext
 
+    # An owner task carries the work kind its admission minted; an unmarked context is consciousness.
     fields = dict(repo_dir=serving, drive_root=data, system_repo_dir=serving, task_id=task_id,
-                  branch_dev="ouroboros", task_metadata={"root_task_id": task_id})
+                  branch_dev="ouroboros", task_metadata={"root_task_id": task_id, "work_kind": "owner"})
     fields.update(overrides)
     return ToolContext(**fields)
 

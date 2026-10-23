@@ -81,7 +81,7 @@ Generate a fresh random `nonce` string for every mount and embed it in the boots
 | `ouro-widget-download` | `id`, `name`, `source` | Save a `Blob`, a `data:` URL or a URL under the skill's prefix. |
 | `ouro-widget-open-external` | `id`, `url` | Open an external link. |
 | `ouro-widget-resize` | `height` | The measured content height in pixels (§5). |
-| `ouro-widget-error` | `kind: "error" \| "rejection" \| "csp"`, `message`, `source`, `line` | A fault inside the frame. Show it on the card. |
+| `ouro-widget-error` | `kind: "error" \| "rejection" \| "csp"`, `message`, `source`, `line` | A fault inside the frame. Show it on the card; builtin logging is described in §5. |
 | `ouro-widget-disposed` | | The frame finished its dispose hooks (§6). |
 
 `init.body` is a structured-clone value: `null`, a string, an `ArrayBuffer`, a typed-array view or a `Blob`. Preserve a view's offset and length. There is no base64 wrapper or required transfer list for request buffers. The builtin bridge posts the body without a transfer list; the page passes that cloned value to fetch. Response chunks have the separate transfer behavior below.
@@ -118,6 +118,10 @@ There is no default timeout. A positive `init.timeoutMs` aborts the request afte
 
 **External links.** Open the link only while the page has a user activation. Answer with `result: {ok: true, ...}`, `{ok: false, degraded, ...}` when only a fallback (such as copying the link) was possible, or `{ok: false, error}`. The frame treats `ok` or `degraded` as success.
 
+**Faults.** Show the fault in the card's status (a card in a message shows it there) and leave the card running. The builtin host additionally posts it once per kind and message, at most 10 per mount, to `POST /api/widgets/fault` (`WidgetFaultRequest`): this card's own `skill`, `tab_id` and `revision`, `where: "board"` or `"message"`, and the frame's `kind`, `message` (clipped to 500 characters), `source` (200) and `line`; a value that is not a string is sent as `""`, a line that is not a whole number from 0 as `0`. Never take who the widget is from the message, and count per mount, not per frame: the widget's own code can read the nonce and post directly. Reporting is optional for other clients. A report is best effort: no retry, and a refusal changes nothing on the card. Until the stop finishes (§6) the frame still reports.
+
+The server normalizes unpaired UTF-16 surrogates in the clipped text to U+FFFD before writing UTF-8; valid emoji remain intact.
+
 ## 6. Stopping a widget
 
 Stopping is a handshake:
@@ -136,7 +140,9 @@ A frame that has already gone away is removed at once.
 | `manual` | Shows the title, icon and a Start button. Runs only after Start. Leaving the view stops it. |
 | `retain` | Starts on the first visit to the widgets view and keeps running on other views until Stop, until the skill leaves the card list, or until the page goes away. |
 
-The owner's choice in `widget_start_mode` overrides `start`. Stop always wins. Installing or enabling a skill never starts a widget: only showing the widgets view does. A frame never outlives the page that hosts it.
+The owner's choice in `widget_start_mode` overrides `start`. Stop always wins: the builtin host keeps the owner's Stop on that device across reloads until Start or a change to `auto` / `retain`. Installing or enabling a skill never starts a widget: only showing the widgets view does. A frame never outlives the page that hosts it.
+
+On WebKit, Android WebView and Firefox a frame shares the page's thread, so a start that loops or blows up takes the page with it. The builtin host writes each frame's start to a local ledger before the frame gets its document and clears it one second after the frame's first `load`, or when the page hides (its thread outlived the start); a card whose last start with this revision the page did not outlive is not started by itself on any view (its facade, one line, Start). A page opened with `?hold=all` holds every frame for that load.
 
 ## 8. Other widget kinds
 
@@ -147,7 +153,7 @@ The owner's choice in `widget_start_mode` overrides `start`. Stop always wins. I
 
 Ouroboros can show a widget, or a small app of its own, inside its own chat message: a living card ([`CLIENT_CONTRACT.md`](CLIENT_CONTRACT.md) §5 "Living cards"). A frame in a message is not a Widgets card. It never joins the widgets view's cards or launch policy, and leaving the widgets view stops nothing in a message; the message disposes its frames when its row goes, and with the page. The builtin implementation is `web/modules/card_frames.js` and `web/modules/chat_cards.js`.
 
-- **Size.** A frame in a message is at least 120 pixels tall and at most 70 % of the window's height. Taller content is cut until the owner presses Expand (then up to the 8192-pixel ceiling); Collapse cuts it again. There is no 320-pixel floor. A module widget's `height` is honoured up to the cap; a self-sizing one reports through `ouro-widget-resize` as on the widgets view. A declarative widget shown in a message is measured and cut the same way. The builtin host runs at most three frames in one feed, started when they come near the view; a frame far from it rests as the card's words with Open.
+- **Size.** A frame in a message is at least 120 pixels tall and at most 70 % of the window's height. Taller content is cut until the owner presses Expand (then up to the 8192-pixel ceiling); Collapse cuts it again. There is no 320-pixel floor. A module widget's `height` is honoured up to the cap; a self-sizing one reports through `ouro-widget-resize` as on the widgets view. A declarative widget shown in a message is measured and cut the same way. The builtin host runs at most three frames in one feed, started when they come near the view; a frame far from it rests as the card's words with Open. A running frame has Close, which rests it the same way on that device until Open; a frame whose last start the page did not outlive (§7) rests so too, with its line, and an app opened from that hold starts without its saved state.
 - **A skill's widget in a message** is the tab `GET /api/widgets` lists for the card's `{skill, tab_id}`. When it is not listed, show the card's words and say that the skill is off. The module bridge, its events and the theme work as on the widgets view; a widget fault is shown on the card. The card's `input` (an object) gives a declarative widget's form fields of the same names their first values; what the owner typed in this page session wins. A module widget gets no input.
 - **An app** is HTML Ouroboros wrote, read as text from `GET /api/cards/{card_id}/app` and never opened as a page. It runs in its own frame, not the module frame: a created `<iframe>` with `sandbox="allow-scripts"` and nothing else (no `allow` attribute), whose `srcdoc` property is set to `<!doctype html><html data-theme="light|dark"><head>`, then this document policy as the head's first element, then a viewport line, the theme and the bridge script, then `</head><body>`, the app's HTML and `</body></html>`:
 
@@ -155,9 +161,10 @@ Ouroboros can show a widget, or a small app of its own, inside its own chat mess
   default-src 'none'; script-src 'unsafe-inline' blob: data:; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; font-src data:
   ```
 
-  An app has no fetch, WebSocket or load, no skill route, no request relay, no events, no downloads and no links out. No page policy covers two paths to the network: navigating its own frame (every navigation is a request; when one loads a second document the host removes the frame and says so on the card, while a navigation answered without a document leaves the app running) and WebRTC. The frame keeps the app away from Ouroboros and the page, not from the network; its only author is Ouroboros, which has the network anyway. The theme reaches the app as `data-theme` and the custom properties `--ouro-text`, `--ouro-text-meta`, `--ouro-accent`, `--ouro-surface`, `--ouro-tray`, `--ouro-border`, `--ouro-ok`, `--ouro-warn`, `--ouro-error`, `--ouro-font` and `--ouro-radius`.
-- **The app bridge** is three messages from the frame and one from the page, each carrying the mount's nonce; the page acts only on messages from that frame's own window:
+  An app has no fetch, WebSocket or load, no skill route, no request relay, no events, no downloads and no links out. No page policy covers two paths to the network: navigating its own frame (every navigation is a request; when one loads a second document the host removes the frame and says so on the card, while a navigation answered without a document leaves the app running) and WebRTC. The frame keeps the app away from Ouroboros and the page, not from the network; its only author is Ouroboros, which has the network anyway. The theme reaches the app as `data-theme` and the custom properties `--ouro-text`, `--ouro-text-meta`, `--ouro-accent`, `--ouro-surface`, `--ouro-tray`, `--ouro-border`, `--ouro-ok`, `--ouro-warn`, `--ouro-error`, `--ouro-font` and `--ouro-radius`, read where the frame lies: inside a dark voice they are that voice's own inks and surfaces, at mount and at every theme change.
+- **The app bridge** is four messages from the frame and one from the page, each carrying the mount's nonce; the page acts only on messages from that frame's own window:
   - `ouro-card-resize {height}`: the content height. The bridge reports it itself as the document grows.
+  - `ouro-card-error {kind, message}`: a script error, an unhandled rejection or a policy refusal (`kind` `error`, `rejection` or `csp`), sent by the bridge itself, each once and ten at most; the host shows it on the card.
   - `ouro-card-state {state}`: JSON text of at most 32 KiB. The host keeps it per card and app bytes in the tab's session storage and hands it back at the next mount.
   - `ouro-card-submit {value, summary}`: the host puts one line into the owner's draft, `From «<title>»: <summary>` followed by the value as compact JSON when that is 300 characters or fewer, and focuses the field. It never sends: only the owner's Send does.
   - `ouro-card-theme {theme: {name, css}}`, page to frame: the theme changed.

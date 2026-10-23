@@ -425,6 +425,7 @@ class _SlowPollStub(_StreamingStub):
         super().__init__(**kwargs)
         self.read_sec, self.reads, self._clock = read_sec, [], time.monotonic
         self.read_spans = []
+        self.requested_bounds, self.timed_out = [], []
 
     def get_run(self, rid, *, timeout_sec=None):
         import time
@@ -432,13 +433,14 @@ class _SlowPollStub(_StreamingStub):
         from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
         self.reads.append(self._clock())
+        self.requested_bounds.append(timeout_sec)
         bound = self.read_sec if timeout_sec is None else min(self.read_sec, float(timeout_sec))
         time.sleep(bound)
-        # The span is recorded STUB-side so "the bound is what ended this read" is
-        # judged on the read's own clock, deterministically — not reconstructed
-        # through the caller's noisy end-to-end wall clock.
+        # Diagnostic wall span only: even this sleep may resume late under contention.
+        # The requested bound and timeout branch below establish the timeout contract.
         self.read_spans.append(self._clock() - self.reads[-1])
         if bound < self.read_sec:
+            self.timed_out.append(len(self.reads))
             raise ClaudexorUnavailable("daemon_unreachable",
                                        "Claudexor daemon unreachable: ReadTimeout")
         return super().get_run(rid)
@@ -681,12 +683,10 @@ def test_the_last_poll_of_a_spent_window_is_bounded_not_skipped(tmp_path, monkey
     # (the stub's own read span, and the expiring_poll recorder above — an unbounded
     # final read would answer instead of raising and never pass through it twice).
     assert elapsed < window + 0.4 + 3.0, elapsed
-    # The BOUND is what ended that read, not the daemon: it cost the 0.4s bound, not
-    # the 1.2s the daemon wanted — judged on the stub's own span, so caller-side
-    # scheduler noise cannot inflate it (the previous reconstruction through
-    # `elapsed` could).
-    last_read_sec = slower.read_spans[-1]
-    assert last_read_sec < 0.4 + 0.4, last_read_sec
+    # The transport received the short bound, and the final read took its timeout
+    # branch. A late OS wakeup cannot change either fact.
+    assert slower.requested_bounds[-1] == pytest.approx(0.4), slower.requested_bounds
+    assert slower.timed_out == [2], slower.timed_out
 
 
 def test_a_run_that_finishes_during_the_last_sleep_is_reported_terminal(tmp_path, monkeypatch):

@@ -80,6 +80,7 @@ def test_unavailable_recent_then_latest_keeps_a_retained_room_at_the_present(dir
             _screenshot(page, tmp_path, f'unavailable-recent-latest-{browser_engine}')
 
             page.locator('#project-panel-close').click()
+            page.locator('.chat-instance-panel[data-pending-work="1"]').wait_for(state='attached')
             assert page.locator('.chat-instance-panel[data-pending-work="1"]').count() == 1
             before = page.evaluate('() => window.__historyReads.length')
             _click_project(page, project)
@@ -142,7 +143,7 @@ def test_a_visible_receipt_line_keeps_its_node_when_the_newest_window_moves_past
         browser = getattr(pw, browser_engine).launch(headless=True)
         try:
             # A feed shorter than the bounded timeline lets it overhang both edges.
-            page = browser.new_page(viewport={'width': 1280, 'height': 440})
+            page = browser.new_page(viewport={'width': 1280, 'height': 360})
             _open(page, direct_server_with_data['url'])
             feed = _open_project(page, project)
             card = page.locator(f'{feed} .chat-live-card[data-task-id="{task_id}"]')
@@ -225,6 +226,7 @@ def test_send_while_a_reopened_room_loads_keeps_a_failed_draft_and_stays_at_the_
                         _step(page, feed, automatic=True)
                     _bookmark_place(page, target, 80)
                 page.locator('#project-panel-close').click()
+                page.locator(feed).wait_for(state='detached')  # a new instance owes the held newest read
                 page.evaluate('id => { window.__holdRoom = {chatId: id, released: new Promise(r => { window.__releaseRoom = r; })}; }', cid)
                 _click_project(page, project)
                 page.wait_for_function(held, arg=cid)
@@ -303,6 +305,7 @@ def test_unavailable_recent_in_a_shallow_room_reopens_following_the_present(dire
             assert page.locator(feed).evaluate(_GAP) <= 8
 
             page.locator('#project-panel-close').click()
+            page.locator('.chat-instance-panel[data-pending-work="1"]').wait_for(state='attached')
             assert page.locator('.chat-instance-panel[data-pending-work="1"]').count() == 1
             _click_project(page, project)
             page.evaluate(_FRAMES)

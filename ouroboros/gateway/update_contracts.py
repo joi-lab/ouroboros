@@ -57,6 +57,7 @@ class UpdateApplySuccessResponse(TypedDict):
     task_id: NotRequired[str]
     merge_plan: NotRequired[UpdateMergePlan]
     error: NotRequired[str]
+    keep_branch: NotRequired[str]
 
 
 class UpdateApplyErrorResponse(TypedDict):

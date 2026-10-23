@@ -34,6 +34,33 @@ def _chip_mark(chip):
                          " return [mark.dataset.shape, mark.dataset.hue, el.dataset.chipTone]; }")
 
 
+def _assert_narrow_identity(card):
+    assert card.get_attribute("data-expanded") != "1"
+    role = card.locator('[data-live-title]')
+    assert card.locator('[data-live-disclosure]').is_visible()
+    facts = card.evaluate("""el => {
+        const role = el.querySelector('[data-live-title]'), style = getComputedStyle(role);
+        const chip = el.querySelector('[data-live-phase]');
+        const details = el.querySelector('[data-live-disclosure]');
+        const r = role.getBoundingClientRect(), c = chip.getBoundingClientRect();
+        const d = details.getBoundingClientRect();
+        return {width: r.width, clipped: role.scrollWidth > role.clientWidth,
+            ellipsis: style.textOverflow, overflow: style.overflowX, whiteSpace: style.whiteSpace,
+            roleTop: r.top, chipTop: c.top,
+            detailsTop: d.top - parseFloat(getComputedStyle(details).marginTop),
+            ordered: c.right <= r.left && r.right <= d.left,
+            cardFits: el.scrollWidth <= el.clientWidth + 1,
+            chipFits: chip.scrollWidth <= chip.clientWidth + 1};
+    }""")
+    assert facts["width"] >= 40, facts  # A readable role fragment, not a zero-width flex item.
+    assert role.is_visible() and role.inner_text() == "researcher"
+    assert facts["clipped"] and facts["ellipsis"] == "ellipsis", facts
+    assert facts["overflow"] == "hidden" and facts["whiteSpace"] == "nowrap", facts
+    assert abs(facts["roleTop"] - facts["chipTop"]) <= 1, facts
+    assert abs(facts["detailsTop"] - facts["chipTop"]) <= 1, facts
+    assert facts["ordered"] and facts["cardFits"] and facts["chipFits"], facts
+
+
 @pytest.mark.parametrize("engine,ending", [("chromium", "recovery"), ("webkit", "recovery"), ("chromium", "cancel")])
 def test_nested_child_wait_and_same_id_recovery(direct_server_with_data, tmp_path, monkeypatch, engine, ending):  # noqa: F811
     from playwright.sync_api import sync_playwright
@@ -143,7 +170,7 @@ def test_nested_child_wait_and_same_id_recovery(direct_server_with_data, tmp_pat
             page.evaluate("() => window.__heldCard = document.querySelector('.chat-live-card[data-task-id=held]')")
             page.set_viewport_size({"width": 390, "height": 844})
             shot(page, "held-narrow")
-            assert child_card.evaluate("el => el.scrollWidth <= el.clientWidth + 1")
+            _assert_narrow_identity(child_card)
             # Typed unknown-dispatch fact uses the same host projection, without a
             # promise of automatic continuation (no client text classification).
             held = next(row for row in host.pending if row["id"] == child["id"])
@@ -155,6 +182,7 @@ def test_nested_child_wait_and_same_id_recovery(direct_server_with_data, tmp_pat
             assert "automatic recovery is not authorized" in child_card.locator('[data-live-meta]').inner_text()
             assert _chip_mark(child_card.locator('[data-live-phase]')) == STILL
             shot(page, "previous-run-unconfirmed-narrow")
+            _assert_narrow_identity(child_card)
             held["_project_admission_restore_hold"] = previous_hold
             unreadable["on"] = False
             assert result_signature(root, "held") == original  # the original receipt, unchanged

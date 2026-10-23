@@ -347,19 +347,57 @@ def disabled_tools_dispatch_only(ctx: Any) -> bool:
 
 
 _GITHUB_TOKEN_TOOLS = frozenset({
-    "list_github_prs",
-    "get_github_pr",
-    "get_github_checks",
-    "comment_on_pr",
+    "github_read",
+    "github_write",
     "pr_merge",
-    "list_github_issues",
-    "get_github_issue",
-    "comment_on_issue",
-    "close_github_issue",
-    "create_github_issue",
     "submit_skill_to_hub",
-    "generate_evolution_stats",
 })
+
+# Consolidation compatibility (2026-10-22): the nine narrow GitHub tools became methods of
+# `github_read` / `github_write`. A saved contract or metadata that withheld a retired name keeps
+# withholding the method(s) that name covered; the successor's `api` hatch goes with it because it
+# reaches every capability, and `search` goes with a retired list tool because it enumerates the
+# same objects. `comment_on_issue` withholds the whole comment method: an issue and a pull request
+# share one number space, so the one verb cannot be split without a read. Each row:
+# retired name -> (successor, ((method, {argument: value}), ...)); an empty constraint withholds
+# every call of that method; target='*' means a positive issue/PR target, never a repo-wide sweep.
+# The dead name stays in the set too (harmless: nothing registers it).
+_RETIRED_GITHUB_TOOLS: dict[str, tuple[str, tuple[tuple[str, dict[str, str]], ...]]] = {
+    "list_github_issues": ("github_read", (("list", {"kind": "issue"}), ("search", {}), ("api", {}))),
+    "get_github_issue": ("github_read", (("get", {"kind": "issue"}), ("list", {"kind": "comment", "target": "*"}), ("api", {}))),
+    "list_github_prs": ("github_read", (("list", {"kind": "pr"}), ("search", {}), ("api", {}))),
+    "get_github_pr": ("github_read", (("get", {"kind": "pr"}), ("list", {"kind": "review", "target": "*"}),
+                                    ("list", {"kind": "review_comment", "target": "*"}), ("list", {"kind": "comment", "target": "*"}), ("api", {}))),
+    "get_github_checks": ("github_read", (("checks", {}), ("api", {}))),
+    "comment_on_issue": ("github_write", (("comment", {}), ("api", {}))),
+    "comment_on_pr": ("github_write", (("comment", {}), ("review", {}), ("api", {}))),
+    "close_github_issue": ("github_write", (("update", {"state": "closed"}), ("api", {}))),
+    "create_github_issue": ("github_write", (("create_issue", {}), ("api", {}))),
+}
+
+
+def _retired_github_method_refusal(ctx: Any, name: str, args: Any) -> str:
+    """The refusal for a successor method a retired, disabled GitHub tool name covered; '' to allow."""
+    if name not in ("github_read", "github_write"):
+        return ""
+    from ouroboros.tools.github import _canonical_github_args
+
+    # Mutate the invocation's arguments so dispatch consumes exactly the values admitted here.
+    args = _canonical_github_args(args if isinstance(args, dict) else {})
+    disabled = _disabled_tools(ctx)
+    method = str(args.get("method") or "")
+    target = str(args.get("target") or "").strip()
+    has_target = not isinstance(args.get("target"), bool) and target.isdigit() and int(target) > 0
+    for retired, (successor, rows) in _RETIRED_GITHUB_TOOLS.items():
+        if retired not in disabled or successor != name:
+            continue
+        for withheld, constraint in rows:
+            if withheld == method and all(has_target if key == "target" and value == "*" else str(args.get(key) or "") == value
+                                          for key, value in constraint.items()):
+                call = ", ".join([f"method={method!r}"] + [f"{key}={value!r}" for key, value in constraint.items()])
+                return (f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.disabled_tools withholds {retired!r}, "
+                        f"which {name}({call}) would carry out for this task.")
+    return ""
 
 
 def _builtin_tool_availability(name: str, ctx: Any = None) -> tuple[bool, str, str]:
@@ -387,7 +425,7 @@ def _builtin_tool_availability(name: str, ctx: Any = None) -> tuple[bool, str, s
             return True, "", ""
     if tool in _GITHUB_TOKEN_TOOLS:
         detail = "GITHUB_TOKEN"
-        if tool in {"submit_skill_to_hub", "generate_evolution_stats"}:
+        if tool == "submit_skill_to_hub":
             configured = bool(os.environ.get("GITHUB_TOKEN", "").strip())
         else:
             from ouroboros.tools.github import github_cli_configured
@@ -417,6 +455,9 @@ def _capability_resource_guard_result(
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     if refusal := observe_argument_refusal(metadata, name, args):
         return ToolResult(status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED", text=refusal)
+    from ouroboros.place_guard import dispatch_refusal
+    if refusal := dispatch_refusal(ctx, name, args, ext_tool=ext_tool, is_mcp=is_mcp):
+        return ToolResult(status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED", text=refusal)
     if name in _disabled_tools(ctx):
         return ToolResult(
             status="blocked",
@@ -426,6 +467,8 @@ def _capability_resource_guard_result(
                 f"withholds {name!r} for this task."
             ),
         )
+    if refusal := _retired_github_method_refusal(ctx, name, args):
+        return ToolResult(status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED", text=refusal)
     available, unavailable_reason, unavailable_detail = _builtin_tool_availability(name, ctx)
     if not available:
         suffix = f" ({unavailable_detail})" if unavailable_detail else ""

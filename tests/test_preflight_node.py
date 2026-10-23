@@ -457,16 +457,19 @@ _ESLINT_STEP = "run: cd web && npm ci --no-audit --no-fund && npm run lint:undef
 _NODE_STEP = "run: python scripts/run_tests.py --node"
 
 
-@pytest.mark.parametrize("job", ["quick-test", "full-test-runs"])
-def test_each_ci_job_runs_the_eslint_second_layer_after_the_node_suite(job):
-    block = _ci_job_block(job)
-    assert block.count(_ESLINT_STEP) == 1, f"{job} does not run the ESLint no-undef layer exactly once"
-    # A second layer is only a second opinion when the first still runs.
-    assert block.index(_NODE_STEP) < block.index(_ESLINT_STEP), (
-        f"{job} runs ESLint before (or instead of) the gate's node suite"
-    )
-    # Windows runner in full-test: bash for the `cd web && ...` chain, same as the node step.
-    assert "shell: bash" in block.split(_ESLINT_STEP)[0].rsplit("- name:", 1)[-1]
+def test_the_eslint_second_layer_runs_wherever_the_node_suite_gates():
+    import yaml
+
+    lint = _ci_job_block("lint")
+    assert lint.count(_ESLINT_STEP) == 1, "the lint job does not run the ESLint no-undef layer exactly once"
+    for job in ("quick-test", "full-test-runs"):
+        assert _ESLINT_STEP not in _ci_job_block(job), f"{job} duplicates the lint job's ESLint layer"
+    # A second layer is only a second opinion when the first still runs: the lint job is admitted
+    # on every event that admits the Node suite, and a release requires both.
+    jobs = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))["jobs"]
+    assert jobs["lint"]["if"] == jobs["full-test-runs"]["if"]
+    assert {"lint", "full-test"} <= set(jobs["release"]["needs"])
+    assert "shell: bash" in lint.split(_ESLINT_STEP)[0].rsplit("- name:", 1)[-1]
 
 
 def test_the_eslint_layer_is_exact_pinned_and_lockfile_frozen():

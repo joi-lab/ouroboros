@@ -1,6 +1,6 @@
 """Reviewer dispatch primitives: the row-identity mint (moved whole from
 ``review_substrate.py`` at the module-size gate, same split shape as
-``skill_review_cycles.py``) and the write-ahead PAID stamp seam (owner
+``tools/review_change_custody.py``) and the write-ahead PAID stamp seam (owner
 Q16/Q17; Max-Review-Cycles fix round).
 
 The ``paid`` fact of Max-Review-Cycles accounting is recorded at PHYSICAL

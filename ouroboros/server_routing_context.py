@@ -5,9 +5,8 @@ result says about where its work lives, what the Main lane can see, and how a
 chat maps to a project. Nothing here delivers a message or picks a target —
 that judgment belongs to the decision turn (BIBLE P5).
 
-Main's manifest lists each project's registry ``working_dir`` and the last 20
-chat rows with text from every room (people's words whole, other rows
-truncated). Project rooms and Main read recent root results and live roots as
+Main's manifest lists each project's registry ``working_dir`` and addresses of
+the last 20 spoken rows; the memory view holds their text. Project rooms and Main read recent root results and live roots as
 bounded typed projections, never raw result text; a project's last result is
 found through the registry row's ``last_task_result_id`` pointer (stamped by
 roots only), with a bounded scan as fallback.
@@ -35,6 +34,17 @@ def _task_belongs_to_chat(ctx: Any, task_id: str, task_obj: Dict[str, Any], chat
         return False
 
 
+def _late_input_author(task: Dict[str, Any]) -> Dict[str, str]:
+    """``{"late_input_of": author}`` for a head a late answer, or a press on a finished author's
+    card, started (typed provenance), else empty."""
+    from ouroboros.card_store import late_press_ref
+    from ouroboros.owner_quiz import late_answer_ref
+
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    ref = late_answer_ref(metadata.get("late_answer")) or late_press_ref(metadata.get("card_press"))
+    return {"late_input_of": ref["task_id"]} if ref else {}
+
+
 def _active_direct_roots(ctx: Any) -> list:
     """All addressable native actors, without constructing agents or queue state."""
     from supervisor.active_activity import get_direct_activity_registry
@@ -56,6 +66,7 @@ def _active_direct_roots(ctx: Any) -> list:
                     "objective": _clip_marked(turn.get("text"), 600),
                     "project_id": turn["project_id"], "chat_id": turn["chat_id"],
                     "started_at": turn["_started_at"], "steerable": True, "direct_chat": True, "room_reader": reader,
+                    **_late_input_author(turn),
                 })
     return roots
 
@@ -94,7 +105,7 @@ def _addressable_root_tasks(ctx: Any, chat_id: Optional[int] = None) -> list:
             "objective": _clip_marked(objective, 600),
             "project_id": str(task_obj.get("project_id") or ""),
             "started_at": started_at,
-            "steerable": True, "room_reader": reader,
+            "steerable": True, "room_reader": reader, **_late_input_author(task_obj),
         })
         seen.add(tid)
 
@@ -196,6 +207,11 @@ def _task_result_ground_truth(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _result_reference(facts: Dict[str, Any]) -> Dict[str, Any]:
+    """A historical result's identity and exact reader, without its evidence body."""
+    return {key: facts[key] for key in ("task_id", "status", "title", "authority_source")}
+
+
 def _is_child_result(facts: Dict[str, Any]) -> bool:
     """A result that is NOT an owner root: it has a parent, or the subagent role.
 
@@ -290,7 +306,7 @@ def _project_routing_manifest(ctx: Any, project_id: str) -> Dict[str, Any]:
         if str(row.get("project_id") or "") == project_id
     ]
     return {
-        "final_results": finals,
+        "final_results": [_result_reference(row) for row in finals],
         "active_roots": active[:40],
         "omissions": {**omissions, "active_roots": max(0, len(active) - 40)},
     }
@@ -356,16 +372,10 @@ def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str,
 
 
 def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
-    """Bounded canonical facts for one Main-chat LLM routing decision.
-
-    Its recent dialogue is the last 20 rows with text from every room, each in the
-    one rendering memory gives a chat row (``render_row_text``: a quiz answer is
-    ``chose (N) <label>`` and the owner's comment, never the question framed before
-    them): people's words ride whole, every other row under the disclosed bound."""
+    """Routing identities and exact readers; the memory view owns spoken rows."""
     from ouroboros import dialogue_store as ds
-    from ouroboros.dialogue_provenance import render_row_text, row_author
+    from ouroboros.chat_chain import row_address, format_address
     from ouroboros.projects_registry import list_projects
-    from ouroboros.utils import truncate_within_limit
 
     projects = [{
         "project_id": str(row.get("id") or ""),
@@ -397,13 +407,15 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
         gaps.add("recorded invalid intervals")
     rows = [entry.row for entry in reversed(rows[:20])]
     for row in rows:
-        text = render_row_text(row).strip() if str(row.get("text") or "").strip() else ""
+        text = str(row.get("text") or "").strip()
         if text:
             dialogue_rows.append({
                 "ts": str(row.get("ts") or ""),
                 "direction": str(row.get("direction") or ""),
                 "chat_id": row.get("chat_id", 1),
-                "text": text if row_author(row)["kind"] == "human" else truncate_within_limit(text, 500),
+                "chars": len(text),
+                "reader": {"tool": "memory_read", "arguments": {"room_id": str(row.get("chat_id", 1)),
+                    "rows": True, "from": format_address(row_address(row)), "to": format_address(row_address(row))}},
                 "task_id": str(row.get("task_id") or ""),
                 "client_message_id": str(row.get("client_message_id") or ""),
             })
@@ -411,7 +423,7 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
     return {
         "projects": projects[:40],
         "root_tasks": roots[:40],
-        "final_results": finals,
+        "final_results": [_result_reference(row) for row in finals],
         "recent_canonical_dialogue": dialogue,
         "omissions": {
             "projects": max(0, len(projects) - 40),
@@ -469,13 +481,12 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
     if main_manifest:
         md["main_routing_manifest"] = main_manifest
     if project_id:
-        # Ground truth for a project-room "continue" decision (Q8-A): the thread's
-        # most recent task result as a bounded typed projection. Without it the
-        # router turn has only chat memory about where prior work lives.
+        # Name the thread's latest result and its exact reader; prior workspace
+        # and outcome evidence remains in that result instead of riding inline.
         try:
             row = _latest_project_task_result(ctx, project_id)
             if row is not None:
-                md["project_last_task_result"] = _task_result_ground_truth(row)
+                md["project_last_task_result"] = _result_reference(_task_result_ground_truth(row))
         except Exception:
             log.debug("project last-task-result projection failed", exc_info=True)
         try:

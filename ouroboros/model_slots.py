@@ -25,6 +25,7 @@ PROCESSING_PREFERENCES = ("standard", "fast", "economy")
 MODEL_ROLE_SETTINGS = {
     "main": "OUROBOROS_MODEL",
     "light": "OUROBOROS_MODEL_LIGHT",
+    "safety": "OUROBOROS_MODEL_SAFETY",
     "vision": "OUROBOROS_MODEL_VISION",
     "consciousness": "OUROBOROS_MODEL_CONSCIOUSNESS",
     "deep_review": "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
@@ -94,6 +95,18 @@ def model_role_option(key: str, role: str, *, settings: dict | None = None) -> s
     default = 0 if key == MODEL_CONTEXT_WINDOWS_KEY else ""
     raw = (settings or {}).get(key, "") if settings is not None else runtime_setting(key, "")
     options, _canonical = normalize_model_role_options(key, raw)
+    if role == "safety":
+        # An empty Supervisor slot inherits the route's authored options as
+        # well as its model. An explicit Supervisor model ends that chain.
+        for candidate in ("safety", "light", "main"):
+            if options.get(candidate):
+                return options[candidate]
+            setting = MODEL_ROLE_SETTINGS[candidate]
+            model = (settings.get(setting, SETTINGS_DEFAULTS[setting]) if settings is not None
+                     else runtime_setting(setting, SETTINGS_DEFAULTS[setting]))
+            if str(model or "").strip():
+                break
+        return default
     family, separator, position = role.partition(":")
     if family == "fallback" and separator:
         try:
@@ -127,18 +140,21 @@ def task_model_binding(task: dict, *, context_fit_plan: object = None,
     Callers may pass their live owner's overrides; this pure projection never
     captures another task's ambient wait or turns an observed Auto account into a pin.
     """
+    from ouroboros.supervisor_route import supervisor_binding
+
+    cognitive, supervisor_role = supervisor_binding(task)
     metadata = task.get("task_metadata", task.get("metadata", {}))
     metadata = metadata if isinstance(metadata, dict) else {}
     actor = task.get("configured_subagent", metadata.get("configured_subagent", {}))
     actor = actor if isinstance(actor, dict) else {}
     route = actor.get("route") or {}
     actor_id = str(actor.get("selected_subagent_id") or "")
-    actor_role = f"subagent:{actor_id}" if actor_id and route.get("kind") == "api_model" else "main"
+    actor_role = supervisor_role or (f"subagent:{actor_id}" if actor_id and route.get("kind") == "api_model" else "main")
     role = str(task.get("model_role") or getattr(context_fit_plan, "model_role", "")
                or metadata.get("model_role") or actor_role)
     pin = task.get("credential_profile_id")
     if pin is None and role == actor_role and actor_role != "main":
-        pin = str(route.get("credential_profile_id") or "")
+        pin = str((cognitive or route).get("credential_profile_id") or "")
     pin = (overrides or {}).get(role, {}).get("model_account_override", pin)
     return role, pin
 
@@ -169,6 +185,9 @@ def task_processing_preference(task: dict, *, model_role: str = "",
     """Capture the actor's intent; an unconfigured fallback preserves that intent."""
     if override is not None:
         return resolve_processing_preference(override=override)
+    from ouroboros.supervisor_route import supervisor_binding
+
+    cognitive, supervisor_role = supervisor_binding(task)
     metadata = task.get("task_metadata", task.get("metadata", {}))
     metadata = metadata if isinstance(metadata, dict) else {}
     actor = task.get("configured_subagent", metadata.get("configured_subagent", {}))
@@ -179,8 +198,10 @@ def task_processing_preference(task: dict, *, model_role: str = "",
         authored = model_role_option(MODEL_PROCESSING_PREFERENCES_KEY, role)
         if authored:
             return resolve_processing_preference(override=str(authored))
-        role = (f"subagent:{actor_id}" if actor_id and (actor.get("route") or {}).get("kind") == "api_model"
-                else "main")
+        role = supervisor_role or (f"subagent:{actor_id}" if actor_id and (actor.get("route") or {}).get("kind") == "api_model"
+                                  else "main")
+    if supervisor_role and role == supervisor_role:
+        return resolve_processing_preference(override=cognitive["processing_preference"])
     if actor_id and role == f"subagent:{actor_id}":
         # Missing in a historical snapshot means captured legacy behavior.
         return resolve_processing_preference(override=actor.get("processing_preference") or "")
@@ -265,6 +286,8 @@ def apply_model_role_override(settings: dict, *, role: str, model: str,
             handles = ", ".join(row.slot_id for row in review_pool_rows(result)) or "empty"
             raise ValueError(f"The selected reviewer no longer exists (the review pool is: {handles})")
         raise ValueError("The selected task agent no longer exists")
+    if family == "subagent" and (actor.get("route") or {}).get("kind") == "agent_session":
+        raise ValueError("This supervisor inherited cognition; switch for this task only, or select an API-model supervisor row to persist its model.")
     actor["route"] = {"kind": "api_model", "target_id": routed_model, "credential_profile_id": pin}
     actor.pop("access", None)  # Native/API rows have no session access profile.
     result["OUROBOROS_SUBAGENTS"] = normalize_configured_subagents(roster)[1]
@@ -313,6 +336,12 @@ def _main_model() -> str:
 def get_light_model() -> str:
     """Light slot; empty falls back to Main (heavy/consciousness stay empty->main)."""
     return str(runtime_setting("OUROBOROS_MODEL_LIGHT", "") or "").strip() or _main_model()
+
+
+def get_safety_model() -> str:
+    """Safety Supervisor inherits Light, including its local route, then Main."""
+    return (str(runtime_setting("OUROBOROS_MODEL_SAFETY", "") or "").strip()
+            or slot_lane_label("light", get_light_model()))
 
 
 def get_heavy_model() -> str:

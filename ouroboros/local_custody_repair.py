@@ -29,9 +29,9 @@ nothing here. Retirement changes local capability only: the effect stays
 ``unknown`` and never replayed; delegated runs, processes, merge and control
 receipts, patches and money keep their own custody.
 
-Separately, ``ended_unbound_model_request`` reads retained terminal HTTP failure
-facts for the passive writer census. It classifies an ended request, retires
-nothing and preserves unresolved money and late-receipt rights.
+Separately, ``ended_unbound_model_request`` reads an unbound send's retained
+raised-failure fact for the passive writer census. It classifies an ended
+request, retires nothing and preserves unresolved money and late-receipt rights.
 """
 
 from __future__ import annotations
@@ -132,24 +132,26 @@ def owner_ended(pid: Any, birth: Any) -> bool:
 
 
 def ended_unbound_model_request(attempt: Dict[str, Any]) -> bool:
-    """A completed HTTP failure without a bound receiver is not a live writer.
+    """An unbound attempt whose answer path already ended is not a live writer.
 
-    Accounting retains these HTTP failure facts after send exits (including
-    _usage_wait's late settlement). These existing facts prove no answer remains
-    for an unbound HTTP failure, regardless of PID liveness. Money stays unresolved;
-    transport uncertainty and partial receiver bindings stay held. No writes.
+    The ``raised_exception`` failure is retained once the one path that could
+    hand this attempt's answer to its caller ended without one: by
+    ``usage_accounting._terminalize_failed_attempt`` after the send raised or
+    could not start (an abandoned sender's late settlement included), or by
+    the Responses search leg after its request or stream raised or closed
+    incomplete. No receiver was bound, so nothing local can still take that
+    answer; a detached I/O thread may only retain evidence. A missing HTTP
+    status or a transport cause describes the remote exchange, whose outcome
+    and money stay unresolved with their late-receipt right; nothing is
+    retried. Bound or partially bound receivers, still-dispatched rows and
+    rows without the retained fact stay held. No writes.
     """
     if (attempt.get("state") != "unresolved" or attempt.get("local_answer_consumer_id")
             or attempt.get("local_answer_owner_birth")
             or attempt.get("local_answer_task_attempt") is not None):
         return False
     failure = attempt.get("physical_failure")
-    if not isinstance(failure, dict):
-        return False
-    status = failure.get("provider_status_code")
-    return (failure.get("stage") == "raised_exception" and type(status) is int
-            and 400 <= status <= 599 and "transport_cause_type" in failure
-            and failure["transport_cause_type"] is None)
+    return isinstance(failure, dict) and failure.get("stage") == "raised_exception"
 
 
 def retire_ended_owner(root: Any, task_id: str, root_task_id: str, *, pid: int, birth: str,

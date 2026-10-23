@@ -1,6 +1,8 @@
-# Ouroboros v7.7.1 — Architecture & Reference
+# Ouroboros v7.8.0 — Architecture & Reference
 
 This present-tense map (BIBLE P6) covers structure, operation and rationale. Replace affected descriptions; keep WHYs here and mechanisms in named module docstrings, so understanding guards, review and lifecycles needs no historical search. History belongs in README.md, tags and Git.
+
+Two helpers support [Agent Core](architecture/06-agent-core.md): `ouroboros/consciousness_view.py` projects places, counted roots and bounded recent wakes; `ouroboros/usage_origin.py` owns task usage scopes and immutable billing/cause attribution in the usage ledger.
 
 ## Chapters
 

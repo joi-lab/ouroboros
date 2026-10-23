@@ -32,13 +32,11 @@ is a disclosed residual, not proof of historylessness.
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
 import logging
 import os
 import pathlib
-import stat
 import uuid
 from typing import Any, Dict, Tuple
 
@@ -61,32 +59,7 @@ def witness_path(drive_root: Any) -> pathlib.Path:
     return pathlib.Path(drive_root) / WITNESS_REL
 
 
-def confirm_absent(path: Any) -> None:
-    """After ``FileNotFoundError`` on ``path``, return only when it is really absent.
-
-    POSIX types a non-directory where a directory belongs as ENOTDIR; Windows reports
-    ERROR_PATH_NOT_FOUND, indistinguishable from a missing parent. A present entry
-    after the failed operation is unknown. Only missing entries below a directory
-    prove absence; a dangling link or an unexaminable ancestor cannot prove it."""
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        pass
-    else:
-        raise FileExistsError(errno.EEXIST, "path present after failed read", str(path))
-    for ancestor in pathlib.Path(path).parents:
-        try:
-            mode = os.stat(ancestor).st_mode
-        except FileNotFoundError:
-            try:
-                os.lstat(ancestor)  # stat alone also reports a dangling link as ENOENT
-            except FileNotFoundError:
-                continue
-            raise
-        if not stat.S_ISDIR(mode):
-            raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(ancestor))
-        return
-    raise FileNotFoundError(errno.ENOENT, "no directory ancestor confirmed", str(path))
+from ouroboros.installation_stop import confirm_absent  # shared stdlib absence reader
 
 
 def read_witness(drive_root: Any) -> Tuple[str, Dict[str, Any]]:

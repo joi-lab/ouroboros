@@ -206,7 +206,7 @@ def install_fence(root_drive: Any, root_task_id: str, *, request_id: str,
     terminal root refuses: a finished tree has nothing to pause — unless its
     answered task still owns late work: an open post-task checkpoint read
     under this lock (the Pause ends that upkeep at once), or a live review
-    operation the caller attests (``late_work``). ``by`` is the author a press
+    operation or live descendants the caller attests (``late_work``). ``by`` is the author a press
     declared (``control_actor.pause_author``): the fence keeps its first one,
     and a press that declared nobody claims none. Raises
     ``OwnerPauseRefused`` without any write on refusal; any write failure
@@ -220,8 +220,8 @@ def install_fence(root_drive: Any, root_task_id: str, *, request_id: str,
     from ouroboros.utils import utc_now_iso
 
     from ouroboros.control_actor import control_actor, pause_author
-    declared = {"by": dict(by)} if by else {}
-    attribution = {**control_actor(), **declared}
+    author = {**control_actor(), **(by or {})}
+    attribution = {"by": author} if author else {}
     outcome: Dict[str, Any] = {}
 
     def update(current: dict) -> Optional[dict]:
@@ -246,7 +246,7 @@ def install_fence(root_drive: Any, root_task_id: str, *, request_id: str,
             raise OwnerPauseRefused("task_terminal")
         if fence_closed(old) and not _resume_outstanding(actor_current if actor_current is not None else current, old):
             requests[request_id] = {**attribution, "fence_id": old["fence_id"], "generation": old.get("generation")}
-            fence = {**old, **({} if pause_author(old)["actor"] else declared), "requests": requests}
+            fence = {**old, **({} if pause_author(old)["actor"] else attribution), "requests": requests}
             outcome.update(fence=fence, created=False)
             return stamp_task_result_schema({**current, "owner_pause": fence})
         fence = {
@@ -603,6 +603,14 @@ def _member_coordinates(source: Any) -> Tuple[str, str, str]:
     return str(root_drive or ""), root_task_id, task_id
 
 
+def awaits_tree_selection(fence: dict, task_id: str, root_task_id: str) -> bool:
+    """An explicitly resumed terminal tree selects each child, including retained warm stacks."""
+    grant = fence.get("resume_grant") or {}
+    return bool(fence.get("state") == FENCE_RELEASED and grant.get("tree_only")
+                and not grant.get("revoked_at") and task_id != root_task_id
+                and task_id in (fence.get("warm_members") or ()) and task_id not in (fence.get("selected_members") or {}))
+
+
 def member_fence(source: Any, *, _observations=None) -> Dict[str, Any]:
     """Read the shared fence strictly: unreadable authority refuses new effects."""
     root_drive, root_task_id, _task_id = _member_coordinates(source)
@@ -632,6 +640,8 @@ def member_fence(source: Any, *, _observations=None) -> Dict[str, Any]:
         return {}  # One consumed owner Resume, bound to this fence generation.
     if fence_closed(fence) and _episode_dispatched_before(fence, root_task_id):
         return {}  # The already-started review episode finishes its own check.
+    if awaits_tree_selection(fence, _task_id, root_task_id):
+        return {**fence, "state": FENCE_PAUSED, "awaiting_selection": True}
     return fence if fence_closed(fence) else {}
 
 

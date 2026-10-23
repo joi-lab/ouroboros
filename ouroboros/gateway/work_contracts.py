@@ -35,7 +35,7 @@ class PauseAuthor(TypedDict):
 class WorkTail(TypedDict):
     """What still runs beside or after the current episode, said as a second fact, never as the work's word."""
 
-    kind: str  # helper | run | review
+    kind: str  # helper | run | review | model
     state: str  # live | unknown
     code: str
     text: str
@@ -68,6 +68,7 @@ class WorkEpisode(TypedDict):
 
 class WorkMembers(TypedDict):
     ids: List[str]
+    states: NotRequired[Dict[str, Dict[str, Any]]]
 
 
 class WorkFocus(TypedDict):
@@ -97,6 +98,8 @@ class Work(TypedDict):
     since: Any
     confirmed: bool
     mark: str
+    stop: NotRequired[Dict[str, Any]]
+    refusal: NotRequired[Dict[str, Any]]
     outcome: NotRequired[str]
     focus: NotRequired[WorkFocus]
     gaps: NotRequired[List[Dict[str, Any]]]

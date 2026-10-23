@@ -433,9 +433,9 @@ class ToolRegistry:
         ``verify_and_record`` is normally an acting/workspace code tool because its
         other contract kinds execute commands or inspect deliverables.  An
         actor-first configured session needs one exceptional, non-shell use: a
-        typed ``delegation_zero_run`` receipt when its selected leaf is still
-        pending.  Keep that exception bound to the private host bootstrap marker;
-        the handler applies the same check again at execution time.
+        typed ``delegation_zero_run`` receipt before a physical leaf exists.
+        Restoring cognition clears auto-start activity, not this eligibility.
+        The private host marker binds the exception; the handler proves custody.
         """
         if name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES | schema_selection_tools_for_context(self._ctx):
             return True
@@ -446,10 +446,6 @@ class ToolRegistry:
             isinstance(bootstrap, dict)
             and not bool(bootstrap.get("physical_started"))
             and not bool(bootstrap.get("zero_run_receipt_recorded"))
-            and (
-                bool(bootstrap.get("exact_start_pending", True))
-                or str(bootstrap.get("zero_run_evidence_status") or "") == "unknown"
-            )
         )
 
     def initial_tool_names(self) -> frozenset[str]:
@@ -653,26 +649,23 @@ class ToolRegistry:
         meta = getattr(self._ctx, "task_metadata", {})
         capability_root = pathlib.Path((meta.get("budget_drive_root") if isinstance(meta, dict) else "") or getattr(self._ctx, "budget_drive_root", "") or getattr(self._ctx, "drive_root", "") or ".").resolve(strict=False)
         with _ext_lock:
-            rows = [
-                dict(tool)
-                for tool in _ext_tools.values()
-                if _ext_is_live(str(tool.get("skill") or ""), capability_root, repo_path=str(tool.get("skills_repo_path") or "") or None)
-                and _presence_tool_allowed(self._ctx, tool["name"])
-                and (grants is None or tool["name"] in grants)
-            ]
+            # One verdict per skill in this enumeration; the next call reads anew.
+            live = {}
+            rows = []
+            for tool in _ext_tools.values():
+                key = (str(tool.get("skill") or ""), str(tool.get("skills_repo_path") or "") or None)
+                if key not in live:
+                    live[key] = _ext_is_live(key[0], capability_root, repo_path=key[1])
+                if (live[key] and _presence_tool_allowed(self._ctx, tool["name"])
+                        and (grants is None or tool["name"] in grants)):
+                    rows.append(dict(tool))
         return self._visible_dynamic_tools("extensions", rows) if record else _partition_shadowed_tools(rows, self._entries)[0]
 
-    def _mcp_rows(self, *, refresh: bool, record: bool) -> List[Dict[str, Any]]:
-        """Configured MCP descriptors (with ``raw_name``) under the same filters.
-
-        ``schemas()`` passes both flags: a changed MCP setting may re-list servers
-        and collisions/empty servers enter the omission ledger. A name-miss read
-        passes neither, so it causes no transport, refresh or ledger write.
-        """
+    def _mcp_rows(self, *, record: bool) -> List[Dict[str, Any]]:
+        """Current published MCP rows under the task's unchanged capability filters."""
         from ouroboros.mcp_client import ensure_configured_from_settings as _mcp_ensure_configured, get_manager as _mcp_get_manager
 
-        if refresh:
-            _mcp_ensure_configured(refresh=True, authority=self._ctx)
+        _mcp_ensure_configured()
         manager = _mcp_get_manager()
         grants = self._acting_tool_grants() if self._is_acting_subagent() else None
         rows = [tool for tool in manager.list_tools_for_registry()
@@ -685,15 +678,13 @@ class ToolRegistry:
             item for item in getattr(manager, "tool_name_collisions", lambda: [])()
             if grants is None or str(item.get("prefixed_name") or "") in grants
         ])
-        # D1: an enabled+configured server returning zero tools WITHOUT
-        # raising (unreachable/slow/auth-failed) is otherwise silent. Make
-        # the reason visible so the model/owner learns WHY an expected MCP
-        # server produced no tools, instead of "the agent can't see MCP".
-        # Checked unconditionally so a broken server is surfaced even when a
-        # co-located healthy server contributed tools (does not mask it).
         empty = manager.enabled_servers_without_tools()
         if empty:
             self._capability_omissions.append({"surface": "mcp", "reason": "server_no_tools", "servers": empty})
+        for notice in manager.catalog_notices():
+            self._capability_omissions.append({"surface": "mcp", "reason": "catalog_provenance",
+                                              "servers": [{"id": notice["id"]}],
+                                              "error": f"{notice['id']}: {notice['detail']}"})
         return rows
 
     def schemas(self, core_only: bool = False) -> List[Dict[str, Any]]:
@@ -752,7 +743,7 @@ class ToolRegistry:
                 self._capability_omissions.append({"surface": "mcp", "reason": "resource_blocked", "resource": "network=false"})
             else:
                 try:
-                    mcp_schemas = [_dynamic_tool_schema(tool) for tool in self._mcp_rows(refresh=True, record=True)]
+                    mcp_schemas = [_dynamic_tool_schema(tool) for tool in self._mcp_rows(record=True)]
                 except Exception as exc:
                     self._capability_omissions.append({"surface": "mcp", "reason": "discovery_error", "error": f"{type(exc).__name__}: {exc}"})
             combined = built_in + extension_schemas + mcp_schemas
@@ -893,7 +884,7 @@ class ToolRegistry:
                 get_manager as _mcp_get_manager,
                 is_mcp_tool_name as _mcp_is_name,
             )
-            _mcp_ensure_configured(refresh=False)
+            _mcp_ensure_configured()
         except Exception:
             _mcp_get_manager = None
             _mcp_is_name = None
@@ -911,7 +902,7 @@ class ToolRegistry:
     def callable_rows(self, namespace: str = "") -> Optional[List[Dict[str, Any]]]:
         """Tools this task can dispatch now, as ``name`` rows (MCP rows add ``raw_name``).
 
-        The ``schemas()`` filters without its MCP settings reload, refresh or omission rebuild, and
+        The ``schemas()`` filters with current catalog adoption but no discovery or omission rebuild, and
         without names dispatch refuses (``task_contract.disabled_tools`` even where a
         schema stays visible): no transport, refresh or safety call. ``namespace``
         (``tool_policy.tool_namespace``) selects one; ``None`` means that selected
@@ -931,7 +922,7 @@ class ToolRegistry:
                 rows += ([{"name": tool["name"]} for tool in self._extension_rows(record=False)] if surface == "ext_"
                          else [{"name": tool["name"], "raw_name": str(tool.get("raw_name") or ""),
                                 "raw_description": str(tool.get("raw_description") or "")}
-                               for tool in self._mcp_rows(refresh=False, record=False)])
+                               for tool in self._mcp_rows(record=False)])
             except Exception:
                 if namespace:
                     return None
@@ -969,18 +960,14 @@ class ToolRegistry:
 
     @staticmethod
     def _mcp_dispatch_resolution(name: str):
-        """Pure on misses; a hit rechecks Settings before timeout/Safety/call."""
+        """Adopt current settings/catalogs before timeout, name resolution and Safety."""
         from ouroboros.mcp_client import (
             ensure_configured_from_settings as ensure,
             get_manager,
         )
 
-        manager = get_manager()
-        resolution = manager.resolve_tool_name(name)
-        if resolution.status == "callable":
-            ensure(refresh=False)
-            resolution = manager.resolve_tool_name(name)
-        return resolution
+        ensure()
+        return get_manager().resolve_tool_name(name)
 
     def _mcp_name_miss(self, name: str) -> Optional[ToolResult]:
         """Resolve before Safety; a miss runs no safety, transport or refresh."""
@@ -1021,7 +1008,7 @@ class ToolRegistry:
         if _mcp_get_manager and _mcp_is_name and _mcp_is_name(name):
             try:
                 # The loop obtains the OUTER timeout before registry execution.
-                # Use the same hit-only Settings recheck as dispatch, or a
+                # Use the same settings/catalog adoption as dispatch, or a
                 # changed valid timeout would be strangled by the old outer one.
                 self._mcp_dispatch_resolution(name)
                 return int(_mcp_get_manager().tool_timeout_sec()) + 3

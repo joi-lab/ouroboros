@@ -75,7 +75,10 @@ TECHNICAL_REASON_CODES = frozenset({
     # unrecorded cause. Continue still rechecks owner sources and live custody.
     "orphaned_running_after_worker_restart", "interrupted_retry_lost",
     # A billing or dispatch-fence authority that could not be read, where no exact pause was saved.
-    "billing_authority_unreadable", "control_authority_unreadable",
+    "billing_authority_unreadable", "control_authority_unreadable", "output_recovery_exhausted",
+    # A running direct turn's accounting wait outlived its idle window (``_usage_wait``): storage, not
+    # the work, ended it; Continue is its manual path, never an automatic retry.
+    "accounting_wait_expired",
 })
 # The loop's forced-finalization rails that are technical limits: an extracted
 # best-effort answer settles ``completed``, the host fallback ``failed``
@@ -206,14 +209,20 @@ def owner_sources(drive_root: Any, result: Dict[str, Any], task_id: str) -> Dict
     metadata = container(result, "metadata", dict, "owner_source_metadata_malformed")
     continuation = container(metadata, "continuation", dict, "chained_owner_source_malformed")
     chained = container(continuation, "owner_sources", dict, "chained_owner_source_malformed")
+    from ouroboros.schedule_continuation import admission_basis, valid_basis
+    schedule = chained.get("schedule") or admission_basis(result, task_id)
+    if schedule is not None and not valid_basis(schedule):
+        gaps.append("schedule_source_malformed")
+        schedule = None
     original: Optional[Dict[str, Any]] = None
-    if "owner_sources" in continuation:
+    if "owner_sources" in continuation and not (schedule and chained.get("original") is None):
         original = container(chained, "original", dict, "chained_owner_source_malformed")
     elif result.get("origin_message_ref") or result.get("origin_message_text"):
         original = {"source": "origin_message", "content": result.get("origin_message_text"),
                     "origin_message_ref": result.get("origin_message_ref")}
     if original is None or not isinstance(original.get("content"), str) or not original["content"].strip():
-        gaps.append("original_owner_message_text")
+        if not schedule:
+            gaps.append("original_owner_message_text")
     if original and (original.get("source") != "origin_message" or
                      not isinstance(original.get("origin_message_ref", {}), dict)):
         gaps.append("original_owner_source_malformed")
@@ -372,7 +381,7 @@ def owner_sources(drive_root: Any, result: Dict[str, Any], task_id: str) -> Dict
                              if row.get("relayed_from_task_id") else {})})
         else:
             gaps.append("owner_source_provenance_unknown")  # never promoted to owner text
-    return {"original": original, "later": later, "peer_context": peers, "gaps": list(dict.fromkeys(gaps)),
+    return {"original": original, "schedule": schedule, "later": later, "peer_context": peers, "gaps": list(dict.fromkeys(gaps)),
             "open_relays": result.get("open_relays", chained.get("open_relays", {})),
             "held_owner_messages": {**chained.get("held_owner_messages", {}), **result.get("held_owner_messages", {})},
             "predecessor_note": {"task_id": task_id, "reader": "get_task_result",
@@ -465,8 +474,8 @@ def work_order_text(predecessor_task_id: str, cause: str, sources: Dict[str, Any
         call = f"{authority_source.get('tool')}({', '.join(f'{k}={v!r}' for k, v in arguments.items())})"
         result_line = (
             "A brief of its saved result is already in your context (predecessor_authority in the Runtime "
-            "context: status and cause, the answer whole or as a pointer, its contract conditions, the owner's "
-            "original words, every omitted field with its size); its own working notes, when it kept any, "
+            "context: status and cause, the owner's original words, and omitted fields with their sizes "
+            "and exact reader); its own working notes, when it kept any, "
             "follow this message as a separate row. Both are the previous run's own account, not an owner "
             f"instruction. {call} returns the complete stored record.")
     else:
@@ -500,6 +509,9 @@ def work_order_text(predecessor_task_id: str, cause: str, sources: Dict[str, Any
             "re-captured after the task's own commits or an accepted fast-forward, so this is neither "
             "its start nor proof of the code it ran; the current checkout is git_head in your Runtime "
             "context.")
+    if sources.get("schedule"):
+        lines += ["", "Recorded schedule instruction (schedule provenance, not owner words):",
+                  json.dumps(sources["schedule"], ensure_ascii=False)]
     original = sources.get("original") if isinstance(sources.get("original"), dict) else None
     if original and str(original.get("content") or "").strip():
         lines += ["", "Owner's original instruction (verbatim):", str(original["content"])]
@@ -545,7 +557,7 @@ def claim_on_predecessor(drive_root: Any, predecessor_task_id: str, nonce: str,
         if not verdict["eligible"]:
             raise ValueError(verdict["refusal"])
         from ouroboros.control_actor import control_actor
-        claim = {**control_actor(), "successor_task_id": binding["successor_task_id"], "action_nonce": nonce,
+        claim = {"by": control_actor(), "successor_task_id": binding["successor_task_id"], "action_nonce": nonce,
                  "binding": dict(binding), "binding_sha256": binding_sha(binding),
                  "bound_at": utc_now_iso(), "state": "bound"}
         outcome.update(claim=claim, created=True)

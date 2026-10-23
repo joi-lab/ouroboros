@@ -10,7 +10,12 @@ import pathlib
 
 import pytest
 
-from ouroboros.triad_review import parse_model_review_results
+from ouroboros.triad_review import parse_seat_answers
+
+
+def parse_model_review_results(result):
+    """Contract A through the one seat parser: an actor without a slot answers the change question."""
+    return parse_seat_answers(result, {})
 
 
 def _actor(text: str, model: str = "m1") -> dict:

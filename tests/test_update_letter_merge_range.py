@@ -49,6 +49,7 @@ def test_full_graph_range_excludes_base_and_local_commits(merged_range, divergen
     assert len(shas) == len(set(shas))
     assert feature in shas and nested in shas
     assert base not in shas and local not in shas
+    assert [c['sha'] for c in material['local_commits']] == ([local] if divergent else [])
     bodies = {c["sha"]: c["body"] for c in material["commits"]}
     assert bodies[feature] == "Preserve the Project through retries."
     assert bodies[nested] == "Transfer the planning obligation."
@@ -88,7 +89,9 @@ def test_real_merge_material_reaches_write_letter_messages(merged_range, letter_
         assert sha in text and subject in text
     assert "Preserve the Project through retries." in text
     assert "Transfer the planning obligation." in text
-    assert "shared base" not in text and "local-only customization" not in text
+    assert "shared base" not in text
+    assert text.index("Existing local history") < text.index("local-only customization")
+    assert local in text and "not incoming changes" in text
     assert "ONE short paragraph" in text and "Summarize the whole range" in text
     assert record["key"]["base_sha"] == local and record["key"]["target_sha"] == target
 

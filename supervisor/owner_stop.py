@@ -40,7 +40,6 @@ log = logging.getLogger(__name__)
 OWNER_STOP_HOLDING = "owner_stop_finalizing"
 
 _CHILD_PROJECTION_MAX_ROWS = 20
-_CHILD_PROJECTION_PREVIEW_CHARS = 240
 
 
 def _parse_ts(raw: Any) -> float:
@@ -639,7 +638,8 @@ def _arm_owner_stop_episode(
         task_drive = q._task_drive_for_task(task, task_id)
     control_text = REASON_OWNER_REQUESTED_FINALIZATION
     if cascade:
-        projection = _child_result_projection(q, logical_task_id or task_id)
+        projection = _child_result_projection(q, logical_task_id or task_id, receipt_task_id=task_id, stop=(
+            str(intent.get("task_id") or logical_task_id or task_id), str(intent.get("request_id") or "")))
         if projection:
             control_text = f"{control_text}\n{projection}"
     grace_deadline = owner_stop_deadline_ts(intent, queue_grace_sec(q))
@@ -737,45 +737,28 @@ def _forensic(q: Any, task_id: str, event: str, intent: Dict[str, Any]) -> None:
         log.debug("owner-stop forensic append failed for %s", task_id, exc_info=True)
 
 
-def _child_result_projection(q: Any, task_id: str) -> str:
-    """Q6=A: the bounded durable child projection for the root's ONE final turn.
+def _child_result_projection(q: Any, task_id: str, *, receipt_task_id: str = "", stop: tuple = ()) -> str:
+    """Q6=A: persist full Wrap up facts, then project the root's ONE bounded final input.
 
-    Built from the existing seams — cascade ancestry enumeration
-    (``terminal_delivery._cascade_descendant_rows``) over durable rows plus the
-    queue snapshot, and each child's own durable result — DELIBERATELY including
-    settled-cancelled children (§12.2 item 4). Bounded: at most
-    ``_CHILD_PROJECTION_MAX_ROWS`` rows with the exact omitted count, each
-    result previewed to ``_CHILD_PROJECTION_PREVIEW_CHARS``. No ledger is added.
-    """
+    Membership is the cascade ancestry walk (``terminal_delivery._cascade_descendant_rows``),
+    DELIBERATELY including settled-cancelled children (§12.2 item 4); the receipt keeps every
+    child and run, the projection counts what it omits. No ledger is added. ``stop`` is the
+    cascade intent's (task id, request id), the identity of the receipt's card row."""
+    from ouroboros.owner_stop_receipt import capture_receipt, receipt_text
+    from supervisor.terminal_delivery import _cascade_descendant_rows
+
     try:
-        from supervisor.terminal_delivery import _cascade_descendant_rows
-        from ouroboros.task_results import load_task_result
-
-        rows = _cascade_descendant_rows(pathlib.Path(q.DRIVE_ROOT), task_id)
+        rows = _cascade_descendant_rows(pathlib.Path(q.DRIVE_ROOT), task_id, strict=True)
+        audit = capture_receipt(pathlib.Path(q.DRIVE_ROOT), receipt_task_id or task_id, rows, stop=stop)
+        return receipt_text(audit, prompt=True, max_rows=_CHILD_PROJECTION_MAX_ROWS)
     except Exception:
-        log.debug("owner-stop child projection failed for %s", task_id, exc_info=True)
-        return ""
-    if not rows:
-        return ""
-    lines = [
-        "[CHILD_RESULTS] Your subtasks were stopped for this owner-requested "
-        "finalization; their preserved durable results:",
-    ]
-    for index, (tid, status) in enumerate(sorted(rows.items())):
-        if index >= _CHILD_PROJECTION_MAX_ROWS:
-            lines.append(f"- … {len(rows) - _CHILD_PROJECTION_MAX_ROWS} more descendant(s) omitted")
-            break
-        preview = ""
+        log.warning("owner-stop retained-work receipt unavailable for %s", task_id, exc_info=True)
         try:
-            result = load_task_result(pathlib.Path(q.DRIVE_ROOT), tid) or {}
-            status = str(result.get("status") or status or "")
-            preview = " ".join(str(result.get("result") or "").split())
+            audit = capture_receipt(pathlib.Path(q.DRIVE_ROOT), receipt_task_id or task_id, {},
+                                    gap="child_receipt_unavailable", stop=stop)
+            return receipt_text(audit, prompt=True)
         except Exception:
-            preview = ""
-        if len(preview) > _CHILD_PROJECTION_PREVIEW_CHARS:
-            preview = preview[:_CHILD_PROJECTION_PREVIEW_CHARS] + "…"
-        lines.append(f"- {tid} ({status or 'unknown'}): {preview or '(no result text)'}")
-    return "\n".join(lines)
+            return "[CHILD_RESULTS] Retained child work could not be verified; saved work is unknown."
 
 
 def handle_finalize_now_entry(entry, owner_ctx, drive_root, task_id, controls) -> None:

@@ -140,6 +140,7 @@ def test_actual_registry_dynamic_tools_keep_canonical_order_and_permissions(tmp_
     mcp_rows = [{"name": "mcp_example__lookup", "description": "Lookup records.", "schema": {"type": "object", "properties": {}}}]
     monkeypatch.setattr(mcp_client, "get_manager", lambda: SimpleNamespace(
         list_tools_for_registry=lambda: mcp_rows, enabled_servers_without_tools=lambda: [],
+        catalog_notices=lambda: [],
     ))
     full = registry.schemas()
     selected = initial_tool_schemas(registry, "nano", ["mcp_example__lookup", name])

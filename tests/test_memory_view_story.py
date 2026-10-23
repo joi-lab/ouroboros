@@ -22,7 +22,7 @@ MAIN = {"id": "turn0001", "chat_id": 1}
 KID = {"id": "kid00001", "chat_id": 1, "delegation_role": "subagent"}
 HELPER = {"kind": "helper", "route": "configured-light"}
 OLD = "### Old memory retold by a helper before the update (not lived; "
-WHOLE = OLD + "whole where the window holds it, else read by id)"
+WHOLE = OLD + "exact sources readable by id)"
 
 
 def _snapshot(root, task=MAIN):

@@ -39,6 +39,7 @@ coordinates are the store's; ``store_switch`` calls it before a root is handed t
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
@@ -49,7 +50,7 @@ import time
 from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 from ouroboros import dialogue_store as ds
-from ouroboros import store
+from ouroboros import store, store_journal
 from ouroboros.store import StoreBusy
 from ouroboros.utils import jsonl_append_lock_path, utc_now_iso
 
@@ -158,14 +159,21 @@ def segment_rows(data: bytes, base: int) -> Iterator[Line]:
 
 # --- the cutover ------------------------------------------------------------------------------
 
-def cutover(root: Any) -> Dict[str, Any]:
-    """Files -> store, once per root; afterwards the cheap re-check described above. Returns a report."""
+def cutover(root: Any, *, initialize_journal: bool = False) -> Dict[str, Any]:
+    """Files -> store, once per root; afterwards the cheap re-check described above. Returns a report.
+    ``initialize_journal`` is the boot's (``server._dialogue_cutover``): after any retier it brings an
+    existing file to this runtime's journal (``store_journal``); a child root's lazy cutover keeps it."""
     root = pathlib.Path(root)
     report: Dict[str, Any] = {"created": False}
     if ds.present(root):
         former = ds.retier(root)
         if former:
             report["retiered_from"] = former
+        if initialize_journal:
+            tier = ds._tier(root)
+            with store.name_lock(root, ds.LOCK_NAME, timeout_sec=ds.WAIT_SEC) if tier == store.TIER_NAME \
+                    else contextlib.nullcontext():
+                report["journal_selected"] = store_journal.configure_journal(ds.path(root), tier, wait_sec=ds.WAIT_SEC)
         if ds.meta(root, "cutover") is not None and not _replan_owed(root):
             report.update(first=False, replanned=False)  # the steady boot: two stats and one job fact
             return report

@@ -700,6 +700,8 @@ def test_corrupt_or_integrity_degraded_ledger_never_permits_budget_resume(
         "ok": False,
         "error": expected_error,
         "action": "cancel_or_new_run",
+        "message": {"replay_unsafe": "Resume refused: replay unsafe",
+                    "accounting_unavailable": "Resume refused: accounting unavailable"}[expected_error],
     }
     assert "_budget_pause" in queue.PENDING[0]
 

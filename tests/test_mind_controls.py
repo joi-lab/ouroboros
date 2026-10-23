@@ -44,14 +44,14 @@ def test_mind_pause_other_root_records_actor_and_resume_keeps_attribution(tmp_pa
     result = _apply(_event("pause_task", "other"))
     assert result["ok"]
     fence = read_fence(tmp_path, "other")
-    assert fence["actor"] == "mind" and fence["actor_task_id"] == "mind-root"
+    assert fence["by"]["actor"] == "ouroboros" and fence["by"]["task_id"] == "mind-root"
     # The owner reads who decided and why: Ouroboros, in its own sentence.
     assert fence["by"]["actor"] == "ouroboros" and fence["by"]["text"] == "finish the earlier request"
     assert fence["by"]["at"] and pause_author(fence)["text"] == "finish the earlier request"
     assert _apply(_event("pause_task", "other"))["fence_id"] == fence["fence_id"]
     resumed = _apply(_event("resume_task", "other", "resume-call"))
     assert resumed["ok"], resumed
-    assert read_fence(tmp_path, "other")["resume_actor"]["actor_task_id"] == "mind-root"
+    assert read_fence(tmp_path, "other")["resume_actor"]["task_id"] == "mind-root"
 
 
 def test_panic_hold_survives_mind_resume_but_owner_can_select_it(tmp_path, monkeypatch):
@@ -114,8 +114,8 @@ def test_mind_continue_and_owner_button_race_share_one_successor(tmp_path, monke
     assert len(workers.PENDING) == 1 and workers.PENDING[0]["id"] == successor
     claim = load_task_result(tmp_path, "pred-1")["continued_by"]
     if answers[0].get("ok"):
-        assert claim["actor"] == "mind" and claim["actor_task_id"] == "mind-root"
-        assert load_task_result(tmp_path, successor)["continuation_admission"]["actor"] == "mind"
+        assert claim["by"]["actor"] == "ouroboros" and claim["by"]["task_id"] == "mind-root"
+        assert load_task_result(tmp_path, successor)["continuation_admission"]["by"]["actor"] == "ouroboros"
     else:
         assert "actor" not in claim
 
@@ -130,7 +130,7 @@ def test_mind_continue_is_attributed_and_idempotent(tmp_path, monkeypatch):
     first, again = _apply(event), _apply(event)
     assert first["ok"] and again["replay"]
     assert first["successor_task_id"] == again["successor_task_id"]
-    assert load_task_result(tmp_path, "pred-1")["continued_by"]["actor_task_id"] == "mind-root"
+    assert load_task_result(tmp_path, "pred-1")["continued_by"]["by"]["task_id"] == "mind-root"
 
 
 @pytest.mark.parametrize("source", ["owner", "panic"])

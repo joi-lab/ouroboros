@@ -75,6 +75,7 @@ from ouroboros.tools.core_file_tools import (  # noqa: F401
     _root_display_path,
     _runtime_data_read_check,
 )
+from ouroboros.delegate_reply import REPLY_TO_SCHEMA, validate_reply_target
 from ouroboros.tools.core_artifacts import (  # noqa: F401
     _MAX_DOCUMENT_FILE_BYTES,
     _MAX_PHOTO_FILE_BYTES,
@@ -1128,7 +1129,7 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
 
 
 def _forward_to_worker(
-    ctx: ToolContext, task_id: str, message: str, relayed_from_task_id: str = "",
+    ctx: ToolContext, task_id: str, message: str, relayed_from_task_id: str = "", reply_to: dict | None = None,
 ) -> str:
     """Write task context to the recipient's mailbox, never owner text.
     Descendants receive ancestor/relayed context; contributions inside one tree
@@ -1147,6 +1148,7 @@ def _forward_to_worker(
 
     try:
         tid = validate_task_id(task_id)
+        reply_to = validate_reply_target(ctx, reply_to, recipient=tid)
     except ValueError as exc:
         return f"⚠️ TOOL_ARG_ERROR (forward_to_worker): {exc}"
     if len(str(message or "")) > TASK_MESSAGE_MAX_CHARS:
@@ -1166,11 +1168,8 @@ def _forward_to_worker(
     # read when it starts, or stay in its result as unread mail, the same receipt a queued one gives.
     if status not in (STATUS_RUNNING, STATUS_SCHEDULED, STATUS_REQUESTED):
         return _publish_tool_result(ctx, ToolResult(status="blocked", code="LEGACY_BLOCKED", text=(f"⚠️ TASK_NOT_ACTIVE: task {tid} is {status or 'unknown'}, neither running nor queued.")))
-    # AR2-6: no NEW steering writes while a cancellation is pending. The
-    # effective status honestly stays ``running`` (cancel_state=pending rides
-    # beside it), so the checks above pass — consult the same predicate the
-    # steer_task/mailbox routes use, covering BOTH carriers (durable intent +
-    # legacy latch), and refuse typed.
+    # Cancellation may still report running; consult intent and legacy latch
+    # before accepting new steering, just as steer_task/mailbox do.
     try:
         from ouroboros.cancel_intents import cancel_pending
 
@@ -1190,10 +1189,8 @@ def _forward_to_worker(
     relation = ""
     listed_root = None
     if not durable_descendant_of(status_drive_root, tid, data, current_task_id):
-        # A peer inside the tree (the caller's parent, a sibling, or any task sharing
-        # its root) before the host roster; its typed admission (relay refused, cancel
-        # state read strictly) lives beside the roster's other addressability rules
-        # in peer_roster.
+        # Same-tree peer admission precedes the independent roster; it refuses
+        # relay and reads cancellation strictly.
         relation, refusal = peer_contribution_admission(
             status_drive_root, current_task_id, metadata, tid, data, relayed_from=relayed_from)
         if refusal is not None:
@@ -1241,6 +1238,7 @@ def _forward_to_worker(
             relayed_from_task_id=relayed_from,
             msg_id=uuid.uuid4().hex,
             relation=relation,
+            **({"reply_to": reply_to} if reply_to else {}),
         )
     except StoreForeign as exc:
         return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(
@@ -1487,6 +1485,7 @@ def get_tools() -> List[ToolEntry]:
             "parameters": {"type": "object", "properties": {
                 "task_id": {"type": "string", "description": "ID of the running, queued or requested task to forward to"},
                 "message": {"type": "string", "description": "Message text to forward (at most 8000 chars)"},
+                "reply_to": REPLY_TO_SCHEMA,
                 "relayed_from_task_id": {"type": "string", "description":
                     "Optional sibling/descendant task whose output this ancestor relays. "
                     "The recipient sees both peer and ancestor provenance."},

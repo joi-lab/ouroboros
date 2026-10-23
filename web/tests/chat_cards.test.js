@@ -1,10 +1,13 @@
 // Living cards in the feed (chat_cards.js): one row live and on replay, never an empty box (the fallback text shows
 // while the body loads and when it cannot be read), Keep on Widgets with Undo, Make it a skill and an app's submit
-// into the owner's draft (never a send), card_state, and at most three live frames.
+// into the owner's draft (never a send), card_state, at most three live frames, and the start ledger: a frame's start
+// stands until its load and a second, a card held after a start the page did not outlive rests as its words with the
+// reason and Open (which starts it without its saved state), Close keeps a card as its face, an app's errors show.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createChatCards, createFrameBudget, readCardBody } from '../modules/chat_cards.js';
+import { createHolds, HELD_LINES, HOLDS_KEY } from '../modules/holds.js';
 import { createChatMedia } from '../modules/chat_media.js';
 import { messageRow } from '../modules/message_actions.js';
 import { stampNodeTimestamp } from '../modules/chat_activity.js';
@@ -26,15 +29,24 @@ function serve(routes) {
     return { calls, restore: () => { globalThis.fetch = prior; } };
 }
 
-function feed({ composer = null } = {}) {
+function feed({ composer = null, holds = undefined, settleMs = 5 } = {}) {
     const frameNode = (msg, node) => {
         const bubble = document.createElement('div');
         bubble.className = 'chat-bubble assistant';
         bubble.append(node);
         return bubble;
     };
-    return createChatCards({ frameNode, composer: () => composer });
+    return createChatCards({ frameNode, composer: () => composer, ...(holds ? { holds } : {}), settleMs });
 }
+
+// A ledger over one storage map, as the next page opening on this device would read it.
+function ledgerStore() {
+    const map = new Map();
+    return { map, getItem: (key) => (map.has(key) ? map.get(key) : null), setItem: (key, value) => map.set(key, String(value)),
+        removeItem: (key) => map.delete(key) };
+}
+const ledgerOn = (store) => createHolds({ win: { location: { href: 'http://local/' }, localStorage: store } });
+const ledgerEntries = (store) => JSON.parse(store.map.get(HOLDS_KEY) || 'null')?.entries || {};
 
 const identity = (id, kind, extra = {}) => ({ type: 'card', role: 'assistant', card: { card_id: id, kind, title: 'Plans', revision: 1 },
     fallback_text: 'Basic 9 · Pro 19', ts: '2026-10-17T10:00:00Z', ...extra });
@@ -54,6 +66,17 @@ test('at most three frames live: near ones mount while there is room, far ones u
     budget.forget('e');
     assert.ok(!budget.live().includes('e'));
     assert.deepEqual(log.slice(0, 5), ['+a', '+b', '+c', '-a', '+d']);
+});
+
+test('a near frame the ledger holds waits for Open; Open still mounts it', () => {
+    const log = [];
+    const held = new Set(['b']);
+    const budget = createFrameBudget({ max: 3, mount: (r) => log.push(`+${r}`), unmount: (r) => log.push(`-${r}`),
+        canStart: (record) => !held.has(record) });
+    for (const record of ['a', 'b', 'c']) budget.near(record, true);
+    assert.deepEqual(budget.live(), ['a', 'c'], 'the held one does not start by itself');
+    budget.open('b');
+    assert.deepEqual(budget.live(), ['a', 'c', 'b'], 'the owner\'s Open starts it');
 });
 
 test('a card body is read once per revision; a failed read is tried again', async () => {
@@ -438,6 +461,112 @@ test('overlapping draws: an earlier draw that resolves late mounts nothing, and 
         assert.equal(redrawn.querySelector('.chat-card-expand').listenerCount(), 1);
         cards.destroy();
         assert.equal(window.listeners('resize'), 0, 'nothing left mounted');
+    } finally {
+        server.restore();
+        dom.restore();
+    }
+});
+
+const appBody = (id, sha = 'f00d') => json(200, { card_id: id, kind: 'app', title: 'Cats', fallback_text: 'A cat calculator', revision: 1,
+    app: { sha256: sha, size: 12, url: `/api/cards/${id}/app` }, submissions_summary: [] });
+const appIdentity = (id) => identity(id, 'app', { card: { card_id: id, kind: 'app', title: 'Cats', revision: 1 }, fallback_text: 'A cat calculator' });
+const loadFrame = (frame) => frame.listeners?.get?.('load')?.forEach((handler) => handler({ type: 'load' }));
+
+test('an app\'s start stands in the ledger until its frame loaded and a second passed; Close keeps it as its face', async () => {
+    const dom = installCardDom();
+    const server = serve({ 'GET /api/cards/card_l1': appBody('card_l1'), 'GET /api/cards/card_l1/app': page('<p>cats</p>') });
+    try {
+        const store = ledgerStore();
+        const cards = feed({ holds: ledgerOn(store) });
+        const bubble = cards.buildCard(appIdentity('card_l1'));
+        await flush();
+        assert.equal(bubble.querySelector('[data-card-close]'), null, 'no Close before a frame runs');
+        bubble.querySelector('[data-card-open]').click();
+        await flush();
+        assert.deepEqual(ledgerEntries(store)['app:card_l1'], { reason: 'start', rev: 'f00d', at: ledgerEntries(store)['app:card_l1'].at, n: 1 },
+            'written before the app\'s first byte runs');
+        assert.equal(bubble.querySelector('[data-card-close]').textContent, 'Close');
+        loadFrame(bubble.querySelector('iframe'));
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        assert.equal(ledgerEntries(store)['app:card_l1'], undefined, 'the page outlived the start');
+        bubble.querySelector('[data-card-close]').click();
+        await flush();
+        assert.equal(bubble.querySelector('iframe'), null, 'Close stops the frame');
+        assert.ok(bubble.querySelector('[data-card-open]'));
+        assert.equal(bubble.querySelector('[data-card-close]'), null);
+        assert.equal(bubble.querySelector('.chat-card-status').hidden, true, 'a closed card needs no reason line');
+        assert.equal(ledgerEntries(store)['card:card_l1'].reason, 'owner', 'kept on this device');
+        cards.destroy();
+        const reopened = feed({ holds: ledgerOn(store) });
+        const again = reopened.buildCard(appIdentity('card_l1'));
+        await flush();
+        assert.ok(again.querySelector('.chat-card-face'), 'the next page opens it as its face');
+        again.querySelector('[data-card-open]').click();
+        await flush();
+        assert.ok(again.querySelector('iframe'), 'Open starts it again');
+        assert.equal(ledgerEntries(store)['card:card_l1'], undefined, 'and ends the owner\'s Close');
+        reopened.destroy();
+    } finally {
+        server.restore();
+        dom.restore();
+    }
+});
+
+test('an app the page did not outlive rests as its words with the reason; Open starts it without its saved state', async () => {
+    const dom = installCardDom();
+    const server = serve({ 'GET /api/cards/card_h1': appBody('card_h1', 'beef'), 'GET /api/cards/card_h1/app': page('<p>cats</p>') });
+    try {
+        const store = ledgerStore();
+        store.setItem(HOLDS_KEY, JSON.stringify({ v: 1, entries: { 'app:card_h1': { reason: 'start', rev: 'beef', at: 1 } } }));
+        dom.storage.setItem('ouro_card_state:card_h1:beef', '{"display":"7"}');
+        const cards = feed({ holds: ledgerOn(store) });
+        const bubble = cards.buildCard(appIdentity('card_h1'));
+        await flush();
+        assert.equal(bubble.querySelector('.chat-card-face').querySelector('.chat-card-fallback').textContent, 'A cat calculator');
+        assert.equal(bubble.querySelector('.chat-card-status').textContent, HELD_LINES.start);
+        assert.equal(bubble.querySelector('.chat-card-status').hidden, false);
+        bubble.querySelector('[data-card-open]').click();
+        await flush();
+        const frame = bubble.querySelector('iframe');
+        assert.match(frame.srcdoc, /let saved = null;/, 'the state it saved may be what stopped the page');
+        assert.equal(dom.storage.getItem('ouro_card_state:card_h1:beef'), null, 'and is forgotten: no later mount hands it back');
+        assert.equal(bubble.querySelector('.chat-card-status').hidden, true);
+        cards.destroy();
+        dom.storage.setItem('ouro_card_state:card_h1:beef', '{"display":"7"}');
+        const unheld = feed({ holds: ledgerOn(ledgerStore()) });
+        const plain = unheld.buildCard(appIdentity('card_h1'));
+        await flush();
+        assert.equal(plain.querySelector('.chat-card-status').hidden, true, 'nothing held: no line');
+        plain.querySelector('[data-card-open]').click();
+        await flush();
+        assert.match(plain.querySelector('iframe').srcdoc, /let saved = "\{\\"display\\":\\"7\\"\}";/, 'an ordinary open hands its state back');
+        unheld.destroy();
+    } finally {
+        server.restore();
+        dom.restore();
+    }
+});
+
+test('an app\'s script error shows on its card, once per message', async () => {
+    const dom = installCardDom();
+    const server = serve({ 'GET /api/cards/card_e1': appBody('card_e1'), 'GET /api/cards/card_e1/app': page('<p>cats</p>') });
+    try {
+        const cards = feed({ holds: ledgerOn(ledgerStore()) });
+        const bubble = cards.buildCard(appIdentity('card_e1'));
+        await flush();
+        bubble.querySelector('[data-card-open]').click();
+        await flush();
+        const frame = bubble.querySelector('iframe');
+        assert.match(frame.srcdoc, /addEventListener\('unhandledrejection'/, 'the bridge listens for the app\'s errors');
+        frame.contentWindow = {};
+        const nonce = frame.srcdoc.match(/const nonce = "([^"]+)"/)[1];
+        window.emit('message', { source: frame.contentWindow, data: { type: 'ouro-card-error', kind: 'error', message: 'x is not defined', nonce } });
+        const status = bubble.querySelector('.chat-card-status');
+        assert.equal(status.textContent, 'App error: x is not defined');
+        assert.equal(status.dataset.tone, 'danger');
+        window.emit('message', { source: {}, data: { type: 'ouro-card-error', kind: 'error', message: 'forged', nonce } });
+        assert.equal(status.textContent, 'App error: x is not defined', 'only this frame\'s window speaks for it');
+        cards.destroy();
     } finally {
         server.restore();
         dom.restore();

@@ -161,7 +161,7 @@ def test_the_delegated_reconciler_reads_its_candidates_before_it_reads_liveness(
     from ouroboros import delegate_custody_reconcile as dcr
 
     live: set[str] = set()
-    run = SimpleNamespace(task_id="late-task", run_id="run-1", settled=False)
+    run = dc.RunCustody(task_id="late-task", run_id="run-1", route_id="fixture", model="m")
     seen: list = []
 
     def reading_candidates(root, where="", params=()):

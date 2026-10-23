@@ -20,7 +20,7 @@ from ouroboros.outcomes import (
     normalize_outcome_axes,
 )
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
-from ouroboros.task_finalization import send_provider_death_notice
+from ouroboros.task_finalization import send_provider_death_notice, terminal_host_notice_text
 from ouroboros.task_results import (
     STATUS_CANCELLED,
     STATUS_COMPLETED,
@@ -788,6 +788,8 @@ def _resolve_lifecycle_fault(
             default=HIDDEN_CHAT_ID,
         ),
         "status": status,
+        "wake_silent": stored.get("wake_silent") is True,
+        "quiet_effective": stored.get("wake_silent") is True and not terminal_host_notice_text(stored),
         "reason_code": str(stored.get("reason_code") or ""),
         "outcome_axes": normalize_outcome_axes(stored),
     }
@@ -1055,6 +1057,8 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
             default=HIDDEN_CHAT_ID,
         ),
         "status": str(final_task_result.get("status") or evt.get("status") or ""),
+        "wake_silent": known_result.get("wake_silent") is True,
+        "quiet_effective": known_result.get("wake_silent") is True and not terminal_host_notice_text(known_result),
         # The direct-turn fact rides the rebuilt terminal so the chat block keys
         # its chrome on host truth: the worker frame carries it, the durable
         # result carries it, and a reaper-delivered terminal reads the result.

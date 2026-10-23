@@ -93,7 +93,7 @@ _REVIEW_SUBSTRATE_PATHS = frozenset({
     "ouroboros/code_intelligence.py", "ouroboros/context_budget.py", "ouroboros/deadline_utils.py",
     "ouroboros/llm.py", "ouroboros/openrouter_attribution.py", "ouroboros/outcomes.py",
     "ouroboros/platform_layer.py", "ouroboros/pricing.py", "ouroboros/provider_models.py",
-    "ouroboros/preflight_runner.py", "ouroboros/review_actor_aggregation.py", "ouroboros/review_dispatch.py",
+    "ouroboros/preflight_runner.py", "ouroboros/review_seat_outcome.py", "ouroboros/review_wave.py", "ouroboros/review_dispatch.py",
     "ouroboros/test_evidence.py", "ouroboros/safe_test_supervisor.py",
     "ouroboros/review_execution.py", "ouroboros/review_execution_projection.py", "ouroboros/review_native_episode.py",
     "ouroboros/review_slot_cancel.py", "ouroboros/review_verdict_extraction.py", "ouroboros/reviewer_slot_config.py",

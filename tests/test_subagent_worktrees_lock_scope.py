@@ -290,7 +290,7 @@ def test_configured_child_bootstrap_keeps_the_refusal_facts(tmp_path, monkeypatc
     refusal = _fail("delegate_start", "execution_snapshot_failed",
                     f"A private execution snapshot could not be provisioned ({busy}).",
                     definitely_unrun=True, **lock_busy_facts(busy))
-    monkeypatch.setattr(subagent_runtime, "delegate_start_entry", lambda ctx, prompt, **kw: refusal)
+    monkeypatch.setattr(subagent_runtime, "exact_start", lambda *_a, **_kw: refusal)
     monkeypatch.setattr(subagent_runtime, "current_subagent_alternatives", lambda selected: [])
 
     class _Ctx:
@@ -514,5 +514,48 @@ def test_snapshot_facts_ride_the_start_receipt_as_disclosure_only(tmp_path):
     consumers = sorted(
         path.relative_to(REPO).as_posix() for path in (REPO / "ouroboros").rglob("*.py")
         if "provisioning_sec" in path.read_text(encoding="utf-8"))
-    assert consumers == ["ouroboros/subagent_worktrees.py", "ouroboros/tools/delegate.py",
-                         "ouroboros/tools/delegate_integration.py"]
+    assert consumers == ["ouroboros/subagent_worktrees.py", "ouroboros/tools/delegate_integration.py"]
+
+
+def test_an_empty_snapshot_names_the_nested_repository_it_left_out(tmp_path):
+    """The shape of the Claudexor project folder: a Git repository with an empty tree whose
+    real work tree is an untracked nested clone. The snapshot leaves the clone out; the
+    receipt said only ``entries: 0``, so the nanny had to discover why by hand."""
+    from ouroboros.tools.delegate import _snapshot_facts
+
+    target = tmp_path / "project"
+    target.mkdir()
+    _git(target, "init")
+    _git(target, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "empty")
+    clone = target / "claudexor"
+    clone.mkdir()
+    _git(clone, "init")
+    (clone / "engine.ts").write_text("export {}\n", encoding="utf-8")
+    _git(clone, "add", "-A")
+    _git(clone, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "seed")
+
+    handle = _provision(target, tmp_path / "snaps", tmp_path / "data")
+    facts = _snapshot_facts(handle)
+    assert facts["entries"] == 0 and facts["nested_repositories_excluded"] == ["claudexor/"]
+    assert not (pathlib.Path(handle.path) / "claudexor" / "engine.ts").exists()
+    assert wt.find_execution_snapshot("snap1", data_dir=tmp_path / "data")["excluded_untracked"] == [
+        {"path": "claudexor/", "reason": "nested_repository"}]
+    # A continuation in the same snapshot names it too; a snapshot with none says nothing extra.
+    from ouroboros.delegate_continuation import AdoptedSnapshot
+
+    reused = AdoptedSnapshot("snap1", handle.baseline_sha, handle.path, "run-first", handle.excluded_untracked)
+    facts = _snapshot_facts(reused)
+    assert set(facts) == {"reused_from_run", "nested_repositories_excluded", "nested_repositories_note"}
+    assert facts["nested_repositories_excluded"] == ["claudexor/"] and "captures changes there" in facts["nested_repositories_note"]
+    assert _snapshot_facts(AdoptedSnapshot("s", "b", "/p", "run-x")) == {"reused_from_run": "run-x"}
+    # Only nested repositories are named, the first twenty with the total beside them.
+    from types import SimpleNamespace
+
+    many = SimpleNamespace(entry_count=3, excluded_untracked=(
+        {"path": ".env", "reason": "credential_shaped", "baseline": {}},
+        {"path": "x.sqlite-wal", "reason": "sqlite_wal_index"},
+        *({"path": f"repo{n:02d}/", "reason": "nested_repository"} for n in range(25))))
+    facts = _snapshot_facts(many)
+    assert facts["nested_repositories_excluded"] == [f"repo{n:02d}/" for n in range(20)]
+    assert facts["nested_repositories_excluded_count"] == 25 and facts["entries"] == 3
+    assert "baseline manifest" in facts["nested_repositories_note"]

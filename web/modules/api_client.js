@@ -207,6 +207,15 @@ export function taskArtifactArchiveUrl(taskId, directory) {
     return `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeSegment(name)}?archive=${encodeURIComponent(directory)}`;
 }
 
+/**
+ * Address of Wrap up's saved-work document, which the task-file route writes on read: the
+ * detail's `wrap_up_document` name with `?wrap_up={request_id}`; '' when the host named none.
+ */
+export function taskWrapUpDocumentUrl(taskId, wrapUp) {
+    const url = typeof wrapUp?.request_id === 'string' ? taskArtifactDownloadUrl(taskId, wrapUp.name) : '';
+    return url && `${url}?wrap_up=${encodeURIComponent(wrapUp.request_id)}`;
+}
+
 /** URL for one published immutable source handle (a delegated run's journal range included). */
 export function taskSourceDownloadUrl(taskId, ref) {
     const path = typeof ref?.path === 'string' ? ref.path : '';
@@ -444,6 +453,10 @@ export const apiClient = {
     saveUiLanguage: (payload) => jsonPost('/api/ui/i18n/language', typeof payload === 'string' ? { language: payload } : payload),
     /** @param {import('./ui_i18n_types.js').UiI18nMissingRequest} payload */
     reportI18nMissing: (payload) => jsonPost('/api/ui/i18n/missing', payload),
+    /** The holds this page found (holds.js). @param {import('./client_contract_types.js').UiHoldsRequest} payload */
+    reportUiHolds: (payload) => jsonPost('/api/ui/holds', payload),
+    /** A running module widget's fault (widget_module.js). @param {import('./client_contract_types.js').WidgetFaultRequest} payload */
+    reportWidgetFault: (payload) => jsonPost('/api/widgets/fault', payload),
     importI18n: (memoryDocument) => jsonPost('/api/ui/i18n/import', memoryDocument),
     exportI18nUrl: (language = '') => `/api/ui/i18n/export${language ? `?language=${encodeURIComponent(language)}` : ''}`,
     regenerateI18n: (payload = {}) => jsonPost('/api/ui/i18n/regenerate', payload),
@@ -513,15 +526,6 @@ export const apiClient = {
         items, ...(expectedContentHash ? { expected_content_hash: expectedContentHash } : {}),
         ...(enableAfterGrant ? { enable_after_grant: true } : {}),
     }, { headers: { Prefer: 'respond-async' } }),
-    /**
-     * @param {string} skill
-     * @param {import('./api_types.js').OwnerSkillPresenceRuntimeRequest} payload
-     * @returns {Promise<import('./api_types.js').OwnerSkillPresenceRuntimeResponse>}
-     */
-    savePresenceRuntime: (skill, payload) => jsonPost(
-        `/api/owner/skills/${encodeURIComponent(skill)}/presence-runtime`,
-        payload,
-    ),
     projectFromTask: (taskId, id, name) => jsonPost('/api/projects/from-task', { task_id: taskId, id, name }),
     /** @param {import('./api_types.js').ProjectCreateRequest} payload */
     projectCreate: (payload) => jsonPost('/api/projects', payload),

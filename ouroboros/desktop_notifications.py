@@ -18,9 +18,9 @@ One adapter per platform, used only where the platform path is actually there:
 * macOS: ``UNUserNotificationCenter``, inside an app bundle (a bare interpreter has no identity
   to authorize). The framework is loaded dynamically and the block signatures it needs are
   registered here, so no new PyObjC wrapper joins the frozen launcher.
-* Windows: a notification-area balloon, which Windows 10/11 present as a system notification, on
-  an icon of its own until its click (``launcher_tray.NotificationIcon``): a balloon's events name
-  no balloon, so one icon per notification is what ties a click to its own source.
+* Windows: a balloon on the app's one notification-area icon (``launcher_tray.WindowsTray``), which
+  Windows 10/11 present as a system notification. A balloon click names no balloon, so it opens the
+  newest one's source (owner decision 1A); the icon is there for the whole desktop run.
 * Linux: the freedesktop Notifications service on the session bus through ``gi``'s Gio, when a
   notification server answers. The server owns the sound; nothing else plays one.
 
@@ -140,9 +140,6 @@ class NativeNotifier:
         except Exception as exc:
             log.warning("Native notification failed; the page falls back.", exc_info=True)
             return refused(self.platform, FAILED, _reason(exc))
-
-    def stop(self, wait: float = 0.0) -> None:
-        """The launcher's exit or Panic: release what would outlive the process (Windows' icons)."""
 
     def _clicked(self, token: str) -> None:
         """A notification was clicked: off the platform's callback thread, which must not wait on the page."""
@@ -351,15 +348,18 @@ _WINDOWS_TEXT = "Open Ouroboros to see it."  # a balloon needs text; with text h
 
 
 class WindowsNotifier(NativeNotifier):
-    """Windows' notification settings decide how a balloon appears; Sound off asks it for silence
-    (``launcher_tray.show_balloon``), which only WinForms' own call, the fallback, cannot (DESIGN §9)."""
+    """Balloons on the launcher's one icon (``tray``, a ``launcher_tray.WindowsTray``), whose own click
+    opens the newest balloon's source through the same ``on_click``. The icon is never started for a
+    notification: before it is up, or once it is gone (exit, Panic), the answer is ``unavailable`` and
+    the page falls back. Windows' notification settings decide how a balloon appears; Sound off asks it
+    for silence (``launcher_tray.show_balloon``), which only WinForms' own call, the fallback, cannot
+    (DESIGN §9)."""
 
     platform = "windows"
 
-    def __init__(self, on_click) -> None:
+    def __init__(self, on_click, tray=None) -> None:
         super().__init__(on_click)
-        self._icons = None
-        self._lock = threading.Lock()
+        self._tray = tray
 
     def _status(self) -> str:
         if sys.platform != "win32":
@@ -370,27 +370,17 @@ class WindowsNotifier(NativeNotifier):
             raise Unavailable(f"no_winforms: {type(exc).__name__}") from exc
         return AUTHORIZED  # no per-app question; Windows' own notification settings still decide
 
-    def _pump(self):
-        with self._lock:
-            if self._icons is None:
-                from ouroboros.launcher_tray import NotificationIcon
-
-                self._icons = NotificationIcon(self._clicked)
-        return self._icons
-
     def _deliver(self, title, body, sound, token):
         self._status()
-        outcome = self._pump().show(title, body or _WINDOWS_TEXT, sound, token)
+        tray = self._tray
+        outcome = tray.balloon(title, body or _WINDOWS_TEXT, sound, token) if tray is not None else False
         if outcome is None:
             return unconfirmed(self.platform, "balloon_unconfirmed")
         if not outcome:
-            if not self._icons.alive.is_set():
+            if tray is None or not tray.ready.is_set():
                 return refused(self.platform, UNAVAILABLE, "notification_area_unavailable")
             return refused(self.platform, FAILED, "balloon_not_submitted")
         return submitted(self.platform, outcome)
-
-    def stop(self, wait: float = 0.0) -> None:
-        self._pump().stop(wait)  # one never started stays unstarted: no alert after the exit began
 
 
 # --------------------------------------------------------------------------------------- Linux ---
@@ -496,12 +486,13 @@ class FreedesktopNotifier(NativeNotifier):
         return submitted(self.platform, "os" if server_sound else "none")
 
 
-def native_notifier(on_click):
-    """This platform's adapter, or None (the bridge then answers ``unavailable``)."""
+def native_notifier(on_click, indicator=None):
+    """This platform's adapter, or None (the bridge then answers ``unavailable``). ``indicator``: the
+    launcher's own (Windows shows its notifications as balloons on it)."""
     if sys.platform == "darwin":
         return MacNotifier(on_click)
     if sys.platform == "win32":
-        return WindowsNotifier(on_click)
+        return WindowsNotifier(on_click, indicator)
     if sys.platform.startswith("linux"):
         return FreedesktopNotifier(on_click)
     return None

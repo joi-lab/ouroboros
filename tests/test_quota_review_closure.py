@@ -172,6 +172,7 @@ from datetime import datetime, timedelta, timezone
 
 def test_unchanged_text_renewal_frequency(publisher, monkeypatch):
     from ouroboros import skill_context_snapshot as scs
+    from ouroboros.transcript_prefix import observe_send
 
     root, skill, ctx, path = publisher
     start = datetime.now(timezone.utc).replace(microsecond=0)
@@ -198,19 +199,21 @@ def test_unchanged_text_renewal_frequency(publisher, monkeypatch):
             lease = {"observed": clock["now"], "valid": clock["now"] + timedelta(seconds=420)}
             write()                                        # producer renews the unchanged text
         before = deepcopy(messages)
-        if scs.maybe_append_skill_snapshots(ctx, messages, root):
+        appended = scs.maybe_append_skill_snapshots(ctx, messages, root)
+        if appended:
             appended_at.append(step)
-        assert messages[:len(before)] == before
+        assert messages[:len(before)] == before  # metadata renewal never rewrites sent history
+        assert observe_send(ctx, messages, round_idx=step // 30) is None
     full_notes = [m for m in messages if m.get("_host_context_kind") == scs.SNAPSHOT_KIND and text in m["content"]]
     print("\nWITNESS appended at seconds:", appended_at)
     print("WITNESS full-text notes in one hour for unchanged text:", len(full_notes),
           "| chars appended:", sum(len(m["content"]) for m in full_notes))
     assert len(full_notes) == 1 and len(messages) > 10
     full = json.loads(full_notes[0]["content"].split("\n", 1)[1])
-    for note in messages[1:]:
-        value = json.loads(note["content"].split("\n", 1)[1])
-        assert "text" not in value
-        assert value["text_ref"]["source_sha256"] == full["source"]["sha256"]
+    assert all("text_ref" in json.loads(note["content"].split("\n", 1)[1]) for note in messages[1:])
+    value = json.loads(messages[-1]["content"].split("\n", 1)[1])
+    assert "text" not in value
+    assert value["text_ref"]["source_sha256"] == full["source"]["sha256"]
     assert scs.visible_snapshots(messages)[skill.name][1]["text"] == text
     assert 0 not in scs.obsolete_snapshot_positions(messages)
     from ouroboros.llm_attempt import _physical_candidate

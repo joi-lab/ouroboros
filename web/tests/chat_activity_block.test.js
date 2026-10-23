@@ -91,6 +91,8 @@ function fixture(history = [], detail = { active_direct_turns: [] }, chatId = 1)
         card: (id = TASK) => walkCard(messages, id),
         rows: (id = TASK) => nodes(walkCard(messages, id)).filter((n) => n.classList?.contains('chat-live-line')),
         meta: (id = TASK) => walkCard(messages, id)?.querySelector('[data-live-meta]')?.innerHTML || '',
+        // The labelled facts beyond the compact line (tool calls, models, origin): the card's own details list.
+        facts: (id = TASK) => walkCard(messages, id)?.querySelector('[data-live-facts]')?.innerHTML || '',
         status: () => env.mount.querySelector('.status-badge')?.textContent,
         typingHidden: () => messages.children
             .find((node) => String(node.className || '').includes('typing-bubble'))?.style.display === 'none',
@@ -129,7 +131,7 @@ test('inert tool carrier restores a speechless card without invented narration o
         assert.match(f.rows().map(row => row.innerHTML).join(' '), /1 tool call/);
         assert.equal(f.card().querySelector('[data-live-phase]').hidden, true, 'history alone confers no liveness');
         assert.match(f.meta(), /Activity unconfirmed/, 'the hidden chip is replaced by the meta label');
-        assert.match(f.meta(), /1 tool call/);
+        assert.match(f.facts(), /<dt>Tool calls<\/dt><dd>1<\/dd>/);
         assert.equal(f.card().querySelector('[data-resume-run]'), null);
         assert.equal(f.card().querySelector('[data-cancel-run]'), null);
         assert.equal(f.card().querySelector('[data-live-title]').textContent, '');
@@ -390,7 +392,7 @@ test('a direct turn with two successful tools is the task card: ONE evidence row
             'the closed row counts; the tool names wait behind Expand');
         f.emit('chat', { ...final, tool_calls: 2 });
         assert.equal(f.card().dataset.finished, '1');
-        assert.match(f.meta(), /2 tool calls/);
+        assert.match(f.facts(), /<dt>Tool calls<\/dt><dd>2<\/dd>/);
         assert.match(f.meta(), /\$0\.12/);
     } finally { f.close(); }
     const g = fixture([
@@ -408,7 +410,7 @@ test('a direct turn with two successful tools is the task card: ONE evidence row
         // The replay row is the same row: the host's totals reach the same builder.
         assert.equal(g.rows().length, 2);
         assert.ok(g.rows().some((n) => /2 tool calls/.test(n.innerHTML)));
-        assert.match(g.meta(), /2 tool calls/);
+        assert.match(g.facts(), /<dt>Tool calls<\/dt><dd>2<\/dd>/);
     } finally { g.close(); }
 });
 
@@ -535,7 +537,8 @@ for (const replay of [false, true]) {
                 assert.ok(card, `child ${id} is rendered`);
                 const title = role === 'Subagent' ? `${role} (${id.slice(0, 8)})` : role;
                 assert.equal(card.querySelector('[data-live-title]').textContent, title);
-                assert.match(f.meta(id), /Agent model: gpt-5\.6-sol/);
+                assert.match(f.meta(id), /gpt-5\.6-sol/, 'the compact line names the model');
+                assert.match(f.facts(id), /<dt>Agent model<\/dt><dd>gpt-5\.6-sol<\/dd>/);
                 assert.equal(card.dataset.parentTaskId, TASK);
             }
         } finally { f.close(); }
@@ -1028,7 +1031,7 @@ test('a child folds its own live calls and host counters', () => {
         f.log({ type: 'task_metrics_event', task_id: CHILD, tool_calls: 5, tool_errors: 0,
             tool_call_counts: { read_file: 5 } });
         assert.equal(folded().length, 1, 'host counters update the same folded row');
-        assert.match(f.meta(CHILD), /5 tool calls/);
+        assert.match(f.facts(CHILD), /<dt>Tool calls<\/dt><dd>5<\/dd>/);
     } finally { f.close(); }
 });
 

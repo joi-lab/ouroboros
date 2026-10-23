@@ -133,8 +133,8 @@ test('settings copy distinguishes Cyber configuration authority without auto-ena
     // Each card up to the next one, wherever the Behavior order puts it.
     const supervisor = html.split('<h3>Safety Supervisor</h3>')[1].split('<h3>')[0];
     const evolution = html.split('<h3>Post-Task Self-Evolution</h3>')[1].split('<h3>')[0];
-    assert.match(supervisor, /outside Cyber Pro, the agent cannot lower its own supervision/);
-    assert.match(supervisor, /Cyber Pro also lets the agent configure Supervisor coverage/);
+    assert.match(supervisor, /outside Cyber Pro, Ouroboros cannot lower its own checks/);
+    assert.match(supervisor, /Cyber Pro also lets it configure Supervisor coverage/);
     assert.doesNotMatch(supervisor, /Owner-only/);
     assert.match(evolution, /outside Cyber Pro, only the owner can enable this/);
     assert.match(evolution, /Cyber Pro also lets the agent configure it/);

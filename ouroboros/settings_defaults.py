@@ -275,6 +275,9 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     #   off   — no LLM safety calls at all; the deterministic registry sandbox, protected-path
     #           policy and light-mode guards STAY ON. Every non-full mode audits durably.
     "OUROBOROS_SAFETY_MODE": "full",
+    "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full",
+    "OUROBOROS_MODEL_SAFETY": "",
+    "OUROBOROS_SAFETY_OWNER_RULES": "",
     # Safety-supervisor LLM call shaping (v6.54.3 parse-bug fix): a tight output
     # budget + no reasoning keeps the light model from spending its whole budget on
     # hidden reasoning and returning a 1-token/empty body that fails JSON parse and
@@ -507,7 +510,9 @@ def retired_setting_keys_notice(dropped: tuple[str, ...]) -> str:
 # ordinary load->save round-trip in a process whose env says low/off would launder that value onto disk
 # unauthorised — or, once the guard reads disk, raise a PermissionError nobody authored. Owner endpoints
 # write BOTH disk and env, so the owner path is unaffected. Keep-running is consent: absent means not asked yet.
-_DISK_AUTHORED_SETTINGS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SAFETY_MODE", "OUROBOROS_DESKTOP_KEEP_RUNNING")
+_DISK_AUTHORED_SETTINGS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SAFETY_MODE",
+                          "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "OUROBOROS_SAFETY_OWNER_RULES",
+                          "OUROBOROS_MODEL_SAFETY", "OUROBOROS_DESKTOP_KEEP_RUNNING")
 
 # ENDPOINT-AUTHORED, DISK-ONLY: install-time facts POST /api/onboarding/complete alone writes. The ratchets above are
 # disk-authored yet DO project once the file carries them; these never leave disk in EITHER direction — an env timestamp alone closed the onboarding window on a fresh install, and an env marker was then persisted by a save.

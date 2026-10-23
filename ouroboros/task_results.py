@@ -484,6 +484,11 @@ def write_task_result(
 
     stored = prepared_write(_write)
     if transition.get("terminal"):
+        # Prior safety flags are in-process retry authority, never a durable grant.
+        # Child completion cannot clear its still-running root's history.
+        if stored and str(stored.get("root_task_id") or (stored.get("metadata") or {}).get("root_task_id") or task_id) == task_id:
+            from ouroboros.safety import clear_safety_work
+            clear_safety_work(task_id)
         # The accepted transition into a truly terminal status ends the task: processes its commands left behind are
         # ended by scope (marker + recorded groups) outside this store transaction, on positive evidence only; a pause,
         # retained hold, handoff or reopenable placeholder never reaches here (DEVELOPMENT "Process Custody Rule").
@@ -492,6 +497,8 @@ def write_task_result(
             note_task_terminal_transition(results_drive_root, task_id)
         except Exception:
             log.debug("task scope cleanup could not be started for %s; the sweep owns it", task_id, exc_info=True)
+    from ouroboros.swarm_receipt import refresh_for_task
+    refresh_for_task(results_drive_root, stored)
     return stored
 
 

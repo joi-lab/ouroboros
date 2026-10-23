@@ -35,6 +35,8 @@ class DirectActivityEntry:
 
     actor: Any = field(default=None, repr=False, compare=False)
     active_llm_call: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
+    parked_wait: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
+    parked_root: Any = field(default=None, repr=False, compare=False)
 
     def _live_model_wait_projection(self, *, availability: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Read the direct turn's existing live ``TaskModelWait`` owner.
@@ -180,11 +182,54 @@ class DirectActivityRegistry:
         with self._lock:
             return list(self._activities.values())
 
-    def wait_until_empty(self, timeout: float) -> List[str]:
-        """Wait for whole executions, including preparation and post-task work."""
+    def mark_parked(
+        self,
+        activity_id: str,
+        wait: Optional[Dict[str, Any]],
+        *,
+        drive_root: Any = None,
+    ) -> bool:
+        aid = str(activity_id or "").strip()
+        if not aid:
+            return False
         with self._lock:
-            self._lock.wait_for(lambda: not self._activities, timeout=max(0.0, timeout))
-            return list(self._activities)
+            entry = self._activities.get(aid)
+            if entry is None:
+                return False
+            entry.parked_wait = dict(wait) if isinstance(wait, dict) else None
+            entry.parked_root = drive_root
+            self._lock.notify_all()
+            return True
+
+    def clear_parked(self, activity_id: str) -> bool:
+        aid = str(activity_id or "").strip()
+        if not aid:
+            return False
+        with self._lock:
+            entry = self._activities.get(aid)
+            if entry is None:
+                return False
+            entry.parked_wait = None
+            entry.parked_root = None
+            self._lock.notify_all()
+            return True
+
+    def wait_until_empty(self, timeout: float) -> List[str]:
+        """Wait for unparked executions, including preparation and post-task work."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with self._lock:
+                entries = list(self._activities.items())
+            # The parked predicate reads the task store and run custody; it runs
+            # outside the registry lock so registration and census stay responsive.
+            remaining_ids = [aid for aid, entry in entries if not is_parked_direct_entry(entry)]
+            if not remaining_ids:
+                return []
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return remaining_ids
+            with self._lock:
+                self._lock.wait(timeout=min(remaining, 0.05))
 
     def clear(self) -> None:
         """Clear registry — primarily for tests and process resets."""
@@ -199,6 +244,54 @@ _DIRECT_ACTIVITY_REGISTRY = DirectActivityRegistry()
 
 def get_direct_activity_registry() -> DirectActivityRegistry:
     return _DIRECT_ACTIVITY_REGISTRY
+
+
+def is_parked_owner_wait(task_id: str, wait: Any, *, drive_root: Any = None) -> bool:
+    """True when ``task_id`` is durably parked in ``owner_wait`` with no live detached or open runs."""
+    tid = str(task_id or "").strip()
+    if not tid or not isinstance(wait, dict) or wait.get("state") != "waiting":
+        return False
+    effective_wait = wait
+    if drive_root is not None:
+        try:
+            from ouroboros.task_results import load_task_result
+
+            row = (load_task_result(drive_root, tid, strict=True) or {}).get("owner_wait")
+        except Exception:
+            return False
+        if not isinstance(row, dict) or row.get("state") != "waiting":
+            return False
+        effective_wait = row
+    try:
+        from ouroboros.review_pause import live_detached_operations
+
+        if live_detached_operations(tid):
+            return False
+    except Exception:
+        return False
+    if effective_wait.get("reason") == "owner_pause":
+        try:
+            from ouroboros.budget_pause import observe_task_runs, task_owned_runs_open
+
+            owner_pause = effective_wait.get("owner_pause")
+            external = owner_pause.get("external_runs") if isinstance(owner_pause, dict) else None
+            if task_owned_runs_open(external):
+                if drive_root is None:
+                    return False
+                external = observe_task_runs(
+                    drive_root, tid, reason="owner_pause_retained_runs", request_stop=False,
+                )
+                if task_owned_runs_open(external):
+                    return False
+        except Exception:
+            return False
+    return True
+
+
+def is_parked_direct_entry(entry: DirectActivityEntry) -> bool:
+    if entry.parked_wait is None:
+        return False
+    return is_parked_owner_wait(entry.activity_id, entry.parked_wait, drive_root=entry.parked_root)
 
 
 def reply_expected(record: Any) -> bool:

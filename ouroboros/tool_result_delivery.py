@@ -19,23 +19,12 @@ Two policies share the machinery:
     drives a prefix search and the view is ``[Tool result source view]``.
 
 ``measured_frame``
-    Main's first show. With B the smaller known positive of the owner target
-    and the route capacity, W the capacity alone, R the reply reserve and Pmin
-    the measured minimum request (every envelope with status and address, no
-    body), unsolicited bodies share ``max(0, min(B - R - Pmin, ceil(B /
-    RECLAIM_LOW_WATER_DIVISOR)))`` less what requested forms already took of
-    ``B - R - Pmin`` -- one allowance per batch, the reserve subtracted once --
-    while a form the call asked for (a head/tail view, a page, a window) may use
-    the physical room ``W - R - Pmin``: an owner target is economy for what the
-    host adds unasked, never a cut of a chosen read. The chosen forms are
-    measured whole beside the minimum unasked envelopes, so each side is priced
-    at its own measured density -- a plain page fitting W stays whole beside a
-    heavily escaped log, never cut by a batch average. The complete candidate is
-    re-measured before it is handed back; only requested forms with minimum
-    unasked envelopes exceeding W may shrink a requested form. An unknown W is disclosed (``capacity_unknown``) and a
-    requested form is delivered as chosen: no capacity is invented, and a known
-    target still bounds the unsolicited bodies. With B unknown too the batch is
-    delivered whole. The callback's ``accepted`` flag is never read as fit here.
+    Unasked bodies share the measured eighth. Chosen bodies arrive as asked,
+    even beside a crowded transcript: Main's pre-send recovery narrows memory
+    and host material first. Only a chosen body exceeding usable input by itself
+    may be cut here. A resulting non-fitting candidate is named for recovery,
+    never mistaken for an accepted provider request.
+
 """
 
 from __future__ import annotations
@@ -360,6 +349,7 @@ def _measured_frame(
     *, drive_root: pathlib.Path, task_id: str,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Main's first show: one measured batch allowance, requested forms first."""
+
     count = len(rows)
     texts = [reader_text(text) for text in full]
     digests = [hashlib.sha256(text.encode("utf-8")).hexdigest() for text in texts]
@@ -416,7 +406,7 @@ def _measured_frame(
              for i in range(count) if requests[i] is not None}
     receipt.update(measurements=2, minimum_tokens=p_min, whole_tokens=p_whole, free_tokens=free,
                    requested_room_tokens=room, unsolicited_allowance_tokens=unsolicited_allowance)
-    whole_fits = (room is None or p_whole + reserve <= capacity) and all(wants[i] >= len(texts[i]) for i in wants)
+    whole_fits = (room is None or p_whole + reserve < capacity) and all(wants[i] >= len(texts[i]) for i in wants)
     complete = "complete" if room is not None else "capacity_unknown"
     if whole_fits and p_whole + reserve <= boundary and p_whole - p_min <= unsolicited_allowance:
         return rows, {**receipt, "status": complete}  # every body together inside the unasked share
@@ -425,7 +415,20 @@ def _measured_frame(
     chosen_contents = [form(i, wants[i]) if i in wants else envelopes[i] for i in range(count)]
     chosen = minimum if not wants else whole if chosen_contents == full else measure(chosen_contents)
     p_chosen = _tokens(chosen)
-    receipt.update(measurements=2 + (chosen is not minimum and chosen is not whole), chosen_tokens=p_chosen)
+    requested_capacity = capacity
+    body_costs = {}
+    for i in wants:
+        empty = list(envelopes)
+        empty[i] = ""
+        baseline = measure(empty)
+        one = list(empty)
+        one[i] = chosen_contents[i]
+        body_costs[i] = max(0, _tokens(measure(one)) - _tokens(baseline))
+    protected = {i for i in wants if capacity is None or body_costs[i] <= capacity - reserve}
+    for i in wants.keys() - protected:
+        facts[i] = {**facts[i], "cut_reason": "chosen_body_exceeds_usable_input"}
+    receipt.update(measurements=2 + (chosen is not minimum and chosen is not whole) + 2 * len(wants),
+                   chosen_tokens=p_chosen, chosen_body_tokens={rows[i]["tool_call_id"]: cost for i, cost in body_costs.items()})
     chosen_chars = sum(max(0, len(chosen_contents[i]) - len(envelopes[i])) for i in wants)
     requested_rate = max(p_chosen - p_min, 1) / max(chosen_chars, 1)
     # Initial estimate of unasked cost: price omitted requested text at its shown
@@ -439,12 +442,13 @@ def _measured_frame(
             and (not unsolicited_tokens or p_whole + reserve <= boundary)):
         return rows, {**receipt, "status": complete}
 
-    allocation = [0] * count
+    allocation = [wants.get(i, 0) if i in protected else 0 for i in range(count)]
     if room is None or p_chosen - p_min <= room:  # unknown window, or every chosen form fits it whole
         allocation = [wants.get(index, 0) for index in range(count)]
         requested_tokens = float(p_chosen - p_min)
     else:  # the window shares out among the chosen forms at their own measured rate
-        for index, chars in _water_fill(wants, int(max(0, room) / requested_rate)).items():
+        for index, chars in _water_fill({i: want for i, want in wants.items() if i not in protected},
+                int(max(0, room - sum(body_costs[i] for i in protected)) / requested_rate)).items():
             allocation[index] = chars
         requested_tokens = sum(allocation[i] for i in wants) * requested_rate
     left = min(free, float("inf") if room is None else room) - requested_tokens
@@ -487,15 +491,15 @@ def _measured_frame(
         body_tokens = max(0, _tokens(final) - _tokens(without_unsolicited))
         receipt["unsolicited_body_tokens"] = body_tokens
         # Only the window shrinks a requested form; the target binds unsolicited bodies alone.
-        capacity_over = _tokens(final) + reserve - capacity if capacity is not None else 0
+        capacity_over = _tokens(final) + reserve - requested_capacity if capacity is not None else 0
         economy_over = max(body_tokens - unsolicited_allowance,
                            _tokens(final) + reserve - boundary if body_tokens else 0)
         over = max(capacity_over, economy_over)
         # An unasked overshoot cannot take space from chosen forms that fit
         # beside the minimum unasked envelopes. Both eligibility and cost use
         # that already measured baseline, including real source locators.
-        shrink_chosen = capacity is not None and _tokens(without_unsolicited) + reserve > capacity
-        shrinking = [i for i in range(count) if shrink_chosen or requests[i] is None]
+        shrink_chosen = capacity is not None and _tokens(without_unsolicited) + reserve > requested_capacity
+        shrinking = [i for i in range(count) if (shrink_chosen and i not in protected) or requests[i] is None]
         shown_total = sum(min(allocation[i], len(texts[i])) for i in shrinking)
         if over <= 0 or shown_total <= 0 or attempt > _MAX_REMEASURES:
             break
@@ -510,6 +514,10 @@ def _measured_frame(
                 allocation[i] = int(allocation[i] * max(0.0, 1.0 - (cut * 1.1) / shown_total))
     status = ("capacity_unknown" if capacity is None
               else "projected" if _tokens(final) + reserve <= capacity else "minimum_view_unfit")
+    receipt["recovery_required"] = capacity is not None and _tokens(final) + reserve > capacity
+    for i in wants:
+        if allocation[i] < wants[i] and rows[i].get("result_partial"):
+            rows[i]["result_source_view"]["cut_reason"] = "chosen_body_exceeds_usable_input"
     target = _positive(whole.get("target_total_tokens"))
     receipt["target_excess_tokens"] = max(0, _tokens(final) + reserve - target) if target else None
     receipt["partial"] = [{"tool_call_id": rows[i]["tool_call_id"], "tool": names[i],

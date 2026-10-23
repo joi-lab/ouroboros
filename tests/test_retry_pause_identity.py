@@ -514,38 +514,35 @@ def test_saved_state_that_cannot_complete_the_seed_defers_until_it_does(host, mo
 
 
 @pytest.mark.parametrize("carried", ["consumed_selection", "newer_hold"])
-def test_a_retry_drops_only_the_selection_its_own_dispatch_consumed(host, monkeypatch, clock, reaper,  # noqa: F811
-                                                                    carried):
+def test_a_new_pause_replaces_a_releasable_hold_and_retry_drops_the_consumed_selection(
+    host, monkeypatch, clock, reaper, carried,  # noqa: F811
+):
     from ouroboros.budget_pause import budget_fence_selected
+    from supervisor.budget_resume import revoke_exact_budget_resume
     from supervisor.events_budget import HOLD_ROOT_FENCE_LIFTED
 
     fresh, _pause, resumed = _consumed(host, monkeypatch, clock)
     _loop_once(host, monkeypatch, resumed, plan=fresh, events=_supervisor_events(host))
     running = workers.RUNNING["held"]["task"]
-    # Its producer: the selection a held row's dispatch passed through (``selected`` is its only release).
-    consumed = running["_budget_pause_hold"]
-    assert consumed["selected"] is True
+    # Retiring the consumed exact handoff transfers its selection without a stop.
+    assert revoke_exact_budget_resume(running, "restart_before_dispatch") is False
+    consumed = running["_resume_selection"]
+    assert consumed["selected_by"] == "owner" and "reason" not in consumed
     if carried == "newer_hold":
         # Constructed: no producer re-holds a RUNNING row (holds replace PENDING rows whole, unselected).
-        running["_budget_pause_hold"] = {**consumed, "selected": False, "reason": HOLD_ROOT_FENCE_LIFTED,
+        running["_budget_pause_hold"] = {"reason": HOLD_ROOT_FENCE_LIFTED,
                                          "fence_id": "newer-fence"}
     # The owner Pauses while the attempt hangs: a fence generation that selection never saw.
     assert request_owner_pause("held", request_id="newer")["ok"]
+    assert not budget_hold_fact(running), "the owner's new Pause releases the prior decision (A6)"
     latch = dict(queue.BUDGET_ROOT_FENCES["held"])
     _reap(clock, reaper)
     [retry] = _successors(host)
-    if carried == "consumed_selection":
-        assert "_budget_pause_hold" not in retry, "the consumed selection is spent with its attempt"
-    else:
-        assert budget_hold_fact(retry)["reason"] == HOLD_ROOT_FENCE_LIFTED, "selected alone erases nothing newer"
+    assert "_resume_selection" not in retry and "_budget_pause_hold" not in retry
     assert not budget_fence_selected(retry, latch) and not _assign(host, monkeypatch)
     resumed_now = queue.resume_budget_paused_task(retry["id"])
-    if carried == "consumed_selection":
-        assert resumed_now["ok"], "only the owner's new Resume releases it"
-        assert [t["id"] for t in _assign(host, monkeypatch)] == [retry["id"]]
-    else:
-        assert resumed_now == {"ok": False, "error": "selection_owner_held"}
-        assert budget_hold_fact(retry)["reason"] == HOLD_ROOT_FENCE_LIFTED and not _assign(host, monkeypatch)
+    assert resumed_now["ok"], "only the owner's new Resume releases it"
+    assert [t["id"] for t in _assign(host, monkeypatch)] == [retry["id"]]
 
 
 # --- B5: an owner Pause over a hung attempt, and the monetary latch --------------------------------
@@ -742,9 +739,9 @@ def test_a_resumed_retry_selects_its_child_under_its_own_grant(host, monkeypatch
     assert outcome["type"] == "budget_resume_child_outcome" and outcome["ok"] is True, (
         outcome.get("error"), outcome.get("detail"))
     [held] = [row for row in host.pending if row["id"] == "held-child"]
-    selection = held[budget_pause.BUDGET_HOLD_KEY]
-    assert (selection["selected"], selection["selected_by"], selection["root_grant_id"]) == (
-        True, running["id"], own), "the selection names the current attempt's grant"
+    selection = held["_resume_selection"]
+    assert (selection["selected_by"], selection["root_grant_id"]) == (
+        running["id"], own), "the selection names the current attempt's grant"
     assert live_root_resume_grant(queue, "held", host.root)["grant_id"] == own
     if prior == "superseded_root_grant":  # an unreadable chain names no grant, never the logical row's
         from ouroboros import task_results

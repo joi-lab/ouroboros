@@ -160,7 +160,7 @@ def test_owner_pause_of_a_retry_stays_quiet_in_main(host, tmp_path, monkeypatch,
 
 
 def test_a_superseded_retry_is_not_the_current_root_actor(host, tmp_path, monkeypatch, clock, reaper):
-    from supervisor.events_budget import explicit_resume_required
+    from ouroboros.gateway.state import _pending_resume_available
 
     first = _project_retry(host, tmp_path, monkeypatch, clock, reaper)
     [running] = _assign(host, monkeypatch)
@@ -173,7 +173,7 @@ def test_a_superseded_retry_is_not_the_current_root_actor(host, tmp_path, monkey
     stale = {**first, "_budget_pause": dict(parked["_budget_pause"])}
     assert not root_actor(host.root, "held", first["id"], strict=True)
     assert root_actor(host.root, "held", current["id"], strict=True)
-    assert explicit_resume_required(queue, stale, owner_paused=False) is False
+    assert _pending_resume_available(queue, stale, owner_paused=False) is False
 
 
 @pytest.mark.parametrize("identity", ["logical-root", "current-retry", "child", "unreadable-chain"])

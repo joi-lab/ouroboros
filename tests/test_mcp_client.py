@@ -216,7 +216,9 @@ def test_invalid_stdio_fields_are_visible_without_transport(extra):
     assert status["id"] == "local"
     assert status["code"] == "MCP_CONFIG_ERROR"
     assert status["last_error"]
-    assert manager.enabled_servers_without_tools()[0]["last_error"] == status["last_error"]
+    assert manager.enabled_servers_without_tools() == []
+    notice = manager.catalog_notices()[0]
+    assert notice["id"] == "local" and status["last_error"] in notice["detail"]
     assert manager.test_server(raw)["code"] == "MCP_CONFIG_ERROR"
     assert manager.refresh_server("local")["code"] == "MCP_CONFIG_ERROR"
     assert manager.list_tools_for_registry() == []
@@ -452,7 +454,8 @@ def test_stdio_transport_passes_exact_argv_without_env_or_cwd(monkeypatch, stdio
 
         async def list_tools(self):
             return SimpleNamespace(
-                tools=[SimpleNamespace(name="ping", description="Ping", inputSchema={})]
+                tools=[SimpleNamespace(name="ping", description="Ping", inputSchema={},
+                                       annotations={"readOnlyHint": True})]
             )
 
         async def call_tool(self, name, arguments):
@@ -479,7 +482,10 @@ def test_stdio_transport_passes_exact_argv_without_env_or_cwd(monkeypatch, stdio
         mcp_client._call_tool_async(cfg, "ping", {"value": "hello"}, timeout_sec=2)
     )
 
-    assert tools == [{"name": "ping", "description": "Ping", "input_schema": {}}]
+    # The listing keeps the spec hints for the published catalog; every process records them when it adopts
+    # that catalog (tests/test_mcp_catalog.py::test_published_annotation_hints_reach_every_process).
+    assert tools == [{"name": "ping", "description": "Ping", "input_schema": {},
+                      "annotations": {"readOnlyHint": True}}]
     assert result == ToolResult(
         status="ok",
         code="OK",
@@ -947,31 +953,35 @@ def test_run_async_works_from_sync_caller():
 
 
 # ---------------------------------------------------------------------------
-# D1 (v6.39): surface enabled servers that returned zero tools (silent absence)
+# Empty listings and failed attempts have separate capability disclosures.
 # ---------------------------------------------------------------------------
 
 
-def test_enabled_servers_without_tools_surfaces_broken_only():
+def test_catalog_notices_surface_broken_only():
     mgr = mcp_client.MCPManager()
 
-    # id-aware transport: 'healthy' returns a tool, 'broken' raises (token to redact)
+    # Healthy, failed and successfully empty listings remain distinguishable.
     async def _list_tools(cfg, timeout):
         if cfg.id == "broken":
             raise RuntimeError("connection refused Bearer secret-1234")
+        if cfg.id == "empty":
+            return []
         return [{"name": "ok_tool", "description": "d", "input_schema": {"type": "object", "properties": {}}}]
     mgr._async_list_tools = _list_tools
 
     mgr.reconfigure(_settings(
         _good_server(id="healthy"),
         _good_server(id="broken", auth_token="Bearer secret-1234"),
+        _good_server(id="empty"),
     ))
     mgr.refresh_server("healthy")
     mgr.refresh_server("broken")
-    empties = mgr.enabled_servers_without_tools()
-    ids = [e["id"] for e in empties]
-    assert ids == ["broken"]  # healthy (has tools) is NOT masked away / not included
-    assert "connection refused" in empties[0]["last_error"]
-    assert "secret-1234" not in empties[0]["last_error"]  # redacted
+    mgr.refresh_server("empty")
+    notices = mgr.catalog_notices()
+    assert [row["id"] for row in notices] == ["broken"]
+    assert "connection refused" in notices[0]["detail"]
+    assert "secret-1234" not in notices[0]["detail"]  # redacted
+    assert mgr.enabled_servers_without_tools() == [{"id": "empty", "last_error": ""}]
 
 
 def test_enabled_servers_without_tools_empty_when_disabled():
@@ -982,6 +992,7 @@ def test_enabled_servers_without_tools_empty_when_disabled():
     mgr.reconfigure(_settings(_good_server(id="s"), enabled=False))
     # global MCP disabled -> nothing surfaced
     assert mgr.enabled_servers_without_tools() == []
+    assert mgr.catalog_notices() == []
 
 
 def test_duplicate_tool_names_disclose_instead_of_crashing(monkeypatch, tmp_path):
@@ -1011,3 +1022,9 @@ def test_duplicate_tool_names_disclose_instead_of_crashing(monkeypatch, tmp_path
     assert out.get("ok") is True, out
     assert out.get("tool_count") == 1
     assert "collision" in (mgr._servers["dup"].last_error or ""), mgr._servers["dup"].last_error
+
+
+@pytest.fixture(autouse=True)
+def _private_mcp_catalog_root(tmp_path, monkeypatch):
+    from ouroboros import config
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)

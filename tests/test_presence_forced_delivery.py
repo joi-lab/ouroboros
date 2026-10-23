@@ -22,7 +22,7 @@ from ouroboros.gateway.host_service import create_host_service_app
 from ouroboros.presence_authority import presence_ceiling_payload
 from ouroboros.presence_runner import _cached_result
 from ouroboros.task_results import load_task_result
-from ouroboros.tools.registry import ToolRegistry
+from tests.presence_legacy_helpers import legacy_registry as ToolRegistry
 from ouroboros.utils import append_jsonl
 from tests.test_host_service_api import _seed_presence_behavior, _seed_token
 from tests.test_presence_completion import _call

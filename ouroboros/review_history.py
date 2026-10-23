@@ -186,6 +186,8 @@ def review_dispute_history(history: Any = (), *, drive_root: Any, repo_root: Any
     open_ids = {row["obligation_id"] for row in open_obligations}
     open_records = {row.review_record_id for row in attempts if open_ids.intersection(row.obligation_ids or [])}
     heads = [rid for rid in ids if rid not in referenced]
+    from ouroboros.review_doctrine import history_author_fields
+
     decision_rows = []
     for row in rounds:
         identity = {k: row[k] for k in ("review_record_id", "revision", "attempt", "subject") if k in row}
@@ -201,9 +203,9 @@ def review_dispute_history(history: Any = (), *, drive_root: Any, repo_root: Any
                     "status": {"recorded_verdict": answer.get("verdict"), "response_status": answer.get("status")},
                     "reason": copy.deepcopy(answer)})
         for decision in row.get("author_decisions") or []:
-            decision_rows.append({**identity, "decision_kind": "author_decision", "remark": "Explicit author decision", "status": decision.get("disposition"),
+            decision_rows.append({**identity, "decision_kind": "author_decision",
                                   "history_role": "open" if decision.get("disposition") in {"partial", "deferred"} else role,
-                                  "reason": decision.get("rationale"), "source": decision.get("source_ref")})
+                                  **history_author_fields(decision)})
     from ouroboros.review_history_view import canonical_decision_projection
     return canonical_decision_projection({"kind": "review_dispute_history", "status": "source_unavailable" if gaps else "complete",
             "rounds": rounds, "decision_rows": decision_rows, "gaps": gaps,

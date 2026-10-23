@@ -798,6 +798,7 @@ def prepared_wrapup_candidate(
     from ouroboros.model_slots import task_model_binding, task_processing_preference
     from ouroboros.model_wait import current_model_wait
     from ouroboros.send_clock import MainSendClock, main_clock_policy
+    from ouroboros.transcript_prefix import append_reasoning_retirement_fact, retire_main_reasoning
 
     owner_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     waiter = current_model_wait()
@@ -806,6 +807,8 @@ def prepared_wrapup_candidate(
         context_fit_plan=getattr(owner_ctx, "context_fit_plan", None),
         overrides=waiter.overrides if waiter else None)
 
+    retire_main_reasoning(ctx, messages)
+    append_reasoning_retirement_fact(ctx.accumulated_usage, getattr(ctx, "round_idx", None), messages)
     # Named residual: reads the task's refused-image memory, never recovers a first refusal (vision_routing).
     send_messages = _prepare_main_messages(
         messages, model=ctx.active_model, llm=ctx.llm,

@@ -146,6 +146,10 @@ def prepare_directory_execution(ctx, gateway, target_root, authority, strategy, 
     from dataclasses import replace
     from ouroboros.workspace_admission import validate_workspace_root
 
+    if authority.mode == "plan":
+        if not default_shaped_directory_options(strategy, scope_paths):
+            raise ValueError("Plan turns read the selected folder; choose directory geometry when starting an executor.")
+        return authority, {}, {"plan_workspace_kind": "directory"}
     investigation = getattr(authority, "investigation", False)
     if not staged:
         try:

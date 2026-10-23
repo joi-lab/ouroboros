@@ -2797,7 +2797,9 @@ def test_queue_snapshot_preserves_subagent_contract_fields(tmp_path, monkeypatch
         SimpleNamespace(drive_root=tmp_path, budget_drive_root=tmp_path), restored,
     ) == {}
     assert restored["predecessor_authority"]["source"] == restored["predecessor_authority_source"]
-    assert restored["predecessor_authority"]["result"] == "Previous exact result"
+    assert "result" not in restored["predecessor_authority"]
+    assert restored["predecessor_authority"]["omitted_fields"]["result"] == len("Previous exact result")
+    assert read_result(tmp_path, "previous")["result"] == "Previous exact result"
 
 
 def test_assign_tasks_mirrors_running_subagent_status_to_parent_drive(tmp_path, monkeypatch):

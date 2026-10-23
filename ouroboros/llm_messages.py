@@ -212,11 +212,22 @@ class _MessageShapingMixin:
         allow_cache_ttl: bool = False,
     ) -> List[Dict[str, Any]]:
         cleaned = scrub_native_custody(messages)
+        sealed = allow_message_cache_control and any(isinstance(m.get("cache_control"), dict) for m in cleaned)
         for msg in cleaned:
             for key in ("acceptance_observation", "_acceptance_observation", "review_feedback",
                         STABLE_PREFIX_BLOCKS_KEY, TOOL_RESULT_RECORD_KEY, REVIEW_HISTORY_MESSAGE_KEY, REVIEW_CONTEXT_INDEX_KEY):
                 msg.pop(key, None)
             msg.pop("nativeContinuation", None)
+            boundary = msg.pop("cache_control", None)
+            # Keep user block boundaries stable after the rolling mark moves.
+            # A live OpenRouter/Anthropic probe (2026-10-21) reused the tool prefix
+            # but rewrote each tool-free tail when its former marked list became
+            # a string; consistent send-copy blocks restored growing cache reads.
+            # Unsealed caller prompts and marker-free lanes retain their shape.
+            if sealed and msg.get("role") == "user" and isinstance(msg.get("content"), str) and msg["content"].strip():
+                msg["content"] = [{"type": "text", "text": msg["content"]}]
+            if allow_message_cache_control and isinstance(boundary, dict) and msg.get("role") in {"user", "tool"}:
+                msg["content"] = cls._content_with_cache_boundary(msg.get("content"), boundary)
             content = msg.get("content")
             if not isinstance(content, list):
                 continue
@@ -332,6 +343,18 @@ class _MessageShapingMixin:
                     content[idx] = {"type": "text", "text": own_lane_image_marker(
                         lane, str(block.get("_caption") or "").strip())}
         return cleaned
+
+    @staticmethod
+    def _content_with_cache_boundary(content: Any, marker: Dict[str, Any]) -> Any:
+        """A send copy's rendering of the seal's row mark (``context_fit.seal_task_transcript``):
+        ``marker`` on the last non-empty text block, a string becoming that one block.
+        Content without such a block comes back unchanged; nothing is mutated."""
+        blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
+        for index in range(len(blocks) - 1, -1, -1) if isinstance(blocks, list) else ():
+            block = blocks[index]
+            if isinstance(block, dict) and block.get("type") == "text" and str(block.get("text") or "").strip():
+                return [*blocks[:index], {**block, "cache_control": dict(marker)}, *blocks[index + 1:]]
+        return content
 
     @staticmethod
     def _content_with_system_notice_marker(content: Any) -> Any:

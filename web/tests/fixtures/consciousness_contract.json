@@ -1,0 +1,119 @@
+{
+  "_comment": "Shapes from impl_plan/API_CONTRACT_v1.md (21.10): /api/state bg_consciousness_state, GET /api/consciousness, GET /api/places, settings + policy_state. Synthetic values.",
+  "state": {
+    "bg_consciousness_enabled": true,
+    "bg_consciousness_state": {
+      "enabled": true,
+      "status": "sleeping",
+      "detail": "Sleeping until 17:30.",
+      "level": "act",
+      "next_wake_at": "2026-10-20T14:30:00+00:00",
+      "last_wake_at": "2026-10-20T12:40:00+00:00",
+      "last_wake_outcome": "completed",
+      "live_wake_task_id": "",
+      "spent_24h_usd": 2.32,
+      "daily_usd": 20,
+      "unknown_unmetered": 0,
+      "integrity_degraded": false,
+      "allowance_resets_at": "",
+      "tasks_running": 1,
+      "max_tasks": 2,
+      "spend_by_cause": [
+        {"cause": "own", "label": "own thoughts", "usd": 0.62, "unmetered_calls": 0},
+        {"cause": "place:slack-acme", "label": "Slack · Acme", "usd": 0.88, "unmetered_calls": 0},
+        {"cause": "started", "label": "started work", "usd": 0.48, "unmetered_calls": 3}
+      ],
+      "counted_roots": [
+        {"task_id": "t-notes", "title": "Release notes draft", "cause": "place:slack-acme", "cause_label": "Slack · Acme"}
+      ],
+      "places_brief": [
+        {"place_id": "slack-acme", "label": "Slack · Acme", "state": "active", "unanswered": 2},
+        {"place_id": "tg-community", "label": "Telegram · Ouroboros community", "state": "silent", "unanswered": 0}
+      ]
+    }
+  },
+  "consciousness": {
+    "enabled": true,
+    "status": "thinking",
+    "detail": "Wake-up w-1 is running as a Main turn.",
+    "level": "act",
+    "next_wake_at": "2026-10-20T14:30:00+00:00",
+    "live_wake_task_id": "",
+    "spent_24h_usd": 2.32,
+    "daily_usd": 20,
+    "unknown_unmetered": 0,
+    "integrity_degraded": false,
+    "tasks_running": 1,
+    "max_tasks": 2,
+    "spend_by_cause": [
+      {"cause": "own", "label": "own thoughts", "usd": 0.62, "unmetered_calls": 0},
+      {"cause": "place:slack-acme", "label": "Slack · Acme", "usd": 0.88, "unmetered_calls": 0},
+      {"cause": "started", "label": "started work", "usd": 0.48, "unmetered_calls": 3}
+    ],
+    "counted_roots": [
+      {"task_id": "t-notes", "title": "Release notes draft", "cause": "place:slack-acme", "cause_label": "Slack · Acme"}
+    ],
+    "places_brief": [],
+    "places": [],
+    "recent_wakes": [
+      {"task_id": "w-live", "cause": "focus", "place_id": "slack-acme", "place_label": "Slack · Acme", "started_at": "2026-10-20T13:04:00+00:00", "first_reply_at": "", "finished_at": "", "outcome": "", "accounted_upper_bound_usd": 0.02, "unmetered": false, "checks": [], "summary": "Мария wrote in a direct message"},
+      {"task_id": "w-own", "cause": "own_clock", "place_id": "", "place_label": "", "started_at": "2026-10-20T12:40:00+00:00", "first_reply_at": "", "finished_at": "2026-10-20T12:52:00+00:00", "outcome": "completed", "accounted_upper_bound_usd": 0.21, "unmetered": false, "checks": [{"chip": "not_checked", "tool": "update_memory"}], "summary": "read 4 places, wrote 2 memory pages"},
+      {"task_id": "w-lena", "cause": "focus", "place_id": "slack-acme", "place_label": "Slack · Acme", "started_at": "2026-10-20T11:51:00+00:00", "first_reply_at": "2026-10-20T11:51:40+00:00", "finished_at": "2026-10-20T11:53:00+00:00", "outcome": "message", "accounted_upper_bound_usd": 0.04, "unmetered": false, "checks": [{"chip": "checked", "tool": "place_reply"}, {"chip": "sent_despite", "tool": "slack_send"}], "summary": "Лена wrote in a direct message"},
+      {"task_id": "w-sub", "cause": "focus", "place_id": "tg-community", "place_label": "Telegram · Ouroboros community", "started_at": "2026-10-20T10:12:00+00:00", "first_reply_at": "", "finished_at": "2026-10-20T10:13:00+00:00", "outcome": "silent", "accounted_upper_bound_usd": null, "unmetered": true, "checks": [{"chip": "held", "tool": "place_reply"}], "summary": ""}
+    ]
+  },
+  "places": {
+    "places": [
+      {
+        "place_id": "slack-acme", "connector": "slack-bridge", "connector_label": "Slack", "provider": "slack",
+        "account_id": "T024BE7LD", "conversation_id": "", "label": "Slack · Acme", "state": "active",
+        "destination": "vendor:Slack", "icon": {"name": "", "svg": "<svg viewBox=\"0 0 24 24\"><path d=\"M4 4h16\"/></svg>"},
+        "wakes": [{"fact": "direct_message", "author": "connector"}, {"fact": "mention", "author": "connector"}, {"fact": "reply_to_me", "author": "owner"}],
+        "wake_suggestions": ["direct_message", "group_dm", "mention", "my_thread", "reply_to_me"],
+        "notes": [
+          {"note_id": "n1", "text": "Отвечай коротко и по делу.", "author": "owner", "at": "2026-10-12T09:00:00+00:00"},
+          {"note_id": "n2", "text": "Лена ведёт релизы.", "author": "ouroboros", "at": "2026-10-19T09:00:00+00:00"}
+        ],
+        "owner_accounts": [{"platform_actor_id": "U01ANTON", "label": "@anton.r", "confirmed_at": "2026-10-12T09:00:00+00:00"}],
+        "working_folder": "~/work/acme", "model": "",
+        "status": {"text": "connected", "tone": "ok"}, "unanswered": 2, "last_activity_at": "2026-10-20T13:04:00+00:00", "spent_24h_usd": 0.88
+      },
+      {
+        "place_id": "tg-community", "connector": "telegram-bot", "connector_label": "Telegram", "provider": "telegram",
+        "account_id": "ouroboros_bot", "conversation_id": "-100123", "label": "Telegram · Ouroboros community", "state": "silent",
+        "destination": "vendor:Telegram", "icon": {"name": "chat"},
+        "wakes": [{"fact": "mention", "author": "connector"}], "wake_suggestions": ["mention", "reply_to_me"],
+        "notes": [], "owner_accounts": [], "working_folder": "", "model": "",
+        "unanswered": 0, "last_activity_at": "", "spent_24h_usd": null
+      },
+      {
+        "place_id": "mail-inbox", "connector": "email-presence", "connector_label": "Mail", "provider": "imap",
+        "account_id": "me@example.org", "conversation_id": "", "label": "Mail · inbox", "state": "paused",
+        "destination": "vendor:Email", "icon": null,
+        "wakes": [{"fact": "any_message", "author": "migration"}], "wake_suggestions": ["any_message"],
+        "notes": [{"note_id": "n9", "text": "Только счета.", "author": "migration", "at": ""}], "owner_accounts": [],
+        "working_folder": "", "model": "anthropic/claude-sonnet-5.5", "unanswered": 0, "last_activity_at": "", "spent_24h_usd": 0
+      }
+    ],
+    "connectors": [
+      {"connector": "slack-bridge", "connector_label": "Slack", "icon": {"name": "chat"}, "destination": "vendor:Slack", "wakes": ["direct_message", "mention"], "connected": true},
+      {"connector": "agentrq-bridge", "connector_label": "AgentRQ", "icon": null, "destination": "vendor:AgentRQ", "wakes": ["direct_message"], "connected": false}
+    ]
+  },
+  "settings": {
+    "OUROBOROS_SAFETY_MODE": "light",
+    "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "light",
+    "OUROBOROS_SAFETY_OWNER_RULES": "Никогда не публикуй ничего из моих личных папок.",
+    "OUROBOROS_MODEL_SAFETY": "",
+    "OUROBOROS_MODEL_LIGHT": "anthropic/claude-sonnet-5.5",
+    "OUROBOROS_MODEL_CONSCIOUSNESS": "",
+    "OUROBOROS_SUBAGENTS": {"enabled": true, "items": [
+      {"subagent_id": "packet_checker", "recommended_use": "Checks flags.", "route": {"kind": "api_model", "target_id": "openai::gpt-5.6"}, "review_eligible": true, "delivery": "packet", "rechecks_flags": true}
+    ]},
+    "_meta": {"policy_state": {
+      "supervisor": {"configured": "light", "effective": "light", "current_process": "light", "next_task": "light"},
+      "supervisor_consciousness": {"configured": "light", "effective": "light", "current_process": "light", "next_task": "light"},
+      "safety_recheck": {"row_id": "packet_checker", "eligible_rows": ["packet_checker"], "measured": false}
+    }}
+  }
+}

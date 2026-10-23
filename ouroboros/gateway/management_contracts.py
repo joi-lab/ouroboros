@@ -1,9 +1,7 @@
-"""Product-management envelopes beside ``contracts.py`` (skills, marketplaces, agent accounts,
-local model, MCP, model catalog, updates, core control): descriptive TypedDicts, the twin of
-``web/modules/management_contract_types.js`` (twins older tests read stay in ``api_types.js``).
-Account routes relay the bundled Claudexor engine's own API v2 objects (protocol major 3, release
-pinned in ``ouroboros/claudexor_runtime_pin.json``, source https://github.com/razzant/claudexor),
-named here by their engine schema type."""
+"""Product-management envelopes beside ``contracts.py`` (skills, marketplaces, agent accounts, local model,
+MCP, model catalog, updates, core control): descriptive TypedDicts, the twin of ``web/modules/management_contract_types.js``
+(twins older tests read stay in ``api_types.js``). Account routes relay the bundled Claudexor engine's own API v2 objects
+(protocol major 3, release pinned in ``ouroboros/claudexor_runtime_pin.json``, source https://github.com/razzant/claudexor), named by their engine schema type."""
 
 from __future__ import annotations
 
@@ -65,13 +63,11 @@ class InstalledSkill(TypedDict, total=False):
     presence_runtime: Dict[str, Any]  # a reviewed presence profile's runtime choice
     provenance: Dict[str, Any]  # a ClawHub install record
     identity_collision: bool
-    # The install record joined with the cached catalog of its source (skill_source_catalog.install_listing):
-    # source {id, name, kind, part}, official (exact endorsed bytes), release, basis, base_known, modified (null: base unknown),
-    # update_available {version, digest} | null, withdrawn ({reason, version} for a withdrawn release), left_source, turn_on_when_ready, installed_by,
-    # installed_at, and reason and task_id when the record has them (an install Ouroboros made says why and in
-    # which task); check {by, notes, at}, pending_update {version, digest}, and
-    # update_rejected {version, digest, reason: review_blockers|review_unfinished|preflight_failed, at}.
-    # null: not installed from a source (made here, a local folder, a built-in seed).
+    # The install record joined with the cached catalog of its source (skill_source_catalog.install_listing): source {id, name, kind, part}, official (exact endorsed bytes),
+    # release, basis, base_known, modified (null: base unknown), update_available {version, digest} | null, withdrawn ({reason, version} for a withdrawn release), left_source,
+    # turn_on_when_ready, installed_by, installed_at, and reason and task_id when the record has them (an install Ouroboros made says why and in which task); check {by, notes,
+    # at}, pending_update {version, digest}, and update_rejected {version, digest, reason: review_blockers|review_unfinished|preflight_failed, at}. null: not installed from a
+    # source (made here, a local folder, a built-in seed).
     install: Optional[Dict[str, Any]]
     category: List[str]  # the source's category ids for this skill, [] when it has none
 
@@ -256,7 +252,7 @@ class SkillReviewResponse(TypedDict, total=False):
     error: str
     ok: bool  # attest only
     status_code: int  # attest refusal only
-    pending: bool  # attest only: the job outlasted the answer bound; job_id and message name it
+    pending: bool  # attest: the job outlasted the answer bound; review: the wave is still open (author left)
     message: str  # attest only, with pending
     reviewer_models: List[str]
     review_profile: str
@@ -278,7 +274,11 @@ class SkillReviewResponse(TypedDict, total=False):
     extension_server_reconcile: str
     extension_load_error: Optional[str]
     extension_live_loaded: Optional[bool]
-    convergence_hint: Any
+    record_id: str  # the review's ledger record
+    reused: bool  # a settled record of the same subject answered at $0
+    paid: bool
+    seats: List[Dict[str, Any]]
+    governance: Dict[str, Any]
     job_id: str
     job_status: str
     group_id: str
@@ -471,10 +471,12 @@ class ClaudexorProblem(TypedDict):
 
 
 class ClaudexorMaintenanceProblem(TypedDict):
-    """Maintenance refusals carry the engine's ControlProblem object, not a sentence:
-    ``{code, message, retryable?, requiredActions?, context?}``. 503 with
-    ``context.acceptance: "unknown"`` means the request may have been accepted: send the same body
-    with the same Idempotency-Key again."""
+    """Engine or host preparation problem: ``{code, message, retryable?, requiredActions?, context?}``.
+    POST may prepare Node/npm: 409 ``maintenance_restart_required`` asks for chat-header Restart;
+    409/503 ``maintenance_preparation_failed`` reports failure. Both use
+    ``context.acceptance=not_submitted, scope=this_attempt``. Optional inspection failure still
+    permits POST. A 503 ``acceptance=unknown`` may have been accepted: retain its body and
+    Idempotency-Key even after a later preparation-only reply, then resend both."""
 
     error: Dict[str, Any]
 
@@ -713,6 +715,15 @@ class LocalModelTestResponse(TypedDict):
     tokens_per_sec: Any
 
 
+class McpListingAttempt(TypedDict):
+    """The latest listing attempt, independent of any retained successful listing."""
+
+    at: str
+    ok: bool
+    error: str
+    partial: bool
+
+
 class McpServerStatus(TypedDict, total=False):
     """One configured MCP server. A configuration error row has only ``id``, ``enabled``,
     ``tool_count``, ``last_error`` and ``code`` (MCP_CONFIG_ERROR or MCP_ID_AMBIGUOUS)."""
@@ -735,6 +746,10 @@ class McpServerStatus(TypedDict, total=False):
     last_error: Required[Optional[str]]
     last_refreshed: Any
     last_attempted: Any
+    listed_at: Optional[str]
+    latest_attempt: Optional[McpListingAttempt]
+    complete: bool
+    publication_error: str
     code: str
 
 
@@ -761,6 +776,8 @@ class McpRefreshResponse(TypedDict, total=False):
 
     server_id: str
     ok: bool
+    published: bool
+    publication_error: str
     tool_count: int
     configuration_warnings: List[str]
     tool_name_collisions: List[Dict[str, Any]]
@@ -795,11 +812,17 @@ class McpTestResponse(TypedDict, total=False):
 # --- Updates and core control ------------------------------------------------------------------
 
 class UpdateProgress(TypedDict, total=False):
-    """The update this process is applying, kept in memory only; ``{}`` when there is none. It is an
-    observation, never proof that the update finished: compare ``running_sha`` after reconnecting."""
+    """The last admitted apply attempt, kept across restarts; ``{}`` when there is none, a named ``unknown``
+    when it cannot be read. An observation, never authority. ``active`` is true only while THIS server
+    executes it. ``outcome`` stays empty until concluded: ``applied`` only after a later server's startup
+    checks passed while serving the landed commit; ``not_applied``, ``rolled_back``, ``failed`` or
+    ``unknown`` (``reason`` names the missing evidence). ``work_stop`` appears only on the executor's own
+    conclusion; ``none`` means it reached no worker or service teardown. A version, SHA or reconnect
+    alone proves nothing."""
 
     operation_id: str
     generation: str
+    current_generation: bool
     stage: str
     started_at: str
     stage_started_at: str
@@ -807,6 +830,19 @@ class UpdateProgress(TypedDict, total=False):
     result: str
     error: str
     restart_required: bool
+    outcome: Literal["", "applied", "not_applied", "rolled_back", "failed", "unknown"]
+    outcome_at: str
+    concluded_by: Literal["executor", "boot"]
+    reason: str
+    blockers: List[str]
+    work_stop: Literal["", "none", "invoked"]
+    base_sha: str
+    target_sha: str
+    tx_attempt_id: str
+    keep_branch: str
+    stash_note: str
+
+    retention_unconfirmed: bool  # live only: saving this observation failed, not the update itself
 
 
 class UpdateLetter(TypedDict):
@@ -888,13 +924,14 @@ class CommandRequest(TypedDict):
     adds a system row; the same ``visible_task_id`` within 5 seconds is answered as deduped."""
 
     cmd: str
+    client_surface: NotRequired[Dict[str, Any]]
     visible_text: NotRequired[str]
     visible_task_id: NotRequired[str]
     task_constraint: NotRequired[Dict[str, Any]]
 
 
 class CommandResponse(TypedDict, total=False):
-    """``{status: "ok"}``: queued, not done. ``{ok, deduped, task_id}`` for a deduped repeat."""
+    """``{status: "ok"}``: queued, except Panic acknowledges its latch. ``{ok, deduped, task_id}`` for a deduped repeat."""
 
     status: str
     ok: bool
@@ -970,7 +1007,7 @@ __all__ = [
     "ClaudexorProfileEnabledResponse", "ReviewPoolResponse",
     "ModelCatalogItem", "ModelCatalogResponse", "OpenAICompatibleModelsRequest", "LocalModelStartRequest",
     "LocalModelStartResponse", "LocalModelRuntimeMissingResponse", "LocalModelStatusResponse",
-    "LocalModelTestResponse", "McpServerStatus", "McpStatusResponse", "McpRefreshRequest",
+    "LocalModelTestResponse", "McpListingAttempt", "McpServerStatus", "McpStatusResponse", "McpRefreshRequest",
     "McpRefreshResponse", "McpTestRequest", "McpTestResponse",
     "UpdateProgress", "UpdateLetter", "UpdateTransactionState", "UpdateStatusResponse",
     "CommandRequest", "CommandResponse", "GitRollbackRequest", "GitRollbackResponse", "GitPromoteResponse",

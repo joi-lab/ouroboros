@@ -7,7 +7,8 @@
 // namespaces its ids and shows in its feed what was sent.
 import { bindComposerFileTargets, cleanupUploadedAttachments } from './chat_media.js';
 import { composerText, createComposerAttachments } from './chat_attachments.js';
-import { loadChatInputHistory, saveChatInputHistory } from './chat_activity.js';
+import { loadChatInputHistory, saveChatInputHistory, sendPanic } from './chat_activity.js';
+import { isPanicFrame } from './panic.js';
 import { clientSurfaceField } from './client_surface.js';
 import { apiClient, apiFetch } from './api_client.js';
 import { bindEnterSubmit, bindMenu } from './ui_interactions.js';
@@ -20,6 +21,7 @@ import { showToast } from './toast.js';
 import { bindComposerPlus } from './composer_plus.js';
 import { bindComposerChips } from './composer_chips.js';
 import { bindVoiceControls } from './voice_controls.js';
+import { draftPlace, flySent } from './send_flight.js';
 
 const CHAT_DRAFT_KEY = 'ouro_chat_draft';
 const CHAT_INPUT_HISTORY_KEY = 'ouro_chat_input_history';
@@ -28,7 +30,9 @@ const PLUS_ICONS = {
     attach: strokeIcon('<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>', 16),
 };
 
-/** The composer inside the room's `.chat-input-wrap`; chat.js mounts it and namespaces its `chat-*` ids in a Project. */
+/** The composer inside the room's `.chat-input-wrap`; chat.js mounts it and namespaces its `chat-*` ids in a Project.
+ * The field (`.chat-field`) is one object: a staged reply's strip (chat_reply.js puts it before the text row) and the
+ * text row with "+", the words, the mic slot and Send. */
 export function composerMarkup() {
     return `
                 <div id="chat-attachment-preview" class="chat-attachment-preview"></div>
@@ -40,15 +44,17 @@ export function composerMarkup() {
                     <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max"></div>
                     <span class="chat-composer-chips" data-composer-chips hidden></span>
                 </div>
-                <div class="chat-text-row">
-                    <button class="chat-plus-btn ui-hit-area" id="chat-plus" type="button" data-composer-plus aria-label="More actions" aria-haspopup="menu" aria-expanded="false" title="More actions">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
-                    </button>
-                    <input type="file" id="chat-file-input" class="chat-file-input-hidden" accept="*/*" multiple>
-                    <textarea id="chat-input" placeholder="Message Ouroboros..." rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
-                    <span class="chat-voice-slot" data-composer-voice hidden></span>
-                    <div class="chat-send-group">
-                        <button class="chat-send-inline ui-hit-area" id="chat-send" title="Send message">Send</button>
+                <div class="chat-field">
+                    <div class="chat-text-row">
+                        <button class="chat-plus-btn ui-hit-area" id="chat-plus" type="button" data-composer-plus aria-label="More actions" aria-haspopup="menu" aria-expanded="false" title="More actions">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+                        </button>
+                        <input type="file" id="chat-file-input" class="chat-file-input-hidden" accept="*/*" multiple>
+                        <textarea id="chat-input" placeholder="Message Ouroboros..." rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+                        <span class="chat-voice-slot" data-composer-voice hidden></span>
+                        <div class="chat-send-group">
+                            <button class="chat-send-inline ui-hit-area" id="chat-send" title="Send message">Send</button>
+                        </div>
                     </div>
                 </div>`;
 }
@@ -165,7 +171,8 @@ export function createPlusMenu({ button, hostItems = [] }) {
  * resolves a namespaced id; `page` is the room (the drop target and the capsules' docking box); `ws` the shared
  * socket; `replies` the room's reply controller, whose reference rides the frame; `storeKey(base)` the room's
  * sessionStorage key. `refreshState()` re-reads the room's settings after a capsule saves, `onLayout()` re-measures
- * the room's dock, `onSent({ text, frame, result, views })` shows an accepted send in the feed, and `readingBack()`
+ * the room's dock, `onSent({ text, frame, result, views })` shows an accepted send in the feed and returns the row it
+ * added (the sent draft rises into it, send_flight.js), and `readingBack()`
  * says whether the owner's own gesture took the room off its newest row (the phone fold reads it: composer_fold.js).
  */
 export function createComposer({ page, byId, ws, replies, chatSessionId, isMain, chatId, projectId, storeKey,
@@ -248,12 +255,32 @@ export function createComposer({ page, byId, ws, replies, chatSessionId, isMain,
     }
 
     async function sendMessage(planMode = false) {
+        let text = input.value.trim();
+        if (isPanicFrame({ type: 'chat', content: text })) {
+            // Emergency input precedes settings saves, uploads and their disabled Send state.
+            const frame = { type: 'chat', content: text, ...clientSurfaceField() };
+            const sentDraft = input.value;
+            sendPanic({ ws, frame, onAccepted: () => {
+                // Only the accepted command text is consumed. Replies, files and
+                // any newer edit belong to the next message.
+                if (input.value !== sentDraft) return;
+                if (!destroyed) {
+                    input.value = inputDraft = '';
+                    inputHistoryIndex = inputHistory.length;
+                    resizeChatInput();
+                }
+                try {
+                    if (sessionStorage.getItem(storeKey(CHAT_DRAFT_KEY)) === sentDraft) clearInputDraft();
+                } catch {}
+            } });
+            return;
+        }
         if (sendBtn.disabled) return;  // guard against Enter re-entry during async upload
         if (ownerControls.hasPendingSave()) {  // both room settings land before the next message
             setSendBusy(true, 'Saving');
             try { if (!(await ownerControls.pendingSave())) return; } finally { setSendBusy(false); }
         }
-        let text = input.value.trim();
+        text = input.value.trim();
         const hasAttachments = attachments.count > 0;
         let uploadedAttachments = [];
         if (!text && !hasAttachments) return;
@@ -298,11 +325,13 @@ export function createComposer({ page, byId, ws, replies, chatSessionId, isMain,
         }
         // Send consumes Swarm.
         if (planMode) setSwarm(false);
+        // Where the draft stands, read before the field empties: the sent bubble rises from here (send_flight.js).
+        const draft = draftPlace(input.closest('.chat-field'), input);
         if (hasAttachments) attachments.clear();
         rememberInput(text);
         input.value = '';
         clearInputDraft();
-        onSent({ text, frame, result, views: uploadedAttachments.map((item) => item.view) });
+        flySent({ from: draft, row: onSent({ text, frame, result, views: uploadedAttachments.map((item) => item.view) }) });
     }
 
     // Send mode lives on DOM so CSS and click/Enter share one source.
@@ -348,7 +377,8 @@ export function createComposer({ page, byId, ws, replies, chatSessionId, isMain,
 
     // Do not pass MouseEvent as planMode.
     sendBtn.addEventListener('click', () => sendMessage(swarmArmed()));
-    bindEnterSubmit(input, sendBtn);
+    // The send path admits Panic even while an ordinary upload/save disables Send.
+    bindEnterSubmit(input, sendBtn, () => sendMessage(swarmArmed()));
     input.addEventListener('keydown', (e) => {
         if (e.key === 'ArrowUp' && !e.shiftKey) {
             restoreInputHistory(-1);
@@ -423,12 +453,12 @@ export function createComposer({ page, byId, ws, replies, chatSessionId, isMain,
         // A brief composer brighten when a task leaves the main chat for a project — a calm "you're free to start
         // something else" signal (P3). The CSS animation owns the duration; the class leaves with it, no timer.
         signalFreed() {
-            const row = page.querySelector('.chat-text-row');
-            row?.classList.add('chat-freed');
-            row?.addEventListener('animationend', function done(event) {
-                if (event.target !== row) return;  // a child's animation is not this cue
-                row.classList.remove('chat-freed');
-                row.removeEventListener('animationend', done);
+            const field = page.querySelector('.chat-field');
+            field?.classList.add('chat-freed');
+            field?.addEventListener('animationend', function done(event) {
+                if (event.target !== field) return;  // a child's animation is not this cue
+                field.classList.remove('chat-freed');
+                field.removeEventListener('animationend', done);
             });
         },
         // Unsendable client-side state: staged File objects or an upload in flight.

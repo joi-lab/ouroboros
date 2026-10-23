@@ -109,7 +109,7 @@ def test_emitted_reader_keeps_disabled_tools_resource_policy_and_network_restric
 
 
 def test_presence_keeps_its_selected_physical_runtime_root(world):
-    from ouroboros.presence_capabilities import PresenceResourceTarget, PresenceToolTarget
+    from tests.frozen_presence_capabilities import PresenceResourceTarget, PresenceToolTarget
 
     for prefix in ("memory", "."):
         ctx = _speaker(world, "speaker", PresenceToolTarget("builtin", "read_file"),

@@ -433,6 +433,16 @@ def _handle_owner_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
         from ouroboros.owner_relay import publish_relay_ack
         publish_relay_ack(ctx.DRIVE_ROOT, str(evt["task_id"]), evt["relay_ack"], getattr(ctx, "bridge", None))
         return
+    if isinstance(evt.get("card_ack"), dict):
+        # The author read a press that waited for it: the card stops saying so, live.
+        from ouroboros.card_store import load_card
+        from supervisor.card_delivery import send_card_state
+        try:
+            if record := load_card(ctx.DRIVE_ROOT, evt["card_ack"].get("card_id")):
+                send_card_state(ctx.bridge, record)
+        except Exception:
+            log.debug("card_state after a press read failed", exc_info=True)
+        return
     try:
         ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", {
             "ts": evt.get("ts", utc_now_iso()),

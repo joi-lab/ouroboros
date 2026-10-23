@@ -12,6 +12,8 @@ decodes, child processes and threads. The contract is EQUALITY of those counters
 roots; the one allowance is ``VM_ALLOWANCE`` SQLite VM steps for a deeper B-tree (logarithmic in
 the history, never a share of it). A full scan hidden inside one SELECT grows the VM steps and
 fails; reading the requested rooms' own rows is the same work at every size and passes.
+The explicit boot compatibility pass may walk child directories and read SQLite headers;
+it has a separate bounded allowance, with no SQL, JSON decoding or frozen-history access.
 
 Counting is not timing: this file holds no clock and proves no latency; it makes the next
 history-sized reader on these paths fail by name instead of arriving silently.
@@ -26,6 +28,7 @@ maintenance jobs: a second run over unchanged inputs commits nothing and reads n
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import math
 import os
@@ -132,6 +135,39 @@ def boundary(measured: Dict[Any, Any], tag: str, k: int) -> Dict[str, Any]:
     return entry
 
 
+def child_header_breaches(entry: Dict[str, Any], children: int, root_depth: int) -> Dict[str, Any]:
+    """Only directory metadata and bounded headers may grow in the boot compatibility pass.
+
+    Each fixture child has one current store. WAL needs its header twice (mode and tier);
+    Windows buffers each 100-byte read. Root resolution and confined directory handles
+    also grow with the number/depth of children, never with their stored history.
+    """
+    counts = entry["counts"]
+    metadata = {"stat", "scandir", "listdir", "open", "os_open", "read_bytes"}
+    breaches = {key: value for key, value in counts.items() if value and (
+        key.split(":")[0] not in metadata or key.endswith((":archive", ":task_results")))}
+    limits = {"stat": (children + 1) * (2 * root_depth + 32),
+              "scandir": 2 * (children + 1), "listdir": 2 * (children + 1),
+              "open": 6 * children, "os_open": 16 * (children + 1),
+              "read_bytes:headless": 2 * io.DEFAULT_BUFFER_SIZE * children}
+    breaches.update({key: (counts[key], limit) for key, limit in limits.items() if counts.get(key, 0) > limit})
+    if counts.get("read_bytes:headless", 0) < 100 * children:
+        breaches["missing_headers"] = (counts.get("read_bytes:headless", 0), children)
+    for source, amount in entry.get("callers", {}).items():
+        if source.startswith("read_bytes:") and not any(owner in source for owner in (
+                "ouroboros.store._read_header", "ouroboros.store._filesystem_type")):
+            breaches[source] = amount
+    return breaches
+
+
+def assert_publication_flat(measured: Dict[Any, Any], tag: str) -> None:
+    for k in (K_SMALL, measured["large"]):
+        entry = boundary(measured, tag, k)["child_headers"]
+        assert not (breaches := child_header_breaches(
+            entry, measured[k]["facts"]["child_drives"], len(pathlib.Path(measured[k]["root"]).parts))), breaches
+    assert_flat(measured, tag)
+
+
 def assert_flat(measured: Dict[Any, Any], tag: str) -> None:
     large = measured["large"]
     answers = [{key: value for key, value in (measured[k].get("responses", {}).get(tag) or {}).items()
@@ -165,11 +201,11 @@ def test_b1_no_child_process_before_health(measured):
 
 
 def test_b2_publication_to_dialogue_is_flat(measured):
-    assert_flat(measured, "B2_dialogue")
+    assert_publication_flat(measured, "B2_dialogue")
 
 
 def test_b2_publication_to_supervisor_ready_is_flat(measured):
-    assert_flat(measured, "B2_ready")
+    assert_publication_flat(measured, "B2_ready")
 
 
 def _assert_state_questions(measured, tag):
@@ -339,6 +375,40 @@ def test_the_contract_catches_a_history_walk(tmp_path, walks_history):
     assert bool(contract_breaches(counted[K_SMALL], counted[30], 30)) is walks_history, counted
 
 
+@pytest.mark.parametrize("extra", ["none", "sql", "body", "legacy_scan", "missing_headers"])
+@pytest.mark.parametrize("mode", ["PERSIST", "WAL"])
+def test_child_header_allowance_rejects_history_work(tmp_path, monkeypatch, extra, mode):
+    from ouroboros import store, store_journal
+    from tests.test_store import document, publish
+
+    monkeypatch.setattr(store, "_journal_mode", lambda *_: mode)
+    drive = tmp_path / "state/headless_tasks/child/data"
+    publish(drive, document("finished", result="x" * 20_000))
+    legacy = drive / "task_results"
+    legacy.mkdir()
+    body = legacy / "finished.json"
+    body.write_text(json.dumps(document("finished", result="x" * 20_000)), encoding="utf-8")
+
+    def prepare():
+        if extra != "missing_headers":
+            store_journal.prepare_children(tmp_path)
+        if extra == "sql":
+            with store.open_store(drive, write=False) as txn:
+                txn.conn.execute("SELECT * FROM task_bodies").fetchall()
+        elif extra == "body":
+            body.read_bytes()  # even an undecoded history read must fail
+        elif extra == "legacy_scan":
+            list((tmp_path / "task_results").glob("*.json"))
+
+    try:
+        with CostMeter(tmp_path) as meter:
+            tagged("headers", prepare)
+        breaches = child_header_breaches(meter.snapshot("headers"), 1, len(tmp_path.parts))
+        assert bool(breaches) is (extra != "none"), breaches
+    finally:
+        store.close_connections()
+
+
 @pytest.mark.parametrize("rests", [False, True])
 def test_the_rest_law_catches_a_job_that_redoes_its_work(tmp_path, rests):
     """A job that records its result reads nothing the second time; one that forgets re-reads the archive."""
@@ -379,6 +449,8 @@ def test_the_meter_installs_where_a_door_is_missing_and_never_records_a_wrapper_
     from tests import _cost_meter
 
     real_stat, real_open = os.stat, open
+    supported = os.supports_dir_fd
+    stat_supports_dir_fd = os.stat in supported
     with monkeypatch.context() as patch:
         patch.setattr(json, "loads", _cost_meter._w_json_loads)  # left wrapped; os.stat .. open come first
         with pytest.raises(RuntimeError, match="still the meter's wrapper"):
@@ -386,8 +458,10 @@ def test_the_meter_installs_where_a_door_is_missing_and_never_records_a_wrapper_
         assert os.stat is real_stat and open is real_open
     monkeypatch.delattr(os, "pread", raising=False)
     with CostMeter(tmp_path) as meter:
+        assert (os.stat in os.supports_dir_fd) is stat_supports_dir_fd
         tagged("read", lambda: os.stat(tmp_path))
     assert meter.snapshot("read")["counts"]["stat"] == 1 and os.stat is real_stat
+    assert os.supports_dir_fd is supported
 
 
 @pytest.mark.parametrize("takes", [0, 1], ids=["rebinding_refused", "restoring_refused"])

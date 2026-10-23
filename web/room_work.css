@@ -40,12 +40,32 @@
    controls: each bar is one row whose commands keep their width while its title block yields to them. */
 :is(.chat-page-header, .project-panel-bar) .app-page-title-row > .rw-trigger {
     flex: 0 1000 auto; min-width: var(--touch-target-min); max-width: 100%; justify-content: center;
-    margin-left: var(--space-1); padding-inline: 10px;
+    margin-inline-start: 6px; padding-inline: 12px;
+}
+:is(.chat-page-header, .project-panel-bar) .app-page-title-row > .rw-trigger:has(> .rw-caret:not([hidden])) {
+    min-width: max(var(--touch-target-min), 60px);
+}
+:is(.chat-page-header, .project-panel-bar) .app-page-title-row > .rw-trigger[data-word="off"] {
+    flex-shrink: 0;
+}
+html[data-layout="docked"] .chat-page-header .app-page-title-row > .rw-trigger {
+    margin-inline-start: 0;
 }
 :is(.chat-page-header, .project-panel-bar) .app-page-title-row > .app-page-title {
     flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.project-panel-bar .app-page-title-block { flex: 1 1 0; min-width: 0; }
+:is(.chat-page-header, .project-panel-bar) > .app-page-title-block { flex: 0 1 auto; min-width: 0; max-width: 100%; }
+:is(.chat-page-header, .project-panel-bar) > :is(.app-page-actions, .app-page-trailing) { flex: 0 0 auto; }
+:is(.chat-page-header, .project-panel-bar) .app-page-title-row {
+    box-sizing: border-box;
+    display: inline-flex; align-items: center; gap: 0; max-width: 100%; min-width: 0;
+    height: var(--chrome-control-h); padding-inline: 14px 4px; border-radius: var(--pill-radius);
+    background: var(--chip-float); box-shadow: var(--elev-rest);
+    -webkit-backdrop-filter: var(--glass); backdrop-filter: var(--glass);
+}
+html[data-layout="docked"] .chat-page-header .app-page-title-row {
+    padding-inline: 2px;
+}
 /* The real badge (setStatus writes it) is bare text inside the control. */
 .rw-trigger .status-badge {
     display: block;
@@ -78,11 +98,19 @@
 .rw-trigger[data-tone="unknown"] { color: var(--status-neutral-fg); }
 .rw-trigger[data-tone="online"] { color: var(--status-ok-fg); }
 .rw-trigger[data-tone="offline"] { color: var(--text-secondary); }
-.rw-trigger:not(:disabled):hover { background: rgba(var(--neutral-rgb), 0.07); }
-.rw-trigger[data-open="1"] { background: rgba(var(--neutral-rgb), 0.11); }
+/* The whole title capsule opens the Shade; its state layer covers that same target. */
+.app-page-title-row:has(> .rw-trigger:not(:disabled):not([hidden])) { cursor: pointer; transition: var(--motion-tone); }
+@media (hover: hover) {
+    .app-page-title-row:has(> .rw-trigger:not(:disabled):not([hidden])):hover { background: var(--chip-float-hover); }
+}
+.app-page-title-row:has(> .rw-trigger[data-open="1"]) { background: var(--chip-float-hover); }
+.app-page-title-row:has(> .rw-trigger:not(:disabled):not([hidden])):active { filter: var(--press); }
 
 /* ---- carets and hidden parts, shared by the control and the rows --------------------------------------- */
 .rw-caret[hidden], .rw-secondary[hidden], .rw-where[hidden], .rw-chev[hidden] { display: none; }
+/* The mark keeps the moving dots' width in every shape, so a room going between Online and Working never moves
+   its caret (a state change never moves a neighbour). */
+.rw-trigger .status-mark { min-width: calc(3 * var(--mark-dot) + 2 * var(--mark-gap)); }
 .rw-caret, .rw-chev { flex: none; display: inline-flex; width: 10px; height: 10px; align-items: center; justify-content: center; }
 .rw-caret::before, .rw-chev::before {
     content: '';
@@ -128,21 +156,17 @@
     border-bottom: 1px solid var(--surface-border, rgba(var(--neutral-rgb), 0.14));
     border-radius: 0 0 var(--radius-lg) var(--radius-lg);
     box-shadow: var(--chrome-shade-shadow);
-    animation: rw-unfold 170ms cubic-bezier(0.2, 0.7, 0.2, 1);
+    animation: rw-unfold var(--motion-fade) var(--ease-sheet);
 }
-/* The bar's hairline moves to the foot of the Shade while it is open. */
-.project-panel[data-rw-open] .project-panel-bar { border-bottom-color: transparent; }
-/* Main: the header floats over the transcript, so its anchor hangs from the header's bottom edge and the
-   Shade takes the same material without a Project tint. While open the header keeps opaque page ink to its
-   edge, so the bar and its Shade read as one surface unfolding, as in a Project. */
-.chat-page-header > .rw-shade-anchor { position: absolute; left: 0; right: 0; top: 100%; height: 0; z-index: 30; }
+/* Main and Project: the header floats over the transcript, so its anchor hangs from the header's bottom edge and
+   the Shade unfolds from there. */
+:is(.chat-page-header, .project-panel-bar) > .rw-shade-anchor { position: absolute; left: 0; right: 0; top: 100%; height: 0; z-index: 30; }
 .chat-page-header .rw-shade {
     --rw-hover: var(--menu-item-hover);
     background: rgb(var(--shell-rgb));
     border-bottom-color: var(--surface-border, rgba(var(--neutral-rgb), 0.14));
 }
 .chat-page-header .rw-shade .rw-list { padding-left: var(--page-header-padding-x); padding-right: var(--page-header-padding-x); }
-.chat-page-header[data-rw-open]::before { -webkit-mask-image: none; mask-image: none; inset: 0; background: rgb(var(--shell-rgb)); }
 /* The Project status bar keeps the room's history note; without one it takes no room. */
 .chat-panel-statusbar:not(:has(> :not([hidden]))) { display: none; }
 

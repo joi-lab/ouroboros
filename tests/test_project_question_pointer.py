@@ -73,8 +73,8 @@ def test_real_escalation_bridge_history_detail_and_answer(tmp_path, monkeypatch)
     main = json.loads(_assemble_history_response(tmp_path, 1, 10, 0))["messages"]
     assert main[0]["quiz_state"] == "answered" and main[0]["answered_index"] == 1
     assert main[0]["question"] == "Which storage?" and main[0]["options"] == ["Local", "Shared"]
-    # Owed to the live asker until its saved read; that read settles it.
-    assert main[0]["text"] == "Answer recorded · delivery pending in Question Project"
+    # Saved in the live asker's mailbox until its saved read; that read settles it.
+    assert main[0]["text"] == "Answer saved · the task reads it when it continues in Question Project"
     from ouroboros.owner_mailbox import acknowledge_transcript_entry, drain_owner_entries
     [entry] = drain_owner_entries(tmp_path, "task-1")
     assert entry["kind"] == "quiz_answer" and acknowledge_transcript_entry(tmp_path, "task-1", entry)

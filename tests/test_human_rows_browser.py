@@ -19,6 +19,7 @@ import pytest
 
 from tests import test_subscription_setup_browser as setup
 from tests.test_sidebar_activity_browser import FRAMES, activity, mount_sidebar
+from tests.ui_chat_viewport_smoke import wait_drawer_closed
 
 subscription_ui = setup.subscription_ui
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
@@ -160,7 +161,7 @@ def test_reworded_host_rows_live_and_after_reload(subscription_ui, tmp_path, mon
     mounted = mount_sidebar(ui, width, theme, False, ROOM, [])
     if width < 700:  # the narrow layout opened the navigation drawer; choosing Main Chat closes it
         page.locator('#primary-sidebar [data-nav-page="chat"]').click()
-        page.wait_for_function("() => !document.body.classList.contains('nav-drawer-open')")
+        wait_drawer_closed(page)  # the room stays inert until its close motion ends
     for tid in ("t-custody", "t-parent", "t-stop"):
         write_task_result(tmp_path, tid, STATUS_RUNNING, chat_id=1, result="working")
         message_bus.send_with_budget(1, f"Working on {tid}.", is_progress=True, task_id=tid, narration=True)
@@ -235,7 +236,7 @@ def test_reworded_host_rows_live_and_after_reload(subscription_ui, tmp_path, mon
     def check(phase):
         page.evaluate(FRAMES)
         for card in page.locator(".chat-live-card").all():
-            # A card opens by its own Show details (a portal has none: its room holds the details).
+            # A card opens by its own Details button (a portal has none: its room holds the details).
             disclosure = card.locator(":scope > [data-live-summary-button] [data-live-disclosure]")
             if card.get_attribute("data-expanded") != "1" and disclosure.is_visible():
                 disclosure.click()

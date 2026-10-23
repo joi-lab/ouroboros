@@ -94,7 +94,7 @@ def _resource_hold(host, clock, monkeypatch, kind, *, deadline=True):  # noqa: F
                 held, _, _ = hold_root_resume_descendants(
                     queue, "root", fence, {"grant_id": "root-grant", "generation": 1})
                 assert held == ["pending"]
-                assert task["_budget_pause_hold"]["cause"] == ""
+                assert "cause" not in task["_budget_pause_hold"]
     assert task["admitted_dispatch"] == "none"
     return task
 

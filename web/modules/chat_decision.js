@@ -7,8 +7,8 @@ import { renderRoutingAnnotation, routingOptionLabel } from './routing_receipt.j
 import { paintAttachmentOutcome } from './chat_attachments.js';
 import { nameProjectReference, projectReference } from './project_reference.js';
 import { ANSWERABLE_QUIZ_STATES, QUIZ_LIFECYCLE, questionMark, questionPresentation, waitFacts, WAIT_FIELDS,
-    normalizeQuiz, hostFactsLine, appendRecommendedBadge, renderOwnerAnswer, questionDeliveryPending, unknownDeliveryRemovable,
-    appendQuestionReplyControls } from './question_presentation.js';
+    normalizeQuiz, appendRecommendedBadge, renderOwnerAnswer, questionDeliveryPending, unknownDeliveryRemovable,
+    appendQuestionReplyControls, paintChosenAnswer } from './question_presentation.js';
 import { fmt, tr, tx } from './i18n.js';
 import { syncQuestionMaterials } from './result_files.js';
 import { createStatusMark, paintStatusMark } from './status_mark.js';
@@ -213,7 +213,7 @@ export function createChatDecision({
     const MIRROR_SETTLE_MS = 5000;
     // Display fields a narrower delivery (the census, a lifecycle frame) may lack: an empty value
     // there never blanks what a complete row already carried.
-    const MIRROR_FIELDS = ['question', 'options', 'option_details', 'stake', 'project_name', 'assumption', 'recommended_index', 'host_facts', 'materials'];
+    const MIRROR_FIELDS = ['question', 'options', 'option_details', 'stake', 'project_name', 'assumption', 'recommended_index', 'materials'];
     const MIRROR_SIGNATURE = ['quiz_state', ...MIRROR_FIELDS, 'answered_index', 'comment', 'closed_reason', 'question_delivery', ...WAIT_FIELDS];
     // The pointer row in the shape of the Project's quiz row, so one normalizer reads both.
     const mirrorQuiz = (row) => ({ ...row, type: 'quiz', role: 'assistant', state: row.quiz_state });
@@ -655,6 +655,7 @@ export function createChatDecision({
                     btn.classList.toggle('chosen', chosen);
                     changed = true;
                 }
+                if (paintChosenAnswer(btn, chosen)) changed = true;
             });
             return changed;
         });
@@ -686,10 +687,6 @@ export function createChatDecision({
         const wait = waitFacts(current);
         const existing = quizViews.get(key);
         if (existing) {
-            // A narrower first delivery may have lacked the host's sentence; a later one adds it.
-            if (quiz.hostFacts && !existing.querySelector('.chat-quiz-host-facts')) {
-                existing.querySelector('.chat-quiz-question')?.nextElementSibling?.before(hostFactsLine(quiz.hostFacts));
-            }
             if (quiz.comment) existing.dataset.ownerComment = quiz.comment;
             else if (Object.hasOwn(current, 'comment')) delete existing.dataset.ownerComment;
             if (quiz.closedReason) existing.dataset.closedReason = quiz.closedReason;
@@ -738,12 +735,11 @@ export function createChatDecision({
         const statusLabel = document.createElement('span');
         statusLabel.className = 'chat-quiz-status-text';
         status.append(createStatusMark(document, 'chat-quiz-mark'), statusLabel);
-        // The status and the card's quiet Close end the head together, so a wrap moves both.
+        // One row in every room: the status describes the question, so it sits beside the chip, and the card's
+        // quiet Close alone ends the row. Where the question comes from is the bubble's voice line (frameNode).
         const headEnd = document.createElement('span');
         headEnd.className = 'chat-quiz-head-end';
-        headEnd.append(status);
-        // The mirror's one addition to the Project form: the chip that opens it in its Project.
-        head.append(chip, ...(mirror ? [mirrorChip(mirror)] : []), headEnd);
+        head.append(chip, status, headEnd);
         card.append(head);
 
         // DRY with the chat surface (owner requirement): question and stake go
@@ -756,7 +752,6 @@ export function createChatDecision({
         if (mountMarkdown) mountMarkdown(question, questionText);
         else question.textContent = questionText;
         card.append(question);
-        if (quiz.hostFacts) card.append(hostFactsLine(quiz.hostFacts));
         syncQuestionMaterials(card, quiz.materials, renderMaterial);
 
         if (quiz.stake) {
@@ -831,7 +826,9 @@ export function createChatDecision({
         if (quiz.comment) card.dataset.ownerComment = quiz.comment;
         setCardState(card, quiz.state, quiz.answeredIndex);
         if (complete) submissions.attach(card, quiz);
-        const framed = frameNode(msg, card);
+        // The bubble says who asks and when: a Main copy's Project reference joins its voice line beside
+        // `Ouroboros` (the mirror's one addition to the Project form), and its time line is the time alone.
+        const framed = frameNode(msg, card, { voice: mirror ? [mirrorChip(mirror)] : [] });
         const disposeMarkdown = enhanceMarkdown && mountMarkdown ? enhanceMarkdown(card) : null;
         if (mirror) mirror.disposeMarkdown = disposeMarkdown;
         return framed;
@@ -861,6 +858,7 @@ export function createChatDecision({
                     btn.classList.toggle('chosen', chosen);
                     changed = true;
                 }
+                if (paintChosenAnswer(btn, chosen && state === 'answered')) changed = true;
             });
             return changed;
         });

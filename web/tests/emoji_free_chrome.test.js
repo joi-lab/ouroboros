@@ -7,21 +7,22 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { createChatInstance } from '../modules/chat.js';
-import { reconnectBannerText, senderLabel } from '../modules/chat_activity.js';
+import { restartNoticeText, senderLabel } from '../modules/chat_activity.js';
 import { installDom, restoreDom, walkCard } from './chat_dom_fixture.js';
 import { fixture as mediaFixture } from './helpers/media_dom.js';
 
 const web = new URL('../', import.meta.url);
 const read = (path) => readFileSync(new URL(path, web), 'utf8');
 
-test('sender labels and the reconnect banner are words', () => {
+test('sender labels and the restart notice are words; any other reload says nothing', () => {
     assert.equal(senderLabel('system', false, 'startup_notice'), 'System');
     assert.equal(senderLabel('system', false, 'task_summary'), 'Task Summary');
     assert.equal(senderLabel('system', false, 'skill_review'), 'Skill Review');
     assert.equal(senderLabel('assistant', true), 'Thought');
-    assert.equal(reconnectBannerText('sha-change'), 'Restart complete');
-    assert.equal(reconnectBannerText('ws-drop'), 'Reconnected');
-    assert.equal(reconnectBannerText(''), '');
+    assert.equal(restartNoticeText('sha-change'), 'Restart complete');
+    for (const reason of ['sha-unknown', 'ui-source', 'socket-disconnect', 'ws-drop', '']) {
+        assert.equal(restartNoticeText(reason), '', reason);
+    }
 });
 
 test('fixed warning decoration is gone while the tone and words stay', () => {

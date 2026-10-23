@@ -190,28 +190,28 @@ def pending_deadline_expirable(task: Dict[str, Any]) -> bool:
     from types import SimpleNamespace
     from ouroboros.owner_pause import member_fence
     from ouroboros.task_results import load_task_result, _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED
-    from supervisor.events_budget import (
-        HOLD_ROOT_FENCE_LIFTED, HOLD_ROOT_FENCE_MEMBER_SELECTION, HOLD_SAVED_WORK,
-        HOLD_OWNER_RESTART, budget_hold_fact, budget_resume_dispatch_allowed,
-    )
+    from supervisor.events_budget import budget_hold_fact, budget_resume_dispatch_allowed
+    from ouroboros.work_stop import continuation_refusal, current_stop
 
     if any(task.get(key) for key in (
         "_owner_hold", "_continuation_prepared", "_cancel_intent_authority_hold",
     )) or task.get("_owner_wait_resume") and not isinstance(task["_owner_wait_resume"], dict):
         return False
     pause, hold = task.get("_budget_pause"), budget_hold_fact(task)
+    stop = current_stop(task, {"budget": _queue().BUDGET_ROOT_FENCES})
+    if continuation_refusal(task) or stop.get("release") == "owner" or stop.get("cause") == "pause":
+        return False
     project = task.get("_project_admission_restore_hold")
     if task.get("_budget_pause_hold") and not isinstance(task["_budget_pause_hold"], dict):
         return False
     if pause and (not isinstance(pause, dict) or pause.get("exact_continuation")
-                  or pause.get("reason") == "owner" or pause.get("cause") == "owner_pause"
                   or pause.get("status") != "paused_before_dispatch"
                   or pause.get("replay_safe") is not True
                   or type(pause.get("physical_calls")) is not int or pause["physical_calls"] != 0):
         return False
-    if hold is not None and (hold.get("reason") not in (
-            HOLD_ROOT_FENCE_LIFTED, HOLD_ROOT_FENCE_MEMBER_SELECTION,
-            HOLD_SAVED_WORK, HOLD_OWNER_RESTART) or hold.get("cause") == "owner_pause"):
+    member_stop = current_stop(task)
+    if hold is not None and (member_stop.get("cause") not in {"app_stop", "awaiting_selection"}
+                             or member_stop.get("door_replaceable") or member_stop.get("release") != "resume"):
         return False
     if project and (not isinstance(project, dict)
                     or project.get("reason") not in ("project_routing_fence_lookup_failed", "deadline")):
@@ -226,11 +226,6 @@ def pending_deadline_expirable(task: Dict[str, Any]) -> bool:
         # The durable Pause precedes its queue latch; an unavailable root is not open.
         if member_fence(SimpleNamespace(task_id=task_id, root_task_id=root_id, budget_drive_root=result_root)):
             return False
-        try:
-            if (result_root / "state" / "panic_stop.flag").read_text(encoding="utf-8").strip() == "panic":
-                return False
-        except FileNotFoundError:
-            pass
         selected = _pending_continuation(task)
         marker = task.get("_terminalization_retry") or {}
         unsubmitted = marker.get("unsubmitted_launch")

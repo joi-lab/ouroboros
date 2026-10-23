@@ -34,6 +34,8 @@ import { extensionActionStatus } from './extension_status_text.js';
 import { bindLanguageSettings } from './settings_language.js';
 import { resetSecretReveals } from './settings_secrets.js';
 import { syncPolicyState } from './settings_policy.js';
+import { applySafetySettings, bindSafetySettings, checkerSaveEffect, checkerTabsText, safetyOwnerDraft, saveSafetyChecker, saveSafetyOwnerChanges } from './settings_safety.js';
+import { applyConsciousnessSettings, bindConsciousnessSettings } from './settings_consciousness.js';
 
 let markSettingsDirty = () => {};
 const BASE_SECRET_KEYS = new Set(SECRET_KEYS.map(([key]) => key));
@@ -68,10 +70,8 @@ const VALUE_FIELDS = [
     ['s-review-max-cycles', 'OUROBOROS_REVIEW_MAX_CYCLES', '2'],
     ['s-update-channel', 'OUROBOROS_UPDATE_CHANNEL', 'stable'],
     ['s-context-mode', 'OUROBOROS_CONTEXT_MODE', 'max'], ['s-image-input-mode', 'OUROBOROS_IMAGE_INPUT_MODE', 'auto'],
-    ['s-safety-mode', 'OUROBOROS_SAFETY_MODE', 'full'],
     ['s-prompt-cache-ttl', 'OUROBOROS_PROMPT_CACHE_TTL', '1h'],
 ];
-const _SAFETY_MODE_RANK = { full: 2, light: 1, off: 0 };
 const NUMBER_FIELDS = [
     ['s-workers', 'OUROBOROS_MAX_WORKERS', 10], ['s-presence-max-active', 'OUROBOROS_PRESENCE_MAX_ACTIVE', 2], ['s-active-subagents', 'OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT', 6], ['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 3, true],
     ['s-tool-timeout', 'OUROBOROS_TOOL_TIMEOUT_SEC', 600], ['s-local-port', 'LOCAL_MODEL_PORT', 8766], ['s-local-gpu-layers', 'LOCAL_MODEL_N_GPU_LAYERS', -1, true],
@@ -540,6 +540,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         ),
     });
     initHarnessAccounts();
+    const disposeOwnerSections = [bindSafetySettings(page), bindConsciousnessSettings(page, { state })];
 
     function syncProcessingPreference(settings) {
         setSubagentsProcessingPreference(settings[PROCESSING_PREFERENCE_KEY]);
@@ -776,7 +777,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         syncRuntimeModeBridgeState();
         syncPolicyState(page, s?._meta);
         syncPostTaskEvolutionUi();
-        refreshSafetySkipCounter();  // fire-and-forget; labels matches in the inspected event window
+        applySafetySettings(page, s);  // owner-only safety values, facts and lines (settings_safety.js)
+        applyConsciousnessSettings(page, s);
         void refreshSearchPreview();  // fire-and-forget; describes the applied search Source/Model
     }
 
@@ -976,9 +978,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         Object.assign(body, uiDirChange(fieldValue('s-ui-dir'), currentSettings?.OUROBOROS_UI_DIR));
         body.OUROBOROS_WEBSEARCH_MODEL = collectSearchSelection().model;
         VALUE_FIELDS
-            // Owner-only keys travel through their audited owner endpoints, never
-            // the generic settings POST (safety_mode joined runtime/context, r4).
-            .filter(([, key]) => key !== 'OUROBOROS_RUNTIME_MODE' && key !== 'OUROBOROS_CONTEXT_MODE' && key !== 'OUROBOROS_SAFETY_MODE')
+            // Owner-only keys travel through their audited owner endpoints, never the generic
+            // settings POST (the safety levels, rules and checker: settings_safety.js).
+            .filter(([, key]) => key !== 'OUROBOROS_RUNTIME_MODE' && key !== 'OUROBOROS_CONTEXT_MODE')
             .forEach(([id, key]) => { body[key] = fieldValue(id); });
         NUMBER_FIELDS.forEach(([id, key, fallback]) => { body[key] = readInt(id, fallback); });
         (Array.isArray(setupContract.budgetFields) ? setupContract.budgetFields : []).forEach((field) => {
@@ -1105,51 +1107,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             throw Object.assign(new Error(result?.error || 'Reviewed-skill auto-grant change was cancelled.'), { body: result });
         }
         return result;
-    }
-
-    async function saveSafetyModeViaOwnerEndpointIfNeeded(next) {
-        // Owner-only, dropped from the generic /api/settings POST — saved through the
-        // dedicated audited endpoint. Confirm on LOWERING coverage (full > light > off).
-        const current = currentSettings?.OUROBOROS_SAFETY_MODE || 'full';
-        if (next === current) return null;
-        const lowering = (_SAFETY_MODE_RANK[next] ?? 2) < (_SAFETY_MODE_RANK[current] ?? 2);
-        if (lowering) {
-            const ok = await openConfirmDialog({
-                title: 'Lower safety supervisor',
-                body: `Lower the LLM safety supervisor from ${current} to ${next}?\n\n` +
-                    `The deterministic sandbox, protected-path policy, and light-mode guards STAY ON in every mode. ` +
-                    `Only the LLM safety-check layer is reduced, and every waved-through check is logged as an audit event.`,
-                confirmLabel: 'Lower safety mode',
-                danger: true,
-            });
-            if (!ok) throw Object.assign(new Error('Safety mode change was not confirmed.'), { body: { saved: false } });
-        }
-        const result = await apiClient.ownerSafetyMode(next);
-        if (!result || result.ok !== true) {
-            throw Object.assign(new Error(result?.error || 'Safety mode change failed.'), { body: result });
-        }
-        return result;
-    }
-
-    async function refreshSafetySkipCounter() {
-        // Count the last-24h matches inside the returned tail, not all of that day.
-        const el = byId('s-safety-skip-counter');
-        if (!el) return;
-        try {
-            const data = await apiClient.logsTail('events', 2000);
-            const cutoff = Date.now() - 24 * 3600 * 1000;
-            const n = (data?.entries || []).filter((e) => {
-                if (String(e?.type || '') !== 'safety_mode_skip') return false;
-                const t = Date.parse(String(e?.ts || ''));
-                return Number.isFinite(t) && t >= cutoff;
-            }).length;
-            // The tail may cover less than a day, including when it has no matches.
-            el.textContent = n > 0
-                ? `${n} safety check(s) waved through among inspected recent events dated within 24h.`
-                : 'No waved-through safety checks found among inspected recent events dated within 24h.';
-        } catch {
-            el.textContent = '';
-        }
     }
 
     async function saveContextModeViaOwnerEndpointIfNeeded(next) {
@@ -1281,6 +1238,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         disposeSettingsTabs();
         window.removeEventListener('beforeunload', beforeUnload);
         disposeLocalModel();
+        disposeOwnerSections.forEach((dispose) => dispose());
         disposeLanguage();
         disposeShell();
         disposeRestartReconnect?.();
@@ -1390,14 +1348,15 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         const body = collectBody();
         loadSequence += 1;
         const sentRevision = draftRevision;
+        const subagentsChanged = subagentSettingsFingerprint(body.OUROBOROS_SUBAGENTS)
+            !== subagentSettingsFingerprint(currentSettings?.OUROBOROS_SUBAGENTS);
         const ownerDraft = {
             runtime: byId('s-runtime-mode').value || 'advanced',
             autoGrant: Boolean(byId('s-auto-grant-reviewed-skills').checked),
             context: byId('s-context-mode').value || 'max',
-            safety: byId('s-safety-mode').value || 'full',
+            // Takes the checker's changed keys (Models, Agents) out of `body`; they are written first, below.
+            safety: safetyOwnerDraft(page, body, currentSettings),
         };
-        const subagentsChanged = subagentSettingsFingerprint(body.OUROBOROS_SUBAGENTS)
-            !== subagentSettingsFingerprint(currentSettings?.OUROBOROS_SUBAGENTS);
 
         // Phase 1 of the save: the button goes busy and the status says so.
         // Capability probes on review-route changes make a save take seconds;
@@ -1407,7 +1366,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         setButtonBusy(saveButton, true);
         setStatus('Saving…', 'muted');
         let saved = false;
+        let checkerSaved = false;
         try {
+            checkerSaved = await saveSafetyChecker(ownerDraft.safety);
             const data = await apiClient.saveSettings(body);
             if (data?.status !== 'saved') {
                 const error = new Error(data?.error || 'The server did not confirm the settings save.');
@@ -1421,8 +1382,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             let autoGrantError = '';
             let contextModeResult = null;
             let contextModeError = '';
-            let safetyModeResult = null;
-            let safetyModeError = '';
             try {
                 runtimeModeResult = await saveRuntimeModeViaNativeBridgeIfNeeded(ownerDraft.runtime);
             } catch (error) {
@@ -1444,18 +1403,14 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 contextModeError = failure.text;
                 saveOutcomeUnknown ||= failure.unknown;
             }
-            try {
-                safetyModeResult = await saveSafetyModeViaOwnerEndpointIfNeeded(ownerDraft.safety);
-            } catch (error) {
-                const failure = settingsWriteFailure(error, "Safety mode");
-                safetyModeError = failure.text;
-                saveOutcomeUnknown ||= failure.unknown;
-            }
-            const ownerError = runtimeModeError || autoGrantError || contextModeError || safetyModeError;
+            const safety = await saveSafetyOwnerChanges(ownerDraft.safety, currentSettings);
+            saveOutcomeUnknown ||= safety.unknown;
+            const ownerError = runtimeModeError || autoGrantError || contextModeError || safety.error;
             const draftKept = ownerError || sentRevision !== draftRevision || !(await loadSettings({ awaitEnrichment: false }));
             syncAutoGrantBridgeState();
-            let statusMsg = settingsSaveEffectText(data);
-            let statusType = data.restart_required && !data.no_changes ? 'warn' : 'ok';
+            const effect = checkerSaveEffect(data, ownerDraft.safety);
+            let statusMsg = settingsSaveEffectText(effect);
+            let statusType = effect.restart_required && !effect.no_changes ? 'warn' : 'ok';
             if (subagentsChanged && data.agent_task_running) {
                 statusMsg += '. Available subagents take effect for new child tasks; '
                     + 'the current task keeps its existing routes';
@@ -1482,13 +1437,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 statusMsg = `${statusMsg} ${contextModeError}`;
                 statusType = 'warn';
             }
-            if (safetyModeResult?.safety_mode) {
-                statusMsg = `${statusMsg} Safety supervisor saved as ${safetyModeResult.safety_mode}.`;
-            }
-            if (safetyModeError) {
-                statusMsg = `${statusMsg} ${safetyModeError}`;
-                statusType = 'warn';
-            }
+            if (safety.saved) statusMsg = `${statusMsg} ${safety.saved}`;
+            if (safety.error) { statusMsg = `${statusMsg} ${safety.error}`; statusType = 'warn'; }
             if (autoGrantError) {
                 statusMsg = `${statusMsg} ${autoGrantError}`;
                 statusType = 'warn';
@@ -1505,11 +1455,13 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             const receipt = e?.body || e?.payload;
             const confirmedSaved = saved || receipt?.saved === true;
             saveOutcomeUnknown = !confirmedSaved && receipt?.saved !== false;
+            // The checker's keys are saved already: the next Save compares against them, never re-sends them.
+            if (checkerSaved && !confirmedSaved) Object.assign(currentSettings, ownerDraft.safety.checker.settings);
             setStatus(confirmedSaved
                 ? `Settings were saved, but a later step failed: ${e.message}. Your draft is kept.`
                 : saveOutcomeUnknown
                     ? `Save outcome unknown: ${e.message}. Your draft is kept. Reload Settings to check before saving again.`
-                    : `Settings were not saved: ${e.message}. Your draft is kept.`, 'warn');
+                    : `${checkerSaved ? `Changes in ${checkerTabsText(ownerDraft.safety)} were saved; the other settings were not` : 'Settings were not saved'}: ${e.message}. Your draft is kept.`, 'warn');
         } finally {
             settingsSaving = false;
             setButtonBusy(saveButton, false);

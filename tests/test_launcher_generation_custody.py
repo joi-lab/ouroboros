@@ -229,7 +229,7 @@ def test_the_parsed_intent_governs_the_child_over_an_inherited_one(launcher_root
     monkeypatch.setattr(launcher, "_load_settings", lambda: {})
     monkeypatch.setattr(launcher, "_apply_settings_to_env", lambda _s: None)
     monkeypatch.setattr(launcher, "_hidden_popen", lambda cmd, **kw: captured.update(kw) or FakeProcess())
-    launcher.start_agent(port=8765)
+    launcher.start_agent(port=1)
     assert captured["env"]["OUROBOROS_LAUNCH_INTENT"] == parsed
 
 
@@ -241,7 +241,7 @@ def test_an_automatic_launcher_does_not_spawn_a_generation_after_panic(launcher_
     monkeypatch.setattr(launcher, "_launch_intent", "automatic")
     monkeypatch.setattr(launcher, "_pre_generation_cleanup", lambda: [])
     monkeypatch.setattr(launcher, "start_agent", lambda port: pytest.fail("Panic must hold the automatic start"))
-    launcher.agent_lifecycle_loop(8765)
+    launcher.agent_lifecycle_loop(1)
     assert shutdown.is_set()
     assert (data / "state" / "panic_stop.flag").read_text(encoding="utf-8") == "panic"
 

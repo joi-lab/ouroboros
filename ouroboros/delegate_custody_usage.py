@@ -36,6 +36,31 @@ def summary_of(detail: Dict[str, Any]) -> Dict[str, Any]:
     return detail.get("summary") if isinstance(detail.get("summary"), dict) else {}
 
 
+def run_names(detail: Dict[str, Any]) -> frozenset[str]:
+    """Both names the engine gives this detail's run: its run id and the job id backing it.
+
+    A start answered before its run bound (HTTP 202) hands the host only the job id, and the
+    engine addresses a run by either name (control-api ``findRun``), so a held run id is one
+    of these exactly. Empty when the detail names no run.
+    """
+    summary = summary_of(detail)
+    run = summary.get("runId") or summary.get("id") or detail.get("runId")
+    return frozenset(str(name) for name in (run, summary.get("jobId")) if name)
+
+
+def names_another_run(detail: Dict[str, Any], run_id: Any) -> bool:
+    """The detail names a run, and ``run_id`` is neither of its names."""
+    names = run_names(detail)
+    return bool(names) and str(run_id or "") not in names
+
+
+def held_run_names(detail: Dict[str, Any], run_id: Any) -> frozenset[str]:
+    """The names the held run may carry in evidence beside this detail (telemetry, turns,
+    continuity rows): ``run_id`` and, only when the detail is of that run, its two names."""
+    held = str(run_id or "")
+    return frozenset({held}) if names_another_run(detail, held) else frozenset({held, *run_names(detail)})
+
+
 def disclosed_spend(summary: Dict[str, Any], *, attempt_execution: Any = None) -> Tuple[Optional[float], bool]:
     """The cash the harness reported AND whether it is settled — never one without both.
 
@@ -87,7 +112,7 @@ def is_terminal(detail: Dict[str, Any], terminal_states: frozenset[str]) -> bool
     return str(summary_of(detail).get("state") or "") in terminal_states
 
 
-# ---- reviewer usage observation (one llm_usage row per physical send) ----
+# ---- reviewer usage observation (sessions and physical extraction sends stay separate) ----
 
 _EMITTED_SESSION_USAGE: Dict[str, float] = {}  # delegated run id -> first llm_usage emission
 
@@ -101,6 +126,13 @@ def session_usage_once(run_id: str) -> bool:
         _EMITTED_SESSION_USAGE.clear() if len(_EMITTED_SESSION_USAGE) >= 256 else None
         _EMITTED_SESSION_USAGE[key] = time.monotonic()
     return True
+
+
+def observe_session_usage(observer: Any, usage: Dict[str, Any]) -> None:
+    """A continued reviewer emits each run, never its chain total as the last run."""
+    for part in usage.get("session_usage_events") or [usage]:
+        if session_usage_once(part.get("delegated_run_id", "")):
+            observe_review_usage(observer, part)
 
 
 def observe_review_usage(observer: Any, usage: Optional[Dict[str, Any]]) -> None:

@@ -17,6 +17,7 @@ import pathlib
 import uuid
 from typing import Any, Dict, List, Optional
 
+from ouroboros.delegate_reply import REPLY_TO_SCHEMA, validate_reply_target, reply_instruction
 from ouroboros.tools.arg_feedback import argument_refusal
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
@@ -429,6 +430,7 @@ ESCALATE_TOOL_SCHEMA: Dict[str, Any] = {
         "Materials may name existing task artifacts needed for the decision."
     ),
     "parameters": {"type": "object", "properties": {
+        "reply_to": REPLY_TO_SCHEMA,
         "action": {"type": "string", "enum": ["ask", "close"], "default": "ask"},
         "quiz_id": {"type": "string", "description": "Existing question to close; used only with action=close."},
         "question_task_id": {"type": "string", "description": "Question author for action=close; defaults to this task. Your own, a recorded Continue/retry predecessor's, or an already finished task's question may be closed; another live task's may not."},
@@ -615,6 +617,7 @@ def _escalate(
     reason: str = "",
     question_task_id: str = "",
     materials: list | None = None,
+    reply_to: dict | None = None,
 ) -> str:
     """One escalation verb for the whole tree (owner decision 31 hierarchy).
 
@@ -671,6 +674,7 @@ def _escalate(
 
     canonical_root = pathlib.Path(str(meta.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
     try:
+        reply_to = validate_reply_target(ctx, reply_to)
         material_refs = _question_materials(ctx, canonical_root, task_id, materials)
     except (ValueError, OSError) as exc:
         return argument_refusal(ctx, "QUIZ_MATERIAL_INVALID", [str(exc)], effect="The quiz was not sent.")
@@ -737,8 +741,9 @@ def _escalate(
         for material in material_refs:
             lines.append(f"Decision material: task_id={material['task_id']}, name={material['name']} ({material['label']})")
         lines.append(f"I continue meanwhile under the assumption: {payload['assumption']}")
+        reply_task = reply_to["starter_task_id"] if reply_to else task_id
         lines.append(
-            f"Answer with forward_to_worker(task_id={task_id}, message=...), or "
+            f"Answer with forward_to_worker(task_id={reply_task}, message=..., reply_to=<address if supplied>), or "
             "escalate this question yourself (verbatim) if it is above your authority."
         )
         parent_drive = str(data.get("child_drive_root") or data.get("headless_child_drive_root") or data.get("drive_root") or "").strip()
@@ -749,6 +754,7 @@ def _escalate(
                 task_id=parent_task_id,
                 source_task_id=task_id,
                 provenance="descendant_task",
+                **({"reply_to": reply_to} if reply_to else {}),
             )
         except StoreForeign as exc:
             return _publish_tool_result(ctx, ToolResult(
@@ -760,6 +766,7 @@ def _escalate(
             return f"⚠️ ESCALATE_UNWRITTEN: the escalation to parent {parent_task_id} was not persisted."
         return (f"OK: escalated to parent task {parent_task_id}; continuing under "
                 f"assumption: {payload['assumption']}"
+                + ("\n" + reply_instruction(reply_to) if reply_to else "")
                 + (f" ({ignored_bound.strip().rstrip('.')})" if ignored_bound else ""))
 
     # Root task: the owner gets a typed quiz card.
@@ -784,6 +791,7 @@ def _escalate(
         max_wait_minutes=payload.get("max_wait_minutes"),
         host_facts=host_facts,
         materials=material_refs,
+        **({"reply_to": reply_to} if reply_to else {}),
     )
     if asked.get("refused"):
         if asked["refused"] == "owner_questions_unavailable":
@@ -810,6 +818,7 @@ def _escalate(
         "task_id": task_id,
         "host_facts": host_facts,
         **({"materials": material_refs} if material_refs else {}),
+        **({"reply_to": reply_to} if reply_to else {}),
         **({"wait_for_answer": True} if wait_for_answer else {}),
     })
     delivered = "accepted for delivery" if mode == "live" else "queued for delivery"

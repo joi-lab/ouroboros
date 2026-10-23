@@ -420,6 +420,7 @@ def _collect_dict_literals_with_type(
 
 def _collect_literal_progress_meta_keys(source_path: pathlib.Path) -> set[str]:
     """Collect literal progress_meta keys that can reach ChatOutbound frames."""
+    from tests._progress_meta_scan import progress_meta_keys
 
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     keys: set[str] = set()
@@ -435,12 +436,12 @@ def _collect_literal_progress_meta_keys(source_path: pathlib.Path) -> set[str]:
             meta_names.add(node.value.id)
     for node in ast.walk(tree):
         if isinstance(node, ast.keyword) and node.arg == "progress_meta" and isinstance(node.value, ast.Dict):
-            literal_keys, unknown = _dict_literal_keys(node.value)
+            literal_keys, unknown = progress_meta_keys(tree, node.value)
             assert not unknown, f"progress_meta literal in {source_path.name} has dynamic keys: {unknown}"
             keys.update(literal_keys)
         elif isinstance(node, ast.Assign):
             if any(isinstance(target, ast.Name) and target.id in meta_names for target in node.targets) and isinstance(node.value, ast.Dict):
-                literal_keys, unknown = _dict_literal_keys(node.value)
+                literal_keys, unknown = progress_meta_keys(tree, node.value)
                 assert not unknown, f"progress_meta assignment in {source_path.name} has dynamic keys: {unknown}"
                 keys.update(literal_keys)
             for target in node.targets:
@@ -473,13 +474,13 @@ def _collect_literal_progress_meta_keys(source_path: pathlib.Path) -> set[str]:
                 and node.args
                 and isinstance(node.args[0], ast.Dict)
             ):
-                literal_keys, unknown = _dict_literal_keys(node.args[0])
+                literal_keys, unknown = progress_meta_keys(tree, node.args[0])
                 assert not unknown, f"progress_meta.update in {source_path.name} has dynamic keys: {unknown}"
                 keys.update(literal_keys)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in meta_helper_names:
             for child in ast.walk(node):
                 if isinstance(child, ast.Return) and isinstance(child.value, ast.Dict):
-                    literal_keys, unknown = _dict_literal_keys(child.value)
+                    literal_keys, unknown = progress_meta_keys(tree, child.value)
                     assert not unknown, f"{node.name} return in {source_path.name} has dynamic keys: {unknown}"
                     keys.update(literal_keys)
     return keys
@@ -1022,6 +1023,14 @@ def test_skill_manifest_scheduled_tasks_contract():
     )
     manifest = parse_skill_manifest_text(text)
     assert manifest.scheduled_tasks == [{"name": "refresh", "cron": "0 * * * *"}]
+
+
+def test_a_schedule_suggestion_needs_no_background_permission():
+    """A suggestion installs nothing, so validation asks for no supervised_task; other checks still warn."""
+    head = ("---\nname: cron-skill\ndescription: Cron skill\nversion: 0.1.0\ntype: instruction\n"
+            "scheduled_tasks:\n  - name: refresh\n    cron: \"0 * * * *\"\n")
+    assert parse_skill_manifest_text(head + "---\nbody\n").validate() == []
+    assert parse_skill_manifest_text(head + "timeout_sec: 0\n---\nbody\n").validate() == ["timeout_sec must be positive"]
 
 
 # Removed in v5.15.x: test_skill_manifest_body_only_markdown_can_start_with_link_syntax

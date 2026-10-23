@@ -216,6 +216,13 @@ def prepare_terminal_send_event(
     custody_notice = terminal_custody_notice_text(usage)
     if not presence and custody_notice:
         send_event["terminal_custody_notice"] = custody_notice
+    if not presence:  # Wrap up's receipt: its own row, one Stop identity on every carrier
+        from ouroboros.owner_stop_receipt import retained_work_fields
+
+        try:  # a receipt that cannot render never holds the answer
+            send_event.update(retained_work_fields(usage))
+        except Exception:
+            log.warning("Wrap up receipt row unavailable for %s", task.get("id"), exc_info=True)
     if origin not in _STAMPED_TERMINAL_ORIGINS:
         return send_event
     canonical_root = pathlib.Path(task.get("budget_drive_root") or env_drive_root)
@@ -544,7 +551,7 @@ def focus_source_projection(
     return {**payload, **current, **({"reason": reason} if reason else {})}
 
 
-def host_acceptance_source(drive_root: Any, task_id: str, digest: str) -> tuple:
+def host_acceptance_source(drive_root: Any, task_id: str, digest: str, *, anchor: Any = None) -> tuple:
     """``(ref, bytes)`` of this physical author's own HOST acceptance record, named by digest.
 
     These records are history: the retired task acceptance wrote them and nothing
@@ -563,12 +570,15 @@ def host_acceptance_source(drive_root: Any, task_id: str, digest: str) -> tuple:
     # this author's known retained drives can supply a not-yet-canonical file.
     from ouroboros.evidence_packs import handle_info
 
-    roots = [drive_root, *retained_task_roots(drive_root, task_id)]
-    stored = next((info for root in roots if (info := handle_info(root, task_id, path)) is not None), None)
+    # An anchor stays as configured: the confined readers re-spell its rows' paths themselves.
+    stored = handle_info(drive_root, task_id, path, anchor=anchor)
+    if stored is None:
+        stored = next((info for child in retained_task_roots(drive_root, task_id)
+                       if (info := handle_info(child, task_id, path, anchor=anchor)) is not None), None)
     if stored is None:
         raise FileNotFoundError(path)
     ref = {"kind": "task_source", "root": "artifact_store", "path": path, "size": stored["size"], "sha256": digest}
-    raw = read_actor_source_bytes(drive_root, task_id, ref)
+    raw = read_actor_source_bytes(drive_root, task_id, ref, anchor=anchor)
     run = json.loads(raw)
     request = run.get("request") if isinstance(run, dict) else None
     if (not isinstance(request, dict) or run.get("authority") != "host_root"
@@ -688,9 +698,9 @@ def sealed_final_prompt_section(sealed_final: Dict[str, Any] | None) -> str:
     heading, presence_facts, internal_text = "Final result text (submitted for delivery):\n", "", ""
     presence = sealed_final.get("presence_delivery")
     if sealed_final.get("wake_silent") is True:
-        heading, final_text = "Final result text:\n", "(none: the wake finished silently; no model words were submitted)"
+        heading, final_text = "Final result text:\n", "(none: the run finished silently; no model words were submitted)"
         if raw := str(sealed_final.get("internal_terminal_text") or ""):
-            internal_text = "Internal wake result (retained, never sent to the owner):\n" + truncate_review_artifact(
+            internal_text = "Internal run result (retained, never sent to the owner):\n" + truncate_review_artifact(
                 raw, limit=_SEALED_FINAL_TEXT_PROMPT_CHARS) + "\n"
     if isinstance(presence, dict):
         introduction = (
@@ -760,8 +770,9 @@ def rescued_files_fact(task_id: str, stores: List[pathlib.Path]) -> Dict[str, An
     (``artifacts.collect_task_artifact_records(measure=False, strict=True)``), so a
     store's metadata, receipt stream, staged inputs and source handles are never
     counted, a registration whose file is gone is not a file, and an unregistered
-    output is. The listing reads only the registration; no deliverable is opened,
-    hashed, copied or registered, and the fact says so (``hash_computed``). ``state`` is
+    output is. The listing reads only the registration's content; the confined walk
+    opens each deliverable for its kind and size, but none is read, hashed, copied or
+    registered, and the fact says so (``hash_computed``). ``state`` is
     ``positive``, ``zero`` (every store was listed and holds none; a store never
     created is one nothing was written to) or ``unknown`` (a store could not be
     listed — ``count`` is then what the listed stores held, a floor, never a total).
@@ -784,9 +795,8 @@ def rescued_files_fact(task_id: str, stores: List[pathlib.Path]) -> Dict[str, An
 def _listed_file_count(task_id: str, store: pathlib.Path) -> int:
     """Deliverables the shared listing finds in ``store``; raises when it cannot vouch for them.
 
-    The listing reads a missing store as empty through ``exists()``, which also says
-    False for some unreadable paths and follows a link: the store's own ``lstat``
-    decides first, so only a store that is not there counts as zero.
+    The listing reads a missing store as empty; the store's own ``lstat`` decides
+    first, so only a store that is not there counts as zero, never a file or link.
     """
     from ouroboros.artifacts import collect_task_artifact_records, task_artifact_dir_path
 
@@ -860,6 +870,10 @@ def build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | N
             return None
         facts = load_swarm_rollup(drive_root, task_id)
         child_ids = facts.get("child_ids", [])
+        from ouroboros.swarm_receipt import publish
+        if (not (task.get("parent_task_id") or metadata.get("parent_task_id"))
+                and str(task.get("root_task_id") or metadata.get("root_task_id") or task_id) == task_id):
+            publish(task.get("budget_drive_root") or drive_root, task_id, task=task)
         if not child_ids:
             if swarm_intent:
                 # Absence proves neither a planned count nor a plain-task intent.

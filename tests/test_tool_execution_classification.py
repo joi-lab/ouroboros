@@ -536,10 +536,10 @@ def test_auto_attach_skips_a_result_that_declared_failure(tmp_path, monkeypatch)
     # same body, which is exactly the single-classifier property under test.
     from ouroboros.tools.tool_result import LegacyTextResultAdapter
 
-    attached = []
+    attached, stamps = [], []
     import ouroboros.tools.vision as vision
     monkeypatch.setattr(vision, "attach_local_image_to_context",
-                        lambda ctx, path: attached.append(path) or (True, "ok"))
+                        lambda ctx, path, *, stamp=None: stamps.append(stamp) or attached.append(path) or (True, "ok"))
     tools = SimpleNamespace(_ctx=SimpleNamespace(messages=[], drive_root=str(tmp_path)))
     body = _json.dumps({"ok": False, "error": "boom", "auto_attach_image": "/x/shot.png"})
     # The adapter types the self-reported failure; the guard reads that code.
@@ -559,6 +559,7 @@ def test_auto_attach_skips_a_result_that_declared_failure(tmp_path, monkeypatch)
         tools,
     )
     assert attached == ["/x/shot.png"], "a healthy payload must still attach"
+    assert len(stamps) == 1 and stamps[0] is tools._ctx, "an eviction is stamped on the live slot"
 
 
 def test_reviewed_mutator_soft_timeout_keeps_foreground_custody(tmp_path, monkeypatch):

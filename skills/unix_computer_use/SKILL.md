@@ -1,7 +1,7 @@
 ---
 name: unix_computer_use
 description: Local and remote desktop observation/input tools with coordinate normalization (local macOS/Linux by default; optional OSWorld HTTP and SSH Mac backends).
-version: 0.5.0
+version: 0.5.1
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -63,6 +63,16 @@ Coordinate contract:
 - macOS input consumes LOGICAL points while screenshots are physical pixels;
   the stored transform already folds the Retina scale in. On multi-display
   Macs the scale is approximate (`approx` flag) — prefer `ax_tree` marks.
+
+Input receipts:
+
+- A successful input call returns `observed_effect: true`: the input command
+  ran and reported success, on every backend. It proves dispatch, not that the
+  screen changed (macOS TCC caveat below) or that the task's goal was met; the
+  host's task result review reads it as work the task produced.
+- An input of several steps that fails after earlier steps succeeded returns
+  `ok: false` with `steps_done` and keeps the mark. A failed or timed-out first
+  step, a refusal, reads, `wait` and `remote_exec` carry none.
 
 Backend matrix (honest limitations):
 

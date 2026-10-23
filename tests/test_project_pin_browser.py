@@ -124,7 +124,7 @@ def row(page, pid):
 
 
 def menu(page):
-    return page.locator('body > .project-row-menu')
+    return page.locator('body > .project-row-menu:not([data-leaving])')
 
 
 def order(page):
@@ -166,10 +166,17 @@ def open_menu(page, pid):
     if coarse(page):
         long_press(page, row(page, pid).locator('.nav-project-row'))
         expect()(menu(page)).to_be_visible()
+        settle_menu(page)
         return row(page, pid).locator('.nav-project-row')
     row(page, pid).locator('.nav-project-kebab').click()
     expect()(menu(page)).to_be_visible()
+    settle_menu(page)
     return row(page, pid).locator('.nav-project-kebab')
+
+
+def settle_menu(page):
+    """A menu grows in from where it was opened (ui.css `ui-popup-in`): its box is read once it has."""
+    menu(page).evaluate("m => Promise.all(m.getAnimations().map((a) => a.finished.catch(() => null)))")
 
 
 def choose(page, pid, label):

@@ -448,7 +448,7 @@ def count_paid_review_cycles(ctx: ToolContext, *, root_task_id: str) -> int:
     from ouroboros.review_state import load_state, make_repo_key
 
     tool = _current_review_tool_name(ctx)
-    if tool in ("review_change", "review_result"):  # review_change waves: canonical custody
+    if tool in ("review_change", "review_result", "review_skill"):  # review_change waves: canonical custody
         from ouroboros.tools.review_change_custody import paid_repo_key, review_state_root
 
         state = load_state(review_state_root(ctx))
@@ -460,7 +460,7 @@ def count_paid_review_cycles(ctx: ToolContext, *, root_task_id: str) -> int:
         for item in state.filter_attempts(tool_name=tool):
             if not item.paid or item.root_task_id != root:
                 continue
-            if tool == "review_result":  # a result's allowance is its root task's, wherever its material lives
+            if tool in ("review_result", "review_skill"):  # a root's allowance, wherever the material lives
                 paid += 1
                 continue
             key = item.review_budget_repo_key or owners.get(item.repo_key)
@@ -662,7 +662,7 @@ def _record_commit_attempt(
                 else None
             )
             if status == "reviewing":
-                if not _attempt_accepts_reviewing_update(existing):
+                if not _attempt_accepts_reviewing_update(existing) and getattr(ctx, "_collect_commit_source", None) is None:
                     attempt_no = state.next_attempt_number(repo_key, tool_name, task_id)
                     existing = None
                 ctx._current_review_attempt_number = attempt_no
@@ -1125,6 +1125,14 @@ def run_commit_preflight(ctx: ToolContext, reviewer: str, *, commit_message: str
     return fact
 
 
+def bind_commit_wake(ctx: ToolContext, wake_on: Any, panel: Any) -> None:
+    """Validate the wait choice independently of landing authority, before staging."""
+    from ouroboros.review_waiting import select_helpers, bind_panel
+    select_helpers(ctx, wake_on)
+    if panel is not None:
+        bind_panel(ctx, panel)
+
+
 def _return_commit_feedback(ctx: ToolContext, message: str, started: float, before: dict, after: dict,
                             *, pending: bool = False, reason: str = "author_decision_required", findings: Optional[list] = None,
                             note: str = "") -> dict:
@@ -1159,16 +1167,21 @@ def _return_commit_feedback(ctx: ToolContext, message: str, started: float, befo
     collect = "Re-issue the same unchanged commit call to collect this paid wave at $0 (no second dispatch), "
     choice = ("Inspect it, then revise and review again, stop, or explicitly continue with the same commit tool "
               "passing review_reference and author_disposition {disposition: accepted|rejected|partial|deferred, "
-              "rationale: ...}; continuation re-checks the current bytes, buys no reviewer and is no reviewer PASS. ")
+              "rationale: ..., subagent_check optional}; continuation re-checks the current bytes, buys no reviewer "
+              "and is no reviewer PASS. subagent_check is author evidence that a helper checked this candidate; "
+              "it is not a seat and does not create PASS. ")
     if row is None:
         choice = "The attempt row is unreadable, so no continuation reference exists; retry or stop. "
     elif pending:
-        choice = collect + ("or explicitly continue now with review_reference and author_disposition; the pending "
+        choice = collect + ("or explicitly continue now with review_reference and author_disposition "
+                            "(subagent_check optional, not a seat, not a PASS); the pending "
                             "review stays recorded and is no PASS. " if continuable
                             else "or stop; informed continuation needs received feedback. ")
         left = getattr(ctx, "_left_review_wait", None) or {}
         if left.get("surface") == "commit" and left.get("retry_key") == getattr(ctx, "_current_review_retry_key", ""):
-            note = ("An addressed message reached you while the reviewers ran: this call returned and their paid "
+            event = ("A selected outcome or wake time was ready" if any(row.get("reason") in {"helper_result", "review_result", "wake_at"} for row in
+                     getattr(ctx, "_review_detached_operations", []) or []) else "An addressed message reached you")
+            note = (event + " while the reviewers ran: this call returned and their paid "
                     "work continues separately; a [Review settled] notice follows the whole wave. " + note)
     if not pending:
         git_mod.run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
@@ -1232,7 +1245,7 @@ def bind_author_commit_candidate(ctx: ToolContext, commit_message: str, pre_fing
     from ouroboros.config import get_review_enforcement
 
     # The critic's own aggregate on ITS subject (the reference's fingerprint), never this candidate's verdict.
-    signal = ""
+    signal, record = "", {}
     if str(getattr(author_source, "review_record_id", "") or ""):
         from ouroboros import review_ledger
         try:
@@ -1243,27 +1256,60 @@ def bind_author_commit_candidate(ctx: ToolContext, commit_message: str, pre_fing
     author = build_author_disposition_from_mapping(ctx._author_commit_decision, subject_hash=pre_fingerprint["fingerprint"],
         reviewer_signal=signal or author_source.block_reason or author_source.status, enforcement=get_review_enforcement())
     author["review_reference"] = ctx._author_commit_reference
+    from ouroboros.review_doctrine import enrich_author_commit
+    from ouroboros.utils import utc_now_iso
+
+    author = enrich_author_commit(
+        author,
+        actors=[*(getattr(author_source, "triad_raw_results", None) or []),
+                getattr(author_source, "scope_raw_result", None) or {}],
+        prior_decision=record.get("author_decision") if isinstance(record.get("author_decision"), dict) else None,
+        record_id=str(record.get("record_id") or getattr(author_source, "review_record_id", "") or ""),
+        revision=int(record.get("revision") or 0),
+        drive_root=getattr(ctx, "drive_root", None),
+        cyber=not review_enforcement_blocks("blocking"),
+        observed_at=utc_now_iso(),
+        review_reference=ctx._author_commit_reference,
+    )
     ctx._author_commit_record = author
     staged = git_mod.run_cmd(["git", "diff", "--cached", "--name-status"], cwd=ctx.repo_dir)
     return _preflight_check(commit_message, format_name_status_for_preflight(staged), ctx.repo_dir)
 
 
 def record_bound_commit_success(ctx: ToolContext, commit_message: str, started_at: float, before: dict, after: dict) -> None:
-    """Persist the already-verified Git effect with its actual review/author facts."""
+    """Persist the already-verified Git effect with its actual review/author facts.
+
+    Landing is written here, after Git succeeded, and nowhere earlier. A failed
+    Git command never reaches this function, so it is not a commit.
+    """
     import time
+    from ouroboros.review_doctrine import attach_landing
     from ouroboros.tools import git as git_mod
+
+    author = getattr(ctx, "_author_commit_record", None)
+    pre_fp, post_fp = before.get("fingerprint", ""), after.get("fingerprint", "")
+    if isinstance(author, dict):
+        author = attach_landing(author, pre_review_fingerprint=pre_fp, post_review_fingerprint=post_fp)
+        ctx._author_commit_record = author
     git_mod._record_commit_attempt(ctx, commit_message, "succeeded",
-                           author_disposition=getattr(ctx, "_author_commit_record", None),
+                           author_disposition=author,
                            duration_sec=time.time() - started_at,
                            phase="commit",
-                           pre_review_fingerprint=before.get("fingerprint", ""),
-                           post_review_fingerprint=after.get("fingerprint", ""),
+                           pre_review_fingerprint=pre_fp,
+                           post_review_fingerprint=post_fp,
                            fingerprint_status="matched",
                            triad_models=getattr(ctx, "_last_triad_models", []),
                            scope_model=getattr(ctx, "_last_scope_model", ""),
                            triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
                            scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
                            degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []))
+    subject = str(author.get("subject_hash") or "") if isinstance(author, dict) else ""
+    landing = author.get("landing") if isinstance(author, dict) else None
+    record_id = str(getattr(ctx, "_current_review_record_id", "") or "")
+    if isinstance(landing, dict) and record_id and post_fp == pre_fp == subject:
+        from ouroboros import review_ledger as ledger
+
+        ledger.note_commit_landing(ledger.ledger_root(ctx), record_id, landing)
 
 
 def prepare_author_commit_request(ctx: ToolContext, review_reference: Any, author_disposition: Any, review_rebuttal: str) -> Optional[str]:
@@ -1380,9 +1426,14 @@ def name_review_record(ctx: ToolContext, result: Any) -> Any:
     record_id = str(getattr(ctx, "_current_review_record_id", "") or "")
     if not record_id or not isinstance(result, str) or record_id in result:
         return result
+    from ouroboros.review_doctrine import doctrine_result_lines
     from ouroboros.tools.tool_result import append_published_text
 
-    return append_published_text(ctx, result, f"\nreview_record_id: {record_id}")
+    suffix = f"\nreview_record_id: {record_id}"
+    lines = doctrine_result_lines(getattr(ctx, "_author_commit_record", None))
+    if lines:
+        suffix += "\n" + "\n".join(lines)
+    return append_published_text(ctx, result, suffix)
 
 
 def _review_tests_facts(ctx: ToolContext, tests_passed: Any) -> Dict[str, Any]:
@@ -1450,7 +1501,7 @@ def settle_commit_review_ledger(ctx: ToolContext, commit_message: str, *, goal: 
         rejoined = attempt is not None and bool(retry_key) and str(getattr(attempt, "review_retry_key", "") or "") == retry_key
         prior = str(getattr(attempt, "review_record_id", "") or "") if rejoined else ""
         existing = ledger.load_record(root, prior) if prior else None
-        if existing is not None and existing.get("state") == ledger.STATE_PENDING:
+        if existing is not None:
             # Settling in place: the dispatching attempt's provenance (subject, brief with
             # its rules, panel, fingerprints, the seats' prompt refs) stays; this attempt
             # contributes the late answers, the verdict, the cost and the state.

@@ -1,8 +1,9 @@
 """Optional reviewed extension facts appended at the existing pre-send tail seam.
 
 Only local data files are read. No callback, model, network or refresh belongs
-on this path. The transcript itself is the deduplication ledger: cold Resume
-and authored compaction therefore cannot leave an invisible fresh claim alive.
+on this path. Deduplication reads the visible transcript; successors and renewals
+only append. Existing context recovery and authored compaction retire obsolete
+notes. Renewals keep their full base visible; cold Resume needs no separate seen-state.
 """
 from __future__ import annotations
 

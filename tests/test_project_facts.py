@@ -438,7 +438,8 @@ def test_scratchpad_and_identity_tools_write_canonical_memory_from_a_project_roo
     # scratchpad and identity files the main chat writes.
     ctx = types.SimpleNamespace(drive_root=tmp_path, project_id="proj_p")
     r1 = control._update_scratchpad(ctx, "a meaningful scratchpad note for the task at hand")
-    r2 = control._update_identity(ctx, "x" * 60)
+    from hashlib import sha256
+    r2 = control._update_identity(ctx, "x" * 60, sha256((tmp_path / "memory/identity.md").read_bytes()).hexdigest())
     assert r1.startswith("OK")
     assert r2.startswith("OK")
     assert (tmp_path / "memory" / "scratchpad_blocks.json").exists()

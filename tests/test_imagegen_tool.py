@@ -430,8 +430,9 @@ def test_readonly_and_network_constraints_block_generation(monkeypatch, ctx):
 
 
 def test_presence_requires_exact_tool_and_input_grants(monkeypatch, ctx):
-    from ouroboros.presence_authority import build_presence_capability_ceiling, presence_ceiling_payload
-    from ouroboros.presence_capabilities import PresenceResourceTarget, PresenceToolTarget
+    from ouroboros.presence_authority import presence_ceiling_payload
+    from tests.frozen_presence_authority import build_presence_capability_ceiling
+    from tests.frozen_presence_capabilities import PresenceResourceTarget, PresenceToolTarget
     from tests.test_presence_authority import _resolution
     registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
     def grant(*targets):

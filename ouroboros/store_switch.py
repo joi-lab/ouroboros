@@ -545,8 +545,9 @@ def _run(root: pathlib.Path, repo_dir: Any, boot: _Boot, request_restart: Callab
             if resumed["status"] == "switched":
                 outcome = resumed  # the window stays open: nothing is imported into a retired store
             else:
-                report = prepare_startup_state(root, repo_dir=repo_dir, strict=False)
-                outcome = {"status": "published" if store.published(root) else str(report.get("status") or "unavailable"),
+                report = prepare_startup_state(root, repo_dir=repo_dir, strict=False, initialize_journal=True)
+                outcome = {"status": "published" if report.get("status") != "unavailable" and store.published(root)
+                           else str(report.get("status") or "unavailable"),
                            "report": report}
                 if outcome["status"] == "published":
                     flush_outbox(root)  # a custody event committed before a death reaches its chain at the next boot

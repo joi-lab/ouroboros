@@ -292,8 +292,10 @@ def attempt_custody_event_fields(error: BaseException) -> dict:
     The physical-attempt capture already rides the exception; without these
     fields the durable ``llm_api_error`` row cannot be joined to the attempt
     ledger, and the transport class of a wrapped cause (ConnectError vs
-    RemoteProtocolError) is unrecoverable after the fact. Bounded type names
-    only — never raw cause text.
+    RemoteProtocolError) is unrecoverable after the fact. A failed stream adds
+    its decoder's typed facts: generation id, whether model output had arrived,
+    and an explicit provider timeout. Bounded type names and identifiers only —
+    never raw cause text.
     """
     capture = _capture_on_chain(error)
     fields: dict = {}
@@ -305,6 +307,14 @@ def attempt_custody_event_fields(error: BaseException) -> dict:
         provider_error_type = str(getattr(capture, "provider_error_type", "") or "")
         if provider_error_type:
             fields["provider_error_type"] = provider_error_type
+    receipt = getattr(error, "stream_receipt", None)
+    receipt = receipt if isinstance(receipt, dict) else {}
+    if isinstance(receipt.get("generation_id"), str) and receipt["generation_id"]:
+        fields["generation_id"] = receipt["generation_id"]
+    if receipt.get("model_output_received") is True:
+        fields["model_output_received"] = True
+    if getattr(error, "explicit_timeout", False) is True:
+        fields["explicit_timeout"] = True
     # The same walk the death predicate uses: the explicit ``__cause__`` chain,
     # plus — at every link including the error itself, because the requests lane
     # raises its ConnectionError bare — the typed death requests keeps in

@@ -89,12 +89,6 @@ def delete_local_skill(
     deleted_state = state_dir.exists()
     if deleted_state:
         shutil.rmtree(state_dir)
-    try:
-        from supervisor.queue import sync_skill_schedules
-
-        sync_skill_schedules(discover_skills(drive, repo_path=repo_path), drive_root=drive)
-    except Exception:
-        log.debug("local skill delete schedule sync failed", exc_info=True)
     if payload_dir.exists() or state_dir.exists():
         return refuse(f"failed to fully delete local skill {loaded.name!r}", 500)
     return {

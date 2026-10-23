@@ -675,7 +675,14 @@ def _web_search_openai(
                 settle_attempt(reservation, usage, cost_usd=reported_cost,
                                cost_final=reported_cost_final)
             else:
-                mark_unresolved(reservation, "Responses stream ended without response.completed")
+                from ouroboros.llm_stream import IncompleteProviderStream
+                from ouroboros.usage_accounting import _retain_physical_failure
+
+                # The read ended without terminal framing: this receive path is over,
+                # its outcome unknown — the same retained fact a raising send leaves.
+                incomplete = IncompleteProviderStream("Responses stream ended without response.completed")
+                _retain_physical_failure(reservation, exc=incomplete)
+                mark_unresolved(reservation, str(incomplete))
             dispatched = False
         except Exception as exc:
             # Preserve an already-paid result; unresolved retains its upper bound.
@@ -742,6 +749,9 @@ def _web_search_openai(
             dispatched = not proven_not_started
         was_dispatched = send_started and not proven_not_started
         if reservation is not None and dispatched:
+            from ouroboros.usage_accounting import _retain_physical_failure
+
+            _retain_physical_failure(reservation, exc=e)  # this send's receive path ended raising
             try:
                 mark_unresolved(reservation, f"{type(e).__name__}: {e}")
             except Exception:

@@ -69,6 +69,8 @@ _AGENT_FAULT_REASONS = frozenset({
     # replayed with DIFFERENT text: the caller reused an invocation identity.
     "idempotency_conflict",
     "message_text_required",
+    "message_frame_conflict",
+    "reply_to_mismatch",
     "missing_interaction_id",
     "missing_run_id",
     "payload_binding_mismatch",
@@ -76,6 +78,7 @@ _AGENT_FAULT_REASONS = frozenset({
     "payload_selector_unresolved",
     "retry_prompt_mismatch",
     "retry_selector_conflict",
+    "run_selector_conflict",
     "selector_on_retry",
     "source_response_invalid",
     "source_response_not_required",
@@ -130,6 +133,9 @@ def delegate_payload(result: ToolResult) -> Dict[str, Any]:
 
 def publish_delegate_result(ctx: Any, result: ToolResult) -> str:
     """The family's ONE public boundary: publish the native result, return its text."""
+    from ouroboros.delegate_progress import message_journal_receipt
+
+    result = message_journal_receipt(ctx, result)
     return _publish_tool_result(ctx, result)
 
 
@@ -198,6 +204,50 @@ def _owned_run(ctx: ToolContext, tool: str, run_id: str) -> Tuple[Optional[ToolR
                      run_settled=bool(getattr(entry, "settled", False)),
                      run_terminal_state=str(getattr(entry, "terminal_state", "") or "")), None
     return None, entry
+
+
+def message_run(ctx: ToolContext, tool: str, run_id: str):
+    """Context-only reach: starter, ancestors and durable same-tree tasks.
+
+    Unlike forward_to_worker, the independent-root roster is not a door into
+    another root's executor. This resolver is never used for lifecycle control.
+    """
+    from ouroboros.install_identity import require_owned_root, StoreForeign
+    from ouroboros.peer_roster import durable_descendant_of, peer_relation_to
+    from ouroboros.task_status import load_effective_task_result
+
+    root = custody.custody_root(ctx)
+    sender = str(getattr(ctx, "task_id", "") or "")
+    try:
+        require_owned_root(root)
+        require_owned_root(ctx.drive_root)
+        status, entry = custody.lookup(root, sender, run_id)
+        if status == custody.UNKNOWN or entry is None:
+            return _fail(tool, "run_ownership_unknown", "No durable run custody is available.", run_id=run_id), None, ""
+        target = load_effective_task_result(root, entry.task_id) or {}
+        for key in ("child_drive_root", "headless_child_drive_root", "drive_root"):
+            if target.get(key):
+                require_owned_root(pathlib.Path(target[key]))
+        if status == custody.OWNED:
+            return None, entry, "starter"
+        own = load_effective_task_result(root, sender) if sender else {}
+        if target and own:
+            # Resolve the same reach facts as task mail; only host-stored lineage
+            # supplies peer provenance, never anything in the sender's text.
+            relation = peer_relation_to(root, sender, own, entry.task_id, target)
+            if durable_descendant_of(root, entry.task_id, target, sender):
+                relation = "ancestor"
+            target_root = str(target.get("root_task_id") or (entry.task_id if not target.get("parent_task_id") else ""))
+            own_root = str(own.get("root_task_id") or (sender if not own.get("parent_task_id") else ""))
+            if relation and target_root and target_root == own_root and (
+                    not entry.root_task_id or entry.root_task_id == target_root):
+                return None, entry, relation
+        return _fail(tool, "run_not_owned", "Messages require an ancestor or a task in the same durable tree.",
+                     run_id=run_id, owner_task_id=entry.task_id), None, ""
+    except StoreForeign as exc:
+        return _fail(tool, "foreign_install_root", str(exc), run_id=run_id), None, ""
+    except (OSError, ValueError, StoreError) as exc:
+        return _fail(tool, "run_ownership_unknown", str(exc), run_id=run_id), None, ""
 
 
 def _retry_lineage(task_id: str, row: Mapping[str, Any]) -> Dict[str, Any]:

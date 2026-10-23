@@ -20,7 +20,8 @@ import pytest
 
 from ouroboros import delegate_custody as custody
 from ouroboros.delegate_registration_policy import INVESTIGATION_AUTHORITY
-from ouroboros.delegate_start_instructions import INVESTIGATION_INSTRUCTION
+from ouroboros.delegate_start_instructions import INVESTIGATION_INSTRUCTION, scratch_fact
+from ouroboros.workspace_preflight import SNAPSHOT_ENVIRONMENT_NOTE
 
 ENGINE_VERSION = "3.25.1"  # carries workspaceRoot (3.8.1+) and scope.ephemeral (3.3.7+)
 
@@ -153,7 +154,15 @@ def test_git_subdirectory_investigation_clones_the_worktree_and_starts_in_the_fo
     assert request["scope"] == {"kind": "project", "root": str(folder)}
     assert engine.grants == ([str(folder)] if access == "full" else [])
     assert INVESTIGATION_INSTRUCTION in request["instructions"]
-    assert f"the sole writable execution root for this run is {start_folder}." in request["instructions"]
+    assert f"the private execution root for this run is {start_folder}:" in request["instructions"]
+    assert f"evidence worth returning under {start_folder / '.review-evidence'}:" in request["instructions"]
+    # Dependency files are read at the clone's root, but the environment does not go there (outside the
+    # folder this session may write): it is disposable state outside every Git tree. A foreign project
+    # hears no safe_test.
+    assert f"Dependency files in {clone.resolve()} (sha256): none at its top level" in request["instructions"]
+    assert f"disposable process state ({scratch_fact()}), since this session writes only in " \
+           f"{start_folder.resolve()}, a folder of the copy" in request["instructions"]
+    assert SNAPSHOT_ENVIRONMENT_NOTE not in request["instructions"] and "safe_test" not in request["instructions"]
     assert f"authority/project root {folder} is a read-only" in request["instructions"]
     assert result["execution_root"] == str(start_folder) and result["authority_target_root"] == str(folder)
     assert "evidence-only investigation" in result["note"] and "apply or reject" not in result["note"]
@@ -424,6 +433,9 @@ def test_folderless_project_investigation_copies_the_staged_inputs(tmp_path, mon
         assert (staged / row["local"]).read_bytes() == source.read_bytes()
     for text in ("READONLY INPUTS", "DELEGATED DIRECTORY COPY BINDING", INVESTIGATION_INSTRUCTION):
         assert text in request["instructions"]
+    # The copy is its retained evidence: no sentence may deny the folder its PURPOSE line names.
+    assert "no evidence folder is retained" not in request["instructions"]
+    assert f"outside this copy goes outside every Git working tree ({scratch_fact()})" in request["instructions"]
     assert result["directory_strategy"] == "copy" and result["authority_target_root"] == str(scratch)
     assert "evidence" in result["note"] and "apply or reject" not in result["note"]
     held = custody.replay(ctx.drive_root)[result["run_id"]]

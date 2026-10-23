@@ -377,6 +377,10 @@ class _SignalStopServer(uvicorn.Server):
         _supervisor_stop.set()
         self.should_exit = True
 
+    async def on_tick(self, counter: int) -> bool:
+        """Observe a stop latched before Uvicorn installed its signal handler."""
+        return _exit_signalled.is_set() or await super().on_tick(counter)
+
     def handle_exit(self, sig: int, frame) -> None:
         # Let uvicorn see the previous should_exit value (repeated SIGINT forces exit).
         global _stop_source

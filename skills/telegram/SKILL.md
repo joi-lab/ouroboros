@@ -1,7 +1,7 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.3.4
+version: 1.3.7
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -40,8 +40,12 @@ answered by tapping an option or by replying to the card with a free-form
 answer; both reach the same host decision ingress as the web UI. The bridge speaks
 the install's interface language (Settings → Appearance → Language, or `/language`
 here): its own lines are English source translated by the install's translation
-memory, so the bot ships no dictionary and follows any language the owner chooses. Slash commands
-keep their ordinary command-mode rules even in replies; quote a literal command
+memory, so the bot ships no dictionary and follows any language the owner chooses. Owner `/panic`
+is available in every command mode, including strict: it sends once through the emergency door,
+never queues or replays. Telegram dates before the host's whole-second import time are refused;
+their previous outcome is unknown. This assumes aligned clocks: a host ahead rejects fresh Panic
+until Telegram reaches that second; a host behind can accept retained commands. Dates in the
+boundary second are accepted. Other slash commands keep their command-mode rules even in replies; quote a literal command
 as code or include it inside an explanation to send it as a quiz answer.
 
 Version 1.3 remembers every mirrored part, including media and completion
@@ -52,7 +56,8 @@ chat use a native reply; answers to its latest owner message stay unquoted.
 Silent mode edits only within one task episode and reply origin; Continue
 episodes remain separate messages. Relay success stays silent; a host-reported
 failure arrives as one line. A relayed row quotes the owner's words verbatim as
-plain text, under where he wrote them and with the file names, above the note.
+plain text, under where he wrote them and with the file names, above the note; a
+note between works that quotes none of his words stays in its room.
 Quiz buttons and replies keep their decision path; earlier parts of a long
 question carry ordinary references.
 
@@ -62,6 +67,9 @@ reference their work, not an authored answer shown only in Main.
 Version 1.3.3 gives a finished root task's notice the task card's cost words for
 its whole tree: `$3.42` when final, `up to $3.42` while costs may still arrive,
 `Tracked:` when some step has no price; an unknown cost adds nothing.
+Version 1.3.6 sends Wrap up's saved-work receipt, which the host types as a terminal
+receipt, even with progress mirroring off; other card rows still follow that toggle.
+Version 1.3.7 sends no finish notification for a run that finished quietly.
 
 Version 1.2.1 marks questions that wait for an owner answer and clears the
 waiting line after an answer submitted through Telegram.

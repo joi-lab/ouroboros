@@ -25,7 +25,7 @@ from ouroboros.gateway.attachment_contracts import (  # noqa: F401 -- public re-
     AttachmentManifestEntry, ChatAttachmentInbound, ChatAttachmentView,
 )
 from ouroboros.gateway.contributions import UiContribution, UiContributionsResponse, UiPreferencesResponse
-from ouroboros.gateway.widgets import ExtensionLiveSnapshot, WidgetTab, WidgetsResponse
+from ouroboros.gateway.widgets import ExtensionLiveSnapshot, WidgetFaultRequest, WidgetFaultResponse, WidgetTab, WidgetsResponse
 from ouroboros.gateway.decision_contracts import DecisionRequest, DecisionResponse  # noqa: F401 -- public re-exports
 from ouroboros.gateway.card_contracts import CardOutbound, CardStateOutbound  # noqa: F401 -- public re-exports
 from ouroboros.gateway.update_contracts import (  # noqa: F401 -- public re-exports
@@ -79,6 +79,13 @@ class CommandInbound(TypedDict):
 
     type: Literal["command"]
     cmd: str
+    client_surface: NotRequired[dict]
+
+
+class PanicAcceptedOutbound(TypedDict):
+    """The emergency owner accepted this connection's request; exit is unproved."""
+
+    type: Literal["panic_accepted"]
 
 
 class ExtensionInbound(TypedDict, total=False):
@@ -181,6 +188,12 @@ class ChatOutbound(ChatReferenceFields):
     # Opaque delegated route stamped once by resolve_subagent_dispatch; absent/empty = native/no chip. Dispatch
     # intent is not a landing receipt: a reduction belongs in capability_delta, never rewrites this route.
     executor_route: NotRequired[str]
+    # Recorded coordinator facts on live/history frames; absence carries no billing or provenance claim.
+    parent_cognitive_route: NotRequired[Dict[str, Any]]
+    coordinator_route: NotRequired[str]
+    use_local_model: NotRequired[bool]
+    coordinator_billing: NotRequired[str]
+    coordinator_provenance: NotRequired[str]
     # The effort decision at dispatch (a session row: its leaf's): level, the parent's request, source
     # auto|pin|model_name|cyber. Empty/absent = unknown, no chip.
     effort_level: NotRequired[str]
@@ -255,6 +268,7 @@ class ChatOutbound(ChatReferenceFields):
     card_row: NotRequired[Literal["timeline", "reviews"]]
     card_row_id: NotRequired[str]
     card_row_revision: NotRequired[int]  # canonical source order, independent of delivery timestamp
+    terminal_receipt: NotRequired[Literal["retained_work"]]  # a placed row typed as a terminal receipt, not progress
     late_evidence: NotRequired[Dict[str, Any]]  # late review identity/revision + exact applied source; no transcript
     # Event-time human presentation; raw task/project ids remain machine keys.
     target_label: NotRequired[str]
@@ -265,7 +279,7 @@ class ChatOutbound(ChatReferenceFields):
     terminal_time: NotRequired[Dict[str, Any]]  # host-owned occurrence, separate from publication ts
     completion_answer: NotRequired[str]  # a Project root's model-authored final answer, mirrored into Main (DESIGN)
     completion_reason: NotRequired[str]  # one recorded nonclean-outcome fact beside the answer
-    completion_notice: NotRequired[Dict[str, Any]]  # transport view: neutral, detail, phase; optional preserved salvage
+    completion_notice: NotRequired[Dict[str, Any]]  # transport view: neutral/detail/phase/salvage; Main adds cause and undescribed codes
     delivery_id: NotRequired[str]  # stable logical publication identity across transport retries
     set_at: NotRequired[str]  # a `reminder` row's provenance, live frame only (its text carries the signature): when written
     scheduled_for: NotRequired[str]  # the due point it was written for
@@ -927,11 +941,29 @@ class GitLogResponse(TypedDict):
     sha: str
 
 
-class EvolutionDataResponse(TypedDict):
+class EvolutionRefresh(TypedDict):  # the background re-measurement behind GET /api/evolution-data
+    state: Literal["idle", "running", "failed"]
+    started_at: str
+    finished_at: str
+    error: str  # "" unless failed; the saved copy stays
+    unmeasured: int  # versions of the saved copy whose commit could not be read (retried by force)
+    unmeasured_error: str  # the first such reason, "" when every version was measured
+
+
+class EvolutionDataResponse(TypedDict):  # answered at once from the saved copy (ouroboros/evolution_history.py)
+    # {tag, aliases, version, date, commit, level, milestone, code_lines, bible_bytes, system_bytes (None = not measured),
+    #  release: {source: readme|tag|"", title, kind, heading, body}}, oldest first
+    versions: list[Dict[str, Any]]
+    saved_at: str  # "" = no saved copy yet
+    refresh: EvolutionRefresh
+    # identity / scratchpad: {at_versions: [characters | None per version], first_at, latest: {at, chars} | None}
+    install: Dict[str, Any]
+    # Published before the version history above and kept for older clients: one point per tag name {tag, date, code_lines, bible_kb,
+    # system_kb, identity_kb, scratchpad_kb, memory_kb}; unmeasured values and the three memory fields are null.
     points: list[Dict[str, Any]]
+    cached: bool  # true when the answer comes from a saved copy (always, once one exists)
     checkpoints: NotRequired[list[Dict[str, Any]]]
     generated_at: str
-    cached: bool
 
 
 class UploadResponse(TypedDict):
@@ -1099,6 +1131,8 @@ class TaskDetailResponse(TypedDict, total=False):
     artifacts: List[Dict[str, Any]]  # Open result rows; a nested file carries additive ``relpath``.
     # Per result directory: {name, files, size, excluded, available} for its ``?archive=`` ZIP.
     artifact_archives: Dict[str, Dict[str, Any]]
+    # Wrap up's saved-work document {name, request_id}: ``?wrap_up=<request_id>`` writes it on read; no size/digest.
+    wrap_up_document: Dict[str, str]
     cost_breakdown: TaskCostBreakdown
     history_retention: HistoryRetentionProjection
     model_waits: Dict[str, Any]
@@ -1399,6 +1433,7 @@ from ouroboros.gateway.client_contracts import FileBrowserListResponse, ServedUi
 WS_MESSAGE_TYPES: tuple[str, ...] = (
     "chat",
     "command",
+    "panic_accepted",  # immediate acceptance only, not proof of process exit
     "photo",
     "video",
     "document",
@@ -1421,7 +1456,7 @@ WS_MESSAGE_TYPES: tuple[str, ...] = (
 
 __all__ = [
     "CostPresentation",
-    "ChatInbound", "TaskConstraintInbound", "CommandInbound", "ExtensionInbound",
+    "ChatInbound", "TaskConstraintInbound", "CommandInbound", "PanicAcceptedOutbound", "ExtensionInbound",
     "TransportMetadata",
     "ChatOutbound",
     "PhotoOutbound", "VideoOutbound", "DocumentOutbound",
@@ -1463,10 +1498,11 @@ __all__ = [
     "UiContribution", "UiContributionsResponse", "UiPreferencesResponse", "DesktopAutostartResponse",
     "GitLogResponse",
     "EvolutionDataResponse",
+    "EvolutionRefresh",
     "ScheduledTasksResponse", "ScheduleUpsertResponse", "ScheduleDeleteResponse", "ScheduleActionResponse",
     "UploadResponse",
     "ExtensionsIndexResponse", "ExtensionLiveSnapshot", "WidgetTab",
-    "WidgetsResponse",
+    "WidgetsResponse", "WidgetFaultRequest", "WidgetFaultResponse",
     "SkillPublishPreflightResponse",
     "SkillLifecycleQueueResponse",
     "MarketplaceSearchResponse",

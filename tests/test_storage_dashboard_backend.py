@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -443,20 +444,65 @@ def _join(counter: StorageCounter):
         assert not thread.is_alive()
 
 
+def _observed(monkeypatch, data: Path, operation):
+    """OPERATION's own effect on DATA: (its result, what ``os.scandir`` listed while it ran, the data
+    folder's entries with their mtimes before and after). The recorder sees OPERATION alone: on some
+    Pythons pathlib's own walk lists through ``os.scandir``, so both snapshots are taken without it."""
+    def entries():
+        return sorted((str(path), path.stat().st_mtime_ns) for path in data.rglob("*"))
+
+    before, listings, real = entries(), [], os.scandir
+    with monkeypatch.context() as observing:
+        observing.setattr(os, "scandir", lambda path=".": listings.append(path) or real(path))
+        result = operation()
+    return result, listings, before, entries()
+
+
 def test_get_projection_is_passive_and_fresh_free_space_is_read_each_time(tmp_path, monkeypatch):
     data = tmp_path / "data"
     _write(data / "observability" / "a.bin", 10)
     counter = StorageCounter()
-    listings = []
-    real = os.scandir
-    monkeypatch.setattr(os, "scandir", lambda path: listings.append(path) or real(path))
-    before = sorted((str(path), path.stat().st_mtime_ns) for path in data.rglob("*"))
-    projection = counter.projection(data)
-    assert projection == {"counting": None, "error": None, "volume": projection["volume"], "retention_days": projection["retention_days"],
-                          "count": None, "free": projection["free"]}
-    assert projection["free"]["state"] == "idle"
-    assert isinstance(projection["volume"]["free_bytes"], int) and isinstance(projection["retention_days"], int)
-    assert listings == [] and sorted((str(path), path.stat().st_mtime_ns) for path in data.rglob("*")) == before
+    volumes = []
+
+    def disk_usage(path):  # a volume whose free space falls between two reads
+        volumes.append(path)
+        return SimpleNamespace(total=4_000, free=4_000 - 100 * len(volumes))
+
+    monkeypatch.setattr(shutil, "disk_usage", disk_usage)
+    projections, listings, before, after = _observed(
+        monkeypatch, data, lambda: [counter.projection(data) for _ in range(2)])
+    for projection in projections:
+        assert projection == {"counting": None, "error": None, "volume": projection["volume"], "retention_days": projection["retention_days"],
+                              "count": None, "free": projection["free"]}
+        assert projection["free"]["state"] == "idle"
+        assert isinstance(projection["volume"]["free_bytes"], int) and isinstance(projection["retention_days"], int)
+    assert [projection["volume"]["free_bytes"] for projection in projections] == [3_900, 3_800]
+    assert volumes == [str(data)] * 2
+    assert listings == [] and after == before
+
+
+@pytest.mark.parametrize("intrusion", ["walk", "write"])
+def test_the_passive_read_observer_sees_a_real_walk_and_a_persistent_write(tmp_path, monkeypatch, intrusion):
+    """The observer above is live whichever Python runs it: a projection followed by the storage walker
+    over the data folder is seen listing it, one followed by a new file under the data folder changes
+    its entries, and each intrusion leaves the other half of the oracle quiet."""
+    data = tmp_path / "data"
+    _write(data / "observability" / "a.bin", 10)
+    counter = StorageCounter()
+
+    def intruding():
+        projection = counter.projection(data)
+        if intrusion == "walk":
+            measure(data, places=[_place("data", data)], sleep=lambda _s: None)
+        else:
+            _write(data / "state" / "written.json", 2)
+        return projection
+
+    _, listings, before, after = _observed(monkeypatch, data, intruding)
+    if intrusion == "walk":
+        assert listings and after == before
+    else:
+        assert listings == [] and after != before
 
 
 def test_sixteen_concurrent_starts_spawn_one_child_and_the_finished_count_is_read_back(tmp_path, monkeypatch):

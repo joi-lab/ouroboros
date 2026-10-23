@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID, WEB_UI_CHAT_ID
 
@@ -203,10 +203,13 @@ def presence_provenance_from_task(task: Mapping[str, Any]) -> dict[str, str]:
     if not presence:
         return {}
     event = _mapping(presence.get("event"))
+    focus = _mapping(metadata.get("focus"))
     actor = _mapping(event.get("actor"))
     contract = _mapping(task.get("task_contract"))
     ceiling = _mapping(contract.get("capability_ceiling"))
     return {
+        **({"place_id": _text(focus.get("place_id") or presence.get("place_id"))}
+           if focus.get("place_id") or presence.get("place_id") else {}),
         "binding_id": _text(presence.get("binding_id")),
         "transport_skill": _text(presence.get("transport_skill")),
         "behavior_skill": _text(presence.get("behavior_skill")),
@@ -214,7 +217,7 @@ def presence_provenance_from_task(task: Mapping[str, Any]) -> dict[str, str]:
         "state_fingerprint": _text(ceiling.get("state_fingerprint")),
         "selection_fingerprint": _text(ceiling.get("selection_fingerprint")),
         "source_event_id": _text(event.get("source_event_id")),
-        "conversation_key": _text(event.get("conversation_key")),
+        "conversation_key": _text(focus.get("conversation_key") or event.get("conversation_key")),
         "provider": _text(event.get("provider")),
         "account_id": _text(event.get("account_id")),
         "conversation_id": _text(event.get("conversation_id")),
@@ -228,7 +231,31 @@ def presence_provenance_fields(task: Mapping[str, Any]) -> dict[str, Any]:
     return {"presence_provenance": value} if value else {}
 
 
-_RUN_ORIGIN_PRESENCE_KEYS = ("provider", "account_id", "conversation_id", "thread_id", "source_event_id", "actor_id")
+_RUN_ORIGIN_PRESENCE_KEYS = ("provider", "account_id", "conversation_id", "thread_id", "source_event_id", "actor_id", "place_id")
+
+
+def row_provenance(row: Mapping[str, Any]) -> Literal["place", "other"]:
+    """Classify stored rows by host stamps, never by their words or task id.
+
+    Older producers used ``presence`` or a typed source; current task facts
+    carry ``presence_provenance`` while arrivals carry transport facts.
+    An owner's ordinary transport row alone does not make a place.
+    """
+    source = _text(row.get("source"))
+    return "place" if (
+        bool(_mapping(row.get("presence_provenance")))
+        or bool(_mapping(row.get("presence")))
+        or source == "presence" or source.startswith("presence:")
+        or row.get("type") == "presence_delivery"
+    ) else "other"
+
+
+def place_row_facts(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Host room/event facts, including the delivery envelope used by older receipts."""
+    transport = _mapping(row.get("transport"))
+    delivery = _mapping(transport.get("delivery"))
+    return {**transport, **_mapping(row.get("presence")),
+            **_mapping(delivery.get("presence_provenance")), **_mapping(row.get("presence_provenance"))}
 
 
 def run_origin(record: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -638,7 +665,7 @@ class RoomLabelResolver:
             if name:
                 return f"Project {name} [chat_id={chat_id}]"
             return f"Project name unavailable [chat_id={chat_id}]"
-        # A presence room is named only by transport facts that re-derive this exact chat id.
+        # A place room is named only by transport facts that re-derive this exact chat id.
         # Inbound, initiated and receipt rows carry ``transport``; a turn's summary row carries the
         # same facts as ``presence_provenance``. One room, one label, whichever row opens a block.
         from ouroboros.presence_bindings import conversation_key
@@ -654,7 +681,7 @@ class RoomLabelResolver:
 
         clean = lambda value: " ".join(value.replace("[", " ").replace("]", " ").split())[:64]  # noqa: E731
         topic = f" topic {clean(thread)}" if thread not in {"", "0"} else ""
-        return f"Presence {clean(provider)} {clean(conversation)}{topic} [chat_id={chat_id}]"
+        return f"Place {clean(provider)} {clean(conversation)}{topic} [chat_id={chat_id}]"
 
 
 
@@ -690,4 +717,5 @@ __all__ = [
     "presence_provenance_fields",
     "presence_provenance_from_task",
     "run_origin",
+    "row_provenance",
 ]

@@ -1,18 +1,15 @@
 """``integrate_delegated_patch``: the C1 delegated-run disposition seam.
 
-The typed early refusals (ownership, isolation, finality, the CR1-3 apply-intent
-ambiguity), capture-at-disposition, the durable dispose/resolve writers, the
-drift refusal, the locked working-tree apply and the disposition flow itself.
-Extracted from ``ouroboros/tools/subagent_integration.py`` at its size gate
-(v7 DEL1 split); ``tools.subagent_integration`` re-exports every name (same
-objects), so sibling code — ``delegate_integration``'s payload branch included —
-the tests and monkeypatch targets keep addressing them on THAT surface.
+Owns typed CR1-3 refusals, capture-at-disposition, dispose/resolve records, drift refusal
+and locked apply. Extracted at the v7 DEL1 size gate: ``subagent_integration`` re-exports
+the same objects, retaining sibling imports and monkeypatch targets on that surface.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import pathlib
 import subprocess
 from contextlib import ExitStack
@@ -274,17 +271,14 @@ def _dispose_delegated(drive: Any, entry: Any, snapshot_key: str, reason: str,
     return True, note
 
 
-def _retain_named_evidence(drive: Any, entry: Any, *, reread: bool = False) -> Dict[str, Any]:
-    """Keep every file the run put under its copy's ``.review-evidence/``, whether or not
-    the patch may carry it (an excluded ``coverage.xml``, a gitignored log), byte-exact
-    within ``EVIDENCE_RETAIN_BYTES`` (reviewer seats have no bound). ``status`` is
-    ``retained``, ``partial`` (bound, link or unsupported-entry gaps), ``capture_failed``
-    (including unreadable paths) or ``copy_missing``.
-    A ``reread`` only answers from the retained summary.
-    """
+def _retain_named_evidence(drive: Any, entry: Any, *, reread: bool = False, whole: bool = False) -> Dict[str, Any]:
+    """Keep new named files byte-exact, including ignored logs: bounded for investigations,
+    streamed whole for candidates, whose baseline entries stay product. Status: retained, partial
+    (bound/link/type gaps), capture_failed (including unreadable paths), or copy_missing.
+    ``reread`` answers only from the retained summary."""
     from ouroboros import delegate_custody as custody
     from ouroboros.artifacts import DELEGATED_CAPTURE_PREFIX
-    from ouroboros.review_checking import EVIDENCE_RETAIN_BYTES, retain_named_evidence
+    from ouroboros.review_checking import EVIDENCE_RETAIN_BYTES, named_evidence_witness, retain_named_evidence
     from ouroboros.utils import atomic_write_json
 
     cap_dir = custody.delegated_capture_dir(drive, entry.task_id, custody.capture_key(entry))
@@ -297,9 +291,25 @@ def _retain_named_evidence(drive: Any, entry: Any, *, reread: bool = False) -> D
             return {"status": "copy_missing", "evidence_dir": str(evidence), "files": [], "gaps": []}
     gaps: List[Dict[str, Any]] = []
     try:
-        files = retain_named_evidence(area, evidence / "files", [EVIDENCE_RETAIN_BYTES], gaps)
+        product_paths = set()
+        if whole:
+            from ouroboros.subagent_worktrees import find_execution_snapshot
+            from ouroboros.workspace_patch_capture import baseline_blob_sizes
+
+            snapshot = find_execution_snapshot(entry.snapshot_id) or {}
+            clone = pathlib.Path(str(snapshot.get("path") or area))
+            prefix = pathlib.PurePosixPath(area.resolve().relative_to(clone.resolve()).as_posix())
+            errors: List[Dict[str, Any]] = []
+            baseline = baseline_blob_sizes(clone, entry.baseline_sha, errors=errors)
+            if errors:
+                raise ValueError(f"evidence baseline could not be read: {errors}")
+            paths = map(pathlib.PurePosixPath, set(baseline) | set(snapshot.get("file_baseline") or {}))
+            product_paths = {path.relative_to(prefix).as_posix() for path in paths if path.is_relative_to(prefix)}
+        witness = named_evidence_witness(area)  # taken first: a write during the copy forces a later retry
+        files = retain_named_evidence(area, evidence / "files", [float("inf") if whole else EVIDENCE_RETAIN_BYTES],
+                                      gaps, product_paths=product_paths)
         summary = {"status": "partial" if gaps else "retained", "evidence_dir": str(evidence),
-                   "summary_read": read, "files": files, "gaps": gaps}
+                   "summary_read": read, "files": files, "gaps": gaps, "witness": witness}
         atomic_write_json(evidence / "summary.json", summary)
     except Exception as exc:  # the copy stays; its custody is the recoverable evidence
         log.warning("investigation %s named evidence retention failed", entry.run_id, exc_info=True)
@@ -307,19 +317,48 @@ def _retain_named_evidence(drive: Any, entry: Any, *, reread: bool = False) -> D
     return summary
 
 
-def retain_investigation_evidence(drive: Any, entry: Any, block: Dict[str, Any], gateway: Any = None) -> Dict[str, Any]:
-    """An evidence-only investigation's ready capture IS its disposition (#1609).
+def run_named_evidence(drive: Any, entry: Any) -> Dict[str, Any]:
+    """A candidate's whole named evidence (#2070); {} for none, payload or engine directory copies.
+    A retained summary answers only while its witness matches; gaps retry."""
+    from ouroboros.delegate_collection import saved_named_evidence
+    from ouroboros.delegate_directory import is_directory_run
+    from ouroboros.delegate_start_instructions import EVIDENCE_DIRNAME
+    from ouroboros.review_checking import named_evidence_witness
+    from ouroboros.utils import atomic_write_json
 
-    The captured patch and file outputs stay in the capture directory and nothing is
-    applied; a Git copy's ``.review-evidence/`` files are retained beside them first
-    (``_retain_named_evidence``). Then ``evidence_retained`` is recorded through the one
-    dispose writer, which releases the private snapshot only once that row landed (an
-    engine directory copy, captured whole, is discarded first; its receipt rides the
-    row). Named files the bound or a failure could not keep leave the copy undisposed
-    with the gap named. A capture that is not ready, or a run that could apply its work,
-    is returned unchanged: the copy stays for inspection and no reject is invented. A
-    reread of a retained investigation keeps its evidence-only presentation.
-    """
+    if (not (entry.snapshot_id and entry.execution_root) or is_directory_run(entry)
+            or getattr(entry, "authority_source", "") == "skill_payload"):
+        return {}
+    (summary, known), area = saved_named_evidence(drive, entry), pathlib.Path(str(entry.execution_root))
+    if not area.is_dir():
+        return known  # the whole copy is gone: its record answers, and nothing is left there to keep
+    if not os.path.lexists(area / EVIDENCE_DIRNAME):  # removed from a surviving copy: nothing is left to lose
+        if known.get("status") in ("partial", "capture_failed"):  # what was retained stays listed
+            known = {**known, "status": "retained", "gaps": [], "removed_gaps": known.get("gaps") or []}
+            atomic_write_json(summary, known)
+        return known
+    if known.get("status") == "retained" and known.get("witness") == (named_evidence_witness(area) or "unlisted"):
+        return known  # still these bytes: a later write (a continued session) is retained anew
+    return _retain_named_evidence(drive, entry, whole=True)
+
+
+def retain_run_evidence(drive: Any, entry: Any, block: Dict[str, Any], gateway: Any = None) -> Dict[str, Any]:
+    """Retention disposes investigations; candidates await owner apply/reject after named evidence."""
+    from ouroboros.delegate_registration_policy import candidate_apply_possible
+
+    if not candidate_apply_possible(entry):
+        return retain_investigation_evidence(drive, entry, block, gateway)
+    named = run_named_evidence(drive, entry) if block.get("status") in _READY_CAPTURE_STATUSES else {}
+    return {**block, "named_evidence": named} if named else block
+
+
+def retain_investigation_evidence(drive: Any, entry: Any, block: Dict[str, Any], gateway: Any = None) -> Dict[str, Any]:
+    """A ready investigation's capture IS its disposition (#1609), never applied.
+    Patch/file outputs stay in the capture directory; Git named evidence is retained first.
+    Gaps keep the copy undisposed. The one dispose writer records evidence_retained before
+    releasing the snapshot; an engine directory copy is discarded first, its receipt on the row.
+    Non-ready or apply-capable runs stay unchanged for inspection, never invented rejections.
+    Rereads keep the retained investigation's evidence-only presentation."""
     import hashlib
 
     from ouroboros import delegate_custody as custody
@@ -699,6 +738,14 @@ def _integrate_git_capture(ctx, entry, decision, reason, manifest, cap_dir, orph
         return _capture_failed_refusal(rid, str(manifest.get("status") or ""), str(exc))
     touched = sorted(set(touched) | {row["path"] for row in file_changes})
 
+    named = run_named_evidence(drive, entry)  # (#2070) evidence first: a gap keeps a surviving copy undisposed
+    if named.get("status") in ("partial", "capture_failed") and pathlib.Path(str(entry.execution_root)).is_dir():
+        gaps = [str(gap.get("path") or "") for gap in named.get("gaps") or [] if isinstance(gap, dict)]
+        return (f"⚠️ INTEGRATE_DELEGATED_EVIDENCE_UNRETAINED: run {rid}'s named evidence could not all be retained "
+                f"({named['status']}: {', '.join(gaps[:5]) or named.get('error') or 'unknown'}). No disposition was "
+                f"recorded and nothing changed: apply or reject would release {entry.execution_root}, the last copy "
+                "of those files. Keep what you need from it (or remove what is not evidence), then repeat this call.")
+
     def _dispose(disposition: str, cleanup: bool) -> tuple[bool, str]:
         return _dispose_delegated(
             drive, entry, snapshot_key, reason, disposition, cleanup,
@@ -743,7 +790,7 @@ def _integrate_git_capture(ctx, entry, decision, reason, manifest, cap_dir, orph
                 return _unwritten_disposition("applied", applied=False)
             return (
                 f"OK: delegated run {rid} has no captured file changes to apply; "
-                f"its answer and external effects remain separate evidence. The snapshot is released."
+                f"its answer and external effects remain separate evidence; the snapshot is released."
                 f"{format_patch_exclusions(manifest)}{note}"
             )
         return (

@@ -15,6 +15,7 @@ import subprocess
 import pytest
 
 from ouroboros import delegate_custody as custody, store
+from ouroboros.delegate_collection import collect_terminal
 from ouroboros.store import STORE_REL
 from ouroboros.task_results import write_task_result
 from ouroboros.subagent_worktrees import (
@@ -591,7 +592,7 @@ def _binding_request_row(task_id, invocation_id, handle):
 class TestOrphanReconciliation:
     """The two C1 release blockers: orphan recovery must not lose the snapshot
     binding (and the GC must not eat an undispositioned patch), and terminal
-    reconciliation must capture the stranded diff — while NEVER applying it."""
+    reconciliation must leave the stranded diff collectible without applying it."""
 
     def _stranded(self, tmp_path, *, snapshot_id, task_id, started=True):
         """A crash-shaped mutating run: snapshot provisioned, child edited it,
@@ -647,17 +648,16 @@ class TestOrphanReconciliation:
         assert report["kept"] == ["inv-lost"] and report["removed"] == []
         assert find_execution_snapshot("inv-lost", data_dir=data) is not None
         assert pathlib.Path(handle.path).exists()
-        # And the work is no longer only-in-the-snapshot: the sweep captured it.
+        # The control sweep retained the terminal; its independent collector now captures it.
+        assert not replayed.patch_captured
+        assert collect_terminal(data, "run-rec")["workspace_capture"]["status"] == "ready_with_changes"
         patch = custody.delegated_capture_dir(data, "t-dead", "inv-lost") / "workspace.patch"
         assert "CHILD-EDIT" in patch.read_text(encoding="utf-8")
         custody._CUSTODY.clear()
 
-    def test_reconcile_captures_the_stranded_patch_and_never_applies_it(self, tmp_path):
-        # Blocker 2 + the no-auto-apply pin: a run reaching terminal through the
-        # sweep (owner gone) got no patch capture at all — the work stayed
-        # stranded in the snapshot with no apply/reject material. The sweep now
-        # captures into the SAME durable artifact the nanny path uses, records
-        # the pending disposition, and touches NOTHING in the shared tree.
+    def test_reconcile_defers_the_stranded_patch_and_collection_never_applies_it(self, tmp_path):
+        # The sweep leaves durable debt; the independent collector uses the same
+        # artifact path as foreground collection and changes nothing in the target.
         target, data, handle = self._stranded(
             tmp_path, snapshot_id="inv-orphan", task_id="t-dead2")
         before_status = _git(target, "status", "--porcelain").stdout
@@ -667,10 +667,11 @@ class TestOrphanReconciliation:
         custody._CUSTODY.clear()
         row = outcomes[0]
         assert row["action"] == "settle_attempted" and row["settled"] is True
-        assert row["patch_capture"] == "ready_with_changes"
-        assert row["patch_disposition"] == "pending"
+        assert row["collection"]["status"] == "pending" and "patch_capture" not in row
+        captured = collect_terminal(data, "run-inv-orphan")["workspace_capture"]
+        assert captured["status"] == "ready_with_changes"
         cap_dir = custody.delegated_capture_dir(data, "t-dead2", "inv-orphan")
-        assert pathlib.Path(row["patch_artifact"]) == cap_dir / "workspace.patch"
+        assert pathlib.Path(captured["patch_artifact"]) == cap_dir / "workspace.patch"
         assert "CHILD-EDIT" in (cap_dir / "workspace.patch").read_text(encoding="utf-8")
         assert (cap_dir / "workspace_patch.json").exists()
         # Durable, replayed: captured yes, disposed NO — the decision is an owner's.
@@ -680,10 +681,11 @@ class TestOrphanReconciliation:
         # NO AUTO-APPLY: the shared tree is byte-identical to before the sweep.
         assert (target / "tracked.txt").read_text(encoding="utf-8") == "one\ntwo\n"
         assert _git(target, "status", "--porcelain").stdout == before_status
-        # The typed disclosure is durable on the RECONCILED row, not only returned.
+        # Reconciliation discloses pending collection without claiming a patch exists.
         events = (data / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
         reconciled = [json.loads(l) for l in events if '"delegate_run_reconciled"' in l]
-        assert reconciled[-1]["patch_disposition"] == "pending"
+        assert reconciled[-1]["collection"]["status"] == "pending"
+        assert "patch_capture" not in reconciled[-1]
         custody._CUSTODY.clear()
 
     def test_a_still_live_run_is_not_captured_and_stays_open(self, tmp_path):
@@ -760,8 +762,9 @@ class TestOrphanReconciliation:
         surface = build_health_invariants(_Env())
         assert "DELEGATED PATCH AWAITS DISPOSITION" in surface
         assert "run-inv-vis" in surface and "integrate_delegated_patch" in surface
-        # A PROVEN-terminal sweep captured eagerly, so the receipt is honest.
-        assert "changes captured" in surface
+        assert "changes captured" not in surface
+        assert collect_terminal(data, "run-inv-vis")["workspace_capture"]["status"] == "ready_with_changes"
+        assert "changes captured" in build_health_invariants(_Env())
 
         entry = custody.replay(data)["run-inv-vis"]
         custody.record_patch_disposed(data, entry, disposition="rejected")
@@ -946,11 +949,9 @@ class TestLazyCaptureAtDisposition:
         assert (target / "tracked.txt").read_text(encoding="utf-8") == "one\ntwo\n"
         custody._CUSTODY.clear()
 
-    def test_cancel_verified_terminal_still_captures_eagerly(self, tmp_path):
-        # (d) regression pin: where a TERMINAL RECEIPT proves the run is over —
-        # here a cancel verified terminal by the read-back — the sweep still
-        # captures eagerly, exactly as before. (The is_terminal branch is pinned
-        # by test_reconcile_captures_the_stranded_patch_and_never_applies_it.) The deliberate owner terminal reaches the cancel arm (inverted floor, B1-A).
+    def test_cancel_verified_terminal_defers_capture_to_its_collector(self, tmp_path):
+        # A verified terminal authorizes later capture. Control settlement itself
+        # leaves the bytes in the snapshot and never joins bulk collection.
         target, data, handle = self._stranded_absent(
             tmp_path, snapshot_id="inv-can", task_id="t-can")
         write_task_result(data, "t-can", "completed", result="verdict")
@@ -972,8 +973,9 @@ class TestLazyCaptureAtDisposition:
         row = outcomes[0]
         assert row["action"] == "cancelled"
         assert row["outcome"] == custody.CANCEL_CONFIRMED
-        assert row["patch_capture"] == "ready_with_changes"
-        assert row["patch_disposition"] == "pending"
+        assert "patch_capture" not in row
+        assert not custody.replay(data)["run-inv-can"].patch_captured
+        assert collect_terminal(data, "run-inv-can")["workspace_capture"]["status"] == "ready_with_changes"
         cap = custody.delegated_capture_dir(data, "t-can", "inv-can") / "workspace.patch"
         assert "CHILD-EDIT" in cap.read_text(encoding="utf-8")
         assert custody.replay(data)["run-inv-can"].patch_captured is True

@@ -227,11 +227,16 @@ def _containment_evidence(detail: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _terminal_payload(run_id: str, detail: Dict[str, Any],
-                      authority: "DelegatedRunShape") -> Dict[str, Any]:
+                      authority: "DelegatedRunShape",
+                      entry: Optional[_RunCustody] = None) -> Dict[str, Any]:
+    from ouroboros.effort_evidence import terminal_prompt_cache_ttl
     from ouroboros.gateways.claudexor import final_attempt_facts
 
     summary = _delegate().custody.summary_of(detail)
     observed = final_attempt_facts(detail, run_id)
+    start_ttl = ((entry.request_event if entry is not None else {}).get("prompt_cache_ttl")
+                 or (entry.prompt_cache_ttl if entry is not None else None))
+    ttl_facts = terminal_prompt_cache_ttl(observed, start_ttl)
     payload = {
         "status": "terminal",
         "run_id": run_id,
@@ -255,6 +260,8 @@ def _terminal_payload(run_id: str, detail: Dict[str, Any],
     }
     if isinstance(detail.get("attemptExecution"), list):
         payload["attempt_execution"] = detail["attemptExecution"]
+    if ttl_facts is not None or "prompt_cache_ttl" in observed:
+        payload["prompt_cache_ttl"] = ttl_facts
     from ouroboros.delegate_continuation import terminal_continuity
 
     # The engine's own continuation facts: `resumable` (why the work stopped, its
@@ -446,9 +453,15 @@ def _retained_terminal_payload(ctx: ToolContext, entry: _RunCustody, *, full=Non
 
 def resolved_terminal_payload(run_id, detail, authority, entry=None, gateway=None):
     """Canonical terminal material, independent of retention and delivery."""
-    full = _terminal_payload(run_id, detail, authority)
+    full = _terminal_payload(run_id, detail, authority, entry=entry)
     if entry is not None:
         _delegate().add_terminal_source_verification(full, entry)
+        if entry.mode == "plan":
+            from ouroboros.delegate_plan import terminal_plan
+
+            full["plan"] = terminal_plan(entry, gateway, detail)
+        if entry.promotion:
+            full["promotion"] = dict(entry.promotion)
         if entry.superseded_by:  # its snapshot and work belong to that continuation's one capture now
             full["superseded_by"] = entry.superseded_by
     # Requested-vs-applied model, the review lane's own lexicon and rule
@@ -666,7 +679,7 @@ def retained_terminal_result(ctx, run_id, *, complete_only=True):
         return None
     payload = _retained_terminal_payload(ctx, entry, full=full)
     if payload is not None:
-        pending = collection_pending(entry)
+        pending = collection_pending(entry, root)
         runtime = body_runtime(root) if pending else None
         if runtime is not None:
             runtime.request(run_id)

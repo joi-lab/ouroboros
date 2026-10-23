@@ -63,7 +63,7 @@ def live_works_present(root, *, exclude=""):
             "state": row["status"], "started_at": row.get("started_at"),
             "open_questions": row.get("open_questions") or [], "waiting": row.get("waiting") or [],
             "last_line": focus.get("text", ""), "last_line_at": focus.get("authored_at"),
-            **{key: row[key] for key in ("focus", "project_admission_hold", "recorded_status", "tails", "unavailable")
+            **{key: row[key] for key in ("focus", "project_admission_hold", "recorded_status", "tails", "unavailable", "stop", "release", "refusal")
                if key in row}})
     from ouroboros.peer_roster import unlisted_live_work
 

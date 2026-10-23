@@ -35,15 +35,19 @@ LANE_EXCLUSION_EXPR = (
     "and not portable_detail and not skill_smoke and not size_ratchet"
 )
 
-# Shared flags for ci.yml `quick-test`/`full-test-runs`, including hang timeout.
-# Windows appends `--default-suite-shard`; the local full run is unsharded.
+# Shared flags for ci.yml `quick-test`/`full-test-runs`, including the hang timeout.
+# CI appends `--default-suite-shard` on every OS; the local full run is unsharded.
+# No `--timeout-method`: pytest-timeout's default is SIGALRM where the platform has
+# it, which fails only the hung test, and its thread method elsewhere (Windows),
+# which stops the worker.
 PARALLEL_PASS_FLAGS = [
     "-n", "auto",
     "--dist", "loadscope",
     "--max-worker-restart=0",
     "--timeout=300",
-    "--timeout-method=thread",
 ]
+# The serial pass carries the same per-test hang bound and none of the xdist flags.
+SERIAL_PASS_FLAGS = ["--timeout=300"]
 
 # Verifying the INTERPRETER (see `_verify_preflight_plugins`) proves the plugins
 # are installed; it does not prove the candidate's own pytest configuration lets
@@ -66,6 +70,8 @@ PARALLEL_PASS_FLAGS = [
 # compared token-for-token against ci.yml, where the environment is provisioned
 # and no candidate configuration is in play.
 _FORCED_PLUGIN_FLAGS = ["-p", "xdist", "-p", "timeout"]
+# The serial pass carries `--timeout` too, so it forces the timeout plugin the same way.
+_FORCED_SERIAL_PLUGIN_FLAGS = ["-p", "timeout"]
 
 # Option NAMES that only a parallel pass carries, derived from the SSOT above so
 # the classifier can never disagree with the flags actually passed. Compared as
@@ -149,20 +155,19 @@ _WORKER_CRASH_PATTERNS = (
     re.compile(r"^maximum crashed workers reached: \d+", re.IGNORECASE),
 )
 
-# pytest-timeout's own banner. `--timeout-method=thread` does NOT fail the test:
-# it dumps stacks and `os._exit(1)`s the whole worker, which xdist then reports
-# with the crash phrasing above. So a plain hang is indistinguishable from a real
-# crash by exit code alone, and the generic "mark it @pytest.mark.serial"
-# remediation would be actively harmful — the serial pass carries no per-test
-# timeout, so obeying it relocates the hang into the pass that has no defence
-# against it. These patterns split the two cases apart.
+# pytest-timeout's own banner. Its thread method (the default where SIGALRM does
+# not exist, i.e. Windows) does NOT fail the test: it dumps stacks and
+# `os._exit(1)`s the whole worker, which xdist then reports with the crash
+# phrasing above. So a plain hang is indistinguishable from a real crash by exit
+# code alone, and the generic "mark it @pytest.mark.serial" remediation would be
+# wrong — the serial pass carries the same per-test timeout, so obeying it only
+# moves the hang. These patterns split the two cases apart.
 #   * thread method (pytest_timeout.timeout_timer -> write_title("Timeout", sep="+"))
 #     prints a "+++++ Timeout +++++" rule; the fill width follows the terminal, and
-#     xdist may prefix the forwarded line, so neither end is anchored. This is the
-#     banner the configured `--timeout-method=thread` actually emits, and only
+#     xdist may prefix the forwarded line, so neither end is anchored. Only
 #     pytest-timeout emits it.
-#   * signal method raises Failed("Timeout >300.0s") — kept so the diagnosis is
-#     right if the method is ever changed. The bare phrase alone is NOT enough:
+#   * signal method (the default with SIGALRM) raises Failed("Timeout >300.0s"):
+#     the test fails and its worker lives on. The bare phrase alone is NOT enough:
 #     `Timeout >30s` is ordinary text a test can print or assert on, and matching
 #     it against the whole pass output would INVERT the remediation for a genuine
 #     crash that happens to run alongside such a test. So the phrase only counts
@@ -262,7 +267,8 @@ def _preflight_pass_specs(
         ),
         _make_pass(
             "serial",
-            [target, "-m", f"serial and {LANE_EXCLUSION_EXPR}", *output_flags],
+            [target, "-m", f"serial and {LANE_EXCLUSION_EXPR}", *SERIAL_PASS_FLAGS,
+             *_FORCED_SERIAL_PLUGIN_FLAGS, *output_flags],
         ),
     ]
 
@@ -973,21 +979,19 @@ def _rejected_parallel_flags(output: str) -> list[str]:
 def _crash_remediation(output: str) -> str:
     """The instruction line for a dead worker — it depends on WHY it died.
 
-    A worker killed by ``--timeout=300 --timeout-method=thread`` reaches the
-    controller with the same crash phrasing as a genuine crash, but the fix is
-    the opposite one: the serial pass runs flag-free (no per-test timeout), so
-    marking a merely-slow test ``@pytest.mark.serial`` moves the hang into the
-    pass that cannot bound it, where it burns the whole remaining total budget
-    and resurfaces as a pass-2 timeout. The label and the hard block are
-    identical either way; only this line changes.
+    A worker killed by ``--timeout=300`` under the thread method (Windows)
+    reaches the controller with the same crash phrasing as a genuine crash, but
+    the fix is a different one: the test is slow or hangs, and marking it
+    ``@pytest.mark.serial`` does not help because the serial pass carries the
+    same per-test timeout. The label and the hard block are identical either
+    way; only this line changes.
     """
     if any(pattern.search(output) for pattern in _TIMEOUT_BANNER_PATTERNS):
         return (
-            "A test exceeded the 300s per-test limit and pytest-timeout killed its worker "
-            "(--timeout-method=thread terminates the process instead of failing the test). "
+            "A test exceeded the 300s per-test limit and pytest-timeout stopped it "
+            "(its thread method, used where SIGALRM does not exist, terminates the worker). "
             "Make that test faster or split it. Do NOT mark it @pytest.mark.serial: the "
-            "serial pass carries no per-test timeout, so the hang would simply move there "
-            "and consume the rest of the total budget."
+            "serial pass carries the same per-test timeout."
         )
     return (
         "A pytest-xdist worker DIED instead of reporting a failure. Find the test that "
@@ -1229,9 +1233,9 @@ def _run_hermetic_pytest(
 ) -> Optional[str]:
     """Run Node and both pytest lanes in one disposable candidate checkout.
 
-    A full run is the default; reviewed ordinary commits request ``selected``.
-    Selection uses the assembled candidate, HEAD before commit or HEAD~1 after,
-    plus authored widening. Only complete full runs may mint durable receipts.
+    A full run is the default; reviewed ordinary commits request ``selected`` against
+    ``base`` (default HEAD before commit, HEAD~1 after) plus authored widening. Green
+    runs mint receipts: full ones as full, selected ones only of an exact commit.
     Skip/no suite returns None without proof; failures return bounded diagnostics.
     OUROBOROS_PREFLIGHT_TIMEOUT_SEC owns the shared total lane budget.
 
@@ -1353,7 +1357,7 @@ def _run_hermetic_pytest(
             PreflightTestProof, capture_preflight_test_subject, log_preflight_test_proof,
             preflight_test_workload_unchanged, selected_workload_unchanged,
         )
-        from ouroboros.preflight_receipts import FullGateReceipt
+        from ouroboros.preflight_receipts import GateReceipt
         from ouroboros.preflight_inventory import selection_passes, read_inventory, inventory_problem
         if selected:
             from ouroboros.test_selection import select_tests
@@ -1371,7 +1375,7 @@ def _run_hermetic_pytest(
         if selection is not None and ctx is not None and subject is None:
             raise ValueError("selected test subject could not be bound")
         can_reuse = isinstance(previous_proof, PreflightTestProof) and previous_proof.covers(subject)
-        receipt = None if can_reuse else FullGateReceipt.prepare(ctx, subject, passes, probe_module, agent_python, temp_root, worktree)
+        receipt = None if can_reuse else GateReceipt.prepare(ctx, subject, passes, probe_module, agent_python, temp_root, worktree)
         if can_reuse or receipt.covered():
             evidence.update(reuse="process_proof" if can_reuse else "receipt", reused_from=getattr(
                 ctx, "_preflight_previous_evidence", None) if can_reuse else receipt.evidence)

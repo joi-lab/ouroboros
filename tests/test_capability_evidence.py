@@ -356,7 +356,7 @@ def test_token_density_is_measured_throttled_and_bounded(tmp_path, monkeypatch):
     assert density == COLD_START_TOKEN_DENSITY
 
 
-def test_density_reducers_use_newest_route_or_model_but_densest_review_witness(
+def test_main_density_uses_exact_route_but_review_uses_densest_model_witness(
     tmp_path, monkeypatch,
 ):
     from datetime import datetime, timezone
@@ -390,7 +390,7 @@ def test_density_reducers_use_newest_route_or_model_but_densest_review_witness(
         1.1, "fresh_route_usage",
     )
     assert resolve_main_token_density(tmp_path, "missing-route", "m/one") == (
-        1.1, "fresh_model_usage",
+        1.0, "cold_estimate",
     )
     review, source = resolve_review_token_density(tmp_path, "m/one")
     assert source == "measured"
@@ -581,7 +581,7 @@ def test_density_retention_preserves_fresh_high_witness_without_refreshing_its_t
 
     monkeypatch.setattr(ce, "utc_now", lambda: now + datetime.timedelta(seconds=120))
     assert resolve_main_token_density(tmp_path, "route-high", "m/one") == (
-        1.5, "fresh_model_usage",
+        1.0, "cold_estimate",
     )
     # Successor pin (issue #284): the densest FRESH exact-model witness (1.5,
     # with the safety factor) undercuts the cold floor and is honored; the
@@ -633,7 +633,7 @@ def test_token_density_is_concurrency_safe_under_bench_like_parallelism(tmp_path
         assert get_token_density(tmp_path, f"m/{index}") > 0
 
 
-def test_cold_density_never_demotes_the_main_loop_context_fit(tmp_path, monkeypatch):
+def test_main_density_uses_the_cold_family_until_this_route_has_a_witness(tmp_path, monkeypatch):
     """Д7 CRITICAL decoupling: the conservative cold-start density is for review-pack
     sizing ONLY. Every fresh install and EVERY isolated benchmark server starts with an
     empty observation store, so applying it to the main loop would silently demote
@@ -645,15 +645,15 @@ def test_cold_density_never_demotes_the_main_loop_context_fit(tmp_path, monkeypa
     (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
 
     # Empty store: a no-observation route keeps the neutral 1.0 baseline.
-    assert context_fit._route_calibration_ratio(tmp_path, "fp", "openai/gpt-5.5") == 1.0
-    assert context_fit._route_calibration_ratio(tmp_path, "fp", "anthropic/claude-fable-5") == 1.0
+    assert context_fit._route_calibration_ratio(tmp_path, "openai-fp", "openai/gpt-5.5") == 1.0
+    assert context_fit._route_calibration_ratio(tmp_path, "fp", "anthropic/claude-fable-5") == 4 / 2.7
 
     # Only a MEASURED density for that exact model may raise it.
     record_token_density(
         tmp_path, "anthropic/claude-fable-5", prompt_chars=4_000_000, prompt_tokens=1_580_000,
-        basis=ce.MAIN_DENSITY_BASIS,
+        basis=ce.MAIN_DENSITY_BASIS, route_fp="fp",
     )
-    assert context_fit._route_calibration_ratio(tmp_path, "fp", "openai/gpt-5.5") == 1.0
+    assert context_fit._route_calibration_ratio(tmp_path, "openai-fp", "openai/gpt-5.5") == 1.0
     assert context_fit._route_calibration_ratio(
         tmp_path, "fp", "anthropic/claude-fable-5"
     ) > 1.5
@@ -731,7 +731,7 @@ def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
     model = "anthropic/claude-fable-5"  # Claude-family, routed through OpenRouter
     core = context_fit.ContextCore(
         base_prompt="p", bible_md="b", architecture_md="a", development_md="d",
-        semi_stable_text="s", dynamic_text="y", user_content_json='"u"',
+        semi_stable_text="s", dynamic_text="y", user_content_json=json.dumps("u" * 200_000),  # comparable to the 50k send
         docs_need_development=False,
     )
     env = SimpleNamespace(drive_root=str(tmp_path))
@@ -753,7 +753,7 @@ def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
     # --- Round 1: no observation anywhere -> neutral baseline, NO demotion.
     assert get_token_density(tmp_path, model) == 0.0
     first = _plan()
-    assert first.max_projection.calibration_ratio == 1.0
+    assert first.max_projection.calibration_ratio == 4 / 2.7
     assert first.initial_mode == "max"
 
     # --- The first settled send records the density through the REAL boundary,
@@ -762,6 +762,8 @@ def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
         model=model,
         provider="openrouter",
         prompt_tokens_estimate=50_000,     # == 200,000 prompt chars
+        physical_context=context_fit._physical_context_for_fit(context_fit.measure_main_fit(
+            first, first.messages_for("max"), [], profile="owner_max", rendered_mode="max", round_id="r1")),
         # The modern producer stamps the fit-estimator basis (no images here,
         # so it equals the raw estimate); a 0 legacy field records basis="raw",
         # which the MAIN fit resolver deliberately refuses to calibrate on.

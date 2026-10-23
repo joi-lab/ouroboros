@@ -381,14 +381,13 @@ def test_commit_triad_delivery_projects_aligned_vectors_from_the_pool(clean_env)
     assert [rsc.row_plan_retrieves(legacy, i) for i in range(4)] == [False, False, True, False]
 
 
-def test_the_skill_fingerprint_names_native_delivery_only_where_a_row_reads(clean_env):
-    from ouroboros.skill_review_cycles import skill_review_contract_fingerprint
+def test_the_shared_contract_fingerprint_names_native_delivery_only_where_a_row_reads(clean_env):
+    """One contract identity for every wave (commit, change, result, skill): a row's delivery is part of it."""
+    from ouroboros.tools.commit_gate import commit_review_contract_fingerprint
 
     def fingerprint(roster):
         clean_env.setenv(SUBAGENTS_SETTING, roster)
-        delivery = rsc.commit_triad_delivery()
-        return skill_review_contract_fingerprint(delivery["models"], delivery=delivery,
-                                                 required_items=("a",), review_profile="p")
+        return commit_review_contract_fingerprint()
 
     bare = fingerprint(_roster(_row("t", "m/one")))  # the catalog default is native
     native = fingerprint(_roster(_row("t", "m/one", delivery="native")))
@@ -422,7 +421,6 @@ def test_a_declared_plan_effort_decides_auto_rows_clamped_and_leaves_pins_and_na
     name, unclamped. The commit gate, acceptance and skill-review identities are
     byte-identical around it."""
     from ouroboros import config
-    from ouroboros.skill_review_cycles import skill_review_contract_fingerprint
     from ouroboros.tools import plan_review_runtime
     from ouroboros.tools.commit_gate import commit_review_contract_fingerprint
 
@@ -432,16 +430,14 @@ def test_a_declared_plan_effort_decides_auto_rows_clamped_and_leaves_pins_and_na
         _row("plain-row", "codex=gpt-5.6-sol", kind="agent_session"),
         _row("pinned-row", "openai/gpt-5.6-sol", effort="low"),
     ))
-    before = (rsc.commit_triad_delivery(), commit_review_contract_fingerprint(),
-              skill_review_contract_fingerprint(["m"], delivery=rsc.commit_triad_delivery()))
+    before = (rsc.commit_triad_delivery(), commit_review_contract_fingerprint())
     declared = plan_review_runtime.plan_review_slots(default_effort="max")
     assert [s.effort for s in declared] == ["xhigh", "high", "low"]  # Auto row: the order clamped to the top
     assert [s.declared_effort for s in declared] == ["", "max", ""]
     assert [s.effort for s in plan_review_runtime.plan_review_slots(default_effort="none")] == ["xhigh", "low", "low"]
     assert [s.effort for s in plan_review_runtime.plan_review_slots()] == ["xhigh", "high", "low"]
     assert [s.slot_id for s in declared] == ["cursor-row", "plain-row", "pinned-row"]
-    after = (rsc.commit_triad_delivery(), commit_review_contract_fingerprint(),
-             skill_review_contract_fingerprint(["m"], delivery=rsc.commit_triad_delivery()))
+    after = (rsc.commit_triad_delivery(), commit_review_contract_fingerprint())
     assert before == after and before[0]["efforts"] == ["xhigh", "high", "low"]
     monkeypatch.setattr(config, "_BOOT_RUNTIME_MODE", "cyber_pro")
     cyber = plan_review_runtime.plan_review_slots(default_effort="max")
@@ -449,12 +445,10 @@ def test_a_declared_plan_effort_decides_auto_rows_clamped_and_leaves_pins_and_na
 
 
 def test_compound_effort_stabilizes_replay_identity_against_global_drift(clean_env):
-    from ouroboros.skill_review_cycles import skill_review_contract_fingerprint
+    from ouroboros.tools.commit_gate import commit_review_contract_fingerprint
 
     def fingerprint():
-        delivery = rsc.commit_triad_delivery()
-        return delivery["efforts"], skill_review_contract_fingerprint(
-            delivery["models"], required_items=("manifest_schema",), delivery=delivery)
+        return rsc.commit_triad_delivery()["efforts"], commit_review_contract_fingerprint()
 
     clean_env.setenv(SUBAGENTS_SETTING, _roster(_row("c", "cursor=cursor-grok-4.6-xhigh", kind="agent_session")))
     clean_env.setenv("OUROBOROS_EFFORT_REVIEW", "low")

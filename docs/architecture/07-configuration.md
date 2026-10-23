@@ -74,6 +74,7 @@ One row per key (`settings_defaults.py`). Env-only rows have no settings.json ca
 | OUROBOROS_MODEL | google/gemini-3.8-flash | Main model |
 | OUROBOROS_MODEL_HEAVY | "" | Outside `ACTIVE_MODEL_SETTING_KEYS`: read for migration, never routed |
 | OUROBOROS_MODEL_LIGHT | openai/gpt-6-luna | Light model |
+| OUROBOROS_MODEL_SAFETY | (empty) | Safety Supervisor; empty uses Light, then Main. Outside Cyber Pro only owner writes change the resolved checker (the owner Safety endpoints, the model-wait card); a provider change that re-proposes an unauthored slot saves and is audited |
 | OUROBOROS_MODEL_ACCOUNTS | {} | Role-owned managed-account pins; empty = Auto |
 | OUROBOROS_PROCESSING_PREFERENCE | "" | Global provider-neutral preference standard/fast/economy; empty keeps the adapter default |
 | OUROBOROS_MODEL_PROCESSING_PREFERENCES | {} | Role-owned preferences; empty roles inherit the global one |
@@ -84,7 +85,7 @@ One row per key (`settings_defaults.py`). Env-only rows have no settings.json ca
 | OUROBOROS_MODEL_CONSCIOUSNESS | "" | Background-consciousness model (empty inherits) |
 | OUROBOROS_MODEL_FALLBACKS | openai/gpt-5.6-luna | Cross-model fallback chain (`fallback_cooldown.py`); blank = none |
 | OUROBOROS_SERVED_MODEL_REDOS | 2 | Redos of a round another model answered, each a new operation (clamped 0-5) |
-| OUROBOROS_MODEL_MAX_CONCURRENCY | 3 | Per-(model, route) concurrent provider-call cap (`model_concurrency.py`) |
+| OUROBOROS_MODEL_MAX_CONCURRENCY | 3 | Concurrent physical calls of one model on one provider route (credential, endpoint), shared by every process of the installation with a fair queue; routes the managed Claudexor engine serves are left to the engine (`model_concurrency.py`) |
 | OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC | 180 | Concurrency-slot wait bound |
 | OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC | 60 | Project-naming call ceiling |
 | OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC | 8 | Inline naming bound when a card becomes a project (`gateway/projects.py`) |
@@ -138,6 +139,8 @@ One row per key (`settings_defaults.py`). Env-only rows have no settings.json ca
 | OUROBOROS_ONBOARDING_COMPLETED_AT | "" | Onboarding completion fact; endpoint-authored, disk-only |
 | OUROBOROS_TASK_REVIEW_MODE | auto | Result review mode: `auto` forces nothing, `required` runs the host's result review at a root delivery with produced material, `off` refuses `review_change(subject="result")` (§6 Result review) |
 | OUROBOROS_SAFETY_MODE | full | Safety supervision mode; a fresh desktop wizard may author `light`; lowering is owner-guarded (§6 Safety and runtime mode) |
+| OUROBOROS_CONSCIOUSNESS_SAFETY_MODE | full | Coverage for consciousness work (own wakes, places, what they start); existing installs copy the saved Safety level once |
+| OUROBOROS_SAFETY_OWNER_RULES | (empty) | The owner's standing rules, read by the Safety Supervisor on every check; owner-only |
 | OUROBOROS_SAFETY_MAX_TOKENS | 2000 | Safety-check output budget |
 | OUROBOROS_SAFETY_CALL_TIMEOUT_SEC | 60 | Safety-check call ceiling |
 | OUROBOROS_WEBSEARCH_TIMEOUT_SEC | 480 | `web_search` ceiling |
@@ -161,8 +164,8 @@ One row per key (`settings_defaults.py`). Env-only rows have no settings.json ca
 | OUROBOROS_RUNTIME_MODE | advanced | Effective Access light/advanced/pro/cyber_pro, persisted as the next-boot value (§6 Safety and runtime mode) |
 | OUROBOROS_SKILLS_REPO_PATH | "" | Skills Repo Path: read in place as My folder (`my-folder`), even with a saved source list; removing that row clears this path. Other folders stay connected. |
 | MCP_ENABLED | false | MCP client toggle (§6 MCP and browser-facing external tools) |
-| MCP_SERVERS | [] | MCP server list; persisted in settings, never env-exported |
-| MCP_TOOL_TIMEOUT_SEC | 60 | Per-MCP-tool timeout |
+| MCP_SERVERS | [] | Saved, never env-exported; a change re-lists in the server |
+| MCP_TOOL_TIMEOUT_SEC | 60 | Per listing and tool call |
 | OUROBOROS_HUB_CATALOG_URL | `https://raw.githubusercontent.com/razzant/OuroborosHub/main/catalog.json` | Derives the two hub rows; a non-GitHub raw URL needs `OUROBOROS_SKILL_SOURCES` with the git address |
 | OUROBOROS_CLAWHUB_REGISTRY_URL | `https://clawhub.ai/api/v1` | ClawHub registry URL |
 | OUROBOROS_SKILL_SOURCES | "" | Skill source list (§13); empty = derived from the keys above, unwritten |
@@ -190,7 +193,7 @@ One row per key (`settings_defaults.py`). Env-only rows have no settings.json ca
 | USE_LOCAL_CONSCIOUSNESS | false | Route Consciousness locally |
 | USE_LOCAL_FALLBACK | false | Route fallback locally |
 | OUROBOROS_MAX_ROUNDS | unlimited | Optional total task round limit (hot-reloadable; a Presence turn keeps its own finite inline cap) |
-| OUROBOROS_TRANSIENT_RETRY_MAX | 6 | Same-model transient retry budget; pre-dispatch `transport_unavailable` is a separate task-bounded outer wait |
+| OUROBOROS_TRANSIENT_RETRY_MAX | 6 | Same-model transient retry budget |
 | OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC | 1800 | Skill lifecycle-lane timeout |
 | OUROBOROS_CLAUDEXOR_HARNESS_INSTALL_TIMEOUT_SEC | 300 | Harness install ceiling (kills the tracked group, typed refusal) |
 | OUROBOROS_CLAUDEXOR_QUOTA_REFRESH_TIMEOUT_SEC | 90 | Quota-refresh POST ceiling (clamped 1-90) |
@@ -217,7 +220,7 @@ One row per key (`settings_defaults.py`). Env-only rows have no settings.json ca
 
 The review pool is the enabled rows of `OUROBOROS_SUBAGENTS` marked `review_eligible: true` (Settings → Agents, the Reviewer mark; `reviewer_slot_config.review_pool_slots`, in the task's settings scope): one list for helpers and reviewers. Blocking seats every pool row on the commit panel, Advisory the named rows (with a reason); unmarked additions advise, never count. Effort and delivery are row properties: `effort` is the owner's pin, empty = Auto (`reviewer_slot_config.row_effort`: model name, else pin, else a wave's order clamped into the range, else its top); an API row's `delivery` is `native` (the default, the two-part brief with inspection tools) or `packet`, for a model positively known not to support tools (quota, timeouts, unknown capability or fallbacks never imply it); a session row always retrieves. Only sessions and managed-model API routes may pin `route.credential_profile_id` (empty = rotation). A marked row switched off leaves the pool silently; a row a call names (`review_change(reviewers=[…])`, `preflight_reviewer`, `/review`) that is off or unknown is refused (`catalog_review_row`), never rerouted. A pool with no reading row asks no seat the coupling question: under Blocking outside Cyber Pro every body commit ends `NOT_PERFORMED` until a reading row is marked or review is Advisory; Save only warns (`subagent_runtime.review_pool_save_warning`).
 
-Save, the wizard and the migration share one judge (`reviewer_slot_config.review_pool_save_error`): a malformed catalog refuses Save and every review surface; a catalog with rows but no mark saves only with the owner's explicit `allow_empty_review_pool`; an empty pool reviews on Main alone. A never-configured install (no catalog or lanes key: Docker or Colab without the wizard) mints its factory catalog over the environment-merged read at each read until saved, following a changed factory default. Reviewers (`subscription_install_presets.factory_review_rows`) follow the reachable Main: an OpenRouter Main (or no access yet) gets the three `OPENROUTER_REVIEW_DEFAULTS`, a MiniMax Main its Main, Light, Light (Direct-provider routes), any other Main one row in its whole route (quorum 1 of 1); a Main the access cannot run mints nothing, naming `OUROBOROS_MODEL`. The wizard's Auto helpers (`factory_actor_rows`) join only this cell. An operator's environment catalog (never our echo) wins over minted rows (`review_pool_migration.environment_overridable_keys`); a saved catalog, or rows minted from the owner's lanes, shadow it like any disk-authored key. A changed delivery changes the review-contract identity (a later review may be paid anew) but launches nothing.
+The generic Settings save, the owner Safety model endpoint, the wizard and the migration share one judge (`reviewer_slot_config.review_pool_save_error`; both settings endpoints use `review_pool_save_judgement` for changed catalogs): a malformed catalog refuses Save and every review surface; a catalog with rows but no mark saves only with the owner's explicit `allow_empty_review_pool`; an empty pool reviews on Main alone. A never-configured install (no catalog or lanes key: Docker or Colab without the wizard) mints its factory catalog over the environment-merged read at each read until saved, following a changed factory default. Reviewers (`subscription_install_presets.factory_review_rows`) follow the reachable Main: an OpenRouter Main (or no access yet) gets the three `OPENROUTER_REVIEW_DEFAULTS`, a MiniMax Main its Main, Light, Light (Direct-provider routes), any other Main one row in its whole route (quorum 1 of 1); a Main the access cannot run mints nothing, naming `OUROBOROS_MODEL`. The wizard's Auto helpers (`factory_actor_rows`) join only this cell. An operator's environment catalog (never our echo) wins over minted rows (`review_pool_migration.environment_overridable_keys`); a saved catalog, or rows minted from the owner's lanes, shadow it like any disk-authored key. A changed delivery changes the review-contract identity (a later review may be paid anew) but launches nothing.
 
 #### Direct-provider routes
 

@@ -231,8 +231,8 @@ def test_explicit_calendar_deadline_still_bounds_the_reviewer_wait(env, monkeypa
     assert len(f.model.calls) == 1, "an interrupted wait never re-sends"
 
 
-@pytest.mark.parametrize("stop", ["cancel", "settled_cancel", "panic"])
-def test_stop_panic_and_settled_cancellation_bind_the_operation(env, stop):
+@pytest.mark.parametrize("stop", ["cancel", "settled_cancel", "owner_restart"])
+def test_stop_restart_and_settled_cancellation_bind_the_operation(env, stop, monkeypatch):
     f = env
     with _parent(f) as parent:
         run_review_request(_request(), slots=[_slot()], drive_root=f.root, usage_ctx=f.ctx, llm=f.model)
@@ -246,10 +246,13 @@ def test_stop_panic_and_settled_cancellation_bind_the_operation(env, stop):
     elif stop == "settled_cancel":
         write_task_result(f.root, TASK, "cancelled")
     else:
-        (f.root / "state").mkdir(exist_ok=True)
-        (f.root / "state" / "panic_stop.flag").write_text("panic", encoding="utf-8")
+        from ouroboros import server_restart
+        import threading
+        monkeypatch.setattr(server_restart, "DATA_DIR", f.root)
+        monkeypatch.setattr(server_restart, "_OWNER_STOP_BEGAN", threading.Event())
+        server_restart._OWNER_STOP_BEGAN.set()
     until(lambda: operation.closed)
-    expected = "panic" if stop == "panic" else "cancelled"
+    expected = "owner_restart" if stop == "owner_restart" else "cancelled"
     assert operation.control() == expected
     resolved = [r for r in load_task_result(f.root, TASK)["model_waits"].values() if r["wait_id"] == row["wait_id"]]
     assert resolved[0]["resolution"] == expected and len(f.model.calls) == 1
@@ -358,6 +361,10 @@ def test_a_waiting_row_superseded_by_its_live_operation_is_not_forwarded(env):
 _REMOTE_OPERATION = r"""
 import json, os, sys, threading, time
 from types import SimpleNamespace
+# A real worker's multiprocessing parent is its supervisor, even when the
+# Windows venv launcher adds an intermediate OS parent.
+import multiprocessing
+multiprocessing.parent_process = lambda: SimpleNamespace(pid=int(sys.argv[5]))
 root, session, task, surface = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 from ouroboros import config, model_wait, process_custody, review_operation
 from ouroboros.llm_claudexor import ClaudexorModelError
@@ -521,7 +528,7 @@ def test_a_real_remote_operation_consumes_its_exact_decision_and_a_closed_one_is
     f = env
     monkeypatch.setattr(task_queue, "RUNNING", {})
     child = subprocess.Popen([sys.executable, "-c", _REMOTE_OPERATION, str(f.root), current_custody_session_id(), TASK,
-                              surface],
+                              surface, str(os.getpid())],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, cwd=os.getcwd())
     out, reader = _lines(child.stdout)
     executing = {}
@@ -649,7 +656,7 @@ def test_a_decision_the_remote_operation_applies_between_the_gateway_reads_is_it
 
     monkeypatch.setattr(review_operation._RemoteOperationController, "closed", property(racing))
     child = subprocess.Popen([sys.executable, "-c", _REMOTE_OPERATION, str(f.root), current_custody_session_id(), TASK,
-                              surface],
+                              surface, str(os.getpid())],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, cwd=os.getcwd())
     out, reader = _lines(child.stdout)
     executing = {}

@@ -162,6 +162,12 @@ def _hard_stop_check(ctx: Any) -> Callable[[], bool]:
 
     def stop() -> bool:
         reason = control.control_reason() if control is not None else None
+        if (getattr(ctx, "task_metadata", {}) or {}).get("wake_cause") == "focus":
+            from supervisor.consciousness_carriers import autonomous_work_enabled
+            from ouroboros.tool_access import canonical_data_root
+            task = {"id": ctx.task_id, "metadata": ctx.task_metadata}
+            if not autonomous_work_enabled(task, canonical_data_root(ctx)):
+                reason = "cancelled"
         if reason in HARD_STOPS:
             stop.reason = reason
         return bool(stop.reason)
@@ -682,16 +688,22 @@ def replay_envelope(drive_root: Path, task_id: str, identity: str) -> Any:
     if not initial or record.get("event_identity") != identity:
         return None
     presence = (stored.get("metadata") or {}).get("presence") or {}
-    return PresenceTurnResult(
+    from ouroboros.place_reply import project_reply
+    return project_reply(drive_root, stored.get("metadata") or {}, PresenceTurnResult(
         outcome=str(initial.get("outcome") or "deferred"), text=str(initial.get("text") or ""),
         task_id=physical, work_ref=str(initial.get("work_ref") or ""),
         delivery_reporting_version=int(presence.get("delivery_reporting_version") == 1),
         status="continuing", continuation_ref=physical, output_ref=str(initial.get("output_ref") or ""),
-        continuation_version=CONTINUATION_VERSION)
+        continuation_version=CONTINUATION_VERSION))
 
 
-def turn_response(result: Any, version: int) -> dict:
+def turn_response(result: Any, version: int, drive_root=None) -> dict:
     """The /presence/turn success body; version 0 keeps the legacy shape exactly."""
+    if drive_root is not None:
+        from ouroboros.place_reply import project_reply
+        from ouroboros.task_results import load_task_result
+        metadata = (load_task_result(drive_root, result.task_id) or {}).get("metadata") or {}
+        result = project_reply(drive_root, metadata, result)
     body = {"ok": True, "status": "completed", "outcome": result.outcome, "text": result.text,
             "turn_ref": result.task_id, "work_ref": result.work_ref,
             "delivery_reporting_version": getattr(result, "delivery_reporting_version", 0)}
@@ -719,12 +731,13 @@ def continuation_status(stored: Mapping[str, Any], drive_root: Path | None = Non
     return status
 
 
-def work_view(stored: Mapping[str, Any], ref: str) -> tuple[int, dict] | None:
+def work_view(stored: Mapping[str, Any], ref: str, drive_root=None) -> tuple[int, dict] | None:
     """The continuation poll of one Presence turn; None for any other work reference.
 
     Whether the author can still change it is decided by ``presence_recovery.retained_work_view``.
     """
     from ouroboros.presence_runner import presence_result_from_stored
+    from ouroboros.place_reply import project_output
 
     record = stored.get("presence_continuation")
     if not isinstance(record, dict) or not isinstance(record.get("initial"), dict):
@@ -732,12 +745,13 @@ def work_view(stored: Mapping[str, Any], ref: str) -> tuple[int, dict] | None:
     presence = (stored.get("metadata") or {}).get("presence") or {}
     common = {"ok": True, "work_ref": ref, "continuation_ref": ref, "continuation_version": CONTINUATION_VERSION,
               "child_work_ref": str(record.get("child_work_ref") or record["initial"].get("work_ref") or ""),
-              "outputs": [dict(row) for row in record.get("outputs") or [] if isinstance(row, dict)],
+              "outputs": [project_output(drive_root, stored.get("metadata") or {}, ref, row)
+                          for row in record.get("outputs") or [] if isinstance(row, dict)],
               "delivery_reporting_version": int(presence.get("delivery_reporting_version") == 1)}
     status = str(stored.get("status") or "")
     if status not in {"completed", "failed", "cancelled"}:
         return 202, {**common, "status": "pending"}
-    result = presence_result_from_stored(stored, ref)
+    result = presence_result_from_stored(stored, ref, drive_root)
     return 200, {**common, "status": status, "outcome": result.outcome, "text": result.text,
                  "output_ref": result.output_ref, "child_work_ref": result.work_ref or common["child_work_ref"]}
 

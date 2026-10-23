@@ -51,19 +51,20 @@ def test_real_directory_producer_recovers_owed_capture_under_each_existing_owner
     assert current.collection_pending is body.collection_pending and body.collection_pending(fresh)
     assert entry.run_id in current.runs(ctx.drive_root, "state=?", (current.HELD,))
     assert custody.open_runs(ctx.drive_root) == [], "financial open-runs semantics stay unchanged"
-    if owner == "body":
-        runtime = body.start_body_runtime(ctx.drive_root, gateway_factory=lambda: engine)
-        try:
-            _until(lambda: current.run(ctx.drive_root, entry.run_id).patch_captured)
-        finally:
-            runtime.close(wait=True)
-    elif owner == "task_exit":
-        assert custody.release_task_runs(ctx.drive_root, ctx.task_id, gateway_factory=lambda: engine)
-    else:
+    if owner == "task_exit":
+        assert custody.release_task_runs(ctx.drive_root, ctx.task_id, gateway_factory=lambda: engine) == []
+    elif owner == "orphan":
         assert custody.reconcile_orphaned_runs(ctx.drive_root, running_task_ids={ctx.task_id},
                                                gateway_factory=lambda: engine) == []
         assert custody.reconcile_orphaned_runs(ctx.drive_root, running_task_ids=set(),
-                                               gateway_factory=lambda: engine)
+                                               gateway_factory=lambda: engine) == []
+    assert not current.run(ctx.drive_root, entry.run_id).patch_captured
+    assert len(capture_reads) == 1, "control reconciliation leaves bulk collection to its owner"
+    runtime = body.start_body_runtime(ctx.drive_root, gateway_factory=lambda: engine)
+    try:
+        _until(lambda: current.run(ctx.drive_root, entry.run_id).patch_captured)
+    finally:
+        runtime.close(wait=True)
     fresh = current.run(ctx.drive_root, entry.run_id)
     assert fresh.patch_captured and not body.collection_pending(fresh)
     captured = body.capture_projection(ctx.drive_root, fresh)

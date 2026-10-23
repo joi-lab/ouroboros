@@ -77,8 +77,9 @@ next start. Later boots, Update, self-modification and Restart run on the volume
 removing and recreating the container keeps body, packages, data, work and
 `HOME`. Mount volumes at `/ouroboros` or at the four kind directories, never at
 the repository itself: bootstrap refuses a mount point without a checkout and
-moves nothing. A new image changes only the launcher and the seed for future first
-boots; a new Python, system package or browser build still needs a new image, and
+moves nothing. At exit 42, changed launcher helpers imported from `/app` hand off to the volume
+checkout, as at cold start; server-only changes keep the shell. A new image supplies
+the startup shell and seed for future first boots; a new Python, system package or browser build still needs a new image, and
 a venv created by another Python is refused untouched with the recovery step
 (move it aside; the next start prepares a fresh one). Git rollback restores code
 and its lock, not data or the exact package set.
