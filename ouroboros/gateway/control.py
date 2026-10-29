@@ -301,6 +301,9 @@ def rollback_through_door(target: str, *, door: str, request_restart: Callable[[
     from ouroboros.store_switch import switch_or_reset
 
     reason = _ROLLBACK_REASONS[door]
+    refusal = _index_lock_precondition()
+    if refusal is not None:
+        return refusal.status_code, json.loads(refusal.body)
     lock_fh, lock_error = _acquire_repo_mutation_lock()
     if lock_error is not None:
         return lock_error.status_code, json.loads(lock_error.body)
@@ -428,11 +431,24 @@ async def api_update_preflight(_request: Request) -> JSONResponse:
     can present the right staged choice (auto / assisted / manual)."""
     try:
         from supervisor.update_merge import plan_managed_update_merge
+        from ouroboros.update_impact import update_effects
 
         plan = await asyncio.to_thread(plan_managed_update_merge, fetch=True)
-        return JSONResponse({"merge_plan": plan})
+        effects = await asyncio.to_thread(update_effects, plan)
+        return JSONResponse({"merge_plan": plan, "effects": effects, **await _preflight_description(plan)})
     except Exception as exc:
         return json_exception(exc)
+
+
+async def _preflight_description(plan: dict) -> dict:
+    """Prose and qualification of exactly this plan's range; unavailable means unknown, never a refusal."""
+    from ouroboros.update_qualification import preflight_description
+
+    try:
+        return await asyncio.to_thread(preflight_description, plan)
+    except Exception:
+        log.warning("update preflight: range description unavailable", exc_info=True)
+        return {"letter": None, "qualification": None}
 
 
 _KNOWN_UPDATE_PLAN_KINDS = frozenset({"clean", "conflicting"})
@@ -458,6 +474,24 @@ def _pins_match(plan: dict, base_sha: str, target_sha: str) -> bool:
         and str(plan.get("base_sha") or "") == base_sha
         and str(plan.get("target_sha") or "") == target_sha
     )
+
+
+def _index_lock_precondition() -> JSONResponse | None:
+    from supervisor.git_ops_reset import observe_index_lock
+
+    try:
+        fact = observe_index_lock()
+    except (OSError, RuntimeError) as exc:
+        return JSONResponse({
+            "error": f"Not applied: could not check Git's index lock: {exc}. No work was stopped.",
+            "reason": "index_lock_check_failed", "outcome": "not_applied",
+        }, status_code=409)
+    if fact["exists"]:
+        return JSONResponse({
+            "error": f"Not applied: Git index lock exists at {fact['path']}. No work was stopped.",
+            "reason": "index_lock_present", "outcome": "not_applied", "index_lock": fact,
+        }, status_code=409)
+    return None
 
 
 def _quiesce_repo_writers(reason: str) -> list[str]:
@@ -593,14 +627,24 @@ def _fence_failure(blockers: list[str], stash_note: str = "") -> JSONResponse:
 
 
 def _rollback_fenced_update(reason: str, error: str, **extra: Any) -> JSONResponse:
-    from supervisor.update_merge import active_update_tx, mark_update_tx_gate_blocked, rollback_managed_update
+    from supervisor.update_merge import (
+        active_update_tx, mark_update_tx_gate_blocked, rollback_managed_update, write_update_tx, _rollback_target_unmet,
+    )
 
+    tx = active_update_tx()
+    failure = tx.get("git_failure") or {}
+    unapplied = bool(failure.get("before_tree_effects")) and not _rollback_target_unmet(
+        str(tx.get("pre_update_sha") or ""), str(tx.get("pre_update_branch") or ""))
+    if tx:
+        tx["rollback_error"] = error
+        write_update_tx(tx)
     update_progress.advance("rolling_back")
     ok, message = rollback_managed_update(reason)
     if ok:
         _respawn_workers_after_failed_update()
         return JSONResponse(
-            {"error": error, "rolled_back": True, "rollback": message, "stash_note": message, **extra},
+            {"error": error, "rolled_back": not unapplied, "outcome": "not_applied" if unapplied else "rolled_back",
+             "rollback": message, "stash_note": message, **extra},
             status_code=409,
         )
     if not active_update_tx().get("stash_restore"):
@@ -626,19 +670,25 @@ def _abandon_replace_refused_before_tree(tx: Dict[str, Any], exc: BaseException)
     no earlier tree step); the live tx must still be this attempt and HEAD its base. The rescue
     snapshot and keep branch made before the checkout stay and are reported by the caller.
     """
+    import subprocess
     from supervisor.git_ops import git_capture
     from supervisor.git_ops_reset import IndexLockRefusal, refusal_parts
-    from supervisor.update_merge import abandon_unapplied_replace, read_update_tx_strict
+    from supervisor.update_merge import abandon_unapplied_replace, read_update_tx_strict, write_update_tx
 
-    if not isinstance(exc, IndexLockRefusal) or not exc.before_tree_effects:
+    if not isinstance(exc, subprocess.CalledProcessError):
         return None
     status, live = read_update_tx_strict()
     if status != "valid" or live.get("phase") != "applying_replace" or live.get("attempt_id") != tx.get("attempt_id"):
         return None
+    cmd, detail = refusal_parts(exc)
+    before = isinstance(exc, IndexLockRefusal) and exc.before_tree_effects
+    live["git_failure"] = {"cmd": cmd, "stderr": detail, "returncode": exc.returncode, "before_tree_effects": before}
+    write_update_tx(live)
+    if not before:
+        return None
     rc_h, head, _error = git_capture(["git", "rev-parse", "--verify", "HEAD"])
     if rc_h != 0 or not head or head != str(live.get("pre_update_sha") or ""):
         return None
-    cmd, detail = refusal_parts(exc)
     return abandon_unapplied_replace(head, cause="index_lock_refused", attempt_id=str(live["attempt_id"]),
                                      cmd=cmd, stderr=detail)
 
@@ -1037,6 +1087,9 @@ def _apply_smart_update_fenced(
         release_update_lock,
     )
 
+    refusal = _index_lock_precondition()
+    if refusal is not None:
+        return refusal
     plan = plan_managed_update_merge(fetch=True, build=False)
     kind = str(plan.get("kind") or "")
     if not plan.get("available") or kind not in _KNOWN_UPDATE_PLAN_KINDS:
@@ -1180,6 +1233,9 @@ def _apply_replace_recovery_fenced(
         write_update_tx,
     )
 
+    refusal = _index_lock_precondition()
+    if refusal is not None:
+        return refusal
     plan = plan_managed_update_merge(fetch=True, build=False)
     if (
         str(plan.get("kind") or "") not in (_KNOWN_UPDATE_PLAN_KINDS | {"current"})

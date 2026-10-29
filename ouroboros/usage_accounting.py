@@ -495,6 +495,7 @@ def usage_breakdown(
     *,
     root_task_id: str = "",
     task_id: str = "", allow_stale: bool = False, include_owners: bool = False,
+    include_custody: bool = False, custody_root=None,
 ) -> Dict[str, Any]:
     """Physical-call/token/cost buckets of the global scope, one root or one
     task, read from the store's summaries in one transaction (an addressed
@@ -502,12 +503,27 @@ def usage_breakdown(
     the ``[epoch, seq]`` publication marker of the SAME read. The global
     per-task/per-root maps enumerate every owner and are rendered only with
     ``include_owners``. ``allow_stale`` is a display read: after the short
-    display wait it raises ``UsageLockUnavailable`` (unavailable, never zero)."""
+    display wait it raises ``UsageLockUnavailable`` (unavailable, never zero).
+    ``include_custody`` is for finality/display consumers only: observe execution
+    coverage first, then join receipts and amounts in this same money read.
+    Amount-only admission and pacing never read custody."""
     root = _drive_root(drive_root)
-    with usage_store.read(root, allow_stale=allow_stale) as txn:
-        result = breakdown_view(txn, root_task_id=root_task_id, task_id=task_id, include_owners=include_owners,
-                                degraded=usage_store.integrity_degraded(root))
-        result["_ledger_high_water_seq"] = txn.marker()
+    from ouroboros._usage_rows import breakdown_read
+    from ouroboros.delegate_custody_usage import cost_coverage, cost_snapshot, with_cost_coverage
+    custody = (cost_snapshot(root, task_id=task_id, root_task_id=root_task_id,
+                             custody_root=custody_root, allow_stale=allow_stale)
+               if include_custody and (task_id or root_task_id) else None)
+    with usage_store.read(root, allow_stale=allow_stale) as txn:  # rows captured here, rendered after it closed
+        render = breakdown_read(txn, root_task_id=root_task_id, task_id=task_id, include_owners=include_owners)
+        marker, joined = txn.marker(), (cost_coverage(custody, txn, root) if custody is not None else None)
+    result = render(usage_store.integrity_degraded(root))
+    result["_ledger_high_water_seq"] = marker
+    if joined is not None:
+        result = with_cost_coverage(result, joined)
+        result["by_task"] = {tid: with_cost_coverage(bucket, joined, task_id=tid)
+                             for tid, bucket in result["by_task"].items()}
+        result["by_root"] = {rid: with_cost_coverage(bucket, joined, root_task_id=rid)
+                             for rid, bucket in result["by_root"].items()}
     return result
 
 
@@ -869,8 +885,8 @@ def record_subscription_session(
     (total, cache read, cache write). It is validated here, the one place that
     persists it, and it is deliberately outside the idempotent identity: an
     engine that starts reporting it must not rewrite or duplicate a row already
-    settled without it. Unreported or unusable stays absent — the legacy
-    ``prompt_tokens``/``cached_tokens`` axes keep their own meanings.
+    settled without it. The input axes are that split, a direct call's meaning (unknown where it
+    is); the harness's own counters, of differing meanings, stay in ``harness_tokens``.
     """
     stable_id, route_id = str(session_id or "").strip(), str(route or "").strip()
     if not stable_id or not route_id:
@@ -878,7 +894,8 @@ def record_subscription_session(
     bound = _CURRENT_SCOPE.get() or UsageScope()
     root = _drive_root(drive_root or bound.drive_root)
     identity = hashlib.sha256(stable_id.encode("utf-8")).hexdigest()
-    attempt_id = f"session-{identity[:24]}"
+    from ouroboros.delegate_custody_usage import disclosed_cost, session_attempt_id
+    attempt_id = session_attempt_id(stable_id)
     from ouroboros.usage_admission import settlement_billing_fields
 
     # Explicit custody identities never inherit an unrelated caller's context.
@@ -886,6 +903,10 @@ def record_subscription_session(
     real_root = str(root_task_id or (bound.root_task_id if not task_id else "") or real_task)
     billing = settlement_billing_fields(root, real_task, real_root)
     input_counters = _normalized_input_token_usage(input_token_usage)
+    split = input_counters or {}
+    cost = provider_cost_value(spend_usd)
+    cash = disclosed_cost({"spendUsd": cost, "spendEstimated": spend_estimated}, attempt_execution=attempt_execution)
+    cost, spend_estimated = cash["cost_usd"], cash["cost_estimated"]
     attribution = {"review_skill": review_skill, "review_wave_id": review_wave_id, "review_slot_id": review_slot_id}
     row = {
         "kind": "subscription_session",
@@ -894,14 +915,18 @@ def record_subscription_session(
         "model": str(model or ""),
         "provider": route_id,
         # None is undisclosed; zero is genuinely free; estimated amounts are non-final.
-        "cost_usd": None if spend_usd is None else round(float(spend_usd), 6),
-        "cost_final": spend_usd is not None and not spend_estimated,
-        "reservation_upper_bound_usd": None if spend_usd is None else round(float(spend_usd), 6),
-        "pricing_known": spend_usd is not None,
-        "prompt_tokens": None if prompt_tokens is None else max(0, int(prompt_tokens)),
+        "cost_usd": None if cost is None else round(cost, 6),
+        "cost_final": cash["cost_final"],
+        "reservation_upper_bound_usd": None if cost is None or cash["cost_partial"] else round(cost, 6),
+        **({"cost_partial": True, "cost_estimated": spend_estimated} if cash["cost_partial"] else {}),
+        "pricing_known": cost is not None,
+        **({"cost_invalid": True} if spend_usd is not None and cost is None else {}),
+        "prompt_tokens": split.get("total_tokens"),
         "completion_tokens": None if completion_tokens is None else max(0, int(completion_tokens)),
-        # Cached tokens are a separate axis because harness semantics differ.
-        "cached_tokens": None if cached_tokens is None else max(0, int(cached_tokens)),
+        "cached_tokens": split.get("cache_read_tokens"),
+        "cache_write_tokens": split.get("cache_write_tokens"),
+        "harness_tokens": {name: None if value is None else max(0, int(value))
+                           for name, value in (("prompt_tokens", prompt_tokens), ("cached_tokens", cached_tokens))},
         "task_id": real_task,
         "root_task_id": real_root,
         **({"consciousness_cause": bound.consciousness_cause}
@@ -1237,7 +1262,9 @@ def _settlement_fields(reservation, usage, cost_usd, cost_final) -> Dict[str, An
     completion_tokens = _reported_token_count(normalized, "completion_tokens", "output_tokens")
     cached_tokens = _reported_token_count(normalized, "cached_tokens")
     cache_write_tokens = _reported_token_count(normalized, "cache_write_tokens")
-    cost = _number(cost_usd)
+    cost = provider_cost_value(cost_usd)
+    if cost_usd is not None and cost is None:
+        normalized["cost_invalid"] = True
     pricing_mode = observed_processing_mode(reservation.provider, normalized)
     has_usage = bool((prompt_tokens or 0) or (completion_tokens or 0))
     if cost is None and str(reservation.provider or "").lower() == "local":
@@ -1264,7 +1291,7 @@ def _settlement_fields(reservation, usage, cost_usd, cost_final) -> Dict[str, An
         cached_tokens=cached_tokens,
         cache_write_tokens=cache_write_tokens,
         prompt_cache_ttl=str(normalized.get("prompt_cache_ttl") or ""),
-        **{key: copy.deepcopy(normalized[key]) for key in ("effort", "effort_resolution", "processing", "speed", "service_tier", "cost_basis", "cost_evidence")
+        **{key: copy.deepcopy(normalized[key]) for key in ("effort", "effort_resolution", "processing", "speed", "service_tier", "cost_basis", "cost_evidence", "cost_invalid")
            if key in normalized},
     )
 

@@ -139,6 +139,7 @@ def test_no_clause_without_a_change_before_that_request(tmp_path):
 @pytest.mark.parametrize("kind,target", [("api_model", "openai/gpt-fixture"), ("agent_session", "codex=gpt-fixture")])
 @pytest.mark.parametrize("input_sources", ["shared", "declared"])
 def test_context_cache_facts(tmp_path, monkeypatch, kind, target, input_sources):
+    from ouroboros import maintenance
     from ouroboros.context import _capture_context_core
     from ouroboros.context_fit import _render_context_system_content
     from ouroboros.memory import Memory
@@ -165,6 +166,9 @@ def test_context_cache_facts(tmp_path, monkeypatch, kind, target, input_sources)
     publish(tmp_path, {"row_id": "worker", "row_identity": execution_identity(task["configured_subagent"]),
         "purpose": "execution", "producer_id": "fixture", "task_id": "task-one", "dispatched": True,
         "terminal": False, "answer_received": None, "usable_verdict": None})
+    pending, _, _ = capture()
+    assert '"stream":"pending"' in pending.dynamic_text
+    assert maintenance.run_job(tmp_path, "subagent_metrics")["state"] == "done"
     after, after_blocks, after_tools = capture()
     assert after.semi_stable_text.encode() == before.semi_stable_text.encode()
     assert json.dumps(after_blocks[:-1], sort_keys=True).encode() == json.dumps(before_blocks[:-1], sort_keys=True).encode()

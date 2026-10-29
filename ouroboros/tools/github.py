@@ -7,17 +7,21 @@ module owns the transport, the repository binding and the registration.
 ``GH_TARGET_INVALID`` / ``GH_TARGET_REQUIRED`` refusals enter the tool-result sidecar. A target
 or missing-CLI refusal raised before the invocation's first ``gh`` launch is published
 ``completed_no_effect``. The checks reader's literal ``gh api`` annotation path is the one
-subcall that does not take the explicit repo.
+subcall that does not take the explicit repo, alongside workflow literal API paths.
+Exact captures stream stdout to a capped file with size/sha256 and retain CRLF and final bytes;
+the cap bounds this destination, not gh internal downloads/cache. Stderr is drained and bounded.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import pathlib
 import re
 import subprocess
+import threading
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from functools import wraps
@@ -77,6 +81,17 @@ _PR_MERGE_REFUSAL_RE = re.compile(
 
 
 @dataclass(frozen=True)
+class GhCapture:
+    """The stdout bytes one exact-capture ``_gh_run`` wrote to its file, as written: no decoding, no strip."""
+    path: pathlib.Path
+    size: int
+    sha256: str
+    # The byte cap ended the read and the process; the file holds the first ``size`` bytes of a longer stream.
+    truncated: bool
+
+
+
+@dataclass(frozen=True)
 class GhResult:
     ok: bool
     text: str
@@ -85,14 +100,25 @@ class GhResult:
     # "target" is a local refusal and "deadline" a request the checks reader never sent;
     # neither is a subprocess exit or exception.
     failure: str
+    # The exact branch's capture; None for the text transport and for every failure.
+    capture: Optional[GhCapture] = None
+
+
+# One pipe read; stderr of an exact capture is kept up to this many bytes for classification. A stderr that
+# exceeds the cap is WITHHELD whole: any cut leaves a boundary a token can straddle, and redaction matches whole
+# values only, so no bounded tail is safe to show. The exit code stays; the HTTP status is then unknown.
+_CAPTURE_CHUNK = _CAPTURE_STDERR_CAP = 65536
+_CAPTURE_STDERR_WITHHELD = b"[stderr exceeded 64 KiB; diagnostics withheld]"
 
 
 def _merge_refused_before_effect(cmd: List[str], res: subprocess.CompletedProcess, stderr: str) -> bool:
     """Whether the complete stderr of the merge ``merge_receipts`` sends is gh's own pre-merge refusal.
 
-    Only ``pr merge N --METHOD --match-head-commit SHA [--repo R]``, exit 1 with empty
+    Only ``pr merge N --METHOD --match-head-commit SHA [--body-file -] [--repo R]``, exit 1 with empty
     stdout, the whole refusal for N and nothing else; a status, prefix or suffix proves nothing."""
     args = cmd[1:]
+    if args[6:8] == ["--body-file", "-"]:
+        args = args[:6] + args[8:]
     if (res.returncode != 1 or res.stdout.strip() or args[:2] != ["pr", "merge"] or len(args) not in (6, 8)
             or args[3] not in ("--merge", "--squash", "--rebase") or args[4] != "--match-head-commit"
             or args[6:7] not in ([], ["--repo"])):
@@ -102,6 +128,93 @@ def _merge_refused_before_effect(cmd: List[str], res: subprocess.CompletedProces
         return False
     return match["checkout"] is None or (len(args) == 6 and match["checkout"] == args[2]
                                          and match["action"] == ("rebase" if args[3] == "--rebase" else "merge"))
+
+
+def _exit_failure(cmd: List[str], res: subprocess.CompletedProcess, stderr: str) -> GhResult:
+    """Classify a nonzero exit from its complete stderr, then keep a bounded head.
+
+    Redact the WHOLE stderr first (a cut could split a token), read gh's own status marker before any
+    bounding, then keep a bounded head. gh writes the status in three deterministic shapes and nowhere
+    else: ``gh: <msg> (HTTP NNN)`` at the end of a line (``gh api`` with a message), ``gh: HTTP NNN``
+    (``gh api`` without one) and ``HTTP NNN: <msg> (<url>)`` — optionally wrapped as ``failed to fork:
+    HTTP NNN: …`` — from every other command. A marker quoted mid-sentence is prose, not a status.
+    HTTP status alone proves nothing about which CLI step failed."""
+    err = redact_known_values(stderr or "", [github_token_from_env_or_settings()])
+    status = _GH_STATUS_RE.search(err)
+    head = " | ".join([line.strip() for line in err.splitlines() if line.strip()][:3])
+    head = truncate_within_limit(head, 600)
+    return GhResult(False, "⚠️ GH_ERROR: " + head, res.returncode,
+                    int(status.group(1) or status.group(2)) if status else None,
+                    "pre_effect" if _merge_refused_before_effect(cmd, res, err) else "exit")
+
+
+
+def _capture_stdout(cmd: List[str], cwd: pathlib.Path, env: dict, timeout: int, path: pathlib.Path,
+                    max_bytes: int) -> tuple:
+    """Stream the process's stdout into ``path`` up to ``max_bytes``: (GhCapture, returncode, stderr, timed_out).
+
+    The cap stops stdout acquisition into our destination, not gh's internal network/cache work.
+    Stderr is drained on its own thread into a bounded buffer so neither pipe blocks the
+    other; the deadline kills the process from a timer. The file holds exactly the bytes hashed. The sink
+    is opened before the launch: an unwritable path fails here, never after a process started."""
+    sink = open(path, "wb")
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except BaseException:
+        sink.close()
+        raise
+    err_parts: List[bytes] = []
+    err_total = [0]
+    timed_out = [False]
+
+    def drain_stderr() -> None:
+        kept = 0
+        while True:
+            chunk = proc.stderr.read(_CAPTURE_CHUNK)
+            if not chunk:
+                return
+            err_total[0] += len(chunk)
+            if kept < _CAPTURE_STDERR_CAP:
+                err_parts.append(chunk[:_CAPTURE_STDERR_CAP - kept])
+                kept += len(err_parts[-1])
+
+    def expire() -> None:
+        timed_out[0] = True
+        proc.kill()
+
+    drain, timer = threading.Thread(target=drain_stderr, daemon=True), threading.Timer(timeout, expire)
+    digest, written, truncated = hashlib.sha256(), 0, False
+    try:
+        drain.start()
+        timer.start()
+        with sink:
+            while True:
+                chunk = proc.stdout.read(_CAPTURE_CHUNK)
+                if not chunk:
+                    break
+                keep = chunk[:max(0, max_bytes - written)]
+                if keep:
+                    sink.write(keep)
+                    digest.update(keep)
+                    written += len(keep)
+                if len(keep) < len(chunk):
+                    truncated = True
+                    proc.kill()
+                    break
+        proc.stdout.close()
+        returncode = proc.wait()
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        drain.join(timeout=5)
+        proc.stderr.close()
+    raw = _CAPTURE_STDERR_WITHHELD if err_total[0] > _CAPTURE_STDERR_CAP else b"".join(err_parts)
+    stderr = raw.decode("utf-8", errors="replace")
+    return GhCapture(path, written, digest.hexdigest(), truncated), returncode, stderr, timed_out[0]
+
 
 
 def _refuse(ctx: ToolContext, text: str, code: str = "TOOL_ARG_ERROR", *, no_effect: bool = False) -> str:
@@ -161,7 +274,8 @@ def github_cli_configured() -> bool:
 
 
 def _gh_run(args: List[str], ctx: ToolContext, timeout: int = 30, input_data: Optional[str] = None,
-            *, repo: object = _GENERIC_TRANSPORT) -> GhResult:
+            *, repo: object = _GENERIC_TRANSPORT, capture_to: Optional[pathlib.Path] = None,
+            max_bytes: int = 0) -> GhResult:
     # Only omitted internal API/Hub calls keep the generic transport contract.
     # Public repository tools always pass repo, including '' for Project focus.
     # The target refusals below publish a typed argument error into the calling
@@ -178,6 +292,8 @@ def _gh_run(args: List[str], ctx: ToolContext, timeout: int = 30, input_data: Op
                                          meta_updates={"operation_outcome": "completed_no_effect"})
         return GhResult(False, _publish_tool_result(ctx, typed) if typed else text, None, None, failure)
 
+    if capture_to is not None and (input_data is not None or type(max_bytes) is not int or max_bytes <= 0):
+        raise ValueError("an exact capture takes a positive max_bytes and no stdin")
     if repo is not _GENERIC_TRANSPORT and not isinstance(repo, str):
         return refused("", "target", ToolResult(
             status="error", code="TOOL_ARG_ERROR",
@@ -213,36 +329,37 @@ def _gh_run(args: List[str], ctx: ToolContext, timeout: int = 30, input_data: Op
                                "target")
             if workspace or room_dir or project:
                 env.pop("GH_REPO", None)  # Ambient defaults cannot replace the selected Project.
-            if repo and args[:1] != ["api"]:  # `gh api` has no --repo: its route names the repository.
-                cmd.extend(["--repo", repo])
+            if repo and args[:1] != ["api"]:  # API routes carry the repository.
+                if args[:2] == ["repo", "view"]:
+                    # `gh repo view [<repository>] [flags]` names its target positionally; its INHERITED FLAGS list
+                    # only --help (gh 2.101 help), so `--repo` would be an unknown flag. Every other subcommand
+                    # this module sends lists `-R, --repo [HOST/]OWNER/REPO`.
+                    cmd[3:3] = [repo]
+                else:
+                    cmd.extend(["--repo", repo])
         if submitted is not None:
             submitted[0] = True
+        if capture_to is not None:
+            capture, returncode, stderr, timed_out = _capture_stdout(cmd, cwd, env, timeout, capture_to, max_bytes)
+            if timed_out:
+                return GhResult(False, f"⚠️ GH_TIMEOUT: exceeded {timeout}s.", None, None, "timeout")
+            if capture.truncated:  # The cap ended the process; its exit says nothing about the command.
+                return GhResult(True, "", None, None, "", capture)
+            if returncode != 0:
+                return _exit_failure(cmd, subprocess.CompletedProcess(cmd, returncode, "", stderr), stderr)
+            return GhResult(True, "", returncode, None, "", capture)
         res = subprocess.run(
             cmd,
             cwd=str(cwd),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=timeout,
             input=input_data,
             env=env,
         )
         if res.returncode != 0:
-            # Redact the WHOLE stderr first (a cut could split a token), read gh's own
-            # status marker before any bounding, then keep a bounded head. gh writes the
-            # status in three deterministic shapes and nowhere else: ``gh: <msg> (HTTP NNN)``
-            # at the end of a line (``gh api`` with a message), ``gh: HTTP NNN`` (``gh api``
-            # without one) and ``HTTP NNN: <msg> (<url>)`` — optionally wrapped as
-            # ``failed to fork: HTTP NNN: …`` — from every other command. A marker quoted
-            # mid-sentence is prose, not a status.
-            err = redact_known_values(res.stderr or "", [github_token_from_env_or_settings()])
-            status = _GH_STATUS_RE.search(err)
-            head = " | ".join([line.strip() for line in err.splitlines() if line.strip()][:3])
-            head = truncate_within_limit(head, 600)
-            # Classified from the whole stderr, before the bounded head the receipt keeps.
-            # HTTP status alone proves nothing about which CLI step failed.
-            return GhResult(False, "⚠️ GH_ERROR: " + head, res.returncode,
-                            int(status.group(1) or status.group(2)) if status else None,
-                            "pre_effect" if _merge_refused_before_effect(cmd, res, err) else "exit")
+            return _exit_failure(cmd, res, res.stderr or "")
         return GhResult(True, res.stdout.strip(), res.returncode, None, "")
     except FileNotFoundError as e:
         missing = str(getattr(e, "filename", "") or "")
@@ -369,13 +486,35 @@ def _gh_graphql(ctx: ToolContext, document: str, variables: dict, *, repo: str, 
                    input_data=json.dumps({"query": document, "variables": values}))
 
 
+def _send_facts(res: GhResult) -> str:
+    """The facts of a failed gh send, never a verdict: gh's exit and HTTP status, a timeout, or a lost answer.
+
+    A nonzero exit alone does not prove GitHub rejected the request (gh can fail after the server acted), so
+    callers report the effect as unconfirmed and read it back instead of calling it refused."""
+    if res.failure in ("exit", "pre_effect"):
+        facts = ", ".join(filter(None, [f"exit {res.exit_code}" if res.exit_code is not None else "",
+                                        f"HTTP {res.http_status}" if res.http_status else ""]))
+        return f"ended with {facts or 'a nonzero exit'}: {res.text}"
+    if res.failure == "timeout":
+        return f"timed out: {res.text}"
+    return f"failed without an answer ({res.failure}): {res.text}"
+
+
+
 def _pr_merge(ctx: ToolContext, number: int, expected_head_sha: str, method: str,
               review_task_ids: Optional[List[str]] = None, reviewed_head_sha: str = "",
               reviewed_base_sha: str = "", review_scope: str = "full", review_verdict: str = "",
-              review_record_id: str = "", repo: str = "") -> str:
+              review_record_id: str = "", repo: str = "", checks: Optional[List[dict]] = None) -> str:
     """Thin transport binding; the receipt contract lives in ``merge_receipts``."""
     from ouroboros.merge_receipts import REVIEW_SCOPES, _VERDICT_RE, _sha, run_pr_merge
     from ouroboros.tool_access import canonical_data_root
+    from ouroboros.update_qualification import STATES
+
+    if checks is not None and (not isinstance(checks, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"].strip()
+            or row.get("status") not in STATES or not isinstance(row.get("detail", ""), str) for row in checks)):
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: checks need name, status (passed, failed, not_run, unknown) and optional detail.",
+                       no_effect=True)
 
     if review_scope not in REVIEW_SCOPES:
         return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: review_scope is full or delta; nothing was merged.", no_effect=True)
@@ -392,7 +531,7 @@ def _pr_merge(ctx: ToolContext, number: int, expected_head_sha: str, method: str
         ctx, lambda args, **kw: _gh_run(args, ctx, repo=repo, **kw), lambda args, **kw: _gh_run(args, ctx, **kw),
         drive_root=canonical_data_root(ctx), task_id=str(ctx.task_id or ""), number=int(number or 0),
         expected_head_sha=expected_head_sha, method=method,
-        review={"declared": declared, "task_ids": list(review_task_ids or []), "record_id": record_id})
+        review={"declared": declared, "task_ids": list(review_task_ids or []), "record_id": record_id, "checks": checks})
     if receipt.get("refused"):
         code = "TOOL_ARG_ERROR" if receipt["refused"] == "arguments" else "TOOL_ERROR"
         return _refuse(ctx, f"⚠️ PR_MERGE_REFUSED: {receipt['refused']} — {receipt.get('detail', '')}", code, no_effect=True)
@@ -479,6 +618,11 @@ def get_tools() -> List[ToolEntry]:
                 "number": {"type": "integer", "description": "PR number"},
                 "expected_head_sha": {"type": "string", "description": "The PR head you intend to merge; GitHub refuses if it moved"},
                 "method": {"type": "string", "enum": ["merge", "squash", "rebase"]},
+                "checks": {"type": "array", "description": "Execution declarations retained in the merge commit. Name full_battery and cost_contract explicitly; omissions stay unknown. Describe accepted FAILs and checks not run.",
+                           "items": {"type": "object", "properties": {
+                               "name": {"type": "string"},
+                               "status": {"type": "string", "enum": ["passed", "failed", "not_run", "unknown"]},
+                               "detail": {"type": "string"}}, "required": ["name", "status"]}},
                 "review_task_ids": {"type": "array", "items": {"type": "string"}, "default": [],
                                     "description": "Task ids of the reviews you rely on; the host records whether each "
                                                    "completed, not its kind or reviewed subject"},

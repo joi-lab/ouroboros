@@ -2279,7 +2279,6 @@ from supervisor.worker_promotion import (  # noqa: E402, F401 -- intentional pub
     _origin_from_mapping,
     _origin_from_task_record,
     _promote_duplicate_reason,
-    _promoted_force_plan_metadata,
     _report_binding_failure,
     ensure_project_scope,
     promote_chat_to_task,

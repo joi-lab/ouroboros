@@ -56,13 +56,76 @@ def _workers() -> int:
     return worker_budget(physical or os.cpu_count() or 1)
 
 
-def serial_shards(workers: int) -> int:
-    """How many serial groups may run at once: one per four workers, at most four.
+def serial_shards(workers: int, table: dict | None = None) -> int:
+    """How many serial groups may run at once.
 
-    Four cores or fewer keep ONE serial group, i.e. serial tests still never
-    overlap each other there — they only stop waiting for the parallel tests.
+    With recorded durations that split this system's test time (``serial``,
+    tests/ci_verdicts.py), the serial tests get the share of the workers their
+    share of the time needs: at least one group, at most half the workers. Without
+    them, one group per four workers, at most four. Either way three workers or
+    fewer keep ONE serial group, i.e. serial tests never overlap each other there —
+    they only stop waiting for the parallel tests.
     """
-    return max(1, min(_MAX_SERIAL_SHARDS, workers // 4))
+    share = _serial_share(table)
+    if share is None:
+        return max(1, min(_MAX_SERIAL_SHARDS, workers // 4))
+    return max(1, min(workers // 2, round(workers * share)))
+
+
+def _serial_share(table: dict | None) -> float | None:
+    """The serial part of this system's recorded test time, or None when the table does not say."""
+    from tests.ci_verdicts import platform_name
+
+    system = platform_name(sys.platform)
+    total = sum(((table or {}).get("platforms") or {}).get(system, {}).values())
+    serial = ((table or {}).get("serial") or {}).get(system)
+    return sum(serial.values()) / total if total and serial is not None else None
+
+
+def recorded_durations() -> tuple[dict | None, str]:
+    """The table serial groups are sized by, and what it is.
+
+    The run's ``OUROBOROS_CI_DURATIONS`` (the table tests/default_lane.py shards CI
+    by), else the one the newest earlier one-run battery beside this run's evidence
+    makes (``tests/ci_evidence.py durations`` over its pass). A battery that did not
+    end (interrupted, stopped at its deadline) is passed over: its reports favour the
+    serial groups, which are handed out first.
+    """
+    from tests.ci_verdicts import collect_durations, durations_table
+
+    table, why = durations_table()
+    if table is not None or why:
+        return table, why or f"run {table['source']['run_id']}"
+    current = os.environ.get("OUROBOROS_TEST_EVIDENCE_ROOT")
+    ended = []
+    for run in pathlib.Path(current).parent.glob("run-*") if current else ():
+        try:
+            recorded = (run / "pytest" / "overlapped" / "results.json").stat().st_mtime
+            if json.loads((run / "result.json").read_text(encoding="utf-8")).get("returncode") in (0, 1):
+                ended.append((recorded, run))
+        except (OSError, ValueError, AttributeError):
+            continue
+    if not ended:
+        return None, "no recorded durations"
+    run = max(ended)[1]
+    return collect_durations(run / "pytest", run_id=run.name, sha=""), f"the battery of {run.name}"
+
+
+def serial_plan(table: dict | None, source: str, workers: int, shards: int) -> str:
+    """The shard count's reason and, from recorded durations, each serial group's predicted seconds."""
+    from tests.ci_verdicts import platform_name, serial_group
+
+    if _serial_share(table) is None:
+        return f"{shards} serial groups of {workers} workers ({source})"
+    system, groups = platform_name(sys.platform), {}
+    for path, ms in table["serial"][system].items():
+        group = serial_group(path, shards)
+        groups[group] = groups.get(group, 0) + ms
+    serial, total = sum(groups.values()), sum(table["platforms"][system].values())
+    predicted = ", ".join(f"{group} {groups[group] / 1000:.0f}" for group in sorted(groups))
+    return (f"{shards} serial groups of {workers} workers, sized by {source}: serial {serial / 1000:.0f} of "
+            f"{total / 1000:.0f} test-s; predicted seconds per group: {predicted}; the other tests about "
+            f"{(total - serial) / 1000 / max(1, workers - shards):.0f} s per remaining worker")
 
 
 def _with(flags: list[str], option: str, value: str) -> list[str]:
@@ -81,10 +144,10 @@ def battery_commands(sequential: bool) -> list[tuple[str, list[str]]]:
             ("serial", [*base, "-m", f"serial and {LANE_EXCLUSION_EXPR}", *SERIAL_PASS_FLAGS]),
         ]
     overlapped = _with(PARALLEL_PASS_FLAGS, "--dist", "loadgroup")
-    return [(
-        "overlapped",
-        [*base, "-m", LANE_EXCLUSION_EXPR, *overlapped, f"--serial-shards={serial_shards(_workers())}"],
-    )]
+    workers, (table, source) = _workers(), recorded_durations()
+    shards = serial_shards(workers, table)
+    print(f"=== {serial_plan(table, source, workers, shards)}", flush=True)
+    return [("overlapped", [*base, "-m", LANE_EXCLUSION_EXPR, *overlapped, f"--serial-shards={shards}"])]
 
 
 def _run(label: str, argv: list[str], cwd: pathlib.Path) -> int:

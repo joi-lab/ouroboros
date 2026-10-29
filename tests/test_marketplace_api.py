@@ -293,10 +293,11 @@ def test_clawhub_fresh_install_rolls_back_payload_on_dependency_failure(monkeypa
 
 @pytest.mark.parametrize('basis', ['trusted', 'owner_skip'])
 @pytest.mark.parametrize('floor_ok', [False, True])
-def test_registry_acceptance_floor_precedes_package_execution(monkeypatch, tmp_path, basis, floor_ok):
+@pytest.mark.parametrize('mode', ['advanced', 'cyber_pro'])
+def test_registry_acceptance_floor_precedes_package_execution(monkeypatch, tmp_path, basis, floor_ok, mode):
     from ouroboros.skill_source_install import accept_and_turn_on
 
-    monkeypatch.setenv('OUROBOROS_RUNTIME_MODE', 'advanced')
+    monkeypatch.setenv('OUROBOROS_RUNTIME_MODE', mode)
     monkeypatch.setenv('OUROBOROS_SKILLS_REPO_PATH', '')
     storage = _patch_clawhub_install_pipeline(monkeypatch, tmp_path,
         auto_specs=[{'kind': 'pip', 'package': 'ddgs', 'bins': []}])

@@ -10,8 +10,10 @@ the owner-edit seam; turn-on-when-ready.
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
+import os
 import pathlib
 
 import pytest
@@ -30,6 +32,74 @@ def _skill(root: pathlib.Path, name: str = "probe", *, extra: str = "") -> pathl
 
 
 # --- the digest -----------------------------------------------------------------------
+
+
+@pytest.fixture
+def digest_memo(monkeypatch):
+    """A memo and device verdicts of this test's own (both are process-wide)."""
+    monkeypatch.setattr(si, "_DIGESTS", collections.OrderedDict())
+    monkeypatch.setattr(si, "_LOCAL_DEVICES", {})
+
+
+def _payload_opens(monkeypatch, skill: pathlib.Path) -> list:
+    opened, real = [], pathlib.Path.open
+    monkeypatch.setattr(pathlib.Path, "open", lambda self, *args, **kwargs: (
+        opened.append(self.name) if self.parent == skill else None) or real(self, *args, **kwargs))
+    return opened
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX change time; Windows hashes every time")
+def test_a_kept_digest_reads_no_payload_but_an_edit_that_restores_size_and_mtime_is_hashed_again(
+        tmp_path, monkeypatch, digest_memo):
+    """P3 at the payload: an unchanged file is not read again, and a same-size edit whose mtime is set back
+    (``utime``, ``touch -r``) still moves the change time, so the next digest reads the new bytes."""
+    from ouroboros.skill_loader import compute_content_hash
+
+    monkeypatch.setattr(si, "_RACY_NS", 0)  # keep a just-written file at once (the clock-tick guard has its own test)
+    skill = _skill(tmp_path / "external")
+    if (skill / "notes.md").stat().st_ctime_ns % 1_000_000_000 == 0:
+        pytest.skip("a whole-second filesystem clock: there only the clock-tick guard keeps the key exact")
+    first = compute_content_hash(skill)
+    opened = _payload_opens(monkeypatch, skill)
+    assert compute_content_hash(skill) == first and "notes.md" not in opened
+    info = (skill / "notes.md").stat()
+    (skill / "notes.md").write_text("BODY\n", encoding="utf-8")  # the same size
+    os.utime(skill / "notes.md", ns=(info.st_atime_ns, info.st_mtime_ns))
+    assert (skill / "notes.md").stat().st_mtime_ns == info.st_mtime_ns
+    opened.clear()  # the edit's own write
+    assert compute_content_hash(skill) != first and opened.count("notes.md") == 1
+
+
+def test_a_file_changed_within_a_clock_tick_of_its_hash_is_read_every_time(tmp_path, monkeypatch, digest_memo):
+    """A coarse filesystem clock (one second on HFS+ and ext3) can give a later write the same change time:
+    a file that changed within ``_RACY_NS`` of being hashed is never served from the memo; once its change
+    time lies further back, the digest is kept and the file is not read again."""
+    from ouroboros.skill_loader import compute_content_hash
+
+    skill = _skill(tmp_path / "external")
+    first = compute_content_hash(skill)
+    opened = _payload_opens(monkeypatch, skill)
+    assert compute_content_hash(skill) == first and "notes.md" in opened
+    if os.name != "nt":
+        monkeypatch.setattr(si, "_RACY_NS", 0)  # as if the change time were old enough
+        compute_content_hash(skill)
+        opened.clear()
+        assert compute_content_hash(skill) == first and "notes.md" not in opened
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows hashes every time anyway")
+def test_a_filesystem_the_store_does_not_call_local_is_hashed_every_time(tmp_path, monkeypatch, digest_memo):
+    """Network, FUSE and unknown filesystems may keep change times dishonestly (a client's attribute cache,
+    a userspace driver): there the memo is never consulted, however old the change time."""
+    from ouroboros import store
+    from ouroboros.skill_loader import compute_content_hash
+
+    monkeypatch.setattr(si, "_RACY_NS", 0)
+    monkeypatch.setattr(store, "_filesystem_type", lambda path: "nfs")
+    skill = _skill(tmp_path / "external")
+    first = compute_content_hash(skill)
+    opened = _payload_opens(monkeypatch, skill)
+    assert compute_content_hash(skill) == first and "notes.md" in opened
 
 
 @pytest.mark.parametrize("note,bucket", sorted(si.PER_INSTALL_NOTE_BUCKETS.items()))

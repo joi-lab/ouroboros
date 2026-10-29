@@ -734,7 +734,7 @@ def _integrate_payload_patch(
             "integrate_delegated_patch(decision='reject') to release the snapshot "
             "while keeping the patch artifact. Finalizing your task while this run is "
             "neither applied nor rejected leaves your custody audit unreconciled (Done "
-            "with warnings, reason delegated_custody_unreconciled). "
+            "with warnings, the run listed in delegated_runs_unreconciled beside your own reason). "
             f"Verdict: {verdict_path or '(unwritten)'}.")
     if result_hash and live_after != result_hash:
         try:
@@ -786,8 +786,8 @@ def _integrate_payload_patch(
             "to release the snapshot while keeping the patch artifact). The snapshot "
             "and the patch are preserved as forensic material. Finalizing your task "
             "while this run is neither applied nor rejected leaves your custody audit "
-            "unreconciled (the task completes as Done with warnings, reason "
-            f"delegated_custody_unreconciled). Verdict: {verdict_path or '(unwritten)'}.")
+            "unreconciled (the task completes as Done with warnings, the run listed in "
+            f"delegated_runs_unreconciled beside your own reason). Verdict: {verdict_path or '(unwritten)'}.")
     return _finalize_payload_apply(
         ctx, rid=rid, reason=reason, target=target, touched=touched,
         ordered=ordered, manifest=manifest, state_root=state_root,

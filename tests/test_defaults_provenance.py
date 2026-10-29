@@ -443,8 +443,7 @@ def test_environment_credentials_reach_the_factory_catalog_with_or_without_a_doc
     monkeypatch.setenv("OPENAI_API_KEY", "k")
     settings = cfg.load_settings()
     assert _pool_targets(settings) == [OPENAI[0]]
-    assert not install.exists() or json.loads(install.read_text()) == {
-        **document, "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE": "full"}, "only the one-time Safety upgrade writes"
+    assert not install.exists() or json.loads(install.read_text()) == document, "a settings read writes nothing"
 
 
 def test_a_never_configured_install_gets_the_wizards_auto_helpers_beside_unchanged_reviewers(install, monkeypatch):
@@ -638,7 +637,8 @@ def _catalog_fetch(settings, monkeypatch):
 
     sent = []
 
-    async def fetch(_client, provider, _label, api_key, base_url):
+    async def fetch(_client, provider, _label, api_key, base_url, *, record_image_input=False):
+        assert record_image_input is False
         sent.append((provider, api_key, base_url))
         return []
 

@@ -788,10 +788,10 @@ def kill_process_tree(proc: subprocess.Popen, *, exclude_pids: "set[int] | None"
 
 
 def terminate_process_tree(proc: subprocess.Popen) -> None:
-    """Gracefully terminate a subprocess and its process tree."""
-    if IS_WINDOWS:
+    """Gracefully terminate a subprocess and its process tree; a child in the caller's own group gets SIGTERM alone."""
+    if IS_WINDOWS or (pgid := process_group_id(proc.pid)) == current_process_group_id():
         proc.terminate()
-    elif pgid := process_group_id(proc.pid):
+    elif pgid:
         terminate_process_group_id(pgid)
 
 
@@ -943,8 +943,7 @@ def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None, *,
     """Caller selects retained subtrees; PID callers kill selectively, Popen also uses unspared groups."""
     if IS_WINDOWS and not exclude_pids:
         try:
-            _hidden_run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                        capture_output=True, timeout=10)
+            _hidden_run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=10)
         except Exception:
             pass
         return
@@ -952,7 +951,8 @@ def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None, *,
     targets, spared = _tree_kill_targets(pid, exclude_pids)
     if include_process_group and not IS_WINDOWS:
         pgid = process_group_id(pid)
-        if pgid > 0 and not any(process_group_id(p) == pgid for p in spared):
+        # A child left in the caller's own group dies by PID below: a killpg there would kill the caller (#2353).
+        if pgid > 0 and pgid != current_process_group_id() and not any(process_group_id(p) == pgid for p in spared):
             kill_process_group_id(pgid)
     for dpid in targets:
         force_kill_pid(dpid)

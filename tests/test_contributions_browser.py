@@ -332,13 +332,12 @@ def test_hold_all_starts_without_page_code_and_start_it_mounts_it_in_place(subsc
     assert page.evaluate("window.samePage") is True, "no reload: the held code starts in this page"
 
 
-def test_a_start_the_page_did_not_outlive_is_held_next_time_and_more_offers_no_reload_door(subscription_ui):
+def test_a_start_the_page_did_not_outlive_is_held_next_time_and_the_bar_offers_no_reload_door(subscription_ui):
     page, loaded, _posted = open_app(subscription_ui)
     page.wait_for_function("Array.isArray(window.voiceContext)")
-    page.locator(".chat-header-more > summary").click()
-    menu = page.locator(".chat-header-menu")
-    menu.get_by_role("button", name="Consciousness").wait_for()
-    assert menu.get_by_role("button", name="Restart without plugins").count() == 0
+    bar = page.locator("#page-chat .chat-page-header")
+    bar.locator('[data-chat-command="panic"]').wait_for()
+    assert bar.get_by_role("button", name="Restart without plugins").count() == 0
     # The entry a page that froze during the voice module's start leaves in the ledger.
     page.evaluate("""() => localStorage.setItem('ouroboros.holds', JSON.stringify({v: 1, entries: {
         'module:voice:tts': {reason: 'start', rev: 'r1', at: Date.now()}}}))""")

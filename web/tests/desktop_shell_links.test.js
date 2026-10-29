@@ -367,6 +367,7 @@ function toastDocument() {
         offsetTop: 0, offsetWidth: 0, offsetHeight: 0,
         setAttribute() {},
         removeAttribute() {},
+        hasAttribute: () => false,
         appendChild() {},
         addEventListener() {},
         remove() {},

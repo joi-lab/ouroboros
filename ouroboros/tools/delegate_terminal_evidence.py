@@ -57,7 +57,7 @@ def retry_terminal_result(ctx: ToolContext, run_id: str, *, gateway: Any = None)
     if status != custody.OWNED or entry is None or not predecessor:
         refusal, _ = _owned_run(ctx, "delegate_wait", run_id)
         return refusal or _fail("delegate_wait", "run_not_owned", "No retry result authority.")
-    retained = retained_terminal_result(ctx, run_id)
+    retained = retained_terminal_result(ctx, run_id, retry_money=True)
     if retained is not None:
         return delegate_result({**retained, "owner_task_id": predecessor,
             "result_reader_task_id": str(getattr(ctx, "task_id", "") or ""), "terminal_result_only": True})
@@ -377,7 +377,12 @@ def _reported_cost(summary: Dict[str, Any], *, attempt_execution: Any = None) ->
     fix was written to eliminate — so a run that really charged money settled honestly in
     the ledger and then told the reasoning path the work was free.
     """
-    spend, estimated = _delegate().custody.disclosed_spend(summary, attempt_execution=attempt_execution)
+    from ouroboros.delegate_custody_usage import disclosed_cost
+    cash = disclosed_cost(summary, attempt_execution=attempt_execution)
+    spend, estimated = cash["cost_usd"], cash["cost_estimated"]
+    if cash["cost_partial"] and spend is not None:
+        return {**cash, "note": "Tracked spend is a known subtotal; some attempts have no price. "
+                "The total cost is unknown, and the subtotal is not an upper bound."}
     if spend is None:
         return {
             "cost_usd": None,
@@ -552,7 +557,7 @@ def _delivered_terminal_payload(ctx: ToolContext, run_id: str, detail: Dict[str,
 def collect_and_deliver_terminal(ctx, rid, detail, authority, entry, gateway):
     """Join the body collection; deliver retained output independently of other duties."""
     from ouroboros import delegate_custody as custody
-    from ouroboros.delegate_collection import collect_terminal, observe_run, retained_payload, body_runtime, capture_projection
+    from ouroboros.delegate_collection import collect_terminal, observe_run, retained_payload, capture_projection, body_runtime
     from ouroboros.delegate_custody_current import run
 
     root = custody.custody_root(ctx)
@@ -583,14 +588,15 @@ def collect_and_deliver_terminal(ctx, rid, detail, authority, entry, gateway):
         _record_containment(ctx, entry, payload)
         return payload
     fresh = run(root, rid) or entry
-    if retained_payload(root, fresh) is None:
+    if not fresh.settled or retained_payload(root, fresh) is None:
+        from ouroboros.delegate_capture_attempt import GENERATION
+        runtime = body_runtime(root)
         collection = collect_terminal(root, rid, gateway=gateway,
                                       staging_task_id=str(getattr(ctx, "task_id", "") or ""),
-                                      output_authority=authority)
+                                      output_authority=authority, background=runtime is not None,
+                                      generation=runtime.runtime_id if runtime is not None else GENERATION,
+                                      output_retry=True)
     else:
-        runtime = body_runtime(root)
-        if runtime is not None:
-            runtime.request(rid)
         collection = {"status": "pending" if not fresh.settled else "retained",
                       "reason": "available_output"}
     entry = run(root, rid) or fresh
@@ -662,10 +668,10 @@ def _record_terminal_delivery(ctx, entry, payload):
         emit_retained(ctx, entry.run_id)
 
 
-def retained_terminal_result(ctx, run_id, *, complete_only=True):
+def retained_terminal_result(ctx, run_id, *, complete_only=True, retry_money=False):
     """Read exact owned bytes before transport; pending collection is a separate fact."""
     from ouroboros.delegate_custody_current import run
-    from ouroboros.delegate_collection import capture_projection, retained_payload, collection_pending, body_runtime
+    from ouroboros.delegate_collection import capture_projection, retained_payload, collection_pending, collect_terminal, body_runtime
     from ouroboros.delegate_shared import retry_result_status
     root = _delegate().custody.custody_root(ctx)
     entry = run(root, run_id)
@@ -677,12 +683,15 @@ def retained_terminal_result(ctx, run_id, *, complete_only=True):
     full = retained_payload(root, entry, require_complete=complete_only)
     if (full is None or full.get("run_id") != run_id or full.get("state") != entry.terminal_state):
         return None
+    if retry_money and not entry.settled:
+        from ouroboros.delegate_capture_attempt import GENERATION
+        runtime = body_runtime(root)
+        collect_terminal(root, run_id, output_retry=True, background=runtime is not None,
+                         generation=runtime.runtime_id if runtime is not None else GENERATION)
+        entry = run(root, run_id) or entry
     payload = _retained_terminal_payload(ctx, entry, full=full)
     if payload is not None:
         pending = collection_pending(entry, root)
-        runtime = body_runtime(root) if pending else None
-        if runtime is not None:
-            runtime.request(run_id)
         payload["current_observation"] = {"status": "retained", "basis": "retained_terminal_source"}
         payload["settlement"] = _settlement_projection(entry)
         payload["collection"] = {"status": "pending" if pending else "retained"}

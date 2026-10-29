@@ -46,6 +46,7 @@ _HOOK_FILE = "ouroboros/__init__.py"
 _REQUIRED_FILES = ("server.py", _HOOK_FILE, "ouroboros/body_switch.py")
 _DEPENDENCY_FILES = ("requirements-runtime.lock", "requirements.txt")
 _PENDING = ("authorized", "armed", "switching", "switched", "stuck")
+_NOT_ARMED = "not armed: "  # the exit tail's own record of the stop owners' blockers
 
 
 class AdoptionRefused(Exception):
@@ -358,7 +359,7 @@ def arm(data_dir: Any, *, worker_exits: Any, live_children: Any, owned_stop: Any
         directory = str(helper_dir(data_dir))
         if blockers:
             handoff["restart_bound"] = False
-            body_switch.record(directory, handoff, "authorized", "not armed: " + ", ".join(blockers))
+            body_switch.record(directory, handoff, "authorized", _NOT_ARMED + ", ".join(blockers))
             _log(data_dir, "body_adoption_not_armed", handoff, blockers=blockers)
             return "authorized"
         handoff["readers_evidence"] = {"worker_exits": census, "owned_stop": {
@@ -433,9 +434,11 @@ def finalize_on_boot(data_dir: Any, repo_dir: Any, *, supervisor_ready: bool,
         return {}
     cand = str(handoff.get("cand") or "")[:12]
     if phase == "authorized":  # found at boot: the generation that authorized it is gone
-        last = (handoff.get("events") or [{}])[-1].get("detail") or "the restart that carried it did not arm it"
+        # Only the exit tail's blockers explain it; the other events quote the caller's reason or mark the binding.
+        last = str((handoff.get("events") or [{}])[-1].get("detail") or "")
+        why = last if last.startswith(_NOT_ARMED) else "the adoption was not armed before this boot"
         _archive(data_dir, handoff, "abandoned:not_armed")
-        return {"outcome": "not_applied", "note": f"Adoption of {cand} was not applied ({last}). "
+        return {"outcome": "not_applied", "note": f"Adoption of {cand} was not applied ({why}). "
                                                   "The serving body is unchanged; the candidate is retained."}
     if phase == "abandoned":
         last = (handoff.get("events") or [{}])[-1].get("detail") or "unknown"

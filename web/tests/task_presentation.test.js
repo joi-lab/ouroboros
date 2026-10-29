@@ -483,8 +483,10 @@ test('nonterminal diagnostics stay visible facts but never promote the task', ()
     assert.match(chatSource, /showTaskIncidentToast\(msg\);/);
     const success = summarizeChatLiveEvent({ type: 'task_done', status: 'completed' });
     assert.deepEqual({ phase: success.phase, headline: success.headline }, { phase: 'done', headline: 'Done' });
-    assert.match(chatSource, /const shouldPromote = Boolean\(summary\.promote\) \|\| record\.finished;/);
-    assert.match(chatSource, /record\.updates > 1 \? record\.titleEl\.textContent : ''/);
+    // Retired with #1992: the `shouldPromote` switch and the `updates > 1` title carry-over
+    // are gone, because only an explicit name, a child's identity or authored narration
+    // titles a card (chat.js cardTitle). chat_headline_reconciliation.test.js pins the
+    // behaviour they guarded: these diagnostics stay rows and never retitle the card.
     // #1369: the status chip already says Working; no title or headline fallback repeats it.
     assert.doesNotMatch(chatSource, /\|\| 'Working\.\.\.'/);
     assert.doesNotMatch(logEventsSource, /headline = 'Working\.\.\.'|\|\| 'Working\.\.\.'/);

@@ -45,9 +45,9 @@ def open_runs(drive_root: Any, state: Optional[Dict[str, "RunCustody"]] = None) 
     """Runs with a durable start and no durable settlement (``state``: a shared
     pre-read snapshot, so a batch of audits pays one read; else the held rows)."""
     if state is None:
-        from ouroboros.delegate_custody_current import runs as current_runs
+        from ouroboros.delegate_custody_current import held_runs
 
-        state = current_runs(drive_root, "state=?", ("held",))
+        state = held_runs(drive_root)
     return [custody for custody in state.values() if not custody.settled]
 
 
@@ -183,7 +183,7 @@ def reconcile_task_runs(drive_root: Any, task_id: str, *,
     if not mine:
         return []
     from ouroboros.delegate_custody_current import task_snapshot
-    from ouroboros.delegate_custody_current import runs as current_runs
+    from ouroboros.delegate_custody_current import held_runs
 
     view = task_snapshot(drive_root, mine)  # one read; pending starts remain the admitted sweep's duty
     if run_ids is not None:
@@ -196,7 +196,7 @@ def reconcile_task_runs(drive_root: Any, task_id: str, *,
     # sweep tick); deferred registrations stay with the periodic sweep. A
     # project with ANY unsettled run is live; unsettled runs are held rows.
     owned = [r for r in view["runs"].values() if r.project_owned and r.project_id and r.settled]
-    live = ({r.project_id for r in current_runs(drive_root, "state=?", ("held",)).values() if r.project_id and r.run_id and not r.settled}
+    live = ({r.project_id for r in held_runs(drive_root).values() if r.project_id and r.run_id and not r.settled}
             if owned else set())
     owed = [r for r in owned if r.project_id not in live]
     if not held and not owed:
@@ -236,8 +236,8 @@ def reconcile_orphaned_runs(
     # replaying the custody log takes seconds, and a candidate exists ⇒ its owner was
     # registered earlier (admission takes ``_queue_lock`` before any spawn), so an owner
     # absent from the LATER snapshot is really gone rather than merely not yet admitted.
-    from ouroboros.delegate_custody_current import runs as current_runs
-    candidates = [c for c in current_runs(drive_root, "state=?", ("held",)).values()
+    from ouroboros.delegate_custody_current import held_runs
+    candidates = [c for c in held_runs(drive_root).values()
                   if not c.settled]  # settled collection debt belongs to the body's independent held-row reader
     # The class ONE STEP EARLIER (P34R.2): an invocation whose POST the daemon may have
     # accepted but whose worker died before record_started has no run row for the sweep
@@ -291,10 +291,10 @@ def _reconcile_each(drive_root: Any, runs: List[RunCustody],
     # Registration duty is real work only for a retire-ELIGIBLE project:
     # a deferred one must not spin the daemon up.
     from ouroboros.delegate_continuation import still_continuable
-    from ouroboros.delegate_custody_current import runs as current_runs
+    from ouroboros.delegate_custody_current import held_runs
 
     # Owned registrations and unsettled runs are HELD rows: one indexed read.
-    snapshot = list(current_runs(drive_root, "state=?", ("held",)).values())
+    snapshot = list(held_runs(drive_root).values())
     # Only a still-owned registration can be retired, so only its rows are asked
     # (each ask reads task results); one continuable row keeps the whole project.
     owned = {row.project_id for row in snapshot if row.project_owned and row.project_id}
@@ -388,12 +388,14 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
     task_id = str(record["task_id"])
     if _custody().review_owned_source(record.get("source")):
         return _retain_panel_invocation(drive_root, record)
-    body = record.get("request")
+    from ouroboros.delegate_pending import request_body
+    body = request_body(drive_root, record)
     if not isinstance(body, dict) or not body:
         result = {"invocation_id": invocation_id, "task_id": task_id,
                   "action": "invocation_retained", "reason": "invocation_request_unrecorded"}
         _custody().emit(drive_root, _custody().RECONCILED, result)
         return result
+    record = {**record, "request": body}
     from types import SimpleNamespace
 
     from ouroboros.owner_pause import OwnerPauseRefused, run_operation

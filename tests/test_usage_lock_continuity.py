@@ -272,9 +272,8 @@ def test_same_chain_preparation_stamp_claim_and_one_send(root, short_acquisition
              if item.get("data", {}).get("checkpoint_kind") == "usage_lock_wait"]
     assert [row["phase"] for row in waits] == ["entered", "ended"]
     from ouroboros.memory import Memory
-    summary = Memory(root).summarize_progress(waits)
-    assert "Waiting for accounting access" in summary
-    assert "Accounting wait ended" in summary
+    summary = Memory(root).summarize_progress(waits)  # the model reads the episode as one line
+    assert len(summary.splitlines()) == 1 and "Accounting wait ended · " in summary
 
 
 @pytest.mark.parametrize("reason", ["cancelled", "deadline", "finalize_requested"])

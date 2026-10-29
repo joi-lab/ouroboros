@@ -152,19 +152,6 @@ def _fail(tool: str, code: str, detail: str, **extra: Any) -> ToolResult:
 REFUSAL_FACT_KEYS = ("cause", "holder", "waited_sec", "retryable", "retry_hint")
 
 
-def lock_busy_facts(exc: BaseException) -> Dict[str, Any]:
-    """Typed facts when a HELD worktree ops lock refused a snapshot provision (#1241):
-    who holds it and for what (``subagent_worktrees.WorktreeOpsLockBusy``), so the
-    nanny can wait for that provision instead of guessing. ``{}`` for any other cause."""
-    holder = getattr(exc, "holder", None)
-    if not isinstance(exc, TimeoutError) or holder is None:
-        return {}
-    return {"cause": "lock_busy", "holder": dict(holder), "retryable": True,
-            "waited_sec": round(float(getattr(exc, "waited_sec", 0.0) or 0.0), 1),
-            "retry_hint": "Another snapshot is being provisioned under the shared worktree "
-                          "lock; wait for it (see holder) and retry delegate_start."}
-
-
 def _emit(ctx: ToolContext, kind: str, payload: Dict[str, Any]) -> bool:
     return custody.emit(custody.custody_root(ctx), kind, {
         "task_id": str(getattr(ctx, "task_id", "") or ""), **payload,
@@ -427,22 +414,14 @@ def orphan_disposition_status(
 
 
 def orphan_apply_target_ok(target: Any, active_root: Any) -> bool:
-    """May a disposition APPLY a run recorded against ``target`` from ``active_root``?
+    """Target geometry for a terminal owner's orphan, never write authority.
 
-    The nanny's own run still needs exact equality. An ORPHAN of a terminal
-    owner may additionally apply into a target NESTED inside the caller's
-    active root, provided BOTH live under ``get_subagent_projects_root()`` —
-    the host-minted project area. That is the aggregator shape the host itself
-    creates: a swarm fans into ``<project>/contributions/<track>`` clones of
-    the very tree the parent works in, and the host already checkpoint-commits
-    exactly those descendants (``coop_checkpoint._task_tree_coop_roots``), so
-    the widened set adds no tree the host was not already writing to. An
-    owner-attached folder never lives there, so this can never reach one.
-
-    ONE predicate for the apply gate, the health invariant, and the tool
-    description: a rule stated three ways drifts into three rules.
+    The recorded target may equal the active folder or lie inside configured
+    projects/worktrees roots, regardless of its creator. Own/retry keep equality
+    at their callers. Apply separately rechecks current write/Presence/body rights
+    through ``workspace_copies.copy_apply_refusal``; this predicate grants none.
     """
-    from ouroboros.config import get_subagent_projects_root
+    from ouroboros.config import get_subagent_projects_root, get_subagent_worktree_root
     from ouroboros.tool_access import path_is_relative_to
 
     try:
@@ -454,10 +433,8 @@ def orphan_apply_target_ok(target: Any, active_root: Any) -> bool:
         return False
     if target_path == root_path:
         return True
-    projects_root = pathlib.Path(get_subagent_projects_root()).expanduser().resolve(strict=False)
-    return (path_is_relative_to(target_path, root_path)
-            and path_is_relative_to(target_path, projects_root)
-            and path_is_relative_to(root_path, projects_root))
+    return any(path_is_relative_to(target_path, pathlib.Path(root()).expanduser().resolve(strict=False))
+               for root in (get_subagent_projects_root, get_subagent_worktree_root))
 
 
 def orphan_capture_read_target(

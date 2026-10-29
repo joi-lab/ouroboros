@@ -33,6 +33,9 @@ class Registry:
     def capability_omissions(self):
         return self.omissions
 
+    def callable_rows(self, namespace=""):
+        return [{"name": row["function"]["name"]} for row in self.current]
+
     def override_handler(self, name, handler):
         self.handlers[name] = handler
 
@@ -40,11 +43,18 @@ class Registry:
         return "not permitted"
 
 
+class OnDemand(Registry):
+    """Its extras stand for an unpinned MCP server: no task starts with their schemas."""
+
+    def on_demand_schema_names(self):
+        return frozenset(name for name in _names(self.current) if name.startswith("extra_"))
+
+
 def prepare(tmp_path, monkeypatch, *, frozen=None, current=None, mode="max", system_changed=True,
-            baseline=True, loaded=(), legacy=False, history=None):
+            baseline=True, loaded=(), legacy=False, history=None, registry_type=None):
     frozen = deepcopy(frozen if frozen is not None else [_schema("old")])
     current = deepcopy(current if current is not None else [_schema("new")])
-    registry = Registry(tmp_path, current, mode)
+    registry = (registry_type or Registry)(tmp_path, current, mode)  # a test may patch this module's Registry
     ctx = registry._ctx
     saved_messages = [{"role": "system", "content": "saved system"},
                       {"role": "user", "content": "continue"},
@@ -165,12 +175,10 @@ def test_history_check_is_after_the_route_ceiling(tmp_path, monkeypatch, enabled
     # Restore will restore this route too.
     prepared[1]["route"]["active_model"] = tools._ctx.active_model
     resident = restore(prepared)
-    if enabled:
-        assert len(resident) == 128 and tail in _names(resident)
-        assert not any("saved tool set was kept" in str(row.get("content")) for row in messages)
-    else:
-        assert resident == frozen
-        assert tail in messages[-1]["content"] and "after route fitting" in messages[-1]["content"]
+    # A name this task's history already called is kept first within the ceiling (#2332), enabled or not:
+    # the fitted set represents its history, so the current set is adopted.
+    assert len(resident) == 128 and tail in _names(resident)
+    assert not any("saved tool set was kept" in str(row.get("content")) for row in messages)
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -195,6 +203,28 @@ def test_ceiling_keeps_enabled_or_legacy_resident_without_inventing_intent(tmp_p
     assert "registered_later" in enabled and "registered_later" in _names(resident)
 
 
+def test_a_ceiling_never_forgets_a_selection_across_cold_resumes(tmp_path, monkeypatch):
+    catalog = _catalog(131)
+    extras = [name for name in _names(catalog) if name.startswith("extra_")]
+    revoked, chosen = extras[0], extras[-1]
+    current = [schema for schema in catalog if schema["function"]["name"] != revoked]
+    # Loaded on a roomy route; resumed on a route that carries 128 schemas at most.
+    first = prepare(tmp_path, monkeypatch, frozen=catalog, current=current, loaded=extras, registry_type=OnDemand)
+    tools, state, messages, _, enabled, _ = first
+    state["route"]["active_model"] = "openai::unseen-model"
+    resident = restore(first)
+    assert len(resident) == 128 and chosen not in _names(resident)
+    assert chosen in enabled and revoked not in enabled  # a ceiling keeps the choice; current policy drops a revoked tool
+    saved = owner_wait.continuation_state(tools._ctx, messages, {}, {}, 3, resident, set())
+    # The next process resumes on a roomy route and gets the choice back.
+    (tmp_path / "second").mkdir()
+    second = prepare(tmp_path / "second", monkeypatch, frozen=resident, current=current,
+                     loaded=saved["actor_loaded_tool_names"], registry_type=OnDemand)
+    second[1]["route"]["active_model"] = "anthropic::unseen"
+    names = _names(restore(second))
+    assert chosen in names and revoked not in names
+
+
 def test_nano_extras_use_current_definitions_and_current_policy(tmp_path, monkeypatch):
     extra = _schema("chosen")
     extra["function"]["description"] = "current contract"
@@ -206,7 +236,7 @@ def test_nano_extras_use_current_definitions_and_current_policy(tmp_path, monkey
     assert enabled == {"chosen"}
     assert "~changed chosen" in messages[-1]["content"]
     assert trace["continuation_tools"][0]["removed"] == ["forbidden"]
-    assert tools.handlers["enable_tools"](ctx=tools._ctx, tools="chosen").endswith("chosen (already active)")
+    assert tools.handlers["enable_tools"](ctx=tools._ctx, tools="chosen") == "Already loaded: chosen"
 
 
 @pytest.mark.parametrize("omissions", [False, True])

@@ -388,6 +388,7 @@ def test_tray_quit_closes_the_active_git_setup_loop(settings, monkeypatch):
                         ('_agent_proc', None), ('_agent_job', None), ('_webview_window', None),
                         ('DATA_DIR', settings.parent), ('acquire_pid_lock', lambda: True),
                         ('automatic_launch_allowed', lambda *a: True), ('Background', owner),
+                        ('paint_room', lambda window: None),  # the macOS leaf; this fake window has no events
                         ('check_git', lambda: False), ('stop_agent', lambda: events.append('ordinary stop'))):
         monkeypatch.setattr(launcher, name, value)
     launcher.main([])

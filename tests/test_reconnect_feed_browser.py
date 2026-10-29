@@ -161,6 +161,7 @@ def test_first_open_after_a_reload_says_only_restart_complete_and_only_once(room
         page.wait_for_function("() => !/[?&]_ouro_(reason|refresh)=/.test(location.search)")
         settle(page)
 
+    room_ui["errors"].watch(page)  # each reopen may cut off the page's own reads (tests/ui_console_errors.py)
     for reason in ("socket-disconnect", "sha-unknown", "ui-source"):
         reopen(reason)
         rw.capture(page, f"reconnect-feed-reload-{reason}")

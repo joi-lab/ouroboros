@@ -435,19 +435,28 @@ def pending_member_replay_safe(q: Any, member: Dict[str, Any]) -> Tuple[bool, st
 
 
 def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[str, Any]:
+    from ouroboros.owner_pause import paused_gap
+    from ouroboros.pause_notices import gap_fact
     from ouroboros.work_stop import resume_outcome
 
-    return resume_outcome(_resume_budget_paused_task(task_id, selected_by=selected_by))
+    gap = paused_gap(_queue_module().DRIVE_ROOT, task_id)  # read before this Resume ends that Pause
+    seen: List[Dict[str, str]] = []  # what this Resume's own census found; the Pause's record keeps its own
+    outcome = _resume_budget_paused_task(task_id, selected_by=selected_by, gaps=seen)
+    if seen:
+        gap = {"membership_gaps": gap_fact(seen, gap.get("membership_gaps"))}
+    return resume_outcome({**outcome, **gap} if outcome.get("ok") else outcome)
 
 
-def _resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[str, Any]:
+def _resume_budget_paused_task(task_id: str, *, selected_by: str = "",
+                               gaps: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
     """Explicitly resume one budget-paused task and, if needed, its root latch.
 
     A replay-safe ZERO-dispatch row is released as before. An EXACT
     continuation gets a single-use ``grant_exact_budget_resume``, never a rerun.
     A lifted root fence releases a held row only after recording its selection.
     ``selected_by`` names the MODEL-issued request (owner Q9); an empty value is
-    the owner's own act, which needs no root grant above itself.
+    the owner's own act, which needs no root grant above itself. ``gaps``
+    receives the damaged rows each door's owner-Pause tree census ties to no tree.
     """
     from ouroboros.control_actor import control_actor, observed_control_stop
     from ouroboros.work_stop import clear_refusal, release_refusal, selection_record
@@ -473,20 +482,20 @@ def _resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[s
         # a model's selection reach it here.
         from supervisor.budget_resume import resume_warm_owner_pause_root
 
-        warm = resume_warm_owner_pause_root(task_id, selected_by=selected_by)
+        warm = resume_warm_owner_pause_root(task_id, selected_by=selected_by, gaps=gaps)
         if warm is not None:
             return warm
     if located is None and not selected_by:
         from supervisor.owner_pause_resume import resume_terminal_tree
 
-        tree = resume_terminal_tree(task_id)
+        tree = resume_terminal_tree(task_id, gaps=gaps)
         if tree is not None:
             return tree
     if located is None and not selected_by:
         # An answered root's Pause: its deferred late review resumes, or nothing is left.
         from supervisor.budget_resume import resume_late_phase
 
-        late = resume_late_phase(task_id)
+        late = resume_late_phase(task_id, gaps=gaps)
         if late is not None:
             return late
     with q._queue_lock:
@@ -542,7 +551,7 @@ def _resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[s
             # Observe the existing whole-tree custody owner off the queue lock.
             try:
                 external["owner_pause_tree"] = {"fence": owner_fence, "blockers": action_writers(
-                    q, root_task_id, drive_root=result_root,
+                    q, root_task_id, drive_root=result_root, gaps=gaps,
                     owner_pause_fence_id=str(owner_fence.get("fence_id") or "") if fence_closed(owner_fence) else "")}
             except Exception as exc:
                 external["owner_pause_tree"] = {"error": str(exc)}
@@ -559,7 +568,7 @@ def _resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[s
 
             try:
                 observation["owner_pause_blockers"] = action_writers(
-                    q, root_id, drive_root=result_root, owner_pause_fence_id=str(owner_fence["fence_id"]))
+                    q, root_id, drive_root=result_root, owner_pause_fence_id=str(owner_fence["fence_id"]), gaps=gaps)
             except Exception as exc:
                 observation["owner_pause_blockers"] = [{"kind": "tree_census_unreadable", "detail": str(exc)[:200]}]
     with q._queue_lock:
@@ -1561,16 +1570,19 @@ def reconcile_terminal_task_projections(drive_root, task_id: str) -> None:
     except Exception:
         log.debug("owner_hurry terminal reconcile failed for %s", task_id, exc_info=True)
     try:
-        # #Q-2b structural expiry (owner decision 30=A): every still-open quiz
-        # dies with its author, and the already-rendered cards learn it live.
-        from ouroboros.owner_quiz import reconcile_terminal as quiz_reconcile
+        # The wait ends with its author; the unanswered card remains answerable.
+        from ouroboros.owner_quiz import reconcile_terminal as quiz_reconcile, quiz_states
 
         expired = quiz_reconcile(drive_root, str(task_id))
         if expired:
             from supervisor.message_bus import get_bridge
 
+            blocks = quiz_states(drive_root, str(task_id))
             for quiz_id in expired:
-                get_bridge().send_quiz_state(quiz_id, str(task_id), "expired_terminal")
+                block = blocks.get(quiz_id) or {}
+                get_bridge().send_quiz_state(quiz_id, str(task_id), "expired_terminal",
+                    chat_id=int(block.get("publication_chat_id", block.get("chat_id", 0)) or 0),
+                    wait_for_answer=False)
     except Exception:
         log.debug("owner_quiz terminal reconcile failed for %s", task_id, exc_info=True)
 

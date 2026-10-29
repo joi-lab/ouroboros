@@ -143,6 +143,8 @@ def list_changed_paths_from_git_status(
     include_sources_for_renames: bool = False,
 ) -> list[str]:
     """Return changed paths using NUL-delimited porcelain output."""
+    from ouroboros.git_observation import host_git_env
+
     path_args = (["--"] + list(paths)) if paths else []
     # --untracked-files=all: a repo-local status.showUntrackedFiles=no would
     # silently EMPTY the untracked half of every consumer (the restore
@@ -154,6 +156,7 @@ def list_changed_paths_from_git_status(
         cwd=repo_dir,
         capture_output=True,
         timeout=10,
+        env=host_git_env(),
     )
     if result.returncode != 0:
         err = (result.stderr or b"").decode("utf-8", errors="replace").strip()[:200]

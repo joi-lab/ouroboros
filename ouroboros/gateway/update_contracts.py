@@ -1,8 +1,6 @@
 """Core update flow envelopes: ``/api/update/preflight``, ``/api/update/apply`` (and the rollback
 refusal that shares its error shape) and the two update WS frames; re-exported by ``gateway/contracts.py``.
-The JSDoc twin stays in ``web/modules/api_types.js``."""
-
-from __future__ import annotations
+The JSDoc twin is ``web/modules/update_types.js``, re-exported by ``api_types.js``."""
 
 from typing import Any, Dict, List, Optional
 
@@ -41,6 +39,9 @@ class UpdatePreflightRequest(TypedDict, total=False):
 
 class UpdatePreflightResponse(TypedDict):
     merge_plan: UpdateMergePlan
+    effects: NotRequired[Dict[str, Any]]  # target-bound engine transition, active_work and interpreter facts
+    letter: NotRequired[Optional[Dict[str, Any]]]  # prose of exactly these pins; absent or null means unknown
+    qualification: NotRequired[Optional[Dict[str, Any]]]  # declared/observed checks of exactly these pins
 
 
 class UpdateApplyRequest(TypedDict):
@@ -62,6 +63,8 @@ class UpdateApplySuccessResponse(TypedDict):
 
 class UpdateApplyErrorResponse(TypedDict):
     error: str
+    outcome: NotRequired[Literal["not_applied", "rolled_back"]]
+    index_lock: NotRequired[Dict[str, Any]]  # effective path, exists, inode and size; never ownership
     reason: NotRequired[str]
     abandoned: NotRequired[bool]
     status: NotRequired[Dict[str, Any]]  # preparation observations, not the success discriminator

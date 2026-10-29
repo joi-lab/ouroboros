@@ -384,13 +384,9 @@ def test_band_presses_over_a_scrolled_transcript_are_the_title_bars(request, mon
     page.mouse.dblclick(point["x"], point["y"])
     facts["double"] = {"drags": drags(page), "clicks": page.evaluate("window.__transcriptClicks")}
     facts["header"] = page.evaluate(script(HEADER_CONTROLS))
-    if room == "main":
-        more = page.locator(f"{header} .chat-header-more")
-        more.locator("summary").click()
-        facts["more_opened"] = more.evaluate("el => el.open")
-        more.locator("summary").click()
-        assert facts["more_opened"]
-    else:
+    # Panic stands in every room's bar and takes a press there (a trial: nothing is stopped).
+    page.locator(f'{header} [data-chat-command="panic"]').click(trial=True)
+    if room == "project":
         page.locator("#project-panel-close").click(trial=True)
     facts["gutter"] = page.evaluate(script(GUTTER_FACTS), TOP)
     below = page.evaluate(script(BELOW_BAND))

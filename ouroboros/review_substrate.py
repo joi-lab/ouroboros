@@ -59,7 +59,8 @@ from ouroboros.usage_accounting import (
     last_physical_attempt_capture,
     usage_scope,
 )
-from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact
+from ouroboros.utils import sanitize_tool_result_for_log
+from ouroboros.utils import truncate_review_artifact  # noqa: F401 -- facade: review_verdict reads this at call time
 from ouroboros._outcome_receipts import disclosed_list_projection  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
 
 
@@ -594,7 +595,9 @@ class ReviewCoordinator:
                 request, actor, call_id, base_call_type, {"message": msg, "usage": usage})
             return actor
         except Exception as exc:
-            error_msg = truncate_review_artifact(str(exc), limit=4000)
+            # Preserve the complete safe cause before any presentation bound.
+            # A measurement after a long engine sentence must remain recoverable.
+            error_msg = sanitize_tool_result_for_log(str(exc))
             (
                 failure_custody, _capture_state, http_status,
                 operation_state, failure_code,
@@ -611,6 +614,7 @@ class ReviewCoordinator:
                 failure_code=failure_code,
                 reset_at=str(getattr(exc, "reset_at", "") or ""),
                 reported_cause=str(getattr(exc, "reported_cause", "") or ""),
+                failure_details=redact_projection(getattr(exc, "failure_details", {}) or {}).value,
                 http_status=http_status if isinstance(http_status, int) and http_status else None,
                 usage=failure_custody,
                 prompt_ref=prompt_ref,

@@ -250,7 +250,8 @@ def _contract_http_entry(token: str, shape: Any, public_paths: frozenset, names:
     entry: Dict[str, Any] = {
         "method": method, "path": path,
         "path_params": re.findall(r"\{([^}:]+)(?::[^}]*)?\}", path),
-        "auth": "public" if path in public_paths else "gate",
+        "auth": ("asset_lease" if path == "/api/widget-assets/{token}/{path:path}" else
+                 "public" if path in public_paths else "gate"),
         "typed": shape is not None,
     }
     if shape is None:

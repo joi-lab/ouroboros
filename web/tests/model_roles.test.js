@@ -117,9 +117,10 @@ test('an unloaded editor authors nothing and an API-only save does not create ro
     editor.destroy();
 });
 
-test('context Auto uses the exact advertised maximum, while manual values stay assertions', () => {
-    assert.match(modelContextNote({ context_window: 272000, max_context_window: 872000 }), /872,000.*advertised/);
-    assert.match(modelContextNote({ max_context_window: 872000 }, 1000000), /1,000,000.*set by you/);
+test('context note uses the server projection, never catalogue arithmetic', () => {
+    const text = 'window 400,000 total: set in Settings; server metadata says 272,000';
+    assert.equal(modelContextNote({ window: { text } }), text);
+    assert.match(modelContextNote({ context_window: 272000, max_context_window: 872000 }), /not known/);
     assert.match(modelContextNote(null), /not known/);
 });
 

@@ -22,7 +22,9 @@ that waits, its ``tails`` (what of its tree still runs, typed and worded as the
 owner's card says it, ``gateway/work_status.py``) -- and the dated authored
 focus of any root that has not settled.  The task result is read per row; the
 direct fragment carries a live turn's facts until that result exists; the open
-delegated runs are one custody read per roster.
+delegated runs are one custody read per roster.  A source a row's read could not
+open is named on that row (``unavailable``): the facts it holds are unknown at
+that read, never absent, and its queue facts stay.
 
 The 40-row cap is presentation only -- the addressability gate consults every
 row -- and the cut is disclosed in the note. A full initial note is followed
@@ -567,9 +569,11 @@ def independent_message_target(
 
 
 def _facts_fingerprint(row: Dict[str, Any]) -> str:
-    """Recorded names, start, origin, waits and tails: absolute values, so a heartbeat never churns them."""
+    """Recorded names, start, origin, waits and tails, and the sources this read could not open: absolute
+    values, so a heartbeat never churns them while a gap that moves to another row does."""
     facts = {key: row[key] for key in ("suggested_name", "started_at", "origin", "waiting", "tails", "open_questions",
-                                     "project_admission_hold", "recorded_status", "project_name") if row.get(key)}
+                                     "project_admission_hold", "recorded_status", "project_name", "unavailable")
+             if row.get(key)}
     return json.dumps(facts, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if facts else ""
 
 
@@ -590,6 +594,9 @@ _WAIT_LABELS = {"owner": "owner answer", "review": "review", "model": "model acc
                 "sleep": "sleep", "owner_pause": "owner Pause", "hold": "held", "unknown": "unknown wait"}
 _WAIT_DETAILS = ("quiz_id", "reason", "text", "by", "release", "role", "mode", "retained", "state", "settlement", "rail", "until",
                  "reset_at", "wake_at", "senders", "tasks", "runs", "services", "any_mail")
+# What a source this read could not open (``row["unavailable"]``) leaves unknown on its row, never absent.
+_UNAVAILABLE_MEANS = {"task_result": "its waits, open questions and settlement are unknown, not ended",
+                      "project": "its project binding is unknown"}
 
 
 def _detail_text(value: Any) -> str:
@@ -634,6 +641,10 @@ def render_roster_note(roster: Dict[str, Any], *, exclude: str = "") -> str:
             facts.append("origin=" + json.dumps(row["origin"], ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         if facts:
             lines.append("  " + " · ".join(facts))
+        if row.get("unavailable"):
+            lines.append("  unavailable at this read: " + "; ".join(
+                f"{source}={error} ({_UNAVAILABLE_MEANS.get(source, 'its facts are unknown')})"
+                for source, error in sorted(row["unavailable"].items())))
         if row.get("waiting"):
             lines.append("  waiting (recorded; the queue status above is unchanged): "
                          + "; ".join(_render_wait(wait) for wait in row["waiting"]))

@@ -90,6 +90,7 @@ def test_durations_sum_each_file_per_system_and_each_ui_node(tmp_path):
                 system="Linux", ui_browser={"full": [], "shard": [1, 8], "assigned": []})
     table = {"format": 1, "platforms": {"darwin": {"tests/test_m.py": 125}, "linux": {"tests/test_a.py": 500},
                                         "windows": {"tests/test_a.py": 4000, "tests/test_b.py": 0}},
+             "serial": {"windows": {"tests/test_a.py": 2000}},
              "source": {"run_id": RUN, "sha": SHA}, "ui_nodes": {"tests/test_ui.py::page[chromium]": 5000}}
     assert collect_durations(root, run_id=RUN, sha=SHA) == table
     out, payloads = tmp_path / "out" / "ci-durations.json", []
@@ -103,6 +104,19 @@ def test_durations_sum_each_file_per_system_and_each_ui_node(tmp_path):
     empty = subprocess.run(CLI + ["durations", "--evidence-root", str(tmp_path / "none"), "--run-id", RUN,
                                   "--sha", SHA, "--out", str(out)], capture_output=True, text=True, timeout=30)
     assert empty.returncode == 0 and "::warning::" in empty.stdout and _json(out)["platforms"] == {}
+
+
+def test_the_one_run_battery_records_the_time_of_its_serial_groups(tmp_path):
+    """scripts/run_tests.py's one-run battery (an ``overlapped`` pass) pins its serial tests to ``serial<N>``
+    xdist groups: their time is their file's serial part; a test in a file or class group is not serial."""
+    root = tmp_path / "evidence"
+    _projection(root / "run-1" / "pytest" / "overlapped", [
+        _row("tests/test_s.py::test_one@serial1", 2.0), _row("tests/test_s.py::test_one@serial1", 0.5, "teardown"),
+        _row("tests/test_p.py::test_two@tests/test_p.py", 1.0),
+        _row("tests/test_q.py::TestK::test_three@tests/test_q.py::TestK", 0.25)], system="Darwin")
+    table = collect_durations(root, run_id=RUN, sha=SHA)
+    assert table["platforms"] == {"darwin": {"tests/test_p.py": 1000, "tests/test_q.py": 250, "tests/test_s.py": 2500}}
+    assert table["serial"] == {"darwin": {"tests/test_s.py": 2500}}
 
 
 def test_file_weights_are_recorded_time_else_nodes_times_the_median_time_per_node(tmp_path, monkeypatch):
@@ -127,9 +141,11 @@ def test_file_weights_are_recorded_time_else_nodes_times_the_median_time_per_nod
      "the durations table has another shape"),
     ('{"format": 1, "source": {"run_id": "1"}, "platforms": {}, "ui_nodes": {"x": 1.5}}',
      "the durations table has another shape"),
+    ('{"format": 1, "source": {"run_id": "1"}, "platforms": {}, "serial": {"linux": {"tests/a.py": 1.5}}}',
+     "the durations table has another shape"),
     ('{"format": 1, "source": {"run_id": "1"}, "platforms": {}}',
      f"the durations of run 1 record no collected file on {SYSTEM}"),
-], ids=["missing", "garbage", "array", "format", "no-run", "negative", "float", "other-system"])
+], ids=["missing", "garbage", "array", "format", "no-run", "negative", "float", "serial-float", "other-system"])
 def test_an_unusable_table_falls_back_to_node_counts_and_says_why(tmp_path, monkeypatch, content, reason):
     path = tmp_path / "durations.json"
     if content is not None:

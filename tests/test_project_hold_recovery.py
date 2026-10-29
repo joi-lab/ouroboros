@@ -108,9 +108,21 @@ def test_same_id_recovers_once_with_original_resources_and_visible_wait(host, tm
     assert not sent[0].get("_project_admission_restore_hold") and not host.attempts
     assert not effective_task_result(host.root, load_task_result(host.root, "held"),
                                      materialize_artifacts=False)["project_admission_hold"]
-    write_task_result(host.root, "held", "completed", result="Done.")  # outside the queue: key absent
-    assert "project_admission_hold" not in effective_task_result(
-        host.root, load_task_result(host.root, "held"), materialize_artifacts=False)
+    # A Project task's completion without its artifact outcome is still finalizing, and
+    # while the queue lists it the overlay is the explicit empty hold.
+    write_task_result(host.root, "held", "completed", result="Done.")
+    finalizing = effective_task_result(host.root, load_task_result(host.root, "held"), materialize_artifacts=False)
+    assert (finalizing["status"], finalizing["artifact_status"], finalizing["child_status"]) == (
+        "running", "finalizing", "completed")
+    assert finalizing["project_admission_hold"] == {}
+    # Terminal artifact evidence settles the result even while the queue still lists it.
+    # This tests result finality, not the worker's separate queue-departure mechanism.
+    write_task_result(host.root, "held", "completed", result="Done.", artifact_status="ready_no_changes")
+    snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    assert "held" in {row.get("id") or row.get("task_id") for row in snap["running"]}
+    settled = effective_task_result(host.root, load_task_result(host.root, "held"), materialize_artifacts=False)
+    assert settled["status"] == "completed" and settled["artifact_status"] == "ready_no_changes"
+    assert "project_admission_hold" not in settled
 
 
 @pytest.mark.parametrize("guard", ["owner_hold", "budget_pause", "budget_root", "acceptance", "reservation",

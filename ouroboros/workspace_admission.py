@@ -336,7 +336,7 @@ def compose_workspace_block(
         f"workspace_root: {workspace_root}\n"
         f"workspace_mode: {workspace_mode or 'external'}\n"
         f"memory_mode: {memory_mode}\n"
-        "Use read_file, write_file, list_files, search_code, vcs_status, vcs_diff, and run_command against this target workspace, not the Ouroboros system repo.\n"
+        "Use read_file, write_file, list_files, search_code, vcs_read, and run_command against this target workspace, not the Ouroboros system repo.\n"
         f"{render_workspace_preflight_summary(workspace_preflight)}\n"
         "Before editing, account for target-repo docs or root-level instructions if present.\n"
         "Project-local dependency installs are allowed in external workspace tasks; system/global installs are for runtime_mode=pro or cyber_pro and must be noninteractive.\n"

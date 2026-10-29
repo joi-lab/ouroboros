@@ -1194,7 +1194,7 @@ test('Storage tray previews on its door, polls while listing, and shows the chec
     routes.set(storageUrl, response(storageBody()));
     start();
     await settle();
-    assert.match(storageTray(mount).textContent, /Copies the app already removes on its own/);
+    assert.match(storageTray(mount).textContent, /Copies and leftovers of finished work/);
     routes.set(previewUrl, (_url, init) => {
         assert.equal(init.method, 'POST');
         return response(freeBody('listing', { total: 2, groups: [freeGroup('work_folders', null)], started: true }), 202);

@@ -7,4 +7,4 @@
 > - Issues, pull requests, discussions and stars: https://github.com/razzant/ouroboros
 > - Website: https://ouroboros-agent.ai/
 
-This repository was the first public home of Ouroboros (the Google Colab version) and later a mirror of the official repository. After each stable release these branches are refreshed automatically: `main`, `ouroboros`, `ouroboros-stable`. They hold Ouroboros v7.8.0 (official commit 6f3ddff05); other branches are historical.
+This repository was the first public home of Ouroboros (the Google Colab version) and later a mirror of the official repository. After each stable release these branches are refreshed automatically: `main`, `ouroboros`, `ouroboros-stable`. They hold Ouroboros v7.9.0 (official commit 6b8a89802); other branches are historical.

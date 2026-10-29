@@ -354,26 +354,6 @@ def _finalize_blocked_review(
         return f"{combined_msg}\n\n---\n{warning}"
     return combined_msg
 
-_DOC_ONLY_EXTENSIONS = (".md", ".txt", ".rst")
-
-
-def _diff_is_doc_only(staged_paths: List[str]) -> bool:
-    """Return True only for docs outside tests; JSON/config keep preflight."""
-    if not staged_paths:
-        return False
-    saw_any = False
-    for raw in staged_paths:
-        p = str(raw).strip()
-        if not p:
-            continue
-        saw_any = True
-        if p.startswith("tests/") or "/tests/" in p:
-            return False
-        if not p.lower().endswith(_git()._DOC_ONLY_EXTENSIONS):
-            return False
-    return saw_any
-
-
 def _review_cycle_infra_failure(
     ctx: ToolContext,
     commit_message: str,
@@ -562,7 +542,7 @@ def _reset_commit_review_state(ctx):
     ctx._commit_review_status = "unknown"
     ctx._commit_preflight = None
     ctx._commit_review_panel = None
-    ctx._preflight_execution = None
+    ctx._preflight_execution, ctx._review_since = None, ""
     ctx._review_detached_operations = []  # what THIS call's author left (``review_pause.watch_left_review``)
 
 
@@ -702,7 +682,11 @@ def _reviewed_stage_cycle(
         preflight = bind_author_commit_candidate(ctx, commit_message, pre_fingerprint)
         if preflight:
             from ouroboros.commit_admission import preflight_evidence_unavailable
-            return {"status": "blocked", "message": preflight, "block_reason": "infra_failure" if preflight_evidence_unavailable(preflight) else "preflight"}
+            from ouroboros.tools.review import _handle_review_block_or_warning
+
+            ctx._last_review_block_reason = "infra_failure" if preflight_evidence_unavailable(preflight) else "preflight"
+            if refusal := _handle_review_block_or_warning(ctx, True, preflight, ""):
+                return {"status": "blocked", "message": refusal, "block_reason": ctx._last_review_block_reason}
         advisory_replay = {"advisory_replay": "Explicit current-author continuation; original reviewer facts retained.", "replay_reason": "author_finish"}
     if gate_outcome is not None:
         if "advisory_replay" in gate_outcome:
@@ -756,7 +740,7 @@ def _reviewed_stage_cycle(
             skip_advisory_pre_review=skip_advisory_pre_review,
             skip_tests=skip_tests,
             review_rebuttal=review_rebuttal,
-            goal=goal, scope=scope,
+            goal=goal, scope=scope, review_only=review_only,
         )
     if preflight_gate_outcome is not None:
         _release_review_evidence_if_settled(ctx)

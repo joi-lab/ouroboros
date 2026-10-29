@@ -53,7 +53,7 @@ if str(REPO) not in sys.path:  # -I leaves the checkout off sys.path.
     sys.path.insert(0, str(REPO))
 
 from tests import ci_accepted  # noqa: E402  -- stdlib only, as is:
-from tests.ci_verdicts import final, journal_rows, valid  # noqa: E402
+from tests.ci_verdicts import attempt_text, final, journal_rows, valid  # noqa: E402
 
 MAX_ROUNDS = 10  # A backstop below the step's own deadline: a pass that needs more ends red, naming the rest.
 _PASSING = frozenset({"green", "flaky", "accepted"})
@@ -78,6 +78,9 @@ _VALUED = frozenset({
 _DROPPED = frozenset({"--default-suite-shard", "--ui-browser-shard", "--session-timeout",
                       "--default-suite-manifest", "--require-ui-browser"})
 _JUNIT = ("--junitxml", "--junit-xml")
+# A dead worker's own facts on its crash row (tests/ci_evidence.py): its gateway and, only for the record
+# that worker's pytest-timeout callback left, the timeout. An attempt carries them; nothing here infers one.
+_CRASH_FACTS = ("worker", "timeout_callback_seconds")
 
 
 def _say(line: str) -> None:
@@ -211,7 +214,8 @@ def _outcomes(rows) -> dict[str, dict]:
         if row["outcome"] == "failed":
             if held is None or held["outcome"] != "failed":
                 outcomes[node] = {"outcome": "failed", "phase": row["phase"],
-                                  "error_type": str(row.get("error_type") or "")}
+                                  "error_type": str(row.get("error_type") or ""),
+                                  **{key: row[key] for key in _CRASH_FACTS if key in row}}
         elif row["outcome"] == "skipped":
             if held is None or held["outcome"] == "passed":
                 outcomes[node] = {"outcome": "skipped", "phase": row["phase"], "error_type": "Skipped"}
@@ -295,7 +299,8 @@ def _accept(nodes: list[str], path: Path) -> list[dict]:
 
 
 def _shown(attempt: dict) -> dict:
-    return {"phase": attempt["phase"], "error_type": attempt["error_type"]}
+    return {"phase": attempt["phase"], "error_type": attempt["error_type"],
+            **{key: attempt[key] for key in _CRASH_FACTS if key in attempt}}
 
 
 def decide(directory: Path, rounds: list[dict], tries: dict[str, list], assigned, collection: set[str],
@@ -419,10 +424,9 @@ def _report(verdict: dict) -> None:
          + f", continued {verdict['continued']}")
     issues = {row["nodeid"]: row["issue"] for row in verdict["accepted"]}
     for row in verdict["flaky"]:
-        _say(f"FLAKY {row['nodeid']} (first: {row['first']['phase']}, {row['first']['error_type']})")
+        _say(f"FLAKY {row['nodeid']} (first: {attempt_text(row['first'])})")
     for row in verdict["failed"]:
-        tries = "; ".join(", ".join(filter(None, (attempt["phase"], attempt["error_type"])))
-                          for attempt in row["attempts"])
+        tries = "; ".join(attempt_text(attempt) for attempt in row["attempts"])
         _say(f"{'ACCEPTED #' + str(issues[row['nodeid']]) if row['nodeid'] in issues else 'FAILED'} "
              f"{row['nodeid']} ({tries})")
     for node in verdict["not_run"]:

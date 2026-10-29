@@ -325,6 +325,8 @@ def record_asked(
     host_facts: str = "",
     materials: Optional[List[Dict[str, Any]]] = None,
     reply_to: Optional[Dict[str, Any]] = None,
+    presence_contact: Optional[Dict[str, Any]] = None,
+    request_fingerprint: str = "",
 ) -> Dict[str, Any]:
     """Worker-side projection write at ask time.
 
@@ -364,12 +366,18 @@ def record_asked(
         **({"host_facts": str(host_facts)} if str(host_facts or "") else {}),
         **({"materials": [dict(ref) for ref in materials]} if materials else {}),
         **({"reply_to": reply_to} if reply_to else {}),
+        **({"presence_contact": dict(presence_contact)} if presence_contact else {}),
+        **({"request_fingerprint": request_fingerprint} if request_fingerprint else {}),
     }
 
     refused: Dict[str, str] = {}
 
     def _mutator(quizzes: Dict[str, Dict[str, Any]]) -> Any:
-        if str(quiz_id) in quizzes:
+        if prior := quizzes.get(str(quiz_id)):
+            if request_fingerprint and prior.get("request_fingerprint") != request_fingerprint:
+                refused["reason"] = "request_id_conflict"
+            elif wait_for_answer and prior.get("wait_ended_at") and prior.get("state") == STATE_OPEN:
+                refused["reason"] = "wait_ended"
             return _KEEP  # asked once; a redelivery never resets an answer
         open_count = sum(
             1 for row in quizzes.values()
@@ -566,10 +574,10 @@ def record_answered(
     task itself received. First-wins is untouched — an already ``answered``
     block stays a refusal on any other ``request_id``.
 
-    ``wait_for_answer`` stays on the answered block on purpose: the answer
-    frame (``gateway.task_decision._quiz_answer_frame``) reads it to say the
-    task was waiting rather than proceeding under its assumption, and every
-    surface settles the card on ``answered`` regardless of wait facts.
+    The answer frame keeps a required wait distinct from proceeding under an
+    assumption. Terminal reconciliation retires the live flag, so its matching
+    wait-ended/reconciled stamps preserve that distinction for late answers.
+    Every surface settles the card on ``answered`` regardless of wait facts.
 
     Returns ``{"ok", "state", "duplicate", "error", "block"}``:
     - unknown quiz_id → ``error="quiz_not_found"``;
@@ -662,6 +670,8 @@ def reconcile_terminal(drive_root: Any, task_id: str) -> List[str]:
             state = str(block.get("state") or STATE_OPEN)
             if state == STATE_OPEN:
                 block.update({"state": STATE_EXPIRED_TERMINAL, "reconciled_at": stamp})
+                if block.pop("wait_for_answer", None):
+                    block.setdefault("wait_ended_at", stamp)
                 expired.append(str(key))
                 terminal_quizzes.append(str(key))
             elif state in (STATE_EXPIRED_TERMINAL, STATE_ANSWERED, STATE_CLOSED):
@@ -751,12 +761,17 @@ def quiz_answer_frame(
         lines.append(f"The owner chose option {option_index + 1}: {label}")
         if comment:
             lines.append(f"Owner comment (verbatim): {comment}")
-    if str(block.get("assumption") or "") and not block.get("wait_for_answer"):
+    ended_at_terminal = bool(block.get("wait_ended_at")) and (
+        block.get("wait_ended_at") == block.get("reconciled_at")
+    )
+    if (str(block.get("assumption") or "") and not block.get("wait_for_answer")
+            and not ended_at_terminal):
         lines.append(
             f"You continued under the assumption: {block.get('assumption')} — "
             "judge yourself whether work has moved past the answered fork."
         )
-    return "\n".join(lines)
+    from ouroboros.presence_owner_contact import answer_source_context
+    return "\n".join(lines) + answer_source_context(block)
 
 
 def recorded_answer_frame(block: Dict[str, Any]) -> str:
@@ -814,9 +829,9 @@ def late_answer_model_text(drive_root: Any, late_answer: Any, owner_text: str) -
     The owner's chat row carries only their own words; the receiving model
     needs the card they answered. Its first line names the asking task, which
     had finished (a late answer is only accepted after it did; TZ-2 B3); the
-    frame is rebuilt from the stored block on the canonical ``drive_root`` (the
-    same projection the ingress recorded). After discharged lifecycle GC, the
-    accepted message's matching host-written snapshot supplies the same frame.
+    frame uses the accepted message's matching host-written snapshot, including
+    its delivery-time source-work facts. Legacy messages without that snapshot
+    read the canonical block on ``drive_root``.
     When neither authority can be read, the owner's words are delivered with
     one host line saying so — disclosed, never a silent loss of the card's
     context. A message with no valid ``late_answer`` provenance is returned
@@ -824,14 +839,16 @@ def late_answer_model_text(drive_root: Any, late_answer: Any, owner_text: str) -
     ref = late_answer_ref(late_answer)
     if ref is None:
         return owner_text
-    block: Dict[str, Any] = {}
-    try:
-        block = quiz_states(drive_root, ref["task_id"]).get(ref["quiz_id"]) or {}
-    except Exception:
-        block = {}
+    snapshot = ref.get("answer_snapshot")
+    # The accepted message freezes the answer AND delivery-time source-work
+    # facts. The older ask block cannot replace its later promoted-work link.
+    block = dict(snapshot["quiz"]) if isinstance(snapshot, dict) else {}
     if not block:
-        snapshot = ref.get("answer_snapshot")
-        block = dict(snapshot["quiz"]) if isinstance(snapshot, dict) else {}
+        try:
+            block = quiz_states(drive_root, ref["task_id"]).get(ref["quiz_id"]) or {}
+        except Exception:
+            # Legacy intake still delivers the owner's words with the gap below.
+            block = {}
     state = "which had finished" if block.get("answered_after_terminal") or block.get("delivery_after_terminal") else "which is not reading"
     head = f"[Late answer to a question asked by task {ref['task_id']}, {state}]\n"
     if isinstance(block, dict) and str(block.get("state") or "") == STATE_ANSWERED:

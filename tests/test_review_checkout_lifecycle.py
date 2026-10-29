@@ -215,7 +215,7 @@ def test_a_late_capture_of_an_old_turn_never_touches_the_newer_turn(tmp_path, mo
     late = rc.capture_seat_evidence(root, TASK, "turn-1")
     assert late["status"] == "retained"
     assert (area / "turn-2.log").read_bytes() == b"newer turn\n"
-    assert not (rc.seat_dir(root, TASK, "turn-1") / "area").exists()
+    assert not (rc.seat_dir(root, TASK, "turn-1") / "area.noindex").exists()
     assert (Path(late["evidence_dir"]) / "files" / "check.py").read_bytes() == EDIT
 
 

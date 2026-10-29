@@ -47,7 +47,9 @@ def test_api_all_fields_form_queues_without_changing_write_surface(registry, acc
     }
     schema = registry.get_schema_by_name("schedule_subagent")["function"]["parameters"]
     # Session-only choices have no API-child default; omission preserves native execution.
-    assert set(args) == set(schema["properties"]) - {"mode", "supervisor"}
+    # API children refuse document selection (attachment_paths_unsupported), so it is session-only too.
+    assert set(args) == set(schema["properties"]) - {
+        "mode", "supervisor", "workspace", "attachment_paths", "attachment_import"}
     access_schema = schema["properties"]["access"]
     assert access_schema["enum"] == ["inherit", "readonly", "workspace_write"]
     assert access_schema["default"] == "inherit"

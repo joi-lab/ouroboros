@@ -293,7 +293,8 @@ class _MarketplaceReviewCtx:
         self.current_chat_id: Any = 0
         self.pending_events: List[Any] = []
         self.emit_progress_fn = lambda _msg: None
-        self.event_queue = None  # _emit_usage_event tolerates None
+        self.event_queue = None  # no task queue: other review events stay on pending_events
+        self.server_usage_bus = True  # its llm_usage rows reach the server bus (review_helpers)
         self.messages: List[Any] = []
 
     def repo_path(self, rel: str) -> pathlib.Path:
@@ -676,11 +677,11 @@ def install_skill(
     if auto_specs:
         from ouroboros.skill_dependencies import ensure_skill_dependencies
 
-        # A trusted/owner-skipped registry landing still owes accept_and_turn_on's preflight.
-        # Only this call's successful review permits preparing packages before that acceptance step.
+        # Deferred review/acceptance owns package preparation when auto_review=False.
+        # After a review attempt, the dependency owner gates current bytes; its admission
+        # includes qualified Advisory acceptance and Cyber authority despite review errors.
         deps_status = "pending_review"
-        reviewed = (_load_clawhub_payload(target_dir, drive_root)
-                    if skill_review_gate(review_status)["executable_review"] and not review_error else None)
+        reviewed = _load_clawhub_payload(target_dir, drive_root) if auto_review else None
         if reviewed is not None and not reviewed.load_error:
             deps_status, deps_error = ensure_skill_dependencies(drive_root, reviewed, progress=_progress)
             if deps_status == "not_admitted":

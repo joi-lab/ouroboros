@@ -7,6 +7,7 @@ nothing to that decision. There is no stat/TTL cache and no partial LoadedSkill.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +29,23 @@ class SkillPeer:
     manifest_error: str = ""
 
 
+def _manifest_peer(drive_root: Path, candidate: _SkillLocationCandidate, enabled: bool | None = None) -> SkillPeer | None:
+    """One unique location from fresh manifest bytes; ``None`` where discovery omits it."""
+    identity = dict(name=candidate.name, location=candidate.location, skill_dir=candidate.skill_dir)
+    try:
+        read = _manifest_text_for_dir(candidate.skill_dir)
+        if read is None:
+            return None
+        manifest = parse_skill_manifest_text(read[0])
+    except (_ManifestUnreadable, SkillManifestError) as exc:
+        return SkillPeer(**identity, manifest_error=type(exc).__name__)
+    if candidate.location == "native" and not _native_platform_visible(candidate.skill_dir, manifest) and _classify_skill_source(
+            candidate.skill_dir, location=candidate.location, drive_root=drive_root) == "native":
+        return None  # discovery hides a launcher seed for another platform
+    return SkillPeer(**identity, enabled=load_enabled(drive_root, candidate.name) if enabled is None else enabled,
+                     conflicts=tuple(manifest.conflicts or ()))
+
+
 def discover_skill_peers(
     drive_root: Path, *, repo_path: str | None = None,
     locations: tuple[_SkillLocationCandidate, ...] | None = None,
@@ -41,26 +59,36 @@ def discover_skill_peers(
     Missing manifests are omitted by the ordinary location inventory.
     """
     inventory = locations if locations is not None else _skill_location_inventory(drive_root, repo_path=repo_path)
-    counts: dict[str, int] = {}
-    for candidate in inventory:
-        counts[candidate.name] = counts.get(candidate.name, 0) + 1
+    counts = Counter(candidate.name for candidate in inventory)
     peers = []
     for candidate in inventory:
-        identity = dict(name=candidate.name, location=candidate.location, skill_dir=candidate.skill_dir)
         if counts[candidate.name] > 1:
-            peers.append(SkillPeer(**identity, identity_collision=True))
+            peers.append(SkillPeer(name=candidate.name, location=candidate.location,
+                                   skill_dir=candidate.skill_dir, identity_collision=True))
+        elif (peer := _manifest_peer(drive_root, candidate)) is not None:
+            peers.append(peer)
+    return tuple(peers)
+
+
+def discover_conflict_peers(
+    drive_root: Path, subject: str, *, repo_path: str | None = None,
+    locations: tuple[_SkillLocationCandidate, ...] | None = None,
+) -> tuple[SkillPeer, ...]:
+    """The peers able to conflict with canonical ``subject``, read fresh.
+
+    ``skill_conflict_status`` reaches the verdict it reaches over
+    ``discover_skill_peers``: there, collision and malformed placeholders and
+    OFF peers are inert. Collisions are counted over the whole inventory before
+    the subject is left out; enablement is read before any manifest, so an OFF
+    peer costs one state read and an ON peer keeps its fresh manifest read.
+    """
+    inventory = locations if locations is not None else _skill_location_inventory(drive_root, repo_path=repo_path)
+    counts = Counter(candidate.name for candidate in inventory)
+    peers = []
+    for candidate in inventory:
+        if counts[candidate.name] > 1 or candidate.name == subject or not load_enabled(drive_root, candidate.name):
             continue
-        try:
-            read = _manifest_text_for_dir(candidate.skill_dir)
-            if read is None:
-                continue
-            manifest = parse_skill_manifest_text(read[0])
-        except (_ManifestUnreadable, SkillManifestError) as exc:
-            peers.append(SkillPeer(**identity, manifest_error=type(exc).__name__))
-            continue
-        if candidate.location == "native" and not _native_platform_visible(candidate.skill_dir, manifest) and _classify_skill_source(
-                candidate.skill_dir, location=candidate.location, drive_root=drive_root) == "native":
-            continue  # discovery hides a launcher seed for another platform
-        peers.append(SkillPeer(**identity, enabled=load_enabled(drive_root, candidate.name),
-                               conflicts=tuple(manifest.conflicts or ())))
+        peer = _manifest_peer(drive_root, candidate, enabled=True)
+        if peer is not None and not peer.manifest_error:
+            peers.append(peer)
     return tuple(peers)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ouroboros.config import runtime_setting
+from ouroboros.config import runtime_setting  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 
 import functools  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 import json  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
@@ -57,6 +57,7 @@ from ouroboros.loop_tool_execution import (
     reclaim_trace_refs,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 )
 from ouroboros.loop_llm_call import TIMEOUT_REPEAT_KEY, TRANSPORT_DEATHS_KEY, call_llm_with_retry, emit_llm_usage_event, forced_response_is_incomplete, forced_response_parts, provider_no_call_source  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
+from ouroboros.loop_llm_call import TRANSPORT_WAIT_REDIAL_KEY
 from ouroboros.preflight_receipts import canonical_data_root
 from ouroboros.transcript_prefix import count_history_change, observe_send as _observe_transcript_send
 from ouroboros.transcript_prefix import retire_main_reasoning as _retire_main_reasoning  # noqa: F401 -- shared send boundary
@@ -176,23 +177,15 @@ from ouroboros.nanny_pacing import (
 
 
 def _setup_dynamic_tools(tools_registry, tool_schemas, messages, context_mode="max"):
-    """Bind the one discovery implementation to this loop's resident schema list."""
+    """Bind the one discovery implementation to this loop's resident schema list.
+
+    The tools a task starts without schemas for are named by the connections map in the
+    system view (``tool_connections``), not by a per-task notice.
+    """
     from ouroboros.tools.tool_discovery import bind_resident_schemas
 
     enabled_extra = bind_resident_schemas(tools_registry, tool_schemas)
     tools_registry._ctx._actor_loaded_tool_names = enabled_extra  # a route's schema ceiling keeps these
-    non_core_count = len(list_non_core_tools(tools_registry, context_mode=context_mode))
-    if non_core_count > 0:
-        _append_or_merge_user_message(
-            messages,
-            (
-                "[SYSTEM NOTICE]\n"
-                f"You have {len(tool_schemas)} core tools loaded. "
-                f"There are {non_core_count} additional tools available "
-                f"(use `list_available_tools` to see them, `enable_tools` to activate). "
-                f"Core tools cover most tasks. Enable extras only when needed."
-            ),
-        )
     omissions = (
         tools_registry.capability_omissions()
         if hasattr(tools_registry, "capability_omissions")
@@ -422,6 +415,7 @@ def _reset_turn_state(ctx: Any) -> None:
     ctx.model_turn_state, ctx._authoring_handover, ctx._pending_model_wait_handover = ModelTurnState(), None, None
     ctx.route_wait_on_primary, ctx.active_role_override, ctx._route_facts_pending = False, None, ""
     ctx._primary_route_observation, ctx._accepted_route_binding, ctx._primary_return_requested = None, None, None
+    ctx._primary_view = None  # a return resumes only the view this turn left (primary_route_observation.held_primary_view)
     ctx._accepted_model_route = ctx._left_review_wait = None  # a new turn waits on no left review
 
 
@@ -431,12 +425,13 @@ def _initial_round_route(ctx: Any, llm: LLMClient, initial_effort: str) -> tuple
     Unknown routes get one honest call; no synthetic short-window capacity, so a
     fit plan is adopted only while it still answers the preferred mode. The same
     binding is recorded as the turn's primary (task override or role slot, role,
-    locality) for configured-route recovery and ``switch_model(primary=...)``.
+    locality) for configured-route recovery and ``switch_model(primary=...)``, and
+    the turn's route choice says whether that binding follows its role live or is
+    the task's own (``route_choice``).
     """
     from ouroboros.model_slots import task_model_binding
+    from ouroboros.route_choice import open_route
 
-    task_model_override = str(getattr(ctx, "task_model_override", "") or "").strip()
-    local_override = getattr(ctx, "task_use_local_override", None)
     preferred_mode = get_context_mode()
     context_fit_plan = getattr(ctx, "context_fit_plan", None)
     if (context_fit_plan is not None
@@ -444,9 +439,7 @@ def _initial_round_route(ctx: Any, llm: LLMClient, initial_effort: str) -> tuple
         active_context_mode = str(getattr(context_fit_plan, "initial_mode", "") or preferred_mode)
     else:
         active_context_mode = preferred_mode
-    model = task_model_override or llm.default_model()
-    use_local = (bool(local_override) if local_override is not None else
-                 runtime_setting("USE_LOCAL_MAIN", "").lower() in ("true", "1"))
+    model, use_local, ctx.route_choice = open_route(ctx, llm)
     ctx.primary_route = {"model": model, "use_local": use_local, "role": task_model_binding(
         {"task_metadata": getattr(ctx, "task_metadata", {})}, context_fit_plan=context_fit_plan)[0]}
     return model, initial_effort, use_local, preferred_mode, active_context_mode, context_fit_plan
@@ -534,6 +527,9 @@ def run_llm_loop(
     if not saved and not saved_pause and not saved_working:
         accumulated_usage["initial_model_request"] = {"model": active_model, "use_local": active_use_local}
         _emit_physical_mode(event_queue, task_id, drive_logs, context_fit_plan, active_context_mode)
+        from ouroboros.memory_max import observe_task_start  # every fresh start: the lost-Max episode
+        observe_task_start(ctx, context_fit_plan, active_context_mode, task_id=task_id or str(getattr(ctx, "task_id", "") or ""),
+                           event_queue=event_queue)
     cost_ceiling = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)
     if cost_ceiling.root_cap_usd is not None:
         # Resumed/late-started members see tree spend before their first pacing surface.
@@ -571,7 +567,7 @@ def run_llm_loop(
                 (active_model, active_use_local, active_effort, context_fit_plan,
                  active_context_mode) = _apply_round_route_overrides(
                     ctx, tools, messages, (active_model, active_use_local, active_effort), context_fit_plan,
-                    active_context_mode, _preferred_context_mode, tool_schemas)
+                    active_context_mode, _preferred_context_mode, tool_schemas, llm=llm)
             ctx.active_context_mode = active_context_mode
             ctx.active_model, ctx.active_effort, ctx.active_use_local = active_model, active_effort, active_use_local
 
@@ -657,7 +653,8 @@ def run_llm_loop(
                     _inject_round_checkpoints(
                         round_idx=round_idx, messages=messages, accumulated_usage=accumulated_usage, tools=tools,
                         event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
-                        budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling, active_use_local=active_use_local)
+                        budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling, active_use_local=active_use_local,
+                        llm_trace=llm_trace)
 
                     messages = _run_round_compaction(messages, _CompactionRoundContext(
                             tools=tools, drive_root=drive_root, drive_logs=drive_logs,
@@ -678,6 +675,7 @@ def run_llm_loop(
                         event_queue=event_queue, accumulated_usage=accumulated_usage, task_type=task_type,
                         active_use_local=active_use_local, active_context_mode=active_context_mode,
                         drive_root=drive_root, emit_progress=emit_progress)
+                    accumulated_usage[TRANSPORT_WAIT_REDIAL_KEY] = transport_wait is not None  # an open episode paces it
                     with receiver_abandonable(), working_checkpoint.model_call_scope(limit_ctx):
                         msg, cost, active_context_mode = _call_round_model(model_call)
                     active_model, active_use_local = model_call.active_model, model_call.active_use_local
@@ -845,9 +843,9 @@ from ouroboros.loop_round_limits import (  # noqa: E402, F401 -- intentional pub
 from ouroboros.loop_nudges import (  # noqa: E402, F401 -- intentional public re-exports
     _skill_names_touched_by_trace,
     _skill_finalization_message,
-    _force_plan_decision,
-    _force_plan_reminder,
-    _force_plan_disclosure,
+    _plan_gate_decision,
+    _plan_gate_reminder,
+    _plan_gate_disclosure,
     _maybe_inject_time_budget_milestone,
     _maybe_inject_cost_budget_milestone,
     _inject_round_checkpoints,
@@ -939,7 +937,7 @@ from ouroboros.loop_forced_finalization import (  # noqa: E402, F401 -- intentio
     _undispositioned_children,
     _undecided_children_listing,
     _maybe_enforce_child_absorption_gate,
-    _enforce_swarm_actions,
+    _enforce_plan_gate,
     _finalize_forced_services,
     _disclose_service_finalization,
     _drain_forced_owner_directives,

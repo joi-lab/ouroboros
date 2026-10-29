@@ -15,7 +15,8 @@ import pytest
 from ouroboros.preflight_runner import LANE_EXCLUSION_EXPR
 from ouroboros.test_parallelism import NESTED_WORKERS_ENV
 from tests import ci_accepted
-from tests.ci_evidence import reconcile_shards
+from tests.ci_evidence import reconcile_shards, render_annotations
+from tests.ci_verdicts import render_run_verdict
 
 REPO = Path(__file__).resolve().parents[1]
 SHA, RUN = "c" * 40, "777"
@@ -568,23 +569,27 @@ def _reconciled(tmp_path, suite, expression, lane_key):
 
 
 @pytest.mark.serial
-def test_a_dead_worker_is_continued_and_the_shard_still_reconciles(tmp_path):
-    """--max-worker-restart=0 stops the whole session when a worker dies (the Windows thread timeout in
-    the parallel pass), and an owned run's controller aborts before the other workers report (tests/conftest.py):
-    the lane block they handed over at collection still reaches the export, the round runs the crashed test
-    again and every test the session never reached, and the shard's red session is proven by its verdict."""
+@pytest.mark.parametrize("death, seconds", [("os._exit(3)", None), ("time.sleep(60)", 2.0)],
+                         ids=["exit", "thread-timeout"])
+def test_a_dead_worker_is_continued_and_the_shard_still_reconciles(tmp_path, death, seconds):
+    """--max-worker-restart=0 stops the whole session when a worker dies (an os._exit, or the thread timeout
+    that ends the worker on Windows), and an owned run's controller aborts before the other workers report
+    (tests/conftest.py): the lane block they handed over at collection still reaches the export, the round runs
+    the crashed test again and every test the session never reached, and the shard's red session is proven by its
+    verdict. The verdict and its readers keep the dead worker's own facts: a timeout only where its callback ran."""
     suite = tmp_path / "suite"
     (suite / "tests").mkdir(parents=True)
-    # --dist loadscope sends the largest scope first: its first test kills its worker at once.
+    # --dist loadscope sends the largest scope first: its first test kills its worker, at once or when its timer fires.
     (suite / "tests" / "test_a_crash.py").write_text(textwrap.dedent(f"""
-        import os
+        import os, time
         from pathlib import Path
         import pytest
+        @pytest.mark.timeout(2, method="thread")
         def test_dies_once():
             marker = Path({str(tmp_path / "crashed-once")!r})
             if not marker.exists():
                 marker.write_text("", encoding="utf-8")
-                os._exit(3)
+                {death}
         @pytest.mark.parametrize("n", range(4))
         def test_after(n):
             pass
@@ -609,8 +614,15 @@ def test_a_dead_worker_is_continued_and_the_shard_still_reconciles(tmp_path):
     assert [row["block"] for row in lanes] == ["default_parallel"] and lanes[0]["lane"] == first["default_parallel"]
     verdict = _json(evidence / "verdict.json")
     assert verdict["verdict"] == "flaky" and verdict["not_run"] == [] and verdict["failed"] == []
-    assert verdict["flaky"] == [{"nodeid": "tests/test_a_crash.py::test_dies_once",
-                                 "first": {"phase": "crash", "error_type": "WorkerCrash"}}]
+    died = {"phase": "crash", "error_type": "WorkerCrash", "worker": first["worker_crash"]["worker"],
+            **({"timeout_callback_seconds": seconds} if seconds else {})}
+    assert verdict["flaky"] == [{"nodeid": "tests/test_a_crash.py::test_dies_once", "first": died}]
+    shown = "tests/test_a_crash.py::test_dies_once (first: crash, WorkerCrash" + (
+        "; timeout callback invoked (2s), worker subsequently lost)" if seconds else ")")
+    assert f"FLAKY {shown}" in result.stdout
+    assert render_annotations([evidence]) == [f"::warning title=Flaky test (passed on its retry)::{shown}"]
+    text, facts = render_run_verdict(tmp_path / "shards")
+    assert f"- {shown}" in text and facts["flaky"][0].get("timeout_callback_seconds") == seconds
     # A test the other worker had in flight when the controller aborted runs again as never run.
     assert verdict["continued"] == len(set(assigned) - reached)
     gaps, notes = _reconciled(tmp_path, suite, PARALLEL, "default_parallel")

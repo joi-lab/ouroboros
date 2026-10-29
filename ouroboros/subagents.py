@@ -835,6 +835,13 @@ SUBAGENT_INTENT_FIELDS: tuple[str, ...] = (
     # policy-overridden between admission and dispatch.
     "required_model_lane",
     "requested_executor",
+    # A writer's explicit placement (``schedule_subagent(workspace="in_place")``, owner 25.10 Q2-A).
+    "workspace",
+    # A session child's selected task documents for its first start (DELEGATED_ADMISSION §3a):
+    # the relpaths, reuse/new, and the one new-import intent saved when the parent chose new.
+    "attachment_paths",
+    "attachment_import",
+    "document_import_intent",
 )
 
 

@@ -81,6 +81,10 @@ class ProviderStreamError(IncompleteProviderStream):
         self.stream_rejected = not numeric
         self.type = str(error.get("type") or error.get("code") or "provider_stream_error")
         self.provider_message = str(error.get("message") or "")
+        # OpenRouter's opt-in routing receipt (``X-OpenRouter-Metadata``) rides beside
+        # ``error``: each upstream attempt's provider, model and status, never its text.
+        receipt = body.get("openrouter_metadata")
+        self.openrouter_metadata = copy.deepcopy(receipt) if isinstance(receipt, dict) else None
         self.stream_usage = copy.deepcopy(usage) if isinstance(usage, dict) and usage else None
         # Keep producer facts in body/private evidence. Text-only pre-routing
         # classifiers must not turn an HTTP-200 SSE failure into a free rejection.

@@ -1486,7 +1486,7 @@ def summarize_skills(drive_root: pathlib.Path, skills: Optional[List[LoadedSkill
     from ouroboros.skill_readiness import skill_readiness_for_execution
 
     rows: List[Dict[str, Any]] = []
-    available = blocked_by_grants = pending_review = blocker_review = warning_review = broken = 0
+    available = blocked_by_grants = pending_review = blocker_review = warning_review = 0
     for s in skills:
         stale = s.review.is_stale_for(s.content_hash)
         gate = s.review.gate_for(s.content_hash)
@@ -1512,7 +1512,6 @@ def summarize_skills(drive_root: pathlib.Path, skills: Optional[List[LoadedSkill
         )
         blocker_review += int(s.review.status == _REVIEW_STATUS_FAIL)
         warning_review += int(s.review.status == _REVIEW_STATUS_ADVISORY)
-        broken += int(bool(s.load_error))
         rows.append({
             "name": s.name,
             "description": s.manifest.description,
@@ -1570,6 +1569,7 @@ def summarize_skills(drive_root: pathlib.Path, skills: Optional[List[LoadedSkill
         })
         if live.get("load_error"):
             rows[-1]["load_error"] = str(live.get("load_error"))
+    broken = sum(1 for row in rows if row["load_error"])  # finished rows, after every runtime overlay (#600)
     return {
         "count": len(skills),
         "runtime_mode": get_runtime_mode(),

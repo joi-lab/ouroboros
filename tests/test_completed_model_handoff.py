@@ -321,7 +321,7 @@ def test_historic_raised_send_uses_only_addressed_open_rows_without_pid_gate(tmp
     assert before["state"] == "unresolved" and before["physical_failure"] == facts
     assert not any(before.get(k) for k in ("local_answer_consumer_id", "local_answer_owner_birth",
                                          "local_answer_task_attempt"))
-    read_attempts = usage_store.Txn.attempts
+    read_attempts = usage_store.Txn.attempt_rows  # the attempts read every reader of this flow takes
     open_reads = []
     with monkeypatch.context() as patch:
         def addressed_open_only(txn, where="1", params=()):
@@ -329,7 +329,7 @@ def test_historic_raised_send_uses_only_addressed_open_rows_without_pid_gate(tmp
                 pytest.fail("completed request classification must read only this root's open attempts")
             open_reads.append((where, tuple(params)))
             return read_attempts(txn, where, params)
-        patch.setattr(usage_store.Txn, "attempts", addressed_open_only)
+        patch.setattr(usage_store.Txn, "attempt_rows", addressed_open_only)
         assert action_writers(queue, "root") == []
         admitted = admit_continuation("root", action_nonce=NONCE)
         assert admitted["ok"] and not admitted["held"], admitted
@@ -432,7 +432,7 @@ def test_probe_shaped_send_holds_the_pause_only_while_it_runs(tmp_path, monkeypa
         refused = queue.resume_budget_paused_task("root")
         assert refused["error"] == "owner_pause_effects_unsettled", refused
         assert refused["blockers"] == [{"kind": "model_handoff", "attempt_id": reservations[0].attempt_id,
-                                        "review_owned": False, "task_id": "root"}]
+                                        "review_owned": False, "task_id": "root", "reason": "no_local_receiver"}]
         assert _row(tmp_path, reservations[0].attempt_id)["state"] == "dispatched"
     finally:
         release.set()

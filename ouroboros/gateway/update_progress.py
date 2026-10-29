@@ -37,7 +37,7 @@ _MUTATION_STAGE = "applying"
 _BOOT_OUTCOMES = frozenset({"applied", "not_applied", "rolled_back"})
 _FIELDS = ("operation_id", "generation", "stage", "started_at", "stage_started_at", "active", "result",
            "error", "restart_required", "outcome", "outcome_at", "concluded_by", "reason", "blockers",
-           "work_stop", "base_sha", "target_sha", "tx_attempt_id", "keep_branch", "stash_note")
+           "work_stop", "base_sha", "target_sha", "tx_attempt_id", "keep_branch", "stash_note", "generation_facts")
 
 
 def _generation() -> str:
@@ -203,6 +203,8 @@ def begin(*, base_sha: str = "", target_sha: str = "") -> None:
             "active": True, "result": "", "error": "", "restart_required": False,
             "outcome": "", "work_stop": "none", "base_sha": str(base_sha or ""), "target_sha": str(target_sha or ""),
         }
+        from ouroboros.update_generation_facts import sample
+        record["generation_facts"] = {"before": sample(), "after": None}
         # A failure before the state mutator runs otherwise leaves no comparison
         # baseline. This read is only a candidate: later recovery compares it under
         # the state lock, including all conclusion fields, before replacing anything.
@@ -261,6 +263,8 @@ def _executor_outcome(body: dict, code: int, error: Exception | None, mutating: 
         return ""
     if not mutating:
         return "not_applied"
+    if code == 409 and body.get("outcome") == "not_applied":
+        return "not_applied"  # the physical first step refused; recovery verified no tree effect
     if code == 409 and body.get("rolled_back") is True:
         return "rolled_back"  # rollback_managed_update verified the restored checkout
     if code == 409 and body.get("abandoned") is True:
@@ -306,11 +310,14 @@ def _conclude(seen: dict, result: dict, bootstrap_ok: bool) -> None:
     change = {"active": False, "outcome": outcome, "outcome_at": utc_now_iso(), "concluded_by": "boot",
               "restart_required": False, **({"reason": reason} if reason else {}),
               **({"stash_note": str(result["stash_note"])} if result.get("stash_note") else {})}
+    from ouroboros.update_generation_facts import sample
+    after = sample() if outcome == "applied" else None
 
     def mutate(stored: dict):
         if stored.get("tx_attempt_id") != seen["attempt_id"] or stored.get("generation") == _generation():
             return None  # another attempt, or this very server: no restart happened in between
-        return _shape({**stored, **change})
+        return _shape({**stored, **change, "generation_facts": {
+            **(stored.get("generation_facts") or {"before": None}), "after": after}})
 
     _store(mutate)
 

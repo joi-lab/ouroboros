@@ -1,8 +1,8 @@
 """#1741 receptive commit review (and review_change) through the real handlers, stage cycle,
 wave, substrate, custody drain and frozen checkout over a real Git repository.
 
-The only stand-ins are a scripted two-seat retrieving reviewer (whose physical rounds
-cross the attempt ledger), the tests preflight and publication. An addressed message
+The stand-ins are a scripted two-seat retrieving reviewer (whose physical rounds
+cross the attempt ledger), release metadata, the tests preflight and publication. An addressed message
 ends the author's wait while launched AND unsent reviewers continue over the frozen
 subject; the old handler never reaches Git; one whole-wave notice follows; the same
 unchanged call rejoins at $0; only an explicit continuation commits.
@@ -123,7 +123,8 @@ def author(tmp_path, monkeypatch):
     ctx.owner_wait_callback = lambda *_a, **_k: "parked"  # an interactive author's continuation owner
     ctx.task_lifecycle_bound = True  # as the agent binds a task's context: Pause and budget scope apply
     monkeypatch.setattr(review_helpers, "check_worktree_readiness", lambda *a, **kw: [])
-    monkeypatch.setattr(commit_admission, "release_metadata_preflight", lambda *a, **kw: "")
+    monkeypatch.setattr(commit_admission, "release_metadata_diagnostics", lambda *a, **kw: {
+        "status": "not_applicable", "findings": [], "unavailable": []})
     monkeypatch.setattr(git, "_managed_candidate_needs_proof", lambda ctx: False)
     monkeypatch.setattr(git, "_run_review_preflight_tests", lambda *a, **k: None)
     monkeypatch.setattr(git, "_post_commit_result", lambda *a, **k: None)

@@ -728,8 +728,9 @@ def test_s2_commit_reviewed_triad_and_scope_pass_on_doc_only_diff(e2e_clone, tmp
             # never commits the checkout the server imports) — under blocking enforcement
             # only through PASS verdicts from both organs — and is recorded as reviewed
             # there; the serving clone did not move.
-            rows = [row for path in sorted(server.data_root.rglob("state/subagent_worktrees.json"))
-                    for row in json.loads(path.read_text())["worktrees"] if row.get("kind") == "body_candidate"]
+            rows = [row for path in sorted(server.data_root.rglob("state/private_copies/*.json"))
+                    if not path.name.startswith(".")
+                    for row in [json.loads(path.read_text(encoding="utf-8"))] if row.get("kind") == "body_candidate"]
             assert len(rows) == 1 and rows[0]["task_id"] == task_id, rows
             log_output = subprocess.run(
                 ["git", "log", "-n", "5", "--format=%H %s", rows[0]["branch"]],

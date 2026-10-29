@@ -7,8 +7,8 @@ answers older than the quota's reach are still weighed by the quota logic), and
 each older page the next older ones (owner decisions 2026-10-05, DESIGN "History
 edges"). The chat and progress streams keep separate quotas (``human``,
 ``progress``), each counted by its own predicate. A room's rows are addressed
-(``RoomLens``): one indexed probe per fact of the room -- its chat, the lineage
-columns of its bound tasks, the owner ids its bindings name -- so a page costs
+(``RoomLens``): indexed probes over the facts of the room -- its chat, the lineage
+columns of its bound tasks, the owner ids its bindings name; one statement per column -- so a page costs
 the room's own rows, never another room's history (``dialogue_store.probe_rows``).
 Coordinates are the chain coordinates the store keeps: every cursor an older
 body or a client holds names the same rows. The archive import's frontier is a
@@ -28,6 +28,7 @@ import pathlib
 from typing import Any, Dict, NamedTuple, Tuple
 
 from ouroboros import dialogue_store as ds
+from ouroboros.checkpoint_waits import wait_episode
 from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID, is_a2a_chat_id
 from ouroboros.dialogue_positions import skipped_between
 from ouroboros.project_dialogue import (
@@ -37,7 +38,7 @@ from ouroboros.store import StoreError, StoreMigrating
 from ouroboros.subagent_messages import CARD_ROW_PLACEMENTS, is_task_card_message, subagent_message_meta
 
 _SOURCES = ("chat", "progress")
-# One indexed probe page per room fact: a page's cost is the room's facts times this, never its history.
+# One probe page: each indexed column of the room's facts reads at most this many coordinates, never its history.
 _PROBE_ROWS = 200
 # The recent page reads the room's newest rows per stream until its quota is met AND its window is:
 # this many rows or this many stored bytes of the room's own rows, whichever comes first (the chain
@@ -58,6 +59,9 @@ _DELTA_CEILING_BYTES = 2 * 1024 * 1024
 _ARRIVAL_SEARCH_ROWS = 200
 # The coverage span's chain witness: the store's coordinates are durable, so one witness names every read.
 _CHAIN_WITNESS = "dialog"
+# The view suffix of a room read in time order (``history_chronology``): its cursors carry row keys
+# ``[time, order, position]``.
+_CHRONOLOGICAL = ":reading-order"
 # Bound on an opaque cursor's length (a query parameter): an ``after`` cursor carries the versions
 # of the tasks its window shows, and a window too large to name them reads its newest page instead.
 _CURSOR_CHARS = 8192
@@ -83,7 +87,9 @@ log = logging.getLogger(__name__)
 
 def progress_quota_predicate(row_matches_thread, stored_chat_id):
     def counts(entry):
-        if not isinstance(entry, dict) or entry.get("type") in {"review_reference", "task_model_wait"}:
+        # A host wait row rides along in the page without spending its quota (``checkpoint_waits``).
+        if (not isinstance(entry, dict) or entry.get("type") in {"review_reference", "task_model_wait"}
+                or wait_episode(entry) is not None):
             return False
         if is_a2a_chat_id(entry.get("chat_id", 1)):
             return False
@@ -143,6 +149,14 @@ def encode_cursor(value):
     return base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).decode().rstrip("=")
 
 
+def _row_key(key) -> bool:
+    """A reading key ``[time, order or null, position]`` (``history_chronology``) as a client may hold it."""
+    from ouroboros.presence_history import SOURCE_ORDER_LIMIT
+    return (isinstance(key, list) and len(key) == 3 and type(key[0]) is str and len(key[0]) <= 64
+            and (key[1] is None or (type(key[1]) is int and 0 <= key[1] < SOURCE_ORDER_LIMIT))
+            and type(key[2]) is int and key[2] >= 0)
+
+
 def decode_cursor(value, thread_id, view):
     try:
         if not isinstance(value, str) or len(value) > _CURSOR_CHARS:
@@ -156,7 +170,17 @@ def decode_cursor(value, thread_id, view):
                 raise ValueError
             if any(type(cursor[field][source]) is not int or cursor[field][source] < 0 for source in _SOURCES):
                 raise ValueError
-        if any(cursor["before"][source] > cursor["upper"][source] for source in _SOURCES):
+        # A time-ordered room's chat coordinates count its rows, continued from row keys (``chrono``):
+        # ``[time, order or null, position]``.
+        timed = str(cursor.get("view") or "").endswith(_CHRONOLOGICAL) and cursor["kind"] != "after"
+        if any(cursor["before"][source] > cursor["upper"][source] for source in _SOURCES
+               if not (timed and source == "chat")):
+            raise ValueError
+        keys = cursor.setdefault("chrono", None)
+        if (keys is not None) != timed or (keys is not None and (
+                not isinstance(keys, dict) or set(keys) - {"before", "lower", "origin"}
+                or not (keys.get("origin") is None or (type(keys["origin"]) is int and keys["origin"] >= 0)) or any(
+                    key is not None and not _row_key(key) for name, key in keys.items() if name != "origin"))):
             raise ValueError
         unfinished = cursor.setdefault("unfinished", [])
         if not isinstance(unfinished, list) or unfinished != sorted(set(unfinished) & set(_SOURCES)):
@@ -201,13 +225,16 @@ def notes_stamp(data_dir):
 
 
 class RoomLens(NamedTuple):
-    """How one stream of a room is addressed in the store: one indexed probe per ``keys`` entry
-    (a ``dialogue_store.probe_rows`` column and value) and, for the chat stream, the coordinates
+    """How one stream of a room is addressed in the store: its ``keys`` (``dialogue_store.probe_rows``
+    columns and values, one statement per column) and, for the chat stream, the coordinates
     (``seqs``) of the owner rows a binding names without a client id, resolved by identity once per
-    request. ``project_dialogue.room_membership`` decides each candidate; the lens is its superset."""
+    request. ``project_dialogue.room_membership`` decides each candidate; the lens is its superset.
+    ``chrono``: the chat stream of a room holding imported earlier messages reads in time order
+    (``history_chronology.ChronologicalSource``)."""
 
     keys: Tuple[Tuple[str, Any], ...]
     seqs: Tuple[int, ...] = ()
+    chrono: bool = False
 
 
 def _descendants(data_dir: pathlib.Path, tasks: list) -> list:
@@ -245,7 +272,10 @@ def room_lens(data_dir: pathlib.Path, thread_id: int, project_chat_ids: set, sou
     into) and the owner rows its bindings name (by client id, else by chat and time). Other rooms
     probe their stored chat only. Main retains the historical non-Project candidate superset
     (A2A and hidden traffic excluded), rows without a chat and its question pointers; membership
-    filters out place rows. A place-room read never scans another room's history."""
+    filters out place rows. Its conversation probes leave out rooms holding place arrivals
+    (``place_arrivals.place_room_chats``), which Main never shows, so a bulk import there never
+    buries Main's own rows; their narration stays probed. A place-room read never scans another
+    room's history."""
     if thread_id in project_chat_ids:
         bound = sorted(task for task, chat in bindings_by_task.items() if chat == thread_id)
         keys: list = [("chat_id", thread_id)]
@@ -270,12 +300,18 @@ def room_lens(data_dir: pathlib.Path, thread_id: int, project_chat_ids: set, sou
         return {"chat": RoomLens((*keys, *dict.fromkeys(owners)), tuple(sorted(set(seqs)))),
                 "progress": RoomLens(tuple(keys))}
     if thread_id != 1:
+        from ouroboros.place_arrivals import holds_history_import
+
         own = RoomLens((("chat_id", thread_id),))
-        return {"chat": own, "progress": own}
+        return {"chat": own._replace(chrono=holds_history_import(data_dir, thread_id)), "progress": own}
+    from ouroboros.place_arrivals import place_room_chats
+
     chats = [room["chat_id"] for room in ds.rooms(data_dir) if room["chat_id"] not in project_chat_ids
              and room["chat_id"] != HIDDEN_CHAT_ID and not is_a2a_chat_id(room["chat_id"])]
     keys = [("chat_id", chat) for chat in chats] + [("chat_id", None)]
-    return {"chat": RoomLens((*keys, ("kind", "quiz"), ("kind", "quiz_answer"), ("kind", "quiz_closed"))),
+    placed = place_room_chats(data_dir)
+    spoken = [key for key in keys if key[1] not in placed]
+    return {"chat": RoomLens((*spoken, ("kind", "quiz"), ("kind", "quiz_answer"), ("kind", "quiz_closed"))),
             "progress": RoomLens(tuple(keys))}
 
 
@@ -297,6 +333,8 @@ class HistorySource:
     a frozen page by its coordinates. Every answer carries the coordinate the page reached and the
     gaps its range holds (lines the import skipped, a segment it could not import)."""
 
+    chain = _CHAIN_WITNESS  # the coverage span's witness
+
     def __init__(self, root: pathlib.Path, source: str, lens: RoomLens, upper=None):
         self.root, self.source, self.lens = pathlib.Path(root), source, lens
         end = ds.stream_end(self.root, source)
@@ -305,6 +343,17 @@ class HistorySource:
             raise HistoryCursorError("history_cursor_invalid", 400)  # a boundary this store never gave
         self.warm = None  # the room rule's lineage batch read (``RoomResolver.warm``), before rows are counted
         self.floor = import_floor(self.root, source)
+
+    @property
+    def horizon(self) -> int:
+        """The coordinate right after the frozen rows: what a page reaching the present ends at."""
+        return self.upper
+
+    def coordinate(self, entry) -> int:
+        return entry["history_position"]["offset"]
+
+    def pin(self, entry):
+        """A page around ``entry`` reads from its coordinates here; a time-ordered reader pins its key."""
 
     def _warmed(self, rows):
         """``rows``, after their tasks' lineage (and their ancestors') was read in batches."""
@@ -431,12 +480,24 @@ class HistorySource:
         return self._entries(rows), lower, self.gaps(lower, before)
 
 
+def history_source(root, source, lens, upper=None, *, physical=False):
+    """The reader of one stream of a room: in time order for a room holding imported history."""
+    if source == "chat" and getattr(lens, "chrono", False) and not physical:
+        from ouroboros.gateway.history_chronology import ChronologicalSource
+
+        return ChronologicalSource(root, lens, upper)
+    return HistorySource(root, source, lens, upper)
+
+
 def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, caps, lens, notes="", warm=None,
                         around=None, thread_filter=None, row_target=None):
     """``lens``: the room's ``RoomLens`` per stream (``history._room_lens``); ``notes``:
     ``notes_stamp``; ``warm``: the room rule's lineage batch read, given rows before they are counted;
     ``around``: a task or exact row (``row_target`` is its resolved source/seq); ``thread_filter``: the
-    room rule and stored-chat coercion it decides membership with (``room_member_predicate``)."""
+    room rule and stored-chat coercion it decides membership with (``room_member_predicate``).
+    A chronological room has its own view: its cursors never continue a stored-order chain."""
+    if lens["chat"].chrono:
+        view = f"{view}{_CHRONOLOGICAL}"
     if around is not None:
         if cursor:
             raise HistoryCursorError("history_around_invalid", 400)  # a page starts at one place
@@ -453,20 +514,28 @@ def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, c
     recent = not continuation or (continuation["kind"] == "page" and continuation["recent"])
     after = bool(continuation) and continuation["kind"] == "after"
     selections, upper, before, page_ends, importing = {}, {}, {}, {}, []
+    horizon, chains, chrono = {}, {}, {}
     for source, quota in (("chat", "human"), ("progress", "progress")):
         # Rows an ``after`` read has not seen are everything stored after the window's last read,
         # so it freezes the stream fresh; every other read keeps the boundary its cursor froze.
-        reader = HistorySource(data_dir, source, lens[source],
-                               continuation["upper"][source] if continuation and not after else None)
+        reader = history_source(data_dir, source, lens[source],
+                                continuation["upper"][source] if continuation and not after else None, physical=after)
         reader.warm = warm
-        upper[source] = reader.upper
-        page_ends[source] = continuation["before"][source] if continuation and not after else reader.upper
+        timed = source == "chat" and getattr(lens[source], "chrono", False) and not after
+        if timed and continuation:
+            reader.keys = continuation["chrono"] or {}
+        upper[source], horizon[source], chains[source] = reader.upper, reader.horizon, reader.chain
+        page_ends[source] = continuation["before"][source] if continuation and not after else reader.horizon
         if after:
             seen = continuation["upper"][source]
             if not seen <= reader.upper or reader.upper - seen > _DELTA_CEILING_BYTES:
                 raise HistoryCursorError("history_delta_reset")
             selections[source] = reader.replay(seen, reader.upper)
             if selections[source][2]:  # rows it could not read stay unaccounted for
+                raise HistoryCursorError("history_delta_reset")
+            if lens[source].chrono and any(isinstance(entry.get("historical_import"), dict)
+                                           for entry in selections[source][0]):
+                # Earlier messages imported since land inside the window's past, not after it.
                 raise HistoryCursorError("history_delta_reset")
         elif continuation and continuation["kind"] == "page":
             selections[source] = reader.replay(continuation["lower"][source], page_ends[source])
@@ -475,6 +544,8 @@ def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, c
         else:
             selections[source] = reader.recent(quotas[quota], predicates[source])
         before[source] = selections[source][1]
+        if timed:
+            chrono[source] = {"lower": reader.lower_key, "top": reader.top_key, "origin": reader.keys.get("origin")}
         if not after and 0 < reader.floor == before[source]:
             importing.append(source)
     if importing and not any(selections[source][0] for source in _SOURCES):
@@ -483,6 +554,7 @@ def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, c
             "quotas": quotas, "recent": recent, "after": after, "replayed": bool(continuation),
             "quiet": bool(continuation and continuation["quiet"]), "lens": lens, "notes": notes,
             "selections": selections, "before": before, "page_ends": page_ends, "importing": importing,
+            "horizon": horizon, "chains": chains, "chrono": chrono,
             **({key: continuation[key] for key in ("tasks", "newest", "lifecycle")} if after else {})}
 
 
@@ -499,12 +571,14 @@ def _select_around(data_dir, thread_id, view, task_id, quotas, predicates, lens,
     quotas = dict(quotas)
     page = {"v": 1, "chat_id": thread_id, "view": view, "upper": {}, "unfinished": [], "quotas": quotas,
             "recent": False, "after": False, "replayed": False, "quiet": False, "lens": lens, "notes": notes,
-            "selections": {}, "before": {}, "page_ends": {}, "importing": []}
+            "selections": {}, "before": {}, "page_ends": {}, "importing": [], "horizon": {}, "chains": {},
+            "chrono": {}}
     readers, pivots, states = {}, {}, set()
     for source in _SOURCES:
-        reader = readers[source] = HistorySource(data_dir, source, lens[source])
+        reader = readers[source] = history_source(data_dir, source, lens[source])
         reader.warm = warm
         page["upper"][source] = reader.upper
+        page["horizon"][source], page["chains"][source] = reader.horizon, reader.chain
         progress = source == "progress"
         if row_target is not None:
             entry = ds.row_at(data_dir, source, row_target["seq"]) if source == row_target["source"] else None
@@ -523,12 +597,19 @@ def _select_around(data_dir, thread_id, view, task_id, quotas, predicates, lens,
         if pivot is None or not any(pivots.values()):
             page["selections"][source], quotas[quota] = ([], 0, {"around_unpositioned"}), 0
             page["before"][source] = page["page_ends"][source] = 0
+            if lens[source].chrono:  # its cursors still name the (empty) cuts their view decodes
+                page["chrono"][source] = {"lower": None, "top": None, "origin": None}
             continue
-        start, older_want = pivot["history_position"]["offset"], want // _AROUND_OLDER_SHARE
+        start, older_want = reader.coordinate(pivot), want // _AROUND_OLDER_SHARE
+        reader.pin(pivot)
+        page["chains"][source] = reader.chain  # a time-ordered pivot begins a chain of its own
         older, lower, older_gaps = reader.older(start, older_want, counts) if older_want else ([], start, set())
         newer, end, newer_gaps = reader.ahead(pivot["_history_end"], want - older_want - bool(counts(pivot)), counts)
         page["selections"][source] = (older + [pivot] + newer, lower, older_gaps | newer_gaps | reader.gaps(start, pivot["_history_end"]))
         page["before"][source], page["page_ends"][source] = lower, end
+        if "_chrono_key" in pivot:
+            page["chrono"][source] = {"lower": (older or [pivot])[0]["_chrono_key"], "top": reader.top_key,
+                                      "origin": reader.keys.get("origin")}
         if 0 < reader.floor == lower:
             page["importing"].append(source)
     anchor = pivots["chat"] or pivots["progress"]
@@ -566,14 +647,34 @@ def history_page_coverage(page, stream_gaps):
     A projected origin, detail overlay or shared row ID proves no delivered span.
     A quota-disabled stream is unknown, even when it emits [] and no continuation.
     Gaps (lines the import skipped, a segment it could not import) remain part of
-    the coverage evidence. The chain witness is one constant: the store's coordinates
-    are durable, so every read names the same chain.
+    the coverage evidence. A stored-order read names one constant chain: the store's
+    coordinates are durable. A time-ordered chat span names its frozen end, and its
+    ``keys`` name its cuts by row key (``_chrono_bound``), comparable across its reads.
     """
-    return {"v": 1, "view": page["view"], "upper": dict(page["upper"]), "spans": {
-        source: ({"from": page["before"][source], "to": page["page_ends"][source],
-                  "chain": _CHAIN_WITNESS, "gaps": sorted(stream_gaps[source])}
-                 if page["quotas"]["human" if source == "chat" else source] else None)
-        for source in _SOURCES}}
+    chains = page.get("chains", {})
+    spans = {source: ({"from": page["before"][source], "to": page["page_ends"][source],
+                       "chain": chains.get(source, _CHAIN_WITNESS), "gaps": sorted(stream_gaps[source])}
+                      if page["quotas"]["human" if source == "chat" else source] else None)
+             for source in _SOURCES}
+    keys = (page.get("chrono") or {}).get("chat")
+    if keys and spans["chat"] is not None:  # a time-ordered span also names its cuts by row key
+        start = _chrono_bound(page, "chat", page["before"]["chat"])
+        if start is not None or not page["before"]["chat"]:  # a lower cut at the present has no key: unknown
+            spans["chat"]["keys"] = {"from": start, "to": keys["top"], "frozen": page["upper"]["chat"]}
+    return {"v": 1, "view": page["view"], "upper": {**page["upper"], **page.get("horizon", {})}, "spans": spans}
+
+
+def delivered_history_gaps(root, page, stream_gaps):
+    """Recheck narrowed import spans; projection failures have no narrower proof."""
+    import_gaps = {*_GAP_NAMES.values(), UNIMPORTABLE}
+    for source in _SOURCES:
+        if page["before"][source] == page["selections"][source][1]:
+            continue
+        reader = history_source(root, source, page["lens"][source], page["upper"][source],
+                                physical=page.get("after", False))
+        stream_gaps[source] = (stream_gaps[source] - import_gaps) | reader.gaps(
+            page["before"][source], page["page_ends"][source])
+    return stream_gaps
 
 
 def history_page_tokens(page, messages=(), reads=None):
@@ -610,17 +711,38 @@ def history_page_tokens(page, messages=(), reads=None):
         if after_cursor is None:
             raise HistoryCursorError("history_delta_reset")
         return {"has_more": False, "next_cursor": None, "page_cursor": None, "after_cursor": after_cursor}
+    keys = (page.get("chrono") or {}).get("chat")  # a time-ordered room continues from row keys
+    origin = {"origin": keys["origin"]} if keys and keys.get("origin") is not None else {}  # a pivot's own chain
+    older_keys = {"chrono": {"before": _chrono_bound(page, "chat", before["chat"]), **origin}} if keys else {}
+    page_keys = {"chrono": {"before": keys["top"], "lower": keys["lower"], **origin}} if keys else {}
     return {
         "has_more": has_more,
         "next_cursor": encode_cursor({**state, "kind": "older", "before": before,
-                                      "quiet": page.get("quiet_below", False)}) if has_more else None,
+                                      "quiet": page.get("quiet_below", False), **older_keys}) if has_more else None,
         "page_cursor": encode_cursor({**state, "kind": "page", "before": page["page_ends"], "quiet": page["quiet"],
                                       "lower": {source: value[1] for source, value in page["selections"].items()},
-                                      "recent": page["recent"]}),
+                                      "recent": page["recent"], **page_keys}),
         # The newest page names where the next read of new arrivals starts.
         **({"after_cursor": after_cursor} if after_cursor and page["recent"] and not page["replayed"] else {}),
         **({"anchor": anchor} if anchor is not None else {}),
     }
+
+
+def _chrono_bound(page, source, boundary):
+    """The cut at a time-ordered page's lower boundary, named by the first row above it (``None``: the
+    room's beginning when ``boundary`` is 0, else the frozen present): the oldest row its reader read, or
+    the row just above the newest one a deferral (``deferred_before``) left for the older page, which
+    reads below this cut. One cut has one name, so spans of any read of these rows meet exactly."""
+    entries, own, _gaps = page["selections"][source]
+    if not boundary:
+        return None
+    if boundary == own:
+        return page["chrono"][source]["lower"]
+    entries = list(entries or ())
+    index = next((index for index, entry in enumerate(entries) if entry.get("_history_end") == boundary), None)
+    if index is None:  # a boundary always names a row of its own page: never continue from a guess
+        raise StoreError("A time-ordered history boundary names none of its page's rows")
+    return entries[index + 1]["_chrono_key"] if index + 1 < len(entries) else page["chrono"][source]["top"]
 
 
 def projected_history_ids(messages):

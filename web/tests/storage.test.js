@@ -7,6 +7,7 @@ import {
     formatBytes,
     groupRows,
     placeRows,
+    removerLine,
     renderStorage,
     storageState,
     whenLabel,
@@ -216,7 +217,7 @@ test('the second card carries the tray whenever an answer exists, idle before an
     assert.match(never.tray, /Temporary space[\s\S]*Show what can go/);
     assert.equal(renderStorage(null).tray, '');
     const counted = renderStorage(response({ count: count() }), { now: NOW, tray: { checked: new Set(), dismissed: false } });
-    assert.match(counted.tray, /Copies the app already removes on its own/);
+    assert.match(counted.tray, /Copies and leftovers of finished work/);
     assert.doesNotMatch(counted.tray, AVOIDED);
 });
 
@@ -229,4 +230,53 @@ test('titles and accessible names are fixed chrome: no size or name is minted pe
     assert.deepEqual(small, ['aria-label=Share of each group; sizes are listed below']);
     assert.deepEqual(large, small);
     for (const entry of small) assert.doesNotMatch(entry, /\d/, entry);
+});
+
+test('each place says who removes it and how its last pass ended, unknown never as zero', () => {
+    const at = '2026-10-17T15:05:00Z';
+    const held = [{ id: 'engine', state: 'held', at, freed_bytes: 2e9, held: 357, held_since: '2026-10-16T09:00:00Z', errors: 0, first_error: null }];
+    assert.equal(removerLine(held, NOW), `Removed by engine retention · last pass ${whenLabel(at, NOW)} · 2.0 GB freed · `
+        + `holding 357 folders since ${whenLabel('2026-10-16T09:00:00Z', NOW)}`);
+    const failed = [{ id: 'engine', state: 'failed', at, freed_bytes: 0, held: 0, errors: 2, first_error: 'upload prune threw' }];
+    assert.equal(removerLine(failed, NOW), `Removed by engine retention · last pass ${whenLabel(at, NOW)} failed · 0 bytes freed · 2 errors`);
+    const heldNone = [{ id: 'engine', state: 'held', at, freed_bytes: 0, held: 0, errors: 0, first_error: null }];
+    assert.equal(removerLine(heldNone, NOW), `Removed by engine retention · last pass ${whenLabel(at, NOW)} held · 0 bytes freed`,
+        'a pass that held is said so though it held no folder');
+    for (const [state, said] of [['unavailable', 'last pass unknown: the engine is not answering'],
+        ['unsupported', 'last pass unknown: this engine does not report it'], ['none', 'no pass yet']]) {
+        const line = removerLine([{ id: 'engine', state, at: null }], NOW);
+        assert.equal(line, `Removed by engine retention · ${said}`);
+        assert.doesNotMatch(line, /freed|\b0\b/, 'an unknown pass shows no amount');
+    }
+    const jobs = [
+        { id: 'runtime_retirement', state: 'pending', at, last_error: { class: 'OSError', at } },
+        { id: 'record_compression', state: 'done', at, compressed: 1204, saved_bytes: 2.1e9 },
+        { id: 'custody_trash', state: 'done', at },
+    ];
+    assert.equal(removerLine(jobs, NOW), `Retirement: stopped by an error (OSError, ${whenLabel(at, NOW)}) · `
+        + 'Compression: 1,204 files compressed, 2.1 GB saved · Deleting moved folders: done');
+    assert.equal(removerLine([{ id: 'record_compression', state: 'unsupported', at }], NOW), 'Compression: not supported on this system');
+    assert.equal(removerLine([{ id: 'record_compression', state: 'done', at, compressed: 3, saved_bytes: null }], NOW),
+        'Compression: 3 files compressed', 'an unreported saving is left out, never zero');
+    assert.equal(removerLine([{ id: 'record_compression', state: 'pending', at, compressed: 1204, saved_bytes: 2.1e9 }], NOW),
+        'Compression: 1,204 files compressed, 2.1 GB saved, in progress', 'an unfinished pass is said as such');
+    assert.equal(removerLine([{ id: 'evidence_packing', state: 'never', at: null }], NOW), 'Evidence packing: not run yet');
+    assert.equal(removerLine(undefined, NOW), '');
+
+    const view = renderStorage(response({ count: count(), removers: { engine: held, app_state: jobs, model_calls: [] } }), { now: NOW });
+    const engineRow = view.places.split('data-storage-place="engine"')[1].split('</li>')[0];
+    assert.match(engineRow, /class="storage-place-remover"[^>]*>Removed by engine retention · last pass/);
+    const appState = view.places.split('data-storage-place="app_state"')[1].split('</li>')[0];
+    assert.match(appState, /storage-place-remover[^>]*>Retirement: stopped by an error/);
+    const calls = view.places.split('data-storage-place="model_calls"')[1].split('</li>')[0];
+    assert.doesNotMatch(calls, /storage-place-remover/, 'a place nothing removes carries no line');
+    assert.doesNotMatch(view.places, /style=/);
+
+    const planes = renderStorage(response({ count: count(), removers: {
+        task_results: [{ id: 'record_compression', state: 'pending', at, compressed: 1204, saved_bytes: 2.1e9 }],
+        app_state: [{ id: 'record_compression', state: 'pending', at, compressed: 3, saved_bytes: null }] } }), { now: NOW });
+    const placeLine = (id) => planes.places.split(`data-storage-place="${id}"`)[1].split('</li>')[0];
+    assert.match(placeLine('task_results'), /storage-place-remover[^>]*>Compression: 1,204 files compressed, 2\.1 GB saved, in progress</);
+    assert.match(placeLine('app_state'), /storage-place-remover[^>]*>Compression: 3 files compressed, in progress</);
+    assert.doesNotMatch(placeLine('app_state'), /1,204/, 'each place its own plane, never one total under two places');
 });

@@ -504,12 +504,15 @@ class LocalChatBridge:
         routing_token: str = "",
         cause: str = "", reasoning_effort: str = "",
         project_name: str = "", target_task_ids=None, target_titles=None,
+        routing_notice_carrier: str = "", reply_to: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Emit a typed routing receipt without creating an assistant bubble.
 
         Web consumes the WS annotation; non-Web skills receive the same additive typed envelope on
         their existing outbound subscription.  ``text`` stays empty and ``suppress_bubble`` is
         explicit, so legacy transports do not invent a human-visible mirror message.
+        ``routing_notice_carrier`` names this ACK the selected carrier of the act's owner notice
+        (never delivery proof); ``reply_to`` is the owner message that notice answers.
         """
         payload = {
             "type": "message_annotation",
@@ -536,6 +539,10 @@ class LocalChatBridge:
             payload["cause"] = str(cause)
         if str(reasoning_effort or ""):  # #1539: the start a New task picked from this card requests
             payload["reasoning_effort"] = str(reasoning_effort)
+        if routing_notice_carrier in {"routing_ack", "system"}:
+            payload["routing_notice_carrier"] = routing_notice_carrier
+        if isinstance(reply_to, dict) and reply_to:
+            payload["reply_to"] = dict(reply_to)
         if options is not None:
             payload["options"] = [dict(row) for row in options if isinstance(row, dict)]
         if attachment_manifest is not None:
@@ -915,14 +922,18 @@ class LocalChatBridge:
             # "quiz:{task_id}:{quiz_id}"): an anonymous quiz would render
             # buttons that cannot deliver anywhere.
             return False, "task_id is required"
-        try:
-            payload = validate_quiz_payload(question, options, stake, assumption, wait_for_answer=wait_for_answer)
-        except QuizValidationError as exc:
-            return False, str(exc)
         from ouroboros.owner_quiz import CLOSURE_FIELDS, question_delivery_projection, quiz_states, record_publication
         from supervisor.log_addressing import resolve_quiz_publication
 
         prior = quiz_states(DATA_DIR, str(task_id)).get(qid) or {}
+        # Validation concerns the original ask, not its still-active wait. Both
+        # timeout and terminal reconciliation retain wait_ended_at as evidence
+        # that this required question was valid without an optional assumption.
+        required_ask = bool(prior.get("wait_for_answer") or prior.get("wait_ended_at")) if prior else wait_for_answer
+        try:
+            payload = validate_quiz_payload(question, options, stake, assumption, wait_for_answer=required_ask)
+        except QuizValidationError as exc:
+            return False, str(exc)
         chat_id = resolve_quiz_publication(DATA_DIR, str(task_id), prior, chat_id)
         block = record_publication(DATA_DIR, str(task_id), qid, chat_id)
         if not block or "publication_chat_id" not in block:
@@ -942,10 +953,12 @@ class LocalChatBridge:
         }
         wait_for_answer = bool(block.get("wait_for_answer"))
         host_facts = str(block.get("host_facts") or host_facts or "")
-        lifecycle = {key: block[key] for key in ("answered_index", "comment", *CLOSURE_FIELDS) if key in block}
+        lifecycle = {key: block[key] for key in ("answered_index", "comment", "wait_ended_at", *CLOSURE_FIELDS) if key in block}
         if delivery := question_delivery_projection(block):
             lifecycle["question_delivery"] = delivery
         materials = list(block.get("materials") or [])
+        if block.get("presence_contact"):
+            lifecycle["presence_contact"] = block["presence_contact"]
         ts = utc_now_iso()
         msg = {
             "type": "quiz",
@@ -990,9 +1003,7 @@ class LocalChatBridge:
                 **lifecycle,
                 **({"materials": materials} if materials else {}),
                 "wait_for_answer": bool(wait_for_answer),
-                "options": payload["options"],
-                "stake": payload["stake"],
-                "assumption": payload["assumption"],
+                **{key: payload[key] for key in ("options", "stake", "assumption")},
                 "state": str(state or "open"),
                 **({"host_facts": str(host_facts)} if host_facts else {}),
             },
@@ -1277,7 +1288,8 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
                      role: str = "", system_type: str = "",
                      narration: Optional[bool] = None,
                      require_write: bool = False,
-                     ensure_record_boundary: bool = False) -> None:
+                     ensure_record_boundary: bool = False,
+                     replay_delivery_id: str = "") -> Optional[bool]:
     """Send an owner-visible row with one voice and timestamp for history and live.
 
     Narration True means model speech, False host speech; absent legacy rows keep
@@ -1287,6 +1299,8 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
     in the existing outbox and also requires a positive transport receipt. A
     required notice without one has one owner, its producer, which retries or
     records a failed write: it keeps the caller's wait and raises when unwritten.
+    Replay records dispatch only after those writes, before transport; False
+    means its outbox debt no longer permits sending. First live sends are unchanged.
     """
     producer_owned = require_write and not (progress_meta or {}).get("delivery_id")
     with (contextlib.nullcontext() if producer_owned
@@ -1368,6 +1382,11 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
         full = _text
 
         transport = dict(ts=msg_ts, is_progress=is_progress, task_id=task_id, progress_meta=progress_meta)
+        if replay_delivery_id:
+            from supervisor.terminal_delivery import record_replay_dispatch
+
+            if not record_replay_dispatch(DATA_DIR, replay_delivery_id):
+                return False
         try:
             if fmt == "markdown":
                 receipt = _send_markdown(chat_id, full, **transport, role=role, system_type=system_type)

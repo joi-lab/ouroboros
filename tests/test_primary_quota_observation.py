@@ -272,14 +272,15 @@ def _observe(monkeypatch, *, pin="", primary=PRIMARY):
     # A fresh record beside an older stale same-subject source keeps the shared verdict unknown.
     ("", _envelope(_snapshot("acct-a"), _snapshot("acct-a", freshness="stale", source="codex_rollout")), None,
      {"state": "unknown", "reason": "quota_evidence_stale_or_incomplete"}, ["acct-a", "acct-a"]),
-    ("codex-default", _envelope(_snapshot(None)), ROSTER, {"state": "available", "resets_at": None}, [None]),
-    ("codex-default", _envelope(_snapshot(None)), {**ROSTER, "profiles": []},
-     {"state": "unknown", "reason": "quota_evidence_missing"}, []),
+    # #244: a null subject is an unprofiled route's window, never `codex-default`'s, roster or not.
+    ("codex-default", _envelope(_snapshot(None)), ROSTER, {"state": "unknown", "reason": "quota_evidence_missing"}, []),
+    ("codex-default", _envelope(_snapshot(None), _snapshot("codex-default")), ROSTER,
+     {"state": "available", "resets_at": None}, ["codex-default"]),
     ("", _envelope(), None, {"state": "unknown", "reason": "quota_evidence_missing"}, []),
     ("", _envelope(_snapshot("acct-a"), scoped=False), None,
      {"state": "unknown", "reason": "availability_scope_unhonored"}, ["acct-a"]),
 ], ids=["pin-never-borrows-sibling", "auto-sees-every-subject", "stale-source-keeps-unknown",
-        "default-alias-proven", "default-alias-unproven", "empty-envelope", "scope-ignored"])
+        "default-pin-never-borrows-unprofiled", "default-pin-exact", "empty-envelope", "scope-ignored"])
 def test_the_observation_projects_the_shared_verdict_for_the_exact_binding(monkeypatch, pin, quota, roster,
                                                                            expected, subjects):
     engine = _Engine(quota, roster=roster)
@@ -291,7 +292,7 @@ def test_the_observation_projects_the_shared_verdict_for_the_exact_binding(monke
     assert reported["availability"]["scope"] == "quota_only" and reported["availability"].get("execution_guaranteed") is not True
     assert [row["subject_id"] for row in reported["snapshots"]] == subjects
     assert reported["scope_honored"] is ("availability_scope" in quota)
-    assert [name for name, _ in engine.calls] == (["roster"] if pin == "codex-default" else []) + ["quota", "close"]
+    assert [name for name, _ in engine.calls] == ["quota", "close"]  # no roster read guesses a subject
     assert len(probes) == 1  # the catalog check still ran, after the quota read, inside the same budget
     assert "Pro plan" not in json.dumps(facts) and "used_ratio" not in json.dumps(facts)
 
@@ -334,14 +335,15 @@ def test_a_failed_read_stays_failed_never_an_empty_envelope(monkeypatch, connect
     assert len(probes) == 1 and facts["kind"] == "unconfirmed"
 
 
-def test_an_unreadable_roster_withholds_only_the_default_alias(monkeypatch):
+def test_a_default_pin_keeps_its_exact_absence_and_never_asks_the_roster(monkeypatch):
     engine = _Engine(_envelope(_snapshot(None), absences=[_absence("codex-default")]),
                      roster=ClaudexorUnavailable("daemon_unreachable", "roster lost"))
     _connect(monkeypatch, engine)
     facts, probes, _ctx = _observe(monkeypatch, pin="codex-default")
     reported = facts["quota"]
-    assert reported["read"] == "ok" and reported["roster_error"] == {"code": "daemon_unreachable"}
-    # The exact pin's own absence still counts; the null-subject row is not borrowed without proof.
+    assert reported["read"] == "ok" and "roster_error" not in reported
+    assert [name for name, _ in engine.calls] == ["quota", "close"]
+    # The exact pin's own absence still counts; the null-subject row is not the pin's.
     assert reported["snapshots"] == [] and reported["subjects"] == "the exact pin"
     assert reported["absences"] == [{"subject_id": "codex-default", "observed_at": "2026-10-21T01:00:00Z",
                                      "reason": "not_logged_in"}]
@@ -395,3 +397,17 @@ def test_a_stop_after_the_quota_read_ends_the_observation_before_the_catalog(mon
     facts, probes, ctx = _observe(monkeypatch)
     assert facts is None and probes == [] and [name for name, _ in engine.calls] == ["quota", "close"]
     assert ctx.tools._ctx._execution_trace == {} and len(ctx.messages) == 1  # nothing appended or recorded
+
+
+def test_a_default_pin_observes_only_its_exact_subject_without_a_roster_read(monkeypatch):
+    """#244: a fresh null-subject window (an unprofiled API-key route) is not `codex-default`'s,
+    even when the roster lists that profile; nothing reads the roster to guess it."""
+    engine = _Engine(_envelope(_snapshot(None, state="exhausted", resets_at=RESET)), roster=ROSTER)
+    _connect(monkeypatch, engine)
+    facts, _probes, _ctx = _observe(monkeypatch, pin="codex-default")
+    reported = facts["quota"]
+    assert reported["read"] == "ok" and reported["snapshots"] == []
+    assert reported["availability"] == {"state": "unknown", "resets_at": None,
+                                        "reason": "quota_evidence_missing", "scope": "quota_only"}
+    assert reported["subjects"] == "the exact pin" and "roster_error" not in reported
+    assert [name for name, _ in engine.calls] == ["quota", "close"]

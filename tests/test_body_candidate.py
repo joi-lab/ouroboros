@@ -1,8 +1,8 @@
 """Own-body candidates: real Git, real registry dispatch, no serving-tree effect (#1539).
 
 Every scenario builds a miniature serving body under ``tmp_path`` and drives the
-product owners themselves — the tool dispatcher, the worktree registry and its
-GC, the child-copy admission, the commit and review seams.
+product owners themselves — the tool dispatcher, the private-copy records and
+their GC, the child-copy admission, the commit and review seams.
 """
 from __future__ import annotations
 
@@ -695,20 +695,36 @@ def test_incomplete_capture_retains_the_original_directory(body):
     assert "body_candidate_retained" in events and "capture_incomplete" in events
 
 
+def test_an_unreadable_candidate_record_is_unknown_never_absent(body):
+    """Each candidate is one record file: a soft listing skips an unreadable one, a strict
+    read refuses, and the commit it holds is unknown (``None``), never proven lost."""
+    serving, data = body
+    held = body_candidate.prepare(make_ctx(serving, data, "rec-broken"))
+    other = body_candidate.prepare(make_ctx(serving, data, "rec-healthy"))
+    tip = candidate_commit(pathlib.Path(held["path"]))
+    assert body_candidate.holds_commit("rec-broken", tip, data) is True
+    record = subagent_worktrees._record_file(held["path"], data)
+    record.write_text("{", encoding="utf-8")
+
+    assert body_candidate.find("rec-broken", data) is None
+    with pytest.raises(subagent_worktrees.SubagentWorktreeRegistryCorrupt):
+        body_candidate.find("rec-broken", data, strict=True)
+    assert body_candidate.holds_commit("rec-broken", tip, data) is None
+    assert body_candidate.holds_commit("no-such-task", tip, data) is False, "no record is evidence"
+    assert body_candidate.find("rec-healthy", data)["path"] == other["path"]
+    assert pathlib.Path(held["path"]).is_dir() and record.read_text(encoding="utf-8") == "{"
+
+
 def test_gc_counts_from_last_use_and_a_missing_checkout_keeps_its_commits(body):
     serving, data = body
     used = body_candidate.prepare(make_ctx(serving, data, "gc-used"))
     lost = body_candidate.prepare(make_ctx(serving, data, "gc-lost"))
     tip = candidate_commit(pathlib.Path(lost["path"]))
     shutil.rmtree(lost["path"])
-    registry_path = data / "state" / "subagent_worktrees.json"
-    import json
-
-    rows = json.loads(registry_path.read_text())
-    for row in rows["worktrees"]:
-        row["created_at"] = 1.0
-        row["used_at"] = __import__("time").time() if row["task_id"] == "gc-used" else 1.0
-    registry_path.write_text(json.dumps(rows))
+    now = __import__("time").time()
+    for row in subagent_worktrees._records(data):  # one record file per candidate
+        subagent_worktrees._put_record(
+            {**row, "created_at": 1.0, "used_at": now if row["task_id"] == "gc-used" else 1.0}, data)
 
     report = subagent_worktrees.prune_orphans(retention_days=7)
 

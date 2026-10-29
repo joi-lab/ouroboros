@@ -937,20 +937,24 @@ def test_terminal_custody_precedes_every_best_effort_wait_in_the_teardown():
     goes AFTER the custody write too: `append_jsonl` waits up to two seconds for
     the log lock and then does file I/O, so on slow storage or a held lock it can
     eat the launcher's force-exit budget before a single worker is terminalized.
-    Nothing between the join and `kill_workers` may do I/O."""
+    Nothing between the join and `kill_workers` may do I/O. The early cause is the
+    door's lock-free entry write, made before the join, so a kill before the row
+    still leaves the cause."""
     import inspect
     import server
 
     teardown = inspect.getsource(server.lifespan).split("\n    finally:\n", 1)[1]
     stop_idx = teardown.index("_supervisor_stop.set()")
+    entry_idx = teardown.index("begin_owned_stop(lifespan_drive_root, cause=server_stop_cause())")
     join_idx = teardown.index("supervisor_thread.join(timeout=2)")
     kill_idx = teardown.index("kill_workers(")
     append_idx = teardown.index('"server_shutdown"')
     extension_idx = teardown.index("extension_reconcile_task.cancel()")
     host_idx = teardown.index("host_service_listener.close()")
     sweeps_idx = teardown.index("stop_owned_work(lifespan_drive_root)")
-    assert stop_idx < join_idx < kill_idx < extension_idx < host_idx < sweeps_idx
+    assert stop_idx < entry_idx < join_idx < kill_idx < extension_idx < host_idx < sweeps_idx
     assert kill_idx < append_idx < extension_idx
+    assert teardown.count("begin_owned_stop(") == 1 and "shutdown_entry" not in teardown[join_idx:kill_idx]
 
 
 def test_supervisor_revival_clears_a_stale_stop_flag(monkeypatch):

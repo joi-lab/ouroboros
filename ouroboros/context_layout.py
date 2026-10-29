@@ -235,9 +235,10 @@ def reference_doc_sections(
     development_text: str | None = None,
     books: tuple[ReferenceBook, ...] = (),
 ) -> tuple[List[str], str]:
-    """Return common reference sections and the optional separate Max handbook.
+    """Return common reference sections and the separate Max handbook block.
 
-    Max's common sections do not depend on the caller's handbook inclusion.
+    Max's common sections do not depend on the caller's handbook inclusion: its
+    own block holds the handbook or, without it, the handbook's chapter map.
     Compact modes orient the mind to both books and retain exact physical
     pointers; they never turn a composed-book line into a file address.
     """
@@ -268,11 +269,12 @@ def reference_doc_sections(
     if development_book is not None and development_text is None:
         dev_text = compose_book(development_book)
     if dev_text.strip():
+        chapters = (book_navigation(development_book) if development_book is not None
+                    else generate_doc_nav_map(dev_text, title="DEVELOPMENT.md", rel_path="docs/DEVELOPMENT.md"))
         if context_mode in {"low", "nano"}:
-            parts.append(book_navigation(development_book) if development_book is not None
-                         else generate_doc_nav_map(dev_text, title="DEVELOPMENT.md", rel_path="docs/DEVELOPMENT.md"))
-        elif include_development:
-            development = "## DEVELOPMENT.md\n\n" + dev_text
+            parts.append(chapters)
+        else:  # Max: the handbook or its chapter map, in its own block, so the common sections stay shared
+            development = "## DEVELOPMENT.md\n\n" + dev_text if include_development else chapters
 
     # README (user-facing) and CHECKLISTS (reviewers load their own copy) are not
     # inlined in the agent context in any mode.

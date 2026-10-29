@@ -192,16 +192,16 @@ def test_registry_arg_aliases_and_public_tool_arg_errors(tmp_path):
     assert seen["max_results"] == 2
     assert seen["binding"] is not None
 
-    def _private_vcs_status(
-        ctx, path="", max_chars=0, root="system_repo", _resolved_binding=None,
+    def _private_vcs_read(
+        ctx, action="status", path="", max_chars=0, root="system_repo", _resolved_binding=None,
     ):
-        seen["vcs_status"] = (path, max_chars, root, _resolved_binding)
+        seen["vcs_read"] = (path, max_chars, root, _resolved_binding)
         return "status-ok"
 
-    reg.override_handler("vcs_status", _private_vcs_status)
-    assert reg.execute("vcs_status", {"root": "system_repo", "path": "."}) == "status-ok"
-    assert seen["vcs_status"][:3] == (".", 0, "system_repo")
-    assert seen["vcs_status"][3].root == "system_repo"
+    reg.override_handler("vcs_read", _private_vcs_read)
+    assert reg.execute("vcs_read", {"action": "status", "root": "system_repo", "path": "."}) == "status-ok"
+    assert seen["vcs_read"][:3] == (".", 0, "system_repo")
+    assert seen["vcs_read"][3].root == "system_repo"
 
     result = reg.execute("search_code", {"dir": "."})
     assert "TOOL_ARG_ERROR (search_code)" in result
@@ -317,19 +317,27 @@ _RETIRED_GITHUB_CASES = [
     ("comment_on_pr", "github_write", {"method": "review", "target": 7, "event": "APPROVE"}, {"method": "create_issue", "title": " "}),
     ("close_github_issue", "github_write", {"method": "update", "target": 7, "state": "closed"}, {"method": "update", "target": 0, "title": "t"}),
     ("create_github_issue", "github_write", {"method": "create_issue", "title": "T"}, {"method": "comment", "target": 0, "body": "x"}),
+    ("create_github_pr", "github_write", {"method": " create_pr ", "title": "T"}, {"method": "create_issue", "title": " "}),
+    ("update_github_pr", "github_write", {"method": "update", "kind": "pr", "target": 7, "title": "T"}, {"method": "update", "kind": "pr", "target": 0, "draft": False}),
+    ("update_github_pr", "github_write", {"method": "update", "kind": "issue", "target": 7, "body": ""}, {"method": "update", "target": 0, "state": "closed"}),
+    ("update_github_pr", "github_write", {"method": "update", "target": 7, "base": "main"}, {"method": "comment", "target": 0}),
+    ("set_github_pr_ready", "github_write", {"method": " update ", "kind": " pr ", "target": 7, "draft": False}, {"method": "update", "kind": "pr", "target": 0, "body": ""}),
+    ("set_github_pr_ready", "github_write", {"method": "update", "kind": "pr", "target": 7, "draft": True}, {"method": "create_pr"}),
+    ("get_github_run_log", "github_read", {"method": " get ", "kind": " run ", "target": 11, "include": ["log"]}, {"method": "get", "kind": "run", "target": 0}),
+    ("list_github_run_artifacts", "github_read", {"method": "list", "kind": "artifact", "target": 11}, {"method": "download", "kind": "artifact", "target": 0}),
+    ("download_github_artifact", "github_read", {"method": "download", "kind": "artifact", "target": 22}, {"method": "list", "kind": "artifact", "target": 0}),
 ]
 
 
 @pytest.mark.parametrize("retired,successor,blocked_call,allowed_call", _RETIRED_GITHUB_CASES)
 def test_a_retired_github_name_withholds_its_successor_methods(tmp_path, monkeypatch, retired, successor, blocked_call, allowed_call):
-    """The nine narrow GitHub tools became methods of github_read / github_write; a saved contract that
+    """The narrow GitHub tools became methods of github_read / github_write; a saved contract that
     withheld one keeps withholding the method(s) it covered, plus the api hatch, and nothing else."""
     from ouroboros.tools import github
     from ouroboros.tools.registry_guards import _GITHUB_TOKEN_TOOLS, _RETIRED_GITHUB_TOOLS
 
     monkeypatch.setattr(github, "github_token_from_env_or_settings", lambda: "fixture-token")
-    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
-    monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_SAFETY_MODE", "off")
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *_a, **_k: (True, ""))
     repo, data = tmp_path / "repo", tmp_path / "data"
     repo.mkdir()
     data.mkdir()
@@ -354,6 +362,7 @@ def test_a_retired_github_name_withholds_its_successor_methods(tmp_path, monkeyp
     contract = build_task_contract({"description": "x", "disabled_tools": [successor]})
     reg.set_context(ToolContext(repo_dir=repo, drive_root=data, task_metadata={"task_contract": contract}))
     assert successor not in set(reg.available_tools()) and reg.get_schema_by_name(successor) is None
+    assert reg.execute_result(successor, allowed_call).status == "blocked"
     reg.set_context(ToolContext(repo_dir=repo, drive_root=data))
     assert reg.execute(retired, {}).startswith("⚠️ Unknown tool")
     assert successor in set(reg.available_tools())

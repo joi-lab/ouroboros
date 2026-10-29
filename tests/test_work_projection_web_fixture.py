@@ -49,6 +49,17 @@ CASES = {
               owner_wait={"quiz_id": "q1", "owner_wait_state": "waiting", "quiz_state": "open"})],
         {}, {}, {},
     ),
+    # A direct turn still preparing says the start step it stands at beside Preparing.
+    "direct_preparing": (
+        [_row("dp", "preparing", kind="direct_chat", chat_id=1, client_message_id="cm-prep",
+              turn_phase="context_building")],
+        {}, {}, {},
+    ),
+    # Its own Main call started before its census phase moved: the word that move gives (Working), no start step.
+    "direct_requested": (
+        [_row("dr", "preparing", kind="direct_chat", chat_id=1, client_message_id="cm-call", turn_phase="requested")],
+        {}, {}, {},
+    ),
     "paused_by_owner": (
         [_row("o", "budget_paused", pause_cause="owner", can_resume=False)],
         {"o": {"_budget_pause": {"reason": "owner", "paused_at": "2026-10-17T15:00:00Z"}}}, {}, {},
@@ -164,7 +175,8 @@ def test_the_web_fixture_is_the_servers_projection():
 
 
 @pytest.mark.parametrize("name, activity", [
-    ("held_continue", "working"), ("direct_question", "waiting"), ("paused_by_owner", "paused"),
+    ("held_continue", "working"), ("direct_question", "waiting"), ("direct_preparing", "working"),
+    ("direct_requested", "working"), ("paused_by_owner", "paused"),
     ("spending_limit", "paused"), ("queued_and_pausing", "working"), ("unknown", "unknown"),
     ("helper_after_parent", "working"), ("paused_review_finishing", "paused"), ("unconfirmed_run", "unknown"),
     ("paused_unattributed", "paused"), ("pausing_with_queued_helper", "working"), ("two_works_one_pausing", "working"),

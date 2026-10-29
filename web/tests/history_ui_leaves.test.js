@@ -90,7 +90,9 @@ test('compact Chat removes internal write/status metadata while preserving execu
     assert.equal(view.terminal, true);
     assert.equal(view.headline, 'Researcher');
     assert.equal(view.body, event.result);
-    assert.equal(view.fullBody, `[RESULT]\n${event.result}`);
+    // A completed child's result is its report to its parent: the label replaces [RESULT] and leads the preview.
+    assert.equal(view.fullBody, `## Report to parent\n${event.result}`);
+    assert.equal(view.activityLead, 'Report to parent');
     assert.equal(view.model, event.model);
     assert.equal(view.executorChip.label, 'Cursor');
     assert.ok(summarizeLogEvent(event).meta.includes('write=workspace'));

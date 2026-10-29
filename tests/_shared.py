@@ -316,11 +316,12 @@ def write_queue_document(path, payload):
 # `test_llm_no_proxy` parameter-rejection retry then has nothing left to drop).
 _PROVIDER_CATALOG_CLASS_STATE = (
     "_SUPPORTED_PARAMS_CACHE", "_SUPPORTED_PARAMS_FETCHED",
-    "_CONTEXT_LENGTH_CACHE", "_CAPABILITIES_FETCH_OK",
+    "_CONTEXT_LENGTH_CACHE", "_CONTEXT_LENGTH_OBSERVED_AT", "_CAPABILITIES_FETCH_OK", "_CAPABILITIES_FAILED_AT",
 )
 _PROVIDER_CATALOG_PRISTINE = {
     "_SUPPORTED_PARAMS_CACHE": {}, "_SUPPORTED_PARAMS_FETCHED": False,
-    "_CONTEXT_LENGTH_CACHE": {}, "_CAPABILITIES_FETCH_OK": False,
+    "_CONTEXT_LENGTH_CACHE": {}, "_CONTEXT_LENGTH_OBSERVED_AT": "", "_CAPABILITIES_FETCH_OK": False,
+    "_CAPABILITIES_FAILED_AT": "",
 }
 
 
@@ -354,3 +355,51 @@ def offline_provider_catalog(monkeypatch):
         yield saved
     finally:
         _restore_provider_catalog(LLMClient, saved)
+
+
+def saved_settings(monkeypatch, tmp_path, **values):
+    """Point the settings document at the test's own tree and save ``values`` there (merged into a document
+    this helper already wrote at that path).
+
+    Route keys (``route_choice.ROUTE_SETTING_KEYS``: model slots, local flags, accounts, provider keys)
+    read the document as it is now, in a task or not, and an unauthored slot takes its proposal — so
+    "no fallback chain" is a SAVED blank Fallbacks, never an absent environment variable, and a model
+    the test needs is a saved slot (a saved slot beats the environment). ``tmp_path=None`` keeps the
+    path a previous call of this helper bound. Returns the document path."""
+    from ouroboros import config
+
+    path = pathlib.Path(tmp_path) / "settings.json" if tmp_path is not None else pathlib.Path(config.SETTINGS_PATH)
+    if tmp_path is not None:
+        monkeypatch.setattr(config, "SETTINGS_PATH", path)
+    document = {}
+    if path.exists() and getattr(saved_settings, "_wrote", None) == str(path):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            document = {}
+    document = {**(document if isinstance(document, dict) else {}), **values}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+    saved_settings._wrote = str(path)
+    return path
+
+
+def write_legacy_capability_rows(root, *, effort_ceilings=None, effort_floors=None, rejected_params=None):
+    """Leave model-global rows in ``root``'s capability-evidence store in the shape releases before
+    exact-route request-wire recovery learned them. The store still loads them; nothing reads them."""
+    from ouroboros import capability_evidence as ce
+    from ouroboros.utils import utc_now_iso
+
+    observed_at = utc_now_iso()
+    with ce._store_transaction(root):
+        data = ce._load(root)
+        for key, ceiling in (effort_ceilings or {}).items():
+            data["effort_ceilings"][key] = {"ceiling": ceiling, "observed_at": observed_at,
+                                            "reason": "provider_rejected", "prev": ""}
+        for key, floor in (effort_floors or {}).items():
+            data["effort_floors"][key] = {"floor": floor, "observed_at": observed_at,
+                                          "reason": "provider_required", "prev": ""}
+        for key, params in (rejected_params or {}).items():
+            data["rejected_params"][key] = {"params": sorted(params), "observed_at": observed_at,
+                                            "reason": "provider_rejected"}
+        assert ce._save(root, data)

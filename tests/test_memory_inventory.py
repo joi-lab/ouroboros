@@ -234,6 +234,39 @@ def test_an_accounts_period_is_the_union_of_its_sources_and_it_seals_no_row(tmp_
     assert mi.record_period(store, {**account, "sources": []}, _units(tmp_path)) == mi.Period(None, -1, "rows")
 
 
+def test_a_parts_period_reads_no_retelling_whose_unit_holds_its_rows(tmp_path, monkeypatch):
+    """A part over retold sections is dated by their units' rows, as when each section is read whole; the
+    retellings themselves are not read."""
+    rooms = shared.world(tmp_path)
+    alpha = str(rooms["alpha"])
+    store = ChronicleStore(tmp_path)
+    sections = [f"legacy-b00-r{alpha}", f"legacy-b01-r{alpha}"]
+    part = store.get(_part(tmp_path, alpha, sections)["id"])
+    units = _units(tmp_path)
+    assert all(units[section].ts_span for section in sections)
+    read, real = [], ChronicleStore.get
+    monkeypatch.setattr(ChronicleStore, "get", lambda self, record_id: read.append(record_id) or real(self, record_id))
+    period = mi.record_period(store, part, units)
+    assert period.span and period.source == "rows" and not set(read) & set(sections)
+    monkeypatch.setattr(mi, "_member", lambda get, _units, member_id: get(member_id))  # every member read whole
+    assert mi.record_period(store, part, units) == period and set(sections) <= set(read)
+
+
+def test_a_capture_reads_the_legacy_pointers_once_for_all_its_readers(tmp_path, monkeypatch):
+    from ouroboros.chronicle_store import capture
+
+    shared.world(tmp_path)
+    store = ChronicleStore(tmp_path)
+    expected = store.legacy_pointer_rows()
+    calls, real = [], ChronicleStore.legacy_pointer_rows
+    monkeypatch.setattr(ChronicleStore, "legacy_pointer_rows", lambda self: calls.append(1) or real(self))
+    monkeypatch.setattr(mi, "_UNITS", {})  # the units are counted anew
+    with capture(tmp_path):
+        assert mi.legacy_units(store, tmp_path) and mi.legacy_pointers(store) == expected
+    assert calls == [1]
+    assert mi.legacy_pointers(store) == expected and calls == [1, 1]  # outside a capture each call reads
+
+
 # --- open segments --------------------------------------------------------------------------------
 
 def _shas(entries):

@@ -67,7 +67,7 @@ test('plan history shows the fact only on the decision that claimed it', () => {
         expandedGroups: new Set([group.id]),
         expandedAttempts: new Set([`${group.id}:${group.attempts[0].id}`]),
     });
-    assert.match(html, /Author finish: partial/);
+    assert.match(html, /<dt>Author finish<\/dt><dd>partial · /);
     assert.match(html, /Check replaced by subagents: I used a helper\./);
     assert.match(html, /do not create PASS/);
 });

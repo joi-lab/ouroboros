@@ -290,6 +290,44 @@ test('a widget card whose skill is off keeps its words and says so', async () =>
     }
 });
 
+test('a classic widget frame survives a same-bytes republication; an ESM card follows its publication', async () => {
+    const dom = installCardDom();
+    let tab = { key: 'clock:face', skill: 'clock', tab_id: 'face', revision: '1', generation: 'g1',
+        render: { kind: 'module', entry: 'widget.js' } };
+    const server = serve({
+        'GET /api/cards/card_p1': json(200, { card_id: 'card_p1', kind: 'widget', title: 'Clock', fallback_text: '10:00', revision: 1,
+            widget: { skill: 'clock', tab_id: 'face' }, submissions_summary: [] }),
+        'GET /api/widgets': () => json(200, { ui_tabs: [tab] }),
+        'GET /api/extensions/clock/module/widget.js': page('// reviewed module'),
+    });
+    try {
+        const cards = feed();
+        const republish = async (change) => {
+            tab = { ...tab, ...change };
+            cards.lifecycle({ skill: 'clock', action: 'enabled' });  // the shared widget list is read fresh
+            await flush();
+        };
+        cards.lifecycle({ skill: 'clock', action: 'enabled' });
+        const bubble = cards.buildCard(identity('card_p1', 'widget', { card: { card_id: 'card_p1', kind: 'widget', title: 'Clock', revision: 1 }, fallback_text: '10:00' }));
+        await flush();
+        bubble.querySelector('[data-card-open]').click();
+        await flush();
+        const frame = bubble.querySelector('iframe');
+        assert.ok(frame, 'the classic frame runs');
+        await republish({ generation: 'g2' });
+        assert.equal(bubble.querySelector('iframe'), frame, 'same revision, new publication: the classic frame keeps running');
+        await republish({ render: { kind: 'module', entry_type: 'module', entry: 'app/main.js' } });
+        const face = bubble.querySelector('.chat-card-face');
+        assert.ok(face && !bubble.querySelector('iframe'), 'a changed declaration draws the card again');
+        await republish({ generation: 'g3' });
+        assert.notEqual(bubble.querySelector('.chat-card-face'), face, 'an ESM card is bound to its publication');
+        cards.destroy();
+    } finally {
+        server.restore();
+        dom.restore();
+    }
+});
+
 test('the live card frame and its history row are one row; replay draws it before final handling', async () => {
     const dom = installCardDom();
     const server = serve({ 'GET /api/cards/card_r1': json(200, componentsBody('card_r1')) });

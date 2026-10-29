@@ -570,4 +570,8 @@ def test_an_ordinary_cycle_appends_whatever_a_seam_calls_its_rewrite(installed_p
                    "[DELIVERY_FINALIZATION_CONTROL]", "[INDEPENDENT_ROOTS]", "Owner follow-up"):
         assert marker in final, marker
     snapshots = [m for m in f.model_inputs[-1] if m.get(HOST_CONTEXT_KIND_KEY) == skill_context_snapshot.SNAPSHOT_KIND]
-    assert len(snapshots) >= 5 if variant == "changing_snapshot" else len(snapshots) == 1
+    # A text that changes every round cannot multiply in the conversation: its full text once, then one
+    # outdated note naming where the current text is read, until the conversation is next rebuilt.
+    assert len(snapshots) == (2 if variant == "changing_snapshot" else 1)
+    if variant == "changing_snapshot":
+        assert '"state": "outdated"' in snapshots[-1]["content"] and '"text":' not in snapshots[-1]["content"]

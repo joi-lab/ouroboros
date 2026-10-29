@@ -11,6 +11,13 @@ from supervisor.schedule_time import parse_schedule_time, timezone_for_schedule
 _LEGACY_NAME = re.compile(r"^(Follow-up|Reminder) of task \S+$")
 
 
+def authored_name(record: dict[str, Any]) -> str:
+    """The schedule's own name; "" for the host's placeholder (``Follow-up of task <id>``), which
+    names no work: surfaces read the request's first line instead."""
+    name = str(record.get("name") or "")
+    return "" if _LEGACY_NAME.fullmatch(name) else name
+
+
 def _is_consumed_once(record: dict[str, Any]) -> bool:
     """A one-shot that already fired: a durable receipt, not a standing schedule."""
     trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}

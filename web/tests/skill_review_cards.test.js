@@ -5,7 +5,6 @@ import test from 'node:test';
 import {
     SKILL_REVIEW_DETAIL_CAP,
     loadSkillReviewDetail,
-    nestedSkillReviewRef,
     renderSkillReviewDisclosure,
     summarizeSkillReviewMessage,
     wireSkillReviewDisclosure,
@@ -145,7 +144,7 @@ test('loaded and in-flight containers are never refetched', async () => {
     assert.equal(attempts, 1);
 });
 
-test('nested attempts reuse the instance exact-job store after DOM rebuild', async () => {
+test('a rebuilt detail container reuses the instance exact-job store', async () => {
     const store = new Map();
     let fetches = 0;
     const deps = {
@@ -158,9 +157,6 @@ test('nested attempts reuse the instance exact-job store after DOM rebuild', asy
     await loadSkillReviewDetail(rebuilt, { skill: 'alpha', jobId: 'nested-job' }, deps);
     assert.equal(fetches, 1);
     assert.match(rebuilt.innerHTML, /cached exact detail/);
-    assert.deepEqual(nestedSkillReviewRef({ dataset: {
-        skillReviewSkill: 'alpha', skillReviewJob: 'nested-job',
-    } }), { skill: 'alpha', jobId: 'nested-job' });
 });
 
 test('the instance store is trimmed FIFO past the cap by the loader itself (issue #135)', async () => {
@@ -427,9 +423,7 @@ test('one job reads its record once; a later job of the same record reads it aga
     assert.match(collected.innerHTML, /blockers: path_confinement/);
 });
 
-test('nested attempts and wired bubbles carry the record id into the reference', async () => {
-    assert.deepEqual(nestedSkillReviewRef({ dataset: { skillReviewSkill: 'alpha', skillReviewJob: 'j2', skillReviewRecord: 'rec-9' } }),
-        { skill: 'alpha', jobId: 'j2', recordId: 'rec-9' });
+test('a wired bubble carries the record id into the reference', async () => {
     const stub = makeBubble({ skill: 'alpha', jobId: 'j2', recordId: 'rec-9' });
     const calls = [];
     wireSkillReviewDisclosure(stub.bubble, {

@@ -17,6 +17,7 @@ from supervisor.state import (
     append_jsonl, atomic_write_text, load_state, save_state, update_state,  # noqa: F401
 )
 from ouroboros import config as _config
+from ouroboros.git_observation import host_git_env
 from ouroboros.utils import utc_now_iso  # noqa: F401
 
 log = logging.getLogger(__name__)
@@ -297,16 +298,16 @@ def _run_git_process_bounded(
 
 
 def git_capture(
-    cmd: List[str], *, timeout: Optional[float] = None, repair_index: bool = True,
+    cmd: List[str], *, timeout: Optional[float] = None, repair_index: bool = False,
 ) -> Tuple[int, str, str]:
-    # A caller interpreting one physical command's effects can opt out of repair/retry;
-    # the final stderr alone cannot describe an earlier attempt or its index rebuild.
+    # Repair is a writer's explicit opt-in, never a side effect of observation.
+    # The final stderr alone cannot describe an earlier attempt or its index rebuild.
     # Same reason as utils.run_cmd: this stderr is PARSED (`_maybe_repair_git_index`
     # matches English git diagnostics), so the operator's locale must not decide
     # whether a repairable index error is recognised.
     # ``timeout`` is None for existing non-rescue call sites: a bound here is a
     # behavior change, so it stays opt-in rather than silently retiming them.
-    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    env = host_git_env()
     repo = current_repo_dir()
     for _attempt in range(2):
         if timeout is None:

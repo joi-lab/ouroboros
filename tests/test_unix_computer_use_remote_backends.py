@@ -1,16 +1,19 @@
 import importlib.util
 import pathlib
+import sys
 import struct
+import urllib.request
 
 
 def _load_plugin():
     root = pathlib.Path(__file__).resolve().parents[1]
+    plugin_path = root / "skills" / "unix_computer_use" / "plugin.py"
     spec = importlib.util.spec_from_file_location(
-        "unix_computer_use_plugin",
-        root / "skills" / "unix_computer_use" / "plugin.py",
+        "unix_computer_use_plugin", plugin_path, submodule_search_locations=[str(plugin_path.parent)],
     )
     mod = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -261,14 +264,14 @@ def test_remote_screenshot_cap_and_invalid_png_cleanup(tmp_path, monkeypatch):
 
     # Oversized download -> not ok, nothing kept.
     big = b"\x89PNG\r\n\x1a\n" + b"x" * (mod._MAX_REMOTE_SHOT_BYTES + 10)
-    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda *a, **k: _Resp(big))
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp(big))
     out = _json_mod.loads(impl.screenshot())
     assert out["ok"] is False and "cap" in out["error"]
 
     # Garbage (non-PNG) bytes -> not ok, file removed. The fetch path retries a
     # corrupt body a bounded number of times and then fails CLOSED; nothing is
     # published either way, which is the property this test guards.
-    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda *a, **k: _Resp(b"not-a-png-body"))
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp(b"not-a-png-body"))
     monkeypatch.setattr(mod.time, "sleep", lambda s: None)
     out = _json_mod.loads(impl.screenshot())
     assert out["ok"] is False and "screenshot_corrupt" in out["error"]
@@ -283,7 +286,7 @@ def test_remote_screenshot_cap_and_invalid_png_cleanup(tmp_path, monkeypatch):
     _buf = _io.BytesIO()
     _Image.new("RGB", (8, 8), (1, 2, 3)).save(_buf, format="PNG")
     header_ok_body_dead = _buf.getvalue()[:40] + b"\x00" * 200
-    monkeypatch.setattr(mod.urllib.request, "urlopen",
+    monkeypatch.setattr(urllib.request, "urlopen",
                         lambda *a, **k: _Resp(header_ok_body_dead))
     out = _json_mod.loads(impl.screenshot())
     assert out["ok"] is False and "screenshot_corrupt" in out["error"]

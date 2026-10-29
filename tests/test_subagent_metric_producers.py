@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros import subagent_metrics as metrics
+from ouroboros import maintenance, subagent_metrics as metrics
 from ouroboros.review_records import ReviewActorRecord, ReviewRequest, ReviewSlot
 from ouroboros.review_seat_outcome import finalize_seat_outcome, publish_seat_execution
 from ouroboros.subagent_history import record_session_execution, record_task_execution
@@ -30,6 +30,7 @@ def test_api_history_selects_original_identity_and_observed_call_accounts(tmp_pa
     append_jsonl(tmp_path / "logs/events.jsonl", {"type": "llm_round", "llm_call_id": "call-one",
         "task_id": "root", "ledger_attempt_ids": ["attempt"], "physical_attempt_id": "attempt"})
     record_task_execution(task, {"llm_call_refs": [call, {**call, "llm_call_id": "other", "model": "fallback"}]}, drive_root=tmp_path)
+    maintenance.run_job(tmp_path, "subagent_metrics")
     row = metrics.read(tmp_path, "worker")["rows"][0]
     assert row["dispatched"] == row["answer_received"] == 1
     assert row["usable_verdict"] == 0  # execution text does not claim a review verdict
@@ -61,6 +62,7 @@ def test_api_duration_samples_use_ledger_stamps_not_late_receipt_time(tmp_path, 
         "route": {"kind": "api_model", "target_id": "test/model"}}}
     record_task_execution(task, {"llm_call_refs": [{"llm_call_id": "call", "model": "test/model",
         "usable_solve_response": True, "response_ref": {"call_id": "response"}}]}, drive_root=tmp_path)
+    maintenance.run_job(tmp_path, "subagent_metrics")
     row = metrics.read(tmp_path, "worker")["rows"][0]
     assert row["duration_samples"] == ({"count": 0, "sum_sec": 0} if late else {"count": 1, "sum_sec": 5})
     assert row["queue"]["fact"]["sum_sec"] == 2
@@ -84,6 +86,7 @@ def test_real_api_error_producer_separates_received_output_from_usability(wire_e
     task = {"id": stream.CHILD, "configured_subagent": {"selected_subagent_id": "worker",
         "route": {"kind": "api_model", "target_id": stream.MODEL}}}
     record_task_execution(task, usage, drive_root=wire_env)
+    maintenance.run_job(wire_env, "subagent_metrics")
     with store.open_store(wire_env, write=False) as txn:
         producer = txn.get_row(metrics.PRODUCERS, "call:" + call["llm_call_id"])
     assert producer["answer_received"] is expected and producer["usable_solve_response"] is False
@@ -104,6 +107,7 @@ def test_api_history_distinguishes_proven_silence_from_absent_receipt(tmp_path, 
     with store.open_store(tmp_path, write=False) as txn:
         producer = txn.get_row(metrics.PRODUCERS, "call:call")
     assert producer["answer_received"] is received and producer["usable_solve_response"] is False
+    maintenance.run_job(tmp_path, "subagent_metrics")
     row = metrics.read(tmp_path, "worker")["rows"][0]
     assert row["answer_received"] == 0 and row["no_answer"] == int(received is False)
 
@@ -121,6 +125,7 @@ def test_absent_api_receipt_fact_stays_unknown_through_pending_and_interruption(
     with store.open_store(tmp_path, write=False) as txn:
         producer = txn.get_row(metrics.PRODUCERS, "call:call")
     assert producer["answer_received"] is None and producer["terminal"] is terminal
+    maintenance.run_job(tmp_path, "subagent_metrics")
     row = metrics.read(tmp_path, "worker")["rows"][0]
     assert row["answer_received"] == row["no_answer"] == 0
     assert row["pending"] == int(not terminal) and row["interrupted"] == int(interrupted)
@@ -141,6 +146,7 @@ def test_canonical_review_publication_separates_received_and_usable(tmp_path, mo
     finalize_seat_outcome(request, slot, actor)
     ctx = SimpleNamespace(drive_root=tmp_path, budget_drive_root=tmp_path)
     publish_seat_execution(request, slot, actor, ctx)
+    maintenance.run_job(tmp_path, "subagent_metrics")
     row = metrics.read(tmp_path, "worker")["rows"][0]
     assert row["answer_received"] == 1
     assert row["usable_verdict"] == int(usable)
@@ -172,6 +178,7 @@ def test_session_plan_and_execution_collection_keep_identity_and_nanny_separate(
         record_session_execution(tmp_path, custody, {"summary": {"state": "succeeded", "answer_received": True,
             "startedAt": "2026-10-22T00:00:00Z", "finishedAt": "2026-10-22T00:00:05Z", "durationSec": 5}},
                                  {"model": "served", "profile_id": "subscription-account"})
+    maintenance.run_job(tmp_path, "subagent_metrics")
     rows = metrics.read(tmp_path, "worker")["rows"]
     assert {row["purpose"] for row in rows} == {"plan", "execution"}
     assert all(row["nanny_billing"]["fact"]["model"] == "paid/api" for row in rows)

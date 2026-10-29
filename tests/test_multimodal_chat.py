@@ -156,7 +156,7 @@ class TestImageEviction:
         live = SimpleNamespace(messages=[{"role": "user", "content": [_image_block(str(idx))]}
                                          for idx in range(LIVE_IMAGE_BLOCKS_HIGH_WATER)])
         monkeypatch.setattr(vision, "_load_local_image_payload", lambda _ctx, _path, retain_original=False: (
-            {"base64": "QUFB", "mime": "image/png", "source_path": "/tmp/shot.png"}, ""))
+            {"base64": "QUFB", "mime": "image/png", "source_path": "/tmp/shot.png", "source_sha256": "fixture"}, ""))
         staged = SimpleNamespace(messages=live.messages)
         ok, _note = vision.attach_local_image_to_context(staged, "shot.png", stamp=live)
         assert ok and getattr(live, SANCTION_ATTR, None) == "image_eviction"
@@ -245,14 +245,19 @@ class TestCompactionAndLanes:
         from ouroboros.llm import LLMClient
 
         cleaned = LLMClient._copy_messages_with_cache_policy(
-            [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "u"}, "_caption": "c", "_source_path": "p"},
+            [{"role": "tool", "tool_call_id": "i", "content": "staged", "_review_image_id": "1:i"},
+             {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "u"}, "_caption": "c", "_source_path": "p",
+                 "_source_sha256": "hash", "_review_image_id": "1:i"},
             ]}],
             allow_message_cache_control=False,
             flatten_tool_content_blocks=False,
         )
-        block = cleaned[0]["content"][0]
+        assert "_review_image_id" not in cleaned[0] and cleaned[0]["tool_call_id"] == "i"
+        block = cleaned[1]["content"][0]
         assert "_caption" not in block and "_source_path" not in block
+        assert "_source_sha256" not in block and "_review_image_id" not in block
+        assert block["image_url"] == {"url": "u"}
 
     def test_vision_preparation_runs_outside_main_physical_binding(self, tmp_path, monkeypatch):
         from ouroboros import usage_accounting as ua

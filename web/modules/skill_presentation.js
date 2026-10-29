@@ -272,14 +272,13 @@ export function trustValueText(source = {}) {
 }
 
 /**
- * A skill's or connector's icon (`{name?, svg?}` from the host's projection) drawn in the house stroke style by
- * `renderSkillIcon` (page_icons.js, the host keeps only the geometry, currentColor); without it, the house glyph
- * for a named control or for a skill. The label beside it always says what it is.
+ * Pass the host's SVG or named glyph spec to `renderSkillIcon`; legacy `{name}` specs also keep their glyph.
+ * An absent or unknown icon uses the house plug. The label beside it always says what it is.
  */
 export function skillIconHtml(icon, size = 18) {
     const render = pageIcons.renderSkillIcon;
     if (typeof render === 'function') {
-        try { return render(icon || {}, size); } catch { /* the house glyph below */ }
+        try { return render(icon || {}, { size }); } catch { /* the house glyph below */ }
     }
     return pageIcons.controlIcon(icon?.name || '', size);
 }
@@ -302,3 +301,6 @@ export function countsAsYoursText(item) {
     const injects = permissions.some((permission) => String(permission || '').split(':')[0] === 'inject_chat');
     return injects && !connectsServices(item).length ? 'Messages from here count as yours' : '';
 }
+
+/** A connector's contribution supplies its public label; ids remain canonical. */
+export const skillTitle = (skill) => skill.title || skill.contributes?.find((row) => row.provides === 'place' && row.label)?.label || skill.name;

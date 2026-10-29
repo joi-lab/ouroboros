@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -18,6 +19,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 import yaml
 
+from ouroboros import utils
 from ouroboros.markdown_source import MarkdownSource, parse_markdown_navigation, parse_markdown_source
 from ouroboros.platform_layer import file_lock_exclusive, file_unlock
 from ouroboros.utils import append_jsonl, utc_now_iso, write_bytes_atomic
@@ -25,7 +27,12 @@ from ouroboros.utils import append_jsonl, utc_now_iso, write_bytes_atomic
 INDEX_FILE = "index-full.md"
 UNKNOWN_STAMP = "unknown"  # a history stamp the writer could not name; legacy rows read the same way
 OVERVIEW_TOPIC = "overview"
-ALWAYS_ACTIVE_TOPICS = frozenset({OVERVIEW_TOPIC, "patterns", "improvement-backlog"})
+# Only the overview, the shared orientation every integrating context loads, must stay active.
+ALWAYS_ACTIVE_TOPICS = frozenset({OVERVIEW_TOPIC})
+# Topics with one global home whichever room addresses them. ``patterns`` and
+# ``improvement-backlog`` are ordinary notes; they keep their old global address
+# so an earlier call from a project room still reaches the one existing note.
+GLOBAL_ADDRESS_TOPICS = frozenset({OVERVIEW_TOPIC, "patterns", "improvement-backlog"})
 _INDEX_HEADER = "# Knowledge Base Index\n<!-- ouroboros:knowledge-index:1 -->\n\n"
 _LEGACY_INDEX_MARKER = "\n<!-- ouroboros:legacy-knowledge-index -->\n"
 
@@ -272,8 +279,8 @@ def _archive_error(topic: str, metadata: Mapping[str, Any]) -> str:
     return ""
 
 
-def _navigation_descriptor(address: KnowledgeAddress) -> dict[str, Any]:
-    raw = address.path.read_bytes()
+def _navigation_descriptor(address: KnowledgeAddress, raw: bytes | None = None) -> dict[str, Any]:
+    raw = address.path.read_bytes() if raw is None else raw
     raw.decode("utf-8")  # unreadable bytes remain a read_error, as in full inventory
     try:
         metadata, title = parse_markdown_navigation(raw, str(address.path))
@@ -285,16 +292,38 @@ def _navigation_descriptor(address: KnowledgeAddress) -> dict[str, Any]:
             "archive": metadata.get("archive"), "archive_error": error}
 
 
+# a note's address -> (what proves its bytes unchanged, its navigation row); a listing drops deleted notes
+_NAVIGATION: Dict[KnowledgeAddress, tuple] = {}
+
+
+def _navigation_row(address: KnowledgeAddress) -> dict[str, Any]:
+    """``_navigation_descriptor``, parsed again only when the note's bytes may have changed: while its
+    file identity holds (``utils.file_identity``, the rule ``utils.json_snapshot`` keeps on every OS;
+    Windows' ``st_ctime`` is the creation time, its in-place writes move the mtime), settled beyond a
+    clock tick. A row with a parse error is never kept."""
+    started = time.time_ns()
+    info = os.stat(address.path)  # before the read: a write after it moves the identity
+    key, settled = utils.file_identity(info), max(info.st_mtime_ns, info.st_ctime_ns) < started - utils._RACY_NS
+    held = _NAVIGATION.get(address)
+    if held is not None and held[0] == key:
+        return dict(held[1])
+    row = _navigation_descriptor(address)
+    if settled and not row.get("parse_error"):
+        _NAVIGATION[address] = (key, row)
+    return dict(row)
+
+
 def inventory_knowledge(address: KnowledgeAddress, *, navigation: bool = False,
                         known_note: KnowledgeNote | None = None) -> tuple[dict[str, Any], ...]:
     """Enumerate the current shelf without writes; navigation omits source proofs.
 
-    A note already read by this operation can be reused. Nothing survives the
-    operation: external edits and missing/failed index publications stay visible.
+    A note already read by this operation can be reused. A note's navigation is
+    reused only while its identity proves the bytes unchanged: external edits and
+    missing/failed index publications stay visible.
     """
     if not address.shelf.exists():
         return ()
-    rows = []
+    rows, listed = [], set()
     for path in sorted(address.shelf.rglob("*.md")):
         if path == address.shelf / INDEX_FILE:
             continue
@@ -304,12 +333,16 @@ def inventory_knowledge(address: KnowledgeAddress, *, navigation: bool = False,
             item.path.resolve().relative_to(address.shelf.resolve())
         except ValueError:
             continue
+        listed.add(item)
         try:
             rows.append(note_descriptor(known_note) if known_note is not None and item.path == known_note.address.path
-                        else _navigation_descriptor(item) if navigation else note_descriptor(read_knowledge_note(item)))
+                        else _navigation_row(item) if navigation else note_descriptor(read_knowledge_note(item)))
         except (OSError, UnicodeDecodeError) as exc:
             rows.append({**item.as_dict(), "title": topic, "summary": "", "revision": None,
                          "read_error": type(exc).__name__})
+    if navigation:
+        for gone in [held for held in _NAVIGATION if held.shelf == address.shelf and held not in listed]:
+            del _NAVIGATION[gone]
     return tuple(rows)
 
 
@@ -337,6 +370,8 @@ def render_knowledge_index(rows: tuple[dict[str, Any], ...], legacy_context: str
         summary = row.get("summary")
         if include_summaries and isinstance(summary, str) and summary:
             line += "\n" + "\n".join("  " + part for part in summary.splitlines())
+        elif include_summaries and state != "archived" and not row.get("read_error") and not row.get("parse_error"):
+            line += " (no summary)"  # a gap the author sees; nothing is synthesized from the body
         if row.get("read_error") or row.get("parse_error") or row.get("archive_error"):
             line += "\n  (source metadata unavailable; read the original note)"
         entries.append(line)
@@ -580,7 +615,7 @@ def write_knowledge_note(
     if mode not in {"overwrite", "append", "edit", "archive", "restore"} or not isinstance(content, str):
         raise ValueError("content must be Markdown text; mode must be overwrite, append, edit, archive or restore")
     if (lifecycle and content) or (mode == "archive" and address.topic in ALWAYS_ACTIVE_TOPICS):
-        raise ValueError("archive/restore take no content; overview, patterns and improvement-backlog must stay active")
+        raise ValueError("archive/restore take no content; the overview must stay active")
     if not isinstance(reason, str) or (mode == "archive" and not reason.strip()) or (reason and mode != "archive"):
         raise ValueError("reason is required for archive and used only with archive")
     if mode != "edit" and old_str is not None:
@@ -656,9 +691,9 @@ def write_knowledge_note(
                  "change_chars": len(updated.text) - len(old_text), "removed_headings": removed_headings,
                  "body_changed": old_body != raw[updated.source.body_span.start_byte:] if known else None,
                  "summary_changed": old_summary != updated.summary if known else None}
-        # Capture both complete versions before replacing source bytes, as the
-        # Pattern Register already does. A capture is not a commit receipt; a
-        # failed publication returns its actual current source, never success.
+        # Capture both complete versions before replacing source bytes. A capture
+        # is not a commit receipt; a failed publication returns its actual
+        # current source, never success.
         history = {"ts": utc_now_iso(), "task_id": task_id, "topic": address.topic, "mode": mode,
                    "address": address.as_dict(), "publication": "source_capture",
                    "writer": writer or UNKNOWN_STAMP, "route": route or UNKNOWN_STAMP,

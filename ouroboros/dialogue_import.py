@@ -175,7 +175,7 @@ def cutover(root: Any, *, initialize_journal: bool = False) -> Dict[str, Any]:
                     else contextlib.nullcontext():
                 report["journal_selected"] = store_journal.configure_journal(ds.path(root), tier, wait_sec=ds.WAIT_SEC)
         if ds.meta(root, "cutover") is not None and not _replan_owed(root):
-            report.update(first=False, replanned=False)  # the steady boot: two stats and one job fact
+            report.update(first=False, replanned=False)  # the steady boot: three stats and two meta rows, no listing
             return report
     else:
         ds.create(root)
@@ -201,7 +201,9 @@ def cutover(root: Any, *, initialize_journal: bool = False) -> Dict[str, Any]:
             marks = {record["stream"]: dict(record) for record in conn.execute("SELECT * FROM streams")}
             facts = {"at": utc_now_iso(), **{stream: marks[stream] for stream in ds.STREAMS}}
             ds._set_meta(conn, "cutover" if first else "reconciled", facts)
-            ds._set_meta(conn, "archive_tails", _archive_tails(root))  # what this plan saw (``_replan_owed``)
+            stamp, tails = _archive_seen(root)
+            ds._set_meta(conn, "archive_tails", tails)  # what this plan saw (``_replan_owed``)
+            ds._set_meta(conn, "archive_stamp", stamp)
             for stream in ds.STREAMS:
                 # A live file rotated into the archive (by this run, or by one a stop interrupted after the
                 # rename: the live file is now shorter than the batch's offset) holds no export batch any more.
@@ -217,6 +219,24 @@ def _live_size(root: pathlib.Path, stream: str) -> int:
         return (root / ds.LIVE_REL[stream]).stat().st_size
     except FileNotFoundError:
         return 0
+
+
+def _archive_stamp(root: pathlib.Path) -> List[int]:
+    """The archive directory's identity and mtime (``[st_ino, st_mtime_ns]``; ``[]`` without the
+    directory): a segment added to or removed from it moves the mtime, whatever its stream, as
+    ``delegate_custody_current._archive_stamp`` relies on for the custody chain."""
+    try:
+        info = os.stat(root / "archive")
+    except FileNotFoundError:
+        return []
+    return [info.st_ino, info.st_mtime_ns]
+
+
+def _archive_seen(root: pathlib.Path) -> Tuple[List[int], Dict[str, List[Any]]]:
+    """The stamp, then the tails: a segment landing between the two moves the stamp the next
+    boot compares, so it lists again; the other order would let it hide behind a current stamp."""
+    stamp = _archive_stamp(root)
+    return stamp, _archive_tails(root)
 
 
 def _archive_tails(root: pathlib.Path) -> Dict[str, List[Any]]:
@@ -237,14 +257,26 @@ def _archive_tails(root: pathlib.Path) -> Dict[str, List[Any]]:
 def _replan_owed(root: pathlib.Path) -> bool:
     """After the first cutover a boot plans the chains again only when another body wrote them:
     a non-empty live file (a store-unaware body appended) or archive segments the last plan did
-    not see (one rotated them). A frozen segment that changed size is found by the import."""
+    not see (one rotated them). The archive is listed only after its directory's stamp moved since
+    the plan or the last check (one stat against one meta row, whatever the archive holds); a move
+    that brought no segment records the new stamp and costs the next boot nothing. A frozen segment
+    that changed size is found by the import."""
     for stream in ds.STREAMS:
         try:
             if (root / ds.LIVE_REL[stream]).stat().st_size:
                 return True
         except FileNotFoundError:
             continue
-    return _archive_tails(root) != ds.meta(root, "archive_tails")
+    with ds.transaction(root, write=False) as conn:
+        recorded_stamp, recorded_tails = ds._meta(conn, "archive_stamp"), ds._meta(conn, "archive_tails")
+    if recorded_stamp is not None and _archive_stamp(root) == recorded_stamp:
+        return False
+    stamp, tails = _archive_seen(root)  # the stamp again, right before the listing it vouches for
+    if tails != recorded_tails:
+        return True
+    with ds.transaction(root, write=True) as conn:
+        ds._set_meta(conn, "archive_stamp", stamp)
+    return False
 
 
 def _live_tail(root: pathlib.Path, stream: str, rotated: Optional[pathlib.Path]) -> List[str]:
@@ -529,6 +561,14 @@ def coverage(root: Any, stream: str, seq: Optional[int] = None) -> Dict[str, Any
         pending = max(pending, 1)
     return {"imported": not pending and not mismatch, "pending": pending, "mismatch": mismatch, "gaps": gaps,
             **({} if planned else {"unplanned": True})}
+
+
+def import_owed(root: Any) -> bool:
+    """Whether any planned segment still waits for the import (the maintenance dispatcher's look):
+    one indexed probe per stream, never a listing or a count over the ledger."""
+    with ds.transaction(root, write=False) as conn:
+        return any(conn.execute("SELECT 1 FROM import_ledger INDEXED BY ledger_state WHERE stream=? AND state='pending' "
+                                "LIMIT 1", (stream,)).fetchone() is not None for stream in ds.STREAMS)
 
 
 def import_status(root: Any) -> Dict[str, Any]:

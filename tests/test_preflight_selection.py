@@ -212,6 +212,41 @@ def test_durable_records_carry_counts_not_the_whole_inventory():
     assert len(json.dumps(compact)) < 2000  # repeated in events, exhibits, ledgers and handoffs
 
 
+@pytest.mark.parametrize("selected", [("tests/deep/test_b.py", "tests/test_a.py"), ("tests/node_modules/test_d.py",)],
+                         ids=["reached", "unreachable"])
+def test_a_selected_pass_walks_tests_once_and_collects_exactly_its_modules(tmp_path, selected):
+    """A selected pass points pytest at ``tests/`` once (a module named as an argument costs a walk of the
+    tree of its own) and keeps the selected modules before any is imported: it collects exactly their
+    nodes. A selected module the walk cannot reach fails the pass instead of vanishing from it."""
+    import os
+    import sys
+
+    from ouroboros import preflight_inventory as inventory
+    from tests.group_run import run_in_group
+
+    repo = tmp_path / "repo"
+    for path, text in {"pytest.ini": "[pytest]\n", "tests/test_a.py": "def test_one(): pass\ndef test_two(): pass\n",
+                       "tests/deep/test_b.py": "def test_three(): pass\n",
+                       "tests/node_modules/test_d.py": "def test_four(): pass\n",
+                       "tests/test_c.py": "raise AssertionError('an unselected module is never imported')\n"}.items():
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(text, encoding="utf-8")
+    scratch = tmp_path / "scratch"
+    first = inventory.selection_passes(SimpleNamespace(tier="selected", files=selected), temp_root=scratch)[0]
+    scope = first.args[:first.args.index("tests/") + 1]
+    assert scope == [f"--select-test={path}" for path in selected] + ["tests/"]
+    done = run_in_group([sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", *scope,
+                         "-p", first.args[-1]], timeout=120, cwd=repo,
+                        env={**os.environ, "PYTHONPATH": str(pr._probe_dir(scratch))})
+    expected = inventory.read_inventory(scratch, "parallel")[0].get("expected")
+    if selected[0].startswith("tests/node_modules"):
+        assert done.returncode != 0 and "never reached" in done.stdout + done.stderr, done.stdout + done.stderr
+        assert not expected
+    else:
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert expected == ["tests/deep/test_b.py::test_three", "tests/test_a.py::test_one", "tests/test_a.py::test_two"]
+
+
 @pytest.mark.parametrize("mutation", ["missing", "duplicate", "unfinished"])
 def test_inventory_rejects_incomplete_or_duplicate_execution(tmp_path, mutation):
     from ouroboros.preflight_inventory import read_inventory

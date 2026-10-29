@@ -183,14 +183,6 @@ export async function loadSkillReviewDetail(full, ref, deps = {}) {
     return entry.state;
 }
 
-/** Exact immutable job reference carried by a nested Reviews attempt. */
-export function nestedSkillReviewRef(detail) {
-    const skill = detail?.dataset?.skillReviewSkill || '';
-    const jobId = detail?.dataset?.skillReviewJob || '';
-    const recordId = detail?.dataset?.skillReviewRecord || '';
-    return skill && jobId ? { skill, jobId, ...(recordId ? { recordId } : {}) } : null;
-}
-
 /**
  * Wire one rendered skill-review bubble: expand/collapse toggle, first-expand
  * lazy fetch for reference rows, and the error-state Retry. `bubble` is the

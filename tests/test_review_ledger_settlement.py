@@ -51,6 +51,69 @@ def test_stale_writer_cannot_replace_answer_or_provenance(tmp_path):
     assert settled["verdict"]["aggregate"] == "PASS"
 
 
+@pytest.mark.parametrize("writer", ["collected", "pending_payload"])
+@pytest.mark.parametrize("status,role", [("responded", "response"), ("error", "failure")])
+def test_settlement_replaces_current_sources_and_keeps_historical_originals(tmp_path, writer, status, role):
+    from ouroboros.review_projection import ledger_record_panel
+    from tests.test_task_review_sources import client_for, source_url
+
+    note = "Timeout at dispatch; physical review operation remains in flight."
+    raw = _raw("sol", "m", "pending", parts=BOTH, operation_id="op", operation_state="in_flight",
+               raw_text=note, failure_code="logical_timeout", reported_cause=note)
+    record = ledger.write_record(tmp_path, ledger.build_commit_gate_record(_facts([raw]), drive_root=tmp_path))
+    assert not ledger_record_panel(record)["actors"][0]["sources"], "pending note is not a failure or an answer"
+    # Also repair a record produced by the old implementation, preserving its immutable URL.
+    old = ledger.retain_text_source(tmp_path, "task-1", record_id=record["record_id"], seat_id="sol",
+                                    role="failure", part="change,coupling", text=note)
+    record = ledger.revise_record(tmp_path, record["record_id"], lambda r: {
+        **r, "rows": [{**r["rows"][0], "source_refs": [*r["rows"][0]["source_refs"], old]}]})
+    body = "Whole late answer\nEND" if status == "responded" else "Actual terminal refusal\nEND"
+    late = _raw("sol", "m", status, parts=BOTH, operation_id="op", operation_state="settled", raw_text=body)
+    if writer == "collected":
+        settled = ledger.settle_from_collected(tmp_path, record["record_id"], [late])
+    else:
+        fresh = ledger.build_commit_gate_record(_facts([late]), record_id=record["record_id"], drive_root=tmp_path).to_dict()
+        settled = ledger.revise_record(tmp_path, record["record_id"], lambda r: ledger.settle_pending_payload(r, fresh))
+    actor = ledger_record_panel(settled)["actors"][0]
+    assert len(actor["sources"]) == 1 and actor["sources"][0]["role"] == role
+    assert note not in actor["reason"] and actor.get("failure_code") != "logical_timeout"
+    assert (settled["verdict"]["aggregate"] == "PASS") == (status == "responded")
+    current = next(s for s in settled["rows"][0]["source_refs"] if s["role"] == role)
+    assert old in settled["rows"][0]["historical_source_refs"]
+    assert ledger.record_sources_resolvable(tmp_path, settled)
+    with client_for(tmp_path) as client:
+        assert client.get(source_url("task-1", settled, current, role=role)).content == body.encode()
+        assert client.get(source_url("task-1", settled, old, role="failure")).content == note.encode()
+
+
+def test_late_owner_settlement_keeps_the_collected_reply_call_refs(tmp_path):
+    """A left wave's reply collected by review_pause keeps its own call refs beside the dispatch prompt."""
+    from ouroboros import review_pause
+    from ouroboros.review_projection import ledger_record_panel
+    from tests.test_review_seat_outcome import _body
+
+    note = "Timeout at dispatch; physical review operation remains in flight."
+    dispatch_call = {"call_id": "dispatch-error", "manifest_ref": {"path": "calls/dispatch-error.json", "sha256": "1" * 64}}
+    pending = _raw("sol", "m", "timeout", parts=BOTH, operation_id="op", operation_state="in_flight",
+                   raw_text=note, response_ref=dispatch_call)
+    record = ledger.write_record(tmp_path, ledger.build_commit_gate_record(_facts([pending]), drive_root=tmp_path))
+    [prompt] = [s for s in record["rows"][0]["source_refs"] if s["role"] == "prompt"]
+    late_call = {"call_id": "late-reply", "manifest_ref": {"path": "calls/late-reply.json", "sha256": "2" * 64}}
+    seat = {"slot_id": "sol", "model": "m", "parts": list(BOTH), "operation_id": "op", "operation_state": "settled",
+            "status": "responded", "raw_text": _body(), "prompt_ref": {"call_id": "late-prompt"}, "response_ref": late_call}
+    settled = review_pause._settle_left_record({"drive_root": str(tmp_path), "record_id": record["record_id"]},
+                                               [seat], final=True)
+    assert settled["state"] == "settled" and settled["verdict"]["aggregate"] == "PASS"
+    row = settled["rows"][0]
+    current = {s["role"]: s for s in row["source_refs"]}
+    assert current["prompt"] == prompt and current["response"]["status"] == "retained"
+    assert current["observability_response"]["ref"] == late_call
+    assert ledger_record_panel(settled)["actors"][0]["response_ref"] == {"call_id": "late-reply", "manifest_sha256": "2" * 64}
+    historical = row["historical_source_refs"]
+    assert [s["role"] for s in historical if s.get("ref", {}) == dispatch_call] == ["observability_response"]
+    assert [s for s in historical if s["role"] == "pending" and s["chars"] == len(note)]
+
+
 def test_additional_pending_does_not_hold_counted_pass(tmp_path):
     record = _record(tmp_path)
     ledger.revise_record(tmp_path, record["record_id"],

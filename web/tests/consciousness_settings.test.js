@@ -18,9 +18,10 @@ import {
 } from '../modules/settings_safety.js';
 import { chooseRecheckRow, recheckDraft, recheckMarkHtml, syncRecheckState } from '../modules/safety_recheck.js';
 import {
-    consciousnessModelText, consciousnessSectionHtml, migrationProblemLines, settingsPlacesHtml,
+    bindConsciousnessSettings, consciousnessModelText, consciousnessSectionHtml, migrationProblemLines, settingsPlacesHtml,
 } from '../modules/settings_consciousness.js';
 import { parseAvailableSubagentsSetting, buildAvailableSubagentsSetting } from '../modules/subagents_settings.js';
+import { setup, NodeStub } from './dashboard_dom_fixture.js';
 import { apiClient } from '../modules/api_client.js';
 
 const FIXTURE = JSON.parse(fs.readFileSync(new URL('./fixtures/consciousness_contract.json', import.meta.url), 'utf8'));
@@ -51,7 +52,7 @@ test('the owner names stand with their notes; stored values never change', () =>
 
 test('a place row says its state, what wakes it and what waits; absent money is the dash', () => {
     const { places } = normalizePlacesResponse(FIXTURE.places);
-    assert.equal(placeStatusText(places[0]), 'active · wakes for direct messages, mentions and replies · 2 unanswered');
+    assert.equal(placeStatusText(places[0]), 'active · wakes for direct messages, mentions and replies · 2 open turns');
     assert.equal(placeStatusText(places[1]), 'silent · wakes for mentions', 'a Silent place still wakes for its list');
     assert.equal(placeStatusText(places[2]), 'paused', 'a Paused place says only its state');
     assert.equal(placeStatusText({ state: 'gone' }), 'state unknown');
@@ -70,7 +71,10 @@ test('the client reads the contract shapes once: places, connectors, the snapsho
     assert.equal(places[0].notes[0].id, 'n1');
     assert.equal(places[0].ownerAccounts[0].label, '@anton.r');
     assert.equal(places[1].icon.name, 'chat');
-    assert.equal(places[2].icon, null);
+    assert.deepEqual(places[2].icon, {});
+    assert.equal(places[0].revision, 4);
+    assert.equal(places[0].icon.kind, 'svg');
+    assert.equal(connectors[0].label, 'Slack');
     assert.equal(places[1].spent24hUsd, null, 'an unknown spend stays unknown');
     assert.equal(places[2].spent24hUsd, 0, 'a real zero is a fact');
     assert.deepEqual(connectors.map((entry) => [entry.connector, entry.connected]), [['slack-bridge', true], ['agentrq-bridge', false]]);
@@ -83,9 +87,12 @@ test('the client reads the contract shapes once: places, connectors, the snapsho
     assert.equal(state.recentWakes, null, '/api/state carries no wakes');
 
     const full = normalizeConsciousness(FIXTURE.consciousness);
-    assert.equal(full.recentWakes.length, 4);
-    assert.deepEqual(full.recentWakes[2].checks.map((check) => check.chip), ['checked', 'sent_despite']);
-    assert.equal(full.recentWakes[3].costUsd, null);
+    const old = full.recentWakes.find((wake) => wake.taskId === '214a31b6');
+    assert.equal(old.live, false);
+    assert.equal(old.phase, 'done');
+    assert.equal(old.cost.cost_presentation.tracked_amount, null);
+    assert.deepEqual(old.checks, [{ chip: 'checked', tool: 'run_command' }]);
+    assert.equal(full.recentWakes.find((wake) => wake.taskId === 'w-running').live, true);
     assert.equal(normalizeConsciousness({}).enabled, null, 'an absent control is unknown, never off');
 });
 
@@ -94,8 +101,8 @@ test('every write sends exactly the contract keys and announces the confirmed pl
     const stub = stubFetch((url) => (url.startsWith('/api/places') ? { ok: true, place } : { ok: true }));
     try {
         assert.equal((await connectPlace({ connector: 'agentrq-bridge' })).id, 'slack-acme');
-        await updatePlace('slack acme', { state: 'silent' });
-        await disconnectPlace('slack-acme');
+        await updatePlace('slack acme', { state: 'silent', expected_revision: 4 });
+        await disconnectPlace('slack-acme', 4);
         await saveSafetyLevel('light');
         await saveSafetyLevel('full', 'consciousness');
         await saveSafetyRules('No posts from my folders.');
@@ -104,8 +111,8 @@ test('every write sends exactly the contract keys and announces the confirmed pl
     } finally { stub.restore(); }
     assert.deepEqual(stub.calls.map(({ url, method, body }) => [method, url, body]), [
         ['POST', '/api/places', { connector: 'agentrq-bridge' }],
-        ['POST', '/api/places/slack%20acme', { state: 'silent' }],
-        ['DELETE', '/api/places/slack-acme', null],
+        ['POST', '/api/places/slack%20acme', { state: 'silent', expected_revision: 4 }],
+        ['DELETE', '/api/places/slack-acme', { expected_revision: 4 }],
         ['POST', '/api/owner/safety-mode', { mode: 'light' }],
         ['POST', '/api/owner/safety-mode', { mode: 'full', kind: 'consciousness' }],
         ['POST', '/api/owner/safety-rules', { rules: 'No posts from my folders.' }],
@@ -336,7 +343,9 @@ test('Models: a Light change outside Cyber Pro saves; only the changed key goes 
         assert.equal((await apiClient.saveSettings(body)).status, 'saved');
         result = await saveSafetyOwnerChanges(draft, LOADED);
         assert.equal(checkerTabsText(draft), 'Models');
-        assert.deepEqual(checkerSaveEffect({ status: 'saved', no_changes: true }, draft), { status: 'saved', no_changes: false, next_task_changed: true });
+        // The checker's model is read live: it applies at the next check, not from the next task.
+        assert.deepEqual(checkerSaveEffect({ status: 'saved', no_changes: true }, draft), { status: 'saved', no_changes: false, immediate_changed: true });
+        assert.equal(checkerSaveEffect({ status: 'saved' }, { checker: { settings: { OUROBOROS_SUBAGENTS: '{}' } } }).next_task_changed, true);
     } finally { server.restore(); }
     const { OUROBOROS_MODEL_LIGHT: _light, ...rest } = collected();
     assert.deepEqual(server.calls.map(({ url, body }) => [url, body]), [
@@ -442,12 +451,12 @@ test('Consciousness: Advises · Acts · Evolves with notes, the allowance and ta
     assert.equal(consciousnessModelText({ OUROBOROS_MODEL_CONSCIOUSNESS: 'openai::gpt-5.6' }), 'gpt-5.6');
 });
 
-test('the Settings places list: icon, label, state word, unanswered count; each row opens its sheet', () => {
+test('the Settings places list: icon, authored label, state word, open turns, readiness; each row opens its sheet', () => {
     const { places } = normalizePlacesResponse(FIXTURE.places);
     const html = settingsPlacesHtml({ places });
     assert.equal((html.match(/data-place-open=/g) || []).length, 3);
-    assert.match(html, /<span class="consciousness-place-name">Slack · Acme<\/span>\s*<span class="consciousness-place-facts">active · 2 unanswered<\/span>/);
-    assert.match(html, /aria-label="Open Mail · inbox: paused"/);
+    assert.match(html, /<span class="consciousness-place-name" data-i18n-authored>Slack · Acme<\/span>\s*<span class="consciousness-place-facts">active · 2 open turns · Connector on<\/span>/);
+    assert.doesNotMatch(html, /aria-label="[^"]*Mail · inbox/, 'authored names stay in the protected visible label');
     assert.match(settingsPlacesHtml({ places: [] }), /No place yet\. Connect one from an installed connector\./);
     assert.match(settingsPlacesHtml({ error: 'Places could not be read: HTTP 404' }), /data-tone="warn"/);
 });
@@ -468,4 +477,51 @@ test('an old connection the places migration could not move is said once, in Set
     assert.equal((html.match(/Could not move an old connection/g) || []).length, 2);
     assert.match(html, /<p class="settings-inline-note" data-tone="warn">Could not move/);
     assert.match(settingsPlacesHtml({ places: [], problems: migrationProblems }), /Connect it again\.<\/p><p class="settings-inline-note">No place yet/);
+});
+
+test('Settings reads Places when visible and after a change, including recovery from a failed read', async (t) => {
+    const { window } = setup(t);
+    const root = new NodeStub();
+    root.innerHTML = '<section data-consciousness-places><div data-place-list></div></section>';
+    root.dataset.activeSettingsTab = 'behavior';
+    const state = { activePage: 'chat' };
+    let reads = 0;
+    const dispose = bindConsciousnessSettings(root, { state, read: async () => {
+        if (++reads === 1) throw new Error('offline');
+        return normalizePlacesResponse(FIXTURE.places);
+    } });
+    const settled = () => new Promise((resolve) => setImmediate(resolve));
+    await settled();
+    assert.equal(reads, 0, 'no boot read while Settings is hidden');
+    state.activePage = 'settings';
+    window.dispatchEvent(new CustomEvent('ouro:page-shown', { detail: { page: 'settings' } }));
+    await settled();
+    assert.equal(reads, 1);
+    assert.match(root.textContent, /Places could not be read: offline/);
+    window.dispatchEvent(new CustomEvent('ouro:places-changed'));
+    await settled();
+    assert.equal(reads, 2);
+    assert.match(root.textContent, /Slack · Acme/);
+    assert.match(root.textContent, /Connector on/);
+    assert.doesNotMatch(root.textContent, /offline/);
+    dispose();
+    window.dispatchEvent(new CustomEvent('ouro:places-changed'));
+    await settled();
+    assert.equal(reads, 2);
+});
+
+test('Settings reads Places on mount only in the visible Behavior tab', async (t) => {
+    setup(t);
+    for (const tab of ['behavior', 'models']) {
+        const root = new NodeStub();
+        root.innerHTML = '<section data-consciousness-places><div data-place-list></div></section>';
+        root.dataset.activeSettingsTab = tab;
+        let reads = 0;
+        const dispose = bindConsciousnessSettings(root, { state: { activePage: 'settings' }, read: async () => {
+            reads++; return normalizePlacesResponse(FIXTURE.places);
+        } });
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(reads, tab === 'behavior' ? 1 : 0);
+        dispose();
+    }
 });

@@ -1,9 +1,10 @@
 """Private checking copies of writable reviewer seats (review_checking).
 
-Real git on a temp fixture: the frozen subject is read once, every seat gets an
-independent copy, the author's repository (refs, stash, config, index, unstaged
-work) is never touched by what a reviewer does in its copy, and the copy's work
-survives as evidence before the copy is released.
+Real git on a temp fixture: the frozen subject is read once, every seat gets its
+own linked worktree of the subject's repository, the author's HEAD, index and
+unstaged work are never touched by what a reviewer does in its copy (branches,
+tags, stash and config are the repository's, shared and announced), and the copy's
+work survives as evidence before the copy is released.
 """
 from __future__ import annotations
 
@@ -44,17 +45,34 @@ def author(tmp_path):
 
 
 def _author_state(repo):
-    return {"stash": _git(repo, "stash", "list"), "refs": _git(repo, "show-ref"),
-            "config": _git(repo, "config", "--list", "--local"), "index": _git(repo, "write-tree"),
+    """What a reviewer's copy never touches: the author's HEAD, index and files."""
+    return {"head": _git(repo, "rev-parse", "HEAD"), "index": _git(repo, "write-tree"),
             "worktree": (repo / "f.txt").read_text()}
 
 
-def test_staged_subject_reaches_every_seat_and_reviewer_git_never_reaches_the_author(author, tmp_path):
+def old_clone_seat(data, author, source, operation, task="task"):
+    """A seat made before linked worktrees: an independent clone at the frozen parent and tree,
+    whose marker records no Git facts (installs keep such seats until they are captured)."""
+    home = rc.seat_dir(data, task, operation)
+    home.mkdir(parents=True)
+    area = home / "area"
+    _git(author.parent, "clone", "-q", "--shared", "--no-checkout", str(author), str(area))
+    _git(area, "checkout", "-q", "--detach", source["parent"])
+    _git(area, "read-tree", "--reset", "-u", source["tree"])
+    (home / "checking.json").write_text(json.dumps({"schema": 1, "task_id": task, "operation_id": operation,
+                                                    "source": dict(source), "area": str(area)}))
+    return area
+
+
+def test_staged_subject_reaches_every_seat_and_reviewer_git_never_moves_the_authors_head_index_or_files(
+        author, tmp_path):
     data = tmp_path / "data"
     source = rc.freeze_checking_source(author, data_root=data, subject=rc.SUBJECT_INDEX)
     before = _author_state(author)
     one = pathlib.Path(rc.prepare_seat_area(data, "task", "op-1", source))
     two = pathlib.Path(rc.prepare_seat_area(data, "task", "op-2", source))
+    assert (one / ".git").is_file()  # a linked worktree, sharing the author's object store:
+    assert (one / _git(one, "rev-parse", "--git-common-dir")).resolve() == (author / ".git").resolve()
     assert (one / "f.txt").read_text() == "A staged\n"  # staged A, never unstaged B
     assert _git(one, "write-tree") == source["tree"]
     assert _git(one, "rev-parse", "HEAD") == source["parent"]
@@ -67,12 +85,12 @@ def test_staged_subject_reaches_every_seat_and_reviewer_git_never_reaches_the_au
                    capture_output=True)
     subprocess.run(["git", "stash", "pop"], cwd=one, check=True, capture_output=True)
     _git(one, "branch", "reviewer-branch")
-    _git(one, "tag", "reviewer-tag")
     _git(one, "config", "core.reviewerKnob", "set")
     assert _author_state(author) == before
     assert not (two / "probe_test.py").exists()  # seats never share a copy
-    with pytest.raises(subprocess.CalledProcessError):
-        _git(one, "remote", "get-url", "origin")  # no default push target
+    # Announced, not hidden: a branch or a config value a reviewer makes is the repository's.
+    assert "refs/heads/reviewer-branch" in _git(author, "show-ref") and _git(author, "config", "core.reviewerKnob") == "set"
+    assert "create no branch or tag, do not stash and change no Git config" in rc.checking_instructions(str(one), source)
 
 
 def test_a_rejoin_reuses_the_copy_as_the_reviewer_left_it(author, tmp_path):
@@ -105,27 +123,37 @@ def test_terminal_evidence_keeps_patch_named_files_and_ignored_listing_then_rele
     assert rc.capture_seat_evidence(data, "task", "op-1")["status"] == "retained"  # replayed, not recomputed
 
 
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="an unlistable folder needs POSIX modes, not root")
 def test_a_failed_capture_keeps_the_recoverable_copy_and_names_the_gap(author, tmp_path):
     data = tmp_path / "data"
     source = rc.freeze_checking_source(author, data_root=data, subject=rc.SUBJECT_INDEX)
     area = pathlib.Path(rc.prepare_seat_area(data, "task", "op-1", source))
-    os.rename(area / ".git", area / ".git-real")
-    (area / ".git").symlink_to(area / ".git-real")  # a child-replaced .git is never trusted
-    evidence = rc.capture_seat_evidence(data, "task", "op-1")
-    assert evidence["status"] == "capture_failed" and area.exists()
+    (area / "locked").mkdir()
+    (area / "locked" / "result.txt").write_text("reviewer output\n")
+    (area / "locked").chmod(0)  # Git cannot list it: the inventory would be incomplete
+    try:
+        evidence = rc.capture_seat_evidence(data, "task", "op-1")
+        assert evidence["status"] == "capture_failed" and "could not be fully listed" in evidence["error"]
+        assert area.exists()
+    finally:
+        (area / "locked").chmod(0o755)
+    assert rc.capture_seat_evidence(data, "task", "op-1")["status"] == "retained" and not area.exists()
 
 
-def test_reviewer_evidence_ignores_the_investigation_bound(author, tmp_path, monkeypatch):
+@pytest.mark.skipif(os.name == "nt", reason="symlink privileges vary on Windows")
+def test_a_replaced_git_pointer_is_never_read_and_the_copy_still_leaves_its_registration(author, tmp_path):
     data = tmp_path / "data"
-    monkeypatch.setattr(rc, "EVIDENCE_RETAIN_BYTES", 4)  # investigations' bound; it never binds a reviewer
     source = rc.freeze_checking_source(author, data_root=data, subject=rc.SUBJECT_INDEX)
     area = pathlib.Path(rc.prepare_seat_area(data, "task", "op-1", source))
-    (area / rc.EVIDENCE_DIRNAME).mkdir()
-    (area / rc.EVIDENCE_DIRNAME / "big.log").write_text("more than four bytes")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (area / ".git").unlink()
+    (area / ".git").symlink_to(elsewhere)  # what the copy's own pointer says is never followed
+    (area / "probe.txt").write_text("reviewer change\n")
     evidence = rc.capture_seat_evidence(data, "task", "op-1")
-    assert evidence["status"] == "retained" and evidence["gaps"] == []
-    retained = pathlib.Path(evidence["evidence_dir"]) / "files" / rc.EVIDENCE_DIRNAME / "big.log"
-    assert retained.read_text() == "more than four bytes" and not area.exists()
+    assert evidence["status"] == "retained" and "A\tprobe.txt" in evidence["changed"]
+    assert not area.exists() and elsewhere.is_dir()
+    assert len(_git(author, "worktree", "list", "--porcelain").split("\nworktree ")) == 1
 
 
 def test_a_worktree_subject_freezes_the_live_tree_once(author, tmp_path):
@@ -157,7 +185,7 @@ def test_named_evidence_is_frozen_with_the_subject_not_read_live_by_each_seat(au
     shutil.rmtree(late)  # a lost copy: the same operation's rejoin rematerializes the frozen input
     rc.prepare_seat_area(data, "task", "op-2", source)
     assert (late / ".review-drive" / "task" / "view.txt").read_bytes() == b"byte-exact evidence\n"
-    shutil.rmtree(rc.seat_dir(data, "task", "op-2") / "area")
+    shutil.rmtree(rc.seat_dir(data, "task", "op-2") / "area.noindex")
     for view in source["evidence_views"].values():
         shutil.rmtree(view)  # no longer retained: a named gap, never the live folder instead
     (drive / "task").mkdir(parents=True)
@@ -166,7 +194,7 @@ def test_named_evidence_is_frozen_with_the_subject_not_read_live_by_each_seat(au
         rc.prepare_seat_area(data, "task", "op-2", source)
     with pytest.raises(rc.CheckingAreaUnavailable, match="no longer retained"):
         rc.thread_seat_area(data, "task", "plan_review:t2", source)
-    assert not (rc.seat_dir(data, "task", "op-2") / "area").exists()  # refused before any clone
+    assert not (rc.seat_dir(data, "task", "op-2") / "area.noindex").exists()  # refused before any clone
 
 
 def test_an_ordinary_folder_is_read_in_place_and_a_view_keeps_links_modes_and_empty_dirs(tmp_path):

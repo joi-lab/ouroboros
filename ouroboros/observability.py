@@ -240,10 +240,12 @@ def new_execution_id() -> str:
     return f"exec_{uuid.uuid4().hex}"
 
 
-def new_call_id(prefix: str) -> str:
+def new_call_id(prefix: str, unique: str = "") -> str:
+    """``<prefix>_<32 hex>``; a 32-hex ``unique`` (a tool invocation id) is that suffix, so
+    the record of one invocation has one address its readers can derive (#1376)."""
     safe = re.sub(r"[^a-zA-Z0-9_]+", "_", str(prefix or "call")).strip("_").lower()
     safe = safe or "call"
-    return f"{safe}_{uuid.uuid4().hex}"
+    return f"{safe}_{unique if re.fullmatch(r'[0-9a-f]{32}', str(unique)) else uuid.uuid4().hex}"
 
 
 def _observability_dir(drive_root: pathlib.Path) -> pathlib.Path:
@@ -408,8 +410,23 @@ def _blob_ref_path(drive_root: pathlib.Path, ref: dict) -> pathlib.Path:
     return _ref_path(drive_root, ref, blob_relative)
 
 
-def read_call_manifest_ref(drive_root: pathlib.Path, ref: dict, *, task_id: str) -> dict:
-    """Read one exact task/call manifest, including a retired store alias."""
+def read_call_manifest_ref(
+    drive_root: pathlib.Path,
+    ref: dict,
+    *,
+    task_id: str,
+    admit: Callable[[pathlib.Path], None] | None = None,
+    max_bytes: int | None = None,
+    call_types: Tuple[str, ...] | None = None,
+) -> dict:
+    """Read one exact task/call manifest, including a retired store alias.
+
+    Existing callers retain the historical unbounded/no-admission default.
+    Source-facing readers can additionally bound every physical read, apply
+    their own resource admission before a loose file or pack is opened, and
+    constrain the decoded call family.  An admission refusal propagates and is
+    never reinterpreted as a missing placement.
+    """
     call_id = str(ref.get("call_id") or "")
     # System scopes (system:ui_translation, system:update_letter) use the
     # same writer, whose filename is sanitized but whose identity stays exact.
@@ -420,21 +437,44 @@ def read_call_manifest_ref(drive_root: pathlib.Path, ref: dict, *, task_id: str)
     expected_sha = str(ref.get("sha256") or "")
     if not expected_sha:
         raise ValueError("observability call manifest ref has no sha256")
+    admission_refused = False
     try:
         path = _ref_path(drive_root, ref, pathlib.Path("calls") / safe_task / f"{call_id}.json")
-        raw = path.read_bytes()
+        if admit is not None:
+            try:
+                admit(path)
+            except PermissionError:
+                admission_refused = True
+                raise
+        if max_bytes is None:
+            raw = path.read_bytes()
+        else:
+            with path.open("rb") as stream:
+                raw = stream.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise ValueError("observability call manifest exceeds byte limit")
         if hashlib.sha256(raw).hexdigest() != expected_sha:
             raise ValueError("observability call manifest ref failed sha256 verification")
     except (OSError, ValueError) as original_error:
-        from ouroboros.source_retention import read_manifest_version
+        if admission_refused:
+            raise
+        from ouroboros.evidence_packs import blob_bytes
+        from ouroboros.source_retention import manifest_version_ref
 
         try:
-            raw = read_manifest_version(pathlib.Path(drive_root), expected_sha)
+            raw = blob_bytes(
+                pathlib.Path(drive_root), manifest_version_ref(pathlib.Path(drive_root), expected_sha),
+                expected_kind="txt", max_bytes=max_bytes, admit=admit,
+            )
+        except PermissionError:
+            raise
         except FileNotFoundError:
             raise original_error
     manifest = json.loads(raw.decode("utf-8"))
     if not isinstance(manifest, dict) or str(manifest.get("task_id") or "") != str(task_id) or str(manifest.get("call_id") or "") != call_id:
         raise ValueError("observability call manifest task/call identity mismatch")
+    if call_types is not None and str(manifest.get("call_type") or "") not in frozenset(call_types):
+        raise ValueError("observability call manifest family mismatch")
     return manifest
 
 
@@ -1037,6 +1077,9 @@ def write_call_manifest(
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError:
         digest = hashlib.sha256(_json_bytes(payload)).hexdigest()
+    if payload.get("producer_complete") and payload.get("surface") == "plan_review":
+        from ouroboros.plan_collection_job import producer_published
+        producer_published(drive_root, [str(task_id), safe_call, digest])
     return {
         "path": str(path),
         "call_id": safe_call,

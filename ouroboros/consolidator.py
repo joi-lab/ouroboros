@@ -288,7 +288,7 @@ def _call_consolidation_llm(
 ) -> Tuple[str, Dict[str, Any]]:
     from contextlib import nullcontext
     from math import ceil
-    from ouroboros.capability_evidence import is_known
+    from ouroboros.context_window import resolve_window
     from ouroboros.context_budget import SummarizerContextOverflow
     from ouroboros.context_fit import (_failed_route_evidence, _route_calibration_ratio,
                                        estimate_context_prompt_tokens, resolve_context_fit_route)
@@ -360,15 +360,17 @@ def _call_consolidation_llm(
                 messages, values["tools"],
                 provider=route["provider"], reasoning_effort=values["reasoning_effort"],
             ) * density)
-        window = int(evidence.window_tokens) if is_known(evidence, require_fresh=True) else None
         from ouroboros.response_limits import ResponseLimit
         output_reserve = ResponseLimit(**(getattr(evidence, "response_limit", {}) or {})).ceiling(values["max_tokens"])
         if values["use_local"]:
             from ouroboros.llm_local import local_context_limits
             _local_window, output_reserve = local_context_limits(output_reserve)
         values["max_tokens"] = output_reserve
-        limit = window - output_reserve if window is not None else None
-        binding = dict(route_fp=evidence.route_fp, capacity_tokens=window, output_reserve_tokens=output_reserve)
+        scope = route.get("window_observation_fp") or evidence.route_fp
+        window = resolve_window(evidence, output_reserve, observation_fp=scope, bound=bool(scope))
+        limit = window.usable
+        binding = dict(route_fp=scope, capacity_tokens=window.total_equivalent if limit is not None else None,
+                       output_reserve_tokens=output_reserve)
         byte_limit = (input_limit["input_bytes"] if input_limit
                       and all(input_limit.get(key) == value for key, value in binding.items()) else None)
         request_text = (values["messages"][0]["content"] if len(values["messages"]) == 1 else

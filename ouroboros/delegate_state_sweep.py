@@ -57,7 +57,7 @@ def sweep_settled_delegate_state(
 ) -> Dict[str, Any]:
     """Remove terminal+aged delegate state files; report what moved and why not."""
     from ouroboros.delegate_custody import custody_log_unreadable
-    from ouroboros.retention import age_cutoff, get_gc_retention_days
+    from ouroboros.retention import age_cutoff, get_gc_retention_days, keep_until
     from ouroboros.utils import read_json_dict
 
     report: Dict[str, Any] = {"removed": [], "errors": [], "skipped": ""}
@@ -71,7 +71,10 @@ def sweep_settled_delegate_state(
 
     def _aged(path: pathlib.Path) -> bool:
         try:
-            return path.stat().st_mtime < cutoff
+            stamp = path.stat().st_mtime
+            if stamp >= cutoff:
+                keep_until(report, stamp, retention_days)
+            return stamp < cutoff
         except OSError:
             return False
 

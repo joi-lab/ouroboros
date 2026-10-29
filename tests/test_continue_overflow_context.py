@@ -15,7 +15,7 @@ import pytest
 
 from tests._budget_pause_exact_helpers import _install_queue
 from tests.test_continue_successor_context import FIELD, _mutation_evidence
-from tests.test_doc_context import _make_env_and_memory
+from tests.test_doc_context import _make_env_and_memory, foreign_tree
 from tests.test_main_authored_context import call
 from tests.test_owner_continue import NONCE, _interrupted
 
@@ -88,8 +88,7 @@ def test_continue_brief_survives_overflow_relocation(tmp_path, monkeypatch, flag
     monkeypatch.setattr("ouroboros.context.resolve_context_fit_route", lambda *_a, **_kw: (
         {"model": "openai/test-model", "provider": "openai"},
         SimpleNamespace(route_fp="fixture", status="asserted", stale=False, window_tokens=1_000_000)))
-    workspace = tmp_path / "working-copy"
-    workspace.mkdir()
+    workspace = foreign_tree(tmp_path / "working-copy")  # proven foreign: only the flag restores the handbook
     _interrupted(env.drive_root, workspace_root=str(workspace), workspace_mode="external",
         task_contract={"context": "PREDECESSOR-CONTRACT-SENTINEL", **({FIELD: flag} if flag is not None else {})},
         mutation_evidence=_mutation_evidence())

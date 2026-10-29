@@ -21,7 +21,10 @@ pytestmark = pytest.mark.serial
 
 
 def root_context(tmp_path, settings, monkeypatch):
+    from tests._shared import saved_settings
+
     monkeypatch.setattr(control, "load_settings", lambda: settings)
+    saved_settings(monkeypatch, tmp_path, **settings)  # route keys (a row's key) read the saved document
     monkeypatch.setenv("OUROBOROS_MAX_SUBAGENT_DEPTH", "4")
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="root")
     ctx.active_model, ctx.active_effort, ctx.active_use_local = "openai::parent", "xhigh", False

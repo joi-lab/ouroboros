@@ -369,6 +369,9 @@ class ReviewActorRecord:
     # (``run_failure_cause``); "" when nothing was reported. Opaque: shown, never branched on.
     # The ledger row keeps a plain fallback from the error text (``review_failure_facts``).
     reported_cause: str = ""
+    # Full safe structured refusal, before the short reported_cause view.
+    # These are evidence, never retry-policy inputs.
+    failure_details: Dict[str, Any] = field(default_factory=dict)
     parse_status: str = ""
     semantic_verdict: str = ""
     provider: str = ""
@@ -458,4 +461,22 @@ HARDNESS_LABEL_ONLY = "label_only"              # recorded on the objective axis
 HARDNESS_HARD_GATE = "hard_gate"                # blocking commit/scope immune gate (unchanged)
 
 
-TYPED_FAILURE_FACT_KEYS = ("failure_code", "reset_at", "http_status", "transport_status", "reported_cause")
+TYPED_FAILURE_FACT_KEYS = ("failure_code", "reset_at", "http_status", "transport_status", "reported_cause", "failure_details")
+
+
+def review_failure_summary(row: Mapping[str, Any]) -> str:
+    """A failed seat's saved facts for author handback, without a retry diagnosis."""
+    import json
+    from ouroboros.observability import redact_projection
+
+    seat = str(row.get("slot_id") or row.get("seat_id") or "unknown seat")
+    model = str(row.get("model_id") or row.get("model") or "model not reported")
+    parts = [f"{seat} ({model})", str(row.get("status") or "unknown")]
+    parts.extend(f"{key}={row[key]}" for key in TYPED_FAILURE_FACT_KEYS
+                 if key != "failure_details" and row.get(key) not in (None, ""))
+    details = row.get("failure_details")
+    if isinstance(details, dict) and details:
+        parts.append(json.dumps(details, ensure_ascii=False, sort_keys=True))
+    elif not row.get("reported_cause"):
+        parts.append(str(row.get("error") or row.get("raw_text") or "No cause was recorded."))
+    return str(redact_projection(" · ".join(parts)).value)

@@ -147,7 +147,7 @@ export function clock(at) {
 }
 
 /**
- * A work's line, said beside its word (the card's quieter line, the Shade row's, the sidebar's name after the word):
+ * A work's line, said beside its word (the card's quieter line, the work-list row's, the sidebar's name after the word):
  * the current episode's own sentence (the owner's Pause with the time it was pressed), then what still runs beside
  * it, one sentence per tail, joined " · ". The line never repeats `word`: an answer wait's own words are compared by
  * their code, in any language.
@@ -158,6 +158,13 @@ export function workLine(work = {}, word = activityWord(work)) {
     const sentence = said === word ? '' : said;
     const pressed = sentence && first.code === 'paused_by_owner' ? clock(first.since) : '';
     return [sentence, pressed, ...tailWords(list(work.tails))].filter(Boolean).join(' · ');
+}
+
+/** The first of a room's works that says the room's own word, else null: a work Pausing beside a running one never
+ *  lends its reason to the room's Working. */
+export function roomSpeaker(room, works = [], word = activityWord(room)) {
+    const byId = new Map(list(works).map((work) => [work?.work_id, work]));
+    return list(room?.works).map((id) => byId.get(id)).find((work) => work && activityWord(work) === word) || null;
 }
 
 /** What waits for the owner in a room ('question' | 'action'), '' when nothing does or its own word says so. */
@@ -176,7 +183,9 @@ export const amberNote = (kind) => (kind === 'question' ? tr('work.amber.questio
  * turn: its amber dot takes the mark's place, the word keeps its ink); `amber` what waits (question | action), said in
  * words where the word does not already say it. `stopping` is the owner's own Stop press on every working work of the
  * room ('finalize' | 'immediate'); until the host is `ready`, an idle room says its start in the words of the host's
- * `boot` phases (host_starting_status.js).
+ * `boot` phases (host_starting_status.js). A room still preparing names as its `step` the step its speaking work
+ * stands at (a direct turn's start step), said beside the word and dropped before it on a short bar, so nothing in
+ * the bar reads as a model call before one is sent.
  */
 export function roomStatusView(state, { connected = true, ready = true, boot = null, sending = false, stopping = '' } = {}) {
     const view = (kind, text, tone, mark, extra = {}) => ({ kind, text, tone, mark, owner: false, amber: '', ...extra });
@@ -186,9 +195,13 @@ export function roomStatusView(state, { connected = true, ready = true, boot = n
     const turn = { owner: list(room.turn).length > 0, amber: roomAmber(room) };
     if (room.activity !== 'working' && sending) return view('thinking', chipWord('sending'), 'live', 'moving', turn);
     switch (room.activity) {
-    case 'working':  // a Pause still settling keeps the neutral ink; its mark moves while work stops
-        return view('thinking', stopping ? chipWord(stopping === 'finalize' ? 'finalizing' : 'cancelling') : activityWord(room),
-            room.transition === 'pausing' && !stopping ? 'held' : 'live', stopping ? 'moving' : mark, turn);
+    case 'working': {  // a Pause still settling keeps the neutral ink; its mark moves while work stops
+        const word = stopping ? chipWord(stopping === 'finalize' ? 'finalizing' : 'cancelling') : activityWord(room);
+        const step = !stopping && room.call === 'preparing'
+            ? reasonText(list(roomSpeaker(room, state?.works, word)?.because)[0]) : '';
+        return view('thinking', word, room.transition === 'pausing' && !stopping ? 'held' : 'live',
+            stopping ? 'moving' : mark, step ? { ...turn, step } : turn);
+    }
     case 'queued': return view('thinking', activityWord(room), 'queued', mark, turn);
     // The owner's own question says itself: the word takes the amber ink, beside the owner's dot.
     case 'waiting': return view('online', activityWord(room), asked(room) ? 'wait' : 'held', mark, turn);
@@ -207,7 +220,7 @@ export function ownStopPress(state, records) {
 }
 
 /**
- * One work's row in the room's Shade: its word (an outcome beside Finalizing…), its line beside it, the row's tone
+ * One work's row in the room's work list: its word (an outcome beside Finalizing…), its line beside it, the row's tone
  * (the word's ink), its `mark` (the work's shape as the server names it; the owner's own Stop press moves it), `owner`
  * whether something in the work waits for the owner (its turn: the amber dot takes the mark's place; a Pause by the
  * owner or by Ouroboros is not the owner's move) and `outcome`, the known outcome said beside Finalizing… (its dot in

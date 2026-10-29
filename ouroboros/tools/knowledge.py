@@ -18,13 +18,12 @@ from ouroboros.tools.tool_result import ToolResult, _MAX_META_BYTES, _publish_to
 KNOWLEDGE_DIR = "memory/knowledge"
 BACKLOG_TOPIC = "improvement-backlog"
 PATTERNS_TOPIC = "patterns"
-# Reserved shared topics with exactly one home. Whichever room asks for them,
-# they resolve to the global shelf: the backlog is the P7 SSOT, the overview is
-# the shared orientation every context loads, and the Pattern Register is
-# cross-project cognition whose readers (context, deep self-review, the headless
-# copy) all use the canonical drive. A project copy of any of them would be a
-# second source of truth nobody reads.
-GLOBAL_ONLY_TOPICS = knowledge_store.ALWAYS_ACTIVE_TOPICS
+# Topics with exactly one home. Whichever room asks for them, they resolve to the
+# global shelf: the overview is the shared orientation every integrating context
+# loads; patterns and improvement-backlog are ordinary notes kept at their old
+# global address, so an earlier call from a project room reaches the existing
+# note instead of starting a second one.
+GLOBAL_ONLY_TOPICS = knowledge_store.GLOBAL_ADDRESS_TOPICS
 
 
 def _backlog_root(ctx: ToolContext) -> Path:
@@ -124,6 +123,22 @@ def _bound_delta_meta(meta: dict) -> None:
                                    json.dumps(headings, ensure_ascii=False).encode("utf-8")).hexdigest()}
 
 
+def _residency(note: knowledge_store.KnowledgeNote) -> str:
+    """Where the written note now sits in my contexts: a fact about its cost, never a limit."""
+    if note.state == "archived":
+        return "Residency: archived, so it is not in the active knowledge index; knowledge_read still opens it."
+    body = note.source.text_at(note.source.body_span) if note.source else note.text
+    loaders = "Main, tasks, wakes and Presence; helpers do not load it"
+    if note.address.scope == "global" and note.address.topic == OVERVIEW_TOPIC:
+        return f"Residency: the overview body ({len(body)} chars) is loaded whole in every context that loads knowledge ({loaders})."
+    where = (f"the global knowledge index ({loaders})" if note.address.scope == "global"
+             else f"the {note.address.scope} knowledge index, loaded in that project's contexts")
+    tail = f"the body ({len(body)} chars) is read on demand with knowledge_read."
+    if isinstance(note.summary, str) and note.summary.strip():
+        return f"Residency: its summary ({len(note.summary)} chars) is shown in {where}; {tail}"
+    return f"Residency: it has no summary, so {where} shows only its title, marked (no summary); {tail}"
+
+
 def _capture_previous(ctx: ToolContext, note: knowledge_store.KnowledgeNote) -> dict:
     """Expose exact pre-transition bytes through existing actor source custody.
 
@@ -155,8 +170,8 @@ def _knowledge_write(
         lifecycle = mode in ("archive", "restore")
         if mode not in ("overwrite", "append", "edit", "archive", "restore") or not isinstance(content, (str, type(None))):
             raise ValueError("content must be Markdown; mode must be overwrite, append, edit, archive or restore")
-        if mode == "archive" and sanitized in GLOBAL_ONLY_TOPICS:
-            raise ValueError("overview, patterns and improvement-backlog must stay active")
+        if mode == "archive" and sanitized in knowledge_store.ALWAYS_ACTIVE_TOPICS:
+            raise ValueError("the overview must stay active")
         if not isinstance(reason, str) or (mode == "archive" and not reason.strip()) or (reason and mode != "archive"):
             raise ValueError("reason is required for archive and used only with archive")
         summary = None if summary == "" else summary  # an empty summary asks for nothing
@@ -208,6 +223,8 @@ def _knowledge_write(
         meta["knowledge_source"] = result.current.source_ref()
         meta["knowledge_state"] = result.current.state
     if result.ok:
+        if result.current is not None:  # before the bound, which then makes room for it
+            meta["knowledge_residency"] = _residency(result.current)
         _bound_delta_meta(meta)
         return _publish_tool_result(ctx, ToolResult(
             status="ok", code="OK",
@@ -244,7 +261,7 @@ def get_tools() -> List[ToolEntry]:
     from ouroboros.tools.chronicle import chronicle_tools
 
     topic = {"type": "string", "description": "Shelf-relative topic path without .md; nested paths and Unicode names are supported; no scope prefixes (global/, project/)."}
-    scope = {"type": "string", "description": "global or project:<exact project id>. Omitted uses this task's project shelf, otherwise global. Global knowledge remains explicitly reachable from a project. Understanding of people and relationships, and anything that should outlive the project, belongs in global. Reserved topics (improvement-backlog, overview, patterns) always resolve to global."}
+    scope = {"type": "string", "description": "global or project:<exact project id>. Omitted uses this task's project shelf, otherwise global. Global knowledge remains explicitly reachable from a project. Understanding of people and relationships, and anything that should outlive the project, belongs in global. The topics overview, patterns and improvement-backlog always resolve to global."}
     return [
         ToolEntry("knowledge_read", {
             "name": "knowledge_read",
@@ -259,7 +276,7 @@ def get_tools() -> List[ToolEntry]:
             "parameters": {"type": "object", "properties": {
                 "topic": topic, "scope": scope,
                 "content": {"type": "string", "description": "Markdown, optionally with YAML frontmatter; supplied fields merge with retained ones. Required except for a summary-only edit; omit for archive/restore. No summary is generated from the body."},
-                "mode": {"type": "string", "enum": ["overwrite", "append", "edit", "archive", "restore"], "description": "overwrite replaces the body; append adds text; edit replaces one exact old_str and/or summary. archive/restore preserve body bytes and require a current revision; archive requires reason. overview, patterns and improvement-backlog always stay active. Missing notes are created by overwrite/append only."},
+                "mode": {"type": "string", "enum": ["overwrite", "append", "edit", "archive", "restore"], "description": "overwrite replaces the body; append adds text; edit replaces one exact old_str and/or summary. archive/restore preserve body bytes and require a current revision; archive requires reason. The overview always stays active. Missing notes are created by overwrite/append only."},
                 "reason": {"type": "string", "description": "Required non-empty explanation for archive only; no automatic classification or summarization occurs."},
                 "old_str": {"type": "string", "description": "Non-empty exact body substring for mode=edit; it must occur once. content is the replacement, including empty text for a justified deletion. Omit both to change only the summary."},
                 "summary": {"type": "string", "description": "mode=edit only: the new authored summary, alone or beside the old_str replacement, in the same revision-checked write."},

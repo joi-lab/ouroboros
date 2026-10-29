@@ -103,8 +103,8 @@ def _git(cwd: Any, *args: str, check: bool = True) -> subprocess.CompletedProces
     return _wt._git(pathlib.Path(cwd), *args, check=check)
 
 
-def _rows(data_dir: Optional[Any] = None, *, strict: bool = False, op: str = "") -> List[Dict[str, Any]]:
-    return [row for row in _wt._load_registry(data_dir, strict=strict, op=op) if row.get("kind") == KIND]
+def _rows(data_dir: Optional[Any] = None, *, op: str = "", strict: bool = False) -> List[Dict[str, Any]]:
+    return [row for row in _wt._records(data_dir, op=op, strict=strict) if row.get("kind") == KIND]
 
 
 def list_candidates(data_dir: Optional[Any] = None) -> List[Dict[str, Any]]:
@@ -113,11 +113,9 @@ def list_candidates(data_dir: Optional[Any] = None) -> List[Dict[str, Any]]:
 
 
 def find(owner: str, data_dir: Optional[Any] = None, *, strict: bool = False) -> Optional[Dict[str, Any]]:
-    owner = str(owner or "").strip()
-    for row in _rows(data_dir, strict=strict) if owner else []:
-        if row.get("task_id") == owner and not row.get("retiring"):
-            return row
-    return None
+    owner = str(owner or "").strip()  # ``strict``: an unreadable copy record raises
+    return next((row for row in (_rows(data_dir, strict=strict) if owner else [])
+                 if row.get("task_id") == owner and not row.get("retiring")), None)
 
 
 def context_fact(owner: str = "", data_dir: Optional[Any] = None, *, limit: int = 8) -> List[Dict[str, Any]]:
@@ -136,7 +134,7 @@ def context_fact(owner: str = "", data_dir: Optional[Any] = None, *, limit: int 
         "yours": bool(owner) and row.get("task_id") == owner,
     } for row in rows[:limit]]
     if len(rows) > limit:
-        shown.append({"omitted": len(rows) - limit, "source": "state/subagent_worktrees.json (kind=body_candidate rows)"})
+        shown.append({"omitted": len(rows) - limit, "source": "state/private_copies/*.json (kind=body_candidate records)"})
     return shown
 
 
@@ -170,7 +168,7 @@ def _provision(serving: pathlib.Path, owner: str, data_dir: Optional[Any]) -> Di
     root, data_root = _wt._resolve_root(), _wt._data_dir(data_dir)
     safe = _wt._safe_name(owner)
     candidate_id = f"body_{safe}"
-    wt_path = (root / candidate_id).resolve()
+    wt_path = _wt.copy_path(root, candidate_id).resolve()
     _wt._assert_root_isolated(wt_path, serving, data_root)
     base_sha = _git(serving, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
     serving_branch = _git(serving, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
@@ -184,12 +182,11 @@ def _provision(serving: pathlib.Path, owner: str, data_dir: Optional[Any]) -> Di
         "reviewed_commits": [],
     }
     root.mkdir(parents=True, exist_ok=True)
-    with _wt._ops_lock(root, op="provision_body_candidate", task_id=owner, target=str(serving)):
-        entries = _wt._load_registry(data_dir, strict=True, op="provision_body_candidate")
-        if any(e.get("path") == str(wt_path) for e in entries) or wt_path.exists():
+    with _wt._record_lock(wt_path, data_dir, op="provision_body_candidate", task_id=owner):
+        if _wt._record_at(wt_path, data_dir, op="provision_body_candidate") is not None or wt_path.exists():
             raise CandidateRefused(
                 "CANDIDATE_PATH_OCCUPIED",
-                f"{wt_path} already holds work that is not registered to this task; it was left untouched.")
+                f"{wt_path} already holds work that is not recorded for this task; it was left untouched.")
         # A branch left by an earlier candidate of this owner may carry unique
         # commits: never move it, take the next free name instead.
         suffix = 1
@@ -197,8 +194,8 @@ def _provision(serving: pathlib.Path, owner: str, data_dir: Optional[Any]) -> Di
             suffix += 1
             branch = f"{BRANCH_PREFIX}{safe}-{suffix}"
         row["branch"] = branch
-        _wt._save_registry(entries + [row], data_dir)
-        _wt._git_quiet(serving, "worktree", "prune")
+        _wt._put_record(row, data_dir)  # the record before the admin dir
+        _wt._forget_checkout(serving, wt_path)  # a crashed earlier attempt's registration of this path
         _git(serving, "worktree", "add", "--no-checkout", "-b", branch, str(wt_path), base_sha)
     row = _populate(row, data_dir)
     _event(data_dir, "body_candidate_prepared", candidate_id=candidate_id, owner=owner,
@@ -220,18 +217,20 @@ def _populate(row: Dict[str, Any], data_dir: Optional[Any] = None) -> Dict[str, 
 
 
 def _update_row(row: Dict[str, Any], change, data_dir: Optional[Any] = None) -> Dict[str, Any]:
-    """Registry read-modify-write of one candidate row under the ops lock."""
-    root = _wt._resolve_root()
-    with _wt._ops_lock(root, op="update_body_candidate", task_id=str(row.get("task_id") or "")):
-        entries = _wt._load_registry(data_dir, strict=True, op="update_body_candidate")
-        for entry in entries:
-            if entry.get("kind") == KIND and entry.get("path") == row.get("path"):
-                if entry.get("retiring"):
-                    raise CandidateRefused("CANDIDATE_MISSING", "the candidate is being retired; nothing was changed.")
-                change(entry)
-                _wt._save_registry(entries, data_dir)
-                return dict(entry)
-    raise CandidateRefused("CANDIDATE_MISSING", "the candidate's registry row is gone; nothing was changed.")
+    """Read-modify-write of one candidate record under that record's lock."""
+    def apply(entry: Dict[str, Any]) -> Dict[str, Any]:
+        if entry.get("kind") != KIND:
+            raise CandidateRefused("CANDIDATE_MISSING", "the candidate's record is gone; nothing was changed.")
+        if entry.get("retiring"):
+            raise CandidateRefused("CANDIDATE_MISSING", "the candidate is being retired; nothing was changed.")
+        change(entry)
+        return entry
+
+    updated = _wt._update_record(str(row.get("path") or ""), apply, data_dir, op="update_body_candidate",
+                                 task_id=str(row.get("task_id") or ""))
+    if updated is None:
+        raise CandidateRefused("CANDIDATE_MISSING", "the candidate's record is gone; nothing was changed.")
+    return dict(updated)
 
 
 def _recorded_terminal(task_id: str, results_root: Any) -> bool:
@@ -468,12 +467,12 @@ def prepare(ctx: Any, *, resume: str = "") -> Dict[str, Any]:
 
 def _forget_missing(row: Dict[str, Any]) -> None:
     """Drop the row of a checkout that is gone; its branch keeps whatever it committed."""
-    root = _wt._resolve_root()
-    with _wt._ops_lock(root, op="forget_body_candidate", task_id=str(row.get("task_id") or "")):
-        entries = [e for e in _wt._load_registry(None, strict=True, op="forget_body_candidate")
-                   if not (e.get("kind") == KIND and e.get("path") == row.get("path"))]
-        _wt._save_registry(entries, None)
-        _wt._git_quiet(pathlib.Path(str(row.get("git_dir") or row.get("repo_dir") or ".")), "worktree", "prune")
+    path = str(row.get("path") or "")
+    with _wt._record_lock(path, None, op="forget_body_candidate", task_id=str(row.get("task_id") or "")):
+        current = _wt._record_at(path, None, op="forget_body_candidate")
+        if current is not None and current.get("kind") == KIND:
+            _wt._drop_record(path, None)
+        _wt._forget_checkout(pathlib.Path(str(row.get("git_dir") or row.get("repo_dir") or ".")), pathlib.Path(path))
     _event(None, "body_candidate_checkout_missing", candidate_id=row.get("candidate_id"), branch=row.get("branch"))
 
 
@@ -720,12 +719,16 @@ def holds_commit(task_id: str, commit_sha: str, data_dir: Optional[Any] = None) 
     """Whether ``task_id``'s own candidate still holds ``commit_sha`` on its branch (what adoption needs).
 
     ``False`` only on evidence: no candidate of that task, no checkout, or Git
-    answering that the commit is gone or off the branch. An unreadable registry or
+    answering that the commit is gone or off the branch. An unreadable record or
     an unanswered Git is ``None``: unknown never proves the reviewed commit lost.
     """
     try:
-        row = next((entry for entry in _rows(data_dir, strict=True, op="read_body_candidate_commit")
+        row = next((entry for entry in _rows(data_dir, op="read_body_candidate_commit")
                     if task_id and entry.get("task_id") == task_id), None)
+        if row is None and task_id:  # a listing skips an unreadable record; this task's own one raises
+            name = f"body_{_wt._safe_name(task_id)}"  # under either name the copy may have been born with
+            for path in (_wt._resolve_root() / name, _wt.copy_path(_wt._resolve_root(), name)):
+                _wt._record_at(path, data_dir, op="read_body_candidate_commit")
     except Exception:
         return None
     if row is None or not commit_sha or not row.get("path") or not pathlib.Path(str(row["path"])).is_dir():
@@ -980,13 +983,10 @@ def _retained_scratch(row: Dict[str, Any], *, classify: bool = False, data_dir=N
     if classify and row.get("kind") == KIND and record != previous:
         # The walk is outside the lock. Publish only against its exact preview,
         # including retirement/ownership; update that preview for GC's same-row check.
-        with _wt._ops_lock(_wt._resolve_root(), op="record_scratch_retention"):
-            entries = _wt._load_registry(data_dir, strict=True, op="record_scratch_retention")
-            entry = next((entry for entry in entries if entry == row), None)
-            if entry is None:
+        with _wt._record_lock(path, data_dir, op="record_scratch_retention"):
+            if _wt._record_at(path, data_dir, op="record_scratch_retention") != row:
                 return True
-            entry["scratch_retention"] = record
-            _wt._save_registry(entries, data_dir)
+            _wt._put_record({**row, "scratch_retention": record}, data_dir)
             row["scratch_retention"] = record
     return observed["retained"]
 

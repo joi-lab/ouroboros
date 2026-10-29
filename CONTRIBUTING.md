@@ -147,8 +147,8 @@ run, record `NOT_RUN` and the reason instead of claiming it passed.
 
 Tests that spawn a real process, bind a real port, or mutate module-level
 global state must be marked `@pytest.mark.serial`. A merely slow test must be
-made faster or split, not moved to the unbounded serial pass. See
-[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the CI split and isolation
+made faster or split: the serial pass has the same 300 s per-test timeout.
+See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the CI split and isolation
 rules.
 
 For a visible UI change, inspect at least one relevant rendered user flow and

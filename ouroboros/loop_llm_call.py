@@ -30,11 +30,12 @@ from ouroboros.model_wait import current_model_wait, model_wait_reason, propagat
 from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY, pop_custom_validation_receipts
 from ouroboros.llm_attempt import PROVIDER_POLICY_REFUSAL, _is_provider_policy_refusal, single_physical_send
 from ouroboros.observability import _json_bytes, new_call_id, new_execution_id, persist_call
-from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
+from ouroboros.pricing import emit_llm_usage_event, infer_model_category, normalize_usage_cost as _normalize_usage_cost
 from ouroboros.send_clock import main_send_scope
 from ouroboros.task_pacing import main_loop_wire_options
+from ouroboros.task_custody import canonical_owner_root
 from ouroboros.transport_custody import attempt_custody_event_fields, is_pre_dispatch_transport_failure, is_retryable_transport_death, outcome_unknown_on_chain
-from ouroboros._usage_response import OUTPUT_LIMIT_FINISH_REASONS, output_exhaustion_facts, provider_cost_value as _provider_cost_value, response_finish_reason
+from ouroboros._usage_response import OUTPUT_LIMIT_FINISH_REASONS, output_exhaustion_facts, response_finish_reason
 from ouroboros.usage_accounting import PhysicalAttemptContext, UsageAccountingError, bind_physical_attempt_context, current_usage_scope, last_physical_attempt_capture
 from ouroboros.contracts.record_contract import RECORD_CONTRACT_VERSION
 from ouroboros.event_usage import REPORTED_TOKENS_KEY, event_token_counts
@@ -165,10 +166,11 @@ _DEADLINE_RETRY_FLOOR_SEC = 10.0
 # ordinal. Every other caller passes 0: its new generation is the round's recovery.
 _TRANSPORT_DEATH_RETRIES = 2
 _TRANSPORT_DEATH_BACKOFF_SEC = (4.0, 8.0)
-# Round-keyed repeat counter on the shared usage dict ({"round_id", "count"}):
-# the wait episode's free redial re-enters call_llm_with_retry with the SAME
-# round id, so the budget must not re-arm per invocation.
+# Round-keyed repeat counter on the shared usage dict ({"round_id", "count"}): the wait episode's free
+# redial re-enters call_llm_with_retry with the SAME round id, so the budget must not re-arm per invocation.
 TRANSPORT_DEATHS_KEY = "_transport_deaths"
+# Stamped by the round gate before each round call: an open wait episode paces its own redials, so its call sends once.
+TRANSPORT_WAIT_REDIAL_KEY = "_transport_wait_redial"
 # A local pre-dispatch refusal's own candidate facts (``LocalContextTooLargeError.refused_candidate``), for the
 # round's one strict-shrink retry; a wait's reprepare rebinds the physical context of the remaining attempts.
 REFUSED_CANDIDATE_KEY, REBOUND_PHYSICAL_CONTEXT_KEY = "_refused_candidate", "_physical_context_rebound"
@@ -823,14 +825,12 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
         and not bool(getattr(capture, "route_is_loopback", False))
         and is_pre_dispatch_transport_failure(exc) and not model_wait_reason(exc)  # an engine resource verdict is no outage
     ):
-        # Typed $0 fact: the request never left this host toward a REMOTE
-        # provider (released custody + typed pre-dispatch transport failure).
-        # Retrying the same request is free and safe; pacing/waiting is owned
-        # by the round-level episode in loop.py, never by this helper. A local
-        # provider's connect failure stays on the generic path — a stopped
-        # local server is not a network outage worth waiting out — and so does
-        # a loopback OpenAI-compatible route (Ollama / LM Studio / vLLM): its
-        # provider stamp is remote-shaped but the server is on this host.
+        # Typed $0 fact: the request never reached a REMOTE provider (released custody + typed pre-dispatch
+        # failure). Retrying the same request is free and safe; the engine's not-delivered receipt repeats within
+        # the ordinary bound (``_stop_after_llm_error``), other pacing is the round-level episode's in loop.py. A local
+        # provider's connect failure stays on the generic path — a stopped local server is not a network outage worth
+        # waiting out — and so does a loopback OpenAI-compatible route (Ollama / LM Studio / vLLM): its provider
+        # stamp is remote-shaped but the server is on this host.
         return LlmErrorClassification(
             "transport_unavailable", True, status_code, provider_code,
         )
@@ -855,53 +855,6 @@ def _remember_llm_call(
     }
     usage["_last_llm_call_meta"] = call_meta
     usage.setdefault("llm_call_refs", []).append(call_meta)
-
-
-def _normalize_usage_cost(usage: Dict[str, Any], *, model: str, use_local: bool) -> tuple[Optional[float], str, str, bool]:
-    raw_cost = usage.get("cost")
-    provider_reported_cost = raw_cost is not None
-    cost = _provider_cost_value(raw_cost) if provider_reported_cost else None
-    display_model = str(usage.get("resolved_model") or model)
-    provider = "local" if use_local else str(usage.get("provider") or "openrouter")
-    if use_local:
-        cost = 0.0
-        display_model = f"{model} (local)"
-    elif cost is None and (provider_reported_cost or usage.get("cost_invalid")):
-        # Invalid reported cost stays unknown under the shared trust predicate.
-        log.warning(
-            "Provider reported an invalid cost (type=%s, value=%s) for %s; recording "
-            "cost as unknown and skipping estimation",
-            type(raw_cost).__name__,
-            truncate_review_artifact(repr(raw_cost), limit=120),
-            display_model,
-        )
-        usage["cost"] = None
-        usage["cost_final"] = False  # unknown cost is never a closed book
-        return None, display_model, provider, bool(usage.get("cost_estimated"))
-    elif cost is None and provider != "claudexor":
-        from ouroboros._usage_response import observed_processing_mode
-
-        processing_mode = observed_processing_mode(provider, usage)
-        cost = estimate_cost_optional(
-            display_model,
-            int(usage.get("prompt_tokens") or 0),
-            int(usage.get("completion_tokens") or 0),
-            cache_usage={
-                "cached_tokens": int(usage.get("cached_tokens") or 0),
-                "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
-                "prompt_cache_ttl": usage.get("prompt_cache_ttl"),
-                "cache_write_tokens_by_ttl": (
-                    usage.get("cache_write_tokens_by_ttl")
-                    if isinstance(usage.get("cache_write_tokens_by_ttl"), dict)
-                    else None
-                ),
-            },
-            provider=provider,
-            **({"processing_mode": processing_mode} if processing_mode else {}),
-        )
-    usage["cost"] = cost
-    cost_estimated = bool(usage.get("cost_estimated")) or (cost is not None and not provider_reported_cost)
-    return cost, display_model, provider, cost_estimated
 
 
 def _uncount_transport_death(accumulated_usage: Dict[str, Any]) -> None:
@@ -994,6 +947,8 @@ def _record_llm_call_error(
     }
     if not append_jsonl(ctx.drive_logs / "events.jsonl", error_event) or not has_log_sink():
         emit_log_event(ctx.event_queue, error_event, log_label="LLM call error")
+    if (owner := canonical_owner_root(ctx.drive_logs.parent)) != ctx.drive_logs.parent.resolve(strict=False):
+        append_jsonl(owner / "logs" / "events.jsonl", error_event, live=False)  # REPLICA_RULE: the drive goes, the charge stays
     failure = {"error": _short_error_text(display_error), "resource_refusal": model_wait_reason(error),
         **{key: error_event[key] for key in ("ts", "llm_call_id", "model", "requested_profile", "observed_route", "status_code", "provider_code")},
         "failure_code": classification.kind, "reset_at": classification.reset_at, **{key: value for key, value in custody_fields.items()
@@ -1037,16 +992,19 @@ def _record_llm_call_error(
 
 
 def _stop_after_llm_error(ctx: _LlmErrorContext) -> bool:
-    """Retry decision for the exception path: ``True`` stops the attempt loop, and every stop
-    except the two transport shapes and a granted timeout repeat's own failure stamps the OB-01
-    marker — permanent classes stopped earlier, so a stop here means "the same-model wall is spent"."""
+    """Retry decision for the exception path: ``True`` stops the attempt loop. Every stop except a one-attempt
+    transport stop, an unknown outcome and a granted timeout repeat's own failure stamps the OB-01 marker (a spent
+    not-delivered burst does): permanent classes stopped earlier, so a stop here means "the same-model wall is spent"."""
     accumulated_usage = ctx.accumulated_usage
     error_kind = str(accumulated_usage.get("_last_llm_error_kind") or "")
     if TIMEOUT_REPEAT_KEY in accumulated_usage:
         return True  # its repeat failed, whatever the class: the no-call terminal reads the record and this row
-    if error_kind == "transport_unavailable":
-        # One free ($0) pre-dispatch attempt; the round-level wait episode owns
-        # redial pacing. NOT a spent wall — the transport-wait terminal owns this.
+    if error_kind == "transport_unavailable" and (
+            (accumulated_usage.get("_last_llm_failure") or {}).get("provider_code") != "transport_not_delivered"
+            or accumulated_usage.get(TRANSPORT_WAIT_REDIAL_KEY) or isinstance(accumulated_usage.get(TRANSPORT_DEATHS_KEY), dict)):
+        # One free attempt: configured routes and the round's episode own an unreachable route's recovery, an open episode
+        # paces its own redials and a held paid repeat sends nothing more. Only the engine's receipt that the request was
+        # not delivered first repeats on its route within the ordinary bound below, as an overloaded route does.
         return True
     if error_kind == "provider_outcome_unknown":
         from ouroboros.loop_transport import wait_transport_repeat
@@ -1563,7 +1521,7 @@ def call_llm_with_retry(
                     "record_contract_version", "reasoning_effort", "cost_usd", "prompt_tokens", "completion_tokens", "cached_tokens", "cache_write_tokens",
                     "prompt_cache_ttl", "effort", "effort_resolution", "request_wire", "claudexor", "duration_ms") if key in _round_event},
                 "response_kind": "tool_calls" if tool_calls else "message",
-                "tool_call_count": len(tool_calls),
+                "tool_call_count": len(tool_calls), "rounds": accumulated_usage["rounds"],
                 "has_text": bool(content and str(content).strip()),
             })
             append_jsonl(drive_logs / "events.jsonl", _round_event)

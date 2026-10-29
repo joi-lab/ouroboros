@@ -10,6 +10,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def stub_delegate_engines(monkeypatch):
     from ouroboros import claudexor_daemon as daemon
+    from ouroboros import claudexor_harness_install as installer
     from ouroboros.gateways import claudexor
     from ouroboros.llm import LLMClient
 
@@ -27,7 +28,7 @@ def stub_delegate_engines(monkeypatch):
     monkeypatch.setattr(daemon, "get_owned_daemon", lambda **_kw: pytest.fail("real engine lifecycle forbidden"))
     monkeypatch.setattr(daemon, "resolve_claudexord", lambda: pytest.fail("real engine provisioning forbidden"))
     monkeypatch.setattr(daemon.OwnedClaudexorDaemon, "_spawn", lambda *_a, **_k: pytest.fail("real engine spawn forbidden"))
-    monkeypatch.setattr(daemon, "install_missing_harness_cli", lambda *_a: pytest.fail("real install forbidden"))
+    monkeypatch.setattr(installer, "install_missing_harness_cli", lambda *_a: pytest.fail("real install forbidden"))
     monkeypatch.setattr(LLMClient, "chat_async", lambda *_a, **_k: pytest.fail("real provider forbidden"))
     monkeypatch.setattr(LLMClient, "chat", lambda *_a, **_k: pytest.fail("real provider forbidden"))
     return calls

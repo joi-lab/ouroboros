@@ -621,7 +621,7 @@ def test_safe_verdict_with_invalid_reported_cost_stays_safe(monkeypatch, tmp_pat
     with caplog.at_level(logging.WARNING):
         ok, msg = check_safety("github_write", {"method": "create_issue", "title": "x"}, ctx=_DriveCtx(tmp_path))
     assert ok is True and msg == ""
-    assert "invalid reported cost" in caplog.text
+    assert "invalid cost" in caplog.text
 
 
 

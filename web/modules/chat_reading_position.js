@@ -3,6 +3,7 @@
  * No fetch, pager, message cache or timer lives here.
  */
 import { DRAG } from './drawer_drag.js';  // a touch's axis is decided by the drawer's own rule
+import { batch } from './layout_batch.js';  // reads the write defers run after it, before the place is restored
 
 // A width that moves again within MOVE_FRAMES frames keeps moving (a drag, a live window resize); one that then
 // holds WIDTH_HELD_FRAMES frames (about 200ms at 60Hz) has stopped: a drag paused that long is laid out once.
@@ -16,14 +17,20 @@ export function createChatReadingPosition({ visible, alive, ready, feed, anchors
     let intent = null;
     // dragging: 'held'/'released' feed scrollbar, or 'owed' to a downward gesture's animation.
     let approximate = false, dragging = '', claimed = null, scrolls = 0, arriving = null, relayout = false;
-    // WebKit also ends each step of an animated page scroll: the owed scrolls
-    // end only once a frame passes without another, and only this gesture's:
-    // a newer one's may not have begun to arrive. A resize that waited on them
-    // lays out then; its own wait looks again while they still arrive.
+    // The feed's box at a drag's release: the drag's own last scrolls arrive in it, a resize's clamp in another.
+    let releasedBox = '';
+    const feedBox = () => `${feed.clientWidth}x${feed.clientHeight}`;
+    // Where the app's own write (mutate) moved the feed while a drag was released: a scroll there is that write's.
+    let placed = null;
+    // WebKit also ends each step of an animated page scroll, and each batch of a
+    // released drag's last scrolls: the owed scrolls end only once a frame
+    // passes without another, and only this gesture's: a newer one's may not
+    // have begun to arrive. A resize that waited on them lays out then; its own
+    // wait looks again while they still arrive.
     const owedEnd = (wait = false) => {
         const token = generation, seen = scrolls;
         requestAnimationFrame(() => requestAnimationFrame(() => {
-            if (dragging === 'owed' && token === generation && scrolls === seen) dragging = '';
+            if ((dragging === 'owed' || dragging === 'released') && token === generation && scrolls === seen) dragging = '';
             if (!relayout) return;
             if (dragging !== 'owed') { relayout = false; if (alive()) state.reflow(); }
             else if (wait) owedEnd(true);
@@ -91,8 +98,13 @@ export function createChatReadingPosition({ visible, alive, ready, feed, anchors
             if (!intent) {
                 // A feed scrollbar drag, and the scrolls it (or a downward
                 // gesture) still owes after its release, follow exactly where
-                // it leaves the feed.
-                if (dragging) state.stick = feed.scrollHeight > feed.clientHeight && state.nearBottom();
+                // it leaves the feed. A resize is no part of a released drag
+                // (reflow), even when its clamped scroll arrives first; nor is
+                // the app's own write (mutate), whose clamp leaves the feed where it put it.
+                if (dragging === 'released' && feedBox() !== releasedBox) dragging = '';
+                if (dragging && !(dragging === 'released' && feed.scrollTop === placed)) {
+                    state.stick = feed.scrollHeight > feed.clientHeight && state.nearBottom();
+                }
                 state.top = feed.scrollTop;
                 state.remember(relayout); // a resize waiting on these scrolls keeps where they end
             }
@@ -104,7 +116,7 @@ export function createChatReadingPosition({ visible, alive, ready, feed, anchors
             if (!alive()) return false;
             if (mutationDepth) return write();
             if (intent || !visible()) {
-                const result = write(); afterWrite();
+                const result = batch(write, afterWrite); afterWrite();
                 if (remoteContent && result && !state.stick) activity();
                 return result;
             }
@@ -113,7 +125,8 @@ export function createChatReadingPosition({ visible, alive, ready, feed, anchors
             const height = feed.scrollHeight, top = feed.scrollTop;
             mutationDepth++;
             let result;
-            try { result = write(); afterWrite(); return result; }
+            // The write's deferred reads (layout_batch.js) run once its rows have settled, before the place is restored.
+            try { result = batch(write, afterWrite); afterWrite(); return result; }
             finally {
                 mutationDepth--;
                 if (visible()) {
@@ -123,6 +136,7 @@ export function createChatReadingPosition({ visible, alive, ready, feed, anchors
                     } else anchors.restore(anchor);
                     if (remoteContent && result && !follow) activity();
                     state.top = feed.scrollTop; state.stick = follow;
+                    if (dragging === 'released' && state.top !== top) placed = state.top;
                     state.remember();
                     updateButton();
                 }
@@ -165,8 +179,12 @@ export function createChatReadingPosition({ visible, alive, ready, feed, anchors
             const gesture = event => {
                 if (event.type === 'pointerup' || event.type === 'pointercancel') {
                     // Released, a drag decides by where it is. Engines report its last
-                    // scrolls after the release; they decide until the feed's scrollend.
-                    if (dragging) { state.stick = feed.scrollHeight > feed.clientHeight && state.nearBottom(); dragging = 'released'; }
+                    // scrolls after the release, WebKit in batches that each end in a
+                    // scrollend, or already before it; they decide until they end (owedEnd).
+                    if (dragging) {
+                        state.stick = feed.scrollHeight > feed.clientHeight && state.nearBottom();
+                        dragging = 'released'; releasedBox = feedBox(); placed = null;
+                    }
                     return;
                 }
                 if (event.type === 'pointerdown') {
@@ -244,8 +262,7 @@ export function createChatReadingPosition({ visible, alive, ready, feed, anchors
             const noteBoxScroll = event => { if (event.target && event.target !== feed) boxScrolled = { box: event.target, at: event.timeStamp }; };
             feed.addEventListener('scroll', noteBoxScroll, { passive: true, capture: true });
             const settle = () => {
-                if (dragging === 'released') dragging = '';
-                if (dragging === 'owed') owedEnd();
+                if (dragging === 'released' || dragging === 'owed') owedEnd();
             };
             feed.addEventListener('scrollend', settle, { passive: true });
             const pointer = ['pointerdown', 'pointerup', 'pointercancel'];

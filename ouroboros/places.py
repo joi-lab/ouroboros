@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -26,11 +27,14 @@ FACT_REPLY_TO_ME = "reply_to_me"
 FACT_MY_THREAD = "my_thread"
 FACT_NEW_ISSUE = "new_issue"
 FACT_NEW_PULL_REQUEST = "new_pull_request"
+FACT_REVIEW_REQUESTED = "review_requested"
+FACT_ASSIGNED = "assigned"
 FACT_ANY_MESSAGE = "any_message"
 FACT_FROM_BOT = "from_bot"
 FACT_LEGACY_ADDRESSED = "legacy_addressed"
 WAKE_FACTS = (FACT_DIRECT_MESSAGE, FACT_GROUP_DM, FACT_MENTION, FACT_REPLY_TO_ME,
-              FACT_MY_THREAD, FACT_NEW_ISSUE, FACT_NEW_PULL_REQUEST, FACT_ANY_MESSAGE, FACT_FROM_BOT)
+              FACT_MY_THREAD, FACT_NEW_ISSUE, FACT_NEW_PULL_REQUEST, FACT_REVIEW_REQUESTED,
+              FACT_ASSIGNED, FACT_ANY_MESSAGE, FACT_FROM_BOT)
 AUTHOR_CONNECTOR, AUTHOR_OWNER, AUTHOR_OUROBOROS, AUTHOR_MIGRATION = (
     "connector", "owner", "ouroboros", "migration")
 AUTHORS = (AUTHOR_CONNECTOR, AUTHOR_OWNER, AUTHOR_OUROBOROS, AUTHOR_MIGRATION)
@@ -38,10 +42,51 @@ SILENT_DISCLOSURE = ("Writes through this connector's declared tools and deliver
                      "Scripts, browser actions and unintegrated code may still write.")
 
 
+def is_wake_signal(fact: Any) -> bool:
+    return isinstance(fact, str) and re.fullmatch(r"signal\.[a-z0-9_-]{1,40}", fact) is not None
+
+
+def valid_wake_fact(fact: Any) -> bool:
+    """Stored signals remain readable when their connector is off or removed."""
+    return isinstance(fact, str) and (fact in (*WAKE_FACTS, FACT_LEGACY_ADDRESSED) or is_wake_signal(fact))
+
+
+def declared_wake_signals(connector: str) -> set[str]:
+    """Only the authenticated connector's live publication can vouch for a signal."""
+    from ouroboros.extension_registry_state import live_contribution_projection
+
+    return {fact["id"] for row in live_contribution_projection()
+            if row.get("provides") == "place" and row.get("skill") == connector
+            for fact in row.get("facts", [])
+            if isinstance(fact, dict) and is_wake_signal(fact.get("id"))}
+
+
 class PlaceError(ValueError):
     def __init__(self, code: str, field: str = "place", message: str = "") -> None:
         self.code, self.field = code, field
         super().__init__(message or f"{code}: {field}")
+
+
+def validate_presence_identity(value: Any) -> dict:
+    """One wire shape for the credential facts on status responses and events."""
+    def entry(item):
+        if (not isinstance(item, dict) or set(item) != {"id", "label", "kind"}
+                or any(not isinstance(item[key], str) or not item[key].strip() or len(item[key]) > 200
+                       for key in ("id", "label"))
+                or item["kind"] not in ("user", "bot")):
+            raise ValueError("identity entries need id and label (1–200 characters) and kind user or bot")
+        return dict(item)
+
+    if not isinstance(value, dict) or set(value) - {"sends_as", "reads_as"}:
+        raise ValueError("identity must be an object with only sends_as and reads_as")
+    result = {}
+    if "sends_as" in value:
+        result["sends_as"] = entry(value["sends_as"])
+    if "reads_as" in value:
+        if not isinstance(value["reads_as"], list):
+            raise ValueError("identity.reads_as must be a list")
+        result["reads_as"] = [entry(item) for item in value["reads_as"]]
+    return result
 
 
 @dataclass(frozen=True)
@@ -109,7 +154,7 @@ def _validate(place: Place) -> Place:
         raise PlaceError("place_invalid")
     if type(place.revision) is not int or place.revision < 0:
         raise PlaceError("place_revision_invalid")
-    if any(w.fact not in (*WAKE_FACTS, FACT_LEGACY_ADDRESSED) or w.author not in AUTHORS for w in place.wakes):
+    if any(not valid_wake_fact(w.fact) or w.author not in AUTHORS for w in place.wakes):
         raise PlaceError("place_wake_invalid", "wakes")
     if any(not n.text.strip() or n.author not in AUTHORS for n in place.notes):
         raise PlaceError("place_note_invalid", "notes")
@@ -194,9 +239,9 @@ def migration_problems(drive_root: Any) -> list[dict]:
     return list(_read(drive_root).get("migration", {}).get("problems", []))
 
 
-def place_room_index(drive_root: Any, place_id: str) -> list[dict]:
+def place_room_index(drive_root: Any, place_id: str, *, details: bool = False) -> list[dict]:
     from ouroboros.place_arrivals import room_index
-    return room_index(drive_root, get_place(drive_root, place_id))
+    return room_index(drive_root, get_place(drive_root, place_id), details=details)
 
 
 def get_place(drive_root: Any, place_id: str) -> Place:
@@ -282,9 +327,14 @@ def wake_matches(place: Place, facts: Iterable[str]) -> tuple[WakeItem, ...]:
 
 
 def is_owner_account(place: Place, platform_actor_id: str, account_id: str = "") -> bool:
+    return owner_account_matches(place.owner_accounts, platform_actor_id, account_id)
+
+
+def owner_account_matches(owner_accounts: Iterable[OwnerAccount], platform_actor_id: str, account_id: str) -> bool:
+    """Pure account-scoped owner match shared by actors and credential identities."""
     actor = str(platform_actor_id or "").strip()
     return bool(actor) and any(a.platform_actor_id == actor and (not a.account_id or a.account_id == account_id)
-                               for a in place.owner_accounts)
+                               for a in owner_accounts)
 
 
 def note_identity(place_id: str, index: int, note: NoteEntry) -> str:
@@ -296,6 +346,8 @@ def place_summary(place: Place) -> Mapping[str, Any]:
 
 
 def _write(drive_root: Any, place_id: str, change: Any, expected_revision: int | None = None) -> Place | None:
+    if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
+        raise PlaceError("place_revision_invalid", "expected_revision", "place_revision_invalid: expected_revision must be a whole number.")
     load_places(drive_root)  # migration precedes the first user edit, under the same file lock
     result = None
 
@@ -312,7 +364,7 @@ def _write(drive_root: Any, place_id: str, change: Any, expected_revision: int |
         if result is None:
             rows.pop(place_id, None)
         else:
-            result = _validate(replace(result, revision=(old.revision if old else 0) + 1))
+            result = _validate(replace(result, revision=current["revision"] + 1))
             rows[place_id] = asdict(result)
         return {**current, "revision": current["revision"] + 1, "places": rows}
 
@@ -322,13 +374,13 @@ def _write(drive_root: Any, place_id: str, change: Any, expected_revision: int |
 
 def connect_place(drive_root: Any, *, connector: str, provider: str, label: str = "", account_id: str = "",
                   conversation_id: str = "", scope: str = "account", wakes: Iterable[str] = (),
-                  contribution_id: str = "", place_id: str = "") -> Place:
+                  contribution_id: str = "", place_id: str = "", state: str = STATE_ACTIVE) -> Place:
     # A repeated Connect is idempotent; a refreshed connector cannot replace choices.
     identity = (connector, provider, account_id, conversation_id, contribution_id)
     place_id = place_id or uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(identity)).hex
     candidate = _validate(Place(place_id=place_id, connector=connector, provider=provider, label=label or provider,
                                account_id=account_id, conversation_id=conversation_id, scope=scope,
-                               contribution_id=contribution_id,
+                               contribution_id=contribution_id, state=state,
                                wakes=tuple(WakeItem(fact, AUTHOR_CONNECTOR) for fact in dict.fromkeys(wakes))))
     return _write(drive_root, place_id, lambda old: old or candidate)
 
@@ -361,16 +413,23 @@ def _change_place(old: Place | None, action: str, author: str, values: dict) -> 
         value = values.get(field, "")
         if not isinstance(value, str):
             raise PlaceError("place_invalid_string", field)
+        if field == "state" and value.strip() == STATE_ACTIVE and author != AUTHOR_OWNER:
+            raise PlaceError("place_activation_owner_only", "state")
         return replace(old, **{field: value.strip()})
     if action == "set_wakes":
         facts = values.get("wakes")
-        if not isinstance(facts, list) or any(f not in (*WAKE_FACTS, FACT_LEGACY_ADDRESSED) for f in facts):
+        if not isinstance(facts, list) or any(not valid_wake_fact(f) for f in facts):
             raise PlaceError("place_wake_invalid", "wakes")
+        added_signals = {f for f in facts if is_wake_signal(f)} - {w.fact for w in old.wakes}
+        if added_signals and not added_signals <= declared_wake_signals(old.connector):
+            raise PlaceError("place_wake_undeclared", "wakes", "place_wake_undeclared: this connector has not declared that signal; turn it on or choose a listed kind.")
         return replace(old, wakes=tuple(next((w for w in old.wakes if w.fact == fact), WakeItem(fact, author)) for fact in dict.fromkeys(facts)))
     if action in {"add_wake", "remove_wake"}:
         fact = values.get("fact", "")
-        if fact not in (*WAKE_FACTS, FACT_LEGACY_ADDRESSED):
+        if not valid_wake_fact(fact):
             raise PlaceError("place_wake_invalid", "fact")
+        if action == "add_wake" and is_wake_signal(fact) and fact not in declared_wake_signals(old.connector):
+            raise PlaceError("place_wake_undeclared", "fact", "place_wake_undeclared: this connector has not declared that signal; turn it on or choose a listed kind.")
         items = tuple(w for w in old.wakes if w.fact != fact)
         if action == "add_wake":
             items += (WakeItem(fact, author),)

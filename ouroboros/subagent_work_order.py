@@ -6,6 +6,24 @@ import json
 from hashlib import sha256
 from typing import Any, Mapping
 
+# Recorded beside the owner's words when a declared child is scheduled: its selection carries them
+# (BIBLE P1). A declared task scheduled before this fact existed keeps the selection it started with,
+# and with it the work-order bytes and fingerprint its recovery and source-range reads check.
+DECLARED_WORDS_FACT = "declared_inputs_carry_owner_words"
+
+
+def declared_words_fact(contract: Mapping[str, Any]) -> dict[str, bool]:
+    """The fact a declared child is scheduled with, ``{}`` for a shared one (its words need none)."""
+    from ouroboros.contracts.task_contract import task_input_sources
+
+    return {DECLARED_WORDS_FACT: True} if task_input_sources({"task_contract": contract}) == "declared" else {}
+
+
+def declared_inputs_carry_owner_words(task: Mapping[str, Any]) -> bool:
+    """Whether the task was scheduled with that fact, read at the top level or under ``metadata``."""
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), Mapping) else {}
+    return task.get(DECLARED_WORDS_FACT) is True or metadata.get(DECLARED_WORDS_FACT) is True
+
 
 def input_source_selection_receipt(task: Mapping[str, Any]) -> dict[str, Any]:
     """Composition fact retained by existing work-order/model-send sources.
@@ -15,16 +33,24 @@ def input_source_selection_receipt(task: Mapping[str, Any]) -> dict[str, Any]:
     the same selection, each recipient named in ``limitations``.
     The selection persists for the task; first-position/mail ordering is the
     caller's ordinary collaboration procedure, not a second host controller.
+    The owner's words that caused the work are included when the task was
+    scheduled with ``DECLARED_WORDS_FACT``; an older declared task names them
+    among the omitted inputs, as its work order always did.
     """
     from ouroboros.contracts.task_contract import task_input_sources
 
     if task_input_sources(task) != "declared":
         return {}
+    selected = ["explicitly selected task documents (attachment_paths), copied as this task's inputs"
+                ] if _selected_documents(task) else []
+    with_words = declared_inputs_carry_owner_words(task)
     return {
         "input_sources": "declared",
         "included": [
             "SYSTEM.md and BIBLE.md; reference-book projections; own-body DESIGN navigation or source-gap disclosure",
             "explicit assignment, question, evidence and normalized task authority",
+            *(["the owner's words that caused this work, verbatim as the host carries them down the task tree, "
+               "or the host's marker that none are recorded"] if with_words else []), *selected,
             "runtime access, tools, workspace, clock, resource and budget facts",
             "the inherited delegation_budget.intent_note: parent-authored advice carried in the task contract, never authority",
             "this child's own retained progress, tool and event history",
@@ -32,8 +58,8 @@ def input_source_selection_receipt(task: Mapping[str, Any]) -> dict[str, Any]:
         "omitted_automatic": [
             "shared autobiography: identity, WORLD, the top level of the life account, the parent's room page "
             "(with the words that started its project) and the memory marks of that room and the global ones",
-            "the owner's words that caused this work (shared children receive them verbatim; include them in "
-            "context if this case needs them)",
+            *([] if with_words else ["the owner's words that caused this work (shared children receive them verbatim; "
+                                     "include them in context if this case needs them)"]),
             "shared review history, health narratives, update letters, registry and installed-skill summaries",
             "parent context, notes, review_notes, predecessor narrative and inherited attachments",
             "task-tree blackboard, routing manifests and other-task summaries",
@@ -47,6 +73,9 @@ def input_source_selection_receipt(task: Mapping[str, Any]) -> dict[str, Any]:
             "Tools, messages, reviews and restored sources are additional inputs; reading outside "
             "the declared corpus changes the claim. Retained model-send/tool-source projections "
             "record the actual sequence."
+            + (" When this task delegates through schedule_subagent or delegate_start, the host adds "
+               "the knowledge index (the global shelf's and its room's) once, to the result of the "
+               "first accepted call; knowledge_list reads it again." if with_words else "")
         ),
         "limitations": (
             "No sandbox, no semantic filtering of declared facts or governance/authority, and no "
@@ -56,6 +85,16 @@ def input_source_selection_receipt(task: Mapping[str, Any]) -> dict[str, Any]:
             "order; files the harness loads from its project and vendor-side memory are unobserved."
         ),
     }
+
+
+def _selected_documents(task: Mapping[str, Any]) -> str:
+    """The parent's ``attachment_paths`` disclosure; "" when the task selected none."""
+    paths = task.get("attachment_paths")
+    if not isinstance(paths, list) or not paths:
+        return ""
+    return ("The parent selected these retained inputs (attachment_paths). The host attaches them to the first "
+            "start of this work order as immutable engine documents; a later start attaches only the documents "
+            "its own request selects.\n" + "\n".join(f"- {path}" for path in paths))
 
 
 def _text(value: Any) -> str:
@@ -69,8 +108,9 @@ def assignment_instructions(ctx: Any) -> str:
 
     The owner's words that caused the work follow the contract: a root's own
     corpus, a child's inherited words, or the host's absence marker; a declared
-    contract keeps its parent's selection and carries none. Full predecessor
-    reports are read through the launching task, never claimed to be inline.
+    contract scheduled before ``DECLARED_WORDS_FACT`` keeps the selection it
+    started with and carries none. Full predecessor reports are read through the
+    launching task, never claimed to be inline.
     """
 
     contract = getattr(ctx, "task_contract", None)
@@ -88,12 +128,14 @@ def assignment_instructions(ctx: Any) -> str:
     from ouroboros.main_context_authority import project_helper_predecessor_authority
     from ouroboros.owner_words import owner_words_text
 
-    # A declared run's receipt names the words among omitted inputs, for the sessions it starts too.
+    # An older declared run's receipt names the words among omitted inputs, for the sessions it starts too.
     declared = task_input_sources({"task_contract": contract}) == "declared"
     if contract.get("predecessor_authority"):
         contract["predecessor_authority"] = project_helper_predecessor_authority(
             contract["predecessor_authority"], declared=declared)
-    words = "" if declared else owner_words_text(ctx, audience="session")
+    meta = getattr(ctx, "task_metadata", None)
+    older = declared and not declared_inputs_carry_owner_words(meta if isinstance(meta, Mapping) else {})
+    words = "" if older else owner_words_text(ctx, audience="session")
     return (
         "HOST TASK CONTRACT AUTHORITY (normalized JSON; predecessor is a brief):\n"
         + json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -110,14 +152,14 @@ def _owner_words_section(task: Mapping[str, Any]) -> str:
 
     Both the payload (nested ``metadata``) and the flat task-metadata/record shapes
     give the same bytes, so a source-range check never sees a digest mismatch. A
-    declared task carries the field too, but its receipt names the words among the
-    omitted inputs, so its work order holds none: it keeps its parent's selection and the
-    words ride its task unread.
+    declared task scheduled before ``DECLARED_WORDS_FACT`` carries the field too, but
+    its receipt names the words among the omitted inputs, so its work order holds none
+    and keeps the bytes and fingerprint it started with.
     """
     from ouroboros.contracts.task_contract import task_input_sources
     from ouroboros.owner_words import render_owner_words, task_governing_words
 
-    if task_input_sources(task) == "declared":
+    if task_input_sources(task) == "declared" and not declared_inputs_carry_owner_words(task):
         return ""
     return render_owner_words(*task_governing_words(task), audience="session",
                               root_task_id=str(task.get("root_task_id") or ""))
@@ -148,6 +190,7 @@ def _render_external_work_order(task: Mapping[str, Any]) -> str:
         ("ACCEPTANCE CLAIMS", contract.get("acceptance_claims")),
         ("TASK CONTRACT AUTHORITY", remaining_contract),
         ("INHERITED TASK INPUTS", contract.get("attachment_manifest")),
+        ("SELECTED DOCUMENTS", _selected_documents(task)),
     ]
     authority = {
         "task_id": str(task.get("id") or ""),
@@ -376,6 +419,25 @@ def session_design_navigation(ctx: Any, *, target_root: str, source_root: str) -
             + navigation + digest)
 
 
+def session_constitution_pointer(ctx: Any, *, target_root: str, source_root: str) -> str:
+    """Point an own-body session at the constitution of the body it works on, beside DESIGN.
+
+    The leaf is an executor, not Ouroboros, and starts before its nanny's first turn; a path
+    and the pinned bytes' digest let its first proposals meet P1. The text is never inlined."""
+    source, _prepared = _own_body_source(ctx, target_root, source_root)
+    if source is None:
+        return ""
+    path = source / "BIBLE.md"
+    head = "\n\nCONSTITUTION DELIVERY (host instructions, separate from canonical work order)\n"
+    try:
+        digest = sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return head + f"BIBLE.md source unavailable at {path}; no constitution delivered."
+    return head + (f"This work concerns the body of Ouroboros, which {path} governs. Before your first proposal, "
+                   "read its Principle 1 (continuity, memory and the cognitive horizon); read the rest as the "
+                   f"work needs.\nSource bytes SHA-256: {digest}.")
+
+
 def session_service_directories(ctx: Any, gateway: Any, route: Any, authority: Any, *, snapshot: Any,
                                 payload: bool, execution_root: str) -> Any:
     """What ONE first start's private copy may write outside it, prepared before the binding, the host
@@ -400,7 +462,7 @@ def session_host_references(ctx: Any, *, target_root: str, source_root: str,
                             private_copy: bool = False, payload_skill: str = "", service: Any = None) -> str:
     """Host references pinned in a session's start request, computed once at first start.
 
-    Own-body DESIGN navigation and the installed instruction-skill index for any workspace;
+    Own-body DESIGN navigation and BIBLE path, and the installed instruction-skill index for any workspace;
     a skill-payload builder also gets the serving host's skill contract, whatever its input
     selection, and any other private copy its environment facts: dependency files read at the
     copy's repository root, the environment placed where the session may write (``source_root``,
@@ -408,7 +470,9 @@ def session_host_references(ctx: Any, *, target_root: str, source_root: str,
     has no copy, so it gets neither. A retry replays the recorded bytes."""
     from ouroboros.skill_catalogue import session_skill_index, skill_contract_references  # lazy skill reads
 
-    text = session_design_navigation(ctx, target_root=target_root, source_root=source_root) + session_skill_index(ctx)
+    text = (session_design_navigation(ctx, target_root=target_root, source_root=source_root)
+            + session_constitution_pointer(ctx, target_root=target_root, source_root=source_root)
+            + session_skill_index(ctx))
     if payload_skill:
         from ouroboros.body_candidate import serving_repo_dir_for
 
@@ -446,6 +510,7 @@ def work_order_fingerprint(task: Mapping[str, Any]) -> str:
 
 
 __all__ = [
+    "DECLARED_WORDS_FACT", "declared_inputs_carry_owner_words", "declared_words_fact",
     "assignment_instructions", "compile_external_work_order", "canonical_work_order_source",
     "work_order_source_projection",
     "validate_work_order_source_response",

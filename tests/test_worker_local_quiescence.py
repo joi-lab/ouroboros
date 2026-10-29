@@ -220,6 +220,23 @@ def _probe_worker(in_q, out_q, data_root, repo_root, release, mode="clean", sett
     class Agent:
         def handle_task(self, task):
             attempt = SimpleNamespace(task_id=task["id"], task_attempt=1)
+            if mode == "late_owed":  # a late callback owes its write after the loop's wait began
+                from ouroboros import custody_owed
+
+                tries = []
+
+                def write():
+                    tries.append(1)
+                    if len(tries) == 1:
+                        raise OSError("the store is busy")  # the first attempt meets a busy store
+                    out_q.put({"type": "owed_written", "tries": len(tries)})
+
+                def late():
+                    _wait_for(release)
+                    custody_owed.owe(("late", task["id"]), write, label="late-call")
+                threading.Thread(target=late, daemon=True).start()
+                out_q.put({"type": "fixture_task_returned", "task_id": task["id"]})
+                return []
             if mode == "settling_owner":
                 from concurrent.futures import ThreadPoolExecutor
 
@@ -464,3 +481,12 @@ def test_empty_and_fully_settled_registries_approve(handoff_registries):
     tool.settle()
     _close_review("review-x")
     assert local_work_settled(), "everything settled: approve"
+
+
+def test_a_fact_owed_after_the_idle_wait_began_wakes_the_last_spare_worker(tmp_path, monkeypatch):
+    """No probe and no task arrive: the late owe alone wakes the blocked wait, and a busy store is retried."""
+    with _probe_worker_process(tmp_path, monkeypatch, "late_owed") as worker:
+        time.sleep(0.5)  # the loop is back in its untimed wait: nothing owed, no probe
+        worker.release.set()
+        written = worker.receive(lambda event: event.get("type") == "owed_written", 15)
+        assert written is not None and written["tries"] == 2

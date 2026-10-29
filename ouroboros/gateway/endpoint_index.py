@@ -40,12 +40,14 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/owner/auto-grant",
     "POST /api/owner/context-mode",
     "POST /api/owner/effort-range",
+    "POST /api/owner/subagents-mode",
     "POST /api/owner/safety-mode",
     "POST /api/owner/safety-rules",
     "POST /api/owner/safety-model",
     "POST /api/owner/capability-ack",
     "POST /api/owner/skills/{skill}/attest-review",
     "GET /api/places",
+    "GET /api/places/{place_id}/rooms",
     "POST /api/places",
     "POST /api/places/{place_id}",
     "DELETE /api/places/{place_id}",
@@ -55,6 +57,9 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/tasks",
     "GET /api/tasks/{task_id}",
     "GET /api/tasks/{task_id}/artifacts/{name}",
+    "GET /api/tasks/{task_id}/reviews",
+    "GET /api/tasks/{task_id}/reviews/skill/{job_id}",
+    "GET /api/tasks/{task_id}/reviews/{record_id}/{seat_id}",
     "GET /api/tasks/{task_id}/events",
     "POST /api/tasks/{task_id}/events",
     "POST /api/tasks/{task_id}/cancel",
@@ -128,6 +133,8 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "PATCH /api/claudexor/credential-profiles/{harness}/{profile_id}",
     "GET /api/widgets",
     "POST /api/widgets/fault",
+    "POST /api/widgets/asset-leases",
+    "POST /api/widgets/asset-leases/{op}",
     "GET /api/extensions",
     "GET /api/extensions/{skill}/manifest",
     "GET /api/extensions/{skill}/module/{entry:path}",
@@ -173,6 +180,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/onboarding/bootstrap",
     "POST /api/onboarding/subagents/preview",
     "POST /api/onboarding/complete",
+    "GET /api/onboarding/complete",
     "GET /api/files/list",
     "GET /api/files/read",
     "GET /api/files/content",
@@ -222,8 +230,8 @@ _ENGINE = "relays the bundled Claudexor engine"
 HTTP_SHAPES: dict[str, Shape] = {
     "GET /api/health": Shape("200:HealthResponse"),
     "GET /api/contract": Shape("200:GatewayContractResponse"),
-    "GET /api/state": Shape("200:StateResponse 500:ErrorResponse"),
-    "GET /api/consciousness": Shape("200:json 503:json", note="consciousness panel: status, spend by cause, places, recent wakes"),
+    "GET /api/state": Shape("200:StateResponse 500:ErrorResponse", query="bindings_since"),
+    "GET /api/consciousness": Shape("200:json 503:json", note="status/detail, spend by cause, places_brief, RecentWakesView fields: recent_wakes: RecentWake[] | null, recent_wakes_coverage names the 50-wake/48 h cap or typed read failure; full Places use /api/places"),
     "GET /onboarding": Shape("200:html", query="builtin", note="selected setup or builtin wizard; builtin=1 forces builtin"),
     "GET /api/onboarding": Shape("200:html 204:empty", note="204: a ready provider exists, no setup needed"),
     "GET /api/onboarding/bootstrap": Shape("200:OnboardingBootstrapResponse", note="read-only; writes nothing"),
@@ -233,6 +241,9 @@ HTTP_SHAPES: dict[str, Shape] = {
     "POST /api/onboarding/complete": Shape(
         "200:OnboardingCompleteResponse 400,403,409,500,503:SettingsWriteRefusal|OnboardingPresetFailureResponse",
         "OnboardingCompleteRequest", note="the one atomic setup writer; a 503 with can_skip offers completion without agent presets"),
+    "GET /api/onboarding/complete": Shape(
+        "200:OnboardingAttemptResponse 400:ErrorResponse", query="attempt",
+        note="read-only; what became of the completion attempt whose attempt_id is given"),
     "GET /api/settings": Shape(
         "200:SettingsReadResponse", query="websearch_preview response_limit_preview model account local backend",
         note="masked secrets read back as placeholders; sending a placeholder keeps the stored value"),
@@ -266,6 +277,8 @@ HTTP_SHAPES: dict[str, Shape] = {
     "POST /api/owner/runtime-mode": Shape(f"200:OwnerRuntimeModeResponse {_SETTINGS_REFUSAL}", "OwnerRuntimeModeRequest"),
     "POST /api/owner/auto-grant": Shape(f"200:OwnerAutoGrantResponse {_SETTINGS_REFUSAL}", "OwnerEnabledRequest"),
     "POST /api/owner/context-mode": Shape(f"200:OwnerContextModeResponse {_SETTINGS_REFUSAL} 404:SettingsWriteRefusal", "OwnerContextModeRequest"),
+    "POST /api/owner/subagents-mode": Shape(f"200:OwnerSubagentsModeResponse {_SETTINGS_REFUSAL} 404:SettingsWriteRefusal", "OwnerSubagentsModeRequest",
+                                            note="live room choice; optional project_id, otherwise Main"),
     "POST /api/owner/effort-range": Shape(f"200:OwnerEffortRangeResponse {_SETTINGS_REFUSAL} 404:SettingsWriteRefusal", "OwnerEffortRangeRequest",
                                           note="helper min <= max; primary independent; optional project_id, otherwise Main"),
     "POST /api/owner/safety-rules": Shape(f"200:OwnerSafetyRulesResponse {_SETTINGS_REFUSAL}", "OwnerSafetyRulesRequest"),
@@ -278,9 +291,10 @@ HTTP_SHAPES: dict[str, Shape] = {
         "200,409:SkillReviewResponse 400:ErrorResponse", "SkillRevisionRequest",
         note=f"the owner's review verdict; 409 when refused (ok false); {_IN_LANE}"),
     "GET /api/places": Shape("200:json", note="Places and installed connector declarations; §12 Places"),
+    "GET /api/places/{place_id}/rooms": Shape("200:PlaceRoomsResponse 404,503:ErrorResponse", note="lazy indexed captured-room discovery; history uses /api/chat/history"),
     "POST /api/places": Shape("200:json 400:json", "PlaceConnectRequest", note="connect from a declared connector"),
     "POST /api/places/{place_id}": Shape("200:json 400,409:json", "PlaceUpdateRequest", note="atomic owner-authored place choices"),
-    "DELETE /api/places/{place_id}": Shape("200:json 400:json", note="disconnect; room history stays"),
+    "DELETE /api/places/{place_id}": Shape("200:json 400,409:json", "PlaceDisconnectRequest", note="disconnect with optional revision; room history stays"),
     "POST /api/skills/{skill}/publish-preflight": Shape(
         "200,400,404,409,503:SkillPublishPreflightResponse", "SkillPublishPreflightRequest",
         note="read-only; every status carries the same shape; state hard_block is a refusal; destination "
@@ -300,7 +314,17 @@ HTTP_SHAPES: dict[str, Shape] = {
     "GET /api/tasks/{task_id}/events": Shape(
         "200:sse/TaskEvent 400,404:sse", query="cursor wait",
         note="resume with ?cursor=<last event id>; a 400/404 stream carries one error event"),
-    "POST /api/tasks/{task_id}/events": Shape("200:sse/TaskEvent 400,404:ErrorResponse", "TaskEventsRequest",
+    "GET /api/tasks/{task_id}/reviews": Shape(
+        "200:TaskReviewHistoryResponse 400,503:ErrorResponse", query="offset limit",
+        note="passive paged ledger history for this exact task, with per-record gaps; no-store"),
+    "GET /api/tasks/{task_id}/reviews/skill/{job_id}": Shape(
+        "200:text 400,404,503:ErrorResponse", query="skill format",
+        note="task-bound saved skill detail export; complete safe normalized text, no-store; existing desktop bridge prefix"),
+    "GET /api/tasks/{task_id}/reviews/{record_id}/{seat_id}": Shape(
+        "200:text 400,404,409:ErrorResponse", query="role part sha256 domain",
+        note="exact task/record/seat source selected by SHA, not a path; redacted complete text, no-store; original and export SHA differ when redacted"),
+    "POST /api/tasks/{task_id}/events": Shape(
+        "200:sse/TaskEvent 400,404:ErrorResponse", "TaskEventsRequest",
                                              note="v2 cursor: send back the cursor of the last event processed"),
     "POST /api/tasks/{task_id}/cancel": Shape(
         f"200,202:TaskCancelResponse {_TASK_ERRORS}", "TaskCancelRequest",
@@ -309,8 +333,9 @@ HTTP_SHAPES: dict[str, Shape] = {
     "POST /api/tasks/{task_id}/pause": Shape(f"200,202:TaskPauseResponse {_TASK_ERRORS}", "TaskPauseRequest"),
     "POST /api/tasks/{task_id}/continue": Shape(f"200:TaskContinueResponse {_TASK_ERRORS}", "TaskContinueRequest",
                                                 note="a timeout is not a refusal: retry with the same action_nonce"),
-    "POST /api/tasks/{task_id}/resume": Shape("200:TaskResumeResponse 400,404,409,503:ErrorResponse",
-                                              note="a budget-paused task; not idempotent: a repeat is refused"),
+    "POST /api/tasks/{task_id}/resume": Shape("200:TaskResumeResponse 400,404,409,503:ErrorResponse", "TaskResumeRequest",
+                                              note="a budget-paused task; not idempotent: a repeat is refused; "
+                                                   "a 409 may list acceptable_unknown ids to name in the body"),
     "POST /api/decisions": Shape(
         "200,202:DecisionResponse 400,404:ErrorResponse 409:DecisionResponse|ErrorResponse 501,503:ErrorResponse",
         "DecisionRequest", note="request_id is the idempotency key; the first answer wins (a card press: unless once)"),
@@ -349,6 +374,10 @@ HTTP_SHAPES: dict[str, Shape] = {
     "GET /api/logs/{name}": Shape("200:LogTailResponse 404:ErrorResponse", query="limit task_id"),
     "GET /api/extensions": Shape("200:ExtensionsIndexResponse 500:ErrorResponse"),
     "GET /api/widgets": Shape("200:WidgetsResponse"),
+    "POST /api/widgets/asset-leases": Shape("200:WidgetAssetLeaseResponse 400,403,409,413:ErrorResponse", "WidgetAssetLeaseRequest",
+                                          note="parent origin only; exact live publication; finite browser files"),
+    "POST /api/widgets/asset-leases/{op}": Shape("200:WidgetAssetLeaseResponse|WidgetAssetRevokeResponse 400,403,404,409,413:ErrorResponse", "WidgetAssetTokenRequest",
+                                               note="op=renew or revoke; parent session only; token confers no control authority"),
     "POST /api/widgets/fault": Shape("200:WidgetFaultResponse 400,413,503:ErrorResponse", "WidgetFaultRequest",
                                      note="one task-less widget_fault row in logs/events.jsonl, bounded per widget per minute"),
     "GET /api/extensions/{skill}/manifest": Shape("200:ExtensionManifestResponse 400,404:ErrorResponse"),
@@ -515,9 +544,11 @@ HTTP_SHAPES: dict[str, Shape] = {
         note="safe to repeat; every engine refusal answers 503"),
 }
 
-# Middleware-owned routes: ``server_auth.NetworkAuthGate`` answers them itself, and only while it
-# enforces a configured network password for a non-loopback peer (otherwise they are not mounted).
+# NetworkAuthGate owns these routes. Login/logout exist only for password-gated
+# non-loopback peers; scoped widget reads exist under every access mode.
 AUTH_ENDPOINTS: dict[str, Shape] = {
+    "GET /api/widget-assets/{token}/{path:path}": Shape("200:any 400,404,405:ErrorResponse",
+        note="GET/HEAD only; declared captured bytes; opaque-origin CORS; scoped bearer read, never API authentication"),
     "GET /auth/login": Shape("200:html", query="next builtin", note="selected login or builtin form; builtin=1 forces builtin; next is a same-origin path"),
     "POST /auth/login": Shape(
         "200:AuthLoginResponse 303:empty 401:ErrorResponse|html", "AuthLoginRequest|form",

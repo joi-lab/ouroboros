@@ -42,7 +42,7 @@ JSDoc twins in `web/modules/api_types.js`.
 | `quota_absences` | Same response's `absences`; legacy omission means `[]`. |
 | `resources` | Optional unchanged resource observations, never an admission balance. |
 | `availability_scope` | Optional engine echo `{model: string\|null, requestKind: 'text'\|'image', basis: 'quota_block'}` of the exact requested binding, not a literal model-name matching policy. A sent selector alone proves nothing. Full status carries the same optional field. |
-| `unified_accounts` | Successful roster contains an `accountPools` list, even empty. False also covers unread/failed roster. |
+| `unified_accounts` | `reads.accounts` is `ok`: the roster is the unified model. False also covers unread/failed roster. |
 | `reads.catalog` | Always `not_read`; no harness catalog or manifest filtering. |
 | `reads.accounts`, `reads.quota` | `ok`: structurally usable (including empty); `failed`: attempted but unusable; `not_read`: discovery/client creation prevented it. |
 | `read_errors` | Failed discovery/accounts/quota phases only; safe code and optional HTTP 400–599 status, never upstream text or credentials. |
@@ -50,9 +50,10 @@ JSDoc twins in `web/modules/api_types.js`.
 
 Read failures still return HTTP 200 with independent facet verdicts. HTTP success,
 empty lists and missing fields are not proof that accounts or quota are absent.
-Roster `profiles` and `harnessAccounts` must be object lists. Named rows require
-`profile.harness_id` / `profile.profile_id`; native rows require `harness_id`;
-present `enabled` must be boolean. Optional `accountPools` must be an object list.
+`claudexor_passive.roster_error` decides the roster for this read and full Accounts:
+object-list `profiles` (rows need `profile.harness_id` / `profile.profile_id`, any
+`enabled` boolean) and object-list `accountPools` (3.6.0+); `harnessAccounts` is
+unread. Its rows without `accountPools`: `account_model_unsupported`, not malformed.
 An unread roster is never authoritative removal or an empty account set.
 
 Quota requires object-list `snapshots`; present `absences` and `resources` must
@@ -62,13 +63,13 @@ has `fresh`, `stale` or `unknown`. Malformed membership or partial freshness fai
 the facet. Resources preserve scope, usage kind, period, fee inclusion, units and
 source fields without reinterpreting team resources as personal reserves.
 Resources bind `target.{harness,profile_id}` (AccountTarget), unlike quota's
-nullable `subject.{harness,subject_id}`; quota aliases never widen resource pins.
+nullable `subject.{harness,subject_id}`.
 
 Safe errors: `daemon_not_discovered`, `daemon_descriptor_unreadable`,
 `daemon_descriptor_incomplete`, `daemon_token_unreadable`,
 `daemon_endpoint_not_loopback`, `daemon_unreachable`, `malformed_response`,
-`protocol_incompatible`, `daemon_recovery_only`, `observation_read_timeout`,
-`read_refused`, `read_failed`. One `claudexor_passive_quota_read` INFO record logs
+`account_model_unsupported`, `protocol_incompatible`, `daemon_recovery_only`,
+`observation_read_timeout`, `read_refused`, `read_failed`. One `claudexor_passive_quota_read` INFO record logs
 only verdicts, safe errors and timings, not exception text, paths or bodies.
 
 ## Exact configured actor
@@ -84,9 +85,9 @@ Resolution uses the offered catalog's reachable Main fallback, retaining disable
 saved rows; model-named effort is reported by the same owner as dispatch.
 
 Managed routes send the literal model/kind to the same passive reader and filter
-subjects locally. A strict account pin never borrows a healthy sibling. The
-unified native default can use the frozen null alias only after a positive roster
-identifies that exact `<harness>-default` profile. The engine owns applicability,
+subjects locally. A strict account pin, `<harness>-default` included, matches only
+its exact subject: never a healthy sibling or an unprofiled null window, which
+Auto still sees. The engine owns applicability,
 constraint freshness and `quota_block`; the host neither matches model names
 fuzzily nor derives availability from ratios or money. Missing scope, stale or
 incomplete facts stay unknown. Migration: legacy engines without scope no longer
@@ -105,14 +106,13 @@ While a fallback acts, `primary_route_observation.observe_primary_route` asks
 `claudexor_observations.quota_observation` about a Claudexor primary's exact
 model, `requestKind=text` and pin or Auto, before its catalog check. One deadline,
 the observation's shared 3 s budget less caller bounds, covers
-`read_owned_gateway`, a `<harness>-default` pin's roster proof and every legacy
-view (`read_quota(timeout_sec=)`; `quota_state`/`credential_profiles(timeout_sec=)`);
-the catalog gets the remainder, and a spent budget reads nothing more. The row
+`read_owned_gateway` and every legacy view (`read_quota(timeout_sec=)`;
+`quota_state(timeout_sec=)`); no roster is read.
+The catalog gets the remainder, and a spent budget reads nothing more. The row
 carries the unchanged `quota_availability` verdict (`scope: quota_only`) beside
 every scoped snapshot and absence row, none dropped: subject, source, `observed_at`,
 freshness, fresh/total windows and the engine's own state and reset, never plan
-labels, ratios, money, roster contents or absence prose; an unreadable roster
-withholds only the alias. `read: failed` (safe code), `not_read`
+labels, ratios, money, roster contents or absence prose. `read: failed` (safe code), `not_read`
 (`observation_deadline_elapsed`) and an empty `ok` stay distinct. Auto rows cover
 every engine subject of the harness, enabled or not, so a fresh row beside a
 stale same-subject source keeps the aggregate unknown. A newer `observed_at`
@@ -141,6 +141,6 @@ GET, older engines up to two; the negotiated view is deliberately not cached.
 
 `test_claudexor_quota_passive.py` drives the real handler and synthetic gateway,
 including exact selectors, no lifecycle work, concurrent facets, catalog barrier,
-malformed/legacy/freshness cases and safe diagnostics. `test_subagent_inspection.py`
-covers configured snapshots, strict subjects, aliases and the public registry;
+malformed/legacy/freshness cases, safe diagnostics and the shared roster decision.
+`test_subagent_inspection.py` covers configured snapshots, strict subjects and the public registry;
 route/review tests preserve dispatch and account-pin behavior.

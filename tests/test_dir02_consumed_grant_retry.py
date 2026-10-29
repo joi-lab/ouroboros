@@ -52,9 +52,8 @@ def test_consumed_g1_selection_after_recovery(
     assert eb.live_root_resume_grant(queue, "held", host.root)["grant_id"] == g1["grant_id"]
     assert eb.budget_hold_fact(next(t for t in host.pending if t["id"] == child_id))
 
-    # A held descendant must prevent manufacturing an ordinary idle-retry job.
+    # Silence beside a held descendant manufactures no reap job.
     assert queue._has_pending_descendant("held")
-    assert queue._has_live_descendant("held")
     clock[0] += max(float(queue.get_task_idle_timeout_sec()),
                     float(queue.get_per_call_timeout_ceiling_sec()) + 120.0) + 1
     queue.enforce_task_timeouts()

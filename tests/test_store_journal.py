@@ -442,6 +442,47 @@ def test_the_store_state_sees_a_vacuum_that_keeps_every_row(tmp_path, monkeypatc
     assert committed_content(path) == before.content and store_state(path) != before
 
 
+@pytest.mark.parametrize("mode", ["PERSIST", "WAL"])
+def test_committed_content_sees_rows_rewritten_in_another_order(tmp_path, monkeypatch, mode):
+    """An obligation set and a task's handoffs read back in rowid order (``set_rows``, ``handoffs``),
+    so the same rows rewritten in another order are other content: ``committed_content`` shows it as
+    it shows a changed row, and sorts only the schema statements a VACUUM reorders. The rewrites go
+    through a bare connection, as a store write would also move ``commit_seq``."""
+    from collections import Counter
+
+    from tests._store_journal_shared import committed_content, use_journal
+    from tests.test_store import document
+
+    use_journal(monkeypatch, mode)
+    path = publish(tmp_path, document("t1"))
+    with store.open_store(tmp_path, write=True) as txn:
+        txn.replace_set("probe", {"a": {"n": 1}, "b": {"n": 2}})
+        for op_id in ("op1", "op2"):
+            txn.put_handoff("t1", "launch_handoffs", op_id, {"state": "claimed"})
+
+    def rewrite(*statements):
+        with contextlib.closing(store.connect(path, store.TIER_ENFORCED)) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for sql in statements:
+                conn.execute(sql)
+            store.commit(conn)
+        return committed_content(path)
+
+    seen = [committed_content(path)]
+    for table, first in (("obligations", "set_name='probe' AND id='a'"), ("task_handoffs", "op_id='op1'")):
+        seen.append(rewrite(f"CREATE TEMP TABLE moved AS SELECT * FROM {table} WHERE {first}",  # it goes last
+                            f"DELETE FROM {table} WHERE {first}", f"INSERT INTO {table} SELECT * FROM moved"))
+        assert Counter(seen[-1]) == Counter(seen[-2]) and seen[-1] != seen[-2]  # the same statements, reordered
+    with store.open_store(tmp_path, write=False) as txn:
+        assert list(txn.set_rows("probe")) == ["b", "a"]
+        assert list(txn.handoffs("t1")["launch_handoffs"]) == ["op2", "op1"]
+    changed = rewrite("UPDATE obligations SET facts='{}' WHERE set_name='probe' AND id='a'")
+    assert changed != seen[-1]
+    with contextlib.closing(store.connect(path, store.TIER_ENFORCED)) as conn:
+        conn.execute("VACUUM")
+    assert committed_content(path) == changed  # a VACUUM keeps each table's row order
+
+
 # ---- who chooses the journal (ouroboros/store_journal.py) --------------------------------
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -864,3 +905,63 @@ def test_boot_prepares_existing_child_stores_before_lazy_consumers(tmp_path, mon
         assert dialogue_store.meta(root, "cutover") is not None
         with usage_store.read(root) as txn:
             assert txn.meta("import")["status"] == "completed"
+
+
+@pytest.mark.parametrize("mode", ["PERSIST", "WAL"])
+def test_an_open_read_blocks_a_commit_only_under_a_rollback_journal(tmp_path, monkeypatch, mode):
+    """The convoy WAL removes (ouroboros#2341): under a rollback journal an open read's SHARED lock holds a
+    writer's COMMIT (here, with no busy wait, a typed StoreBusy and the write rolled back); under WAL the
+    write commits beside the open read, and the read's snapshot keeps its own answer either way."""
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 53, 1) if mode == "WAL" else (3, 50, 4))
+    monkeypatch.setattr(store, "_filesystem_type", lambda _path: "apfs")
+    publish(tmp_path, {"task_id": "t", "status": "running"})
+
+    def write():  # nested inside the read: its own connection
+        with store.acquisition_budget(0), store.open_store(tmp_path, write=True) as writer:
+            writer.conn.execute("UPDATE tasks SET status='completed' WHERE task_id='t'")
+
+    with store.open_store(tmp_path, write=False) as reader:
+        assert reader.conn.execute("PRAGMA journal_mode").fetchone()[0] == mode.lower()
+        assert reader.row("t", "status") == "running"
+        if mode == "WAL":
+            write()
+        else:
+            with pytest.raises(store.StoreBusy):
+                write()
+        assert reader.row("t", "status") == "running"
+    with store.open_store(tmp_path, write=False) as after:
+        assert after.row("t", "status") == ("completed" if mode == "WAL" else "running")
+
+
+def test_a_forced_journal_a_late_thread_still_leases_is_given_back_at_a_later_teardown(tmp_path, monkeypatch):
+    """The teardown give-back of a forced journal leaves a store another thread still leases to a later teardown
+    instead of failing the test that ends, and converts it once the lease is gone (tests/_store_journal_shared.py)."""
+    from tests import _store_journal_shared as shared
+
+    root = tmp_path / "root"
+    publish(root, {"task_id": "t", "status": "completed", "_schema_version": 1})
+    path = os.path.abspath(store.store_path(root))
+    with store.open_store(root, write=False) as txn:
+        native = txn.conn.execute("PRAGMA journal_mode").fetchone()[0]
+    shared.use_journal(monkeypatch, "PERSIST" if native == "wal" else "WAL")
+    leased, release = threading.Event(), threading.Event()
+
+    def late_reader():
+        with store.open_store(root, write=False):
+            leased.set()
+            release.wait(10)
+
+    reader = threading.Thread(target=late_reader)
+    reader.start()
+    try:
+        assert leased.wait(10)
+        monkeypatch.undo()  # what the teardown hook sees: every monkeypatch undone
+        shared.give_back_converted_journals()  # the lease is the other thread's: nothing raises here
+        assert any(os.path.abspath(converted) == path for converted, _tier in shared._CONVERTED)
+    finally:
+        release.set()
+        reader.join(10)
+    shared.give_back_converted_journals()
+    assert not any(os.path.abspath(converted) == path for converted, _tier in shared._CONVERTED)
+    with store.open_store(root, write=False) as txn:
+        assert txn.conn.execute("PRAGMA journal_mode").fetchone()[0] == native

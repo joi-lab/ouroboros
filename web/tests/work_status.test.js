@@ -111,6 +111,28 @@ test('only the client facts overlay the room, each with its mark: socket closed,
         'a press on work that does not work changes no word');
 });
 
+// A direct turn before its first model request: every surface says Preparing with the start step the turn stands
+// at (the bar keeps it apart from its word, to drop first); once its Main call started it says the word its census
+// move gives, never Sending or Thinking before the census sees the request go out.
+test('a turn still preparing says its start step beside Preparing on the bar and on every other surface', () => {
+    const state = stateOf('direct_preparing', 1);
+    const bar = roomStatusView(state);
+    assert.deepEqual([bar.text, bar.step, bar.tone, bar.mark], ['Preparing', 'Building context', 'live', 'moving']);
+    assert.equal(summarizeRoom(state.room, state.works).label, 'Preparing · Building context');
+    const row = workRowView(state.works[0]);
+    assert.deepEqual([row.word, row.secondary], ['Preparing', 'Building context']);
+    const card = cardWorkView(state.works[0]);
+    assert.deepEqual([card.text, card.secondary], ['Preparing', 'Building context']);
+    assert.equal(roomStatusView(state, { stopping: 'immediate' }).text, 'Cancelling…', 'the owner\'s own Stop says only its word');
+    const called = stateOf('direct_requested', 1);
+    assert.deepEqual([roomStatusView(called).text, workRowView(called.works[0]).secondary], ['Working', '']);
+    assert.ok(!('step' in roomStatusView(called)) && !('step' in roomStatusView(stateOf('working_call'))),
+        'a working room says no start step');
+    // Only a preparing room says a line in the bar: a working room's reason stays beside its work.
+    assert.equal(workLine(stateOf('held_continue').works[0]), 'Continue starts when 3 helpers of the earlier attempt finish');
+    assert.equal(roomStatusView(stateOf('held_continue')).text, 'Working');
+});
+
 test('reasons read their code through the catalog; counts stay parameters; an unknown code reads its sentence', () => {
     const held = work('held_continue');
     assert.equal(reasonText(held.because[0]), 'Continue starts when 3 helpers of the earlier attempt finish');

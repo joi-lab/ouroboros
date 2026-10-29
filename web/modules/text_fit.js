@@ -7,9 +7,13 @@
 // element's own size, so a fit inside the observer's callback could loop in one frame: WebKit reports that as an
 // error), a height change does not, and an element removed from the page leaves the observer (no element is kept
 // alive by it). That frame's re-fit is heard (`onRefit`): a room places its reader again once its lines changed size
-// (Main shown again had laid out its newest message before its lines were fitted at their width). Elements fitted together are fitted in lockstep: every element's probe of a round is written before
-// any is read, so a batch costs a few layouts of the page however many lines it holds (fitted one by one, every probe
-// laid out the whole page: a long Main whose hundred work lines changed behind a page froze for seconds on return).
+// (Main shown again had laid out its newest message before its lines were fitted at their width). Elements fitted in one
+// batch (layout_batch.js: that frame's re-fit, the reading owner's write) are fitted in lockstep: every element's probe of
+// a round is written before any is read, so a batch costs a few layouts of the page however many lines it holds (fitted
+// one by one, every probe laid out the whole page: a long Main whose hundred work lines changed behind a page froze for
+// seconds on return, and a page of history re-fitted each card once per row it replayed).
+import { batch, measure } from './layout_batch.js';
+
 const fits = new WeakMap();  // element -> { text, lines, width, onFit }
 let observer = null;
 const widened = new Set();  // elements whose width changed, fitted on the next frame
@@ -47,46 +51,45 @@ function fitsInline(el, nowrap) {
 // A wrapping element overflows downwards, a one-line (nowrap) element sideways.
 const inside = (job) => job.el.scrollHeight <= job.limit && fitsInline(job.el, job.nowrap);
 
-function refit(els) {
-    const jobs = [];
-    const heard = [];  // onFit is called after the last read: a caller's own write would lay the page out again
-    for (const el of els) {
-        const fit = fits.get(el);
-        if (!fit) continue;
-        if (!el.isConnected || !el.clientWidth) {
-            if (el.textContent !== fit.text) el.textContent = fit.text;
-            heard.push([fit, false]);
-            continue;
-        }
+// One element's fit, written as the reads it waits for: each `yield read` is measured with every other pending read
+// (layout_batch.js), then the fit resumes with its value — its width, line height and whether the whole text fits,
+// then a binary search on its words. The whole text is written at once, so whoever reads the element in the same write
+// sees it (a card's change projection, chat_render_batch.js); only a cut waits for its reads. An element with no layout
+// shows its whole text. In a batch an element built before it is mounted (a reply's quote) is fitted once the batch's
+// writes have mounted it.
+function* fitSteps(el, fit) {
+    if (el.textContent !== fit.text) el.textContent = fit.text;
+    const box = yield () => {
+        if (!el.isConnected || !el.clientWidth) return null;
         const style = getComputedStyle(el);
-        jobs.push({ el, fit, width: el.clientWidth, limit: fit.lines * lineHeight(style) + 1, nowrap: style.whiteSpace === 'nowrap' });
+        const job = { el, width: el.clientWidth, limit: fit.lines * lineHeight(style) + 1, nowrap: style.whiteSpace === 'nowrap' };
+        job.whole = inside(job);
+        return job;
+    };
+    fit.width = box ? box.width : 0;  // an element with no layout forgets its width, so showing it again fits it again
+    if (!box || box.whole) { fit.onFit?.(false); return; }
+    // Cut on whitespace only: a word is never split, a line never ends half a word.
+    const tokens = fit.text.split(/(\s+)/);
+    let low = 0, high = tokens.length;
+    while (low < high) {
+        const mid = Math.ceil((low + high) / 2);
+        el.textContent = ellipsize(tokens.slice(0, mid).join(''));
+        if (yield () => inside(box)) low = mid; else high = mid - 1;
     }
-    for (const job of jobs) { job.fit.width = job.width; job.el.textContent = job.fit.text; }
-    let open = [];
-    for (const job of jobs) {
-        if (inside(job)) { heard.push([job.fit, false]); continue; }
-        // Cut on whitespace only: a word is never split, a line never ends half a word.
-        job.tokens = job.fit.text.split(/(\s+)/);
-        job.low = 0;
-        job.high = job.tokens.length;
-        open.push(job);
-    }
-    const cut = open.slice();
-    while (open.length) {
-        for (const job of open) {
-            job.mid = Math.ceil((job.low + job.high) / 2);
-            job.el.textContent = ellipsize(job.tokens.slice(0, job.mid).join(''));
-        }
-        for (const job of open) {
-            if (inside(job)) job.low = job.mid; else job.high = job.mid - 1;
-        }
-        open = open.filter((job) => job.low < job.high);
-    }
-    for (const job of cut) {
-        job.el.textContent = ellipsize(job.tokens.slice(0, Math.max(job.low, 1)).join(''));
-        heard.push([job.fit, true]);
-    }
-    for (const [fit, wasCut] of heard) fit.onFit?.(wasCut);
+    el.textContent = ellipsize(tokens.slice(0, Math.max(low, 1)).join(''));
+    fit.onFit?.(true);
+}
+
+function refit(el) {
+    const fit = fits.get(el);
+    if (!fit) return;
+    const steps = fitSteps(el, fit);
+    const step = (value) => {
+        if (fits.get(el) !== fit) return;  // a newer fit of the element ends this one
+        const { value: read, done } = steps.next(value);
+        if (!done) measure(read, step);
+    };
+    step();
 }
 
 /**
@@ -117,13 +120,13 @@ export function fitText(el, text, lines, onFit = null) {
                 frame = 0;
                 const due = [...widened];
                 widened.clear();
-                refit(due);
+                batch(() => due.forEach(refit));
                 for (const listener of refitted) listener(due);
             });
         });
     }
     observer?.observe?.(el);
-    refit([el]);
+    refit(el);
     return el;
 }
 

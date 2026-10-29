@@ -387,16 +387,24 @@ def test_model_role_resolves_the_consciousness_slots_and_falls_back_to_main():
     assert _initial_effort_for({"reasoning_effort": "xhigh", "metadata": meta}, "task") == "xhigh"
 
 
-def test_prepare_task_context_applies_the_role_slot_through_the_tool_context_seam():
-    """The agent pins ``ctx.task_model_override``/``task_use_local_override`` — the
-    seam the loop already reads for a subagent's model — from the role slot."""
+def test_prepare_task_context_binds_the_route_through_route_choice_and_pins_no_wake_slot():
+    """The agent binds a task's route at the one ``route_choice`` seam; a wake carries no frozen model
+    (``task_model_override`` stays empty) and follows its slot per call instead (owner 1A, route_choice)."""
     import inspect
+    from types import SimpleNamespace
 
     from ouroboros import agent as agent_module
+    from ouroboros.route_choice import bind_task_route, open_route
 
     source = inspect.getsource(agent_module.OuroborosAgent._prepare_task_context)
-    assert "role_slot = model_role_slot_override(task_metadata)" in source
-    assert "ctx.task_model_override, ctx.task_use_local_override = role_slot" in source
+    assert "route_choice.bind_task_route(ctx, task_metadata" in source
+    assert "model_role_slot_override(task_metadata)" not in source
+    ctx = SimpleNamespace(task_metadata={"model_role": "consciousness"})
+    bind_task_route(ctx, ctx.task_metadata, presence=False)
+    assert ctx.task_model_override is None and ctx.task_use_local_override is None
+    with mock.patch.dict(os.environ, {"OUROBOROS_MODEL_CONSCIOUSNESS": "openai::consc", "USE_LOCAL_CONSCIOUSNESS": ""}):
+        assert open_route(ctx, SimpleNamespace(default_model=lambda: "main/model")) == (
+            "openai::consc", False, {"kind": "following", "role": "consciousness"})
 
 
 def test_handle_task_ledger_category_comes_from_usage_category(monkeypatch, tmp_path):

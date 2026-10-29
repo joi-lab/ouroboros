@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET, _emit_ws_frame
+from tests.ui_console_errors import PageErrors
 
 pytest_plugins = ("tests.test_ui_smoke_playwright",)
 
@@ -158,11 +159,52 @@ def test_successful_recheck_keeps_release_tags_and_the_last_attempt(direct_serve
             browser.close()
 
 
+def _sidebar(page, width):
+    """The sidebar the indicator lives in: always there on a desk, the open drawer on a phone."""
+    if width < 980 and not page.evaluate("document.body.classList.contains('nav-drawer-open')"):
+        page.locator(".page.active [data-mobile-nav-toggle]:visible").click()
+        page.wait_for_function("document.getElementById('content').inert === true")
+
+
+def _settled(page):
+    """Every finite animation and transition has ended: colours are read where they rest, never mid-transition."""
+    page.evaluate("() => Promise.all(document.getAnimations().filter(a => a.effect?.getTiming().iterations !== Infinity)"
+                  ".map(a => a.finished.catch(() => {})))")
+
+
+def _reload(page, width):
+    page.reload(wait_until="domcontentloaded")
+    page.wait_for_function("window.__testSockets?.some(s => s.readyState === 1)")
+    _sidebar(page, width)
+
+
+_NOTICE = """() => {
+    const box = (el) => { const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, r: r.right, b: r.bottom, w: r.width, h: r.height }; };
+    const pill = document.getElementById('update-pill');
+    const close = document.querySelector('.update-notice-close');
+    const sidebar = document.getElementById('primary-sidebar').getBoundingClientRect();
+    return { pill: box(pill), close: box(close), sidebar: { x: sidebar.x, r: sidebar.right },
+             clipped: pill.scrollWidth > pill.clientWidth + 1, overflow: document.documentElement.scrollWidth - innerWidth,
+             active: document.activeElement?.id || String(document.activeElement?.className || ''),
+             closeColor: getComputedStyle(close).color, pillColor: getComputedStyle(pill).color };
+}"""
+
+# The close's focus ring against its capsule: the ring's outer edge must stay inside the capsule and clear of its words.
+_RING = """() => { const c = document.querySelector('.update-notice-close'), s = getComputedStyle(c);
+    const pill = document.getElementById('update-pill'), p = pill.getBoundingClientRect();
+    const r = c.getBoundingClientRect(), out = parseFloat(s.outlineOffset) + parseFloat(s.outlineWidth);
+    const words = p.right - parseFloat(getComputedStyle(pill).paddingRight);
+    return { offset: s.outlineOffset, style: s.outlineStyle, inCapsule: r.left - out >= words
+        && r.right + out <= p.right + 0.5 && r.top - out >= p.top - 0.5 && r.bottom + out <= p.bottom + 0.5 }; }"""
+
+
 @pytest.mark.ui_browser
 @pytest.mark.parametrize("width", [1100, 390])
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
-def test_update_indicator_carries_the_outcome_until_dismissed_and_shows_the_next_attempt(direct_server, tmp_path, width, engine):
-    """Owner 3A (#1818): the existing pill shows stage, then outcome; dismissing sends nothing and keeps the panel."""
+def test_update_indicator_failure_closes_on_its_notice_and_success_stays_in_the_panel(direct_server, tmp_path, width, engine):
+    """Owners 3A and 1B (#1818): a running stage and a failed or unconfirmed outcome stay on the existing capsule, the
+    last until the close beside it hides it (this browser, this attempt); a confirmed success never wears it and never
+    masks a newer version, its record being the Dashboard panel's alone; a needed restart keeps its words."""
     from playwright.sync_api import expect, sync_playwright
 
     refusal = {"operation_id": "attempt-a", "current_generation": True, "active": False, "result": "failed",
@@ -170,7 +212,7 @@ def test_update_indicator_carries_the_outcome_until_dismissed_and_shows_the_next
                "stage": "draining_writers", "reason": "update_writer_fence_blocked",
                "blockers": ["active:Main conversation"], "work_stop": "none", "concluded_by": "executor", "restart_required": False,
                "error": "Could not prove every repository writer stopped.", "base_sha": "a" * 40, "target_sha": "b" * 40}
-    status = {"managed": True, "check_ok": True, "available": True, "safe_to_apply": True,
+    status = {"managed": True, "check_ok": True, "available": True, "safe_to_apply": True, "local_changes": "absent",
               "current_version": "7.0.0", "latest_version": "7.1.0",
               "current_short_sha": "aaaaaaaa", "latest_short_sha": "bbbbbbbb",
               "update_tx": {"active": False}, "warnings": [],
@@ -179,75 +221,154 @@ def test_update_indicator_carries_the_outcome_until_dismissed_and_shows_the_next
     evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", str(tmp_path)))
     evidence.mkdir(parents=True, exist_ok=True)
     actions = []
+    theme = "dark" if width == 1100 else "light"
+
+    def open_page(browser):
+        page = browser.new_page(viewport={"width": width, "height": 750}, color_scheme=theme, has_touch=width < 980)
+        page.add_init_script(f"({_CAPTURE_TEST_SOCKET})();")
+        errors = PageErrors(page, engine)
+        page.on("request", lambda request: actions.append(request.url) if request.method == "POST" and any(
+            path in request.url for path in ("/api/update/", "/api/command", "/api/git/")) else None)
+        page.route("**/api/update/status**", lambda route: route.fulfill(json=status))
+        page.goto(direct_server, wait_until="domcontentloaded")
+        page.wait_for_selector("#page-chat")
+        page.wait_for_function("window.__testSockets?.some(s => s.readyState === 1)")
+        return page, errors
+
+    def conclude(page, **fields):
+        status["update_progress"] = {**refusal, **fields}
+        _emit_ws_frame(page, {"type": "update_progress_changed"})
+
     with sync_playwright() as pw:
         browser = getattr(pw, engine).launch(headless=True)
-        page = browser.new_page(viewport={"width": width, "height": 750}, color_scheme="dark" if width == 1100 else "light")
         try:
-            page.add_init_script(f"({_CAPTURE_TEST_SOCKET})();")
-            page.on("request", lambda request: actions.append(request.url) if request.method == "POST" and any(
-                path in request.url for path in ("/api/update/", "/api/command", "/api/git/")) else None)
-            page.route("**/api/update/status**", lambda route: route.fulfill(json=status))
-            page.goto(direct_server, wait_until="domcontentloaded")
-            page.wait_for_selector("#page-chat")
-            page.wait_for_function("window.__testSockets?.some(s => s.readyState === 1)")
-            if width < 980:
-                page.locator("[data-mobile-nav-toggle]:visible").click()
-            pill = page.locator("#update-pill")
+            page, errors = open_page(browser)
+            _sidebar(page, width)
+            pill, close = page.locator("#update-pill"), page.locator(".update-notice-close")
+            # A stage names itself and has no close: it ends by itself, with the attempt.
             expect(pill).to_have_text("Stopping work…")
-            status["update_progress"] = refusal
-            _emit_ws_frame(page, {"type": "update_progress_changed"})
+            expect(close).to_be_hidden()
+            # A failure stays, with its own close inside the capsule's end, in the capsule's ink.
+            conclude(page)
             expect(pill).to_have_text("Update not applied")
             expect(pill).to_have_attribute("data-tone", "error")
-            page.screenshot(path=str(evidence / f"update-indicator-{engine}-{width}-outcome.png"))
-            if width < 980:
-                # Exercise the settled modal drawer, not a click that races its inert boundary.
-                page.wait_for_function("document.getElementById('content').inert === true")
-            pill.focus()
-            page.keyboard.press("Enter")
+            expect(close).to_be_visible()
+            _settled(page)
+            notice = page.evaluate(_NOTICE)
+            assert notice["close"]["x"] >= notice["pill"]["x"] and notice["close"]["r"] <= notice["pill"]["r"] + 0.5, notice
+            assert notice["close"]["y"] >= notice["pill"]["y"] - 0.5 and notice["close"]["b"] <= notice["pill"]["b"] + 0.5, notice
+            assert notice["close"]["w"] >= 24 and notice["close"]["h"] >= 24, ("a real pointer target", notice)
+            assert notice["pill"]["r"] <= notice["sidebar"]["r"] and not notice["clipped"] and notice["overflow"] <= 0, notice
+            assert notice["closeColor"] == notice["pillColor"], ("the close takes the capsule's ink", notice)
+            # Under a coarse pointer the drawn 24 px circle gains the shared 44 px hit area (`.ui-hit-area`).
+            coarse = page.evaluate("matchMedia('(pointer: coarse)').matches")
+            if coarse:
+                hit = page.evaluate("""() => { const s = getComputedStyle(document.querySelector('.update-notice-close'), '::after');
+                    return [parseFloat(s.width), parseFloat(s.height)]; }""")
+                assert hit[0] >= 44 and hit[1] >= 44, ("a touch target of at least 44 px", hit)
+            page.locator("#primary-sidebar .sidebar-foot").screenshot(path=str(evidence / f"update-foot-{engine}-{width}-failure.png"))
+            # The capsule still goes to the one panel; the panel keeps the saved result and has no remote hide.
+            pill.click()
             expect(page.locator("#dashboard-panel-updates")).to_be_visible()
             expect(page.locator("#updates-attempt-headline")).to_have_text("No update was applied.")
             expect(page.locator("#updates-attempt-text")).to_have_text(
                 "Work was still finishing: Main conversation. This attempt stopped no running work. Try again when it finishes.")
             expect(page.locator("#btn-update-primary")).to_have_text("Update to 7.1.0")
-            page.locator("#updates-attempt-details summary").click()
+            page.locator("#updates-attempt-details > summary").click()
             expect(page.locator("#updates-attempt-facts")).to_contain_text("update_writer_fence_blocked")
-            page.screenshot(path=str(evidence / f"update-panel-{engine}-{width}-attempt.png"), full_page=True)
-            page.locator("#updates-attempt-dismiss").focus()
+            assert page.locator("#updates-attempt-dismiss").count() == 0, "the hide lives on the notice, never on another page"
+            _sidebar(page, width)
+            # Keyboard: Tab from the capsule reaches the close, Enter hides this notice and focus lands on what is left.
+            pill.focus()
+            page.keyboard.press("Alt+Tab" if engine == "webkit" else "Tab")  # WebKit tabs to buttons with Option held
+            assert page.evaluate(_NOTICE)["active"] == "update-notice-close ui-hit-area", "the close follows the capsule in tab order"
+            # The one focus ring in its flush variant (DESIGN §3 "Focus"): it stays inside the capsule's end, clear of the
+            # capsule's edge and of its words, which a ring drawn outside the close crosses (falsified right here).
+            ring = page.evaluate(_RING)
+            assert ring == {"offset": "-2px", "style": "solid", "inCapsule": True}, ring
+            outer = page.add_style_tag(content=".update-notice-close:focus-visible { outline-offset: 2px !important; }")
+            assert page.evaluate(_RING)["inCapsule"] is False, "an outer ring would cross the capsule and its words"
+            outer.evaluate("el => el.remove()")
+            box = page.locator(".update-notice").bounding_box()
+            page.screenshot(path=str(evidence / f"update-foot-{engine}-{width}-focus.png"), clip={
+                "x": max(0, box["x"] - 12), "y": max(0, box["y"] - 12), "width": box["width"] + 24, "height": box["height"] + 24})
             page.keyboard.press("Enter")
-            expect(page.locator("#updates-attempt-dismiss")).to_be_hidden()
-            expect(page.locator("#updates-attempt-headline")).to_have_text("No update was applied.")
-            if width < 980:
-                page.locator("[data-mobile-nav-toggle]:visible").click()
             expect(pill).to_have_text("Update available")
-            page.reload(wait_until="domcontentloaded")
-            page.wait_for_function("window.__testSockets?.some(s => s.readyState === 1)")
-            if width < 980:
-                page.locator("[data-mobile-nav-toggle]:visible").click()
-            expect(pill).to_have_text("Update available")  # the dismissed result stays dismissed after reload
-            status["update_progress"] = {**refusal, "operation_id": "attempt-b", "outcome": "unknown",
-                                         "reason": "no_completion_record", "work_stop": "", "blockers": []}
-            _emit_ws_frame(page, {"type": "update_progress_changed"})
+            expect(close).to_be_hidden()
+            assert page.evaluate(_NOTICE)["active"] == "update-pill", "focus never falls to the page"
+            expect(page.locator("#updates-attempt-headline")).to_have_text("No update was applied.")
+            # Reload: this browser remembers the hide for that attempt.
+            _reload(page, width)
+            expect(pill).to_have_text("Update available")
+            expect(close).to_be_hidden()
+            # The next attempt is a new notice, closable; an unconfirmed outcome stays beside a newer version, and
+            # pressing the close with a pointer hides it the same way.
+            conclude(page, operation_id="attempt-b", outcome="unknown", reason="no_completion_record", work_stop="", blockers=[])
             expect(pill).to_have_text("Update outcome unconfirmed")
             expect(pill).to_have_attribute("data-tone", "neutral")
-            if width < 980:
-                page.wait_for_function("document.getElementById('content').inert === true")
+            expect(close).to_be_visible()
             box = pill.bounding_box()
             assert box and box["x"] >= 0 and box["x"] + box["width"] <= width, box
-            pill.click()  # Pointer and keyboard enter the same existing panel.
-            expect(page.locator("#dashboard-panel-updates")).to_be_visible()
-            status["update_progress"]["retention_unconfirmed"] = True
-            _emit_ws_frame(page, {"type": "update_progress_changed"})
-            expect(page.locator("#updates-attempt-text")).to_contain_text("could not be saved")
-            expect(page.locator("#updates-attempt-headline")).to_have_text("The last update outcome is unconfirmed.")
-            status['update_progress'].update(outcome='', result='restart_required', restart_required=True)
+            _settled(page)
+            page.screenshot(path=str(evidence / f"update-indicator-{engine}-{width}-unconfirmed.png"))
+            # Another browser has no such memory: the same record shows its notice there.
+            other = browser.new_context(viewport={"width": width, "height": 750}, color_scheme=theme)
+            try:
+                second = other.new_page()
+                second.add_init_script(f"({_CAPTURE_TEST_SOCKET})();")
+                second.route("**/api/update/status**", lambda route: route.fulfill(json=status))
+                second.goto(direct_server, wait_until="domcontentloaded")
+                second.wait_for_function("window.__testSockets?.some(s => s.readyState === 1)")
+                expect(second.locator("#update-pill")).to_have_text("Update outcome unconfirmed")
+            finally:
+                other.close()
+            close.click()
+            expect(pill).to_have_text("Update available")
+            expect(close).to_be_hidden()
+            # A confirmed success wears nothing: no capsule, no toast, no timer; a newer version still shows.
+            conclude(page, operation_id="attempt-c", outcome="applied", result="applied", concluded_by="boot", blockers=[],
+                     work_stop="", reason="")
+            expect(pill).to_have_text("Update available")
+            expect(pill).not_to_have_attribute("data-tone", "ok")
+            expect(close).to_be_hidden()
+            status["available"] = False
+            _emit_ws_frame(page, {"type": "update_status_ready"})
+            expect(pill).to_be_hidden()
+            page.wait_for_timeout(300)
+            assert page.locator(".toast").count() == 0 and page.locator("#update-pill:visible").count() == 0
+            _settled(page)
+            page.screenshot(path=str(evidence / f"update-indicator-{engine}-{width}-success-silent.png"))
+            _reload(page, width)
+            expect(pill).to_be_hidden()
+            # Its record is the Dashboard panel's, untouched by any of this.
+            page.click('[data-nav-page="dashboard"]')
+            page.click('[data-dashboard-tab="updates"]')
+            expect(page.locator("#updates-attempt-headline")).to_have_text("Update completed.")
+            expect(page.locator("#updates-attempt-text")).to_contain_text("The restarted server confirmed this update.")
+            page.screenshot(path=str(evidence / f"update-panel-{engine}-{width}-success-record.png"), full_page=True)
+            # A needed restart keeps its words and has no close: it is a stage until the restart ends it.
+            _sidebar(page, width)
+            conclude(page, operation_id="attempt-d", active=False, outcome="", result="restart_required", restart_required=True,
+                     stage="stopping_services", blockers=["service:mcp"], work_stop="invoked")
+            expect(pill).to_have_text("Restart needed")
+            expect(close).to_be_hidden()
+            # A failed retention write remains visible in the preserved Dashboard record, including after restart is needed.
+            if width < 980:
+                page.keyboard.press("Escape")
+                page.wait_for_function("document.getElementById('content').inert === false")
+            status['update_progress']['retention_unconfirmed'] = True
             _emit_ws_frame(page, {'type': 'update_progress_changed'})
             expect(page.locator('#btn-update-primary')).to_have_text('Restart now')
             expect(page.locator('#updates-attempt-text')).to_be_visible()
             expect(page.locator('#updates-attempt-text')).to_contain_text('could not be saved')
-            page.screenshot(path=str(evidence / f'update-panel-{engine}-{width}-retention-warning.png'), full_page=True)
+            conclude(page, operation_id='attempt-e', outcome='unknown', reason='no_completion_record',
+                     work_stop='', blockers=[], retention_unconfirmed=True)
+            expect(page.locator('#updates-attempt-headline')).to_have_text('The last update outcome is unconfirmed.')
+            expect(page.locator('#updates-attempt-text')).to_contain_text('could not be saved')
+            assert page.locator('#dashboard-panel-updates').evaluate('el => el.scrollWidth <= el.clientWidth')
             assert actions == [], actions
             assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
-            assert page.locator("#dashboard-panel-updates").evaluate("el => el.scrollWidth <= el.clientWidth")
+            assert errors.unexpected() == [], errors
         finally:
             browser.close()
 

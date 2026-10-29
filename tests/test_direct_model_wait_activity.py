@@ -167,8 +167,10 @@ def test_warm_owner_pause_registry_and_fence_reach_the_rendered_card(tmp_path, m
     assert _js_pause_cards(samples) == [
         {"phase": "Paused", "line": "Review work finishing", "resume": True, "mark": "pause/ink"},
         {"phase": "Paused", "line": "", "resume": True, "mark": "pause/ink"},
-        # A resumed direct turn reads its own census phase (``preparing``), a managed task ``working``.
-        {"phase": "Preparing" if kind == "direct_chat" else "Working", "line": "", "resume": False, "mark": "moving/ink"},
+        # A resumed direct turn reads its own census phase (``preparing``) beside the start step it stands at (registered,
+        # never started), a managed task ``working``.
+        {"phase": "Preparing" if kind == "direct_chat" else "Working",
+         "line": "Setting up the turn" if kind == "direct_chat" else "", "resume": False, "mark": "moving/ink"},
     ]
 
 

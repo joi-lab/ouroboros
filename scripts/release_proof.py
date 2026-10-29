@@ -9,6 +9,7 @@ import hashlib
 import json
 import re
 import runpy
+import zipfile
 from functools import partial
 from pathlib import Path
 from typing import Iterable
@@ -124,10 +125,14 @@ REQUIRED_SMOKE_CHECKS = {
 }
 # Windows signing is selected by configuration: without a signer thumbprint the
 # ZIP ships explicitly unsigned; with one, the receipt must name that verified
-# signer and carry these checks, or the whole release stops.
+# signer, carry these checks and hash exactly the catalogued executables before
+# and after signing, or the whole release stops.
 AUTHENTICODE_PROOF_ID = "windows-x64"
 AUTHENTICODE_SMOKE_CHECKS = frozenset(
     {"authenticode_signer", "timestamp", "signed_payload_archive_match"}
+)
+WINDOWS_SIGNING_CATALOG = json.loads(
+    (Path(__file__).resolve().parent / "windows_signing_catalog.json").read_text(encoding="utf-8")
 )
 # Like Windows signing, configuration selects the macOS state: a signed stable
 # build must prove both stapled tickets and Gatekeeper acceptance of the
@@ -199,6 +204,52 @@ def command_locate(args: argparse.Namespace) -> None:
     print(json.dumps(values, sort_keys=True))
 
 
+def _signed_files(records: object) -> list[dict]:
+    """Each catalogued executable exactly once, with distinct hashes before and
+    after signing; an upstream-pinned file must have been signed from its pin."""
+    catalog = {entry["path"]: entry for entry in WINDOWS_SIGNING_CATALOG["files"]}
+    if not isinstance(records, list) or not all(
+        isinstance(row, dict) and set(row) == {"path", "unsignedSha256", "sha256"}
+        and all(isinstance(value, str) for value in row.values())
+        for row in records
+    ):
+        raise ValueError("Windows signing record must give path, unsignedSha256 and sha256 per file")
+    paths = [row["path"] for row in records]
+    if sorted(paths) != sorted(catalog):
+        raise ValueError(f"Windows signing record covers {paths}, not exactly the catalogued {list(catalog)}")
+    for row in records:
+        pin = catalog[row["path"]].get("upstreamSha256")
+        if not all(re.fullmatch(r"[0-9a-f]{64}", row[key]) for key in ("unsignedSha256", "sha256")) or (
+            row["unsignedSha256"] == row["sha256"]
+        ):
+            raise ValueError(f"Windows signing record for {row['path']} lacks distinct SHA-256 digests")
+        if pin and row["unsignedSha256"] != pin:
+            raise ValueError(
+                f"{row['path']} was signed from SHA-256 {row['unsignedSha256']}, not the catalogued upstream {pin}"
+            )
+    return sorted(records, key=lambda row: list(catalog).index(row["path"]))
+
+
+def _archived_signed_files(artifact: Path, record: str) -> list[dict]:
+    """The signing job's record, bound to the bytes the final ZIP holds."""
+    files = _signed_files(json.loads(record or "null"))
+    try:
+        with zipfile.ZipFile(artifact) as archive:
+            for row in files:
+                digest = hashlib.sha256()
+                with archive.open(row["path"]) as member:
+                    for chunk in iter(lambda: member.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                if digest.hexdigest() != row["sha256"]:
+                    raise ValueError(
+                        f"{row['path']} in {artifact.name} has SHA-256 {digest.hexdigest()}, "
+                        f"not the signed {row['sha256']}"
+                    )
+    except (KeyError, zipfile.BadZipFile) as exc:
+        raise ValueError(f"{artifact.name} does not hold every catalogued executable: {exc}") from exc
+    return files
+
+
 def command_record_smoke(args: argparse.Namespace) -> None:
     if args.proof_id not in PROOF_IDS:
         raise ValueError(f"unsupported proof id: {args.proof_id}")
@@ -224,7 +275,11 @@ def command_record_smoke(args: argparse.Namespace) -> None:
                 "status": "signed",
                 "signerThumbprint": args.authenticode_thumbprint.upper(),
                 "publisher": args.authenticode_publisher,
+                "files": _archived_signed_files(args.artifact, args.authenticode_files),
+                "pythonUpstream": WINDOWS_SIGNING_CATALOG["pythonUpstream"],
             }
+        elif args.authenticode_files:
+            raise ValueError("signed Windows file hashes need the verified signer")
     if args.proof_id == NOTARIZATION_PROOF_ID:
         receipt["notarization"] = {"status": args.macos_notarization or "not_notarized"}
     _write_json(args.output, receipt)
@@ -312,7 +367,10 @@ def _authenticode_state(smoke: dict, checks: list, signer_thumbprint: str) -> di
     missing = AUTHENTICODE_SMOKE_CHECKS - claimed
     if missing:
         raise ValueError(f"windows-x64 receipt is missing signing checks: {sorted(missing)}")
-    return {"status": "signed", "signerThumbprint": expected, "publisher": publisher}
+    if state.get("pythonUpstream") != WINDOWS_SIGNING_CATALOG["pythonUpstream"]:
+        raise ValueError("windows-x64 receipt does not name the catalogued upstream Python")
+    return {"status": "signed", "signerThumbprint": expected, "publisher": publisher,
+            "files": _signed_files(state.get("files")), "pythonUpstream": state["pythonUpstream"]}
 
 
 def _notarization_state(smoke: dict, checks: list) -> dict:
@@ -510,13 +568,18 @@ def _release_notes(
         lines.append(f"- **{label}:** [{name}]({url})")
     authenticode = records_by_id[AUTHENTICODE_PROOF_ID]["authenticode"]
     if authenticode["status"] == "signed":
+        python = authenticode["pythonUpstream"]
         lines.extend([
             "",
-            "Windows: `Ouroboros.exe` in the ZIP carries a timestamped Authenticode signature "
+            "Windows: `Ouroboros.exe` and the bundled interpreter's `python.exe` and `pythonw.exe` "
+            f"(CPython {python['pythonVersion']} from python-build-standalone {python['release']}) "
+            "carry timestamped Authenticode signatures "
             f"from **{authenticode['publisher']}** (certificate SHA-1 "
-            f"`{authenticode['signerThumbprint']}`). The other files in the ZIP are not "
-            "signed individually, and SmartScreen may still warn while the publisher's "
-            "reputation builds.",
+            f"`{authenticode['signerThumbprint']}`); `release-evidence.json` lists each file's "
+            "SHA-256 before and after signing. This release signs no other file in the ZIP, "
+            "no Python environment later created from that interpreter and no code that later "
+            "Git updates bring, and SmartScreen or antivirus may still warn while the "
+            "publisher's reputation builds.",
         ])
     else:
         lines.extend([
@@ -729,6 +792,8 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--check", action="append", default=[])
     smoke.add_argument("--authenticode-thumbprint", default="")
     smoke.add_argument("--authenticode-publisher", default="")
+    # The windows-sign job's signed_files output: JSON rows of path, unsignedSha256, sha256.
+    smoke.add_argument("--authenticode-files", default="")
     smoke.add_argument("--macos-notarization", choices=("notarized", "not_notarized"))
     smoke.set_defaults(func=command_record_smoke)
 

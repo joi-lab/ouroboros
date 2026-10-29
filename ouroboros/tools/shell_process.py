@@ -2,9 +2,10 @@
 
 Owns the tracked subprocess registry and its panic-time tree kill, the
 PYTHONPATH scrubbing that keeps an external workspace from shadow-importing
-Ouroboros, the single normalized per-command timeout resolution, the
-return-code and bounded stdout/stderr rendering, and the probe that decides
-whether a resolved cwd is reachable through the workspace executor. The
+Ouroboros, the single normalized per-command timeout resolution (which the
+loop's outer wait reuses, ``command_timeout_for_call``), the return-code and
+bounded stdout/stderr rendering, and the probe that decides whether a
+resolved cwd is reachable through the workspace executor. The
 run_command/run_script handlers and the tool descriptors stay with
 ``tools/shell.py``.
 """
@@ -15,7 +16,7 @@ import os
 import pathlib
 import subprocess
 import threading
-from typing import List
+from typing import Any, List, Mapping, Optional
 
 from ouroboros.platform_layer import kill_process_tree, request_process_tree_kill, scrub_repo_from_pythonpath, subprocess_new_group_kwargs
 from ouroboros.config import SETTINGS_DEFAULTS, load_settings, runtime_environ
@@ -217,6 +218,25 @@ def _resolve_effective_timeout(
 
     # 4. Floor at 1s.
     return max(1, int(effective))
+
+
+# The handlers that bound their child with ``_resolve_effective_timeout``. The loop's outer
+# wait resolves the same value here and adds its settlement margin, so whatever sets the
+# bound (override, environment, settings, default, ceiling or task deadline) the child's own
+# cleanly reported timeout fires first. The margin covers ordinary settlement, not work after
+# the child: verify_and_record's executor probes can outlast it, and that result then settles
+# late (``late_tool_results``) (#1376). Only these three are aligned here: skill_exec,
+# extensions and MCP keep their own child bounds and outer windows.
+COMMAND_TIMEOUT_TOOLS = frozenset({"run_command", "run_script", "verify_and_record"})
+
+
+def command_timeout_for_call(tool_name: str, args: Mapping[str, Any], ctx: ToolContext | None = None) -> Optional[int]:
+    """The child timeout ``tool_name``'s handler will use for dispatched ``args``, or ``None``
+    when the tool does not bound a child through this resolution. Dispatch has already folded
+    the ``timeout`` alias into ``timeout_sec`` (``tool_resolution._normalize_tool_call_args``)."""
+    if tool_name not in COMMAND_TIMEOUT_TOOLS:
+        return None
+    return _resolve_effective_timeout(_RUN_SHELL_DEFAULT_TIMEOUT_SEC, ctx, override_sec=args.get("timeout_sec"))
 
 
 # R5 (node-runtime sprint): the render moved to the typed process-facts SSOT

@@ -20,7 +20,7 @@
    — one finished task has several wire shapes, and a quiz frame can be
    delivered more than once.
 
-   Preferences are client-local like the appearance choice (web/theme.js): the
+   Preferences stay with this client's origin: the
    desktop window and each browser keep their own, nothing is sent to the
    server, and the controls carry no `s-` id, so the Settings collector never
    posts them.

@@ -36,6 +36,7 @@ from ouroboros.secret_masking import (
     mask_prefixed_secret,
 )
 from ouroboros.mcp_headers import mask_headers, validate_headers
+from ouroboros.mcp_schema import filter_schema_literals, redact_metadata, tool_metadata
 from ouroboros.tools.tool_result import ToolResult
 from ouroboros.platform_layer import IS_WINDOWS
 from ouroboros.config import get_runtime_mode
@@ -45,8 +46,7 @@ from ouroboros.workspace_executor import resolve_process_env, validate_process_e
 from ouroboros import mcp_catalog
 from ouroboros.mcp_schema import (
     _redact_error_text as _redact_error_text,
-    _model_facing_description, _model_facing_result, _normalize_input_schema,
-    _wrap_schema_text_fields as _wrap_schema_text_fields,
+    _exception_text, _model_facing_description, _model_facing_result, _normalize_input_schema,
 )
 
 log = logging.getLogger(__name__)
@@ -113,6 +113,8 @@ class MCPServerConfig:
     secret_values: tuple[str, ...] = field(default=(), repr=False)
     configuration_warnings: tuple[str, ...] = ()
     headers: Dict[str, str] = field(default_factory=dict, repr=False)
+    # Owner pin: call schemas from task start in every request; otherwise loaded on demand (the map lists it).
+    schemas_at_start: bool = False
 
     def has_auth(self) -> bool:
         return bool(self.auth_token.strip())
@@ -139,6 +141,7 @@ class MCPTool:
     prefixed_name: str
     description: str
     schema: Dict[str, Any]
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -148,6 +151,7 @@ class MCPServerRuntime:
     config: MCPServerConfig
     tools: List[MCPTool] = field(default_factory=list)
     tool_name_collisions: List[Dict[str, str]] = field(default_factory=list)
+    schema_omissions: List[str] = field(default_factory=list)
     last_error: str = ""
     last_refreshed: str = ""
     last_attempted: str = ""
@@ -437,7 +441,8 @@ def normalize_server_config(
 
     try:
         known = {"id", "slug", "name", "label", "enabled", "transport", "url", "command",
-                 "args", "auth_header", "auth_token", "allowed_tools", "cwd", "env", "env_from_settings", "headers"}
+                 "args", "auth_header", "auth_token", "allowed_tools", "cwd", "env", "env_from_settings", "headers",
+                 "schemas_at_start"}
         unknown = set(raw) - known
         warnings = ("Fields retained but not applied: " + ", ".join(sorted(map(str, unknown))),) if unknown else ()
         cwd = raw.get("cwd", "")
@@ -473,12 +478,12 @@ def normalize_server_config(
         return invalid(str(exc))
 
     name = str(raw.get("name") or raw.get("label") or server_slug).strip() or server_slug
-    enabled_raw = raw.get("enabled", False)
-    if isinstance(enabled_raw, bool):
-        enabled = enabled_raw
-    else:
-        enabled = str(enabled_raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
+    def flag(key: str) -> bool:
+        value = raw.get(key, False)
+        return value if isinstance(value, bool) else str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    enabled = flag("enabled")
     allowed_tools = _coerce_str_list(raw.get("allowed_tools"))
 
     return MCPServerConfig(
@@ -498,6 +503,7 @@ def normalize_server_config(
         secret_values=secret_values,
         configuration_warnings=warnings,
         headers=headers,
+        schemas_at_start=flag("schemas_at_start"),
     )
 
 
@@ -563,6 +569,7 @@ def redact_servers_for_status(configs: List[MCPServerConfig]) -> List[Dict[str, 
                 "allowed_tools": list(cfg.allowed_tools),
                 "cwd": cfg.cwd,
                 "env_from_settings": dict(cfg.env_from_settings),
+                "schemas_at_start": cfg.schemas_at_start,
             }
         )
     return out
@@ -745,11 +752,13 @@ async def _list_tools_async(cfg: MCPServerConfig, *, timeout_sec: int) -> List[D
             else:
                 read, write = streams.read, streams.write  # pragma: no cover
             async with ClientSession(read, write) as session:
-                await session.initialize()
+                initialized = await session.initialize()
+                # The server's own usage text rides as a marker row (mcp_catalog.split_instructions).
+                instructions = getattr(initialized, "instructions", None)
                 # Follow nextCursor (E5, capinv-447): the MCP listing is paginated
                 # and a single call silently loses every tool after page one. The
                 # page bound only guards against a cursor loop from a broken server.
-                tools_raw: List[Dict[str, Any]] = []
+                tools_raw: List[Dict[str, Any]] = [{"_server_instructions": instructions}] if instructions else []
                 cursor: Any = None
                 for _page in range(50):
                     result = await (
@@ -767,6 +776,8 @@ async def _list_tools_async(cfg: MCPServerConfig, *, timeout_sec: int) -> List[D
                             value = getattr(tool, key, None)
                             if value is not None:
                                 tools_raw[-1][key] = value.model_dump(mode="json", by_alias=True) if hasattr(value, "model_dump") else value
+                        if metadata := tool_metadata(tool):
+                            tools_raw[-1]["metadata"] = {**(tools_raw[-1].get("metadata") or {}), **metadata}
                     cursor = getattr(result, "nextCursor", None)
                     if not cursor:
                         break
@@ -774,14 +785,9 @@ async def _list_tools_async(cfg: MCPServerConfig, *, timeout_sec: int) -> List[D
                     if cursor:
                         # Cap exhausted with pages remaining: a partial catalog
                         # must not read as the complete one (#447 P1).
-                        tools_raw.append({
-                            "name": "",
-                            "_pagination_truncated": True,
-                        })
-                        log.warning(
-                            "MCP tool listing stopped at the 50-page bound with "
-                            "nextCursor still present; catalog is PARTIAL",
-                        )
+                        tools_raw.append({"name": "", "_pagination_truncated": True})
+                        log.warning("MCP tool listing stopped at the 50-page bound with "
+                                    "nextCursor still present; catalog is PARTIAL")
                 return tools_raw
 
     # Server listings and draft probes name no task; no task's Pause gates them.
@@ -926,8 +932,10 @@ def _serialize_content_part(item: Any) -> Dict[str, Any]:
 def _run_async(coro_factory: Callable[[], Awaitable[Any]], *, join_timeout: Optional[int] = None) -> Any:
     """Run async work from sync code; the factory avoids reusing closed coroutines."""
     try:
-        asyncio.get_running_loop()
+        running = asyncio.get_running_loop() is not None
     except RuntimeError:
+        running = False
+    if not running:  # outside the handler, whose RuntimeError would be every failure's context
         return asyncio.run(coro_factory())
 
     # Existing loop: run the coroutine in a sub-thread.
@@ -957,13 +965,15 @@ def _run_async(coro_factory: Callable[[], Awaitable[Any]], *, join_timeout: Opti
 
 def normalize_listing(cfg: MCPServerConfig, tools_raw: list, complete: bool) -> tuple:
     """Pure provider presentation shared by publication, seeding and adoption."""
+    tools_raw, literal_omissions = filter_schema_literals(tools_raw, lambda text: _redact_error_text(text, cfg))
     normalized = [
         MCPTool(
             server_id=cfg.id,
             raw_name=str(item.get("name") or "").strip(),
             prefixed_name=make_tool_name(cfg.id, item.get("name") or ""),
-            description=_redact_error_text(str(item.get("description") or ""), cfg)[:1024],
+            description=_redact_error_text(str(item.get("description") or ""), cfg),
             schema=_normalize_input_schema(item.get("input_schema"), cfg),
+            metadata=redact_metadata(item.get("metadata") or {}, lambda text: _redact_error_text(text, cfg)),
         )
         for item in tools_raw
         if str(item.get("name") or "").strip()
@@ -986,7 +996,7 @@ def normalize_listing(cfg: MCPServerConfig, tools_raw: list, complete: bool) -> 
             continue
         seen[tool.prefixed_name] = tool
         deduped.append(tool)
-    omission_notes: List[str] = []
+    omission_notes: List[str] = literal_omissions
     if collisions:
         omission_notes.append(
             f"{len(collisions)} tool(s) unavailable due to slug collision: "
@@ -1098,6 +1108,8 @@ class MCPManager:
         items = envelope["items"] if envelope else []
         runtime.tools, runtime.tool_name_collisions, notes = normalize_listing(
             runtime.config, items, bool(envelope and envelope["complete"]))
+        notes.extend(envelope.get("schema_omissions", []) if envelope else [])
+        runtime.schema_omissions = list(dict.fromkeys(note for note in notes if note.startswith("MCP_SCHEMA_")))
         from ouroboros.tool_effects import record_mcp_annotations  # every process learns the published hints
         record_mcp_annotations(runtime.config.id, items)
         attempt = envelope["latest_attempt"] if envelope else {}
@@ -1173,6 +1185,13 @@ class MCPManager:
                     and rt.catalog["latest_attempt"].get("ok") is True
                     and not rt.catalog["latest_attempt"].get("partial")]
 
+    def server_facts(self) -> Dict[str, Dict[str, Any]]:
+        """Each enabled server's display name, pin and redacted ``initialize`` instructions (the map's headers)."""
+        with self._lock:
+            return {rt.config.id: {"name": rt.config.name, "schemas_at_start": rt.config.schemas_at_start,
+                                   "instructions": _redact_error_text((rt.catalog or {}).get("instructions", ""), rt.config)}
+                    for rt in self._servers.values() if self._enabled and rt.config.enabled}
+
     def list_tools_for_registry(self) -> List[Dict[str, Any]]:
         """Return enabled MCP tools in ToolRegistry shape."""
         with self._lock:
@@ -1195,6 +1214,8 @@ class MCPManager:
                             "server_id": tool.server_id,
                             "raw_name": tool.raw_name,
                             "raw_description": _redact_error_text(tool.description, cfg),
+                            "metadata": tool.metadata,
+                            "schemas_at_start": cfg.schemas_at_start,
                         }
                     )
             return results
@@ -1243,6 +1264,8 @@ class MCPManager:
                         "allowed_tools": list(cfg.allowed_tools),
                         "cwd": cfg.cwd,
                         "env_from_settings": dict(cfg.env_from_settings),
+                        "schemas_at_start": cfg.schemas_at_start,
+                        "instructions": _redact_error_text((runtime.catalog or {}).get("instructions", ""), cfg),
                         "configuration_warnings": list(cfg.configuration_warnings),
                         "tool_count": len(runtime.tools),
                         "tools": [
@@ -1250,6 +1273,7 @@ class MCPManager:
                                 "name": tool.raw_name,
                                 "prefixed_name": tool.prefixed_name,
                                 "description": _redact_error_text(tool.description, cfg),
+                                **({"metadata": tool.metadata} if tool.metadata else {}),
                             }
                             for tool in runtime.tools
                         ],
@@ -1295,21 +1319,25 @@ class MCPManager:
                 return {"ok": False, "error": f"MCP server {server_id!r} is disabled."}
         from ouroboros.owner_pause import OwnerPauseRefused
 
-        items, complete, error = None, False, ""
+        items, complete, error, instructions = None, False, "", ""
+        schema_omissions = []
         try:
             raw = _run_async(lambda: self._async_list_tools(cfg, timeout), join_timeout=timeout + 3)
+            raw, instructions = mcp_catalog.split_instructions(raw)
+            raw, schema_omissions = filter_schema_literals(raw, lambda text: _redact_error_text(text, cfg))
             items, complete = mcp_catalog.sanitize_items(raw, lambda text: _redact_error_text(text, cfg))
         except OwnerPauseRefused as exc:
             return {"ok": False, "not_started": True, "error": f"MCP listing NOT STARTED: {exc}"}
         except BaseException as exc:  # noqa: BLE001 - retain last-known tools on every failure
-            error = f"{type(exc).__name__}: {_redact_error_text(exc, cfg)}"
+            error = _exception_text(exc, cfg)
         at = datetime.now(timezone.utc).isoformat()
         with self._lock:
             target = self._servers.get(server_id)
             if target is not runtime or mcp_catalog.identity(target.config) != mcp_catalog.identity(cfg):
                 return {"ok": False, "published": False, "error": f"stale MCP refresh discarded for server {server_id!r}"}
-            envelope = mcp_catalog.attempt_envelope(cfg, target.catalog, at=at, error=error,
-                                                   items=items, complete=complete)
+            envelope = mcp_catalog.attempt_envelope(cfg, target.catalog, at=at, error=error, items=items, complete=complete,
+                                                   schema_omissions=schema_omissions,
+                                                   instructions=_redact_error_text(instructions, cfg))
             target.published_before_failure = self._catalog_reader.load(cfg)
             try:
                 mcp_catalog.publish(cfg, envelope)
@@ -1319,7 +1347,7 @@ class MCPManager:
                 envelope = loaded
                 target.publication_error = ""
             except Exception as exc:
-                target.publication_error = f"{type(exc).__name__}: {_redact_error_text(exc, cfg)}"
+                target.publication_error = _exception_text(exc, cfg)
                 log.warning("MCP catalog publication failed for %s: %s", cfg.id, target.publication_error)
             self._adopt_catalog(target, envelope)
             return {"ok": items is not None, "published": not bool(target.publication_error),
@@ -1376,24 +1404,24 @@ class MCPManager:
         try:
             tools_raw = _run_async(lambda: self._async_list_tools(cfg, timeout), join_timeout=timeout + 3)
         except BaseException as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"{type(exc).__name__}: {_redact_error_text(exc, cfg)}"}
-        truncated = any(
-            isinstance(t, dict) and t.get("_pagination_truncated") for t in tools_raw
-        )
-        tools_raw = [
-            t for t in tools_raw
-            if not (isinstance(t, dict) and t.get("_pagination_truncated"))
-        ]
+            return {"ok": False, "error": _exception_text(exc, cfg)}
+        tools_raw, instructions = mcp_catalog.split_instructions(tools_raw)
+        truncated = any(isinstance(t, dict) and t.get("_pagination_truncated") for t in tools_raw)
+        tools_raw = [t for t in tools_raw if not (isinstance(t, dict) and t.get("_pagination_truncated"))]
+        tools_raw, literal_omissions = filter_schema_literals(tools_raw, lambda text: _redact_error_text(text, cfg))
         return {
             "ok": True,
             "server_id": cfg.id,
             "tool_count": len(tools_raw),
             "configuration_warnings": list(cfg.configuration_warnings),
+            **({"instructions": _redact_error_text(instructions, cfg)} if instructions else {}),
+            **({"schema_omissions": literal_omissions} if literal_omissions else {}),
             **({"pagination_truncated": True} if truncated else {}),
             "tools": [
                 {
                     "name": str(t.get("name") or ""),
-                    "description": _redact_error_text(str(t.get("description") or ""), cfg)[:512],
+                    "description": _redact_error_text(str(t.get("description") or ""), cfg),
+                    "metadata": redact_metadata(t.get("metadata") or {}, lambda text: _redact_error_text(text, cfg)),
                 }
                 for t in tools_raw
             ],
@@ -1477,7 +1505,7 @@ class MCPManager:
                 from ouroboros.tools.tool_result import launch_refusal_result, _replace_tool_result
                 return _replace_tool_result(launch_refusal_result(exc),
                                             meta_updates={"mcp_call_not_sent": True})
-            body = f"⚠️ MCP_TOOL_ERROR: {type(exc).__name__}: {_redact_error_text(exc, cfg)}"
+            body = f"⚠️ MCP_TOOL_ERROR: {_exception_text(exc, cfg)}"
             text = _model_facing_result(cfg, tool.raw_name, body)
             return ToolResult(
                 status="error",

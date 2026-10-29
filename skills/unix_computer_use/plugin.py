@@ -13,34 +13,39 @@ accept coordinates in the LAST SCREENSHOT's image space by default and remap
 them through that stored transform; pass ``raw=true`` to bypass remapping and
 address native input coordinates directly.
 
-Permission caveat (honest): macOS TCC state (Screen Recording / Accessibility)
-is NOT probed — ``screencapture``/``cliclick`` exit 0 even when permission is
-denied (capturing only the wallpaper, or dropping synthetic input), so callers
-must ensure the host has granted these. Wayland support depends on ydotool
-(input) and grim/gnome-screenshot (capture); X11 uses xdotool/scrot. Windows
-desktops use the separate windows_computer_use skill.
+Permissions (honest): ``screencapture``/``cliclick`` exit 0 even when a macOS grant is
+missing (capturing only the wallpaper, or dropping synthetic input). ``capabilities``
+reads the grants through prompt-free preflights in the native helper, and an input
+receipt is demoted to a failure when cliclick itself warns that the event was dropped.
+Wayland support depends on ydotool (input) and grim/gnome-screenshot (capture); X11
+uses xdotool/scrot. Windows desktops use the separate windows_computer_use skill.
 
 Input receipt semantics and partial-failure limits: see SKILL.md, "Input receipts".
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import pathlib
 import platform
 import re
-import shlex
 import shutil
 import struct
 import subprocess
+import sys
 import time
-import urllib.request
 import uuid
 from typing import Any
 
+from .place import PlaceMixin
+from .remote import (  # noqa: F401 - re-exported names the tests and the key/hold_key remote branches use
+    _MAX_REMOTE_SHOT_BYTES, _OSWORLD_PKGS_PREFIX, _PYAUTOGUI_BASE_ALIASES, _PYAUTOGUI_MODS, RemoteBackends,
+    _osworld_result_ok, cliclick_point,
+)
+
 _TIMEOUT_SEC = 10
+_NOT_LAUNCHED = -255  # _try: the OS could not start the helper, so nothing was dispatched
 # Anthropic computer-use guidance: keep screenshots at/below ~XGA/WXGA so the
 # model reasons over a stable, token-cheap coordinate space.
 _MAX_IMAGE_W = 1280
@@ -49,61 +54,6 @@ _TRANSFORM_FILE = "coord_transform.json"
 _CONNECTIONS_FILE = "connections.json"
 _ACTIVE_CONNECTION_FILE = "active_connection.txt"
 _REMOTE_BACKENDS = {"osworld_http", "ssh_macos"}
-_AX_MAX_ELEMENTS = 120
-# Cap a remote /screenshot download (a 1920x1080 PNG is well under 10 MB).
-_MAX_REMOTE_SHOT_BYTES = 20 * 1024 * 1024
-
-# Remote backend constants. These are dormant unless a non-local connection is
-# explicitly activated in skill state (or by a benchmark runner). The default
-# behavior remains local macOS/Linux computer-use.
-_OSWORLD_PKGS_PREFIX = (
-    "import pyautogui; import time; import platform; "
-    "pyautogui.FAILSAFE = False; "
-    "{command}"
-)
-_PYAUTOGUI_MODS = {
-    "ctrl": "ctrl", "control": "ctrl",
-    "alt": "alt", "option": "alt", "opt": "alt",
-    "shift": "shift",
-    "cmd": "winleft", "command": "winleft", "super": "winleft", "meta": "winleft", "win": "winleft",
-    "fn": "fn",
-}
-
-
-def _osworld_result_ok(out: dict[str, Any]) -> tuple[bool, str]:
-    """Fail-closed verdict for an OSWorld /execute round-trip: the in-VM server
-    returns HTTP 200 even on nonzero exit, so require 200 AND (dict body)
-    status=="success" AND returncode==0 when present."""
-    if int(out.get("status") or 0) != 200:
-        return False, f"HTTP {out.get('status')}"
-    result = out.get("result")
-    if not isinstance(result, dict):
-        return False, "unexpected non-JSON /execute response"
-    status = str(result.get("status") or "").strip().lower()
-    if status and status != "success":
-        return False, str(result.get("message") or result.get("error") or f"status={status}")[:1000]
-    returncode = result.get("returncode")
-    if returncode is not None:
-        try:
-            rc = int(returncode)
-        except Exception:
-            return False, f"non-integer returncode {returncode!r}"
-        if rc != 0:
-            err = str(result.get("error") or result.get("output") or "").strip()
-            return False, (err or f"guest command exited {rc}")[:1000]
-    return True, ""
-
-
-_PYAUTOGUI_BASE_ALIASES = {
-    "return": "enter", "enter": "enter", "esc": "esc", "escape": "esc",
-    # Canonical "delete"=BACKWARD (matches _X11_KEY_ALIASES); pyautogui "delete"=FORWARD, so swap.
-    "del": "backspace", "delete": "backspace", "backspace": "backspace", "fwd-delete": "delete",
-    "space": "space", "tab": "tab", "home": "home", "end": "end",
-    "page-down": "pagedown", "pagedown": "pagedown", "page_down": "pagedown", "pgdn": "pagedown",
-    "page-up": "pageup", "pageup": "pageup", "page_up": "pageup", "pgup": "pageup",
-    "arrow-down": "down", "arrow-up": "up", "arrow-left": "left", "arrow-right": "right",
-    "down": "down", "up": "up", "left": "left", "right": "right",
-}
 
 
 def _png_dimensions(path: pathlib.Path) -> tuple[int, int]:
@@ -170,6 +120,17 @@ def _macos_logical_size() -> tuple[int, int]:
     return 0, 0
 
 
+def _helper_python() -> str:
+    """Interpreter for the native helper process: the host's agent python when it names one, else this one."""
+    return os.environ.get("OUROBOROS_AGENT_PYTHON") or sys.executable
+
+
+def _pipe(cmd: list[str], text: str, *, timeout: int = _TIMEOUT_SEC) -> tuple[int, str, str]:
+    """Run a command with ``text`` on its stdin (the clipboard writer)."""
+    proc = subprocess.run(cmd, input=text, text=True, capture_output=True, timeout=timeout)
+    return int(proc.returncode), proc.stdout or "", proc.stderr or ""
+
+
 def _json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -228,6 +189,9 @@ def _coerce_point(x: Any, y: Any) -> tuple[int, int]:
             return xs[0], xs[1]
         raise ValueError(f"ambiguous coordinates: x={x!r} carries a pair but y={y!r} disagrees")
     raise ValueError(f"cannot parse coordinates from x={x!r}, y={y!r}")
+
+
+_cc = cliclick_point  # the same cliclick point format locally and on a Mac over SSH
 
 
 def _run(cmd: list[str], *, timeout: int = _TIMEOUT_SEC) -> tuple[int, str, str]:
@@ -294,11 +258,46 @@ _MAC_MODS = {
 _ALL_MODS = {**_MAC_MODS, "super": "super", "meta": "meta"}
 
 
-class _ComputerUse:
+class _ComputerUse(PlaceMixin, RemoteBackends):
+    _MAX_IMAGE_W = _MAX_IMAGE_W
+    _MAX_IMAGE_H = _MAX_IMAGE_H
+
     def __init__(self, api: Any) -> None:
         self.api = api
         self.state_dir = pathlib.Path(api.get_state_dir())
         self.state_dir.mkdir(parents=True, exist_ok=True)
+
+    # Seams the mixins use; resolved at call time so tests can patch the module names.
+    @staticmethod
+    def _plat() -> str:
+        return _platform()
+
+    @staticmethod
+    def _session() -> str:
+        return _session_type()
+
+    @staticmethod
+    def _which_tool(name: str) -> str:
+        return _which(name)
+
+    @staticmethod
+    def _helper_python() -> str:
+        return _helper_python()
+
+    def _run_cmd(self, cmd: list[str], *, timeout: int = _TIMEOUT_SEC) -> tuple[int, str, str]:
+        return _run(cmd, timeout=timeout)
+
+    @staticmethod
+    def _json_text(payload: dict[str, Any]) -> str:
+        return _json(payload)
+
+    @staticmethod
+    def _png_dims(path: pathlib.Path) -> tuple[int, int]:
+        return _png_dimensions(path)
+
+    @staticmethod
+    def _png_ok(path: pathlib.Path) -> bool:
+        return _png_intact(path)
 
     # ------------------------------------------------------------------
     # connection registry / backend selection
@@ -446,9 +445,6 @@ class _ComputerUse:
         self._write_connections(data)
         return _json({"ok": True, "active": "local"})
 
-    def clear_active_connection(self) -> str:
-        return self.use_local()
-
     def test_connection(self, *, name: str = "") -> str:
         if name:
             data = self._read_connections()
@@ -466,354 +462,6 @@ class _ComputerUse:
         if backend == "ssh_macos":
             return self._test_ssh_macos(conn, conn_name)
         return _json({"ok": False, "connection": conn_name, "error": f"unsupported backend {backend!r}"})
-
-    # ------------------------------------------------------------------
-    # remote backend helpers
-    # ------------------------------------------------------------------
-
-    def _connection_target(self, conn: dict[str, Any]) -> str:
-        target = str(conn.get("target") or "").strip()
-        if not target and conn.get("target_file"):
-            # Path confinement: only read a target_file that lives inside this
-            # skill's OWN state dir (where add_connection / a benchmark runner
-            # publishes it). Refuse any path outside it so the tool cannot be
-            # used to read arbitrary files elsewhere on disk.
-            try:
-                candidate = pathlib.Path(str(conn["target_file"])).expanduser().resolve()
-                base = self.state_dir.resolve()
-                if candidate == base or base in candidate.parents:
-                    target = candidate.read_text(encoding="utf-8").strip()
-                else:
-                    target = ""
-            except Exception:
-                target = ""
-        return target.rstrip("/")
-
-    def _osworld_execute(self, conn: dict[str, Any], command: list[str], *, timeout: int = 60) -> dict[str, Any]:
-        target = self._connection_target(conn)
-        payload = json.dumps({"command": command, "shell": False}).encode("utf-8")
-        req = urllib.request.Request(target + "/execute", data=payload, headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            status = int(getattr(resp, "status", 0) or resp.getcode())
-            body = resp.read().decode("utf-8", errors="replace")
-        try:
-            parsed: Any = json.loads(body)
-        except Exception:
-            parsed = body[:1000]
-        return {"status": status, "result": parsed}
-
-    @staticmethod
-    def _ssh_macos_key_name(key: str) -> str:
-        low = str(key or "").strip().lower()
-        return {
-            "enter": "return", "return": "return", "esc": "esc", "escape": "esc",
-            # Input is a PYAUTOGUI key name: its "delete" is forward delete (cliclick fwd-delete).
-            "delete": "fwd-delete", "backspace": "delete", "pagedown": "page-down",
-            "pageup": "page-up", "down": "arrow-down", "up": "arrow-up",
-            "left": "arrow-left", "right": "arrow-right", "winleft": "cmd",
-            "super": "cmd", "meta": "cmd",
-        }.get(low, key)
-
-    def _ssh_macos_cliclick_for_pyautogui(self, code: str) -> tuple[list[str], str]:
-        """Translate the pyautogui snippets this skill emits into cliclick args."""
-        text = str(code or "").strip()
-        m = re.search(r"pyautogui\.click\((\d+),\s*(\d+),\s*clicks=(\d+).*button=([\"'])([^\"']+)\4", text)
-        if m:
-            x, y, clicks, button = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(5)
-            if button == "right":
-                return [f"rc:{x},{y}"], ""
-            if button == "middle":
-                return [], "middle-click unsupported by cliclick"
-            op = "tc" if clicks >= 3 else ("dc" if clicks == 2 else "c")
-            return [f"{op}:{x},{y}"], ""
-        m = re.search(r"pyautogui\.moveTo\((\d+),\s*(\d+)\).*pyautogui\.dragTo\((\d+),\s*(\d+)", text)
-        if m:
-            sx, sy, ex, ey = map(int, m.groups())
-            return [f"dd:{sx},{sy}", f"dm:{ex},{ey}", f"du:{ex},{ey}"], ""
-        m = re.search(r"pyautogui\.moveTo\((\d+),\s*(\d+)\)", text)
-        if m:
-            return [f"m:{int(m.group(1))},{int(m.group(2))}"], ""
-        m = re.search(r"pyautogui\.(mouseDown|mouseUp)\(x=(\d+),\s*y=(\d+),\s*button=([\"'])([^\"']+)\4", text)
-        if m:
-            fn, x, y, button = m.group(1), int(m.group(2)), int(m.group(3)), m.group(5)
-            if button != "left":
-                return [], "mouseDown/mouseUp supports only left button via cliclick"
-            return [f"{'dd' if fn == 'mouseDown' else 'du'}:{x},{y}"], ""
-        m = re.search(r"pyautogui\.(mouseDown|mouseUp)\(button=([\"'])([^\"']+)\2", text)
-        if m:
-            fn, button = m.group(1), m.group(3)
-            if button != "left":
-                return [], "mouseDown/mouseUp supports only left button via cliclick"
-            return [f"{'dd' if fn == 'mouseDown' else 'du'}:."], ""
-        m = re.search(r"pyautogui\.typewrite\((?P<q>[\"'])(?P<txt>.*?)(?P=q),\s*interval=", text)
-        if m:
-            return [f"t:{m.group('txt')}"], ""
-        m = re.search(r"pyautogui\.press\(([\"'])([^\"']+)\1\)", text)
-        if m:
-            return [f"kp:{self._ssh_macos_key_name(m.group(2))}"], ""
-        m = re.search(r"pyautogui\.hotkey\((.*)\)", text)
-        if m:
-            toks = [t.strip().strip("'\"") for t in m.group(1).split(",") if t.strip()]
-            if not toks:
-                return [], "empty hotkey"
-            mods = [self._ssh_macos_key_name(t) for t in toks[:-1]]
-            base = self._ssh_macos_key_name(toks[-1])
-            if mods:
-                held = ",".join(mods)
-                return [f"kd:{held}", f"kp:{base}", f"ku:{held}"], ""
-            return [f"kp:{base}"], ""
-        if "pyautogui.scroll" in text or "pyautogui.hscroll" in text:
-            return [], "scroll unsupported via cliclick; use key page-down/page-up"
-        return [], f"unsupported pyautogui snippet for ssh_macos/cliclick: {text[:120]}"
-
-    def _remote_pyautogui(self, conn: dict[str, Any], code: str, *, note: dict[str, Any] | None = None, timeout: int = 30, input_effect: bool = True) -> str:
-        if conn.get("disabled"):
-            return self._disabled_connection_error(str(self._read_connections().get("active") or "?"), conn)
-        backend = str(conn.get("backend") or "").lower()
-        try:
-            if backend == "osworld_http":
-                wrapped = _OSWORLD_PKGS_PREFIX.format(command=code)
-                out = self._osworld_execute(conn, ["python", "-c", wrapped], timeout=timeout)
-                ok, err = _osworld_result_ok(out)
-                payload: dict[str, Any] = {"ok": ok, "backend": backend, "status": out["status"], "execute_result": out["result"]}
-                if ok and input_effect:
-                    payload["observed_effect"] = True
-                if not ok:
-                    payload["error"] = err
-            elif backend == "ssh_macos":
-                cliclick_args, err = self._ssh_macos_cliclick_for_pyautogui(code)
-                if err:
-                    return _json({"ok": False, "backend": backend, "error": err, "code": code})
-                remote = "cliclick " + " ".join(shlex.quote(arg) for arg in cliclick_args)
-                rc, stdout, stderr = self._ssh_run(conn, remote, timeout=timeout)
-                payload = {"ok": rc == 0, "backend": backend, "returncode": rc, "output": stdout, "error": stderr}
-                if rc == 0 and input_effect:
-                    payload["observed_effect"] = True
-            else:
-                return _json({"ok": False, "error": f"unsupported remote backend {backend!r}"})
-        except Exception as exc:  # noqa: BLE001
-            return _json({"ok": False, "backend": backend, "error": f"{type(exc).__name__}: {exc}", "code": code})
-        if note:
-            payload.update(note)
-        return _json(payload)
-
-    def _remote_screenshot_result(
-        self,
-        *,
-        backend: str,
-        raw_path: pathlib.Path,
-        max_width: int,
-        max_height: int,
-        input_w: int,
-        input_h: int,
-        extra: dict[str, Any] | None = None,
-    ) -> str:
-        px_w, px_h = _png_dimensions(raw_path)
-        if px_w <= 0 or px_h <= 0 or not _png_intact(raw_path):
-            # Not a fully decodable PNG — don't claim success on garbage; a valid
-            # 24-byte header over zero-padded data must fail here, not rounds
-            # later as a provider 400. Drop the file.
-            try:
-                raw_path.unlink()
-            except OSError:
-                pass
-            return _json({"ok": False, "backend": backend, "error": "remote screenshot is not a fully decodable PNG"})
-        if input_w <= 0 or input_h <= 0:
-            input_w, input_h = px_w, px_h
-        max_w = max(320, min(int(max_width or _MAX_IMAGE_W), 4096))
-        max_h = max(240, min(int(max_height or _MAX_IMAGE_H), 4096))
-        img_path, img_w, img_h = self._downscale(raw_path, max_w, max_h)
-        # Path confinement: the downscaled image already lives under the skill's
-        # own job dir; return it directly for view_image, never copied elsewhere.
-        view_path = img_path
-        result: dict[str, Any] = {
-            "ok": True,
-            "path": str(view_path),
-            "backend": backend,
-            "image_width": img_w,
-            "image_height": img_h,
-            "capture_width_px": px_w,
-            "capture_height_px": px_h,
-            "input_width": input_w,
-            "input_height": input_h,
-            "downscaled": img_path != raw_path,
-            "view_image_ready": True,
-            # Typed opt-in for the host's same-round image attachment (v6.81.1).
-            # DISTINCT from view_image_ready, which only ever meant "a path you
-            # may view manually" — reusing it would retroactively change the
-            # contract of every result that already carries it.
-            "auto_attach_image": str(view_path),
-        }
-        if img_path != raw_path:
-            result["full_resolution_path"] = str(raw_path)
-        if extra:
-            result.update(extra)
-        if img_w > 0 and img_h > 0 and input_w > 0 and input_h > 0:
-            sx = round(input_w / img_w, 6)
-            sy = round(input_h / img_h, 6)
-            transform = {
-                "sx": sx, "sy": sy,
-                "image_w": img_w, "image_h": img_h,
-                "input_w": input_w, "input_h": input_h,
-                "platform": backend, "session": "remote",
-                "approx": False, "ts": time.time(),
-            }
-            self._save_transform(transform)
-            result["coord_transform"] = transform
-            result["coordinate_note"] = (
-                "Pass coordinates read off THIS image directly to click/move/drag — "
-                "they are auto-remapped through coord_transform (image -> remote input space)."
-            )
-        return _json(result)
-
-    def _osworld_screenshot(self, conn: dict[str, Any], *, max_width: int, max_height: int) -> str:
-        target = self._connection_target(conn)
-        if not target:
-            return _json({"ok": False, "error": "osworld_http connection has no target/target_file"})
-        out_dir = pathlib.Path(self.api.skill_job_dir("osworld_http")) / "output"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"screenshot-{int(time.time())}-{uuid.uuid4().hex[:6]}.png"
-        # Bounded re-fetch on a corrupt payload: a truncated body from the guest
-        # is transient (mid-write read), but once persisted it used to survive
-        # header-only checks and detonate rounds later as a provider 400.
-        last_err = ""
-        for attempt in range(3):
-            try:
-                with urllib.request.urlopen(target + "/screenshot", timeout=20) as resp:
-                    data = resp.read(_MAX_REMOTE_SHOT_BYTES + 1)
-            except Exception as exc:  # noqa: BLE001
-                return _json({"ok": False, "error": f"/screenshot failed: {type(exc).__name__}: {exc}", "backend": "osworld_http"})
-            if not data:
-                return _json({"ok": False, "error": "/screenshot returned empty body", "backend": "osworld_http"})
-            if len(data) > _MAX_REMOTE_SHOT_BYTES:
-                return _json({"ok": False, "error": f"/screenshot exceeded {_MAX_REMOTE_SHOT_BYTES} byte cap", "backend": "osworld_http"})
-            # Write-then-validate-then-rename: the published path never holds
-            # a partially written or undecodable image.
-            tmp_path = out_path.with_suffix(".part")
-            tmp_path.write_bytes(data)
-            if _png_intact(tmp_path):
-                tmp_path.rename(out_path)
-                break
-            last_err = f"undecodable PNG ({len(data)} bytes) on attempt {attempt + 1}/3"
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-            time.sleep(0.5)
-        else:
-            return _json({"ok": False, "error": f"screenshot_corrupt: {last_err}", "backend": "osworld_http"})
-        px_w, px_h = _png_dimensions(out_path)
-        return self._remote_screenshot_result(
-            backend="osworld_http",
-            raw_path=out_path,
-            max_width=max_width,
-            max_height=max_height,
-            input_w=px_w,
-            input_h=px_h,
-            # NOT `target`: the bridge URL is control-plane, and putting it in an
-            # agent-visible result is how an agent learns where the harness lives.
-            # Measured in the v6.81.1 OSWorld run: one agent read the port out of a
-            # screenshot result and curled `<bridge>/evaluate` looking for the grader
-            # (it failed only because remote_exec runs inside the guest, where that
-            # port is not the host's — containment by luck of topology, not design).
-            # The host keeps the target in bridge.json for observability.
-            extra={"backend_endpoint": "osworld_http"},
-        )
-
-    def _test_osworld(self, conn: dict[str, Any], name: str) -> str:
-        target = self._connection_target(conn)
-        if not target:
-            return _json({"ok": False, "connection": name, "backend": "osworld_http", "error": "missing target/target_file"})
-        try:
-            with urllib.request.urlopen(target + "/screenshot", timeout=10) as resp:
-                raw = resp.read(32)
-            out = self._osworld_execute(conn, ["python", "-c", "import pyautogui; print(pyautogui.size())"], timeout=20)
-            return _json({
-                "ok": bool(raw) and _osworld_result_ok(out)[0],
-                "connection": name,
-                "backend": "osworld_http",
-                "target": target,
-                "screenshot_bytes_probe": len(raw),
-                "execute_probe": out,
-            })
-        except Exception as exc:  # noqa: BLE001
-            return _json({"ok": False, "connection": name, "backend": "osworld_http", "target": target, "error": f"{type(exc).__name__}: {exc}"})
-
-    def _ssh_destination(self, conn: dict[str, Any]) -> list[str]:
-        alias = str(conn.get("ssh_alias") or "").strip()
-        if alias:
-            return [alias]
-        host = str(conn.get("host") or "").strip()
-        user = str(conn.get("user") or "").strip()
-        port = int(conn.get("port") or 22)
-        dest = f"{user}@{host}" if user else host
-        return ["-p", str(port), dest] if port != 22 else [dest]
-
-    def _ssh_scp_source(self, conn: dict[str, Any], remote_path: str) -> list[str]:
-        """scp source args: '-P <port>' (scp uses capital P) plus a SINGLE
-        '<destination>:<remote_path>' token (scp needs the source as one arg)."""
-        alias = str(conn.get("ssh_alias") or "").strip()
-        if alias:
-            return [f"{alias}:{remote_path}"]
-        host = str(conn.get("host") or "").strip()
-        user = str(conn.get("user") or "").strip()
-        port = int(conn.get("port") or 22)
-        dest = f"{user}@{host}" if user else host
-        src = f"{dest}:{remote_path}"
-        return ["-P", str(port), src] if port != 22 else [src]
-
-    def _ssh_run(self, conn: dict[str, Any], command: str, *, timeout: int = 30) -> tuple[int, str, str]:
-        ssh_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", *self._ssh_destination(conn), command]
-        return _run(ssh_cmd, timeout=timeout)
-
-    def _ssh_macos_screenshot(self, conn: dict[str, Any], *, max_width: int, max_height: int) -> str:
-        out_dir = pathlib.Path(self.api.skill_job_dir("ssh_macos")) / "output"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        remote_path = f"/tmp/ouroboros-shot-{int(time.time())}-{uuid.uuid4().hex[:6]}.png"
-        rc, stdout, stderr = self._ssh_run(conn, f"screencapture -x {remote_path!r}", timeout=20)
-        if rc != 0:
-            return _json({"ok": False, "backend": "ssh_macos", "error": stderr.strip() or stdout.strip() or f"exit {rc}"})
-        dest = out_dir / pathlib.Path(remote_path).name
-        scp_cmd = ["scp", "-q", *self._ssh_scp_source(conn, remote_path), str(dest)]
-        try:
-            proc = subprocess.run(scp_cmd, text=True, capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
-        except Exception as exc:  # noqa: BLE001
-            return _json({"ok": False, "backend": "ssh_macos", "error": f"scp failed: {type(exc).__name__}: {exc}"})
-        if proc.returncode != 0 or not dest.exists():
-            return _json({"ok": False, "backend": "ssh_macos", "error": proc.stderr.strip() or proc.stdout.strip() or f"scp exit {proc.returncode}"})
-        rc, out, _err = self._ssh_run(conn, "osascript -e 'tell application \"Finder\" to get bounds of window of desktop'", timeout=10)
-        input_w = input_h = 0
-        if rc == 0:
-            parts = [p.strip() for p in out.replace(",", " ").split()]
-            nums = [int(p) for p in parts if p.lstrip("-").isdigit()]
-            if len(nums) >= 4:
-                input_w, input_h = nums[2] - nums[0], nums[3] - nums[1]
-        return self._remote_screenshot_result(
-            backend="ssh_macos",
-            raw_path=dest,
-            max_width=max_width,
-            max_height=max_height,
-            input_w=input_w,
-            input_h=input_h,
-            extra={"host": str(conn.get("ssh_alias") or conn.get("host") or "")},
-        )
-
-    def _test_ssh_macos(self, conn: dict[str, Any], name: str) -> str:
-        rc, stdout, stderr = self._ssh_run(
-            conn,
-            "printf 'host='; hostname; printf '\\nuser='; whoami; printf '\\nos='; sw_vers -productVersion 2>/dev/null; printf '\\n'; command -v screencapture; command -v cliclick || true",
-            timeout=15,
-        )
-        ok = rc == 0 and "screencapture" in stdout
-        hint = ""
-        if rc != 0:
-            hint = (
-                "SSH auth failed. Put the private key in ~/.ssh/<name>, chmod 600 it, "
-                "and add Host/User/IdentityFile to ~/.ssh/config; then retry test_connection."
-            )
-        elif "cliclick" not in stdout:
-            hint = "Install cliclick on the Mac (e.g. brew install cliclick) and grant Accessibility permission."
-        return _json({"ok": ok, "connection": name, "backend": "ssh_macos", "output": stdout, "error": stderr, "hint": hint})
 
     # ------------------------------------------------------------------
     # capabilities / coordinate transform
@@ -845,8 +493,8 @@ class _ComputerUse:
             "notes": [
                 "ALL actions are for supervised, low-risk local workflows under human observation.",
                 "macOS requires Screen Recording for screenshot and Accessibility for input.",
-                "macOS TCC permission state is NOT verified here: screencapture/cliclick exit 0 "
-                "even when denied (wallpaper-only capture / dropped input). Ensure grants are in place.",
+                "macOS grants are read by prompt-free preflights (see permissions); a dropped input is reported "
+                "from the helper's own warning. Nothing here prompts for a grant.",
                 "macOS scroll is unsupported (cliclick has no scroll-wheel command); use key paging instead.",
                 "macOS middle-click and mouse_down/up for non-left buttons are unsupported via cliclick.",
                 "Linux X11 needs xdotool (input) + gnome-screenshot/scrot (capture).",
@@ -866,6 +514,38 @@ class _ComputerUse:
         payload["active_backend"] = str(conn.get("backend") or "local")
         if self._is_remote():
             payload["remote"] = {k: v for k, v in conn.items() if "key" not in k.lower() and "secret" not in k.lower()}
+            if conn.get("disabled"):
+                return _json(payload)
+            backend = str(conn.get("backend") or "")
+            payload["frontmost"] = self._remote_front(conn)
+            payload["targeting"] = {"app": "supported", "resolved_from": "wmctrl rows in the guest" if backend == "osworld_http"
+                                    else "lsappinfo on the remote Mac", "availability": "checked at use",
+                                    "note": "the remote machine's grants and tools are not probed here; a missing tool or a dropped "
+                                            "input is reported by the call that needed it"}
+            return _json(payload)
+        plat, session = _platform(), _session_type()
+        payload["frontmost"] = self._front_local()
+        if plat == "macos":
+            perms = self._native("perms", timeout=15)
+            if perms.get("ok"):
+                payload["permissions"] = {k: perms.get(k, "unknown") for k in ("accessibility", "screen_recording", "post_events", "listen_events")}
+                payload["permission_state_verified"] = True
+                payload["targeting"] = {"app": "supported" if _which("lsappinfo") else "unsupported",
+                                        "note": ("activation by Accessibility, else NSRunningApplication, else System Events; verified by lsappinfo"
+                                                 if perms.get("accessibility") == "trusted" else
+                                                 "Accessibility untrusted: activation tries NSRunningApplication and System Events; verified by lsappinfo")}
+            else:
+                payload["permissions"] = {"error": perms.get("error") or "preflight unavailable"}
+                payload["targeting"] = {"app": "unavailable", "note": f"the native helper gave no answer: {perms.get('error')}"}
+        elif plat == "linux":
+            if session == "wayland":
+                payload["targeting"] = {"app": "unsupported", "session_type": session, "note": "the compositor exposes no window list or activation"}
+            elif _which("wmctrl") and _which("xdotool"):
+                payload["targeting"] = {"app": "supported", "session_type": session}
+            else:
+                missing = [t for t in ("wmctrl", "xdotool") if not _which(t)]
+                payload["targeting"] = {"app": "unsupported", "session_type": session,
+                                        "note": f"{' and '.join(missing)} missing: a switch could not be made or verified, so targeted inputs are refused"}
         return _json(payload)
 
     def _save_transform(self, data: dict[str, Any]) -> None:
@@ -896,8 +576,8 @@ class _ComputerUse:
         if sx <= 0.0 or sy <= 0.0:
             return int(x), int(y), {"coordinate_space": "raw (no stored screenshot transform)"}
         return (
-            int(round(int(x) * sx)),
-            int(round(int(y) * sy)),
+            int(round(int(x) * sx)) + int(tf.get("ox") or 0),
+            int(round(int(y) * sy)) + int(tf.get("oy") or 0),
             {
                 "coordinate_space": "screenshot",
                 "mapped_from": [int(x), int(y)],
@@ -953,23 +633,33 @@ class _ComputerUse:
         return dest, (got_w or new_w), (got_h or new_h)
 
     def screenshot(self, *, job_id: str = "manual", max_width: int = _MAX_IMAGE_W,
-                   max_height: int = _MAX_IMAGE_H) -> str:
+                   max_height: int = _MAX_IMAGE_H, app: str = "") -> str:
         _conn_name, conn = self._active_connection()
         if conn.get("disabled"):
             return self._disabled_connection_error(_conn_name, conn)
         backend = str(conn.get("backend") or "local").lower()
-        if backend == "osworld_http":
-            return self._osworld_screenshot(conn, max_width=max_width, max_height=max_height)
-        if backend == "ssh_macos":
-            return self._ssh_macos_screenshot(conn, max_width=max_width, max_height=max_height)
+        if backend in ("osworld_http", "ssh_macos"):
+            shot = (self._osworld_screenshot if backend == "osworld_http" else self._ssh_macos_screenshot)(
+                conn, max_width=max_width, max_height=max_height)
+            if str(app or "").strip():
+                parsed = json.loads(shot)
+                if parsed.get("ok"):
+                    # One screen per remote: app= selects nothing there, and the result says so instead of echoing it.
+                    parsed["display"] = {"selected_by": "default", "app_display_unread": f"app= is not applied to {backend} captures"}
+                    return _json(parsed)
+            return shot
         job_dir = self.api.skill_job_dir(job_id or uuid.uuid4().hex[:8])
         out_dir = pathlib.Path(job_dir) / "output"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"screenshot-{int(time.time())}.png"
         plat = _platform()
         session = _session_type()
+        display: dict[str, Any] = {}
         if plat == "macos" and _which("screencapture"):
-            cmd = ["screencapture", "-x", str(out_path)]
+            display = self._capture_display(app)
+            if "error" in display:
+                return _json({"ok": False, "error": display["error"]})
+            cmd = ["screencapture", "-x", *(["-D", str(display["index"])] if not display.get("main", True) else []), str(out_path)]
         elif plat == "linux" and session == "wayland" and _which("grim"):
             cmd = ["grim", str(out_path)]
         elif plat == "linux" and _which("gnome-screenshot"):
@@ -1001,7 +691,8 @@ class _ComputerUse:
         scale_note = ""
         approx = False
         if plat == "macos":
-            log_w, log_h = _macos_logical_size()
+            from_display = bool(display.get("width"))
+            log_w, log_h = (int(display["width"]), int(display["height"])) if from_display else _macos_logical_size()
             if log_w > 0 and log_h > 0:
                 input_w, input_h = log_w, log_h
                 scale = round(px_w / log_w, 4) if log_w else 0.0
@@ -1012,6 +703,9 @@ class _ComputerUse:
                 # the main one — the transform is wrong even if the ratio looks
                 # "clean" (e.g. two identical Retinas give exactly 0.5).
                 if scale and scale < 0.95:
+                    approx = True
+                if not from_display:
+                    # The Finder desktop size is the union of all displays, not the captured one: approximate by provenance.
                     approx = True
                 scale_note = (
                     "macOS input uses LOGICAL points; this transform already maps "
@@ -1038,6 +732,13 @@ class _ComputerUse:
             "downscaled": img_path != out_path,
             "auto_attach_image": str(img_path),
         }
+        if display.get("index"):
+            result["display"] = {k: display[k] for k in ("index", "x", "y", "width", "height", "main", "selected_by", "app_window_unread") if k in display}
+            if display.get("selected_by") == "app":
+                result["app"] = display["app"]
+        elif app:
+            result["display"] = {"selected_by": "default", "app_display_unread": display.get("app_display_unread")
+                                 or (f"app= is not applied to {plat} captures" if plat != "macos" else "no display list from the native helper")}
         if img_path != out_path:
             result["full_resolution_path"] = str(out_path)
         if img_w > 0 and img_h > 0 and input_w > 0 and input_h > 0:
@@ -1049,6 +750,7 @@ class _ComputerUse:
                 "input_w": input_w, "input_h": input_h,
                 "platform": plat, "session": session,
                 "approx": approx, "ts": time.time(),
+                "ox": int(display.get("x", 0)), "oy": int(display.get("y", 0)),
             }
             self._save_transform(transform)
             result["coord_transform"] = transform
@@ -1064,6 +766,54 @@ class _ComputerUse:
     # pointer actions
     # ------------------------------------------------------------------
 
+    def _capture_display(self, app: str = "") -> dict[str, Any]:
+        """The display to capture: the main one, or the one holding ``app``'s front window (bounds from CoreGraphics).
+
+        The answer says how the display was chosen (``selected_by``: default, app, or fallback when the app's window
+        could not be located) so a main-display capture is never presented as the named app's display."""
+        res = self._native("displays", timeout=10)
+        displays = res.get("displays") if res.get("ok") else None
+        query = str(app or "").strip()
+        if not displays:
+            return {"app_display_unread": res.get("error") or "no display list"} if query else {}
+        chosen = {**next((d for d in displays if d.get("main")), displays[0]), "selected_by": "default"}
+        if query:
+            found = self._native("resolve", query, timeout=15)
+            if not found.get("ok"):
+                return {"error": self._target_error(query, found)}
+            target = found["candidates"][0]
+            tree = self._native("tree", target["pid"], 1, 1500, timeout=8)
+            node = (tree.get("nodes") or [{}])[0] if tree.get("ok") else {}
+            if "x" in node and "w" in node:
+                cx, cy = node["x"] + node["w"] // 2, node["y"] + node["h"] // 2
+                for d in displays:
+                    if d["x"] <= cx < d["x"] + d["width"] and d["y"] <= cy < d["y"] + d["height"]:
+                        return {**d, "selected_by": "app", "app": target}
+                chosen["app_window_unread"] = f"the window's centre ({cx},{cy}) lies on no active display"
+            else:
+                chosen["app_window_unread"] = str(tree.get("error") or tree.get("reason") or "the window's bounds could not be read")
+            chosen["selected_by"] = "fallback"
+        return chosen
+
+    def _takes_negative_points(self) -> bool:
+        """A Mac desktop (local or over SSH) has screen space left of/above the origin; X11, Wayland and an OSWorld guest do not."""
+        if self._is_remote():
+            _name, conn = self._active_connection()
+            return str(conn.get("backend") or "") == "ssh_macos"
+        return _platform() == "macos"
+
+    def _outside_desktop(self, *points: tuple[int, int]) -> str:
+        """A mapped point left of or above the origin on a desktop that has no such space: the stored screenshot
+        transform belongs to another display or backend. Empty when every point is fine."""
+        if self._takes_negative_points():
+            return ""
+        bad = [p for p in points if p[0] < 0 or p[1] < 0]
+        if not bad:
+            return ""
+        return (f"the stored screenshot transform maps this point to {bad[0][0]},{bad[0][1]}, outside this desktop "
+                "(a screenshot of another display or backend?): take a screenshot of this desktop first, or pass raw=true "
+                "only if these are this desktop's native coordinates")
+
     def _backend_unavailable(self, action: str) -> str:
         return _json({
             "ok": False,
@@ -1073,7 +823,7 @@ class _ComputerUse:
         })
 
     def click(self, *, x: int, y: int | None = None, button: str = "left", double: bool = False,
-              triple: bool = False, raw: bool = False) -> str:
+              triple: bool = False, raw: bool = False, app: str = "") -> str:
         plat = _platform()
         button = str(button or "left").strip().lower()
         if button not in ("left", "right", "middle"):
@@ -1082,16 +832,18 @@ class _ComputerUse:
             x, y = _coerce_point(x, y)
         except ValueError as exc:
             return _json({"ok": False, "error": str(exc)})
-        if int(x) < 0 or int(y) < 0:
+        if (int(x) < 0 or int(y) < 0) and not self._takes_negative_points():
             return _json({"ok": False, "error": f"negative coordinates not allowed ({x},{y})"})
         ix, iy, note = self._map_xy(x, y, raw=raw)
+        if self._outside_desktop((ix, iy)):
+            return _json({"ok": False, "error": self._outside_desktop((ix, iy))})
         repeat = 3 if triple else (2 if double else 1)
         if self._is_remote():
             _name, conn = self._active_connection()
             return self._remote_pyautogui(
                 conn,
                 f"pyautogui.click({ix}, {iy}, clicks={repeat}, interval=0.1, button={button!r})",
-                note=note,
+                note=note, target=app,
             )
         if plat == "macos" and _which("cliclick"):
             if button == "middle":
@@ -1104,19 +856,19 @@ class _ComputerUse:
                 op = "dc"
             else:
                 op = "c"
-            cmd = ["cliclick", f"{op}:{ix},{iy}"]
+            cmd = ["cliclick", f"{op}:{_cc(ix, iy)}"]
         elif plat == "linux" and _session_type() == "wayland" and _which("ydotool"):
             button_code = {"left": "0xC0", "middle": "0xC2", "right": "0xC1"}[button]
             return self._exec_sequence([
                 ["ydotool", "mousemove", "--absolute", "-x", str(ix), "-y", str(iy)],
                 ["ydotool", "click", "--repeat", str(repeat), button_code],
-            ], extra=note)
+            ], extra=note, app=app)
         elif plat == "linux" and _which("xdotool"):
             button_id = {"left": "1", "middle": "2", "right": "3"}[button]
             cmd = ["xdotool", "mousemove", str(ix), str(iy), "click", "--repeat", str(repeat), button_id]
         else:
             return self._backend_unavailable("click")
-        return self._exec_input(cmd, extra=note)
+        return self._exec_input(cmd, extra=note, app=app)
 
     def move(self, *, x: int, y: int | None = None, raw: bool = False) -> str:
         plat = _platform()
@@ -1124,14 +876,16 @@ class _ComputerUse:
             x, y = _coerce_point(x, y)
         except ValueError as exc:
             return _json({"ok": False, "error": str(exc)})
-        if int(x) < 0 or int(y) < 0:
+        if (int(x) < 0 or int(y) < 0) and not self._takes_negative_points():
             return _json({"ok": False, "error": f"negative coordinates not allowed ({x},{y})"})
         ix, iy, note = self._map_xy(x, y, raw=raw)
+        if self._outside_desktop((ix, iy)):
+            return _json({"ok": False, "error": self._outside_desktop((ix, iy))})
         if self._is_remote():
             _name, conn = self._active_connection()
             return self._remote_pyautogui(conn, f"pyautogui.moveTo({ix}, {iy})", note=note)
         if plat == "macos" and _which("cliclick"):
-            cmd = ["cliclick", f"m:{ix},{iy}"]
+            cmd = ["cliclick", f"m:{_cc(ix, iy)}"]
         elif plat == "linux" and _session_type() == "wayland" and _which("ydotool"):
             cmd = ["ydotool", "mousemove", "--absolute", "-x", str(ix), "-y", str(iy)]
         elif plat == "linux" and _which("xdotool"):
@@ -1141,27 +895,28 @@ class _ComputerUse:
         return self._exec_input(cmd, extra=note)
 
     def left_click_drag(self, *, start_x: Any, start_y: Any = None, end_x: Any = None,
-                        end_y: Any = None, raw: bool = False) -> str:
+                        end_y: Any = None, raw: bool = False, app: str = "") -> str:
         plat = _platform()
         try:
             start_x, start_y = _coerce_point(start_x, start_y)
             end_x, end_y = _coerce_point(end_x, end_y)
         except ValueError as exc:
             return _json({"ok": False, "error": str(exc)})
-        for v in (start_x, start_y, end_x, end_y):
-            if int(v) < 0:
-                return _json({"ok": False, "error": "negative coordinates not allowed"})
+        if any(int(v) < 0 for v in (start_x, start_y, end_x, end_y)) and not self._takes_negative_points():
+            return _json({"ok": False, "error": "negative coordinates not allowed"})
         sx_, sy_, note = self._map_xy(start_x, start_y, raw=raw)
         ex_, ey_, _ = self._map_xy(end_x, end_y, raw=raw)
+        if self._outside_desktop((sx_, sy_), (ex_, ey_)):
+            return _json({"ok": False, "error": self._outside_desktop((sx_, sy_), (ex_, ey_))})
         if self._is_remote():
             _name, conn = self._active_connection()
             return self._remote_pyautogui(
                 conn,
                 f"pyautogui.moveTo({sx_}, {sy_}); pyautogui.dragTo({ex_}, {ey_}, duration=0.5, button='left')",
-                note=note,
+                note=note, target=app,
             )
         if plat == "macos" and _which("cliclick"):
-            cmd = ["cliclick", f"dd:{sx_},{sy_}", f"dm:{ex_},{ey_}", f"du:{ex_},{ey_}"]
+            cmd = ["cliclick", f"dd:{_cc(sx_, sy_)}", f"dm:{_cc(ex_, ey_)}", f"du:{_cc(ex_, ey_)}"]
         elif plat == "linux" and _session_type() == "wayland" and _which("ydotool"):
             # ydotool encodes press/release in the button byte: 0x40|btn=down,
             # 0x80|btn=up (0xC0|btn = full click). There are no --down/--up flags.
@@ -1171,21 +926,21 @@ class _ComputerUse:
                 ["ydotool", "mousemove", "--absolute", "-x", str(ex_), "-y", str(ey_)],
                 ["ydotool", "click", "0x80"],
             ]
-            return self._exec_sequence(steps, extra=note)
+            return self._exec_sequence(steps, extra=note, app=app)
         elif plat == "linux" and _which("xdotool"):
             cmd = ["xdotool", "mousemove", str(sx_), str(sy_), "mousedown", "1",
                    "mousemove", str(ex_), str(ey_), "mouseup", "1"]
         else:
             return self._backend_unavailable("drag")
-        return self._exec_input(cmd, extra=note)
+        return self._exec_input(cmd, extra=note, app=app)
 
-    def mouse_down(self, *, x: Any = None, y: Any = None, button: str = "left", raw: bool = False) -> str:
-        return self._mouse_press(x=x, y=y, button=button, raw=raw, press=True)
+    def mouse_down(self, *, x: Any = None, y: Any = None, button: str = "left", raw: bool = False, app: str = "") -> str:
+        return self._mouse_press(x=x, y=y, button=button, raw=raw, press=True, app=app)
 
     def mouse_up(self, *, x: Any = None, y: Any = None, button: str = "left", raw: bool = False) -> str:
         return self._mouse_press(x=x, y=y, button=button, raw=raw, press=False)
 
-    def _mouse_press(self, *, x: int, y: int, button: str, raw: bool, press: bool) -> str:
+    def _mouse_press(self, *, x: int, y: int, button: str, raw: bool, press: bool, app: str = "") -> str:
         plat = _platform()
         button = str(button or "left").strip().lower()
         if button not in ("left", "right", "middle"):
@@ -1206,22 +961,28 @@ class _ComputerUse:
                 x, y = _coerce_point(x, y)
             except ValueError as exc:
                 return _json({"ok": False, "error": str(exc)})
-            has_xy = int(x) >= 0 and int(y) >= 0
+            if (int(x) < 0 or int(y) < 0) and not self._takes_negative_points():
+                # A provided point the destination has no space for is refused, as click does: never a press at
+                # wherever the pointer happens to be.
+                return _json({"ok": False, "error": f"negative coordinates not allowed ({x},{y})"})
+            has_xy = True
         ix = iy = 0
         note: dict[str, Any] = {}
         if has_xy:
             ix, iy, note = self._map_xy(x, y, raw=raw)
+            if self._outside_desktop((ix, iy)):
+                return _json({"ok": False, "error": self._outside_desktop((ix, iy))})
         if self._is_remote():
             _name, conn = self._active_connection()
             fn = "mouseDown" if press else "mouseUp"
             code = (f"pyautogui.{fn}(x={ix}, y={iy}, button={button!r})" if has_xy
                     else f"pyautogui.{fn}(button={button!r})")
-            return self._remote_pyautogui(conn, code, note=note)
+            return self._remote_pyautogui(conn, code, note=note, target=app)
         if plat == "macos" and _which("cliclick"):
             if button != "left":
                 return _json({"ok": False, "error": "mouse_down/up supports only the left button on macOS (cliclick dd/du)"})
             op = "dd" if press else "du"
-            target = f"{op}:{ix},{iy}" if has_xy else f"{op}:."
+            target = f"{op}:{_cc(ix, iy)}" if has_xy else f"{op}:."
             cmd = ["cliclick", target]
         elif plat == "linux" and _session_type() == "wayland" and _which("ydotool"):
             # press = 0x40|btn, release = 0x80|btn (left +0, right +1, middle +2).
@@ -1231,7 +992,7 @@ class _ComputerUse:
             if has_xy:
                 steps.append(["ydotool", "mousemove", "--absolute", "-x", str(ix), "-y", str(iy)])
             steps.append(["ydotool", "click", f"0x{code:02X}"])
-            return self._exec_sequence(steps, extra=note)
+            return self._exec_sequence(steps, extra=note, app=app)
         elif plat == "linux" and _which("xdotool"):
             button_id = {"left": "1", "middle": "2", "right": "3"}[button]
             cmd = ["xdotool"]
@@ -1240,7 +1001,7 @@ class _ComputerUse:
             cmd += ["mousedown" if press else "mouseup", button_id]
         else:
             return self._backend_unavailable("mouse press")
-        return self._exec_input(cmd, extra=note)
+        return self._exec_input(cmd, extra=note, app=app)
 
     def cursor_position(self) -> str:
         plat = _platform()
@@ -1279,66 +1040,26 @@ class _ComputerUse:
     # keyboard actions
     # ------------------------------------------------------------------
 
-    def type_text(self, *, text: str, interval_ms: int = 0) -> str:
+    def type_text(self, *, text: str, interval_ms: int = 0, app: str = "", via: str = "") -> str:
         plat = _platform()
         text = str(text or "")
+        via = str(via or "").strip().lower()
+        if via not in ("", "type", "paste"):
+            return _json({"ok": False, "error": f"unknown via {via!r} (use '' / type / paste)"})
         if self._is_remote():
             _name, conn = self._active_connection()
-            interval = max(0, int(interval_ms or 0)) / 1000.0
-            typewrite_code = f"pyautogui.typewrite({text!r}, interval={interval!r})"
-            backend = str(conn.get("backend") or "").lower()
-            # typewrite silently drops non-ASCII, so paste it via the in-VM clipboard
-            # (base64-safe), like official OSWorld agents; ssh_macos `t:` handles unicode.
-            #
-            # ASCII is NOT automatically safe either: pyautogui types shift-symbols by
-            # pressing the unshifted key with SHIFT held, and on the guest's keymap that
-            # mis-resolves for the angle brackets. Measured byte-for-byte in the
-            # v6.81.1 OSWorld run (task gimp/62f7fd55): the agent typed
-            # `<?xml version="1.0"...` and the file on disk read `>?xml version="1.0"...`
-            # — every `<` arrived as `>` (hexdump `3e` where `3c` was sent), silently
-            # corrupting any XML/HTML/shell-redirect the agent types. Route those through
-            # the same clipboard path instead of trusting the keystroke translation.
-            # Multi-line and long payloads also go via clipboard: typewrite presses
-            # Enter for each "\n" (submitting forms / running partial shell lines)
-            # and long keystroke streams drop characters under load. Forensics on
-            # the v6.81.1 run counted lost paragraph breaks and leading spaces in
-            # retyped documents as concrete task failures.
-            if backend == "osworld_http" and (any(ord(ch) > 127 for ch in text)
-                                              or "<" in text or ">" in text
-                                              or "\n" in text or len(text) > 200):
-                b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
-                # Chord selection happens INSIDE this one guest call: a terminal
-                # ignores Ctrl+V (it wants Ctrl+Shift+V) yet the hotkey itself
-                # succeeds, so a terminal paste would report ok:true having typed
-                # nothing — and sending both chords everywhere would paste twice
-                # in an ordinary field. One round trip, no guessing on the host.
-                clip_code = (
-                    "import base64, subprocess, pyperclip; "
-                    f"pyperclip.copy(base64.b64decode('{b64}').decode('utf-8')); "
-                    "_cls = ''\n"
-                    "try:\n"
-                    "    _cls = subprocess.run(['xdotool','getactivewindow','getwindowclassname'],"
-                    "capture_output=True,text=True,timeout=5).stdout.strip().lower()\n"
-                    "except Exception:\n"
-                    "    _cls = ''\n"
-                    "_term = any(t in _cls for t in "
-                    "('terminal','xterm','konsole','alacritty','kitty'))\n"
-                    "pyautogui.hotkey('ctrl','shift','v') if _term else pyautogui.hotkey('ctrl','v')\n"
-                    "print('paste_target=' + ('terminal' if _term else 'field'))"
-                )
-                out = self._remote_pyautogui(
-                    conn, clip_code, note={"method": "clipboard"}, timeout=60,
-                )
-                try:
-                    if json.loads(out).get("ok"):
-                        return out
-                except Exception:
-                    pass
-                # Clipboard path failed (pyperclip/xclip absent) — typewrite fallback.
-                return self._remote_pyautogui(
-                    conn, typewrite_code, note={"method": "typewrite", "clipboard_fallback": True}, timeout=60,
-                )
-            return self._remote_pyautogui(conn, typewrite_code, note={"method": "typewrite"}, timeout=60)
+            return self._remote_type_text(conn, text, interval_ms, target=app, via=via)
+        if via == "paste":
+            # The model's choice for long or non-ASCII text (cliclick types ~70 chars/s and hit the 18 s cap on
+            # 1,281 characters): write the clipboard, then paste. The clipboard is replaced, and said so; it is
+            # written only after the target was verified in front, so a refusal leaves the clipboard alone.
+            if plat == "macos" and _which("cliclick") and _which("pbcopy"):
+                def copy() -> str:
+                    rc, _out, err = _pipe(["pbcopy"], text)
+                    return "" if rc == 0 else f"pbcopy failed: {err.strip() or rc}"
+                return self._exec_input(["cliclick", "kd:cmd", "t:v", "ku:cmd"], app=app, before=copy,
+                                        extra={"method": "paste", "clipboard_replaced": True, "chars": len(text)})
+            return _json({"ok": False, "error": f"via=paste is supported on local and SSH macOS only (platform={plat})"})
         if plat == "macos" and _which("cliclick"):
             cmd = ["cliclick", f"t:{text}"]
         elif plat == "linux" and _session_type() == "wayland" and (_which("ydotool") or _which("wtype")):
@@ -1353,8 +1074,8 @@ class _ComputerUse:
         else:
             return self._backend_unavailable("typing")
         # Long text / per-char delay can exceed the 10s input cap; allow up to
-        # the registered 20s tool budget.
-        return self._exec_input(cmd, timeout=18)
+        # the registered tool budget.
+        return self._exec_input(cmd, timeout=18, app=app)
 
     def _parse_combo(self, combo: str) -> tuple[list[str], str, str]:
         """(modifiers, base_key, error). Split ONLY on '+' (key names contain '-').
@@ -1376,7 +1097,7 @@ class _ComputerUse:
         base = _KEY_ALIASES.get(parts[-1], parts[-1])
         return mod_tokens, base, ""
 
-    def key(self, *, keys: str) -> str:
+    def key(self, *, keys: str, app: str = "") -> str:
         combo = str(keys or "").strip()
         if not combo:
             return _json({"ok": False, "error": "keys is required"})
@@ -1388,22 +1109,70 @@ class _ComputerUse:
         # the agent believed a keypress happened that never did. Both were measured
         # in the v6.81.1 OSWorld run; the silent one is the more dangerous.
         steps = combo.split()
-        if len(steps) > 1:
-            results = []
-            for step in steps:
-                out = self.key(keys=step)
-                results.append(json.loads(out))
-                # Each step's own receipt mark survives the sequence, a failed step's included.
-                ran = {"observed_effect": True} if any(r.get("observed_effect") is True for r in results) else {}
-                if not results[-1].get("ok"):
-                    return _json({"ok": False, "error": f"step {step!r} failed: "
-                                                        f"{results[-1].get('error')}",
-                                  "steps_done": len(results) - 1, "steps_total": len(steps), **ran})
-            return _json({"ok": True, "sequence": steps, "steps": len(steps), **ran})
+        if len(steps) == 1:
+            return _json(self._key_step(combo, app=app))
+        # The target is brought forward once; before every later step the front is read again and a targeted
+        # call stops, sending nothing more, when its application is no longer in front. The aggregate names
+        # every step's recipient when they differ: the 27.10 shape (cmd+tab, then an arrow) must not read as
+        # "both went to the same app".
+        refusal, ctx = self._begin(app)
+        if refusal:
+            return _json(refusal)
+        results: list[dict[str, Any]] = []
+        for index, step in enumerate(steps):
+            results.append(self._key_step(step, ctx=ctx, recheck=index > 0))
+            if not results[-1].get("ok"):
+                break
+        recipients = [r.get("delivered_to") or r.get("front_at_dispatch") or "unknown"
+                      for r in results if r.get("dispatched") is True]  # the dispatched steps, whether or not their front was read
+        last = results[-1]
+        if last.get("ok"):
+            payload: dict[str, Any] = {"ok": True, "sequence": steps, "steps": len(steps), "keys": combo, "dispatched": True}
+        else:
+            done = len(results) - 1
+            dispatched = last.get("dispatched")  # the failing step's helper ran (its outcome may be partial)
+            if dispatched is None and not last.get("transport_failed"):
+                dispatched = False  # a refusal: nothing ran
+            outcome = "failed" if dispatched else ("not sent" if dispatched is False else "outcome unknown, the remote call did not answer")
+            payload = {"ok": False, "error": f"step {steps[done]!r} {outcome}: {last.get('error')}",
+                       "steps_done": done, "steps_total": len(steps), "keys": combo, "dispatched": dispatched}
+            for key in ("reason", "candidates", "front", "cmd", "returncode", "permission", "untyped", "transport_failed"):
+                if key in last:
+                    payload[key] = last[key]
+        # Each step's own receipt mark survives the sequence, a failed step's included; so does the switch that
+        # ran before a first step that never did (an invalid combo, a refusal).
+        if any(r.get("observed_effect") is True for r in results):
+            payload["observed_effect"] = True
+            if last.get("activation_done"):
+                payload["activation_done"] = True
+        elif (ctx.get("target") or {}).get("activated"):
+            payload["observed_effect"] = True
+            payload["activation_done"] = True
+        if not isinstance(ctx.get("delivered_to"), dict) and isinstance(results[0].get("delivered_to"), dict):
+            ctx["delivered_to"] = results[0]["delivered_to"]  # a remote probe read it in the first step
+        stderr = "\n".join(r.get("helper_stderr") or "" for r in results).strip()
+        payload = self._finish(payload, ctx, stderr, after=ctx.get("front_last"))
+        if not last.get("ok") and last.get("reason") in ("permission_denied", "untypable_characters") and last.get("note"):
+            # A demoted step keeps its own explanation; after completed steps it is said about the next step.
+            done = len(results) - 1
+            if done:
+                at = payload.get("delivered_to")
+                where = (at.get("app") or at.get("title")) if isinstance(at, dict) else None
+                payload["note"] = (f"{done} of {len(steps)} step(s) completed while {where or 'an unknown application'} was in front; "
+                                   f"the next step: {last['note']}; the rest were not sent")
+            else:
+                payload["note"] = last["note"]
+        if len({json.dumps(r, sort_keys=True) if isinstance(r, dict) else "unknown" for r in recipients}) > 1:
+            payload["steps_delivered_to"] = recipients
+        return _json(payload)
+
+    def _key_step(self, combo: str, *, app: str = "", ctx: dict[str, Any] | None = None, recheck: bool = False) -> dict[str, Any]:
+        """One key combo on the active backend: with ``app`` it is targeted by itself; with ``ctx`` it is a later
+        step of one call (the switch already happened; ``recheck`` reads the front again first)."""
         plat = _platform()
         mods, base, err = self._parse_combo(combo)
         if err:
-            return _json({"ok": False, "error": err})
+            return {"ok": False, "error": err, "dispatched": False, "note": "the input was not sent"}
         if self._is_remote():
             _name, conn = self._active_connection()
             tokens = [_PYAUTOGUI_MODS.get(m, m) for m in mods]
@@ -1411,11 +1180,11 @@ class _ComputerUse:
             b = _PYAUTOGUI_BASE_ALIASES.get(base, base_raw if len(base_raw) == 1 else base)
             tokens.append(b)
             code = f"pyautogui.press({tokens[0]!r})" if len(tokens) == 1 else "pyautogui.hotkey(" + ", ".join(repr(t) for t in tokens) + ")"
-            return self._remote_pyautogui(conn, code)
+            return json.loads(self._remote_pyautogui(conn, code, target=app, ctx=ctx, later=recheck))
         if plat == "macos" and _which("cliclick"):
             non_mac = [t for t in mods if t not in _MAC_MODS]
             if non_mac:
-                return _json({"ok": False, "error": f"modifier(s) {non_mac} are not available on macOS"})
+                return {"ok": False, "error": f"modifier(s) {non_mac} are not available on macOS", "dispatched": False, "note": "the input was not sent"}
             inner = f"t:{base}" if len(base) == 1 else f"kp:{base}"
             if mods:
                 mac_mods = [_MAC_MODS[t] for t in mods]
@@ -1427,14 +1196,14 @@ class _ComputerUse:
             # 28:0) and treats anything else as a no-op delay with exit 0 —
             # a silent fake success. Be honest instead: key combos are
             # unsupported on Wayland; use type_text (ydotool/wtype) for text.
-            return _json({
+            return {
                 "ok": False,
                 "error": (
                     "key combos are unsupported on Wayland (ydotool key takes raw "
                     "keycodes only); use type_text for text input or an X11 session"
                 ),
                 "capabilities": self._capabilities(),
-            })
+            }
         elif plat == "linux" and _which("xdotool"):
             # Aliases map to canonical keysyms; unknown multi-char tokens keep
             # their ORIGINAL case (X11 keysyms like XF86AudioPlay, KP_Enter).
@@ -1444,10 +1213,10 @@ class _ComputerUse:
             x_combo = "+".join(x_mods + [x_base])
             cmd = ["xdotool", "key", x_combo]
         else:
-            return self._backend_unavailable("key")
-        return self._exec_input(cmd)
+            return json.loads(self._backend_unavailable("key"))
+        return self._exec_input_dict(cmd, app=app, ctx=ctx, recheck=recheck, extra={"keys": combo})
 
-    def hold_key(self, *, keys: str, duration_ms: int = 500) -> str:
+    def hold_key(self, *, keys: str, duration_ms: int = 500, app: str = "") -> str:
         combo = str(keys or "").strip()
         if not combo:
             return _json({"ok": False, "error": "keys is required"})
@@ -1461,7 +1230,7 @@ class _ComputerUse:
             pya = [_PYAUTOGUI_MODS.get(t.lower(), (t if len(t) == 1 else t.lower())) for t in tokens]
             downs = "; ".join(f"pyautogui.keyDown({t!r})" for t in pya)
             ups = "; ".join(f"pyautogui.keyUp({t!r})" for t in reversed(pya))
-            return self._remote_pyautogui(conn, f"{downs}; time.sleep({duration/1000.0!r}); {ups}", timeout=max(12, duration // 1000 + 8))
+            return self._remote_pyautogui(conn, f"{downs}; time.sleep({duration/1000.0!r}); {ups}", timeout=max(12, duration // 1000 + 8), target=app)
         if plat == "macos" and _which("cliclick"):
             # cliclick `kd:`/`ku:` accept ONLY modifiers (cmd/ctrl/alt/shift/fn);
             # `kp:` is press-AND-RELEASE — it cannot hold. Be honest: only
@@ -1469,7 +1238,7 @@ class _ComputerUse:
             lowered = [t.lower() for t in tokens]
             non_mods = [t for t, low in zip(tokens, lowered) if low not in _MAC_MODS]
             if non_mods:
-                return _json({
+                return _json({"dispatched": False, "note": "the input was not sent",
                     "ok": False,
                     "error": (
                         f"cliclick cannot hold non-modifier key(s) {non_mods}; "
@@ -1478,7 +1247,7 @@ class _ComputerUse:
                 })
             held = ",".join(_MAC_MODS[low] for low in lowered)
             cmd = ["cliclick", f"kd:{held}", f"w:{duration}", f"ku:{held}"]
-            return self._exec_input(cmd, timeout=max(12, duration // 1000 + 4))
+            return self._exec_input(cmd, timeout=max(12, duration // 1000 + 4), app=app)
         if plat == "linux" and _session_type() == "wayland":
             # ydotool's key syntax is raw KEYCODE:STATE pairs and silently
             # ignores anything else; no honest hold contract — unsupported.
@@ -1486,7 +1255,7 @@ class _ComputerUse:
         if plat == "linux" and _which("xdotool"):
             mods, base, err = self._parse_combo(combo)
             if err:
-                return _json({"ok": False, "error": err})
+                return _json({"ok": False, "error": err, "dispatched": False, "note": "the input was not sent"})
             # Same case-preservation as key(): unknown multi-char tokens keep
             # their ORIGINAL case (X11 keysyms are case-sensitive).
             base_raw = getattr(self, "_last_base_raw", base)
@@ -1494,22 +1263,26 @@ class _ComputerUse:
             x_mods = [_X11_KEY_ALIASES.get(m, m) for m in mods]
             x_combo = "+".join(x_mods + [x_base]) if (x_mods or x_base) else x_base
             steps = [["xdotool", "keydown", x_combo]]
-            return self._hold_then_release(steps, [["xdotool", "keyup", x_combo]], duration)
+            return self._hold_then_release(steps, [["xdotool", "keyup", x_combo]], duration, app=app)
         return self._backend_unavailable("hold-key")
 
     def _hold_then_release(self, down_steps: list[list[str]], up_steps: list[list[str]],
-                           duration_ms: int) -> str:
+                           duration_ms: int, app: str = "") -> str:
+        refusal, ctx = self._begin(app)
+        if refusal:
+            return _json(refusal)
         total = len(down_steps) + len(up_steps)
         for done, cmd in enumerate(down_steps):
             rc, out, err = self._try(cmd)
             if rc != 0:
-                return self._step_failure(cmd, rc, out, err, done, total)
+                return self._step_failure(cmd, rc, out, err, done, total, ctx)
         time.sleep(min(10.0, duration_ms / 1000.0))
         for done, cmd in enumerate(up_steps, len(down_steps)):
             rc, out, err = self._try(cmd)
             if rc != 0:
-                return self._step_failure(cmd, rc, out, err, done, total)
-        return _json({"ok": True, "held_ms": duration_ms, **({"observed_effect": True} if total else {})})
+                return self._step_failure(cmd, rc, out, err, done, total, ctx)
+        payload: dict[str, Any] = {"ok": True, "held_ms": duration_ms, **({"observed_effect": True, "dispatched": True} if total else {})}
+        return _json(self._finish(payload, ctx) if total else payload)
 
     def wait(self, *, ms: int = 500) -> str:
         delay = max(0, min(10_000, int(ms or 0)))
@@ -1520,7 +1293,7 @@ class _ComputerUse:
     # scroll / windows / accessibility
     # ------------------------------------------------------------------
 
-    def scroll(self, *, clicks: int = 3, direction: str = "down") -> str:
+    def scroll(self, *, clicks: int = 3, direction: str = "down", app: str = "") -> str:
         direction = str(direction or "down").lower()
         amount = max(1, min(20, abs(int(clicks or 1))))
         plat = _platform()
@@ -1529,10 +1302,10 @@ class _ComputerUse:
             # X11 pyautogui = one wheel detent per unit (like the local path): 1:1, no multiplier.
             if direction in ("up", "down"):
                 delta = amount if direction == "up" else -amount
-                return self._remote_pyautogui(conn, f"pyautogui.scroll({delta})")
+                return self._remote_pyautogui(conn, f"pyautogui.scroll({delta})", target=app)
             if direction in ("left", "right"):
                 delta = amount if direction == "right" else -amount
-                return self._remote_pyautogui(conn, f"pyautogui.hscroll({delta})")
+                return self._remote_pyautogui(conn, f"pyautogui.hscroll({delta})", target=app)
             return _json({"ok": False, "error": f"unknown scroll direction {direction!r} (use up/down/left/right)"})
         if plat == "macos":
             # cliclick has NO scroll-wheel command — its `w:` is WAIT. Faking it
@@ -1550,289 +1323,157 @@ class _ComputerUse:
             if direction not in ("up", "down"):
                 return _json({"ok": False, "error": f"unsupported scroll direction {direction!r} on Wayland (use up/down)"})
             cmd = ["ydotool", "mousemove", "--wheel", "-x", "0", "-y", str(delta)]
-            return self._exec_input(cmd)
+            return self._exec_input(cmd, app=app)
         if plat == "linux" and _which("xdotool"):
             button = {"down": "5", "up": "4", "left": "6", "right": "7"}.get(direction)
             if button is None:
                 return _json({"ok": False, "error": f"unknown scroll direction {direction!r} (use up/down/left/right)"})
             cmd = ["xdotool", "click", "--repeat", str(amount), button]
-            return self._exec_input(cmd)
+            return self._exec_input(cmd, app=app)
         return self._backend_unavailable("scroll")
-
-    def window_list(self) -> str:
-        plat = _platform()
-        if self._is_remote():
-            _name, conn = self._active_connection()
-            if conn.get("disabled"):
-                return self._disabled_connection_error(_name, conn)
-            backend = str(conn.get("backend") or "").lower()
-            if backend == "osworld_http":
-                return self.remote_exec(command='DISPLAY=:0 wmctrl -lG 2>/dev/null || wmctrl -l 2>/dev/null || true', timeout=15)
-            if backend == "ssh_macos":
-                rc, out, err = self._ssh_run(conn, 'osascript -e \'tell application "System Events" to get the name of every process whose background only is false\'', timeout=15)
-                if rc == 0:
-                    return _json({"ok": True, "backend": backend, "windows": [p.strip() for p in out.split(",") if p.strip()]})
-                return _json({"ok": False, "backend": backend, "error": err.strip() or out.strip() or f"exit {rc}"})
-        if plat == "macos" and _which("osascript"):
-            script = (
-                'tell application "System Events" to get the name of every process '
-                'whose background only is false'
-            )
-            try:
-                rc, stdout, stderr = _run(["osascript", "-e", script])
-            except Exception as exc:  # noqa: BLE001
-                return _json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
-            if rc == 0:
-                return _json({"ok": True, "platform": plat, "windows": [p.strip() for p in stdout.split(",") if p.strip()]})
-            return _json({"ok": False, "error": stderr.strip() or stdout.strip() or f"exit {rc}"})
-        if plat == "linux" and _which("wmctrl"):
-            try:
-                rc, stdout, stderr = _run(["wmctrl", "-l"])
-            except Exception as exc:  # noqa: BLE001
-                return _json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
-            if rc == 0:
-                windows = [line.strip() for line in stdout.splitlines() if line.strip()]
-                return _json({"ok": True, "platform": plat, "windows": windows})
-            return _json({"ok": False, "error": stderr.strip() or stdout.strip() or f"exit {rc}"})
-        return self._backend_unavailable("window listing")
-
-    _AX_SCRIPT = """
-on run
-  set out to ""
-  tell application "System Events"
-    set frontProc to first process whose frontmost is true
-    set procName to name of frontProc
-    tell frontProc
-      if (count of windows) is 0 then return "PROC\\t" & procName
-      set theWindow to window 1
-      set out to "PROC\\t" & procName & "\\nWIN\\t" & (name of theWindow)
-      set elems to entire contents of theWindow
-      set maxN to %d
-      set n to 0
-      repeat with el in elems
-        if n is greater than or equal to maxN then exit repeat
-        try
-          set elRole to role of el
-          if elRole is in {"AXButton", "AXTextField", "AXTextArea", "AXLink", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXComboBox", "AXMenuButton", "AXTab", "AXMenuItem"} then
-            set elPos to position of el
-            set elSize to size of el
-            set elTitle to ""
-            try
-              set elTitle to title of el
-            end try
-            if elTitle is "" then
-              try
-                set elTitle to name of el
-              end try
-            end if
-            set out to out & "\\nEL\\t" & elRole & "\\t" & elTitle & "\\t" & (item 1 of elPos) & "\\t" & (item 2 of elPos) & "\\t" & (item 1 of elSize) & "\\t" & (item 2 of elSize)
-            set n to n + 1
-          end if
-        end try
-      end repeat
-    end tell
-  end tell
-  return out
-end run
-"""
-
-    def ax_tree(self) -> str:
-        """Set-of-marks accessibility snapshot of the frontmost window.
-
-        macOS: numbered interactive elements (role/title/center in INPUT
-        coordinates — pass them with raw=true, or remap to screenshot space
-        yourself). Falls back to the visible-process list when the AX walk
-        fails (TCC denied, AppleScript timeout, no window). Linux: process
-        list only (a full AT-SPI walk is out of substrate-thin scope).
-        """
-        plat = _platform()
-        if self._is_remote():
-            _name, conn = self._active_connection()
-            if conn.get("disabled"):
-                return self._disabled_connection_error(_name, conn)
-            backend = str(conn.get("backend") or "").lower()
-            if backend == "osworld_http":
-                target = self._connection_target(conn)
-                if not target:
-                    return _json({"ok": False, "error": "osworld_http connection has no target/target_file"})
-                try:
-                    with urllib.request.urlopen(target + "/accessibility", timeout=20) as resp:
-                        raw = resp.read().decode("utf-8", errors="replace")
-                    return _json({"ok": True, "backend": backend, "accessibility_tree": raw[:80_000], "truncated": len(raw) > 80_000})
-                except Exception as exc:  # noqa: BLE001
-                    return _json({"ok": False, "backend": backend, "error": f"{type(exc).__name__}: {exc}"})
-            # Remote macOS AX over SSH would need a more careful per-target TCC
-            # setup; degrade honestly instead of faking a set-of-marks tree.
-            return self.window_list()
-        if plat == "macos" and _which("osascript"):
-            script = self._AX_SCRIPT % _AX_MAX_ELEMENTS
-            try:
-                rc, stdout, stderr = _run(["osascript", "-e", script], timeout=20)
-            except Exception as exc:  # noqa: BLE001
-                rc, stdout, stderr = 1, "", f"{type(exc).__name__}: {exc}"
-            if rc == 0 and stdout.strip():
-                marks: list[dict[str, Any]] = []
-                proc_name = ""
-                window_name = ""
-                for line in stdout.splitlines():
-                    parts = line.rstrip("\n").split("\t")
-                    if parts[0] == "PROC" and len(parts) > 1:
-                        proc_name = parts[1]
-                    elif parts[0] == "WIN" and len(parts) > 1:
-                        window_name = parts[1]
-                    elif parts[0] == "EL" and len(parts) >= 7:
-                        try:
-                            x, y, w, h = int(parts[3]), int(parts[4]), int(parts[5]), int(parts[6])
-                        except ValueError:
-                            continue
-                        marks.append({
-                            "id": len(marks) + 1,
-                            "role": parts[1].replace("AX", "", 1),
-                            "title": parts[2],
-                            "center_x": x + w // 2,
-                            "center_y": y + h // 2,
-                            "x": x, "y": y, "w": w, "h": h,
-                        })
-                return _json({
-                    "ok": True, "platform": plat, "frontmost": proc_name,
-                    "window": window_name, "marks": marks,
-                    "truncated": len(marks) >= _AX_MAX_ELEMENTS,
-                    "coordinate_note": (
-                        "mark coordinates are INPUT-space (macOS logical points): "
-                        "click them with raw=true."
-                    ),
-                })
-            # Honest fallback: process list (the old best-effort surface).
-            fb_rc, fb_out, fb_err = self._try([
-                "osascript", "-e",
-                'tell application "System Events" to get the name of every process whose background only is false',
-            ])
-            if fb_rc == 0:
-                return _json({
-                    "ok": True, "platform": plat, "marks": [],
-                    "visible_processes": [p.strip() for p in fb_out.split(",") if p.strip()],
-                    "degraded": "AX element walk failed; returned process list only "
-                                f"({(stderr or '').strip() or 'no window / AX denied'})",
-                })
-            return _json({"ok": False, "error": (fb_err or stderr or "AX walk failed").strip()})
-        if plat == "linux":
-            if _which("wmctrl"):
-                rc, out, err = self._try(["wmctrl", "-l"])
-                if rc == 0:
-                    return _json({
-                        "ok": True, "platform": plat, "marks": [],
-                        "windows": [line.strip() for line in out.splitlines() if line.strip()],
-                        "degraded": "set-of-marks unsupported on Linux (no AT-SPI walk); window list only",
-                    })
-            return self._backend_unavailable("accessibility tree")
-        return self._backend_unavailable("accessibility tree")
 
     # ------------------------------------------------------------------
     # exec helpers
     # ------------------------------------------------------------------
 
     def _try(self, cmd: list[str], *, timeout: int = _TIMEOUT_SEC) -> tuple[int, str, str]:
+        """(exit code, stdout, stderr); ``_NOT_LAUNCHED`` when the OS could not start the helper (it never ran)."""
         try:
             return _run(cmd, timeout=timeout)
-        except Exception as exc:  # noqa: BLE001
+        except OSError as exc:  # the process was never created (binary missing, not executable, exec failure)
+            return _NOT_LAUNCHED, "", f"{type(exc).__name__}: {exc}"
+        except Exception as exc:  # noqa: BLE001 - it ran and did not finish well (a timeout): outcome unknown
             return 1, "", f"{type(exc).__name__}: {exc}"
 
-    def _exec_input(self, cmd: list[str], *, timeout: int = _TIMEOUT_SEC,
-                    extra: dict[str, Any] | None = None) -> str:
-        """One input process. Its successful exit is the receipt (``observed_effect``); a
-        failed or timed-out process has an unknown outcome and carries none."""
+    def _exec_input(self, cmd: list[str], *, timeout: int = _TIMEOUT_SEC, extra: dict[str, Any] | None = None,
+                    app: str = "", before: Any = None) -> str:
+        return _json(self._exec_input_dict(cmd, timeout=timeout, extra=extra, app=app, before=before))
+
+    def _exec_input_dict(self, cmd: list[str], *, timeout: int = _TIMEOUT_SEC, extra: dict[str, Any] | None = None,
+                         app: str = "", ctx: dict[str, Any] | None = None, recheck: bool = False,
+                         before: Any = None) -> dict[str, Any]:
+        """One input process. Its successful exit is the receipt (``observed_effect``); a failed or timed-out
+        process has an unknown outcome and carries none. With ``app`` the target is brought forward and verified
+        first; nothing is sent when that fails. With ``ctx`` (a later step of one call) the earlier switch is
+        reused and ``recheck`` reads the front again first. ``before`` runs after the target is verified and
+        before the input (the clipboard write of via=paste); its error message cancels the input."""
+        if ctx is None:
+            refusal, ctx = self._begin(app)
+            if refusal:
+                return refusal
+        step = ctx
+        if recheck:
+            refusal, step = self._recheck(ctx)
+            if refusal:
+                return refusal
+        activated = bool((ctx.get("target") or {}).get("activated"))
+        if before is not None:
+            try:
+                problem = before()
+            except Exception as exc:  # noqa: BLE001 - a failed preparation cancels the input, with a receipt
+                problem = f"{type(exc).__name__}: {exc}"
+            if problem:
+                payload: dict[str, Any] = {"ok": False, "error": problem, "cmd": cmd, "dispatched": False,
+                                           "reason": "clipboard_failed" if (extra or {}).get("method") == "paste" else "preparation_failed"}
+                if activated:
+                    payload["observed_effect"] = True  # the switch ran before the input was cancelled
+                    payload["activation_done"] = True
+                return self._finish(payload, step)
         rc, stdout, stderr = self._try(cmd, timeout=timeout)
         if rc != 0:
-            return _json({"ok": False, "error": stderr.strip() or stdout.strip() or f"exit {rc}", "cmd": cmd})
-        payload: dict[str, Any] = {"ok": True, "cmd": cmd, "observed_effect": True}
-        if extra:
-            payload.update(extra)
-        return _json(payload)
+            payload = {"ok": False, "error": stderr.strip() or stdout.strip() or f"exit {rc}", "cmd": cmd,
+                       "dispatched": rc != _NOT_LAUNCHED}
+            if rc != _NOT_LAUNCHED:
+                payload["returncode"] = rc
+            else:
+                payload["reason"] = "helper_not_launched"
+            if activated:
+                payload["observed_effect"] = True  # the switch ran before the input failed
+                payload["activation_done"] = True
+            if before is not None and extra:
+                # The preparation (the clipboard write) completed; only the helper after it failed. A replaced
+                # clipboard is an observed external effect of its own.
+                payload.update({k: extra[k] for k in ("method", "clipboard_replaced", "chars") if k in extra})
+                if extra.get("clipboard_replaced"):
+                    payload["observed_effect"] = True
+                    payload["clipboard_done"] = True
+        else:
+            payload = {"ok": True, "cmd": cmd, "observed_effect": True, "dispatched": True}
+            if extra:
+                payload.update(extra)
+        payload = self._finish(payload, step, stderr)
+        ctx["front_last"] = step.get("front_last")  # the call's last front read, for a sequence's aggregate
+        return payload
 
-    def _exec_sequence(self, steps: list[list[str]], *, extra: dict[str, Any] | None = None) -> str:
+    def _exec_sequence(self, steps: list[list[str]], *, extra: dict[str, Any] | None = None, app: str = "") -> str:
+        refusal, ctx = self._begin(app)
+        if refusal:
+            return _json(refusal)
         for done, cmd in enumerate(steps):
             rc, stdout, stderr = self._try(cmd)
             if rc != 0:
-                return self._step_failure(cmd, rc, stdout, stderr, done, len(steps))
+                return self._step_failure(cmd, rc, stdout, stderr, done, len(steps), ctx)
         payload: dict[str, Any] = {"ok": True, "steps": len(steps)}
         if steps:
             payload["observed_effect"] = True
+            payload["dispatched"] = True
         if extra:
             payload.update(extra)
-        return _json(payload)
+        return _json(self._finish(payload, ctx) if steps else payload)
 
-    @staticmethod
-    def _step_failure(cmd: list[str], rc: int, stdout: str, stderr: str, done: int, total: int) -> str:
+    def _step_failure(self, cmd: list[str], rc: int, stdout: str, stderr: str, done: int, total: int,
+                      ctx: dict[str, Any] | None = None) -> str:
         """A failed step of a multi-process input: the call failed, and the ``done`` steps
         before it ran and reported success, so their receipt mark stays."""
         payload: dict[str, Any] = {"ok": False, "error": stderr.strip() or stdout.strip() or f"exit {rc}",
-                                   "cmd": cmd, "steps_done": done, "steps_total": total}
-        if done:
+                                   "cmd": cmd, "steps_done": done, "steps_total": total, "dispatched": rc != _NOT_LAUNCHED}
+        if rc != _NOT_LAUNCHED:
+            payload["returncode"] = rc
+        else:
+            payload["reason"] = "helper_not_launched"
+        if done or ((ctx or {}).get("target") or {}).get("activated"):
             payload["observed_effect"] = True
-        return _json(payload)
-
-    def remote_exec(self, *, command: str, timeout: int = 60) -> str:
-        """Run a shell command on the active remote connection.
-
-        For local backend, this refuses to run so existing local computer-use does
-        not become a general shell tool. Use ordinary Ouroboros shell/file tools
-        for local work; remote_exec is for inspecting a selected remote machine.
-        """
-        _name, conn = self._active_connection()
-        if conn.get("disabled"):
-            return self._disabled_connection_error(_name, conn)
-        backend = str(conn.get("backend") or "local").lower()
-        cmd = str(command or "").strip()
-        if not cmd:
-            return _json({"ok": False, "error": "command is required"})
-        timeout = max(5, min(300, int(timeout or 60)))
-        try:
-            if backend == "osworld_http":
-                out = self._osworld_execute(conn, ["bash", "-lc", cmd], timeout=timeout)
-                ok, err = _osworld_result_ok(out)
-                payload: dict[str, Any] = {"ok": ok, "backend": backend, "status": out["status"], "result": out["result"]}
-                if not ok:
-                    payload["error"] = err
-                return _json(payload)
-            if backend == "ssh_macos":
-                rc, stdout, stderr = self._ssh_run(conn, cmd, timeout=timeout)
-                return _json({"ok": rc == 0, "backend": backend, "returncode": rc, "output": stdout, "error": stderr})
-        except Exception as exc:  # noqa: BLE001
-            return _json({"ok": False, "backend": backend, "error": f"{type(exc).__name__}: {exc}"})
-        return _json({"ok": False, "backend": backend, "error": "remote_exec requires an active remote backend"})
+            if not done:
+                payload["activation_done"] = True
+        return _json(self._finish(payload, ctx) if ctx else payload)
 
 
 def register(api: Any) -> None:
     impl = _ComputerUse(api)
     _xy = {"x": {"type": "integer"}, "y": {"type": "integer"}, "raw": {"type": "boolean", "default": False}}
+    # `app`: a running application (name, bundle id / WM_CLASS, or pid:<n> from window_list). Empty = untargeted,
+    # which is also what a voice model sends for an optional field it does not use.
+    _app = {"app": {"type": "string", "default": ""}}
+    _targeted = ("app= acts in that application (brought forward and verified in front first; nothing is sent otherwise). "
+                 "The result names who was in front at dispatch, not that the app reacted.")
     api.register_tool("list_connections", lambda: impl.list_connections(), description="List configured local/remote computer-use connections and the active backend.", schema={"type": "object", "properties": {}}, timeout_sec=5)
-    api.register_tool("add_connection", impl.add_connection, description="Add or update a remote computer-use connection (no secrets stored; SSH uses existing ssh config/agent).", schema={"type": "object", "properties": {"name": {"type": "string"}, "backend": {"type": "string"}, "target": {"type": "string", "default": ""}, "target_file": {"type": "string", "default": ""}, "host": {"type": "string", "default": ""}, "user": {"type": "string", "default": ""}, "port": {"type": "integer", "default": 22}, "ssh_alias": {"type": "string", "default": ""}, "enabled": {"type": "boolean", "default": True}, "activate": {"type": "boolean", "default": False}}, "required": ["name", "backend"]}, timeout_sec=10)
-    api.register_tool("test_connection", impl.test_connection, description="Run a safe non-mutating health check for a configured connection.", schema={"type": "object", "properties": {"name": {"type": "string", "default": ""}}}, timeout_sec=30)
+    api.register_tool("add_connection", impl.add_connection, description="Add or update a remote computer-use connection: backend osworld_http (target or target_file) or ssh_macos (ssh_alias or host). No secrets are stored; SSH uses your existing ssh config/agent; activate=true also selects it.", schema={"type": "object", "properties": {"name": {"type": "string"}, "backend": {"type": "string"}, "target": {"type": "string", "default": ""}, "target_file": {"type": "string", "default": ""}, "host": {"type": "string", "default": ""}, "user": {"type": "string", "default": ""}, "port": {"type": "integer", "default": 22}, "ssh_alias": {"type": "string", "default": ""}, "enabled": {"type": "boolean", "default": True}, "activate": {"type": "boolean", "default": False}}, "required": ["name", "backend"]}, timeout_sec=10)
+    api.register_tool("test_connection", impl.test_connection, description="Run a safe non-mutating health check for a configured connection (default: the active one).", schema={"type": "object", "properties": {"name": {"type": "string", "default": ""}}}, timeout_sec=30)
     api.register_tool("activate_connection", impl.activate_connection, description="Select a configured connection as the active target for screenshot/input tools.", schema={"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}, timeout_sec=5)
     api.register_tool("use_local", lambda: impl.use_local(), description="Return computer-use tools to the local desktop backend.", schema={"type": "object", "properties": {}}, timeout_sec=5)
-    api.register_tool("clear_active_connection", lambda: impl.clear_active_connection(), description="Alias for use_local: clear any active remote connection.", schema={"type": "object", "properties": {}}, timeout_sec=5)
-    api.register_tool("capabilities", lambda: impl.capabilities(), description="Report available computer-use backends, session type, and coordinate contract.", schema={"type": "object", "properties": {}}, timeout_sec=5)
-    api.register_tool("screenshot", impl.screenshot, description="Capture the desktop, downscale to <=WXGA, persist the image->input coordinate transform, and return the PNG path. The image is attached to the conversation automatically — no view_image call is needed to see it.", schema={"type": "object", "properties": {"job_id": {"type": "string", "default": "manual"}, "max_width": {"type": "integer", "default": _MAX_IMAGE_W}, "max_height": {"type": "integer", "default": _MAX_IMAGE_H}}}, timeout_sec=25)
+    api.register_tool("capabilities", lambda: impl.capabilities(), description="Who is in front, which OS grants this process holds (prompt-free preflights on macOS), whether app= targeting works here, and the installed backends.", schema={"type": "object", "properties": {}}, timeout_sec=45)
+    api.register_tool("screenshot", impl.screenshot, description="Capture the main display (or, with app=, the display holding that app's window on macOS; display.selected_by says which was captured), downscale to <=WXGA and persist the image->input transform. The image is attached automatically; an engine without vision gets its path.", schema={"type": "object", "properties": {"job_id": {"type": "string", "default": "manual"}, "max_width": {"type": "integer", "default": _MAX_IMAGE_W}, "max_height": {"type": "integer", "default": _MAX_IMAGE_H}, **_app}}, timeout_sec=90)
     # y is deliberately NOT in `required` for click/move: models recurringly emit the
     # whole point inside x ("663, 500") with y omitted, and a required-field rejection
     # then fires BEFORE the handler's _coerce_point can recover the pair.
-    api.register_tool("click", impl.click, description="Click at screenshot-space coordinates (auto-remapped; raw=true for native input space).", schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}, "double": {"type": "boolean", "default": False}, "triple": {"type": "boolean", "default": False}}, "required": ["x"]}, timeout_sec=10)
+    api.register_tool("click", impl.click, description="Click at screenshot-space coordinates (auto-remapped; raw=true for native input space). " + _targeted, schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}, "double": {"type": "boolean", "default": False}, "triple": {"type": "boolean", "default": False}, **_app}, "required": ["x"]}, timeout_sec=90)
     # Models call these names unprompted (111 such calls in one OSWorld run, all
     # previously "Unknown tool"): register them as thin aliases of click.
-    api.register_tool("double_click", lambda **kw: impl.click(**{**kw, "double": True}), description="Alias of click with double=true.", schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}}, "required": ["x"]}, timeout_sec=10)
-    api.register_tool("triple_click", lambda **kw: impl.click(**{**kw, "triple": True}), description="Alias of click with triple=true.", schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}}, "required": ["x"]}, timeout_sec=10)
-    api.register_tool("move", impl.move, description="Move the mouse pointer to screenshot-space coordinates.", schema={"type": "object", "properties": _xy, "required": ["x"]}, timeout_sec=10)
+    api.register_tool("double_click", lambda **kw: impl.click(**{**kw, "double": True}), description="Alias of click with double=true (app= as in click).", schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}, **_app}, "required": ["x"]}, timeout_sec=90)
+    api.register_tool("triple_click", lambda **kw: impl.click(**{**kw, "triple": True}), description="Alias of click with triple=true (app= as in click).", schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}, **_app}, "required": ["x"]}, timeout_sec=90)
+    api.register_tool("move", impl.move, description="Move the mouse pointer to screenshot-space coordinates (auto-remapped; raw=true for native input space).", schema={"type": "object", "properties": _xy, "required": ["x"]}, timeout_sec=60)
     # start_y/end_y are recoverable from a pair packed into start_x/end_x, so only
     # the x-side fields stay required (same rationale as click/move above).
-    api.register_tool("left_click_drag", impl.left_click_drag, description="Press the left button at start coordinates, drag to end coordinates, release.", schema={"type": "object", "properties": {"start_x": {"type": "integer"}, "start_y": {"type": "integer"}, "end_x": {"type": "integer"}, "end_y": {"type": "integer"}, "raw": {"type": "boolean", "default": False}}, "required": ["start_x", "end_x"]}, timeout_sec=15)
-    api.register_tool("mouse_down", impl.mouse_down, description="Press and hold a mouse button (left only on macOS), optionally at coordinates.", schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}}}, timeout_sec=10)
-    api.register_tool("mouse_up", impl.mouse_up, description="Release a held mouse button, optionally at coordinates.", schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}}}, timeout_sec=10)
+    api.register_tool("left_click_drag", impl.left_click_drag, description="Drag with the left button from start to end (screenshot-space, auto-remapped; raw=true for native). " + _targeted, schema={"type": "object", "properties": {"start_x": {"type": "integer"}, "start_y": {"type": "integer"}, "end_x": {"type": "integer"}, "end_y": {"type": "integer"}, "raw": {"type": "boolean", "default": False}, **_app}, "required": ["start_x", "end_x"]}, timeout_sec=90)
+    api.register_tool("mouse_down", impl.mouse_down, description="Press and hold a mouse button (left only on macOS) at the pointer or at screenshot-space coordinates. " + _targeted, schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}, **_app}}, timeout_sec=90)
+    api.register_tool("mouse_up", impl.mouse_up, description="Release a held mouse button at the pointer, or at screenshot-space coordinates (auto-remapped; raw=true for native input space). Never changes which app is in front.", schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}}}, timeout_sec=60)
     api.register_tool("cursor_position", lambda: impl.cursor_position(), description="Report the current pointer position in native input coordinates.", schema={"type": "object", "properties": {}}, timeout_sec=10)
-    api.register_tool("type_text", impl.type_text, description="Type text into the focused application.", schema={"type": "object", "properties": {"text": {"type": "string"}, "interval_ms": {"type": "integer", "default": 0}}, "required": ["text"]}, timeout_sec=20)
-    api.register_tool("key", impl.key, description="Press a key or modifier combo (e.g. return, cmd+s, ctrl+l, page-down). Split combos with '+'.", schema={"type": "object", "properties": {"keys": {"type": "string"}}, "required": ["keys"]}, timeout_sec=10)
-    api.register_tool("hold_key", impl.hold_key, description="Hold a key or modifier combo for a duration (50-10000 ms).", schema={"type": "object", "properties": {"keys": {"type": "string"}, "duration_ms": {"type": "integer", "default": 500}}, "required": ["keys"]}, timeout_sec=15)
-    api.register_tool("scroll", impl.scroll, description="Scroll the active view (X11/Wayland; unsupported on macOS — use key paging).", schema={"type": "object", "properties": {"clicks": {"type": "integer", "default": 3}, "direction": {"type": "string", "default": "down"}}}, timeout_sec=10)
+    api.register_tool("type_text", impl.type_text, description="Type text into the focused field of the frontmost app, or of app= (brought forward and verified first). via=paste writes the clipboard and pastes (long or non-ASCII text on a local or SSH Mac; the clipboard is replaced); an OSWorld guest pastes such text through its clipboard by itself.", schema={"type": "object", "properties": {"text": {"type": "string"}, "interval_ms": {"type": "integer", "default": 0}, **_app, "via": {"type": "string", "default": ""}}, "required": ["text"]}, timeout_sec=180)
+    api.register_tool("key", impl.key, description="Press keys in the front app or app= (verified; else nothing sent). Result: who was in front, not that the app reacted. Combos with '+', sequences with spaces (cmd+s, ctrl+l, page-down, 'down down return'); a targeted sequence stops when its app leaves the front. Scriptable apps are better driven by their own commands through run_command.", schema={"type": "object", "properties": {"keys": {"type": "string"}, **_app}, "required": ["keys"]}, timeout_sec=90)
+    api.register_tool("hold_key", impl.hold_key, description="Hold a key or modifier combo for a duration (50-10000 ms). " + _targeted, schema={"type": "object", "properties": {"keys": {"type": "string"}, "duration_ms": {"type": "integer", "default": 500}, **_app}, "required": ["keys"]}, timeout_sec=90)
+    api.register_tool("scroll", impl.scroll, description="Scroll 1-20 wheel steps; app= acts in that app (verified first, else nothing is sent). X11/OSWorld: up/down/left/right; Wayland: up/down; macOS: unsupported, page with key. The result names who was in front at dispatch.", schema={"type": "object", "properties": {"clicks": {"type": "integer", "default": 3}, "direction": {"type": "string", "default": "down"}, **_app}}, timeout_sec=90)
     api.register_tool("wait", impl.wait, description="Sleep up to 10s so the UI can settle before the next observation.", schema={"type": "object", "properties": {"ms": {"type": "integer", "default": 500}}}, timeout_sec=12)
-    api.register_tool("window_list", lambda: impl.window_list(), description="List visible desktop windows/processes when a backend is available.", schema={"type": "object", "properties": {}}, timeout_sec=10)
-    api.register_tool("ax_tree", lambda: impl.ax_tree(), description="Set-of-marks accessibility snapshot of the frontmost window (macOS; numbered clickable elements) with honest degradation.", schema={"type": "object", "properties": {}}, timeout_sec=25)
+    api.register_tool("activate_app", impl.activate_app, description="Bring a running application to the front (name, bundle id / WM_CLASS, or pid:<n> from window_list; resolved from the running list, never launched) and report who is in front afterwards. Inputs with app= do this themselves; use this to switch before several inputs or to check that a switch works.", schema={"type": "object", "properties": {"app": {"type": "string"}, "wait_ms": {"type": "integer", "default": 2000}}, "required": ["app"]}, timeout_sec=90)
+    api.register_tool("window_list", impl.window_list, description="Running applications with their windows: who is in front, titles, bounds, pid, and on macOS whether the app has its own scripting commands (scriptable). app= filters; limit caps the rows (truncated says so).", schema={"type": "object", "properties": {**_app, "limit": {"type": "integer", "default": 50}}}, timeout_sec=60)
+    api.register_tool("ax_tree", impl.ax_tree, description="Read one window as text through the Accessibility API (macOS), bounded: the frontmost app's window or app='s (without bringing it forward). Nodes with role/label/value/bounds plus numbered marks (positions to click with raw=true; a mark is not proof the element reacts); truncated_by names every cut. An OSWorld remote returns the guest's whole tree; Linux reports unsupported with the window rows, SSH Macs unsupported.", schema={"type": "object", "properties": {**_app, "max_nodes": {"type": "integer", "default": 150}, "timeout_ms": {"type": "integer", "default": 3000}, "root": {"type": "string", "default": "window"}, "include_web": {"type": "boolean", "default": False}}}, timeout_sec=45)
     api.register_tool("remote_exec", impl.remote_exec, description="Run a shell command on the active remote connection only; refuses on local backend. OSWorld/Linux guest: each call is a FRESH `bash -lc` starting in $HOME. SSH Mac: each call runs through the remote account's login shell via ssh. Either way this is NOT the visible desktop terminal: it does not inherit that terminal's working directory and leaves nothing in its shell history.", schema={"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer", "default": 60}}, "required": ["command"]}, timeout_sec=120)

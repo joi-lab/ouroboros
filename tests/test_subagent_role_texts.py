@@ -121,6 +121,6 @@ def test_schedule_subagent_tells_the_parent_children_write_signed_memory_and_dra
             "(chronicle_write kind=decision)") in description
     assert "identity and scratchpad stay with the parent" in description
     assert "apart from knowledge notes, memory marks and chronicle drafts in its own name" in description
-    assert "Mutative children cannot commit or enable tools" in description
+    assert "Mutative children cannot commit or grant themselves tools" in description
     for claim in FALSE_CLAIMS:
         assert claim not in description

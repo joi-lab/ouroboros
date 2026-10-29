@@ -52,7 +52,7 @@ from ouroboros.server_process import (  # noqa: F401
     _request_restart_exit, _restart_requested,
     _supervisor_stop, _exit_signalled,
     _SignalStopServer, _embedded_uvicorn_server,
-    capture_server_source_baseline, server_stop_source, log,
+    capture_server_source_baseline, server_stop_cause, log,
 )
 from ouroboros.server_routing_context import (  # noqa: F401
     _active_direct_roots,
@@ -66,7 +66,6 @@ from ouroboros.server_routing_context import (  # noqa: F401
     _project_id_for_registered_chat,
     _reserved_project_for_chat,
     _scoped_task_metadata,
-    _task_belongs_to_chat,
     _task_result_ground_truth,
     main_lane_routing_metadata,
 )
@@ -853,10 +852,10 @@ def _run_supervisor(settings: dict) -> None:
                 _last_custody_reap, _last_review_job_reconcile, stop_event=_watchdog_stop,
             )
             _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "assign"), time.monotonic()
-            # Loop-tick restart drain (no sleep, events keep flowing): while
-            # draining a deferred restart, skip starting new work the restart
-            # deadline would immediately chop (evolution / pending project tasks).
-            if not _check_pending_restart_drain(_event_ctx):
+            # The requester's finalization starts the drain; its accepted intent
+            # already holds independent starts. Existing trees still finish.
+            draining = _check_pending_restart_drain(_event_ctx)
+            if not draining and not _restart_lifecycle.agent_restart_pending():
                 try:
                     from ouroboros.post_task_evolution import apply_pending_request
                     from supervisor import state as _pte_state
@@ -865,12 +864,12 @@ def _run_supervisor(settings: dict) -> None:
                 except Exception:
                     log.debug("Post-task evolution apply failed", exc_info=True)
                 enqueue_evolution_task_if_needed()
-                assign_tasks()
             if _restart_requested.is_set():
                 break  # restart just triggered (drain done) — exit without assigning new work (bridge intake already ran early this iteration)
+            assign_tasks()
             if persist_queue_snapshot(reason="main_loop") is False:  # None: a saved queue kept as it is
                 raise RuntimeError("queue publication failed")
-            if _consciousness is not None:
+            if _consciousness is not None and not draining and not _restart_lifecycle.agent_restart_pending():
                 try:
                     _consciousness.tick(time.time())
                 except Exception:
@@ -1121,15 +1120,15 @@ async def lifespan(app):
         name="ws-heartbeat",
     )
 
-    # Boot APPLIES the provider normalization in-process and persists nothing
-    # (mirror of launcher_onboarding.prepare_first_run_settings). Two
+    # Boot APPLIES the provider normalization in-process and persists none of it
+    # (mirror of launcher_onboarding.prepare_first_run_settings); its read does
+    # persist the two compatibility upgrades (``migrate=True``). Two
     # normalizations, two re-derivations: the VOCABULARY one is the read seam
     # every reader applies (config.normalize_settings_raw); the PROVIDER one is
     # re-derived by every consumer that needs the route — the task-start
     # projection, the settings GET and onboarding reads, the context-fit route
-    # resolver — so a start-time write would only make boot a second author of
-    # settings.json with no reader that needs it.
-    settings, _provider_defaults_changed, _provider_default_keys = apply_runtime_provider_defaults(load_settings())
+    # resolver — so writing it at start would only make boot a second author.
+    settings, _provider_defaults_changed, _provider_default_keys = apply_runtime_provider_defaults(load_settings(migrate=True))
     _apply_settings_to_env(settings)
     served_ui.apply(app, settings)  # this generation's main interface, before any request is served
     # Pin boot-time runtime-mode after env apply; save_settings compares to this owner baseline.
@@ -1231,6 +1230,7 @@ async def lifespan(app):
         ("usage_store", _usage_store),
         ("skills", lambda: live and server_boot.seed_skills(lifespan_drive_root, settings, provider_ready=startup_provider_ready)),
         ("projects", lambda: live and server_boot.reconcile_projects(lifespan_drive_root)),
+        ("log_listings", lambda: live and server_boot.remember_log_listings(lifespan_drive_root)),
         ("services", lambda: server_boot.start_background_services(
             settings, local_model=has_local, boot_managed_update=_boot_managed_update_tasks, warm_daemon=live)),
         ("host_service", lambda: server_boot.on_loop(_event_loop, server_boot.serve_host_service(lifespan_drive_root, boot))),
@@ -1252,7 +1252,9 @@ async def lifespan(app):
         body_stop.set()  # the body runtime and the boot coordinator stop with the generation
         from ouroboros.delegate_collection import stop_body_runtime
         stop_body_runtime(lifespan_drive_root, wait=False)
-        begin_owned_stop(lifespan_drive_root)  # the grace starts here; pending stops are recorded before any wait
+        from ouroboros.maintenance import child as maintenance_child
+        maintenance_child.stop()
+        begin_owned_stop(lifespan_drive_root, cause=server_stop_cause())  # the grace starts here; cause and pending stops are recorded before any wait
         log.info("Server shutting down...")
         # Let the loop leave its current tick BEFORE workers are killed and the
         # bridge/Manager go down: a tick still running would otherwise respawn
@@ -1287,7 +1289,7 @@ async def lifespan(app):
                     {
                         "ts": utc_now_iso(),
                         "type": "server_shutdown",
-                        "cause": "restart_requested" if restart_requested else server_stop_source(),
+                        "cause": server_stop_cause(restart_requested),
                         "restart_exit": restart_requested,
                     },
                 )
@@ -1381,7 +1383,7 @@ def _emergency_process_cleanup() -> dict:
     maintenance_child.stop()
     storage_count.stop()
     storage_free.stop()
-    begin_owned_stop(DATA_DIR)  # the grace starts here; pending stops are recorded before any wait
+    begin_owned_stop(DATA_DIR, cause=server_stop_cause())  # the grace starts here; cause and pending stops are recorded before any wait
     worker_exits = None  # the pool's own PID census; None until kill_workers ran to its end
     try:
         from supervisor.workers import kill_workers, last_worker_exit_census

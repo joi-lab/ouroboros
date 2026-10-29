@@ -55,6 +55,10 @@ _OPEN_STATES = frozenset({OPERATION_PREPARING, OPERATION_RETAINED, OPERATION_DIS
 # never-dispatched one, and neither is an unknown outcome.
 COLLECTED, DEFERRED, UNAVAILABLE, NEVER_DISPATCHED = (
     "collected", "deferred", "unavailable", "never_dispatched")
+# ``usage.custody_state`` of a lost seat whose own row names a requested, never-bound start:
+# an attach-only read cannot bind it, but its review's own collection may still replay that
+# exact request under its original key (``review_pause._settle_left_record``).
+START_UNBOUND = "start_unbound"
 _OBSERVE_TIMEOUT_SEC = 10.0
 _CONTROL_RECHECK_SEC = 1.0
 
@@ -198,9 +202,9 @@ class ReviewOperation:
         self.control_state = ""
         self._drains = 0
         self._dispatched = False
-        # The owner paused the author while this operation's launched reviewers
-        # ran: the author took pending rows and parked (``review_custody``).
-        self.author_detached = False
+        # A background caller already left its author slot; a synchronous author
+        # can also detach later while its reviewers run (``review_custody``).
+        self.author_detached = bool(getattr(parent, "author_detached", False))
         self._control, self._checked_at = "", float("-inf")
         parent_task = parent.task if isinstance(parent.task, dict) else {}
         metadata = getattr(parent.tool_context, "task_metadata", None)
@@ -872,9 +876,13 @@ def _observe_delegated_review(root: Any, request: Any, slot: Any, row: dict, ope
     if record.get("state") == "failed_definite":
         return _row_actor(slot, operation_id, row, state="not_dispatched",
                           reason="The daemon definitively refused this reviewer's start."), NEVER_DISPATCHED
-    return _row_actor(slot, operation_id, row, state="custody_lost", reason=(
+    actor = _row_actor(slot, operation_id, row, state="custody_lost", reason=(
         "A start was requested but no run was ever bound to it; its outcome stays unknown "
-        "and it is never re-posted.")), UNAVAILABLE
+        "and it is never re-posted."))
+    # Only the seat's own token and the retained exact body let its review's collection replay it.
+    if recorded_invocation_tokens(row) and isinstance(record.get("request"), dict) and record["request"]:
+        actor.usage["custody_state"] = START_UNBOUND
+    return actor, UNAVAILABLE
 
 
 def _attach_only_run(root: Any, request: Any, slot: Any, operation_id: str, run_id: str, invocation: dict,
@@ -913,7 +921,8 @@ def _attach_only_run(root: Any, request: Any, slot: Any, operation_id: str, run_
         observed = final_attempt_facts(detail, run_id)
         routes = (invocation.get("request") or {}).get("harnesses") or []
         requested_route = str(routes[0]) if len(routes) == 1 else ""
-        usage = session_usage_facts(run_id, requested_route=requested_route, observed_attempt=observed, summary=summary)
+        usage = session_usage_facts(run_id, requested_route=requested_route, observed_attempt=observed,
+                                    summary=summary, attempt_execution=detail.get("attemptExecution"))
         if usage_ctx is not None:  # Observe terminal facts even if the output read below fails.
             observe_session_usage(lambda facts: emit_review_usage(
                 usage_ctx, model=str(facts.get("resolved_model") or ""), usage=facts,

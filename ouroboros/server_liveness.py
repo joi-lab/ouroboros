@@ -388,6 +388,103 @@ def _innermost_repo_frame(stack: list[str]) -> str:
     return outside
 
 
+def _top_frames(samples: dict) -> list:
+    """Up to five innermost repository frames, the most sampled first."""
+    return [{"frame": frame, "samples": count} for frame, count in
+            sorted(samples.items(), key=lambda item: (-item[1], item[0]))[:5]]
+
+
+def _fold_sample(episode: dict, stack: list) -> None:
+    """One stack sample into an open episode: counted by its innermost repository frame, the latest kept."""
+    if stack:
+        episode["last_stack"] = stack
+    key = _innermost_repo_frame(stack) or "(outside the repository)"
+    episode["samples"][key] = episode["samples"].get(key, 0) + 1
+
+
+class _TurnPhaseWatch:
+    """Where a direct turn's own thread stands while its start phase does not advance.
+
+    Each watchdog interval reads every running ``TurnExecution`` (its thread and the start
+    facts it passed, each with the monotonic instant it was stamped). One whose phase has
+    stood a whole interval before its Main call started gets one ``direct_turn_stall``
+    row with that thread's stack, one folded stack sample per interval while the phase
+    stands, and one ``direct_turn_stall_end`` once it advances (``then``: the next phase,
+    ``stood_sec`` up to that phase's own stamp), the turn ends in it (``then: "ended"``, up
+    to its end) or this watchdog stops (``then: "unwatched"``; a next one opens its own).
+    Heartbeat age decides nothing: a turn blocked before its heartbeat starts and one
+    blocked under a live heartbeat are watched alike, and the onset row only reports the
+    heartbeat's age (null before it started). Journal only, as invariant 20 binds the
+    watchdog: no owner message, no checkpoint row, no cancel, no verdict."""
+
+    def __init__(self, interval: float) -> None:
+        self._interval = interval
+        self._open: dict = {}  # execution_id -> the open episode
+
+    def tick(self, now: float, heartbeats: dict) -> None:
+        from supervisor.active_activity import CALL_PHASES, get_direct_activity_registry
+
+        executions = {row.execution_id: row for row in get_direct_activity_registry().executions()}
+        for execution_id in [key for key in self._open if key not in executions]:
+            self._close(execution_id, now)
+        for execution_id, execution in executions.items():
+            index = len(execution.marks) - 1
+            phase, at = execution.marks[index]
+            episode = self._open.get(execution_id)
+            if episode is not None and episode["index"] != index:
+                self._close(execution_id, now)
+                episode = None
+            if phase in CALL_PHASES or now - at < self._interval:
+                continue
+            ident = execution.thread[0]
+            if episode is not None:
+                _fold_sample(episode, _loop_thread_stack(ident))
+                continue
+            flags: dict = {}
+            stack = _loop_thread_stack(ident, facts=flags)
+            beat = heartbeats.get(execution.task_id) if execution.task_id else None
+            self._journal({"type": "direct_turn_stall", **self._ids(execution), "thread": execution.thread[1],
+                           "phase": phase, "stood_sec": round(now - at, 1),
+                           "heartbeat_sec": round(now - beat, 1) if isinstance(beat, (int, float)) else None,
+                           **({"stack_truncated": True} if flags else {}), **({"stack": stack} if stack else {})})
+            episode = self._open[execution_id] = {"execution": execution, "index": index,
+                                                  "samples": {}, "last_stack": []}
+            _fold_sample(episode, stack)
+
+    def close(self, now: float) -> None:
+        """This watchdog stops: every episode it opened ends with its own row."""
+        for execution_id in list(self._open):
+            self._close(execution_id, now)
+
+    def _close(self, execution_id: str, now: float) -> None:
+        episode = self._open.pop(execution_id)
+        execution, index = episode["execution"], episode["index"]
+        marks = list(execution.marks)
+        phase, at = marks[index]
+        if index + 1 < len(marks):
+            then, until = marks[index + 1]
+        elif execution.ended_at is not None:
+            then, until = "ended", execution.ended_at
+        else:
+            then, until = "unwatched", now
+        self._journal({"type": "direct_turn_stall_end", **self._ids(execution), "phase": phase, "then": then,
+                       "stood_sec": round(until - at, 1), "samples": sum(episode["samples"].values()),
+                       "top_frames": _top_frames(episode["samples"]), "last_stack": episode["last_stack"]})
+
+    @staticmethod
+    def _ids(execution) -> dict:
+        return {"execution_id": execution.execution_id, "task_id": execution.task_id,
+                "chat_id": execution.chat_id, "client_message_id": execution.client_message_id}
+
+    @staticmethod
+    def _journal(row: dict) -> None:
+        from supervisor.state import append_jsonl
+        try:
+            append_jsonl(DATA_DIR / "logs" / "supervisor.jsonl", {"ts": utc_now_iso(), **row})
+        except Exception:
+            log.debug("%s log failed", row.get("type"), exc_info=True)
+
+
 def _stall_cpu_over(onset_facts: dict, latest_facts: dict) -> Optional[float]:
     """The loop thread's CPU from the stamp it went silent on to its latest stamp
     — the whole stall, however many stamps the recovery published before the
@@ -445,7 +542,7 @@ def _start_supervisor_liveness_watchdog(
     liveness: list, stop_event=None, *, loop_thread_ident: Optional[int] = None,
 ) -> None:
     """Dedicated daemon thread (NOT inside the supervisor loop, so it fires even when
-    that loop stalls). It observes two silent-wedge classes and reports them
+    that loop stalls). It observes silent-wedge classes and reports them
     DIFFERENTLY (owner decision 4C). A heartbeat-silent in-process direct-chat turn
     ALERTS the owner, because /restart is a recovery they can perform. A supervisor
     loop stall (new-message intake starvation) is JOURNAL ONLY: the ``log.error``
@@ -459,7 +556,9 @@ def _start_supervisor_liveness_watchdog(
     not only where it began. Onset without an end is a generation that never
     recovered. Nothing reaches the
     owner's chat from that half: a stall they cannot act on is an alarm, not
-    information, and the rows carry the diagnosis anyway. It deliberately does NOT
+    information, and the rows carry the diagnosis anyway. A direct turn whose start
+    phase stops advancing before its first model request is journal only the same way,
+    with its own thread's stack, whatever its heartbeat says (``_TurnPhaseWatch``). It deliberately does NOT
     kill a hung thread; independent native actors keep the chat responsive
     meanwhile. ``loop_thread_ident`` is the thread whose stack a stall row carries;
     it defaults to the CALLER, because the loop thread starts its own watchdog
@@ -479,16 +578,9 @@ def _start_supervisor_liveness_watchdog(
         interval = min(15, max(1, deadline // 3))
         loop_alerted = False
         stall_onset: tuple = ()  # (stalled stamp, phase, onset facts) of the OPEN alerted stall
-        samples: dict = {}  # innermost repository frame -> stack samples while the stall is open
-        last_stack: list = []
+        stall: dict = {"samples": {}, "last_stack": []}  # its stack samples while the stall is open
         wedged_tasks: set[str] = set()
-
-        def sample(stack: list) -> None:
-            nonlocal last_stack
-            if stack:
-                last_stack = stack
-            key = _innermost_repo_frame(stack) or "(outside the repository)"
-            samples[key] = samples.get(key, 0) + 1
+        turn_phases = _TurnPhaseWatch(interval)
         while not _restart_requested.is_set() and not (stop_event is not None and stop_event.is_set()):
             time.sleep(interval)
             # ONE clock: both halves measure an ELAPSED GAP against stamps taken on
@@ -525,10 +617,10 @@ def _start_supervisor_liveness_watchdog(
                         log.debug("loop-stall log failed", exc_info=True)
                     loop_alerted = True
                     stall_onset = (liveness[_STAMP], facts.get("phase"), facts)
-                    samples, last_stack = {}, []
-                    sample(stack)
+                    stall = {"samples": {}, "last_stack": []}
+                    _fold_sample(stall, stack)
                 else:
-                    sample(_loop_thread_stack(watched_ident))  # one bounded sample per interval
+                    _fold_sample(stall, _loop_thread_stack(watched_ident))  # one bounded sample per interval
             else:
                 if loop_alerted:
                     # The loop ticked again: close the episode ONCE, and only one
@@ -553,10 +645,9 @@ def _start_supervisor_liveness_watchdog(
                             "cpu_interval_sec": stalled,
                             # Where the thread SPENT the stall: one stack sample per watchdog
                             # interval, folded by innermost repository frame, plus the last one.
-                            "samples": sum(samples.values()),
-                            "top_frames": [{"frame": frame, "samples": count} for frame, count in
-                                           sorted(samples.items(), key=lambda item: (-item[1], item[0]))[:5]],
-                            "last_stack": last_stack,
+                            "samples": sum(stall["samples"].values()),
+                            "top_frames": _top_frames(stall["samples"]),
+                            "last_stack": stall["last_stack"],
                         })
                     except Exception:
                         log.debug("loop-stall-end log failed", exc_info=True)
@@ -573,6 +664,12 @@ def _start_supervisor_liveness_watchdog(
                 if _chat_turn_wedged(True, turn_ts, now, deadline) and turn_task not in wedged_tasks:
                     _alert_chat_turn_wedge(turn_task, now - turn_ts)
                     wedged_tasks.add(turn_task)
+            # (3) Each direct turn's start phase: where its own thread stands while the phase holds.
+            try:
+                turn_phases.tick(now, dict(turns))
+            except Exception:
+                log.debug("direct-turn phase watch failed", exc_info=True)
+        turn_phases.close(time.monotonic())
 
     threading.Thread(target=_watch, name="supervisor-liveness-watchdog", daemon=True).start()
 

@@ -68,10 +68,9 @@ _VALIDATORS: Dict[str, Tuple[List[str], str]] = {
     ".bash": (["bash", "-n", "{path}"], "bash"),
 }
 
-# A declared module-widget entry is injected as a CLASSIC inline <script>, so the
-# grammar that matters is the Script goal, not the module goal. `node --check`
-# accepts top-level import/export in a .js file; `new vm.Script(...)` rejects it
-# exactly as the browser will, and it is suffix-independent.
+# Match the declared browser grammar, independently of suffix or package.json:
+# classic entries use Script, explicit ESM uses SourceTextModule. Node --check
+# alone can accept import/export in a classic widget's .js entry.
 _CLASSIC_SCRIPT_VALIDATOR: Tuple[List[str], str] = (
     [
         "node",
@@ -82,6 +81,11 @@ _CLASSIC_SCRIPT_VALIDATOR: Tuple[List[str], str] = (
         "{path}",
     ],
     "node",
+)
+_ESM_VALIDATOR: Tuple[List[str], str] = (
+    ["node", "--experimental-vm-modules", "-e",
+     "const fs=require('fs'),vm=require('vm');"
+     "new vm.SourceTextModule(fs.readFileSync(process.argv[1],'utf8'))", "--", "{path}"], "node",
 )
 
 
@@ -223,6 +227,8 @@ def _validate_widget_render(
             # The normalized entry is what the frame will fetch; carry it so the
             # caller can check the declared file actually exists on disk.
             row["entry"] = clean["entry"]
+            row["entry_type"] = clean.get("entry_type", "classic")
+            row["assets"] = clean.get("assets", [])
         return row
     except ExtensionRegistrationError as exc:
         return {
@@ -525,6 +531,7 @@ def _widget_entry_exists_finding(
         "ok": ok,
         "verified": True,
         "detail": entry if ok else f"missing or escaping module widget entry: {entry}",
+        "entry_type": row.get("entry_type", "classic"),
     }
 
 
@@ -536,26 +543,33 @@ def _widget_schema_findings(skill_dir: pathlib.Path, manifest: Optional[SkillMan
                          "ok": not problems, "verified": True,
                          "detail": "; ".join(problems) if problems else "valid contributions"})
     if manifest is not None and isinstance(manifest.ui_tab, dict):
-        render = manifest.ui_tab.get("render")
-        schema_row = _validate_widget_render(render, source="manifest.ui_tab.render")
-        findings.append(schema_row)
-        # Generated before the containment early return below: an escaping
-        # plugin path must not silently drop the manifest entry check.
-        entry_row = _widget_entry_exists_finding(skill_dir, schema_row)
-        if entry_row is not None:
-            findings.append(entry_row)
+        findings.append(_validate_widget_render(manifest.ui_tab.get("render"), source="manifest.ui_tab.render"))
     entry_name = str(manifest.entry or "plugin.py") if manifest is not None else "plugin.py"
     plugin = (skill_dir / entry_name).resolve()
     try:
         relative_plugin = plugin.relative_to(skill_dir.resolve())
     except ValueError:
-        return findings
-    if plugin.is_file():
-        for schema_row in _registered_ui_schema_findings(plugin, source_name=relative_plugin.as_posix()):
-            findings.append(schema_row)
-            entry_row = _widget_entry_exists_finding(skill_dir, schema_row)
-            if entry_row is not None:
-                findings.append(entry_row)
+        relative_plugin = None  # Still check manifest entries when the plugin escapes.
+    if relative_plugin is not None and plugin.is_file():
+        findings.extend(_registered_ui_schema_findings(plugin, source_name=relative_plugin.as_posix()))
+    eligible = None
+    for row in list(findings):
+        entry_row = _widget_entry_exists_finding(skill_dir, row)
+        if entry_row is not None:
+            findings.append(entry_row)
+        if row.get("entry_type") != "module":
+            continue
+        if eligible is None:
+            from ouroboros.skill_loader import _iter_payload_files
+
+            root = skill_dir.resolve()
+            eligible = {p.relative_to(root).as_posix() for p in _iter_payload_files(root)}
+        paths = [row["entry"], *row["assets"]]
+        missing = [p for p in paths if p not in eligible or any(
+            part.is_symlink() for part in (root / p, *(root / p).parents)
+            if part != root and root in part.parents)]
+        findings.append({"item": "widget_assets_exist", "source": row["source"], "verified": True,
+                         "ok": not missing, "detail": f"missing, excluded or symlink files: {missing}" if missing else "ok"})
     return findings
 
 
@@ -723,12 +737,15 @@ def _handle_skill_preflight(
             })
             widget_findings.extend(_widget_schema_findings(skill_dir, None))
 
-    # Declared module-widget entries are parsed with classic-script grammar below.
+    # Classic remains suffix-independent; opted-in entries and declared JS use ESM grammar.
     module_entries = {
         (skill_dir / str(f.get("detail") or "")).resolve()
         for f in widget_findings
-        if f.get("item") == "widget_entry_exists" and f.get("ok")
+        if f.get("item") == "widget_entry_exists" and f.get("ok") and f.get("entry_type") != "module"
     }
+    esm_files = {(skill_dir / path).resolve() for f in widget_findings
+                 if f.get("item") == "widget_schema" and f.get("entry_type") == "module"
+                 for path in [f["entry"], *f["assets"]] if path.endswith((".js", ".mjs"))}
 
     # paths scopes recent edits; otherwise walk the reviewable payload surface.
     files_to_check: List[pathlib.Path] = []
@@ -787,11 +804,12 @@ def _handle_skill_preflight(
             })
             continue
         classic_script = path in module_entries
-        validator = _CLASSIC_SCRIPT_VALIDATOR if classic_script else _VALIDATORS.get(suffix)
+        validator = (_CLASSIC_SCRIPT_VALIDATOR if classic_script else
+                     _ESM_VALIDATOR if path in esm_files else _VALIDATORS.get(suffix))
         if validator is None:
             continue
         argv_template, runtime = validator
-        grammar = {"grammar": "classic_script"} if classic_script else {}
+        grammar = {"grammar": "classic_script"} if classic_script else {"grammar": "module"} if path in esm_files else {}
         runtime_path, runtime_reason = _resolve_runtime(runtime)
         rel_path = str(path.relative_to(skill_dir))
         if runtime_path is None:
@@ -933,9 +951,9 @@ _PREFLIGHT_SCHEMA = {
     "name": "skill_preflight",
     "description": (
         "Read-only payload syntax/contract validator for one skill. Runs Python "
-        "compile() (no __pycache__), bash -n, and node syntax checks (a declared module-widget "
-        "entry gets classic-script grammar) on every reviewable file, or just `paths`, plus a manifest "
-        "parse, module-widget entry existence, and static render-schema validation. Cheap and offline (no LLM, no review.json mutation, "
+        "compile() (no __pycache__), bash -n, and node syntax checks (widget entries stay classic "
+        "unless entry_type: module declares ESM) on every reviewable file, or just `paths`, plus a manifest "
+        "parse, declared widget file existence, and render-schema validation. Cheap and offline (no LLM, no review.json mutation, "
         "no review status change). Skill-development tasks use this before "
         "calling skill_review so silly syntax errors are caught "
         "without spending the review panel's tokens. Argv-only "

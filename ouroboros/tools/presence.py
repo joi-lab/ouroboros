@@ -32,6 +32,9 @@ def _configure_presence(ctx: ToolContext, action: str, place_id: str = "", **par
             result = {"place": place_view(root, saved)} if saved else {}
         return json.dumps({"ok": True, **result}, ensure_ascii=False)
     except (PlaceError, ValueError, TypeError) as exc:
+        if getattr(exc, "code", "") == "place_activation_owner_only":
+            return _publish_tool_result(ctx, ToolResult(status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED",
+                text="Only your human switches a place to Active, on its sheet or by a word in Main; propose it there."))
         blocked = getattr(exc, "code", "") == "place_owner_confirmation_required"
         return _publish_tool_result(ctx, ToolResult(status="blocked" if blocked else "error",
             code="RESOURCE_CONSTRAINT_BLOCKED" if blocked else "TOOL_ARG_ERROR",
@@ -62,8 +65,9 @@ def get_tools() -> list[ToolEntry]:
     return [ToolEntry(name="configure_presence", schema={
         "name": "configure_presence",
         "description": "Inspect places and their connector choices; edit state, wakes, notes, folder or model. "
+                       "Only your human switches a place to Active, on its sheet or by a word in Main; propose it there. "
                        "Only an owner-door turn may confirm an owner account. A folder is an address, not a fence. "
-                       "Connect uses the installed connector's place declaration; disconnect keeps room history.",
+                       "Connect starts Silent using the installed connector's declaration; disconnect keeps room history.",
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["list", "inspect", "connect", "disconnect", "set_state",
                 "add_wake", "remove_wake", "add_note", "remove_note", "set_working_folder", "set_model",
@@ -71,7 +75,8 @@ def get_tools() -> list[ToolEntry]:
             "place_id": {"type": "string"}, "connector": {"type": "string"},
             "account_id": {"type": "string"}, "conversation_id": {"type": "string"},
             "state": {"type": "string", "enum": ["active", "silent", "paused"]},
-            "fact": {"type": "string"}, "text": {"type": "string"}, "note_id": {"type": "string"},
+            "fact": {"type": "string", "description": "A core wake fact or signal.<slug> declared by this live connector."},
+            "text": {"type": "string"}, "note_id": {"type": "string"},
             "working_folder": {"type": "string"}, "model": {"type": "string"},
             "platform_actor_id": {"type": "string"}, "label": {"type": "string"},
             "expected_revision": {"type": "integer"},

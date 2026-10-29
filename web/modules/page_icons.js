@@ -32,6 +32,8 @@ const CONTROL_BODIES = {
     check: '<path d="M20 6 9 17l-5-5"/>',
     book: '<path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/>',
     stop: '<rect width="12" height="12" x="6" y="6" rx="2"/>',
+    // Consciousness, its own time: the header's chip and the Dashboard's wakes.
+    brain: '<path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/>',
     close: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
     chevron: '<path d="m6 9 6 6 6-6"/>',
     'message-circle': '<path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5z"/>',
@@ -53,18 +55,9 @@ export function renderSkillIcon(spec, { size = 16, className = '' } = {}) {
     const pixels = Number.isFinite(size) && size > 0 ? size : 16;
     const name = typeof spec === 'string' ? spec : spec?.name;
     let svg = strokeIcon(CONTROL_BODIES[name] || CONTROL_BODIES.plug, pixels);
-    if (spec?.kind === 'svg' && typeof spec.svg === 'string' && spec.svg.length <= 8192 && globalThis.DOMPurify) {
-        // The server has already rebuilt these bytes. Keep the DOM sink limited to geometry too.
-        const clean = globalThis.DOMPurify.sanitize(spec.svg, {
-            ALLOWED_TAGS: ['svg', 'g', 'path', 'circle', 'ellipse', 'line', 'polyline', 'polygon', 'rect'],
-            ALLOWED_ATTR: ['xmlns', 'viewBox', 'd', 'cx', 'cy', 'r', 'rx', 'ry', 'x', 'y', 'width', 'height',
-                'points', 'x1', 'y1', 'x2', 'y2', 'transform', 'fill', 'stroke', 'stroke-width',
-                'stroke-linecap', 'stroke-linejoin', 'fill-rule', 'clip-rule'],
-            ALLOW_DATA_ATTR: false, ALLOW_ARIA_ATTR: false, KEEP_CONTENT: false,
-        });
-        if (clean.startsWith('<svg ') && clean.endsWith('</svg>')) {
-            svg = clean.replace('<svg ', `<svg width="${pixels}" height="${pixels}" `);
-        }
+    // icon_spec rebuilt this geometry on the server; do not fetch or sanitize it again.
+    if (spec?.kind === 'svg' && typeof spec.svg === 'string' && spec.svg.startsWith('<svg ') && spec.svg.endsWith('</svg>')) {
+        svg = spec.svg.replace('<svg ', `<svg width="${pixels}" height="${pixels}" `);
     }
     const css = String(className).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
     return svg.replace('<svg ', `<svg aria-hidden="true"${css ? ` class="${css}"` : ''} `);

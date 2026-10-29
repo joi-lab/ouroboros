@@ -1,3 +1,18 @@
+import { tr, fmt } from './i18n.js';
+import { taskPresentation } from './log_events.js';
+import { taskCostMeta } from './chat_activity.js';
+import { escapeHtmlAttr as escapeHtml } from './ui_primitives.js';
+
+/** The relay and wake note lead: the author's whole text; the surface alone fits its first words. */
+export const noteLeadText = (text) => String(text ?? '').trim();
+
+/** The same account stamp on wake and delivery rows; account names remain authored. */
+export function sendsAsHtml(sender) {
+    if (!sender?.label) return '';
+    return sender.owner ? escapeHtml(tr('places.identity.as_you', 'as you'))
+        : fmt('as {label}', { label: `<span data-i18n-authored>${escapeHtml(sender.label)}</span>` });
+}
+
 // The owner's words for consciousness, places and safety (owner's final names, 21.10), in one place.
 // Stored values never change: only these words do, so a relabel is one line here. Pure data and pure
 // helpers over host facts; nothing here reads the network or the page.
@@ -13,7 +28,7 @@ export const AUTONOMY_LEVELS = Object.freeze([
 export const PLACE_STATES = Object.freeze([
     { value: 'active', label: 'Active', word: 'active', note: 'Lives here: listens, wakes when its list says so, speaks and acts.' },
     { value: 'silent', label: 'Silent', word: 'silent', note: 'Hears everything here and changes nothing: no messages, reactions, edits or moderation.' },
-    { value: 'paused', label: 'Paused', word: 'paused', note: 'Away from this place: no wakes, no actions. Still connected.' },
+    { value: 'paused', label: 'Paused', word: 'paused', note: 'Away from this place: no wakes, no actions. Still connected; reported events are saved.' },
 ]);
 
 /** What Silent enforces, said by the host (verbatim, owner 21.10). */
@@ -28,19 +43,23 @@ export const SAFETY_LEVELS = Object.freeze([
 export const SAFETY_RANK = Object.freeze({ off: 0, light: 1, full: 2 });
 export const SAFETY_KINDS = Object.freeze({ your_work: 'Your work', consciousness: 'Consciousness' });
 
-/** What wakes it, as words after "wakes for …" (the typed facts of `places.WAKE_FACTS`). */
-export const WAKE_FACT_WORDS = Object.freeze({
-    direct_message: 'direct messages',
-    group_dm: 'group messages',
-    mention: 'mentions',
-    reply_to_me: 'replies',
-    my_thread: 'replies in its threads',
-    new_issue: 'new issues',
-    new_pull_request: 'new pull requests',
-    any_message: 'every message',
-    from_bot: 'messages from bots',
-    legacy_addressed: 'messages addressed to it',
+/** The typed facts of `places.WAKE_FACTS`: wake choices and observations about one message. */
+const FACT_WORDS = Object.freeze({
+    direct_message: { wake: 'direct messages', heard: 'addressed to it' },
+    group_dm: { wake: 'group messages', heard: 'group message' },
+    mention: { wake: 'mentions', heard: 'mentions it' },
+    reply_to_me: { wake: 'replies', heard: 'reply to it' },
+    my_thread: { wake: 'replies in its threads', heard: 'in its thread' },
+    new_issue: { wake: 'new issues', heard: 'new issue' },
+    new_pull_request: { wake: 'new pull requests', heard: 'new pull request' },
+    review_requested: { wake: 'review requests addressed to me', heard: 'review requested' },
+    assigned: { wake: 'assignments addressed to me', heard: 'assigned to it' },
+    any_message: { wake: 'every message', heard: '' },
+    from_bot: { wake: 'also wakes on bot messages', heard: 'from a bot' },
+    legacy_addressed: { wake: 'messages addressed to it', heard: 'addressed to it' },
 });
+export const WAKE_FACT_WORDS = Object.freeze(Object.fromEntries(Object.entries(FACT_WORDS)
+    .map(([fact, words]) => [fact, words.wake])));
 
 /** Who added a wake item or a note. */
 export const AUTHOR_WORDS = Object.freeze({
@@ -67,7 +86,7 @@ export const safetyLevelOf = (value) => SAFETY_LEVELS.find((level) => level.valu
 export function listWords(words) {
     const list = words.filter(Boolean);
     if (list.length < 2) return list.join('');
-    return `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`;
+    return fmt('{head} and {last}', { head: list.slice(0, -1).join(', '), last: list[list.length - 1] });
 }
 
 export const capitalized = (text) => {
@@ -75,29 +94,49 @@ export const capitalized = (text) => {
     return value ? value[0].toUpperCase() + value.slice(1) : value;
 };
 
-/** One wake fact in words; an unknown kind keeps its own spelling rather than a guess. */
-export const wakeFactWord = (fact) => WAKE_FACT_WORDS[fact] || String(fact || '').replace(/_/g, ' ');
+/** One wake fact in words; a declared label wins; an unknown kind keeps its spelling. */
+export const wakeFactWord = (fact, labels = null) => labels?.[fact] || (WAKE_FACT_WORDS[fact]
+    ? tr(`places.wake.${fact}`, WAKE_FACT_WORDS[fact]) : String(fact || '').replace(/_/g, ' '));
+
+/** A heard fact names this message; the universal any_message adds no chip, even when labelled. */
+export function heardFactWord(fact, labels = null) {
+    const word = FACT_WORDS[fact]?.heard;
+    return word === '' ? '' : labels?.[fact] || (word
+        ? tr(`places.heard.${fact}`, word) : String(fact || '').replace(/_/g, ' '));
+}
+
+/** `{id: label}` for declared facts, including signals (`facts` entries that are objects). */
+export const signalLabels = (facts) => Object.fromEntries((Array.isArray(facts) ? facts : [])
+    .filter((item) => item && typeof item === 'object' && item.id && item.label).map((item) => [item.id, item.label]));
+
+/** Lower an initial capital only in an otherwise lowercase first word; keep GitHub and PR intact. */
+export const sentenceLabel = (label) => /^\p{Lu}\p{Ll}+(?!\p{L})/u.test(label)
+    ? label[0].toLowerCase() + label.slice(1) : label;
 
 /** «wakes for direct messages, mentions and replies», or '' when nothing wakes it here. */
-export function wakesForText(wakes = []) {
+export function wakesForText(wakes = [], declared = null, labels = null) {
     const facts = [...new Set(wakes.map((item) => item?.fact).filter(Boolean))];
-    return facts.length ? `wakes for ${listWords(facts.map(wakeFactWord))}` : '';
+    const kinds = facts.filter((fact) => fact !== 'from_bot');
+    const named = { ...signalLabels(declared), ...labels };
+    const word = (fact) => named[fact] ? sentenceLabel(named[fact]) : wakeFactWord(fact);
+    return [kinds.length ? fmt('wakes for {kinds}', { kinds: listWords(kinds.map(word)) }) : '',
+        facts.includes('from_bot') ? word('from_bot') : ''].filter(Boolean).join(' · ');
 }
 
 export const authorWord = (author) => AUTHOR_WORDS[author] || (author ? `added by ${author}` : '');
 
 /** The row's status word for a stored state; an unknown state says so instead of guessing. */
-export const placeStateWord = (state) => placeStateOf(state)?.word || 'state unknown';
+export const placeStateWord = (state) => placeStateOf(state)?.word || tr('places.state.unknown', 'state unknown');
 
 /**
  * A place row's one status sentence: «active · wakes for direct messages, mentions and replies». A Silent place
  * keeps its list (it still wakes there to read and think; what it would say or change is held); a Paused place
- * says only its state. Unanswered messages are a count.
+ * says only its state. The count is open focus turns, not owed replies.
  */
 export function placeStatusText(place) {
     const parts = [placeStateWord(place?.state)];
-    if (place?.state === 'active' || place?.state === 'silent') parts.push(wakesForText(place.wakes));
-    if (Number.isInteger(place?.unanswered) && place.unanswered > 0) parts.push(`${place.unanswered} unanswered`);
+    if (place?.state === 'active' || place?.state === 'silent') parts.push(wakesForText(place.wakes, place.facts, place.labels));
+    if (Number.isInteger(place?.unanswered) && place.unanswered > 0) parts.push(fmt('{n} open turns', { n: place.unanswered }));
     return parts.filter(Boolean).join(' · ');
 }
 
@@ -142,8 +181,50 @@ export function durationText(from, to) {
     const end = Date.parse(String(to || ''));
     if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return '';
     const seconds = Math.round((end - start) / 1000);
-    if (seconds < 60) return `${seconds} s`;
+    if (seconds < 60) return fmt('{n} s', { n: seconds });
     const minutes = Math.round(seconds / 60);
-    if (minutes < 60) return `${minutes} min`;
-    return `${Math.round(minutes / 60)} h`;
+    if (minutes < 60) return fmt('{n} min', { n: minutes });
+    return fmt('{n} h', { n: Math.round(minutes / 60) });
+}
+
+/** The card's terminal family and the server's distinct active phases. */
+export function wakePhaseText(wake) {
+    const active = { waiting: 'Waiting', queued: 'Queued', paused: 'Paused', unknown: 'State unknown' };
+    if (wake.phase in active) return tr(`task.phase.${wake.phase}`, active[wake.phase]);
+    if (['running', 'working', 'done', 'warn', 'error', 'cancelled'].includes(wake.phase)) {
+        return taskPresentation(wake.phase === 'running' ? 'working' : wake.phase, !wake.live && wake.quiet).headline;
+    }
+    return tr('task.phase.unknown', 'State unknown');
+}
+
+export function wakeFactsText(wake) {
+    return [
+        wake.toolCalls === null ? '' : fmt(wake.toolCalls === 1 ? '{n} tool call' : '{n} tool calls', { n: wake.toolCalls }),
+        wake.rounds === null ? '' : fmt(wake.rounds === 1 ? '{n} round' : '{n} rounds', { n: wake.rounds }),
+    ].filter(Boolean).join(' · ');
+}
+
+export function wakeCheckText(check) {
+    const words = {
+        checked: 'Safety Supervisor checked {tool}', warned: 'Safety Supervisor warned about {tool}',
+        held: 'Safety Supervisor held {tool}', sent_despite: '{tool} sent despite the check',
+        not_checked: 'not checked ({tool})',
+    };
+    if (check.chip === 'not_checked' && !check.tool) return tr('consciousness.check.not_checked', 'Not checked');
+    const named = { place_reply: tr('consciousness.tool.reply', 'the reply'), send_user_message: tr('consciousness.tool.message', 'the message') }[check.tool];
+    const text = words[check.chip] ? fmt(words[check.chip], { tool: named || check.tool }) : '';
+    // Sentence case for the chip, except when it starts with a raw tool id.
+    return !named && check.tool && text.startsWith(check.tool) ? text : capitalized(text);
+}
+
+/** Keep the card's scoped cost projection; word openness and unknown without a false zero. */
+export function wakeCostText(wake) {
+    const meta = taskCostMeta(wake.cost)[0];
+    if (!meta || meta === 'Cost unknown' || meta === 'cost unavailable') return tr('consciousness.spend_unknown', 'spend unknown');
+    // These are the card's closed presentation templates, never authored text.
+    const words = meta.startsWith('Tracked: up to ') ? fmt('Tracked: up to {amount}', { amount: meta.slice(15) })
+        : meta.startsWith('Tracked: ') ? fmt('Tracked: {amount}', { amount: meta.slice(9) })
+            : meta.startsWith('up to ') ? fmt('up to {amount}', { amount: meta.slice(6) }) : meta;
+    return wake.live || wake.cost.cost_presentation?.accounting_open || wake.cost.cost_presentation?.tracked_final === false
+        ? fmt('{cost} so far', { cost: words }) : words;
 }

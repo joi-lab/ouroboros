@@ -407,13 +407,15 @@ ESCALATE_TOOL_SCHEMA: Dict[str, Any] = {
         "are not shared context by themselves. The card carries the explanation needed to "
         "understand this decision and its consequences.\n\n"
         "The source of the fork belongs in that explanation, in ordinary prose: the human's "
-        "words, a document they supplied, your idea, or a reviewer's proposal. Human words "
+        "words, a document they supplied, your idea, or a helper's or reviewer's proposal. Human words "
         "the fork rests on are quoted exactly when available; missing wording is disclosed, "
         "and your paraphrase is identified as your interpretation. Your own proposal is a "
         "distinct option, not an assumed premise of every option.\n\n"
         "Offer 0-6 real alternatives for this decision: none for an open question the human "
         "answers in their own words; with options, mark your recommendation with "
-        "recommended=true. By default, state the assumption you continue under and keep "
+        "recommended=true. A substantive position you or a helper set aside is one of them, "
+        "stated at its strongest with its cost and why you set it aside. "
+        "By default, state the assumption you continue under and keep "
         "working; the card stays answerable and a late answer still arrives. Set "
         "wait_for_answer=true on a live root, including an ordinary conversation, when the "
         "next step is irreversible or costly to redo, or the choice belongs to the human; "
@@ -431,6 +433,7 @@ ESCALATE_TOOL_SCHEMA: Dict[str, Any] = {
     ),
     "parameters": {"type": "object", "properties": {
         "reply_to": REPLY_TO_SCHEMA,
+        "request_id": {"type": "string", "description": "Stable ask retry key, at most 128 characters. Reuse it with identical question fields after uncertain delivery. After its wait ends, use a new request_id to wait again. With a retained Presence source, asks go privately to Main and omitted keys deduplicate identical asks from that work. Other roots mint a new ask when the key is omitted."},
         "action": {"type": "string", "enum": ["ask", "close"], "default": "ask"},
         "quiz_id": {"type": "string", "description": "Existing question to close; used only with action=close."},
         "question_task_id": {"type": "string", "description": "Question author for action=close; defaults to this task. Your own, a recorded Continue/retry predecessor's, or an already finished task's question may be closed; another live task's may not."},
@@ -618,6 +621,7 @@ def _escalate(
     question_task_id: str = "",
     materials: list | None = None,
     reply_to: dict | None = None,
+    request_id: str = "",
 ) -> str:
     """One escalation verb for the whole tree (owner decision 31 hierarchy).
 
@@ -651,7 +655,14 @@ def _escalate(
     task_id = str(getattr(ctx, "task_id", "") or "").strip()
     if not task_id:
         return "⚠️ ESCALATE_UNAVAILABLE: escalate requires an active task context."
-    if bool(getattr(ctx, "is_direct_chat", False)) and (
+    from ouroboros.presence_owner_contact import contact_origin, contact_identity
+    # A child still escalates to its parent, never directly to Main.
+    parent_task_id = str(meta.get("parent_task_id") or "").strip()
+    try:
+        origin = contact_origin(ctx, allow_unattributed=True) if not parent_task_id else None
+    except (OSError, ValueError) as exc:
+        return argument_refusal(ctx, "OWNER_CONTACT_UNAVAILABLE", [str(exc)], effect="The quiz was not sent.")
+    if origin is None and bool(getattr(ctx, "is_direct_chat", False)) and (
             not callable(getattr(ctx, "owner_wait_callback", None))):
         # Native conversations with a live continuation owner are addressable
         # through the same decision ingress.
@@ -659,7 +670,9 @@ def _escalate(
                 "ask the question directly in your reply instead of a card.")
     parent_task_id = str(meta.get("parent_task_id") or "").strip()
     delegation_role = str(meta.get("delegation_role") or "").strip()
-    if wait_for_answer and (parent_task_id or not callable(getattr(ctx, "owner_wait_callback", None))):
+    wait_owner = callable(getattr(ctx, "owner_wait_callback", None)) or (
+        origin is not None and callable(getattr(ctx, "review_wait_callback", None)))
+    if wait_for_answer and (parent_task_id or not wait_owner):
         return "⚠️ ESCALATE_UNAVAILABLE: required owner waiting needs a root task with a live continuation owner."
     if wait_for_answer:
         from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
@@ -772,17 +785,31 @@ def _escalate(
     # Root task: the owner gets a typed quiz card.
     from ouroboros.owner_quiz import record_asked
 
-    quiz_id = uuid.uuid4().hex
+    fingerprint = ""
+    if origin is not None or request_id:
+        try:
+            quiz_id, fingerprint = contact_identity(task_id, "quiz", {
+                **payload, "wait_for_answer": wait_for_answer, "materials": material_refs,
+                **({"reply_to": reply_to} if reply_to else {}),
+            }, request_id)
+        except ValueError as exc:
+            return argument_refusal(ctx, "QUIZ_REQUEST_INVALID", [str(exc)], effect="The quiz was not sent.")
+    else:
+        quiz_id = uuid.uuid4().hex
     # The card's own chat, stored with the block: a late answer arriving after
     # this task is gone is delivered there, exactly where the card was shown.
     try:
         card_chat_id = int(getattr(ctx, "current_chat_id", None) or 0)
     except (TypeError, ValueError):
         card_chat_id = 0
+    if origin is not None:
+        from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID
+        card_chat_id = WEB_UI_CHAT_ID
     host_facts = _quiz_host_facts(ctx, canonical_root, task_id, card_chat_id)
+    question_text = payload["question"]
     asked = record_asked(
         canonical_root, task_id,
-        quiz_id=quiz_id, question=payload["question"],
+        quiz_id=quiz_id, question=question_text,
         options=[row["label"] for row in payload["options"]],
         option_details=[row.get("detail", "") for row in payload["options"]],
         recommended_index=next((i for i, row in enumerate(payload["options"]) if row.get("recommended")), None),
@@ -792,8 +819,15 @@ def _escalate(
         host_facts=host_facts,
         materials=material_refs,
         **({"reply_to": reply_to} if reply_to else {}),
+        presence_contact=origin,
+        request_fingerprint=fingerprint,
     )
     if asked.get("refused"):
+        if asked["refused"] in {"request_id_conflict", "wait_ended"}:
+            problem = ("The previous wait ended; use a new request_id to wait again"
+                       if asked["refused"] == "wait_ended" else "request_id already names different question fields")
+            return argument_refusal(ctx, "QUIZ_REQUEST_CONFLICT", [problem],
+                                    effect="The original question is unchanged; no new question or wait was selected.")
         if asked["refused"] == "owner_questions_unavailable":
             return argument_refusal(ctx, "QUIZ_MEMBERSHIP_UNAVAILABLE",
                 ["The current-question address could not be registered; retry when storage is available."],
@@ -806,17 +840,20 @@ def _escalate(
                 f"stated assumption: {payload['assumption']}")
     from ouroboros.tools.owner_delivery import deliver_owner_event
 
+    if asked.get("state") != "open":
+        return f"OK: quiz {quiz_id} already {asked.get('state')}; no new question or wait was selected."
     mode = deliver_owner_event(ctx, {
         "type": "send_quiz",
-        "chat_id": getattr(ctx, "current_chat_id", None) or 0,
+        "chat_id": card_chat_id,
         "quiz_id": quiz_id,
-        "question": payload["question"],
+        "question": question_text,
         "options": payload["options"],
         "stake": payload["stake"],
         "assumption": payload["assumption"],
         "state": "open",
         "task_id": task_id,
         "host_facts": host_facts,
+        **({"presence_contact": origin} if origin else {}),
         **({"materials": material_refs} if material_refs else {}),
         **({"reply_to": reply_to} if reply_to else {}),
         **({"wait_for_answer": True} if wait_for_answer else {}),

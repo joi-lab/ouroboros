@@ -14,6 +14,7 @@ from ouroboros import dialogue_store
 from tests.test_ui_smoke_playwright import direct_server_with_data as direct_server_with_data
 from tests._store_shared import seed_result
 from tests._work_projection_shared import work_fields
+from tests.ui_chat_viewport_smoke import state_reads
 from ouroboros.test_evidence import diagnostic_directory
 
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
@@ -81,7 +82,7 @@ def test_speechless_history_and_direct_resume(direct_server_with_data, engine):
                 context = browser.new_context(viewport={"width": width, "height": 900},
                     is_mobile=width == 390, has_touch=width == 390)
                 page = context.new_page()
-                page.route("**/api/state", state_route)
+                page.route(state_reads, state_route)
                 census["phase"] = "budget_pausing"
                 page.goto(fixture["url"], wait_until="domcontentloaded")
                 card = page.locator(f'.chat-live-card[data-task-id="{task_id}"]')
@@ -108,7 +109,8 @@ def test_speechless_history_and_direct_resume(direct_server_with_data, engine):
                 resume = turn.locator("[data-resume-run]")
                 resume.wait_for(state="visible")
                 assert resume.inner_text() == "Resume"
-                assert turn.locator("[data-live-phase]").inner_text() == "Paused"
+                # The first read lands before the socket opens: Activity unconfirmed until the census over it lands.
+                expect(turn.locator("[data-live-phase]")).to_have_text("Paused")
                 assert page.locator("#chat-messages").evaluate("el => el.scrollWidth <= el.clientWidth + 1")
                 assert resume.evaluate("el => { const r=el.getBoundingClientRect(); return r.left>=0 && r.right<=innerWidth; }")
                 turn.locator("[data-cancel-run]").click()
@@ -117,8 +119,7 @@ def test_speechless_history_and_direct_resume(direct_server_with_data, engine):
                 page.keyboard.press("Escape")
                 page.screenshot(path=str(diagnostic_directory(root.parent, "task-evidence") / f"task-evidence-{engine}-{width}-paused.png"), full_page=True)
                 card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
-                expect(card.locator("[data-live-facts] .chat-live-fact").filter(
-                    has=page.locator("dt", has_text="Tool calls")).locator("dd")).to_have_text("24")
+                expect(card.locator(":scope > [data-live-foot] > [data-live-meta]")).to_contain_text("24 tool calls")
                 lines = card.locator(".chat-live-line")
                 # The tool calls, then the answer's own Done line.
                 assert lines.count() == 2, lines.all_inner_texts()
@@ -174,7 +175,7 @@ def test_pause_notice_translation_and_historical_wake_status(direct_server_with_
             def rows():
                 return [{"activity_id": "with-card", "chat_id": 1, "kind": "managed_task",
                          "phase": "working", "owner_wait": owner_wait, "required_question_unavailable": True}]
-            page.route("**/api/state", lambda route: route.fulfill(json={**state, "bg_consciousness_enabled": True,
+            page.route(state_reads, lambda route: route.fulfill(json={**state, "bg_consciousness_enabled": True,
                 "active_chat_activities": rows(), "active_chat_activities_complete": True, **work_fields(rows()),
                 "bg_consciousness_state": {"status": status, "detail": details[status]}}))
             page.route("**/api/ui/i18n", lambda route: route.fulfill(json=payload))

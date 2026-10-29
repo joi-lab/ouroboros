@@ -458,7 +458,8 @@ def test_a_continuation_binds_the_rights_of_its_own_start(tmp_path, monkeypatch)
     first, _payload, ctx, _calls = _start(tmp_path, monkeypatch, acting=True, run_id="run-first",
                                           harness_row=GRANTED)
     _settle(tmp_path, "run-first", ctx.task_id)
-    # Same tree, still negotiated: this start grants again the scratch of the snapshot it runs in.
+    # Same tree (the predecessor was never captured, so its checkout is still there), still negotiated:
+    # this start grants again the scratch of the snapshot it runs in.
     same, payload, _ctx, _calls = _start(tmp_path, monkeypatch, acting=True, run_id="run-next", harness_row=GRANTED,
                                          start_kwargs={"continue_from": "run-first"})
     assert payload["continuation"]["workspace"] == "same_snapshot" and same["continueFrom"] == "run-first"
@@ -507,6 +508,8 @@ def test_scratch_is_never_captured_retained_or_released_with_the_copy(tmp_path, 
     assert "product.txt" in patch and "check.log" not in patch and "marker.txt" not in patch
     assert [row["path"] for row in block["named_evidence"]["files"]] == [".review-evidence/check.log"]
     assert str(scratch) not in json.dumps(block)
+    # The copy's checkout went with its saved capture; the scratch has its own lifetime.
+    assert block["checkout_released"] is True and not copy.exists()
     assert (scratch / "env" / "marker.txt").read_text(encoding="utf-8") == "environment\n"
 
 
@@ -614,7 +617,10 @@ def test_a_supported_writable_seat_sends_names_and_sizes_exactly_its_directories
     area = pathlib.Path(execution["workspaceRoot"])
     text = binding["instructions"]
     assert f"goes outside every Git working tree (in {scratch}, the scratch your engine grants this run)" in text
-    assert f"where this copy's .gitignore ignores it (an ignored folder is listed, not retained) or in {scratch}" in text
+    # The copy is a linked worktree: its changes are evidence, so no environment goes inside it.
+    assert (f"in {scratch}, the scratch your engine grants this run, never inside this copy, since its changes are "
+            "retained as evidence") in text and ".gitignore ignores it" not in text
+    assert "linked worktree of its repository: branches, tags, stash and Git config are the author's" in text
     assert f"UV_CACHE_DIR={cache / 'uv'}" in text and "granted to this run" in text
     # The request is prepared and measured with the final instructions and the grant in it.
     delivery: dict = {}
@@ -652,7 +658,7 @@ def test_full_and_unsupported_seats_keep_their_request_and_rights(tmp_path, acce
     binding = rc.session_checking(gateway, custody_drive=data, task_id="task-1", operation_id="op-1",
                                   root=str(author), source=source, shape=delegated_run_shape(False, access),
                                   route_id="route")
-    area = rc.seat_dir(data, "task-1", "op-1") / "area"
+    area = rc.seat_dir(data, "task-1", "op-1") / "area.noindex"
     assert binding["execution"] == {"isolation": "live", "delegated": True, "workspaceRoot": str(area)}
     text = binding["instructions"]
     assert ("your engine grants this run none (auxiliary_roots_unsupported:" in text) is (access == "workspace_write")

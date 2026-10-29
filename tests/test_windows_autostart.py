@@ -180,7 +180,7 @@ def test_the_toggle_never_enters_the_settings_draft():
     for attribute in ('id="s-', 'name="s-'):
         assert attribute not in block
     settings = (root / "web" / "modules" / "settings.js").read_text(encoding="utf-8")
-    assert "closest?.('[data-notify-settings], [data-autostart-settings]')" in settings
+    assert "closest?.('[data-notify-settings], [data-autostart-settings], [data-interface-size]')" in settings
 
 
 @pytest.fixture

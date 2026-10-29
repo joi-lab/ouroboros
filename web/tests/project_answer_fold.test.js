@@ -25,7 +25,7 @@ test('answer folds in a feed whose width still moves wait until the width holds'
         const measured = [];
         const answer = (id, moving, asleep = () => false) => {
             const classes = new Set(['chat-bubble', 'project-answer']);
-            const message = { clientHeight: 100, get scrollHeight() { measured.push(id); return 300; }, querySelectorAll: () => [] };
+            const message = { style: { setProperty() {} }, clientHeight: 100, get scrollHeight() { measured.push(id); return 300; }, querySelectorAll: () => [] };
             const holds = { '[data-resizing]': moving, '[data-laid]': asleep };
             return { classList: { contains: (name) => classes.has(name),
                 toggle: (name, on) => { measured.push(`mark ${id}`); return on ? classes.add(name) : classes.delete(name); } },

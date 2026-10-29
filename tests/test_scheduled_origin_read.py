@@ -8,8 +8,8 @@ predecessor, never a write. The authority is the host-written occurrence receipt
 provenance), and task metadata an ordinary admission accepted proves nothing. Real producers: the
 ``schedule_followup`` tool, the schedule table, occurrence admission (``check_scheduled_tasks``), the
 real worker start that builds the ToolContext (``agent_start``), the ``schedule_subagent`` tool and
-its supervisor admission, the reaper's retry producer (``_enqueue_retry``; the kill decision before
-it is not run here), both public APIs, the tool registry, ``write_file`` artifact registration,
+its supervisor admission, a stored pre-upgrade timeout retry (``tests._silence_reaper_support``; no
+producer mints one now), both public APIs, the tool registry, ``write_file`` artifact registration,
 terminal-file settlement and the drive-retention prune. Missing scratch after retention is an honest
 not-found; registered artifacts remain; nothing new is retained.
 """
@@ -186,8 +186,8 @@ def test_an_unreadable_receipt_denies_now_and_the_same_actor_reads_it_again(host
 def test_its_admitted_child_and_its_retry_read_the_same_origin_one_hop(host, origin, monkeypatch):  # noqa: F811
     from ouroboros.tools.control import _schedule_task
     from supervisor import events
-    from supervisor.task_reaper import _enqueue_retry
     from tests._shared import configure_test_subagent
+    from tests._silence_reaper_support import historical_successor
 
     task = _fire(host, origin, "independent")
     _registry, ctx = _started_registry(host, task, monkeypatch)
@@ -200,10 +200,7 @@ def test_its_admitted_child_and_its_retry_read_the_same_origin_one_hop(host, ori
     assert child["delegation_role"] == "subagent" and child["root_task_id"] == task["id"]
     host.pending.remove(task)
     write_task_result(host.root, task["id"], "running", root_task_id=task["id"])
-    requeued = _enqueue_retry(queue, dict(task), task_id=task["id"], retry_task_id="retry-1", attempt=1,
-                              terminal_reason="idle_timeout",
-                              recon_fields={"cost_accounting_status": "available", "cost_final": True})
-    assert requeued == (True, 2, "idle_timeout", {})
+    historical_successor(dict(task), 1, "retry-1")
     [retry] = [t for t in host.pending if t["id"] == "retry-1"]
     for row in (child, retry):
         registry, started = _started_registry(host, row, monkeypatch)

@@ -42,6 +42,7 @@ def test_a_mutating_child_runs_live_in_a_private_snapshot_not_the_shared_tree(tm
     # The snapshot genuinely carries the target's current state.
     assert (scope_root / "README.md").read_text(encoding="utf-8") == "seed\n"
     assert payload["access"] == "workspace_write" and payload["isolation"] == "live"
+    assert payload["workspace"] == "copy"  # the default place; workspace='in_place' is the explicit other one
 
 
 def test_a_read_only_child_uses_the_same_transport_with_a_narrower_profile(tmp_path, monkeypatch):
@@ -83,13 +84,16 @@ def test_naming_the_documented_default_starts_exactly_like_omitting_it(
         roots[1], acting=False, monkeypatch=monkeypatch, start_kwargs=named_default, access="readonly")
     assert "execution" not in explicit
     assert payload["access"] == "readonly"
-    # These requests use different repositories. Keep the honest missing-DESIGN
-    # disclosure and normalize only its exact source address before comparison.
+    # These requests use different repositories. Keep the honest missing-DESIGN and
+    # missing-BIBLE disclosures and normalize only their exact source addresses before comparison.
     for request, root in ((omitted, roots[0]), (explicit, roots[1])):
         source = str(root / "repo/docs/DESIGN.md")
         assert source in request["instructions"]
         assert "No DESIGN content or navigation delivered" in request["instructions"]
         request["instructions"] = request["instructions"].replace(source, "<selected-repo>/docs/DESIGN.md")
+        bible = str(root / "repo/BIBLE.md")
+        assert f"BIBLE.md source unavailable at {bible}" in request["instructions"]
+        request["instructions"] = request["instructions"].replace(bible, "<selected-repo>/BIBLE.md")
     assert {key: value for key, value in explicit.items() if key != "scope"} == {
         key: value for key, value in omitted.items() if key != "scope"}
 
@@ -169,11 +173,18 @@ def test_the_model_has_no_argument_that_could_widen_the_profile():
     # ResolvedResourceBinding authorizer as ordinary writes (R1 item 9); `effort` is reasoning
     # depth inside the owner's effort range (a pin or a level in the model name keeps its own).
     # D2 exposes ask/plan/agent and explicit readiness override; the retained ceiling still governs.
+    # `workspace` (owner 25.10, Q2-A) names WHERE a Git writer works inside the task's own write root,
+    # a private copy (default) or that root in place; it is never a path and never wider access.
+    # `attachment_paths`/`attachment_import` only select this task's own retained inputs (exact manifest
+    # relpaths) to attach as engine documents and whether to reuse their import; never a path or access.
     assert properties == {
         "prompt", "subagent_id", "max_seconds", "retry_of", "continue_from", "continue_carrier", "root",
         "bucket", "skill_name", "directory_strategy", "scope_paths", "access", "effort", "mode",
-        "override_plan_readiness",
+        "override_plan_readiness", "workspace", "attachment_paths", "attachment_import",
     }
+    assert entry.schema["parameters"]["properties"]["attachment_import"]["enum"] == ["reuse", "new"]
+    assert entry.schema["parameters"]["properties"]["attachment_paths"]["items"] == {"type": "string"}
+    assert entry.schema["parameters"]["properties"]["workspace"]["enum"] == ["copy", "in_place"]
     from ouroboros.settings_scales import EFFORT_SCALE
     assert entry.schema["parameters"]["properties"]["effort"]["enum"] == ["auto", *EFFORT_SCALE]
     assert entry.schema["parameters"]["properties"]["continue_carrier"]["enum"] == ["auto", "packet"]

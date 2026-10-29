@@ -51,10 +51,12 @@ def test_fresh_and_mature_envelopes_leave_one_work_room(window, density, mature,
     assert facts["target_tokens"] is None
     if plan.initial_mode == "max":
         assert core.architecture_md in shown.system_content_json
-        assert "Low: the books did not fit" not in shown.system_content_json
+        assert "Low with chapter maps" not in shown.system_content_json and shown.memory_facts["max_room"]["cause"] == "held"
     else:
         assert core.architecture_md not in shown.system_content_json
-        assert "Low: the books did not fit beside the story and the work room" in shown.system_content_json
+        cause = shown.memory_facts["max_room"]["cause"]  # the route's disclosed fact, or memory/schemas took the room
+        assert cause in ("route", "crowded") and ("a disclosed fact of this route" if cause == "route" else
+                                                  "The host's measure of this start") in shown.system_content_json
     other = _start(core, 1_000_000 if plan.initial_mode == "low" else 128_000, monkeypatch, density, kind)
     assert other.initial_mode != plan.initial_mode
 

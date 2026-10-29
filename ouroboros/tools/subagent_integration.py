@@ -27,7 +27,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
-from typing import Any, Dict, Iterator, List, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.tools.tool_result import completed_local_read
@@ -409,7 +409,7 @@ def _stageable_paths(target: pathlib.Path, touched: List[str]) -> List[str]:
 
 
 def _baseline_drifted_paths(
-    target: pathlib.Path, baseline_sha: str, touched: List[str],
+    target: pathlib.Path, baseline_sha: str, touched: List[str], baseline_entries: Optional[Dict[str, str]] = None,
 ) -> tuple[List[str], str]:
     """Touched paths whose CURRENT target state differs from the run's baseline.
 
@@ -421,6 +421,11 @@ def _baseline_drifted_paths(
     the baseline itself was built with (identical filter/attribute treatment):
     seed a scratch index from the baseline tree, stage the current worktree state
     of exactly these paths into it, and ask git which entries now differ.
+
+    Once the owner released a result's pins and Git collected the baseline,
+    ``baseline_entries`` (the capture's recorded "mode blob" of each path B held)
+    make the same proof without B: the current entries staged into an empty
+    scratch index must equal them, and a path B lacked must still be absent.
 
     Returns ``(drifted_paths, error)``; a non-empty error means the comparison
     could not be made and the caller must refuse rather than apply blind.
@@ -442,6 +447,8 @@ def _baseline_drifted_paths(
                 args, cwd=str(target), capture_output=True, env=env,
                 input=payload if args[1] == "update-index" else None,
             )
+            if proc.returncode != 0 and args[1] == "read-tree" and baseline_entries is not None:
+                return _recorded_baseline_drift(target, env, payload, touched, baseline_entries)
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace")
                 return [], f"{args[1]} failed: {detail.strip()[:300]}"
@@ -452,6 +459,26 @@ def _baseline_drifted_paths(
         return drifted, ""
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _recorded_baseline_drift(target: pathlib.Path, env: Dict[str, str], payload: bytes, touched: List[str],
+                             entries: Dict[str, str]) -> tuple[List[str], str]:
+    """The drift proof against recorded baseline entries. The scratch index is seeded with them first, as
+    ``read-tree`` of B would be, so ``core.fileMode=false`` or ``core.symlinks=false`` keep B's modes."""
+    seed = "".join(f"{entries[path]}\t{path}\0" for path in touched if path in entries)
+    current: Dict[str, str] = {}
+    for args, data in ((["update-index", "-z", "--index-info"], seed.encode("utf-8", "surrogateescape")),
+                       (["update-index", "-z", "--add", "--remove", "--stdin"], payload),
+                       (["ls-files", "--stage", "-z"], None)):
+        proc = subprocess.run(["git", *args], cwd=str(target), capture_output=True, env=env, input=data)
+        if proc.returncode != 0:
+            return [], f"{args[0]} failed: {(proc.stderr or b'').decode('utf-8', errors='replace').strip()[:300]}"
+    for line in proc.stdout.split(b"\0"):
+        meta, _, path = line.partition(b"\t")
+        if path:
+            mode, blob, _stage = meta.decode("ascii").split()
+            current[path.decode("utf-8", errors="surrogateescape")] = f"{mode} {blob}"
+    return sorted(path for path in touched if current.get(path) != entries.get(path)), ""
 
 
 def _target_is_system_repo(ctx: ToolContext) -> bool:
@@ -483,14 +510,13 @@ def _is_host_minted_projects_tree(path: pathlib.Path) -> bool:
     """True when ``path`` is a host-minted genesis/coop tree — i.e. inside the
     durable subagent-projects root. Owner-attached folders never live there, so this
     is the structural boundary for the coop no-op (and the checkpoint-commit).
-    It asks the SAME containment predicate the orphan apply gate asks
-    (``delegate_shared.orphan_apply_target_ok``); here the projects root is both
-    the boundary and the containment root, so the two can never drift apart."""
+    Child/body checkouts are not coop projects, even when an orphan result may
+    return to one under the caller's existing write rights."""
     try:
         from ouroboros.config import get_subagent_projects_root
-        from ouroboros.delegate_shared import orphan_apply_target_ok
+        from ouroboros.tool_access import path_is_relative_to
 
-        return orphan_apply_target_ok(path, get_subagent_projects_root())
+        return path_is_relative_to(path.resolve(), pathlib.Path(get_subagent_projects_root()).expanduser().resolve())
     except Exception:
         return False
 
@@ -1022,7 +1048,7 @@ def _integrate_subagent_patch(
         )
         detail = ("Integration did not finish cleanly." if apply_attempted else
                   "Result preparation failed. No file or patch apply was attempted.")
-        next_step = ("Inspect with vcs_diff and resolve, or run vcs_restore to abort, then retry or pick another child."
+        next_step = ("Inspect with vcs_read diff and resolve, or run vcs_restore to abort, then retry or pick another child."
                      if apply_attempted else "The copy and patch are retained. Reconcile changed source files with this copy, or reject the result.")
         return (f"⚠️ INTEGRATE_CONFLICT: {child_task_id} into {target}: {detail} "
                 f"Details: {stderr[:600]}\n{next_step}")
@@ -1179,7 +1205,7 @@ def get_tools() -> List[ToolEntry]:
                     "commit_reviewed. For best-of-N pick a child "
                     "and integrate it, or integrate several to synthesize. Own-body protected-path changes require "
                     "pro runtime mode (and, for a nested acting parent, protected_paths_grant). Conflicts "
-                    "are reported for you to resolve (vcs_diff) or abort (vcs_restore). Writes a "
+                    "are reported for you to resolve (vcs_read diff) or abort (vcs_restore). Writes a "
                     "subagent_patch_verdict_<task_id>.json audit artifact."
                 ),
                 "parameters": {
@@ -1205,7 +1231,9 @@ def get_tools() -> List[ToolEntry]:
                     "orphan recovery remains available to top-level tasks. Current target authority still applies. "
                     "Git runs edit a private execution snapshot; apply verifies its complete result "
                     "against the recorded baseline under the repository lock, applies and stages "
-                    "changed files into your active root, and never commits. Skill-payload runs "
+                    "changed files into the recorded target, and never commits. A terminal owner's orphan "
+                    "may return to its original target inside the configured projects/worktrees roots, "
+                    "including manually placed folders, under current write authority; no workspace is rebound. Skill-payload runs "
                     "apply LIVE apply into the non-Git payload with content-hash CAS (nothing is staged into your active root) and make its review "
                     "stale before reuse. Ordinary-folder copies use the engine's complete file "
                     "manifest and per-file baseline checks; paths may select files and remaining "
@@ -1226,7 +1254,7 @@ def get_tools() -> List[ToolEntry]:
                     "type": "object",
                     "properties": {
                         "run_id": {"type": "string", "description": "The delegated run whose captured patch to integrate (from delegate_start)."},
-                        "decision": {"type": "string", "enum": ["apply", "reject"], "default": "apply", "description": "apply = integrate the captured result: Git changes are STAGED into your active root; skill changes are applied LIVE into the non-Git payload with content-hash CAS; directory copies use engine file delivery. reject = explicit discard of unapplied results, never an undo of direct effects."},
+                        "decision": {"type": "string", "enum": ["apply", "reject"], "default": "apply", "description": "apply = integrate the captured result: Git changes are STAGED into the recorded target; skill changes are applied LIVE into the non-Git payload with content-hash CAS; directory copies use engine file delivery. reject = explicit discard of unapplied results, never an undo of direct effects."},
                         "paths": {"type": "array", "items": {"type": "string"}, "description": "For an engine directory copy, optionally select a nonempty list of captured file paths to apply; omit for the complete result. Remaining changes stay retained until applied or explicitly rejected. Git and skill captures are whole-result operations: omit paths or pass [] for the complete capture; nonempty selections are unsupported there."},
                         "reason": {"type": "string", "description": "Optional rationale recorded in the verdict and the durable disposition row."},
                         "acknowledge_ambiguous": {"type": "boolean", "default": False, "description": "Set true ONLY after inspecting an INTEGRATE_DELEGATED_APPLY_AMBIGUOUS state (a crashed apply left a durable unresolved intent): resolves that stale intent and re-runs the normal disposition guards, which re-verify the tree. A no-op when no ambiguity is pending."},

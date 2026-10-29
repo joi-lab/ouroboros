@@ -20,6 +20,9 @@ from ouroboros.platform_layer import (
 log = logging.getLogger(__name__)
 
 _SCRATCHPAD_MAX_BLOCKS = 10
+_DIALOGUE_LOGS = frozenset({"chat.jsonl", "progress.jsonl"})  # their rows live in state/dialog.sqlite
+# The rows one recent window reads at most, host waits included: a read bound, not a quota.
+_RECENT_ROWS_CEILING = 2000
 
 
 def render_scratchpad_markdown(
@@ -172,6 +175,16 @@ def _chat_history_snapshot_id(
     return hashlib.sha256(encoded).hexdigest()
 
 
+
+def _ok_answer_mark(bucket: Any) -> str:
+    """✓ for an ordinary success. A typed code that answers ok yet names another outcome
+    (an inspection before apply, a review block) shows its bucket: the code table decides."""
+    from ouroboros._outcome_tool_errors import _OK_TOOL_STATUSES
+    from ouroboros.tools.tool_result import TOOL_CODE_SPECS
+
+    named = {spec.outcome_bucket for spec in TOOL_CODE_SPECS.values() if spec.status == "ok"} - _OK_TOOL_STATUSES
+    return str(bucket) if bucket in named else "✓"
+
 class Memory:
     def __init__(self, drive_root: pathlib.Path, repo_dir: Optional[pathlib.Path] = None):
         self.drive_root = drive_root
@@ -187,6 +200,7 @@ class Memory:
     def world_path(self) -> pathlib.Path: return self._memory_path("WORLD.md")
     def journal_path(self) -> pathlib.Path: return self._memory_path("scratchpad_journal.jsonl")
     def identity_journal_path(self) -> pathlib.Path: return self._memory_path("identity_journal.jsonl")
+    def world_journal_path(self) -> pathlib.Path: return self._memory_path("world_journal.jsonl")
     def logs_path(self, name: str) -> pathlib.Path:  # once per instance: a resolve lstat's every component
         return self._logs.get(name) or self._logs.setdefault(name, (self.drive_root / "logs" / name).resolve())
 
@@ -489,6 +503,10 @@ class Memory:
                 exclude_a2a=True,
                 predicate=matches,
             )
+            # "From latest" is by time: an imported earlier message, stored after newer rows, pages at its send time,
+            # and its room's live rows read as the room does whichever of them the filters kept.
+            from ouroboros.dialogue_provenance import in_reading_order, rooms_read_by_time
+            entries = in_reading_order(entries, rooms_read_by_time(self.drive_root, entries))
 
             current_snapshot = _chat_history_snapshot_id(coverage, filters, search)
             requested_snapshot = str(snapshot or "").strip().lower()
@@ -615,17 +633,31 @@ class Memory:
         quota went unmet while older archives stayed unopened (BIBLE P1: the
         section discloses it; ``read_file`` on the log pages the rest).
         ``iter_objects``, ``list_archives`` and ``stat`` are the reader's parser,
-        archive-listing and metadata seams, passed through unchanged.
+        archive-listing and metadata seams, passed through unchanged; without any,
+        the log's ``archive/`` listing is reused until the log rotates and an
+        archive that holds none of this task's rows is not parsed again for it.
         """
-        if log_name in {"chat.jsonl", "progress.jsonl"}:
+        if log_name in _DIALOGUE_LOGS:
             from ouroboros import dialogue_store as ds
+            from ouroboros.checkpoint_waits import wait_episode
 
             stream, wanted, limit = log_name[:-6], str(task_id or "").strip(), max(1, int(want))
             upper = ds.stream_end(self.drive_root, stream)
-            records = (ds.probe_rows(self.drive_root, stream, [("task_id", wanted)], before=upper, limit=limit + 1)
-                       if wanted else list(reversed(ds.newest(self.drive_root, stream, limit=limit + 1, before=upper))))
-            bounded = len(records) > limit
-            records = records[:limit]
+            # A host wait row rides along without spending the quota (``checkpoint_waits``): a burst
+            # of accounting waits never pushes the task's own rows out of its window.
+            records, own, before, bounded = [], 0, upper, False
+            while not bounded:
+                batch = (ds.probe_rows(self.drive_root, stream, [("task_id", wanted)], before=before, limit=limit + 1)
+                         if wanted else list(reversed(ds.newest(self.drive_root, stream, limit=limit + 1, before=before))))
+                for record in batch:
+                    bounded = own >= limit or len(records) >= _RECENT_ROWS_CEILING
+                    if bounded:
+                        break
+                    records.append(record)
+                    own += wait_episode(record.row) is None
+                if len(batch) <= limit:
+                    break
+                before = batch[-1].seq
             lower = records[-1].seq if bounded else 0
             imported = ds.range_coverage(self.drive_root, stream, lower=lower, upper=upper)
             gaps = (["history is still importing"] if imported["pending"] else [])
@@ -635,12 +667,13 @@ class Memory:
                 gaps.append("recorded invalid intervals")
             coverage = {"task_id": wanted, "source": f"state/dialog.sqlite ({stream})", "dialogue": True,
                         "lower": lower, "upper": upper, "shown": len(records), "matched": len(records),
-                        "quota_met": len(records) >= limit, "older_available": bounded, "gaps": gaps,
+                        "host_waits": len(records) - own,
+                        "quota_met": own >= limit, "older_available": bounded, "gaps": gaps,
                         "archives_bounded": False, "archives": 0, "archives_available": 0,
                         "live_size": upper, "live_window": upper - lower}
             return [entry.row for entry in reversed(records)], coverage
 
-        from ouroboros.jsonl_tail import read_rotated_jsonl_entries
+        from ouroboros.jsonl_tail import read_rotated_jsonl_entries, remembered_listing, task_archive_parser
         from ouroboros.tool_call_log import counts_as_call, logical_calls
 
         wanted = str(task_id or "").strip()
@@ -657,6 +690,9 @@ class Memory:
 
         stem = log_name[:-len(".jsonl")] if log_name.endswith(".jsonl") else log_name
         coverage: Dict[str, Any] = {"task_id": wanted, "source": f"logs/{log_name}"}
+        if iter_objects is None and list_archives is None and stat is None:
+            list_archives = remembered_listing(self.logs_path(log_name))
+            iter_objects = task_archive_parser(self.logs_path(log_name), wanted) if wanted else None
         try:
             rows = read_rotated_jsonl_entries(
                 self.logs_path(log_name), self.drive_root / "archive", stem,
@@ -740,16 +776,7 @@ class Memory:
         from ouroboros.jsonl_tail import coverage_line
 
         sections: List[str] = []
-        # (log, header, formatter, quota, note): the note names what the formatter really
-        # does with more rows than it renders (progress renders its newest 50; tools renders
-        # 10 and scans 20 for review markers; events counts every row it is given).
-        for log_name, header, formatter, want, note in (
-            ("progress.jsonl", "## Recent progress", lambda rows: self.summarize_progress(rows, limit=50), 50,
-             lambda n: f"newest 50 rendered of {n} loaded" if n > 50 else ""),
-            ("tools.jsonl", "## Recent tools", self.summarize_tools, 20,
-             lambda n: f"10 rendered, {min(n, 20)} scanned for review markers" if n > 10 else ""),
-            ("events.jsonl", "## Recent events", self.summarize_events, 200, lambda n: ""),
-        ):
+        for log_name, header, formatter, want, note in self._recent_sections():
             source = own_drive if own_drive is not None and log_name != "progress.jsonl" else self
             entries, coverage = source.read_task_recent(log_name, task_id, want if task_id else 200)
             if own_drive is not None:  # a child's header says which drive each window came from
@@ -757,7 +784,8 @@ class Memory:
                     f"task drive logs/{log_name}" + (
                         " (worker rows; host-side rows such as waits stay in the canonical log)"
                         if log_name == "events.jsonl" else ""))
-            shown = int(coverage.get("shown") or 0)  # tools: logical calls, never rows (#1316)
+            # tools: logical calls, never rows (#1316); progress: the task's own rows, waits ride along
+            shown = int(coverage.get("shown") or 0) - int(coverage.get("host_waits") or 0)
             if note(shown):
                 coverage["rendered"] = note(shown)
             summary = formatter(entries)
@@ -765,13 +793,41 @@ class Memory:
                 sections.append(f"{header} ({coverage_line(coverage)})" + (f"\n\n{summary}" if summary else ""))
         return sections
 
-    def summarize_progress(self, entries: List[Dict[str, Any]], limit: int = 15) -> str:
-        if not entries:
-            return ""
-        return "\n".join(
-            f"⚙️ {str(e.get('ts', ''))[11:16] if len(str(e.get('ts', ''))) >= 16 else ''} {short(str(e.get('text', '')), 800)}"
-            for e in entries[-limit:]
+    def _recent_sections(self) -> tuple:
+        # (log, header, formatter, quota, note): the note names what the formatter really
+        # does with more rows than it renders (progress renders its newest 50; tools renders
+        # 10 and scans 20 for review markers; events counts every row it is given).
+        return (
+            ("progress.jsonl", "## Recent progress", lambda rows: self.summarize_progress(rows, limit=50), 50,
+             lambda n: f"newest 50 rendered of {n} loaded" if n > 50 else ""),
+            ("tools.jsonl", "## Recent tools", self.summarize_tools, 20,
+             lambda n: f"10 rendered, {min(n, 20)} scanned for review markers" if n > 10 else ""),
+            ("events.jsonl", "## Recent events", self.summarize_events, 200, lambda n: ""),
         )
+
+    def remember_log_listings(self) -> None:
+        """Off the turn (the boot): list ``archive/`` once for each rotated log the recent sections
+        read, so a process's first owner turn starts from that remembered listing (``read_task_recent``);
+        a log rotated since, or a listing that could not be remembered, is listed by its turn as before."""
+        from ouroboros.jsonl_tail import remembered_listing
+
+        for log_name, *_section in self._recent_sections():
+            if log_name not in _DIALOGUE_LOGS:
+                remembered_listing(self.logs_path(log_name))(self.drive_root / "archive", log_name[:-len(".jsonl")])
+
+    def summarize_progress(self, entries: List[Dict[str, Any]], limit: int = 15) -> str:
+        """The newest ``limit`` progress rows, oldest first; each run of host waits among them is
+        one line that does not count against ``limit`` (``checkpoint_waits.fold_progress``)."""
+        from ouroboros.checkpoint_waits import fold_progress
+
+        lines, own = [], 0
+        for e in reversed(fold_progress(entries or [])):
+            own += not e.get("host_waits")
+            if own > limit:
+                break
+            ts = str(e.get('ts', ''))
+            lines.append(f"⚙️ {ts[11:16] if len(ts) >= 16 else ''} {short(str(e.get('text', '')), 800)}")
+        return "\n".join(reversed(lines))
 
     def summarize_tools(self, entries: List[Dict[str, Any]]) -> str:
         """One line per LOGICAL call (#1316): a start with no later row is an
@@ -799,7 +855,7 @@ class Memory:
                 note = (" (wait ended; no result recorded)" if "wait_ended" in call else
                         " (started; no outcome recorded)")
             elif isinstance(settled.get("is_error"), bool):
-                status = "·" if settled["is_error"] else "✓"
+                status = "·" if settled["is_error"] else _ok_answer_mark(settled.get("status"))
             elif settled.get("status"):
                 if settled["status"] == "ok":
                     status = "✓"
@@ -832,16 +888,6 @@ class Memory:
             lines.append("\nRecent errors:")
             lines.extend(f"  {e.get('type', '?')}: {short(str(e.get('error', '')), 120)}" for e in errors[-10:])
         return "\n".join(lines)
-
-    def summarize_supervisor(self, entries: List[Dict[str, Any]]) -> str:
-        if not entries:
-            return ""
-        for e in reversed(entries):
-            if e.get("type") in ("launcher_start", "restart", "boot"):
-                branch = e.get("branch") or e.get("git_branch") or "?"
-                sha = short(str(e.get("sha") or e.get("git_sha") or ""), 12)
-                return f"{e['type']}: {e.get('ts', '')} branch={branch} sha={sha}"
-        return ""
 
     def _default_scratchpad(self) -> str:
         return f"# Scratchpad\n\nUpdatedAt: {utc_now_iso()}\n\n(empty — write anything here)\n"

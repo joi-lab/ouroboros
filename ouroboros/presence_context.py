@@ -355,10 +355,11 @@ def confirmed_delivery_receipts(ctx: Any) -> frozenset[tuple[str, str]]:
 
 
 PLACEHOLDERS = ("who", "place", "when", "waiting_line", "event", "place_state", "notes",
-                "wake_item", "actor_facts", "work_here", "spent_line", "roots_line", "working_folder")
+                "wake_item", "actor_facts", "work_here", "spent_line", "roots_line", "working_folder", "voice_line")
 
 
 def focus_metadata(admission: Any, event: Any, task_id: str, chat_id: int) -> dict:
+    from copy import deepcopy
     from ouroboros.config import get_consciousness_autonomy, runtime_setting
     from ouroboros.presence_runner import presence_event_identity
     from ouroboros.places import FACT_LEGACY_ADDRESSED, is_owner_account, wake_matches
@@ -367,19 +368,26 @@ def focus_metadata(admission: Any, event: Any, task_id: str, chat_id: int) -> di
     if event.actor.get("is_bot") is True:
         facts = (*facts, "from_bot")
     actor = str(event.actor.get("platform_actor_id") or event.actor.get("id") or "")
+    owner_address = is_owner_account(place, actor, event.account_id)
+    identity = deepcopy(event.identity)
+    sending = (identity or {}).get("sends_as") or {}
     allowance = dict(admission.allowance or {})
     metadata = {
         "initiator": "consciousness", "usage_category": "consciousness", "model_role": "consciousness",
         "consciousness_autonomy": get_consciousness_autonomy(), "wake_cause": "focus",
         "consciousness_cause": "place:" + place.place_id, "work_kind": "consciousness",
         "focus": {"place_id": place.place_id, "conversation_key": event.conversation_key,
+                  "identity": identity, "identity_owner": sending.get("kind") == "user" and is_owner_account(place, sending["id"], event.account_id),
                   "room_chat_id": chat_id, "event_identity": presence_event_identity(admission.binding_id, event),
                   "actor": {"platform_actor_id": actor,
                             "display_name": str(event.actor.get("display_name") or event.actor.get("username") or ""),
-                            "owner_confirmed": is_owner_account(place, actor, event.account_id),
+                            **({"owner_address_unverified": True} if owner_address and event.actor.get("authenticated") is False else {}),
+                            "owner_confirmed": owner_address and event.actor.get("authenticated") is not False,
+                            **({"authenticated": event.actor["authenticated"]} if "authenticated" in event.actor else {}),
                             "is_bot": event.actor.get("is_bot") is True or "from_bot" in facts},
                   "matched_wakes": [w.fact for w in wake_matches(place, facts)],
-                  "addressed": bool(set(facts) & {"direct_message", "group_dm", "mention", "reply_to_me", "legacy_addressed"})},
+                  "addressed": bool(set(facts) & {"direct_message", "group_dm", "mention", "reply_to_me",
+                                                  "review_requested", "assigned", "legacy_addressed"})},
         "focus_allowance": allowance,
         "focus_counted_roots": allowance.get("counted_roots", "unavailable; inspect current work"),
     }
@@ -396,6 +404,19 @@ def focus_metadata(admission: Any, event: Any, task_id: str, chat_id: int) -> di
     return metadata
 
 
+def _voice_line(focus: Mapping[str, Any]) -> str:
+    sending = (focus.get("identity") or {}).get("sends_as") or {}
+    if not sending:
+        return ""
+    label = sending["label"]
+    if sending["kind"] == "bot":
+        return f"You write here as Ouroboros, through {label}."
+    if focus.get("identity_owner"):
+        return (f"You write here from your human's own account, {label}: your words appear as theirs, and their notes say how. "
+                "If someone sincerely asks whether they are writing to a person, say what you are.")
+    return f"You write here through the account {label}; your human's notes say what that account is."
+
+
 def frame_focus_content(task: Mapping[str, Any], content: Any) -> Any:
     """The volatile assignment lives at the user tail, after the shared cached prefix."""
     from ouroboros.places import SILENT_DISCLOSURE
@@ -404,7 +425,8 @@ def frame_focus_content(task: Mapping[str, Any], content: Any) -> Any:
     place = presence.get("place") or {}
     event = presence.get("event") or {}
     focus = metadata.get("focus") or {}
-    actor = focus.get("actor") or {}
+    actor = dict(focus.get("actor") or {})
+    unverified = actor.pop("owner_address_unverified", False)
     allowance = metadata.get("focus_allowance") or {}
     matched = set(focus.get("matched_wakes") or [])
     state = str(place.get("state") or "unknown")
@@ -415,7 +437,9 @@ def frame_focus_content(task: Mapping[str, Any], content: Any) -> Any:
     previous = presence.get("previous_turn")
     if isinstance(previous, Mapping):
         work = _previous_turn_line(previous) + ("\n" + work if work else "")
+    voice = _voice_line(focus)
     fields = {
+        "voice_line": voice + "\n" if voice else "",
         "who": actor.get("display_name") or actor.get("platform_actor_id") or "A person",
         "place": place.get("label") or place.get("provider") or place.get("place_id"),
         "when": str((event.get("message") or {}).get("timestamp") or (event.get("message") or {}).get("ts") or "at an unrecorded time"),
@@ -424,7 +448,9 @@ def frame_focus_content(task: Mapping[str, Any], content: Any) -> Any:
         "place_state": state + (". " + SILENT_DISCLOSURE if state == "silent" else ""),
         "notes": json.dumps(place.get("notes") or [], ensure_ascii=False),
         "wake_item": json.dumps([w for w in place.get("wakes", []) if w["fact"] in matched], ensure_ascii=False),
-        "actor_facts": json.dumps(actor, ensure_ascii=False),
+        "actor_facts": json.dumps(actor, ensure_ascii=False) + (
+            "; authenticated: no" + ("; your human's own address: yes (unverified)" if unverified else "")
+            if actor.get("authenticated") is False else ""),
         "work_here": work or "No earlier work recorded here; recent_tasks reads current work.",
         "spent_line": json.dumps(allowance, ensure_ascii=False),
         "roots_line": json.dumps(metadata.get("focus_counted_roots", "unavailable; inspect current work"), ensure_ascii=False),

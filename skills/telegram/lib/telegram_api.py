@@ -563,6 +563,14 @@ def _telegram_html_to_plain(value: str) -> str:
     return html_lib.unescape(re.sub(r"<[^>]+>", "", value))
 
 
+def message_chunks(text: str, parse_mode: str = "HTML") -> list[str]:
+    """The Telegram messages ``send_message`` sends for ``text``, blank parts dropped."""
+    source = str(text or "")
+    if parse_mode != "HTML":
+        return [chunk for chunk in _chunk_raw_text(source) if chunk.strip()]
+    return [chunk for chunk in markdown_to_telegram_chunks(source) if _telegram_html_to_plain(chunk).strip()]
+
+
 class TelegramClient:
     def __init__(self, token: str, *, trust_env: bool = False, proxy: Optional[str] = None,
                  on_message=None, reply_to_message_id: int = 0):
@@ -678,7 +686,8 @@ class TelegramClient:
         payload = await self.call("getUpdates", data={"timeout": 20, "offset": offset}, timeout=25)
         return list(payload.get("result") or [])
 
-    async def send_message(self, chat_id: int, text: str, parse_mode: str = "HTML") -> int:
+    async def send_message(self, chat_id: int, text: str, parse_mode: str = "HTML", *,
+                           disable_notification: bool = False) -> int:
         """Send a text message, chunking past Telegram's 4096-unit limit.
 
         Markdown is converted at block granularity before chunks are packed.
@@ -686,21 +695,13 @@ class TelegramClient:
         oversized blocks are split with active HTML tags re-balanced.
         Returns the LAST chunk's message_id (0 on parse failure / empty input).
         The optional on_message observer receives every confirmed chunk id.
+        ``disable_notification`` asks Telegram to deliver every part without sound:
+        the owner still gets a notification, a silent one.
         """
-        source = str(text or "")
-        chunks = (
-            markdown_to_telegram_chunks(source)
-            if parse_mode == "HTML"
-            else _chunk_raw_text(source)
-        )
+        muted = {"disable_notification": True} if disable_notification else {}
         last_message_id = 0
-        for formatted in chunks:
-            visible_text = (
-                _telegram_html_to_plain(formatted) if parse_mode == "HTML" else formatted
-            )
-            if not visible_text.strip():
-                continue
-            data = {"chat_id": str(chat_id), "text": formatted}
+        for formatted in message_chunks(text, parse_mode):
+            data = {"chat_id": str(chat_id), "text": formatted, **muted}
             if parse_mode:
                 data["parse_mode"] = parse_mode
             try:
@@ -710,7 +711,7 @@ class TelegramClient:
                     raise
                 payload = await self.call(
                     "sendMessage",
-                    data={"chat_id": str(chat_id), "text": _telegram_html_to_plain(formatted)},
+                    data={"chat_id": str(chat_id), "text": _telegram_html_to_plain(formatted), **muted},
                     timeout=20,
                 )
             try:
@@ -912,6 +913,9 @@ _MENU_TEXTS_EN = {
     "file_too_large_notice": "{filename} is saved in Ouroboros. This file exceeds the Telegram upload limit and cannot be mirrored here.",
     "file_open_app_hint": "Open the app to download it.",
     "attachments_not_attached": "Not attached to the task: {names}",
+    "routing_choose_target": "Choose a target for the last message:",
+    "routing_more_targets": "…and {count} more in the web chat.",
+    "routing_reply_with_number": "Reply with a number, or tap an option in the web chat.",
     "btn_open_app": "Open Ouroboros",
     "budget_unbounded": "unbounded",
     "bg_active_label": "ACTIVE",
@@ -920,8 +924,9 @@ _MENU_TEXTS_EN = {
     "settings_title": "⚙️ **Telegram Settings**\nConfigure the Telegram control panel and message display:",
     "btn_silent_on": "🔕 Silent Mode: ON",
     "btn_silent_off": "🔔 Silent Mode: OFF",
-    "silent_toggled_on": "🔕 Silent mode enabled — new thoughts will replace the last message",
-    "silent_toggled_off": "🔔 Silent mode disabled — each thought becomes a new message",
+    "quiet_toggled_on": "🔕 Silent mode on: replies and progress arrive without sound; questions, files "
+                        "and problems keep their sound.",
+    "quiet_toggled_off": "🔔 Silent mode off: replies arrive with their usual sound.",
     "cmd_menu": "Interactive panel",
     "cmd_language": "Interface language",
     "cmd_status": "Request status",

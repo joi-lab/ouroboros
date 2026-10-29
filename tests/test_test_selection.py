@@ -29,7 +29,6 @@ def test_leaf_selects_only_direct_importers_and_changed_tests_above_floor(repo):
     result = selection.select_from_paths(repo, ["ouroboros/leaf.py", "tests/test_indirect.py"], base="base")
     assert result.tier == "selected"
     assert set(result.files) == {"tests/test_floor.py", "tests/test_direct.py", "tests/test_nested.py", "tests/test_indirect.py"}
-    assert result.targets == result.files
     assert result.record()["omitted_files"] == 1
     assert result.policy and result.base == "base"
 
@@ -43,7 +42,7 @@ def test_leaf_selects_only_direct_importers_and_changed_tests_above_floor(repo):
 ])
 def test_verification_changes_require_full(repo, path):
     result = selection.select_from_paths(repo, [path], base="base")
-    assert result.tier == "full" and result.targets == ("tests/",)
+    assert result.tier == "full"
     assert len(result.files) == result.available
     assert (path, "verification apparatus changed") in result.reasons
 

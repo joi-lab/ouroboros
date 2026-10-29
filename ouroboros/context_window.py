@@ -6,7 +6,7 @@ The observations share the capability JSON store; old stores need no migration.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -29,6 +29,8 @@ class WindowRecord:
     accepted: int = 0
     declared: tuple[WindowLimit, ...] = ()
     accepted_at: str = ""
+    contradicted_by: Optional[WindowLimit] = None
+    retired_ack: dict = field(default_factory=dict)
 
     @property
     def usable(self) -> Optional[int]:
@@ -42,9 +44,13 @@ class WindowRecord:
         return min(limits) if limits else None
 
     @property
+    def limiting(self) -> Optional[WindowLimit]:
+        return min((limit for limit in (self.input, self.total) if limit),
+                   key=lambda item: item.tokens - (self.reserve if item.kind == "total" else 0), default=None)
+
+    @property
     def source(self) -> str:
-        limit = min((limit for limit in (self.input, self.total) if limit),
-                    key=lambda item: item.tokens - (self.reserve if item.kind == "total" else 0), default=None)
+        limit = self.limiting
         if limit is None:
             return "unknown"
         stamp = limit.observed_at.replace("T", " ")[:16]
@@ -62,21 +68,38 @@ def record_observation(root, route_fp: str, *, accepted: int = 0, refused: int =
 
     if not route_fp or not (accepted > 0 or refused > 0):
         return
-    with ce._STORE_LOCK:
-        data = ce._load(root)
-        record = data.setdefault("main_windows", {}).setdefault(route_fp, {})
-        rows = record.setdefault("observations", [])
-        # Retain immutable frontier observations, including a later acceptance
-        # below a historic maximum that nevertheless supersedes a newer refusal.
-        last_refusal = next((row for row in reversed(rows) if row.get("refused")), {})
-        high = max((row.get("accepted", 0) for row in rows), default=0)
-        supersedes = accepted > last_refusal.get("refused", accepted) and not any(
-            row.get("accepted", 0) > last_refusal.get("refused", 0)
-            for row in rows[rows.index(last_refusal) + 1:]) if last_refusal else False
-        if refused or accepted > high or supersedes:
-            rows.append({"accepted": accepted, "refused": refused, "kind": "input" if accepted else kind,
-                         "reserve": reserve, "transmitted": transmitted, "ts": ce.utc_now_iso()})
-            ce._save(root, data)
+    try:
+        with ce._store_transaction(root):
+            data = ce._load(root)
+            record = data.setdefault("main_windows", {}).setdefault(route_fp, {})
+            rows = record.setdefault("observations", [])
+            prior = list(rows)
+            # Retain immutable frontier observations, including a later acceptance
+            # below a historic maximum that nevertheless supersedes a newer refusal.
+            last_refusal = next((row for row in reversed(rows) if row.get("refused")), {})
+            high = max((row.get("accepted", 0) for row in rows), default=0)
+            supersedes = accepted > last_refusal.get("refused", accepted) and not any(
+                row.get("accepted", 0) > last_refusal.get("refused", 0)
+                for row in rows[rows.index(last_refusal) + 1:]) if last_refusal else False
+            if refused or accepted > high or supersedes:
+                rows.append({"accepted": accepted, "refused": refused, "kind": "input" if accepted else kind,
+                             "reserve": reserve, "transmitted": transmitted, "ts": ce.utc_now_iso()})
+            keep = set()
+            largest = max(range(len(rows)), key=lambda i: rows[i].get("accepted", 0), default=None)
+            if largest is not None and rows[largest].get("accepted"):
+                keep.add(largest)
+            newest = next((i for i in reversed(range(len(rows))) if rows[i].get("refused")), None)
+            if newest is not None:
+                keep.add(newest)
+                later = next((i for i in range(newest + 1, len(rows))
+                              if rows[i].get("accepted", 0) > rows[newest]["refused"]), None)
+                if later is not None:
+                    keep.add(later)
+            record["observations"] = [rows[i] for i in sorted(keep)]
+            if record["observations"] != prior:
+                ce._save(root, data)
+    except OSError:  # a busy or unwritable store skips this observation; the send it saw stands
+        return
 
 
 def observation_scope(plan) -> str:
@@ -89,12 +112,16 @@ def route_observation_scope(route, settings) -> str:
     import hashlib
     import json
     from ouroboros.capability_evidence import route_fingerprint
+    from ouroboros.llm_attempt import ConnectionUnavailable
     from ouroboros.response_limits import dispatch_target
 
     if route["provider"] == "claudexor":
         return route_fingerprint(provider=route["provider"], model=route["model"],
             base_url=route["base_url"], options=route["options"]) if route["options"].get("account_fingerprint") else ""
-    target = dict(route, keyless=True) if route["use_local"] else dispatch_target(route["model"], settings)
+    try:
+        target = dict(route, keyless=True) if route["use_local"] else dispatch_target(route["model"], settings)
+    except ConnectionUnavailable:
+        return ""  # a refused connection sends nothing, so it has no observations to scope
     credentials = {key: target.get(key, "") for key in ("api_key", "user", "password", "scope")}
     if not any(credentials.values()) and not target.get("keyless"):
         return ""
@@ -108,7 +135,7 @@ def resolve_window(evidence, reserve: int, *, root=None, bound: bool = True,
     from ouroboros import capability_evidence as ce
 
     fp = observation_scope(evidence) if observation_fp is None else observation_fp
-    rows = ((ce._load(root or ce.canonical_evidence_root()).get("main_windows", {}).get(fp) or {})
+    rows = ((ce._read(root or ce.canonical_evidence_root()).get("main_windows", {}).get(fp) or {})
             .get("observations", [])) if bound and fp else []
     accepted = max((row.get("accepted", 0) for row in rows), default=0)
     accepted_at = next((row["ts"] for row in rows if accepted and row.get("accepted") == accepted), "")
@@ -122,6 +149,12 @@ def resolve_window(evidence, reserve: int, *, root=None, bound: bool = True,
                                   str(getattr(evidence, "source", None) or getattr(evidence, "evidence_source", "metadata")),
                                   str(getattr(evidence, "ts", "")))
     declared = tuple(limits.values())
+    server = getattr(evidence, "server_window", {})
+    contradiction = WindowLimit(**server) if server else captured.contradicted_by if captured else None
+    if contradiction and (ce._age_seconds(contradiction.observed_at) > ce._CONFIRMED_TTL_SEC or not any(
+            limit.source in {ce.SOURCE_OWNER_ACK, ce.SOURCE_USER_SETTING} and
+            (limit.tokens, limit.kind) != (contradiction.tokens, contradiction.kind) for limit in declared)):
+        contradiction = None
     # Only a disproved stated limit yields to an accepted INPUT. An acceptance
     # below a stated total proves no reply room; without a statement capacity stays unknown.
     if any(accepted > limit.tokens for limit in limits.values()):
@@ -131,7 +164,9 @@ def resolve_window(evidence, reserve: int, *, root=None, bound: bool = True,
         if row.get("refused"):
             if ce._age_seconds(row["ts"]) <= ce._CONFIRMED_TTL_SEC and not any(
                     later.get("accepted", 0) > row["refused"] for later in rows[index + 1:]):
-                limits[row["kind"]] = WindowLimit(row["refused"], row["kind"], "refusal", row["ts"])
+                current = limits.get(row["kind"])
+                if current is None or row["refused"] < current.tokens:
+                    limits[row["kind"]] = WindowLimit(row["refused"], row["kind"], "refusal", row["ts"])
             break
     output = getattr(evidence, "response_limit", {}) or {}
     maximum = output.get("max_output_tokens", 0)
@@ -139,7 +174,9 @@ def resolve_window(evidence, reserve: int, *, root=None, bound: bool = True,
                         WindowLimit(maximum, "output", output.get("source", "metadata"),
                                     output.get("observed_at", "")) if maximum and not output.get("stale")
                         else captured.output if captured else None,
-                        reserve=reserve, accepted=accepted, declared=declared, accepted_at=accepted_at)
+                        reserve=reserve, accepted=accepted, declared=declared, accepted_at=accepted_at,
+                        contradicted_by=contradiction,
+                        retired_ack=getattr(evidence, "retired_ack", {}) or (captured.retired_ack if captured else {}))
 
 
 def record_refusal(usage, plan) -> None:
@@ -152,6 +189,7 @@ def record_refusal(usage, plan) -> None:
     limit = ce._parse_ctx_limit_number(message)
     if not limit or not getattr(plan, "window_witness_bound", True):
         return
+    # Sglang shares its input bound with generation, so its length refusal stays total.
     input_only = any(marker in message.lower() for marker in ("prompt is too long", "maximum input", "input token count"))
     record_observation(ce.canonical_evidence_root(), observation_scope(plan), refused=limit,
                        kind="input" if input_only else "total")

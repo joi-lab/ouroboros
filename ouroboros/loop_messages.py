@@ -175,36 +175,22 @@ def _append_or_merge_user_content(
             isinstance(b, dict) and b.get("type") in ("image_url", "image") for b in content):
         if _evict_stale_image_blocks([*messages, {"content": content}]) and (stamp or slot) is not None:
             sanction_rewrite(stamp or slot, "image_eviction")
-    if kind or not (messages and unsent_in_previous_send(slot, messages[-1])
+    if kind or not (messages and messages[-1].get("role") == "user"
+                    and unsent_in_previous_send(slot, messages[-1])
                     and set(messages[-1]) <= {"role", "content"}):
         # Typed words, unknown or sent content and any typed tail stay intact (slot-less producers too).
         messages.append({"role": "user", **({HOST_CONTEXT_KIND_KEY: kind} if kind else {}), "content": content})
         return
-    if messages and messages[-1].get("role") == "user":
-        prior = messages[-1].get("content")
-        if isinstance(content, list):
-            new_blocks = list(content)
-            if isinstance(prior, list):
-                messages[-1] = {**messages[-1], "content": list(prior) + new_blocks}
-                return
-            prior_text = prior if isinstance(prior, str) else str(prior or "")
-            prefix_block = [{"type": "text", "text": prior_text.rstrip() + "\n\n---\n\n"}] if prior_text else []
-            messages[-1] = {**messages[-1], "content": prefix_block + new_blocks}
-            return
-        text = str(content or "")
-        if isinstance(prior, list):
-            messages[-1] = {
-                **messages[-1],
-                "content": list(prior) + [{"type": "text", "text": "\n\n---\n\n" + text}],
-            }
-            return
+    prior = messages[-1].get("content")
+    if isinstance(prior, list):
+        suffix = list(content) if isinstance(content, list) else [{"type": "text", "text": "\n\n---\n\n" + str(content or "")}]
+        merged = list(prior) + suffix
+    else:
         prior_text = prior if isinstance(prior, str) else str(prior or "")
-        messages[-1] = {
-            **messages[-1],
-            "content": (prior_text.rstrip() + "\n\n---\n\n" + text) if prior_text else text,
-        }
-        return
-    messages.append({"role": "user", "content": content})
+        prefix = prior_text.rstrip() + "\n\n---\n\n" if prior_text else ""
+        merged = (([{"type": "text", "text": prefix}] if prefix else []) + list(content)
+                  if isinstance(content, list) else prefix + str(content or ""))
+    messages[-1] = {**messages[-1], "content": merged}
 
 
 def _owner_marked_content(content: Any) -> Any:
@@ -236,8 +222,9 @@ def _record_owner_directive(
 
     ``origin`` carries the typed ids the caller already holds (a task message's
     ``source_task_id``, and ``relayed_from_task_id`` when a parent relayed a
-    sibling's words): the row keeps them so every reader of this one corpus can
-    tell a directive from a relayed proposal without inferring it from the text.
+    sibling's words; an owner answer's card as ``source_task_id`` + ``quiz_id``): the row
+    keeps them so every reader of this one corpus can tell a directive from a relayed
+    proposal, and find an answer's question, without inferring it from the text.
     """
     if ctx is None:
         return
@@ -283,6 +270,16 @@ def _initialize_owner_directives(ctx: Any, messages: List[Dict[str, Any]]) -> No
         return
     metadata = getattr(ctx, "task_metadata", None)
     metadata = metadata if isinstance(metadata, dict) else {}
+    from ouroboros.owner_quiz import late_answer_ref, late_answer_owner_text
+    late = late_answer_ref(metadata.get("late_answer"))
+    answered = ((late or {}).get("answer_snapshot") or {}).get("quiz") or {}
+    if answered.get("presence_contact"):
+        # The named owner ingress carries the host-bound answer snapshot. Keep
+        # its human words as authority; the source-work link in the model's
+        # surrounding frame and the external request are context, not orders.
+        _loop()._record_owner_directive(ctx, source="owner_quiz_answer", content=late_answer_owner_text(answered),
+                                      origin={"source_task_id": late["task_id"], "quiz_id": late["quiz_id"]})
+        return
     author = metadata.get("objective_author")
     # A task-drafted objective, or the host's Continue work order (its facts are
     # the host's; the owner's exact words ride ``owner_corpus``).
@@ -294,7 +291,7 @@ def _initialize_owner_directives(ctx: Any, messages: List[Dict[str, Any]]) -> No
                 _loop()._record_owner_directive(
                     ctx, source=str(row["source"]), content=row.get("content"),
                     msg_id=str(row.get("msg_id") or ""),
-                    origin={key: row[key] for key in ("source_task_id", "relayed_from_task_id") if row.get(key)},
+                    origin={key: row[key] for key in ("source_task_id", "relayed_from_task_id", "quiz_id") if row.get(key)},
                 )
         return  # The task-drafted objective is never an owner directive.
     for message in messages:
@@ -656,22 +653,34 @@ CONTEXT_FACTS_HEADER = "[CONTEXT_FACTS]"
 CONTEXT_FACTS_NAME = "ouroboros_context_facts"
 
 
-def context_facts_line(ctx: Any, *, money: Optional[Dict[str, Any]] = None,
-                       measured: bool = True, focus_fact: str = "") -> str:
-    """One line of this round's facts for the actor, no advice (owner decisions 5A, 11 Oct 1A).
+def subagents_fact_line() -> str:
+    """The room's current delegation choice belongs only to the round's dynamic tail."""
+    from ouroboros import config
+    from ouroboros.settings_integrity import live_subagents_mode, room_subagents_mode_applies
+    from ouroboros.subagent_runtime import subagents_availability
 
-    Reads the measurement the round already recorded (``_remember_main_fit`` facts),
-    the window's free room and the owner target's room or excess apart, each known or
-    unknown (free room is never the smaller of window and target), the largest resident
-    units from the existing unit reader, the task's own recorded cost, and a tariff only
-    when the exact route's catalog is cached (no fetch, no price table). ``money`` carries
-    the round's observation (``wallet``, ``tree``, ``cost_ceiling``, ``quota``;
-    ``task_pacing.round_money_observation``), each bound named. Time comes from the Time
-    clock owners (``context_runtime_facts.round_clock_fact``); a nanny's burn names its
-    anchors (``nanny_pacing.nanny_burn_fact``); tool counts are the observed results.
-    ``measured=False`` names the input as unmeasured instead of reusing stale numbers.
+    if not room_subagents_mode_applies():
+        return ""
+    try:
+        settings = config.load_settings()
+        if subagents_availability(settings) != "available":
+            return "Subagents: Off — off in Settings"
+        return f"Subagents: {live_subagents_mode(settings=settings).title()} — set by my human for this chat"
+    except Exception:
+        log.debug("Subagents fact unavailable for the facts line", exc_info=True)
+        return "Subagents: unknown (room settings unavailable)"
+
+
+def context_facts_line(ctx: Any, *, money: Optional[Dict[str, Any]] = None,
+                       measured: bool = True, focus_fact: str = "", subagents_fact: Optional[str] = None) -> str:
+    """Round facts, no advice (owner decisions 5A, 11 Oct 1A).
+    ``_remember_main_fit`` supplies distinct window/target room, largest residents and own cost; tariffs stay cached.
+    ``money`` is the round's wallet/tree/ceiling/quota observation, each bound named.
+    Time and nanny burn keep their owners/anchors; tool counts are observed results.
+    ``measured=False`` reports unmeasured input rather than stale numbers.
     """
     from ouroboros.context_runtime_facts import round_clock_fact
+    from ouroboros.context_source_view import superseded_host_fact
     from ouroboros.nanny_pacing import nanny_burn_fact
     from ouroboros.transcript_prefix import previous_cache_fact, reasoning_retirement_fact
 
@@ -690,12 +699,10 @@ def context_facts_line(ctx: Any, *, money: Optional[Dict[str, Any]] = None,
     notes = [note for note in (f"largest accepted input {int(accepted):,}" if accepted else "",
                                f"refused at ~{int(refused):,}" if refused else "") if note]
     largest = f" ({'; '.join(notes)})" if notes else ""
-    from ouroboros.context_view_facts import window_fact, wake_facts
+    from ouroboros.context_view_facts import memory_facts, window_fact
     source = window_fact(getattr(ctx, "context_fit_plan", None), usage.get("_context_response_reserve_tokens")) if measured else ""
     parts.append((source or ("window unknown" if capacity is None else f"window {int(capacity):,}")) + largest)
-    wake = wake_facts(getattr(ctx, "context_fit_plan", None), ctx.active_context_mode)
-    if wake:
-        parts.append(wake)
+    parts.extend(filter(None, [memory_facts(getattr(ctx, "context_fit_plan", None), ctx.active_context_mode)]))
     if target is not None:
         parts.append(f"target {int(target):,}")
     if estimate is None:
@@ -721,7 +728,6 @@ def context_facts_line(ctx: Any, *, money: Optional[Dict[str, Any]] = None,
     if components:
         parts.append("largest " + ", ".join(f"{label} ~{tokens:,}" for label, tokens in components))
     from ouroboros.context_compaction import _capsule_metadata
-
     # The mind's own folds stay countable to it (17.10.2026: after 42 folds it told the owner it never folded).
     parts.append(f"own notes in view {sum(1 for row in ctx.messages if (_capsule_metadata(row)[1] or {}).get('authorship') == 'actor')}")
     parts.append(previous_cache_fact(usage))
@@ -741,10 +747,9 @@ def context_facts_line(ctx: Any, *, money: Optional[Dict[str, Any]] = None,
             log.debug("time/nanny facts unavailable for the facts line", exc_info=True)
             parts.append("time and nanny facts unavailable")
     parts.append(_tool_results_fact(usage))
-    if focus_fact:
-        parts.append(focus_fact)
-    parts.extend(filter(None, [reasoning_retirement_fact(usage, ctx.round_idx)]))
-    return f"{CONTEXT_FACTS_HEADER} " + " | ".join(parts)
+    parts.extend(filter(None, [focus_fact, reasoning_retirement_fact(usage, ctx.round_idx), superseded_host_fact(ctx.messages)]))
+    mode_fact = subagents_fact_line() if subagents_fact is None else subagents_fact
+    return f"{CONTEXT_FACTS_HEADER} " + " | ".join(parts) + ("\n" + mode_fact if mode_fact else "")
 
 
 def _round_fact(ctx: Any, tool_ctx: Any) -> str:
@@ -957,12 +962,13 @@ def append_context_facts(ctx: Any, *, money: Optional[Dict[str, Any]] = None) ->
     usage = ctx.accumulated_usage
     plan = ctx.context_fit_plan
     focus_identity, focus_fact = _own_focus_fact(ctx)
+    subagents_fact = subagents_fact_line()
     source = [{k: v for k, v in m.items() if k != "cache_control"} for m in ctx.messages if m.get(HOST_CONTEXT_KIND_KEY) != CONTEXT_FACTS_NAME]
     source.append({"role": "system", "content": json.dumps(ctx.tool_schemas, ensure_ascii=False, sort_keys=True)})
     key = (ctx.round_idx, ctx.active_model, ctx.active_context_mode, ctx.active_effort,
            str(getattr(plan, "route_fp", "")), str(getattr(plan, "status", "")),
            bool(getattr(plan, "stale", False)), int(getattr(plan, "window_tokens", 0) or 0),
-           context_reclaim_transcript_sha256(source), focus_identity, reasoning_retirement_fact(usage, ctx.round_idx))
+           context_reclaim_transcript_sha256(source), focus_identity, subagents_fact, reasoning_retirement_fact(usage, ctx.round_idx))
     visible = any(m.get(HOST_CONTEXT_KIND_KEY) == CONTEXT_FACTS_NAME and m.get("content") == usage.get("_context_facts_line")
                   for m in ctx.messages)
     if tuple(usage.get("_context_facts_key") or ()) == key and visible:
@@ -986,7 +992,7 @@ def append_context_facts(ctx: Any, *, money: Optional[Dict[str, Any]] = None) ->
                 refresh=True, max_age_sec=_loop()._TREE_ACCOUNTING_MAX_STALE_SEC))
         money = {"wallet": observed["wallet"], "tree": observed["tree"],
                  "cost_ceiling": getattr(tool_ctx, "_cost_ceiling", None)}
-    line = context_facts_line(ctx, money=money, measured=measured, focus_fact=focus_fact)
+    line = context_facts_line(ctx, money=money, measured=measured, focus_fact=focus_fact, subagents_fact=subagents_fact)
     ctx.messages.append(bound_host_row(CONTEXT_FACTS_NAME, line))
     usage["_context_facts_round"] = ctx.round_idx
     usage["_context_facts_key"] = key

@@ -124,7 +124,7 @@ def test_the_reconcile_pass_runs_the_state_sweep():
 
     import ouroboros.server_maintenance as sm
 
-    assert "sweep_settled_delegate_state" in inspect.getsource(sm._run_reconcile_prunes)
+    assert "sweep_settled_delegate_state" in inspect.getsource(__import__("ouroboros.maintenance_retirement", fromlist=["run"]).run)
     assert "sweep_settled_delegate_state" not in inspect.getsource(sm._startup_custody_sweep)
 
 

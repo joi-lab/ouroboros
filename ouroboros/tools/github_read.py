@@ -18,9 +18,9 @@ from ouroboros.tool_capabilities import tool_result_limit
 from ouroboros.tools.github import _canonical_github_args, _gh_api, _gh_graphql, _gh_run, _graphql_operations, _no_launch_yet, _refuse, _split_repo, github_token_from_env_or_settings
 from ouroboros.tools.registry import ToolContext
 
-METHODS = ("whoami", "get", "list", "search", "checks", "api")
-KINDS = ("issue", "pr", "discussion", "comment", "review_comment", "review", "notification", "release", "label")
-FACETS = ("comments", "review_comments", "reviews", "threads", "files", "diff", "commits")
+METHODS = ("whoami", "get", "list", "search", "checks", "download", "api")
+KINDS = ("issue", "pr", "discussion", "comment", "review_comment", "review", "notification", "release", "label", "run", "artifact")
+FACETS = ("comments", "review_comments", "reviews", "threads", "files", "diff", "commits", "log")
 _LIMIT_DEFAULT, _LIMIT_MAX = 30, 100
 _BODY_CHARS, _PREVIEW_CHARS, _DIFF_CHARS, _REPLIES = 2000, 200, 8000, 50
 _LINK_NEXT_RE = re.compile(r'<([^>]*)>;\s*rel="next"')
@@ -411,7 +411,13 @@ def _whoami(read: _Read) -> str:
 
 def _get(read: _Read) -> str:
     kind, number = read.kind, read.number()
+    if kind == "run":
+        from ouroboros.tools.github_workflows import get_run
+
+        return get_run(read)
     include = [str(f) for f in (read.args.get("include") or [])]
+    if "log" in include:
+        return read.refuse("⚠️ TOOL_ARG_ERROR: include=['log'] requires kind='run'.")
     unknown = [f for f in include if f not in FACETS]
     if unknown:
         return read.refuse(f"⚠️ TOOL_ARG_ERROR: unknown include facet(s) {', '.join(unknown)}; facets: {', '.join(FACETS)}.")
@@ -607,6 +613,12 @@ def _pr_items(read: _Read, rows: list) -> Tuple[Optional[list], str]:
 
 def _list(read: _Read) -> str:
     kind, number, state = read.kind, read.number(), str(read.args.get("state") or "open")
+    if kind == "artifact":
+        from ouroboros.tools.github_workflows import list_artifacts
+
+        return list_artifacts(read)
+    if kind == "run":
+        return read.refuse("⚠️ TOOL_ARG_ERROR: get(kind='run', target=run_id) reads a run; checks lists a commit's runs.")
     if kind not in KINDS:
         return read.refuse(f"⚠️ TOOL_ARG_ERROR: list needs kind ∈ {', '.join(KINDS)}.")
     if kind == "discussion":
@@ -819,8 +831,12 @@ def run_read(ctx: ToolContext, method: str = "", repo: str = "", **args: Any) ->
         return read.refuse("⚠️ TOOL_ARG_ERROR: detail is 'concise' or 'full'.")
     if read.kind and read.kind not in KINDS:
         return read.refuse(f"⚠️ TOOL_ARG_ERROR: kind must be one of {', '.join(KINDS)}.")
-    if method in ("get", "list", "search") and not read.kind:
+    if method in ("get", "list", "search", "download") and not read.kind:
         return read.refuse(f"⚠️ TOOL_ARG_ERROR: {method} needs kind ∈ {', '.join(KINDS)}.")
+    if method == "download":
+        from ouroboros.tools.github_workflows import download
+
+        return download(read)
     return {"whoami": _whoami, "get": _get, "list": _list, "search": _search, "checks": _checks, "api": _api}[method](read)
 
 
@@ -839,20 +855,29 @@ SCHEMA: Dict[str, Any] = {
         "with replies when target is set); search = GitHub search syntax in query, kind issue|pr|discussion, with "
         "total_count; checks = the recorded checks of one commit (target = PR number or full SHA, optional wait_seconds); "
         "api = any REST GET route (query string allowed, {owner}/{repo} placeholders follow repo) or a GraphQL query, "
-        "never a mutation (that is github_write(method='api')). Writes are github_write; merges are pr_merge."
+        "never a mutation (that is github_write(method='api')). get kind='run', target=run_id, include=['log'] reads "
+        "a completed run's log (optional job_id, attempt, failed_only, max_bytes, tail_lines); exact bytes, size and sha256 "
+        "are retained as task artifacts before a bounded preview. The stdout cap does not bound gh's internal cache. "
+        "list kind='artifact', target=run_id pages artifacts using limit/cursor; download kind='artifact', target=artifact_id "
+        "requires max_bytes and retains the exact zip without extraction. Writes are github_write; merges are pr_merge."
     ),
     "parameters": {"type": "object", "properties": {
         "method": {"type": "string", "enum": list(METHODS),
-                   "description": "whoami | get | list | search | checks | api (see the tool description)"},
+                   "description": "whoami | get | list | search | checks | download | api"},
         "kind": {"type": "string", "enum": list(KINDS),
                  "description": "Object kind for get/list/search: issue, pr, discussion, comment (conversation), review_comment "
-                                "(inline code review), review, notification, release, label"},
+                                "(inline code review), review, notification, release, label, run, artifact"},
         "target": {"type": ["integer", "string"], "default": "",
                    "description": "issue/PR/discussion number; comment id (get kind=comment|review_comment); release tag; label name; "
-                                  "PR number or 40-hex commit SHA for checks; for list kind=comment|review_comment|review the issue/PR number"},
+                                  "PR number or 40-hex commit SHA for checks; run id for get run/list artifact, artifact id for download"},
         "include": {"type": "array", "items": {"type": "string", "enum": list(FACETS)}, "default": [],
                     "description": "get facets, first page each: comments, review_comments, reviews, threads (review threads with ids "
-                                   "for github_write resolve_thread), files, diff, commits"},
+                                   "for github_write resolve_thread), files, diff, commits; run: log"},
+        "job_id": {"type": "integer", "default": 0, "description": "Run log: job id belonging to the selected run/attempt; omitted reads all jobs"},
+        "attempt": {"type": "integer", "default": 0, "description": "Run: 0 selects latest; logs pin the observed attempt before capture"},
+        "failed_only": {"type": "boolean", "default": False, "description": "Run log: failed steps only; empty when none failed"},
+        "max_bytes": {"type": "integer", "description": "Run log: default 4 MiB, ceiling 32 MiB; artifact download: required explicit cap, ceiling 64 MiB"},
+        "tail_lines": {"type": "integer", "default": 120, "description": "Run log preview: last 1–2000 lines, clipped to 400 chars each; read_file pages retained text"},
         "since": {"type": "string", "default": "", "description": "ISO-8601 UTC instant for supported list/facet timestamps; labels have no since filter"},
         "cursor": {"type": "string", "default": "", "description": "next_cursor of the previous page (list, search, or get with one facet)"},
         "limit": {"type": "integer", "default": _LIMIT_DEFAULT, "minimum": 1, "maximum": _LIMIT_MAX, "description": "Page size, 1–100"},

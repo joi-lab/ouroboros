@@ -208,7 +208,7 @@ def test_a_long_press_lifts_the_row_over_the_dimmed_feed_until_its_menu_closes(c
 
 
 def test_inside_telegram_each_moment_plays_its_one_haptic(chromium_ui, tmp_path):
-    """Swarm flipped: a tick each way. A swipe past the reply point: one medium tap (none for pulling further). A long
+    """A Subagents value chosen: a tick each. A swipe past the reply point: one medium tap (none for pulling further). A long
     press that opens the menu: one medium tap. The drawer latched open by a finger: one light tap; ☰ is silent."""
     page, client = booted(chromium_ui, tmp_path, telegram=True)
     finger = Finger(page)
@@ -218,9 +218,13 @@ def test_inside_telegram_each_moment_plays_its_one_haptic(chromium_ui, tmp_path)
     try:
         facts['host'] = page.evaluate('document.documentElement.dataset.ouroborosHost')
         facts['idle'] = played()
-        page.locator('#chat-swarm').click()
-        page.locator('#chat-swarm').click()
-        facts['swarm'] = played()
+        page.route('**/api/owner/subagents-mode', lambda route: route.fulfill(json={
+            'ok': True, 'project_id': '', 'subagents_mode': route.request.post_data_json['mode']}))
+        page.locator('#page-chat .chat-subagents-head').click()
+        page.locator('#page-chat .chat-subagents-strip .chat-seg[data-mode="swarm"]').click()
+        page.locator('#page-chat .chat-subagents-strip .chat-seg[data-mode="off"]').click()
+        facts['mode'] = played()
+        page.keyboard.press('Escape')
         clear()
         row = page.evaluate(ROW, ASSISTANT)
         start = (row['x'] + row['w'] - 24, row['y'] + row['h'] / 2)
@@ -262,7 +266,7 @@ def test_inside_telegram_each_moment_plays_its_one_haptic(chromium_ui, tmp_path)
         page.close()
         client.close()
     assert facts['host'] == 'telegram' and facts['idle'] == [], facts
-    assert facts['swarm'] == ['tick', 'tick'], ('armed, then disarmed', facts)
+    assert facts['mode'] == ['tick', 'tick'], ('Swarm, then Off: a tick each', facts)
     assert facts['swipe'] == ['medium'], ('one tap as the reply point is crossed', facts)
     assert facts['press'] == ['medium'], ('one tap as the long press opens the menu', facts)
     assert facts['drawer']['open'] is True and facts['latch'] == ['light'], ('the finger latched the drawer open', facts)

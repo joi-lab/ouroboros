@@ -35,7 +35,10 @@ def test_runtime_status_preserves_checkout_and_only_reads_captured_baseline(monk
 
 
 def test_same_successful_range_reuses_without_material_or_model_work(tmp_path, monkeypatch):
+    from ouroboros.update_qualification import range_qualification
     record = _record()
+    record["qualification"] = range_qualification({"base_sha": "a" * 40, "target_sha": "b" * 40,
+        "commits": [{"sha": "b" * 40, "subject": "change", "body": ""}]}, "")
     ul.atomic_write_json(ul.record_path(tmp_path), record)
     monkeypatch.setattr(ul, "_default_git", lambda: lambda cmd: (1, "", ""))
     calls = []
@@ -92,7 +95,8 @@ def test_failure_keeps_shown_origin_and_failed_attempt_origin_independent(tmp_pa
     good = _record()
     ul.atomic_write_json(ul.record_path(tmp_path), good)
     status = _status(current_sha="b" * 40, running_sha="b" * 40, latest_sha="c" * 40)
-    monkeypatch.setattr(ul, "collect_range_material", lambda *a: {"commits": ["new"]})
+    monkeypatch.setattr(ul, "collect_range_material", lambda *a: {"base_sha": "b" * 40, "target_sha": "c" * 40,
+        "commits": [{"sha": "c" * 40, "subject": "new", "body": ""}]})
     monkeypatch.setattr(ul, "_default_git", lambda: lambda cmd: (1, "", ""))
     monkeypatch.setattr(ul, "write_letter", lambda status, *a, **k: _record(
         key=ul._key_from_status(status), state="failed", text="", error_kind="budget_exhausted",

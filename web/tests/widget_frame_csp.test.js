@@ -30,3 +30,12 @@ test('the module document CSP spells out absolute sources for the owning skill o
     // The skill name is URL-encoded into the source expression like the route prefix.
     assert.ok(moduleFrameCsp('a b', 'http://h').includes('http://h/api/extensions/a%20b/module/'));
 });
+
+test('ESM resource policy admits only its mount prefix and keeps scriptable network closed', () => {
+    const base = 'https://h/api/widget-assets/one/';
+    const policy = moduleFrameCsp('demo', 'https://h', base);
+    assert.ok(policy.includes(`style-src 'unsafe-inline' ${base}`));
+    assert.ok(policy.includes(`script-src 'unsafe-inline' 'wasm-unsafe-eval' blob: ${base}`));
+    assert.ok(!policy.includes('/api/extensions/') && !policy.includes('connect-src'));
+    assert.ok(!policy.includes('https://h/api/widget-assets/;'));
+});

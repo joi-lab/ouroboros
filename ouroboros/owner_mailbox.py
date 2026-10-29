@@ -344,6 +344,7 @@ def write_task_message(
     relayed_from_task_id: str = "",
     msg_id: Optional[str] = None,
     review_feedback: Optional[Dict[str, Any]] = None,
+    work_attention: Optional[Dict[str, Any]] = None,
     relation: str = "",
     sender_origin: Optional[Dict[str, Any]] = None,
     reply_to: Optional[Dict[str, Any]] = None,
@@ -384,6 +385,8 @@ def write_task_message(
         entry["sender_origin"] = {str(key): str(value) for key, value in dict(sender_origin).items()}
     if provenance == "system" and isinstance(review_feedback, dict):
         entry["review_feedback"] = dict(review_feedback)
+    if provenance == "system" and isinstance(work_attention, dict):
+        entry["work_attention"] = dict(work_attention)
     try:
         return _append_mail(drive_root, task_id, path, entry)
     except StoreForeign:
@@ -606,88 +609,6 @@ def reset_attempt_controls_for_retry(
         return 0
 
 
-def copy_owner_mailbox_for_retry(
-    drive_root: pathlib.Path,
-    task_id: str,
-    retry_task_id: str,
-    *,
-    path_replacements: Optional[Dict[str, str]] = None,
-) -> bool:
-    """Carry the existing mailbox protocol across a new-id physical retry.
-
-    Timeout retries of root tasks receive a fresh task id.  Copy the append-only
-    mailbox and acknowledgement rows by value so the retry keeps the same
-    durable message ids while later steering can continue on its new task id.
-    Repeated calls merge idempotently instead of replacing any newer rows.
-    """
-
-    task_id = validate_task_id(task_id)
-    retry_task_id = validate_task_id(retry_task_id)
-    if task_id == retry_task_id:
-        return True
-
-    for source, target in (
-        (_mailbox_path(drive_root, task_id), _mailbox_path(drive_root, retry_task_id)),
-        (_ack_path(drive_root, task_id), _ack_path(drive_root, retry_task_id)),
-    ):
-        if not source.exists():
-            continue
-        try:
-            source_rows = [json.loads(line) for line in mailbox_lines(source.read_text(encoding="utf-8"))]
-            target_rows = (
-                [json.loads(line) for line in mailbox_lines(target.read_text(encoding="utf-8"))]
-                if target.exists() else []
-            )
-        except (OSError, TypeError, ValueError):
-            log.warning(
-                "Failed to read owner mailbox retry handoff %s -> %s",
-                task_id, retry_task_id, exc_info=True,
-            )
-            return False
-
-        def _rebase(value: Any) -> Any:
-            if isinstance(value, str):
-                for old, new in (path_replacements or {}).items():
-                    value = value.replace(str(old), str(new))
-                return value
-            if isinstance(value, list):
-                return [_rebase(item) for item in value]
-            if isinstance(value, dict):
-                return {key: _rebase(item) for key, item in value.items()}
-            return value
-
-        normalized: List[dict] = []
-        for row in source_rows:
-            if not isinstance(row, dict):
-                continue
-            copied = dict(row)
-            if "attachment_manifest_ref" in copied:
-                from ouroboros.artifacts import attachment_manifest_projection, resolve_attachment_manifest
-                try:
-                    full = resolve_attachment_manifest(drive_root, task_id, copied)
-                    copied.update(attachment_manifest_projection(drive_root, retry_task_id, _rebase(full)))
-                except (OSError, ValueError, TypeError):
-                    log.warning("Attachment manifest retry publication failed", exc_info=True)
-                    return False
-            if "task_id" in copied:
-                copied["task_id"] = retry_task_id
-            normalized.append(_rebase(copied))
-        fingerprints = {
-            json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            for row in target_rows if isinstance(row, dict)
-        }
-        for row in normalized:
-            fingerprint = json.dumps(
-                row, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-            )
-            if fingerprint in fingerprints:
-                continue
-            if not _append_mail(drive_root, retry_task_id, target, row):
-                return False
-            fingerprints.add(fingerprint)
-    return True
-
-
 def drain_owner_entries(
     drive_root: pathlib.Path,
     task_id: str,
@@ -804,6 +725,8 @@ def drain_owner_entries(
                     drained["provenance"] = str(entry.get("provenance") or "ancestor_task")
                     if drained["provenance"] == "system" and isinstance(entry.get("review_feedback"), dict):
                         drained["review_feedback"] = dict(entry["review_feedback"])
+                    if drained["provenance"] == "system" and isinstance(entry.get("work_attention"), dict):
+                        drained["work_attention"] = dict(entry["work_attention"])
                     drained["source_task_id"] = str(entry.get("source_task_id") or "")
                     drained["relayed_from_task_id"] = str(entry.get("relayed_from_task_id") or "")
                     # The peer relation is a written fact the renderer reads;
@@ -886,32 +809,21 @@ def cleanup_task_mailbox(drive_root: pathlib.Path, task_id: str, *, canonical_ro
                                carry_inputs=carry_inputs, stop=stop)
 
 
-def discard_mailbox_copy(drive_root: pathlib.Path, task_id: str) -> None:
-    """Drop a by-value mailbox copy made for a retry id that will never run: the original
-    id keeps every row, so no custody is owed; appends still serialize with the unlink."""
-    from ouroboros.task_custody import task_mail_lock
-
-    with task_mail_lock(drive_root, task_id) as locked:
-        if locked:
-            for path in (_mailbox_path(drive_root, task_id), _ack_path(drive_root, task_id)):
-                path.unlink(missing_ok=True)
-
-
 def mailbox_drain_ended(task_drive: pathlib.Path, task_id: str) -> bool:
     """The actor's own result row is settled: no solve loop drains this mailbox.
 
     A worker may stay RUNNING to finish paid post-work after its answer settled
     (TZ-2 D15). Its mailbox is then only cleaned up, never read again, so owner
     mail and quiz answers must not be labelled delivered into it — the routing
-    guard and the quiz ingress both ask this one fact. The actor's drive is read,
-    not the canonical row: split-root copyback can lag the settlement. Mail that
-    lands after the drain ended is ``MAIL_RETAINED_UNREAD`` (``mail_write_receipt``):
-    the task's result keeps it as unread mail.
+    guard and the quiz ingress both ask this one fact: the typed status column of
+    the actor's drive, never its body (split-root copyback can lag the settlement
+    in the canonical row). Mail that lands after the drain ended is
+    ``MAIL_RETAINED_UNREAD`` (``mail_write_receipt``): the result keeps it unread.
     """
-    from ouroboros.task_results import load_task_result
     from ouroboros.task_status import SETTLED_STATUSES
+    from ouroboros.task_store import task_drive_status
 
-    return str((load_task_result(task_drive, task_id) or {}).get("status") or "") in SETTLED_STATUSES
+    return task_drive_status(task_drive, [task_id]).get(str(task_id), ("", ""))[0] in SETTLED_STATUSES
 
 
 # Receipt vocabulary for a message written into a task's mailbox. A write proves only

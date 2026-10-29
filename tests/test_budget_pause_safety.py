@@ -566,7 +566,7 @@ def test_consumed_resume_crash_retries_current_working_source_without_old_grant(
         return {"role": "assistant", "content": "Continued new work", "tool_calls": []}, 0.0
 
     monkeypatch.setattr(loop, "_dispatch_round_model", dispatch)
-    kwargs = {**_loop_kwargs(tmp_path, registry, []), "task_id": "dead"}
+    kwargs = {**_loop_kwargs(tmp_path, registry, [], llm=SimpleNamespace(default_model=lambda: "m")), "task_id": "dead"}  # the checkpoint ran on Main
     result, _usage, _trace = loop.run_llm_loop(**kwargs)
     assert result == "Continued new work"
     assert any(row.get("content") == "done a" for row in seen)

@@ -10,6 +10,7 @@ has exactly one field-identical JSDoc twin among the browser modules.
 from __future__ import annotations
 
 import importlib
+import json
 import pathlib
 import re
 import threading
@@ -311,11 +312,112 @@ def test_every_request_and_header_fact_is_published_for_the_journeys():
     assert sorted(plain) == ["POST /api/settings", "POST /api/ui/preferences"], plain
 
 
+@pytest.mark.parametrize("with_summary", [False, True])
+@pytest.mark.parametrize("live", [False, True])
+@pytest.mark.parametrize("cause,status,wait,phase", [
+    ("own_clock", "completed", {}, "done"), ("own_clock", "running", {}, "running"),
+    ("focus", "running", {"state": "waiting", "quiz_id": "q1"}, "waiting"),
+    ("focus", "scheduled", {}, "queued"), ("focus", "paused", {}, "paused"),
+    ("own_clock", "interrupted", {}, "unknown"),
+])
+def test_recent_wake_rows_match_the_typed_contract(client, monkeypatch, with_summary, live, cause, status, wait, phase):
+    from ouroboros import usage_accounting
+    from ouroboros.consciousness import BackgroundConsciousness
+    from ouroboros.task_results import TASK_COST_META_FIELDS
+    from tests._store_shared import seed_result
+
+    root = client.app.state.drive_root
+    document = json.loads((REPO / "tests/fixtures/wake_document_214a31b6.json").read_text(encoding="utf-8"))
+    task_id = document["task_id"]
+    document["metadata"]["wake_cause"] = cause
+    if status != "completed":
+        document.update(status=status, outcome_axes={}, owner_wait=wait)
+        document.pop("terminal_time")
+    if with_summary:
+        document.update(wake_summary="Проверил состояние; нового решения не требуется.", owner_message_sent=True)
+    seed_result(root, task_id, document)
+    usage_accounting.record_unmetered_external_dispatch(
+        task_id, drive_root=root, task_id=task_id, root_task_id=task_id, category="consciousness")
+    clock = object.__new__(BackgroundConsciousness)
+    clock._drive_root = root
+    monkeypatch.setattr(clock, "status_snapshot", lambda: {"live_wake_task_id": task_id if live else ""})
+    client.app.state.describe_consciousness = lambda: clock.details_snapshot(True)
+    response = client.get("/api/consciousness")
+    assert assert_bound("GET /api/consciousness", response) == "application/json"
+    panel = response.json()
+    row, = panel["recent_wakes"]
+    assert "places" not in panel
+    shape = contract_typed_dict("RecentWake")
+    assert not validate_ingress(row, shape)
+    assert set(row) <= _declared("RecentWake")
+    assert set(TASK_COST_META_FIELDS) <= _declared("RecentWake")
+    assert row["live"] is (live or status != "completed") and row["quiet"] is (not with_summary)
+    assert row["phase"] == ("running" if status == "interrupted" and live else phase)
+    assert row["cause"] == ("focus" if cause == "focus" else "own")
+    assert ("first_reply_at" in row) is (cause == "focus")
+    assert "place_id" not in row and "tool_calls" not in row
+    assert row["cost_presentation"] == document["cost_presentation"]
+    assert row["note"] == document["result"]
+    assert ("summary" in row) is with_summary and ("said_owner" in row) is with_summary
+    assert panel["recent_wakes_coverage"] == "wakes that reached a model call in the last 48 h"
+    history = {key: panel[key] for key in _declared("RecentWakesView")}
+    assert not validate_ingress(history, contract_typed_dict("RecentWakesView"))
+    for field, invalid in (("live", "false"), ("phase", "completed"), ("cause", "own_clock"), ("ended_at", 7),
+                           ("tool_calls", "16"), ("checks", [{"chip": "checked", "tool": 7}]),
+                           ("cost_presentation", {"scope": "root_tree"})):
+        assert validate_ingress({**row, field: invalid}, shape), field
+    assert validate_ingress({key: value for key, value in row.items() if key != "task_id"}, shape)
+    assert not validate_ingress({key: value for key, value in row.items()
+                                 if key not in {"tool_calls", "rounds", "first_reply_at"}}, shape)
+
+
+@pytest.mark.parametrize("source", ["usage", "tasks"])
+@pytest.mark.parametrize("typed", [True, False])
+def test_recent_wake_read_unavailability_keeps_the_panel(client, monkeypatch, source, typed):
+    from ouroboros import consciousness_view, store, usage_store
+    from ouroboros.consciousness import BackgroundConsciousness
+    from tests._wake_summary_shared import seed_wake
+
+    root = client.app.state.drive_root
+    document = seed_wake(root)
+    clock = object.__new__(BackgroundConsciousness)
+    clock._drive_root = root
+    monkeypatch.setattr(clock, "status_snapshot", lambda: {
+        "enabled": True, "next_wake_at": "2027-01-15T12:30:00Z", "spent_24h_usd": 2.5, "places_brief": []})
+    client.app.state.describe_consciousness = lambda: clock.details_snapshot(True)
+    error = (usage_store.UsageLockUnavailable if source == "usage" else store.StoreBusy)("busy") if typed else ValueError("unexpected failure")
+    calls = []
+
+    def unavailable(root, **kwargs):
+        calls.append(kwargs)
+        raise error
+
+    if source == "usage":
+        monkeypatch.setattr(usage_store, "read", unavailable)
+    else:
+        monkeypatch.setattr(consciousness_view, "wake_ids", lambda *args: [document["task_id"]])
+        monkeypatch.setattr(store, "open_store", unavailable)
+    if not typed:
+        with pytest.raises(ValueError, match="unexpected failure"):
+            client.get("/api/consciousness")
+    else:
+        response = client.get("/api/consciousness")
+        assert response.status_code == 200
+        panel = response.json()
+        reason = "usage ledger busy." if source == "usage" else "task store busy."
+        assert panel["recent_wakes"] is None
+        assert panel["recent_wakes_coverage"] == "Recent wakes could not be read: " + reason
+        assert panel["status"] == "sleeping" and panel["spent_24h_usd"] == 2.5
+        history = {key: panel[key] for key in _declared("RecentWakesView")}
+        assert not validate_ingress(history, contract_typed_dict("RecentWakesView"))
+    assert calls == ([{"allow_stale": True}] if source == "usage" else [{"write": False}])
+
+
 def test_place_request_shapes_cover_the_owner_journey(client, monkeypatch):
     monkeypatch.setattr("ouroboros.place_projection.place_declarations", lambda _root: [{
         "skill": "bridge", "id": "chat", "destination": "vendor:chat", "label": "Test chat", "wakes": ["mention"],
     }])
-    connect = {"connector": "bridge", "account_id": "account", "conversation_id": "room"}
+    connect = {"connector": "bridge", "account_id": "account", "conversation_id": "room", "label": "Room"}
     assert BY_TOKEN["POST /api/places"]["request"]["schemas"] == ["PlaceConnectRequest"]
     assert _declared("PlaceConnectRequest") == set(connect)
     connect_type = contract_typed_dict("PlaceConnectRequest")
@@ -325,6 +427,9 @@ def test_place_request_shapes_cover_the_owner_journey(client, monkeypatch):
     connected = client.post("/api/places", json=connect)
     assert connected.status_code == 200, connected.text
     place = connected.json()["place"]
+    assert place["label"] == "Test chat · Room" and place["state"] == "silent"
+    assert not validate_ingress(place, contract_typed_dict("PlaceSummary"))
+    assert set(place) <= _declared("PlaceSummary") and "connector_label" not in place
     path = f"/api/places/{place['place_id']}"
     change = {
         "state": "silent", "wakes": ["direct_message"], "add_note": "Owner choice",
@@ -353,3 +458,8 @@ def test_place_request_shapes_cover_the_owner_journey(client, monkeypatch):
     assert removed.json()["place"]["notes"] == removed.json()["place"]["owner_accounts"] == []
     conflict = client.post(path, json=change)
     assert conflict.status_code == 409 and conflict.json()["code"] == "place_revision_conflict"
+    assert conflict.json()["place"] == removed.json()["place"]
+    assert BY_TOKEN["DELETE /api/places/{place_id}"]["request"]["schemas"] == ["PlaceDisconnectRequest"]
+    disconnect = {"expected_revision": removed.json()["place"]["revision"]}
+    assert not validate_ingress(disconnect, contract_typed_dict("PlaceDisconnectRequest"))
+    assert client.request("DELETE", path, json=disconnect).status_code == 200

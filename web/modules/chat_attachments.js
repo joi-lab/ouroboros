@@ -349,7 +349,7 @@ export function createComposerAttachments({ preview, attachBtn, fileInput, input
 
 // What a reload keeps of a sent frame: its words, identity, routing and the refs of uploads the
 // host already stores — never bytes, never the send-time client_surface (an honest gap on resend).
-const KEPT_FRAME_KEYS = ['type', 'content', 'client_message_id', 'sender_session_id', 'force_plan', 'chat_id', 'project_id', 'reply_to'];
+const KEPT_FRAME_KEYS = ['type', 'content', 'client_message_id', 'sender_session_id', 'chat_id', 'project_id', 'reply_to'];
 
 function keptFrame(frame) {
     if (isPanicFrame(frame)) return null;

@@ -63,8 +63,17 @@ def normalize_model_role_options(key: str, raw: object) -> tuple[dict, str]:
             raw = json.loads(raw)
         except (ValueError, TypeError) as exc:
             raise ValueError(f"{key} must be a JSON object") from exc
-    if not isinstance(raw, dict) or set(raw) - set(MODEL_ROLE_SETTINGS):
-        raise ValueError(f"{key} must contain only known model roles")
+    if not isinstance(raw, dict):
+        raise ValueError(f"{key} must be a JSON object")
+    unknown_roles = [ascii(role) for role in raw if role not in MODEL_ROLE_SETTINGS]
+    if unknown_roles:
+        raise ValueError(
+            f"{key}: unknown model role(s): {', '.join(unknown_roles)}. "
+            f"Supported roles: {', '.join(MODEL_ROLE_SETTINGS)}. "
+            "Check the role spelling or use a compatible application version; "
+            "do not reset your settings. Packaged startup recovery: "
+            "docs/DEPLOYMENT.md#unknown-model-role-at-startup"
+        )
     def value(item: object) -> str | int:
         if key == MODEL_PROCESSING_PREFERENCES_KEY:
             return normalize_processing_preference(item)
@@ -154,7 +163,9 @@ def task_model_binding(task: dict, *, context_fit_plan: object = None,
                or metadata.get("model_role") or actor_role)
     pin = task.get("credential_profile_id")
     if pin is None and role == actor_role and actor_role != "main":
-        pin = str((cognitive or route).get("credential_profile_id") or "")
+        followed = str((cognitive or {}).get("follows_role") or "")  # a nanny following its parent's role: that role's current pin
+        pin = (str(model_role_option(MODEL_ACCOUNTS_KEY, followed) or "") if followed
+               else str((cognitive or route).get("credential_profile_id") or ""))
     pin = (overrides or {}).get(role, {}).get("model_account_override", pin)
     return role, pin
 
@@ -387,11 +398,11 @@ def parse_fallback_chain() -> list[str]:
     """Parse the raw ordered cross-model fallback chain — SSOT for every consumer
     (resilience walk, pricing categorization, credentialed-model resolution).
 
-    Reads OUROBOROS_MODEL_FALLBACKS; only a process where it is absent (never projected)
-    reads the legacy singular OUROBOROS_MODEL_FALLBACK (env-only back-compat, never a
-    settings value). No dedup, no active-model drop, and NO SETTINGS_DEFAULTS injection:
-    an EXPLICITLY empty Fallbacks slot means "no cross-model fallback" and stays projected
-    as blank (``config.apply_settings_to_env``), so the alias cannot revive behind it."""
+    Reads OUROBOROS_MODEL_FALLBACKS as the settings document reads now (``route_choice``): a saved
+    blank is "no cross-model fallback" and an unauthored slot its proposal. Only a process with no
+    document, where the key is absent (never projected), reads the legacy singular
+    OUROBOROS_MODEL_FALLBACK (env-only back-compat, never a settings value). No dedup, no active-model
+    drop, and NO SETTINGS_DEFAULTS injection."""
     modern = runtime_setting("OUROBOROS_MODEL_FALLBACKS")
     raw = str((runtime_setting("OUROBOROS_MODEL_FALLBACK", "") if modern is None else modern) or "").strip()
     return [m.strip() for m in _parse_model_list(raw) if str(m or "").strip()]

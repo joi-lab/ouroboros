@@ -356,6 +356,17 @@ def live_author(conversation_key: str, *, drive_root: Any = None) -> str:
         os.close(fd)
 
 
+def presence_author_agent(drive_root, author: str):
+    """The local inline author's intake owner, including while its conversation is lent.
+
+    Question delivery uses this existing actor's final-drain lock. A census on
+    another process never invents a local admission endpoint.
+    """
+    with _AUTHORS_LOCK:
+        lease = _AUTHORS.get((str(Path(drive_root).resolve()), author))
+    return lease.intake_agent if lease is not None and not lease._ended else None
+
+
 def accept_author_mail(drive_root, author: str, conversation_key: str, append: Callable[[], bool]) -> bool:
     """Accept under the author's own intake/close lock, never a census-to-append race.
 

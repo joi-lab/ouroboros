@@ -378,6 +378,7 @@ def test_primary_choice_survives_shared_cold_continuation(main_call, monkeypatch
     ctx, _gateway, owner, _events, _decide, _observations = main_call
     # This route-only fixture has no resident or current tool catalog.
     monkeypatch.setattr(ctx.tools, "schemas", lambda: [], raising=False)
+    monkeypatch.setenv("OUROBOROS_MODEL", MODEL)  # the primary follows Main: its current slot is this model
     monkeypatch.setenv(MODEL_ACCOUNTS_KEY, json.dumps({"main": "decoy", "fallback": ["account-b"]}))
     owner.overrides["main"] = {"model_account_override": primary_account}
     inner = ctx.tools._ctx

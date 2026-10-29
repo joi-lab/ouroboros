@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import logging
 import pathlib
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
+_GAP_NAMES = 10  # damaged rows a membership gap names before it counts the rest
 
 
 def _td():
@@ -102,11 +103,13 @@ def deliver_cascade_summary(
         }
         membership_gap = ""
         try:
+            gaps: list = []
             for tid, status in _cascade_descendant_rows(
-                pathlib.Path(drive_root), task_id, strict=wrap_up,
+                pathlib.Path(drive_root), task_id, strict=wrap_up, gaps=gaps,
             ).items():
                 if tid and tid not in merged:
                     merged[tid] = status
+            membership_gap = "; ".join(gaps)  # a named damaged row keeps the known children, honestly partial
         except Exception:
             membership_gap = "descendant_enumeration_unavailable"
             log.debug(
@@ -152,6 +155,8 @@ def deliver_cascade_summary(
                 salvage_text = pathlib.Path(salvage_path).read_text(encoding="utf-8")
             except Exception:
                 salvage_text = ""
+        # A partial digest census rides the summary's own receipt and words; Wrap up's row already names it.
+        summary_gap = "" if wrap_up else membership_gap
         delivery_id = ""
         try:
             from ouroboros.cancel_intents import active_intent
@@ -169,6 +174,7 @@ def deliver_cascade_summary(
             salvaged_text=salvage_text,
             preserved_path=salvage_path,
             children=children,
+            membership_gap=summary_gap,
             settled_status=root_status,
             delivery_id=delivery_id,
         )
@@ -185,6 +191,7 @@ def deliver_cascade_summary(
             salvaged_text=salvage_text,
             preserved_path=salvage_path,
             children=children,
+            membership_gap=summary_gap,
             # GR2-12: the typed root status decides the completed-vs-salvage
             # framing; the prose in ``outcome`` is presentation only.
             settled_status=root_status,
@@ -196,7 +203,8 @@ def deliver_cascade_summary(
         return False
 
 
-def _cascade_descendant_rows(drive_root: pathlib.Path, task_id: str, *, strict: bool = False) -> Dict[str, str]:
+def _cascade_descendant_rows(drive_root: pathlib.Path, task_id: str, *, strict: bool = False,
+                             gaps: Optional[List[str]] = None) -> Dict[str, str]:
     """``{descendant_id: status}`` for every task whose ancestry reaches ``task_id``.
 
     GR6-2: the digest's membership walk. Rows come from the durable task
@@ -206,7 +214,11 @@ def _cascade_descendant_rows(drive_root: pathlib.Path, task_id: str, *, strict: 
     plus a depth-bounded parent-chain walk over the collected rows — the same
     reachability shape the cascade sweep and ``_has_live_ancestor_in_set``
     use. Deliberately NOT filtered to subagents: a non-subagent descendant
-    torn down by the cascade belongs in the tree's one summary too.
+    torn down by the cascade belongs in the tree's one summary too. A damaged
+    row the census could not place, or a descendant whose own record it could
+    not read (still listed), keeps every known row and is named in ``gaps``
+    (the receipt's membership gap); so is a queue-only fallback after the
+    store itself failed, which ``strict`` raises instead.
     """
     target = str(task_id or "").strip()
     queued = []
@@ -232,12 +244,19 @@ def _cascade_descendant_rows(drive_root: pathlib.Path, task_id: str, *, strict: 
     try:
         from ouroboros.task_store import tree_facts
 
-        rows = tree_facts(drive_root, target, descendants=True, queue_rows=queued)
+        census = tree_facts(drive_root, target, descendants=True, queue_rows=queued)
+        rows, unresolved = census.members, census.unresolved
     except Exception:
         if strict:
             raise
         log.debug("cascade digest durable-row selection failed for %s", target, exc_info=True)
-        rows = {row["task_id"]: row for row in reversed(queued)}
+        rows, unresolved = {row["task_id"]: row for row in reversed(queued)}, None
+    if gaps is not None and unresolved is None:
+        gaps.append("descendant_enumeration_unavailable")
+    elif gaps is not None and set(unresolved) - {target}:  # the target's own record is no descendant's
+        named = [f"{tid} ({fact['reason']})" for tid, fact in sorted(unresolved.items()) if tid != target]
+        gaps.append("unresolved_task_rows: " + ", ".join(named[:_GAP_NAMES])
+                    + (f" and {len(named) - _GAP_NAMES} more" if len(named) > _GAP_NAMES else ""))
 
     def _reaches_target(tid: str) -> bool:
         row = rows.get(tid) or {}

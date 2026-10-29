@@ -46,7 +46,7 @@ FACTS = """() => { const wrap = document.querySelector('#page-chat .chat-input-w
     const button = row.querySelector(':scope > .composer-menu');
     const menu = button.getBoundingClientRect(), field = text.getBoundingClientRect();
     const plus = wrap.querySelector('[data-composer-plus]').getBoundingClientRect();
-    const swarm = row.querySelector('.chat-swarm');
+    const capsule = row.querySelector('.chat-subagents-mode');
     return {folded: 'folded' in wrap.dataset, rowHeight: Math.round(row.getBoundingClientRect().height),
             menuMiddle: menu.top + menu.height / 2, fieldMiddle: field.top + field.height / 2,
             plusMiddle: plus.top + plus.height / 2,
@@ -54,20 +54,20 @@ FACTS = """() => { const wrap = document.querySelector('#page-chat .chat-input-w
             // What a finger reaches at ☰'s centre: ☰ itself, never "+" painted over it.
             menuHit: button.contains(document.elementFromPoint(menu.left + menu.width / 2, menu.top + menu.height / 2)),
             fieldHeight: Math.round(field.height),
-            swarm: getComputedStyle(swarm).visibility, fit: row.dataset.ownerCompact || '',
+            capsule: getComputedStyle(capsule).visibility, fit: row.dataset.ownerCompact || '',
             area: Math.round(document.querySelector('#chat-input-area').getBoundingClientRect().height)}; }"""
 # Every frame for `ms` from the fold's start (the composer takes data-folded): how far ☰ has gone down, the room the
-# field makes on its leading side, the opacity of the capsules' group (Swarm's), and the transitions running on the
+# field makes on its leading side, the opacity of the first capsule (Subagents), and the transitions running on the
 # line, the field and each control on the line. No fold within 5 s gives no frames: the facts read next say so.
 FOLD_FRAMES = """ms => new Promise((resolve) => {
     const wrap = document.querySelector('#page-chat .chat-input-wrap');
     const row = wrap.querySelector('.chat-toolbar-row'), text = wrap.querySelector('.chat-field');
-    const menu = row.querySelector(':scope > .composer-menu'), pills = row.querySelector(':scope > .chat-composer-pills');
+    const menu = row.querySelector(':scope > .composer-menu'), capsule = row.querySelector(':scope > .chat-subagents-mode');
     const lead = getComputedStyle(text).direction === 'rtl' ? 'marginRight' : 'marginLeft';
     const down = (el) => { const t = getComputedStyle(el).transform; return t === 'none' ? 0 : new DOMMatrixReadOnly(t).m42; };
     const frames = [];
     const sample = () => frames.push({menu: down(menu), margin: parseFloat(getComputedStyle(text)[lead]),
-        swarm: Number(getComputedStyle(pills).opacity),
+        capsule: Number(getComputedStyle(capsule).opacity),
         moving: [row, text, ...row.children].flatMap((el) => el.getAnimations().map((a) => a.transitionProperty || '?'))});
     const observer = new MutationObserver(() => {
         if (!('folded' in wrap.dataset)) return;
@@ -113,13 +113,13 @@ def test_reading_back_folds_the_row_and_the_way_down_brings_it_back(chromium_ui,
         evidence(tmp_path, 'composer-fold-phone', facts)
         page.close()
     latest, reading, back, again, writing = (facts[k] for k in ('latest', 'reading', 'back', 'again', 'writing'))
-    assert latest['folded'] is False and latest['swarm'] == 'visible', ('at the latest the row is there', latest)
-    assert reading['folded'] is True and reading['swarm'] == 'hidden' and reading['rowHeight'] == 0, reading
+    assert latest['folded'] is False and latest['capsule'] == 'visible', ('at the latest the row is there', latest)
+    assert reading['folded'] is True and reading['capsule'] == 'hidden' and reading['rowHeight'] == 0, reading
     assert abs(reading['menuMiddle'] - reading['plusMiddle']) <= 1.5, ('☰ waits on the field\'s last line, beside "+"', reading)
     assert reading['menuRight'] < reading['fieldLeft'], ('beside the field, not over it', reading)
     assert reading['fit'] == latest['fit'], ('folded, the row keeps its fit (☰ off its line misled the refit)', reading, latest)
     assert reading['area'] <= latest['area'] - 30, ('the composer gives its line back to the feed', reading, latest)
-    assert back['folded'] is False and back['swarm'] == 'visible' and back['area'] == latest['area'], ('the way down', back)
+    assert back['folded'] is False and back['capsule'] == 'visible' and back['area'] == latest['area'], ('the way down', back)
     assert again['folded'] is True and writing['folded'] is False, ('the field\'s focus brings it back', writing)
 
 
@@ -213,10 +213,10 @@ def test_the_folded_menu_waits_on_the_fields_leading_side_and_moves_only_where_m
         assert folded['menuLeft'] > folded['fieldRight'], ('beside the field, on its right', folded)
     assert frames, ('setup: the fold was sampled from its start', facts)
     end = frames[-1]
-    assert end['menu'] > 4 and end['margin'] > 30 and end['swarm'] == 0 and end['moving'] == [], ('setup: settled folded', end)
+    assert end['menu'] > 4 and end['margin'] > 30 and end['capsule'] == 0 and end['moving'] == [], ('setup: settled folded', end)
     if motion == 'reduce':
         assert all(f['moving'] == [] for f in frames), ('nothing moves', frames)
-        assert all((f['menu'], f['margin'], f['swarm']) == (end['menu'], end['margin'], 0) for f in frames), (
+        assert all((f['menu'], f['margin'], f['capsule']) == (end['menu'], end['margin'], 0) for f in frames), (
             'from its first frame the row is folded', frames)
     else:
         lead = 'margin-left' if direction == 'ltr' else 'margin-right'
@@ -243,4 +243,4 @@ def test_a_desk_never_folds_the_row(chromium_ui, tmp_path):
         evidence(tmp_path, 'composer-fold-desk', facts)
         page.close()
     assert facts['scrolled'] > 300, ('the owner read back', facts)
-    assert facts['reading']['folded'] is False and facts['reading']['swarm'] == 'visible', facts
+    assert facts['reading']['folded'] is False and facts['reading']['capsule'] == 'visible', facts

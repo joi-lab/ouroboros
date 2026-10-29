@@ -12,10 +12,18 @@ from ouroboros.store import StoreError
 
 
 def projection_fields(row: dict) -> dict:
-    """Additive fields for live frames and history, from the same stored row."""
+    """Additive fields for live frames and history, from the same stored row.
+
+    An outgoing chat row saved under its own name (a relay's ``relay:<id>:<task>``) carries that name as
+    ``row_client_message_id``: on a live assistant/system frame ``client_message_id`` names the owner's
+    submission the row answers, so the row's own name travels under a field of its own. A progress
+    record is not named: it merges its frame's meta, owner correlation included.
+    """
     fields = {key: row[key] for key in ("reply_to", "relay") if isinstance(row.get(key), dict)}
     if row.get("reply_to_relay"):
         fields["reply_to_relay"] = row["reply_to_relay"]
+    if row.get("direction") != "in" and not row.get("is_progress") and row.get("client_message_id"):
+        fields["row_client_message_id"] = str(row["client_message_id"])
     fields["row_address"] = format_address(row_address(row))
     return fields
 
@@ -33,8 +41,8 @@ def reference_from_row(row: dict) -> dict:
     role = "assistant" if answer else {"in": "user", "out": "assistant", "system": "system"}.get(
         row.get("direction"), "system")
     return {"address": format_address(row_address(row)), "chat_id": int(row.get("chat_id", 1)),
-            "role": role, "author_label": str(row.get("sender_label") or
-                                               {"user": "You", "assistant": "Ouroboros", "system": "System"}[role]),
+            "role": role, "author_label": (str(row.get("sender_label") or "You") if role == "user"
+                                             else {"assistant": "Ouroboros", "system": "System"}[role]),
             "kind": kind, "snippet": " ".join(str(answer or row.get("text") or row.get("caption") or "").split())[:160],
             "ts": str(row.get("ts") or ""), "task_id": str(row.get("task_id") or "")}
 

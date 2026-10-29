@@ -11,6 +11,7 @@ boundary (``subprocess.run``, ``urlopen``) is faked, so no desktop, SSH or guest
 from __future__ import annotations
 
 import importlib.util
+import sys
 import io
 import json
 import subprocess
@@ -24,8 +25,9 @@ TIMEOUT = subprocess.TimeoutExpired(["fixture"], 10)
 
 
 def load_plugin():
-    spec = importlib.util.spec_from_file_location("unix_computer_use_effects_plugin", PLUGIN)
+    spec = importlib.util.spec_from_file_location("unix_computer_use_effects_plugin", PLUGIN, submodule_search_locations=[str(PLUGIN.parent)])
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -52,16 +54,26 @@ def png(path: Path) -> None:
     Image.new("RGB", (64, 40), (7, 11, 13)).save(path, format="PNG")
 
 
+def is_probe(argv: list[str]) -> bool:
+    """A place fact the skill reads around an input (who is in front, the native helper, a window listing)."""
+    return (argv[:1] == ["lsappinfo"] or argv[:2] == ["xdotool", "getactivewindow"] or argv[:2] == ["wmctrl", "-lpxG"]
+            or any(str(part).endswith("macos_native.py") for part in argv))
+
+
 class Transport:
     """``subprocess.run`` as the skill sees it. Every argv is recorded; ``answer(argv, index)`` returns
     a return code, ``(code, stdout)``, or an exception to raise. Screen captures get a real PNG."""
 
     def __init__(self, answer=None):
-        self.calls: list[list[str]] = []
+        self.calls: list[list[str]] = []   # the inputs and reads a test pins
+        self.probes: list[list[str]] = []  # front reads, the native helper, window listings: the receipt's place facts
         self.answer = answer or (lambda argv, index: 0)
 
     def __call__(self, cmd, *args, **kwargs):
         argv = [str(part) for part in cmd]
+        if is_probe(argv):
+            self.probes.append(argv)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
         self.calls.append(argv)
         outcome = self.answer(argv, len(self.calls) - 1)
         if isinstance(outcome, BaseException):
@@ -166,6 +178,7 @@ def test_mac_refusals_reads_and_waits_carry_no_mark(tmp_path, monkeypatch):
         assert not marked(receipt(text)), text
     assert receipt(reads[0])["ok"] is True and receipt(reads[4])["ok"] is True, "the reads really answered"
     assert {argv[0] for argv in transport.calls} == {"cliclick", "osascript", "screencapture"}
+    assert any(str(argv[-2]).endswith("macos_native.py") for argv in transport.probes), "window_list/ax_tree ask the native helper"
 
 
 def test_a_mac_key_sequence_keeps_the_mark_of_the_steps_that_ran(tmp_path, monkeypatch):
@@ -234,6 +247,41 @@ def test_x11_reads_and_refusals_carry_no_mark(tmp_path, monkeypatch):
         assert not marked(receipt(text)), text
 
 
+def test_a_multi_process_input_reports_which_step_ran_and_a_helper_that_never_started(tmp_path, monkeypatch):
+    """`dispatched` is the fact that a helper ran: a failing later step is dispatched (its outcome unknown), a
+    failing first step too, and a helper the OS could not start is not."""
+    tools, transport = desktop(tmp_path, monkeypatch, "linux", "wayland", tools=("ydotool",), answer=fail_at(1))
+    out = receipt(tools["click"](x=10, y=20, raw=True))
+    assert out["ok"] is False and out["steps_done"] == 1 and out["dispatched"] is True and out["observed_effect"] is True, out
+    assert "dispatched and did not report success" in out["note"] and "not sent" not in out["error"]
+    tools, transport = desktop(tmp_path, monkeypatch, "linux", "wayland", tools=("ydotool",), answer=fail_at(0))
+    first = receipt(tools["click"](x=10, y=20, raw=True))
+    assert first["ok"] is False and first["steps_done"] == 0 and first["dispatched"] is True and "unknown" in first["note"], first
+    assert "not sent" not in first["note"] and "observed_effect" not in first
+    tools, transport = desktop(tmp_path, monkeypatch, "linux", "x11", tools=("xdotool",), answer=fail_at(1))
+    held = receipt(tools["hold_key"](keys="a", duration_ms=50))
+    assert held["ok"] is False and held["steps_done"] == 1 and held["dispatched"] is True and "dispatched and did not report success" in held["note"], held
+    tools, transport = desktop(tmp_path, monkeypatch, "linux", "wayland", tools=("ydotool",))
+    assert receipt(tools["click"](x=10, y=20, raw=True))["dispatched"] is True, "a successful multi-process input says its helpers ran"
+    missing = FileNotFoundError(2, "No such file or directory", "cliclick")
+    tools, transport = desktop(tmp_path, monkeypatch, "macos", tools=MAC, answer=fail_at(0, outcome=missing))
+    never = receipt(tools["click"](x=10, y=20, raw=True))
+    assert never["ok"] is False and never["dispatched"] is False and never["reason"] == "helper_not_launched", never
+    assert "not sent" in never["note"] and "returncode" not in never and "observed_effect" not in never
+    tools, transport = desktop(tmp_path, monkeypatch, "linux", "wayland", tools=("ydotool",), answer=fail_at(1, outcome=missing))
+    step = receipt(tools["click"](x=10, y=20, raw=True))
+    assert step["dispatched"] is False and step["steps_done"] == 1 and "the next step was not sent" in step["note"], step
+
+
+def test_a_press_at_a_negative_point_is_refused_where_the_desktop_has_no_such_space(tmp_path, monkeypatch):
+    tools, transport = desktop(tmp_path, monkeypatch, "linux", "x11", tools=("xdotool",))
+    for tool in ("mouse_down", "mouse_up"):
+        out = receipt(tools[tool](x=-5, y=20, raw=True))
+        assert out["ok"] is False and "negative" in out["error"] and transport.calls == [], (tool, out)
+    assert receipt(tools["mouse_down"](x=5, y=6, raw=True))["ok"] is True and transport.calls[-1] == ["xdotool", "mousemove", "5", "6", "mousedown", "1"]
+    assert receipt(tools["mouse_up"]())["ok"] is True, "omitted coordinates still release at the pointer"
+
+
 @pytest.mark.parametrize("tool, args, steps", [
     ("click", {"x": 3, "y": 4, "raw": True}, 2),
     ("left_click_drag", {"start_x": 1, "start_y": 2, "end_x": 3, "end_y": 4, "raw": True}, 4),
@@ -297,7 +345,8 @@ def test_a_successful_ssh_input_carries_the_mark(tmp_path, monkeypatch, tool, ar
     tools, transport = ssh_mac(tmp_path, monkeypatch)
     result = receipt(tools[tool](**args))
     assert result["ok"] is True and result["returncode"] == 0 and marked(result), result
-    assert [remote(argv) for argv in transport.calls] == [command]
+    assert len(transport.calls) == 1 and command in remote(transport.calls[0]), transport.calls
+    assert "__FRONT_BEFORE__" in remote(transport.calls[0]), "the same ssh call reads who is in front"
 
 
 @pytest.mark.parametrize("outcome", [1, 255, TIMEOUT])
@@ -316,16 +365,21 @@ def test_ssh_reads_refusals_and_remote_exec_carry_no_mark(tmp_path, monkeypatch)
             return 0, "0, 0, 1440, 900"
         if "background only" in command:
             return 0, "Finder, Safari"
+        if "lsappinfo list" in command:  # an inventory that names nothing is apps_unread; a read names one application
+            return 0, (' 1) "Finder" ASN:0x0-0x1: \n    bundleID="com.apple.finder"\n    pid = 100 type="Foreground" flavor=3\n'
+                       '__FRONT__"pid"=100 "CFBundleIdentifier"="com.apple.finder" "LSDisplayName"="Finder" ')
         return (0, "host=mac\nuser=owner\n/usr/sbin/screencapture\n/opt/homebrew/bin/cliclick") if "hostname" in command else 0
     tools, transport = ssh_mac(tmp_path, monkeypatch, answer=answer)
     refused = [tools["scroll"](clicks=2), tools["click"](x=1, y=1, button="middle", raw=True),
                tools["hold_key"](keys="cmd"), tools["cursor_position"]()]
     assert transport.calls == [], "nothing unsupported reaches the Mac"
-    reads = [tools["remote_exec"](command="true"), tools["window_list"](), tools["ax_tree"](),
-             tools["test_connection"](), tools["screenshot"](), tools["capabilities"](), tools["wait"](ms=1)]
-    for text in refused + reads:
+    reads = [tools["remote_exec"](command="true"), tools["window_list"](), tools["test_connection"](),
+             tools["screenshot"](), tools["capabilities"](), tools["wait"](ms=1)]
+    refusal = tools["ax_tree"]()  # no accessibility reader over SSH: an honest refusal, never a window list as success
+    for text in refused + reads + [refusal]:
         assert not marked(receipt(text)), text
     assert all(receipt(text)["ok"] is True for text in reads), reads
+    assert receipt(refusal)["ok"] is False and receipt(refusal)["reason"] == "unsupported"
     assert {argv[0] for argv in transport.calls} == {"ssh", "scp"}
 
 
@@ -338,7 +392,8 @@ def test_an_ssh_key_sequence_keeps_the_mark_of_the_steps_that_ran(tmp_path, monk
     transport.answer = fail_at(2)
     result = receipt(tools["key"](keys="down down return"))
     assert result["ok"] is False and marked(result) and result["steps_done"] == 2, result
-    assert [remote(argv) for argv in transport.calls] == ["cliclick kp:arrow-down"] * 2 + ["cliclick kp:return"]
+    assert [c for c in ("cliclick kp:arrow-down", "cliclick kp:arrow-down", "cliclick kp:return")] == \
+        [next(c for c in ("cliclick kp:arrow-down", "cliclick kp:return") if c in remote(argv)) for argv in transport.calls]
 
     transport.calls.clear()
     transport.answer = fail_at(0, outcome=255)
@@ -401,3 +456,12 @@ def test_osworld_reads_and_remote_exec_stay_unmarked(tmp_path, monkeypatch):
     assert marked(receipt(tools["click"](x=1, y=2, raw=True)))
     for text in (tools["cursor_position"](), tools["remote_exec"](command="touch /tmp/x")):
         assert receipt(text)["ok"] is True and not marked(receipt(text)), text
+
+
+def test_a_refused_combo_is_a_not_sent_input_on_every_refusal_path(tmp_path, monkeypatch):
+    tools, transport = desktop(tmp_path, monkeypatch, "macos", tools=MAC)
+    for keys in ("bogus+right", "super+x"):
+        out = receipt(tools["key"](keys=keys))
+        assert out["ok"] is False and out["dispatched"] is False and "not sent" in out["note"] and transport.calls == [], (keys, out)
+    held = receipt(tools["hold_key"](keys="a"))
+    assert held["ok"] is False and held["dispatched"] is False and "not sent" in held["note"] and transport.calls == [], held

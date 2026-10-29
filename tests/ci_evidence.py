@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import platform
 import sys
+import threading
 from time import monotonic
 
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
@@ -33,9 +35,9 @@ if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tests.ci_verdicts import (  # noqa: E402 -- stdlib only, as everything above `import pytest` below
-    DURATIONS_ENV, PHASES as _PHASES, ROUND_DIR as _ROUND_DIR, SECTIONS as _SECTIONS, cell as _cell,
-    durations_command, final as _final, journal_rows as _journal_rows, run_verdict_command, system_of as _system,
-    valid as _valid,
+    DURATIONS_ENV, PHASES as _PHASES, ROUND_DIR as _ROUND_DIR, SECTIONS as _SECTIONS, attempt_text as _attempt,
+    cell as _cell, durations_command, error_text as _error, final as _final, journal_rows as _journal_rows,
+    run_verdict_command, system_of as _system, valid as _valid,
     verdict_counts as _verdict_counts, verdict_file as _verdict_file, verdict_passes as _verdict_passes, write_json,
 )
 
@@ -127,7 +129,7 @@ def _failure_table(failed: list[dict]) -> list[str]:
         return []
     return ["", "| Test | Phase | Error type |", "| --- | --- | --- |"] + [
         f"| {_cell(row['nodeid'])} | {_cell(row['phase'])} | "
-        f"{_cell(row.get('error_type') or 'see test step')} |" for row in failed]
+        f"{_cell(_error(row) or 'see test step')} |" for row in failed]
 
 
 def render_summary(root: Path, *, producer_outcome: str, artifact_outcome: str,
@@ -240,10 +242,6 @@ def _escaped(value, *, property_value: bool = False) -> str:
 
 def _annotation(title: str, message: str, command: str = "error") -> str:
     return f"::{command} title={_escaped(title, property_value=True)}::{_escaped(message)}"
-
-
-def _attempt(row) -> str:
-    return ", ".join(str(part) for part in (row.get("phase"), row.get("error_type")) if part)
 
 
 def render_annotations(roots, *, limit: int = 10) -> list[str]:
@@ -685,8 +683,43 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
+    # An xdist worker writes where its controller reads (pytest_configure_node below), even when
+    # tests/conftest.py derived that directory from this process's own session root.
+    handed = getattr(config, "workerinput", {}).get("ci_evidence_dir")
+    if handed:
+        config.option.ci_evidence_dir = handed
     if output_dir(config) is not None:
         config.pluginmanager.register(_Results(config), "ci_safe_results")
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node):
+    directory = output_dir(node.config)
+    if directory is not None:
+        node.workerinput["ci_evidence_dir"] = str(directory)
+
+
+def _timeout_callback(directory, report):
+    """The timeout whose pytest-timeout callback the dead worker recorded for exactly this test of
+    this run, read once. A stale run, another worker or test, or a torn record names no cause."""
+    node = getattr(report, "node", None)
+    worker = getattr(getattr(node, "gateway", None), "id", "")
+    path = Path(directory) / f".timeout-{worker}.json"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        record = None
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    expected = {"worker": worker, "testrunuid": getattr(node, "workerinput", {}).get("testrunuid"),
+                "nodeid_sha256": hashlib.sha256(report.nodeid.encode("utf-8")).hexdigest()}
+    if not (isinstance(record, dict) and expected["testrunuid"]
+            and all(record.get(key) == value for key, value in expected.items())):
+        return None
+    seconds = record.get("timeout_seconds")
+    return float(seconds) if type(seconds) in (int, float) and math.isfinite(seconds) and seconds > 0 else None
 
 
 def pytest_collection_finish(session):  # noqa: ARG001
@@ -839,6 +872,50 @@ class _Results:
         canary = getattr(getattr(item, "callspec", None), "params", {}).get("canary")
         report.ci_canary_id = getattr(canary, "canary_id", "")
 
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_timeout_set_timer(self, item, settings):
+        """Arm pytest-timeout's thread method as the plugin does, around the plugin's own callback.
+
+        That callback prints its banner to an xdist worker's stdout, which execnet discards, and then
+        ends the worker with os._exit(1) (#1949). On entry the wrapper leaves this worker's record for
+        the controller (_timeout_callback); should the callback return, a debugger suppressed it and
+        the record goes. Other methods, a run without xdist and a plugin without that callback keep
+        the plugin's own timer.
+        """
+        import pytest_timeout
+
+        callback, worker = getattr(pytest_timeout, "timeout_timer", None), getattr(self.config, "workerinput", None)
+        if settings.method != "thread" or worker is None or not callable(callback):
+            return None
+        record = output_dir(self.config) / f".timeout-{worker['workerid']}.json"
+        facts = json.dumps({"worker": worker["workerid"], "testrunuid": worker.get("testrunuid"),
+                            "nodeid_sha256": hashlib.sha256(item.nodeid.encode("utf-8")).hexdigest(),
+                            "timeout_seconds": settings.timeout})
+
+        def invoked():
+            try:
+                record.write_text(facts, encoding="utf-8")
+            except Exception:  # A diagnostic never delays or skips the timeout itself.
+                pass
+            try:
+                callback(item, settings)
+            finally:
+                try:
+                    record.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        timer = threading.Timer(settings.timeout, invoked)
+        timer.name = f"pytest_timeout {item.nodeid}"
+
+        def cancel():
+            timer.cancel()
+            timer.join()
+
+        item.cancel_timeout = cancel
+        timer.start()
+        return True
+
     def pytest_runtest_logreport(self, report):
         duration = float(getattr(report, "duration", 0.0))
         # xdist reports a dead worker's test with when="???" and no worker-side attributes.
@@ -852,10 +929,20 @@ class _Results:
             "error_type": "WorkerCrash" if crashed else getattr(report, "ci_error_type", ""),
             "canary_id": getattr(report, "ci_canary_id", ""),
         }
+        cause = {}
+        if crashed:  # The dead worker: the commit gate matches it to worker_crash (ouroboros/preflight_runner.py).
+            row["worker"] = cause["worker"] = getattr(getattr(getattr(report, "node", None), "gateway", None), "id", "")
+        seconds = _timeout_callback(output_dir(self.config), report) if crashed else None
+        if seconds is not None:  # A fact about this test only; the worker's end stays unexplained beyond it.
+            row["timeout_callback_seconds"] = cause["timeout_callback_seconds"] = seconds
+            reporter = self.config.pluginmanager.get_plugin("terminalreporter")
+            if reporter is not None:  # For readers, on its own line after xdist's "F"; this row is the record.
+                reporter.write_line(f"\n[{report.node.gateway.id}] pytest-timeout callback invoked ({seconds:g}s) "
+                                    f"while running {report.nodeid!r}; worker subsequently lost")
         self.reports.append(row)
         self._event("report", row["nodeid"], phase=row["phase"], outcome=row["outcome"],
                     error_type=row["error_type"], duration_seconds=row["duration_seconds"],
-                    is_subtest=row["is_subtest"])
+                    is_subtest=row["is_subtest"], **cause)
 
     def pytest_collectreport(self, report):
         if report.failed:

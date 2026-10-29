@@ -302,7 +302,7 @@ def _wake_members(q: Any, root_task_id: str, fence: Dict[str, Any], members: lis
     return woken
 
 
-def refresh_owner_pause_tree(root_task_id: str) -> str:
+def refresh_owner_pause_tree(root_task_id: str, *, gaps: Optional[List[Dict[str, str]]] = None) -> str:
     """Turn the root's fence ``paused`` once the whole tree is saved and its own work stopped.
 
     Saved means: every member of the tree is parked — cold under its exact
@@ -312,7 +312,11 @@ def refresh_owner_pause_tree(root_task_id: str) -> str:
     unknown keeps the tree ``requested`` exactly as it keeps that member's
     Resume refused (#1562; the settle tick re-reads it). Only the owner's one
     exception is disclosed instead of waited for: reviewers already launched,
-    their delegated runs and their own model sends (``finishing_reviews``).
+    their delegated runs and their own model sends (``finishing_reviews``). A
+    damaged old row no surviving link ties to this tree is named on the fence
+    (``membership_gaps``), never waited for; a tied one holds it. A Resume's own
+    read passes ``gaps``: such rows go there, and an already paused fence keeps
+    the ones its Pause recorded.
     Returns the fence state after the check (``""`` when no fence).
     """
     from ouroboros.owner_pause import (
@@ -387,7 +391,10 @@ def refresh_owner_pause_tree(root_task_id: str) -> str:
         return str(fence.get("state") or "")
     from supervisor.continuation_admission import conflicting_writers
 
-    blockers = conflicting_writers(q, root_task_id, drive_root=root_drive, owner_pause_fence_id=fence_id)
+    found: List[Dict[str, str]] = []
+    blockers = conflicting_writers(q, root_task_id, drive_root=root_drive, owner_pause_fence_id=fence_id, gaps=found)
+    if gaps is not None:
+        gaps.extend(found)
     if [b for b in blockers if not review_finishing(b)]:
         return str(fence.get("state") or "")
     reviews = {str(b.get("task_id") or b.get("attempt_id") or "") for b in blockers if review_finishing(b)}
@@ -399,7 +406,12 @@ def refresh_owner_pause_tree(root_task_id: str) -> str:
             log.debug("Live review operations of %s unreadable at the Pause census", task_id, exc_info=True)
     facts = {"parked_members": [str(item.get("id") or "") for item in parked] + warm,
              "warm_members": list(warm), "finishing_reviews": sorted(reviews - {""})}
-    if str(fence.get("state") or "") == FENCE_PAUSED:
+    paused = str(fence.get("state") or "") == FENCE_PAUSED
+    if (found or fence.get("membership_gaps")) and not (paused and gaps is not None):
+        # Rows no surviving link ties to this tree: named, never a member, never what holds it.
+        from ouroboros.pause_notices import gap_fact
+        facts["membership_gaps"] = gap_fact(found)
+    if paused:
         if all(fence.get(key) == value for key, value in facts.items()):
             return FENCE_PAUSED
         try:  # the "still finishing" line changes on the same paused fence
@@ -515,8 +527,8 @@ def _record_settled_member(q: Any, item: Dict[str, Any]) -> None:
     wins, and this stale observation is dropped for the next pass to redo.
     """
     from ouroboros.budget_pause import (
-        STOP_POLICY_TASK_OWNED, BudgetPauseSuperseded, budget_pause_row, observe_task_runs, set_budget_pause,
-        task_owned_runs_open,
+        STOP_POLICY_TASK_OWNED, BudgetPauseSuperseded, budget_pause_row, episode_fields, observe_task_runs,
+        set_budget_pause, task_owned_runs_open,
     )
     from ouroboros.owner_pause import SETTLEMENT_EXTERNAL_RUNNING, SETTLEMENT_SETTLED
 
@@ -534,6 +546,11 @@ def _record_settled_member(q: Any, item: Dict[str, Any]) -> None:
     # The stops this pause already issued are re-READ, never issued again.
     observed = observe_task_runs(result_root, task_id, reason="owner_pause_settlement_check",
                                  stop_policy=STOP_POLICY_TASK_OWNED, prior=row.get("external_runs"))
+    # This Pause's participants, never fewer. Only its first look at a cold receipt it never observed
+    # begins a whole list; an owner tick an older body ran there left these marks, so that list is partial.
+    seen = row.get("settlement_observed_at") or any(isinstance(run, dict) and run.get("stop_policy") == "request_stop"
+                                                    for run in (row.get("external_runs") or {}).get("runs") or [])
+    participants = episode_fields(row, observed, starts=bool(cold_receipt) and not seen)
     if task_owned_runs_open(observed):
         def facts(external: Any) -> list:
             return sorted((str(run.get("run_id") or run.get("invocation_id") or ""), str(run.get("state") or ""),
@@ -542,7 +559,7 @@ def _record_settled_member(q: Any, item: Dict[str, Any]) -> None:
         if observed.get("custody_read") == "ok" and facts(observed) == facts(row.get("external_runs")):
             return  # nothing moved: no rewrite of the same facts every tick
         try:  # the fresh outcomes (requested -> confirmed, unknown) are the owner's facts
-            set_budget_pause(result_root, task_id, {**row, "external_runs": observed},
+            set_budget_pause(result_root, task_id, {**row, "external_runs": observed, **participants},
                              expected_pause_id=str(row.get("pause_id") or ""),
                              expected_state=str(row.get("state") or ""),
                              expected_grant_id=str((row.get("grant") or {}).get("grant_id") or ""))
@@ -550,7 +567,7 @@ def _record_settled_member(q: Any, item: Dict[str, Any]) -> None:
             log.debug("Owner pause observation of %s superseded by a newer pause row", task_id, exc_info=True)
         return
     try:
-        set_budget_pause(result_root, task_id, {**row, "external_runs": observed,
+        set_budget_pause(result_root, task_id, {**row, "external_runs": observed, **participants,
                                                 **({} if cold_receipt else {"settlement": SETTLEMENT_SETTLED}),
                                                 "settlement_observed_at": utc_now_iso()},
                          expected_pause_id=str(row.get("pause_id") or ""),
@@ -569,7 +586,7 @@ def _reread_warm_member(q: Any, task_id: str, meta: Dict[str, Any]) -> None:
     keep the resumed stack's newer cognition), and this stale observation is
     dropped for the next pass to redo. The RUNNING mirror takes only the facts.
     """
-    from ouroboros.budget_pause import STOP_POLICY_TASK_OWNED, observe_task_runs
+    from ouroboros.budget_pause import STOP_POLICY_TASK_OWNED, episode_fields, observe_task_runs
     from ouroboros.owner_wait import OwnerWaitSuperseded, set_owner_wait
 
     wait = dict(meta.get("owner_wait") or {})
@@ -582,8 +599,10 @@ def _reread_warm_member(q: Any, task_id: str, meta: Dict[str, Any]) -> None:
                                     for r in (external or {}).get("runs") or [] if isinstance(r, dict))
     if observed.get("custody_read") != "ok" or facts(observed) == facts(pause.get("external_runs")):
         return
+    participants = episode_fields(pause, observed)  # this park's, never fewer; a park without a list stays partial
     try:
-        set_owner_wait(result_root, task_id, {**wait, "owner_pause": {**pause, "external_runs": observed}},
+        set_owner_wait(result_root, task_id, {**wait, "owner_pause": {**pause, "external_runs": observed,
+                                                                      **participants}},
                        expected_wait_id=str(wait.get("wait_id") or ""), expected_state=str(wait.get("state") or ""))
     except OwnerWaitSuperseded:
         log.debug("Warm Pause observation of %s superseded by a Resume or newer park", task_id, exc_info=True)
@@ -594,7 +613,7 @@ def _reread_warm_member(q: Any, task_id: str, meta: Dict[str, Any]) -> None:
         if (isinstance(current, dict) and current.get("wait_id") == wait.get("wait_id")
                 and current.get("state") == wait.get("state")):
             live["owner_wait"] = {**current, "owner_pause": {**dict(current.get("owner_pause") or {}),
-                                                             "external_runs": observed}}
+                                                             "external_runs": observed, **participants}}
 
 
 def settle_requested_owner_pauses(q: Any = None, *, now: Optional[float] = None,

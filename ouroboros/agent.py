@@ -58,7 +58,7 @@ from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.consciousness_authority import apply_consciousness_authority
 from ouroboros.contracts.task_contract import attach_task_contract
 from ouroboros.outcomes import infra_failed_axes
-from ouroboros import body_candidate, subagent_bootstrap, subagent_runtime
+from ouroboros import body_candidate, route_choice, subagent_bootstrap, subagent_runtime
 from ouroboros.subagents import (
     CapabilityDelta,  # noqa: F401 -- the agent module keeps its historical import surface for the dispatch leaf
     SubagentExecutorResolution,  # noqa: F401 -- the agent module keeps its historical import surface for the dispatch leaf
@@ -149,7 +149,7 @@ def _task_exception_terminal(env: Any, task: Dict[str, Any], exc: Exception, dri
                 "task_exception", review_trigger="agent_exception"),
             trace_summary=build_trace_summary(llm_trace),
             trace_refs=loop_outcome.get("trace_refs") or collect_trace_refs(usage, llm_trace),
-            **effort_result_fields(task), **terminal_result_fields(usage),
+            **effort_result_fields(task), **terminal_result_fields(usage, title=task.get("title")),
         )
     except Exception:
         log.debug("Failed to persist task exception projection", exc_info=True)
@@ -827,22 +827,11 @@ class OuroborosAgent:
             ctx.begin_acceptance_fence = self._begin_acceptance_fence
             ctx.inspect_acceptance_fence = self._inspect_acceptance_fence
             ctx.end_acceptance_fence = self._end_acceptance_fence
-        if (
-            str(task_metadata.get("delegation_role") or "").lower() == "subagent"
-            or bool(task.get("_presence_turn"))
-        ):
-            model_override = str(task_metadata.get("model") or "").strip()
-            if model_override:
-                ctx.task_model_override = model_override
-            if "use_local_model" in task_metadata:
-                ctx.task_use_local_override = bool(task_metadata.get("use_local_model"))
+        # The model a task carries binds its route; a role-named task (a consciousness wake) and a
+        # nanny of a following parent carry none and follow that role's current slot (route_choice).
+        route_choice.bind_task_route(ctx, task_metadata, presence=bool(task.get("_presence_turn")))
         if bool(task.get("_presence_turn")):
             ctx.inline_max_rounds = int(task_metadata.get("inline_max_rounds") or 10)
-        # A task that names a model ROLE (a consciousness wake-up) runs on that
-        # role's slot when the slot is set; an empty slot is Main (В25=B).
-        role_slot = model_role_slot_override(task_metadata)
-        if role_slot is not None and not getattr(ctx, "task_model_override", None):
-            ctx.task_model_override, ctx.task_use_local_override = role_slot
         self.tools.set_context(ctx)
 
         dispatch, _preflight_amended = self._run_delegate_preflight(drive_logs, task, dispatch)
@@ -857,10 +846,7 @@ class OuroborosAgent:
                     task_metadata[_key] = task.get(_key)
             with self._owner_message_admission_lock:
                 self._current_task_metadata = dict(task_metadata)
-            if str(task_metadata.get("delegation_role") or "").lower() == "subagent":
-                ctx.task_model_override = str(task_metadata.get("model") or "").strip()
-                if "use_local_model" in task_metadata:
-                    ctx.task_use_local_override = bool(task_metadata.get("use_local_model"))
+            route_choice.bind_task_route(ctx, task_metadata, presence=bool(task.get("_presence_turn")))
         startup_wake = subagent_bootstrap.bootstrap_before_context(ctx, task, dispatch)
         self._capture_mutation_baseline(task, task_metadata)
         self._emit_typing_start()
@@ -874,7 +860,7 @@ class OuroborosAgent:
             task=task,
             review_context_builder=lambda: build_review_context(review_env),
             ctx=ctx,
-            tool_schemas=initial_tool_schemas(self.tools, context_mode=get_context_mode()),
+            tool_schemas=initial_tool_schemas(self.tools, context_mode=get_context_mode()), tool_registry=self.tools,
         )
         # The second of the three places a reduction must reach (the durable record
         # above is the first, `[SUBTASK_OUTCOME]` the third). It is appended HERE,

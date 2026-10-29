@@ -96,6 +96,26 @@ def terminal_custody_notice_text(result: Dict[str, Any]) -> str:
     return terminal_custody_notice(result, owner_row=True)
 
 
+def quiet_finish(row: Dict[str, Any]) -> bool:
+    """A silent finish is quiet only when neither the mind nor the host sent a message."""
+    return row.get("wake_silent") is True and not row.get("owner_message_sent") and not terminal_host_notice_text(row)
+
+
+def wake_cause_title(metadata: Dict[str, Any]) -> str:
+    """The host's admission title; the authored title slot stays empty."""
+    from ouroboros.consciousness_authority import wake_cause
+    from ouroboros.usage_origin import cause_label
+
+    cause = wake_cause(metadata)
+    if cause == "own_clock":
+        return "Own time"
+    if cause == "focus":
+        focus, place = metadata.get("focus") or {}, (metadata.get("presence") or {}).get("place") or {}
+        return str(focus.get("label") or cause_label(
+            str(metadata.get("consciousness_cause") or "place:" + str(focus.get("place_id") or "")), [place]))
+    return ""
+
+
 def terminal_notice_text(result: Dict[str, Any]) -> str:
     """The same terminal notices on transports with one text body or no event stream."""
     return "\n\n".join(part for part in (
@@ -247,7 +267,8 @@ def prepare_terminal_send_event(
     )
 
 
-def terminal_result_fields(usage: Dict[str, Any], *, existing: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def terminal_result_fields(usage: Dict[str, Any], *, existing: Dict[str, Any] | None = None,
+                           title: str | None = "") -> Dict[str, Any]:
     """Carry current custody and origin facts without minting empty custody envelopes."""
     from ouroboros.delegate_terminal import _stored_disclosure_matches
 
@@ -266,6 +287,14 @@ def terminal_result_fields(usage: Dict[str, Any], *, existing: Dict[str, Any] | 
         fields["terminal_salvage_path"] = path
     if usage.get("wake_silent") is True:
         fields["wake_silent"] = True
+    if usage.get("wake_summary"):
+        # The run's one sentence for its human names the card only when no authored name does
+        # (a wake); a schedule-born root keeps the schedule's name and shows the sentence under it.
+        fields["wake_summary"] = str(usage["wake_summary"])
+        if not str(title or prior.get("title") or "").strip():
+            fields["suggested_name"] = fields["wake_summary"]
+    if usage.get("owner_message_sent") is True:
+        fields["owner_message_sent"] = True
     if usage.get("terminal_plan_review_open") is True:
         fields["terminal_plan_review_open"] = True
     for key in ("terminal_provider_notice", "terminal_host_notice"):
@@ -274,6 +303,8 @@ def terminal_result_fields(usage: Dict[str, Any], *, existing: Dict[str, Any] | 
     handovers = usage.get("authoring_handovers")
     if isinstance(handovers, list) and handovers:
         fields["authoring_handovers"] = handovers
+    if isinstance(usage.get("cancel_origin"), dict) and usage["cancel_origin"]:
+        fields["cancel_origin"] = dict(usage["cancel_origin"])  # the owner's typed stop (owner_stop_origin)
     return fields
 
 
@@ -855,25 +886,36 @@ def build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | N
 
     Swarm intent with no observed fan-out stays explicit; requested counts and
     lanes never claim actual concurrency, dispatch lanes or child-wait time.
-    Legacy rows catch up once; later calls decode only the unconsumed suffix.
+    Producer-owned facts need no shared-journal read. This explicit observation
+    catches up legacy history; missing/damaged history cannot claim zero.
     """
     task_id = str(task.get("id") or task.get("task_id") or "")
     if not task_id:
         return None
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
-    swarm_intent = metadata.get("force_plan_source") == "swarm"
+    swarm_intent = metadata.get("subagents_mode") == "swarm"
     try:
         from ouroboros.swarm_rollup import load_swarm_rollup
 
         drive_root = getattr(env, "drive_root", None)
         if drive_root is None:
             return None
-        facts = load_swarm_rollup(drive_root, task_id)
-        child_ids = facts.get("child_ids", [])
         from ouroboros.swarm_receipt import publish
-        if (not (task.get("parent_task_id") or metadata.get("parent_task_id"))
-                and str(task.get("root_task_id") or metadata.get("root_task_id") or task_id) == task_id):
-            publish(task.get("budget_drive_root") or drive_root, task_id, task=task)
+        try:
+            facts = load_swarm_rollup(drive_root, task_id)
+        finally:
+            if (not (task.get("parent_task_id") or metadata.get("parent_task_id"))
+                    and str(task.get("root_task_id") or metadata.get("root_task_id") or task_id) == task_id):
+                canonical = pathlib.Path(task.get("budget_drive_root") or drive_root)
+                if canonical.resolve() != pathlib.Path(drive_root).resolve():
+                    try:
+                        load_swarm_rollup(canonical, task_id)
+                    except Exception:
+                        log.debug("canonical swarm history unavailable", exc_info=True)
+                # Other known actors/usage still deserve a provisional receipt
+                # when fan-out is unavailable. Publishing never repairs history.
+                publish(canonical, task_id, task=task)
+        child_ids = facts.get("child_ids", [])
         if not child_ids:
             if swarm_intent:
                 # Absence proves neither a planned count nor a plain-task intent.

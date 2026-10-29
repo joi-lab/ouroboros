@@ -160,6 +160,38 @@ def test_schema_bookkeeping_exempts_only_successful_results(turn, name, failure)
         assert not trace.get('completion_refusals')
 
 
+@pytest.mark.parametrize('name, arguments', [('chronicle_write', {'kind': 'page', 'text': 'What I did'}),
+                                             ('memory_mark', {}),
+                                             ('update_scratchpad', {'content': 'Next: the docs'})])
+@pytest.mark.parametrize('answer, held', [('written', False), ('⚠️ PARTIAL_WRITE: two decisions not recorded', True),
+                                          ('⚠️ TOOL_ERROR: write failed', True)])
+def test_a_receipt_write_rides_with_the_answer_unless_it_said_more(turn, name, arguments, answer, held):
+    """The page, a note or an addressed message written in the finishing response does not cost
+    the answer a round (owner decision 27.10); a warning or a failure from it is read first."""
+    registry, calls, notes, run = turn
+    registry.override_handler(name, lambda _ctx, **kw: answer)
+    response = finish('The asked fact')
+    response['tool_calls'].insert(0, {'id': 'receipt', 'type': 'function', 'function': {
+        'name': name, 'arguments': json.dumps(arguments)}})
+    text, _, trace = run([response, finish('Read it first')])
+    assert len(calls) == (2 if held else 1)
+    assert text == ('Read it first' if held else 'The asked fact')
+    assert bool(trace.get('completion_refusals')) is held
+
+
+def test_only_an_ok_receipt_write_skips_the_read_before_finish():
+    from ouroboros.tool_capabilities import COMPLETION_RECEIPT_TOOLS, completion_observation_calls
+
+    def call(tool, code='OK', is_error=False):
+        return {'tool': tool, 'tool_result_code': code, 'is_error': is_error}
+
+    assert completion_observation_calls([call(name) for name in sorted(COMPLETION_RECEIPT_TOOLS)]) == []
+    held = [call('tell_task', 'LEGACY_WARNING'), call('forward_to_worker', 'TOOL_ERROR', True),
+            call('update_identity'), call('update_world'), call('read_file'), call('verify_and_record'),
+            call('a_tool_added_later'), call('chronicle_write', None)]
+    assert completion_observation_calls(held) == held
+
+
 def test_stop_avoids_reviews_nudges_and_question_parking(turn, monkeypatch):
     registry, calls, notes, run = turn
     monkeypatch.setattr('ouroboros.tools.review_result.result_review_at_delivery',

@@ -183,15 +183,15 @@ def test_real_http_packed_source_preserves_placement_index_authority(tmp_path):
                                              data=raw, extension="json")
     write_task_result(data, TASK, "completed", completion_observations={"source_ref": ref})
     loose = artifacts.task_artifact_dir_path(data, TASK) / ref["path"]
-    pack, _ = evidence_packs.write_pack(data, TASK, 1, [{"sha256": ref["sha256"], "size": len(raw),
+    pack, sidecar = evidence_packs.write_pack(data, TASK, 1, [{"sha256": ref["sha256"], "size": len(raw),
         "kind": evidence_packs.CHECKPOINT, "path": ref["path"], "source": loose}])
     loose.unlink()
     index = evidence_packs.packs_dir(data) / evidence_packs.INDEX_NAME
-    assert not index.exists()
     with _http(data) as client:
         response = client.get(_url(Path(ref["path"]).name), params={"source": ref["path"]})
         assert (response.status_code, response.content) == (200, raw)
-        assert index.is_file()
+        assert not index.exists()  # the task's own sidecar answered; the shared index is the packer's to build
+        evidence_packs.index_upsert(data, pack, sidecar)  # as the packer does before it unlinks a loose handle
         # A warm placement remains usable if its sidecar is damaged.
         (index.parent / evidence_packs.sidecar_name(TASK, 1)).write_text("{")
         cached = client.get(_url(Path(ref["path"]).name), params={"source": ref["path"]})

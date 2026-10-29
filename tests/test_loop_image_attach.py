@@ -21,7 +21,7 @@ def test_tool_results_carrying_auto_attach_image_get_the_image_same_round(tmp_pa
     attached = []
     stamps = []
 
-    def fake_attach(ctx, path, *, stamp=None):
+    def fake_attach(ctx, path, *, stamp=None, observation=None):
         attached.append(path)
         stamps.append(stamp)
         ctx.messages.append({"role": "user", "content": [{"type": "image_url"}]})

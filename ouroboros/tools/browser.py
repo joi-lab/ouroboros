@@ -742,6 +742,8 @@ def _inject_native_screenshot(ctx: ToolContext, b64: str) -> str:
         shot_dir.mkdir(parents=True, exist_ok=True)
         shot_path = shot_dir / f"{ts}.png"
         shot_path.write_bytes(base64.b64decode(b64))
+        from ouroboros.maintenance_retirement import artifact_changed
+        artifact_changed(ctx.drive_root)
         caption = f"[browser screenshot {ts}]"
         from ouroboros.loop import _append_or_merge_user_content
 
@@ -1174,8 +1176,8 @@ def get_tools() -> List[ToolEntry]:
             schema={
                 "name": "browse_page",
                 "description": (
-                    "Open a URL in headless browser. Returns page content as text, "
-                    "html, markdown, or screenshot (base64 PNG). "
+                    "Open a URL in this task's own headless Playwright browser (not the owner's signed-in Chrome) "
+                    "and return its content as text, html, markdown, or screenshot (base64 PNG). "
                     "Browser persists across calls within a task. "
                     "For screenshots: use send_photo tool to deliver the image to the user. "
                     "Use viewport to test mobile layouts (e.g. '375x812'). "
@@ -1226,7 +1228,7 @@ def get_tools() -> List[ToolEntry]:
             schema={
                 "name": "browser_action",
                 "description": (
-                    "Perform action on current browser page. Actions: "
+                    "Act on the page open in this task's headless browser (from browse_page). Actions: "
                     "click (selector), fill (selector + value), select (selector + value), "
                     "screenshot (base64 PNG), evaluate (JS code in value), "
                     "scroll (value: up/down/top/bottom), wait (selector + state, without navigation)."

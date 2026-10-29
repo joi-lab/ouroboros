@@ -275,7 +275,7 @@
       },
       "minimax": {
         "label": "MiniMax",
-        "modelCopy": "MiniMax-only setup detected. These defaults include MiniMax-M3 and MiniMax-M2.7.",
+        "modelCopy": "MiniMax-only setup detected. These defaults include MiniMax-M3 and MiniMax-M3.1-Flash.",
         "providerCopy": "MiniMax is present, so the next step prefills MiniMax's own model ids."
       },
       "openai": {
@@ -302,7 +302,7 @@
     "reviewModes": [
       {
         "className": "advisory",
-        "copy": "Review still runs. After feedback, Ouroboros can fix, reject or finish; raw reviewer findings remain visible.",
+        "copy": "Reviewers read plans, results and changes; their findings stay visible and Ouroboros decides what to do with them.",
         "label": "Advisory",
         "tone": "Flexible",
         "value": "advisory"
@@ -361,7 +361,7 @@
         "title": "Choose models"
       },
       {
-        "copy": "Decide how strict pre-commit review should be before Ouroboros starts modifying itself.",
+        "copy": "Reviewers read how Ouroboros understood a request, its plans, its results and its changes. Decide whether their critical findings block the work or only inform Ouroboros.",
         "footer": "Pick both review enforcement and the initial runtime mode before Ouroboros starts.",
         "id": "review_mode",
         "railCopy": "Advisory vs blocking",
@@ -504,8 +504,8 @@
     },
     "minimax": {
       "consciousness": "",
-      "fallback": "minimax::MiniMax-M2.7",
-      "light": "minimax::MiniMax-M2.7",
+      "fallback": "minimax::MiniMax-M3.1-Flash",
+      "light": "minimax::MiniMax-M3.1-Flash",
       "main": "minimax::MiniMax-M3",
       "safety": "",
       "vision": ""
@@ -570,7 +570,7 @@
     "openai-compatible::meta-llama/compatible",
     "cloudru::zai-org/GLM-4.7",
     "minimax::MiniMax-M3",
-    "minimax::MiniMax-M2.7"
+    "minimax::MiniMax-M3.1-Flash"
   ],
   "secretPlaceholder": "***set***",
   "stepOrder": [

@@ -236,6 +236,9 @@ def _ensure(root: pathlib.Path, path: pathlib.Path, *, rederive: bool = False,
                 with store.name_lock(root, IMPORT_LOCK_NAME, timeout_sec=600.0, stale_sec=600.0):
                     if retiered and header == TIER_ENFORCED:  # out of WAL under the tier in use, before the header names another
                         store.prepare_handoff(path, header, seam=False)
+                    if retiered:  # the header changes in place: read it every time until the new tier commits
+                        known = (str(path), store.file_identity(path))
+                        store._TIERS[known] = None
                     with store.open_store(root, write=True, service=True) as txn:
                         if txn.phase() != PUBLISHED:
                             raise store.StoreRetired("store entered export during boot preparation")
@@ -256,6 +259,8 @@ def _ensure(root: pathlib.Path, path: pathlib.Path, *, rederive: bool = False,
                             txn.set_meta("legacy_results", report["results"])
                         if changed_body:
                             txn.set_meta("last_store_body", {"sha": body_sha, "at": utc_now_iso()})
+                    if retiered:
+                        store._TIERS[known] = tier
             if initialize_journal:  # explicit boot ownership, independent of legacy reconciliation
                 report["journal_selected"] = _select_journal(root, path, tier)
             if not store.generation_stamped(root):
@@ -271,6 +276,9 @@ def _ensure(root: pathlib.Path, path: pathlib.Path, *, rederive: bool = False,
                 with store.name_lock(root, IMPORT_LOCK_NAME, timeout_sec=600.0, stale_sec=600.0):
                     if retiered and header == TIER_ENFORCED:  # as above: the old tier converts first
                         store.prepare_handoff(path, header, seam=False)
+                    if retiered:  # as above: read every time until the new tier commits
+                        known = (str(path), store.file_identity(path))
+                        store._TIERS[known] = None
                     with store.open_store(root, write=True, service=True) as txn:
                         if derive:
                             _derive_flag_columns(txn, rederive=rederive)
@@ -278,6 +286,8 @@ def _ensure(root: pathlib.Path, path: pathlib.Path, *, rederive: bool = False,
                             txn.conn.execute(f"PRAGMA application_id = {store._APPLICATION_ID[tier]}")
                         if tier_record != facts["lock_tier"]:
                             txn.set_meta("lock_tier", tier_record)
+                    if retiered:
+                        store._TIERS[known] = tier
             return {"status": "switch_pending", "phase": phase, "lock_tier": tier, **retiered,
                     "legacy_reconcile": "not_needed"}, []
     elif store.generation_stamped(root):
@@ -325,6 +335,11 @@ def _upgrade_review_collection(txn: Txn) -> None:
         txn.conn.execute(index)
     if "drive_retention_at" not in columns:
         txn.conn.execute("ALTER TABLE tasks ADD COLUMN drive_retention_at TEXT")
+    for index in store.ROOT_WINDOWS:  # schema 8: root windows and terminal_seq, built once, committed with the version
+        txn.conn.execute(index)
+    if "terminal_seq" not in columns:  # rows written terminal before it carry no count (nothing to look at again)
+        txn.conn.execute("ALTER TABLE tasks ADD COLUMN terminal_seq INTEGER")
+    txn.conn.execute(store.TERMINAL_SEQ_INDEX)
     if int(txn.meta("schema_version") or 1) < store.SCHEMA_VERSION:
         txn.set_meta("schema_version", store.SCHEMA_VERSION)
 
@@ -465,11 +480,12 @@ def _custody_rows(root: pathlib.Path, records: List[Record]) -> Tuple[Dict[str, 
         raise _unreadable(exc, chain, "custody chain") from exc
     folded = {**fold(rows), "chain_offset": offset}  # the boundary: what an old body appends later is P6' input
     owed = {task_id for task_id, document in records if document.get("delegated_runs_unreconciled")}
-    receipts: Dict[str, Dict[str, Any]] = {}
+    receipts: Dict[str, Dict[str, Any]] = {tid: {"task_id": tid, "cost_revision": revision}
+                                        for tid, revision in folded["cost_revisions"].items()}
     for rid, (facts, _hold) in folded["runs"].items():
         task_id = str(facts.get("task_id") or "")
         if facts.get("settled") and task_id in owed:
-            receipts.setdefault(task_id, {"task_id": task_id, "closed_runs": {}})["closed_runs"][rid] = facts
+            receipts.setdefault(task_id, {"task_id": task_id}).setdefault("closed_runs", {})[rid] = facts
     return folded, {"custody_open": folded["open"], "delegated_runs": receipts}
 
 
@@ -478,6 +494,8 @@ def _merge_receipts(held: Dict[str, Dict[str, Any]], folded: Dict[str, Dict[str,
     for task_id, facts in folded.items():
         entry = merged.setdefault(task_id, {"task_id": task_id})
         entry["closed_runs"] = {**facts.get("closed_runs", {}), **entry.get("closed_runs", {})}
+        if facts.get("cost_revision"):
+            entry["cost_revision"] = max(facts["cost_revision"], entry.get("cost_revision", 0))
     return merged
 
 

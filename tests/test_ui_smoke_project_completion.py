@@ -441,7 +441,10 @@ def test_ui_folded_completion_excludes_late_table_focus(direct_server_with_data,
             tables.first.evaluate('n => { n.style.minWidth = `${n.clientWidth}px`; n.style.maxWidth = "none"; }')
             page.evaluate('() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))')
             dimensions = tables.first.evaluate('n => [n.clientWidth, n.clientHeight]')
-            message.evaluate("n => n.style.maxHeight = 'none'")
+            # The fold is measured in lines (--project-answer-lines on the bubble, project_answer.js measureFold):
+            # give the bubble enough lines for the whole answer, as a taller fold would.
+            row.evaluate("""n => { const m = n.querySelector('.message');
+                n.style.setProperty('--project-answer-lines', String(Math.ceil(m.scrollHeight / parseFloat(getComputedStyle(m).lineHeight)) + 1)); }""")
             page.evaluate("window.dispatchEvent(new Event('resize'))")
             expect(row).not_to_have_class(re.compile(r'\bis-folded\b'))
             expect(tables.first).to_have_attribute('tabindex', '0')

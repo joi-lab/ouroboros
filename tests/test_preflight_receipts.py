@@ -676,8 +676,12 @@ def test_only_a_complete_default_run_with_a_root_and_a_baseline_becomes_durable(
     assert receipt["status"] == "declined" and expected in receipt["reason"]
     assert _receipt_files(canonical) == []
     # Reviewers read the run's own lanes whatever durability declined; a focused argv
-    # proves nothing about the candidate's default gate, so it shows no green at all.
+    # proves nothing about the candidate's default gate, so it shows no green status: its
+    # run stays an observation of the same bytes under another workload, never proof.
     exhibit = receipts.execution_exhibit(ctx)
+    if case == "focused_args":
+        [run] = exhibit.pop("observed")
+        assert (run["outcome"], run["relation"], run["differs"]) == ("passed", "same_bytes", ["workload"])
     assert exhibit.get("lanes", exhibit) == {
         "serial_escape": ["single"], "no_root": ["parallel", "serial"], "no_baseline": ["parallel", "serial"],
         "focused_args": {"status": "not_run", "reason": "the green run's proof does not cover this candidate"}}[case]
@@ -794,8 +798,14 @@ def test_the_exhibit_never_claims_a_run_for_a_candidate_edited_after_it(tmp_path
     assert pr.run_hermetic_pytest(repo, ctx=ctx) is None
     assert receipts.execution_exhibit(ctx)["status"] == "passed"
     (repo / "tests" / "test_parallel.py").write_text("def test_one():\n    assert False\n", encoding="utf-8")
-    assert receipts.execution_exhibit(ctx) == {
-        "status": "not_run", "reason": "the green run's proof does not cover this candidate"}
+    exhibit = receipts.execution_exhibit(ctx)
+    [run] = exhibit.pop("observed")
+    assert exhibit == {"status": "not_run", "reason": "the green run's proof does not cover this candidate"}
+    # The green run stays visible as what it was: a pass of the earlier bytes, not of these.
+    assert (run["outcome"], run["relation"], run["differs"]) == ("passed", "other_bytes", ["tree"])
+    section = receipts.execution_section({**exhibit, "observed": [run]})
+    assert "gate passed" not in section and "PASSED, on OTHER bytes (differs: tree)" in section
+    assert "Not proof here" in section
 
 
 @pytest.mark.parametrize("empty,baseline", [(None, True), ("parallel", True), ("serial", True), ("parallel", False)])

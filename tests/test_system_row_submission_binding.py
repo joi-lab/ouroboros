@@ -113,23 +113,10 @@ def test_direct_lane_refusals_name_their_submission(tmp_path, monkeypatch):
     assert kwargs["progress_meta"] == {"client_message_id": "cm-3"} and kwargs["system_type"] == "managed_update_notice"
 
 
-def test_force_plan_refusal_names_its_submission(monkeypatch):
-    from ouroboros import server_owner_routing
-    from supervisor import state as state_mod
-    from supervisor import worker_chat_lane
+def test_ordinary_host_failure_names_its_submission():
+    from supervisor.worker_chat_lane import _host_operation_failure
 
-    sent = []
-    monkeypatch.setattr(worker_chat_lane, "owner_conversation_admitted", lambda *_a: True)
-    monkeypatch.setattr(state_mod, "budget_remaining", lambda *_a, **_k: 0)
-    monkeypatch.setattr(state_mod, "load_state", lambda: {})
-    monkeypatch.setattr(server_owner_routing, "_reserved_project_for_chat", lambda *_a: {})
-    ctx = types.SimpleNamespace(send_with_budget=lambda *a, **k: sent.append((a, k)))
-    server_owner_routing._route_owner_message(types.SimpleNamespace(), ctx, {
-        "chat_id": 1, "text": "plan it", "client_message_id": "cm-swarm",
-        "task_metadata": {"force_plan": True}})
-    (args, kwargs), = sent
-    assert args[1].startswith("🚫 Budget exhausted.")
-    assert kwargs["progress_meta"] == {"client_message_id": "cm-swarm"}
+    assert _host_operation_failure({"client_message_id": "cm-swarm", "force_plan": True})["progress_meta"] == {"client_message_id": "cm-swarm"}
 
 
 def test_initialization_notice_names_the_refused_frame():

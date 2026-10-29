@@ -12,7 +12,8 @@ import { DOTS, formatBytes, isSize, number, plural } from './storage_format.js';
 const text = escapeHtmlText;
 const attr = escapeHtmlAttr;
 
-/** The two groups the server offers, with their words: what is lost, what stays, the unit. */
+/** The groups the server offers, with their words: what is lost, what stays, the unit. A group that
+ *  holds saved work (`saved`) starts unchecked: freeing it loses that work for good. */
 export const FREE_GROUPS = {
     work_folders: {
         label: 'Finished tasks’ work folders',
@@ -23,6 +24,36 @@ export const FREE_GROUPS = {
         label: 'Working copies of finished work',
         loss: 'Ready-to-use copies of code. Their results and commits are kept.',
         unit: ['{n} copy', '{count} copies'],
+    },
+    review_evidence: {
+        label: 'Reviewers’ saved files of finished tasks',
+        loss: 'What reviewers of finished tasks set aside or changed in their copies: test-run records (often with whole environments and databases), logs, screenshots. Their verdicts stay in the review results.',
+        unit: ['{n} reviewer folder', '{count} reviewer folders'],
+        saved: true,
+    },
+    review_checkouts: {
+        label: 'Review copies no task owns',
+        loss: 'Copies of reviewed code from rounds no recorded task owns. A review that needs one makes it again; changes a reviewer left in one are not kept.',
+        unit: ['{n} copy', '{count} copies'],
+        saved: true,
+    },
+    lost_copies: {
+        label: 'Helper copies no record names',
+        loss: 'Copies of code whose record is gone. They may hold changes that were never moved into the project.',
+        unit: ['{n} copy', '{count} copies'],
+        saved: true,
+    },
+    service_folders: {
+        label: 'Leftover environments and test-run records',
+        loss: 'Environments of copies that are already gone, and records of finished test runs made inside copies.',
+        unit: ['{n} folder', '{count} folders'],
+        saved: true,
+    },
+    result_pins: {
+        label: 'Git marks of results never applied',
+        loss: 'Git marks of helper results their finished task never applied or rejected. The saved change stays in the task results and can still be applied as a plain patch; the space returns at Git’s next cleanup.',
+        unit: ['{n} result', '{count} results'],
+        saved: true,
     },
 };
 
@@ -45,6 +76,9 @@ const NOT_STARTED = {
 
 export const groupsOf = (free) => (Array.isArray(free?.groups) ? free.groups : []);
 const words = (group) => FREE_GROUPS[group?.id] || { label: String(group?.id || ''), loss: '', unit: ['{n} folder', '{count} folders'] };
+/** A new preview checks every group except those holding saved work. */
+export const startsChecked = (group) => !words(group).saved;
+const savedOf = (groups) => groups.filter((group) => group.count > 0 && words(group).saved);
 const groupBytes = (group) => (isSize(group?.bytes) ? group.bytes : 0);
 const chosen = (free, checked = null) => groupsOf(free).filter((group) => !checked || checked.has(group.id));
 /** The sum of the sizes known for the (checked) groups: unknown is never zero, so see `sumComplete`. */
@@ -189,7 +223,9 @@ export function trayHtml(free, ui, days = 7) {
     if (state === 'listing') return `${headHtml()}${listingHtml(free, checked, days)}`;
     if (state === 'ready') {
         return `${headHtml(sumLabel(free))}
-            <p class="storage-meta">Nothing here holds results, messages or model history.</p>
+            <p class="storage-meta">${savedOf(groupsOf(free)).length
+                ? 'Groups that hold saved work start unchecked; each says what goes.'
+                : 'Nothing here holds results, messages or model history.'}</p>
             ${checklistHtml(free, checked, days)}
             ${largestHtml(free)}
             <p class="storage-meta">Gone for good. Sizes are what the listed folders occupy; the space freed can be smaller.</p>
@@ -212,7 +248,7 @@ export function trayHtml(free, ui, days = 7) {
         return `${headHtml()}<p class="ui-status storage-status" data-tone="warn" data-i18n-fmt="storage.free.failed">${text(fmt('Temporary space could not be listed: {reason}. Nothing was removed.', { reason }))}</p>
             <div class="storage-actions">${button('Try again', 'data-free-preview')}</div>`;
     }
-    return `${headHtml()}<p class="storage-meta">Copies the app already removes on its own. Most of Ouroboros is kept on purpose.</p>
+    return `${headHtml()}<p class="storage-meta">Copies and leftovers of finished work. Most of Ouroboros is kept on purpose.</p>
         <div class="storage-actions">${button('Show what can go', 'data-free-preview')}</div>`;
 }
 
@@ -225,9 +261,12 @@ export function confirmCopy(free, checked) {
     const size = formatBytes(freeSum(free, checked));
     const removes = sumComplete(free, checked) ? fmt('This removes {size} for good.', { size })
         : fmt('This removes the checked folders for good; some of their sizes could not be read.');
+    const saved = savedOf(groups).map((group) => fmt(words(group).label));
+    const kept = saved.length ? fmt('Saved work goes too: {groups}.', { groups: saved.join('; ') })
+        : fmt('Results, messages and the exact model history are kept. Continuing one of these tasks later starts without its scratch files.');
     return {
         title: fmt('Free temporary space?'),
-        body: `${removes} ${fmt('Results, messages and the exact model history are kept. Continuing one of these tasks later starts without its scratch files.')}`,
+        body: `${removes} ${kept}`,
         details: {
             summary: fmt('Show details'),
             rows: groups.map((group) => ({ label: fmt(words(group).label), value: `${groupSize(group)} · ${unitOf(group, group.count)}` })),

@@ -1,6 +1,6 @@
 /**
  * Status marks (docs/DESIGN.md "Status marks"): the one small family of marks every surface uses to say what a work or
- * a room is doing — a Project row, Main's row, the Projects header, the phone menu button, a room's status, a Shade
+ * a room is doing — a Project row, Main's row, the Projects header, the phone menu button, a room's status, a work-list
  * row, a task card's chip, a question's head.
  *
  * Two facts, two channels. The SHAPE says what the work does; for projected work the server names it (`mark`:

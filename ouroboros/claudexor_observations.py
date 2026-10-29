@@ -107,31 +107,24 @@ def scope_honored(value: dict, model: str | None, request_kind: str = "text") ->
             and scope.get("requestKind") == request_kind and scope.get("basis") == "quota_block")
 
 
-def default_subject_aliases(roster: Any, harness: str, profile: str) -> tuple:
-    """Frozen unified default id may inherit null only after a positive roster read."""
-    if (not isinstance(roster, dict) or not isinstance(roster.get("accountPools"), list)
-            or not isinstance(roster.get("profiles"), list)
-            or profile != f"{harness}-default"):
-        return ()
-    return (None, "") if any(isinstance(row, dict) and isinstance(row.get("profile"), dict)
-        and row["profile"].get("harness_id") == harness and row["profile"].get("profile_id") == profile
-        for row in roster.get("profiles", [])) else ()
+def subject_rows(rows: Any, harness: str, profile: str = "") -> list[dict]:
+    """A pin matches only its literal engine subject, never a healthy sibling.
 
-
-def subject_rows(rows: Any, harness: str, profile: str = "", *, aliases: tuple = ()) -> list[dict]:
-    """A pin matches only its literal engine subject, never a healthy sibling."""
+    A null subject is an unprofiled route's own window (an explicit API key, a
+    bootstrap or rollback state), never a named row's, whatever that row's id;
+    Auto (no pin) still sees every subject of the harness.
+    """
     relevant = [row for row in rows if isinstance(row, dict)
             and isinstance(row.get("subject"), dict)
             and row["subject"].get("harness") == harness] if isinstance(rows, list) else []
-    exact = [row for row in relevant if not profile or row["subject"].get("subject_id") == profile]
-    return exact or [row for row in relevant if row["subject"].get("subject_id") in aliases]
+    return [row for row in relevant if not profile or row["subject"].get("subject_id") == profile]
 
 
 def resource_rows(rows: Any, harness: str, profile: str = "") -> list[dict]:
     """AccountResourceSnapshot uses AccountTarget, not a nullable quota subject.
 
-    Resource targets always name a profile: quota native-null aliases cannot
-    widen this independently typed identity or borrow another account's money.
+    Resource targets always name a profile: a null-target row cannot widen
+    this independently typed identity or borrow another account's money.
     """
     return [row for row in rows if isinstance(row, dict)
             and isinstance(row.get("target"), dict)
@@ -141,7 +134,7 @@ def resource_rows(rows: Any, harness: str, profile: str = "") -> list[dict]:
 
 
 def quota_availability(value: dict, harness: str, *, model: str | None = None,
-                       profile: str = "", request_kind: str = "text", aliases: tuple = ()) -> dict:
+                       profile: str = "", request_kind: str = "text") -> dict:
     """Project engine verdicts, never infer applicability from model spellings.
 
     Unknowns fail open at admission, not as a claim of execution readiness.
@@ -151,8 +144,8 @@ def quota_availability(value: dict, harness: str, *, model: str | None = None,
     unknown = {"state": "unknown", "resets_at": None}
     if not scope_honored(value, model, request_kind):
         return {**unknown, "reason": "availability_scope_unhonored"}
-    snapshots = subject_rows(value.get("snapshots"), harness, profile, aliases=aliases)
-    if not snapshots or subject_rows(value.get("absences"), harness, profile, aliases=aliases):
+    snapshots = subject_rows(value.get("snapshots"), harness, profile)
+    if not snapshots or subject_rows(value.get("absences"), harness, profile):
         return {**unknown, "reason": "quota_evidence_missing"}
     verdicts = []
     for row in snapshots:
@@ -192,13 +185,11 @@ def quota_observation(harness: str, model: str | None, profile: str = "", *, tim
                       request_kind: str = "text") -> dict[str, Any]:
     """Quota-only facts for one exact binding: the shared verdict and every scoped row, compact and dated.
 
-    One deadline covers the metadata connection, a default pin's roster proof and every
-    legacy view. A failed read, an unread envelope and an empty one stay distinct; an
-    unreadable roster only withholds the alias. Nothing refreshes, starts, selects or reads
-    money, and roster contents never leave here. Auto sees every subject of the harness.
+    One deadline covers the metadata connection and every legacy view. A failed read,
+    an unread envelope and an empty one stay distinct. Nothing refreshes, starts,
+    selects, reads the roster or reads money. Auto sees every subject of the harness.
     """
     from ouroboros.claudexor_daemon import read_owned_gateway
-    from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
     started = time.monotonic()
 
@@ -210,15 +201,9 @@ def quota_observation(harness: str, model: str | None, profile: str = "", *, tim
 
     fact: dict[str, Any] = {"requested_scope": {"model": model, "requestKind": request_kind,
                                                 "account": profile or "Auto"}}
-    aliases: tuple = ()
     try:
         gateway = read_owned_gateway(timeout_sec=left())
         try:
-            if profile == f"{harness}-default":
-                try:
-                    aliases = default_subject_aliases(gateway.credential_profiles(timeout_sec=left()), harness, profile)
-                except ClaudexorUnavailable as exc:
-                    fact["roster_error"] = passive_read_error(exc)
             value = read_quota(gateway, model=model, request_kind=request_kind, timeout_sec=left())
         finally:
             gateway.close()
@@ -226,13 +211,12 @@ def quota_observation(harness: str, model: str | None, profile: str = "", *, tim
         return {**fact, "read": "not_read", "reason": "observation_deadline_elapsed"}
     except Exception as exc:
         return {**fact, "read": "failed", "error": passive_read_error(exc)}
-    snapshots = subject_rows(value.get("snapshots"), harness, profile, aliases=aliases)
-    absences = subject_rows(value.get("absences"), harness, profile, aliases=aliases)
-    verdict = quota_availability(value, harness, model=model, profile=profile,
-                                 request_kind=request_kind, aliases=aliases)
+    snapshots = subject_rows(value.get("snapshots"), harness, profile)
+    absences = subject_rows(value.get("absences"), harness, profile)
+    verdict = quota_availability(value, harness, model=model, profile=profile, request_kind=request_kind)
     fact.update(read="ok", scope_honored=scope_honored(value, model, request_kind),
                 subjects=("every engine subject of the harness, enabled or not" if not profile
-                          else "the pin and its proven default alias" if aliases else "the exact pin"),
+                          else "the exact pin"),
                 availability={**verdict, "scope": "quota_only"},
                 snapshots=[_dated_row(row, snapshot=True) for row in snapshots],
                 absences=[_dated_row(row, snapshot=False) for row in absences])

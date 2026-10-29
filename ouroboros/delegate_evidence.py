@@ -102,7 +102,7 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
     failure_states: List[str] = []
     models: List[str] = []
     applied_access_profiles: List[str] = []
-    cost_total, cost_known, cost_estimated = 0.0, True, False
+    cost_total, cost_known, cost_estimated, cost_partial = 0.0, False, False, False
     # Scope finding (a5e59bdf gate): UNREADABLE custody must not collapse into the
     # same zero-count result as a proven empty one — a reader would then accuse a
     # nanny of "zero attempts" on evidence it never saw. The store answers or raises;
@@ -136,17 +136,19 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
             # pending/settled readers (nanny reminder) forever. No ledger row was
             # written, so its spend is undisclosed, never zero.
             failure_states.append("closed_absent")
-            cost_known = False
+            cost_partial = True
             continue
         if entry.terminal_state in custody.SUCCEEDED_STATES:
             succeeded.add(run_id)
         elif entry.terminal_state:
             failure_states.append(entry.terminal_state)
         if entry.spend_disclosed and entry.cost_usd is not None:
+            cost_known = True
             cost_total += float(entry.cost_usd)
             cost_estimated = cost_estimated or entry.spend_estimated
+            cost_partial = cost_partial or entry.cost_partial
         else:
-            cost_known = False
+            cost_partial = True
         # ENGINE-reported models only (SETTLED facts): the STARTED row's requested pin
         # with an owner default model is routinely non-empty and names a model that
         # never executed.
@@ -221,6 +223,7 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
         # The settlement row's own estimated/final distinction, carried instead of
         # dropped: an estimated sum must never render as an exact receipt.
         "subscription_cost_estimated": bool(settled and cost_known and cost_estimated),
+        "subscription_cost_partial": bool(settled and cost_partial),
         "harness_models": models,
         # Additive (D29 projection): the access the engine actually served,
         # from SETTLED rows only. Empty list = no receipt disclosed it.

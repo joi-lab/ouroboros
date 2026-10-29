@@ -2,8 +2,8 @@
 
 Docked: no visible title where the sidebar names the page (the h2 stays); the page's tabs or location take its place
 and its actions the end; the Project keeps its name, and a header with nothing to show renders no bar. Stack: one
-row of at most 56px, `☰ · title · status … Panic · ⋯`, tabs under it, the title one line and ellipsized; Restart and
-the budget inside ⋯. No icon anywhere."""
+row of at most 56px, `title · status · consciousness … Panic`, tabs under it, the title one line and ellipsized first;
+Restart and the budget in the status Shade. No ⋯, no More, no icon for a place."""
 from __future__ import annotations
 
 import re
@@ -33,7 +33,7 @@ def test_docked_header_hides_a_title_the_sidebar_names_and_an_empty_bar():
     assert ".app-page-lede" not in css, "a page has no caption line"
 
 
-def test_stack_header_is_one_row_of_at_most_56px_with_restart_and_budget_inside_the_menu():
+def test_stack_header_is_one_row_of_at_most_56px_with_restart_and_budget_in_the_status_shade():
     css = _read("web/style.css")
     row = _rule(css, 'html[data-layout="stack"] .app-page-header {')
     # 44px controls plus the 5px chrome inset above and below: 54, held at 56 by the min-height.
@@ -41,11 +41,11 @@ def test_stack_header_is_one_row_of_at_most_56px_with_restart_and_budget_inside_
     assert "var(--inset-top)" in row
     assert "flex-wrap: nowrap" in _rule(css, 'html[data-layout="stack"] .chat-page-header {')
     assert "flex-wrap: nowrap" in _rule(css, 'html[data-layout="stack"] .chat-header-actions {')
-    summary = _rule(css, 'html[data-layout="stack"] .chat-header-more > summary {')
-    assert "width: 44px" in summary and "height: 44px" in summary
-    assert 'html[data-layout="stack"] .chat-header-more-word { display: none; }' in css
-    assert '.chat-header-menu > .chat-budget-pill {' in css
-    # The note is a floating sibling under the bar, never a second row of it; the move into ⋯ follows the
+    assert "chat-header-more" not in css and "chat-header-menu" not in css, "no More, no ⋯"
+    room_work = _read("web/room_work.css")
+    assert ".rw-extras:empty { display: none; }" in room_work
+    assert ":root[data-theme] .rw-extras > :is(.chat-header-btn, .chat-budget-pill).ui-chrome-control {" in room_work
+    # The note is a floating sibling under the bar, never a second row of it; the move into the Shade follows the
     # bar's measured width as well as the layout (page_header.js), so a narrow docked column keeps one row too.
     assert '.chat-page-note {' in css and "top: var(--chat-header-bar, 56px)" in _rule(css, ".chat-page-note {")
     assert re.search(r"createHistoryControls\(messagesDiv, pageNote \|\| page\.querySelector\('\.chat-panel-statusbar'\)[,)]",
@@ -94,10 +94,16 @@ def test_the_status_word_clips_past_its_line_so_descenders_stay_whole():
     assert "padding-block: 0.15em" in badge and "margin-block: -0.15em" in badge
 
 
-def test_the_desktop_title_band_keeps_an_empty_header_as_a_plain_strip():
+def test_the_desktop_title_band_over_an_empty_header_is_the_windows_handle_not_a_row():
+    # Owner 22.10: the empty strip an empty header kept for the band cut the Widgets board. The band is the window's:
+    # the empty header lies over the top of its page as the window's handle (out of the flow, above the content, clear
+    # of the scrollbar), and the page's scroll body starts at the top edge with its first row padded below the band.
     css = _read("web/style.css")
     band = _rule(css, ':root[data-window-chrome="integrated"][data-layout="docked"] .app-page-header[data-empty] {')
-    assert "display: block" in band and "height: var(--window-chrome-top)" in band and "padding: 0" in band
+    assert "position: absolute" in band and "inset: 0 6px auto 0" in band and "z-index: 2" in band, band
+    assert "height: var(--window-chrome-top)" in band and "padding: 0" in band, band
+    board = _rule(css, ':root[data-window-chrome="integrated"][data-layout="docked"] .app-page-header[data-empty] ~ .widgets-scroll {')
+    assert "padding-top: calc(var(--space-4) + var(--window-chrome-top))" in board, board
     # Outside the desktop window an empty header still takes no room.
     assert "display: none" in _rule(css, 'html[data-layout="docked"] .app-page-header[data-empty] {')
 
@@ -110,8 +116,14 @@ def test_a_desk_bar_starts_with_its_pages_navigation_and_ends_with_its_actions()
     bar = _rule(css, 'html[data-layout="docked"] .app-page-header[data-lead] {')
     assert 'grid-template-areas: "title toolbar"' in bar and "padding-block: 0" in bar and "min-height: 50px" in bar
     # The band's height only where the shell measured it (tests/test_launcher_window_chrome.py: no phantom spacer).
+    # At every Interface size the row is the band and the tabs' top inset shrinks with it (10px at 100 %), so the
+    # tabs stay level with the traffic lights where a 50px floor left them below once the band shrank.
     band = _rule(css, ':root[data-window-chrome="integrated"][data-layout="docked"] .app-page-header[data-lead] {')
-    assert "min-height: max(50px, var(--window-chrome-top))" in band
+    assert "min-height: var(--window-chrome-top)" in band and "50px" not in band, band
+    assert "--lead-inset: min(10px, max(0px, calc((var(--window-chrome-top) - var(--chrome-control-h)) / 2)))" in band
+    inset = _rule(css, ':root[data-window-chrome="integrated"][data-layout="docked"] .app-page-lead .app-tab-strip {')
+    # Both insets shrink together, so the actions centred in the row stay level with the tabs.
+    assert "padding-top: var(--lead-inset)" in inset and "padding-bottom: calc(16px + var(--lead-inset))" in inset
     controls = _rule(css, 'html[data-layout="docked"] .app-page-header[data-lead] > .app-page-toolbar :is(.btn, button) {')
     tab = _rule(css, 'html[data-layout="docked"] .app-page-lead .app-tab {')
     assert "height: var(--chrome-control-h)" in controls and "height: var(--chrome-control-h)" in tab

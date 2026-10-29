@@ -113,7 +113,7 @@ def route_facts_text(tool_ctx, *, model: str, use_local: bool, role: str, failed
         ("status_code", "HTTP {}"), ("provider_code", "code {}"), ("resource_refusal", "resource refusal {}"))
         if failure.get(key))
     meaning = {"provider_outcome_unknown": " That attempt's outcome and cost stay unknown.",
-               "transport_unavailable": " That request never left this host."}.get(code, "")
+               "transport_unavailable": " The complete request did not reach the provider; generation did not start."}.get(code, "")
     error = (f" Recorded error text: {json.dumps(str(failure['error']), ensure_ascii=False)}."
              if failure.get("error") else "")
     return (f"[ROUTE FACTS] This task's primary route is {label(target, primary['role'])}; "
@@ -258,6 +258,7 @@ def record_round_route_result(ctx, role: str, *, accepted: bool) -> None:
             and tuple(binding) == route_binding(primary["model"], bool(primary["use_local"]), primary["role"],
                                                 overrides=waiter.overrides if waiter else None)):
         ctx.accumulated_usage[PRIMARY_CALL_KEY] = {**call, "binding": list(binding)}  # its own facts and binding
+        owner._primary_view = None  # the primary answered on its own view: nothing is held for a return any more
     previous = getattr(owner, "_accepted_route_binding", None)
     previous_observed = getattr(owner, "_accepted_model_route", None)
     owner._accepted_route_binding = binding
@@ -269,3 +270,53 @@ def record_round_route_result(ctx, role: str, *, accepted: bool) -> None:
     ctx.accumulated_usage.setdefault("accepted_routes", []).append(row)
     if isinstance(getattr(owner, "_execution_trace", None), dict):
         owner._execution_trace.setdefault("accepted_routes", []).append(row)
+
+
+def held_primary_view(owner, plan, start_mode, *, model: str, use_local: bool, role: str):
+    """The plan and start mode a route switch rebinds from.
+
+    The first departure from the task's primary holds the view it showed there, keyed to the primary's model and
+    locality: rebinds before adoption (a walk candidate, its observed account, a wait card's choice) still read the
+    primary as acting and never replace it. A return to the primary resumes the held view, so the narrowing another
+    route's window wrote into every book leaves with that route, while the primary's own lowering (its start fit, a
+    real overflow before it left) and my forms selected meanwhile (``hold_selection``) stay, and the window of the
+    account now serving it may narrow the view again. Accounts are not part of this identity: one model shows one
+    view, and an account is not reliably known while a walk or a wait card is still switching. So a fallback on the
+    primary's model with another account keeps the view it is shown, as before. The primary and the target are the
+    models their roles resolve to under the owner's wait-card choices, while the acting pair is the route that showed
+    the view (a card writes its choice before this rebind). A switch on the same route (account rotation, a wait's
+    reprepare) or to a primary whose model changed meanwhile never raises the mode. The hold is in memory only;
+    after a restart a return keeps the acting view.
+    """
+    primary = getattr(owner, "primary_route", None)
+    if not isinstance(primary, dict) or not primary.get("model"):
+        return plan, start_mode
+    from ouroboros.model_slots import route_binding
+    from ouroboros.model_wait import current_model_wait
+
+    overrides = getattr(current_model_wait(), "overrides", None)
+    home = route_binding(str(primary["model"]), bool(primary["use_local"]), primary["role"], overrides=overrides)[:2]
+    acting = (str(getattr(owner, "active_model", "") or ""), bool(getattr(owner, "active_use_local", False)))
+    target = route_binding(str(model or ""), bool(use_local), role, overrides=overrides)[:2]
+    held = getattr(owner, "_primary_view", None)
+    if held is not None and (held[0] != home or held[1].core_sha256 != plan.core_sha256):
+        held = owner._primary_view = None  # another primary or core: that view is no longer the primary's own
+    if held is None and acting == home != target:
+        owner._primary_view = (home, plan)
+    elif held is not None and target == home != acting:
+        return held[1], held[1].initial_mode
+    return plan, start_mode
+
+
+def hold_selection(owner, addresses, *, owner_note: bool) -> None:
+    """Forms I select while another route acts stay mine on the held primary view too; a form the held view
+    cannot take releases the hold, so a return keeps the acting view with my choice instead of losing it."""
+    held = getattr(owner, "_primary_view", None)
+    if held is None or not addresses:
+        return
+    from ouroboros.memory_floor import select_view
+
+    try:
+        owner._primary_view = (held[0], select_view(held[1], held[1].initial_mode, addresses, owner_note=owner_note))
+    except ValueError:
+        owner._primary_view = None

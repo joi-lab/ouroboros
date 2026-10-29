@@ -61,9 +61,7 @@ warning | web/style.css | .chat-composer-chip[data-tone="warn"] .chat-chip-dot |
 warning | web/style.css | .chat-delegated-final | color
 warning | web/style.css | .chat-delegated-problem | color
 warning | web/style.css | .chat-live-line.warn .chat-live-line-title | color
-warning | web/style.css | .chat-live-review-summary[data-warning="1"] | color
 warning | web/style.css | .chat-quiz-storage-note | color
-warning | web/style.css | .chat-review-attempt.warn | border-inline-start-color
 warning | web/style.css | .document-reader-notice | background, border-bottom, color
 warning | web/style.css | .harness-exhausted | background
 warning | web/style.css | .harness-exhausted .harness-account-meta | color
@@ -97,7 +95,7 @@ warning | web/onboarding.css | .settings-inline-note[data-tone="warn"] | color
 warning | web/onboarding.css | .settings-inline-status[data-tone="warn"] | color
 warning | web/onboarding.css | .wizard-inline-note[data-tone="warn"] | color
 warning | web/onboarding.css | .wizard-test-result[data-tone="warn"] | border-color, color
-# The System voice: its bubble, sender and text, quotes of a System message, the skill review it shows.
+# The System voice: its bubble, sender and text (chat and the Place reader), quotes of a System message, the skill review it shows.
 system | web/style.css | .chat-bubble.system | background
 system | web/style.css | .chat-bubble.system .message | color
 system | web/style.css | .chat-bubble.system .sender | color
@@ -111,13 +109,19 @@ system | web/style.css | .skill-review-summary-button:hover | background
 system | web/style.css | .skill-review-summary-main | color
 system | web/style.css | .skill-review-toggle-label | color
 system | web/style.css | :root[data-theme="light"] .skill-review-summary-main | color
+system | web/consciousness.css | .place-convo-row.is-system | background
+system | web/consciousness.css | .place-convo-row.is-system .place-convo-text | color
+system | web/consciousness.css | .place-convo-row.is-system .place-convo-who | color
 system | web/consciousness.css | .place-sheet-section p.place-silent-card | background, color
-# Data categories, not statuses: the Logs task category, code highlighting, the Storage temporary segment.
+# Data categories, not statuses: the Logs task category, code highlighting, the Storage temporary segment, the
+# fourth default chart series.
 data | web/style.css | .log-type.tasks | color
 data | web/style.css | .md-code-block .hljs-class .hljs-title | color
 data | web/style.css | .md-code-block .hljs-type | color
 data | web/style.css | :is(.storage-bar-seg, .storage-key)[data-group="temporary"] | background
 data | web/style.css | :root[data-theme="light"] .md-code-block .hljs-class .hljs-title | color
+data | web/ui.css | :root | --chart-series-4
+data | web/ui.css | :root[data-theme="light"] | --chart-series-4
 # The palette that defines the amber tokens and their aliases.
 palette | web/ui.css | :root | --amber, --mark-owner, --status-warn-fg, --status-warn-word, --system-sender
 palette | web/ui.css | :root[data-theme="light"] | --amber, --amber-dim, --status-warn-bg, --status-warn-border, --status-warn-fg
@@ -125,9 +129,9 @@ palette | web/ui.css | :root[data-theme="light"] | --system-bubble-bg, --system-
 palette | web/ui.css | :root[data-theme="light"] | --tone-amber-hover
 """
 
-# How many amber references each first-party script may hold, all data categories: a chart series colour (a widget
-# chart's palette) and Logs' task category.
-SCRIPT_AMBER = {"web/modules/log_events.js": 1, "web/modules/widget_chart.js": 2}
+# How many amber references each first-party script may hold, all data categories: the fourth default chart series
+# (theme_palette.js, which host charts draw from) and Logs' task category.
+SCRIPT_AMBER = {"web/modules/log_events.js": 1, "web/modules/theme_palette.js": 1}
 
 
 def _decommented(css: str) -> str:

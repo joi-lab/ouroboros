@@ -1,7 +1,7 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.3.7
+version: 1.3.9
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -53,8 +53,8 @@ notices, in a bounded durable message map. Replying passes its host row or work
 reference through normal chat; Ouroboros decides what it means. Unknown or
 evicted ids add nothing. Answers to an earlier owner message from this Telegram
 chat use a native reply; answers to its latest owner message stay unquoted.
-Silent mode edits only within one task episode and reply origin; Continue
-episodes remain separate messages. Relay success stays silent; a host-reported
+Silent mode replaces a progress note only within one task episode and reply
+origin; Continue episodes remain separate messages. Relay success stays silent; a host-reported
 failure arrives as one line. A relayed row quotes the owner's words verbatim as
 plain text, under where he wrote them and with the file names, above the note; a
 note between works that quotes none of his words stays in its room.
@@ -70,6 +70,23 @@ its whole tree: `$3.42` when final, `up to $3.42` while costs may still arrive,
 Version 1.3.6 sends Wrap up's saved-work receipt, which the host types as a terminal
 receipt, even with progress mirroring off; other card rows still follow that toggle.
 Version 1.3.7 sends no finish notification for a run that finished quietly.
+Version 1.3.8 paints the Mini App's connecting page in the interface's light or dark:
+the Mini App's saved Light or Dark, else Telegram's own, as the page that follows it does.
+Version 1.3.9 makes Silent mode mean no sound: replies, the final answer and progress,
+Ouroboros's own technical notes included, arrive without sound, every authored message
+stays its own message, and only a one-message progress note is replaced by the next one
+of its episode; questions, files and problems keep their sound. A question card is the
+answer's receipt: it shows the answer Ouroboros recorded, never the words or option sent
+from here, and whether its delivery is saved for the task, pending or unknown; no line
+says the task read it. A tap also gets a toast. A tap or a text answer gets one message
+only for a conflict, which names the recorded answer, a closed question, an error, an
+unconfirmed answer, or a card that could not be updated.
+A card goes out as one message only while its answered form still fits in the install's
+language. A request Ouroboros refused is told in one message replying to it, even to the
+latest message: its target and the host's reason, then the choice of target when one is
+needed, then the files that were not attached. The System line the web shows for the same
+refusal comes here only when no acknowledgement carried the reason, and an accepted
+request stays silent.
 
 Version 1.2.1 marks questions that wait for an owner answer and clears the
 waiting line after an answer submitted through Telegram.
@@ -116,7 +133,7 @@ Required, unresolved or unknown review obligations remain disclosed. Previously
 stored Off values now mean no extra notices; no setting is migrated or added.
 The status-only Main mirror follows this toggle too; preserved intermediate
 content still arrives. Ordinary replies, files and questions are independent, as is
-`TELEGRAM_SILENT_MODE` (editing consecutive replies). IDs observed while Off
+`TELEGRAM_SILENT_MODE` (replies without sound). IDs observed while Off
 remain seen, so enabling does not replay that backlog. Older summary rows without
 the host's compact cause projection retain their original reason text when On.
 

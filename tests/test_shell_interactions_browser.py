@@ -580,6 +580,13 @@ SIDEBAR_FACTS = """() => {
     return {rows: rows.map((e) => e.querySelector('[data-project-id]').dataset.projectId),
             gapToTools: Math.round(files.top - zone.bottom), filesTop: Math.round(files.top),
             sidebarBottom: Math.round(side.getBoundingClientRect().bottom),
+            // The foot: how far the version row's bottom sits above the column's content edge (0 = on the edge), and
+            // whether the column itself scrolls (the short-window fallback, where the foot is pinned over it).
+            footGap: Math.round(side.getBoundingClientRect().bottom - parseFloat(getComputedStyle(side).paddingBottom)
+                - side.querySelector('.sidebar-foot-meta').getBoundingClientRect().bottom),
+            footBelowTools: side.querySelector('.sidebar-foot-meta').getBoundingClientRect().top
+                >= side.querySelector('[data-nav-page="settings"]').getBoundingClientRect().bottom - 0.5,
+            columnScrolls: side.scrollHeight > side.clientHeight + 1,
             showAll: Boolean(document.getElementById('nav-projects-show-all')),
             header: {shape: mark.dataset.shape, hue: mark.dataset.hue, drawn: getComputedStyle(mark).display !== 'none'},
             expanded: document.getElementById('nav-projects-toggle').getAttribute('aria-expanded')};
@@ -614,8 +621,14 @@ def test_collapsed_projects_keep_only_the_pinned_ones_and_the_tools_follow(shell
     assert collapsed['expanded'] == 'false' and collapsed['rows'] == pins, facts
     assert collapsed['showAll'] is False, facts
     assert collapsed['header'] == facts['open']['header'] == {'shape': 'moving', 'hue': 'ink', 'drawn': True}, facts
-    # The tools follow the Projects zone: no empty room between them (the free room is under the last row).
+    # The tools follow the Projects zone: no empty room between them (owner 18.10). The version and the update rest on
+    # the bottom edge in every state (owner 22.10): the free room lies between the tools and the foot.
     assert collapsed['gapToTools'] <= 24 and collapsed['filesTop'] < collapsed['sidebarBottom'] - 200, facts
+    for state in ('open', 'collapsed', 'expanded'):
+        side = facts[state]
+        assert side['footBelowTools'], (state, facts)
+        if not side['columnScrolls']:
+            assert abs(side['footGap']) <= 1, (state, facts)
     assert facts['open']['expanded'] == 'true' and len(facts['open']['rows']) == len(PROJECTS), facts
     assert facts['expanded']['expanded'] == 'true' and len(facts['expanded']['rows']) == len(PROJECTS), facts
 

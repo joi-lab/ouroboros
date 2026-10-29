@@ -101,7 +101,8 @@ def _connector_facts(manifest: Any, *, icon_source: bytes | None = None) -> Dict
         icon = places[0].get("icon", "")
     services = [str(row.get("destination") or "")[len("vendor:"):].strip() for row in places
                 if str(row.get("destination") or "").startswith("vendor:")]
-    return {"connects": connect_services(services), "icon": icon_spec(icon, icon_source)}
+    return {"connects": connect_services(services), "icon": icon_spec(icon, icon_source),
+            "title": getattr(manifest, "raw_extra", {}).get("title") or next((p["label"] for p in places if p.get("label")), "")}
 
 
 def connect_services(*values: Any) -> List[str]:
@@ -444,7 +445,7 @@ def items_for(row: Dict[str, Any], snapshot: Optional[Dict[str, Any]]) -> List[D
         source = entry.get("source") or {}
         item = {
             "id": f"{row['id']}/{entry['name']}", "source_id": row["id"], "source_name": row["name"],
-            "trust": row["trust"], "name": entry["name"], "description": entry.get("description", ""),
+            "trust": row["trust"], "name": entry["name"], "title": entry.get("title", ""), "description": entry.get("description", ""),
             "category": list(entry.get("category") or []), "version": entry.get("version", ""),
             "digest": entry.get("digest", ""), "official": is_official,
             "recommended": is_official and endorsed.get("recommended") is True,

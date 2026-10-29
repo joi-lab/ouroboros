@@ -27,7 +27,7 @@ def routes(monkeypatch, tmp_path):
                                          (299_999, 1.0), (1_200_001, 1.0)])
 def test_exact_local_route_crosses_storage_keys_but_respects_size(routes, monkeypatch, tmp_path, raw, expected):
     local, remote, foreign = routes
-    monkeypatch.setattr(ce, "_load", lambda root: {"token_density": {
+    monkeypatch.setattr(ce, "_read", lambda root: {"token_density": {
         "local-model": {"pairs": [_witness(600_000, 1.4, route=local), _witness(600_000, 2.0, route=foreign)]},
         MODEL: {"pairs": [_witness(600_000, 0.9, route=remote)]},
     }})
@@ -38,7 +38,7 @@ def test_exact_local_route_crosses_storage_keys_but_respects_size(routes, monkey
 
 def test_foreign_local_model_and_stale_or_old_basis_witnesses_cannot_calibrate(routes, monkeypatch, tmp_path):
     local, _remote, foreign = routes
-    monkeypatch.setattr(ce, "_load", lambda root: {"token_density": {
+    monkeypatch.setattr(ce, "_read", lambda root: {"token_density": {
         "local-model": {"pairs": [_witness(600_000, 1.4, route=foreign),
                                   _witness(600_000, 1.4, route=local, observed="2000-01-01T00:00:00Z"),
                                   _witness(600_000, 1.4, route=local, basis="raw")]},

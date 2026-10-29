@@ -214,7 +214,14 @@ def _chat_record(
             "task_id": str(task_id or ""),
         }
         if direction == "in":
+            from ouroboros.settings_integrity import effective_subagents_mode
+
             record["message_accepted_at"] = utc_now_iso()
+            try:
+                if effective_subagents_mode(task={"chat_id": chat_id}, drive_root=root) == "swarm":
+                    record["subagents_mode"] = "swarm"
+            except Exception:
+                log.debug("Subagents label unavailable for the inbound row", exc_info=True)
         if direction == "in" and source == "web" and client_message_id and require_write:
             # The canonical append is the proof used by the live echo. Keep it
             # on that SAME row so history can replay the fact after a reload.
@@ -245,6 +252,8 @@ def _chat_record(
                 record[key] = dict(meta[key])
         if meta.get("reply_to_relay"):
             record["reply_to_relay"] = str(meta["reply_to_relay"])
+        if isinstance(meta.get("presence_contact"), dict):
+            record["presence_contact"] = dict(meta["presence_contact"])
         if meta.get("late_answer"):
             from ouroboros.owner_quiz import late_answer_ref
             accepted_answer = late_answer_ref(meta["late_answer"])
@@ -553,6 +562,7 @@ def record_inbound_message(bridge, message: dict, *, chat_id: int, user_id: int,
             "sender_session_id": str(message.get("sender_session_id") or ""),
             "client_message_id": client_message_id, "transport": message.get("transport") or {},
             "chat_id": chat_id, **(projection_fields(row) if row else {}),
+            **({"subagents_mode": "swarm"} if row and row.get("subagents_mode") == "swarm" else {}),
         })
     return ref
 
@@ -665,6 +675,8 @@ def handle_web_message(
                 "sender_session_id": sender_session_id, "client_message_id": message_id,
                 "ingress_accepted": True,  # Canonical row exists; execution is not promised.
             }
+            if row.get("subagents_mode") == "swarm":
+                echo["subagents_mode"] = "swarm"
             if placeholder:
                 echo["text_placeholder"] = True
             # Positive call-entry evidence, never the acceptance stamp alone; a deferred dispatch is still pending.

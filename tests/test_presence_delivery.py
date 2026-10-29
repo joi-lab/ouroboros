@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from tests.test_host_service_api import FakeBridge, _seed_presence_behavior, _se
 from tests._store_shared import seed_result
 from tests._dialogue import chat_rows, import_all
 from ouroboros import dialogue_store as ds
+from tests.test_place_focus import focus as focus, task_for
 
 
 @pytest.fixture(autouse=True)
@@ -96,6 +98,7 @@ def test_http_records_exact_facts_with_nonterminal_history_type(tmp_path, state,
     {"part_id": 0}, {"part_id": "part-0"}, {"account_id": ""}, {"text": None},
     {"origin": {"kind": "tool", "authority": "owner"}}, {"message": []},
     {"profile": "caller-cannot-supply-authority"},
+    {"sends_as": {"id": "forged", "label": "Forged", "kind": "user"}}, {"sends_as_owner": True},
 ])
 def test_invalid_wire_is_400_without_chat_mutation(tmp_path, change):
     response = _post(_client(tmp_path), _payload(**change))
@@ -274,6 +277,47 @@ def test_task_lineage_requires_stored_task_owned_by_reporting_transport(tmp_path
     assert row["task_id"] == ("turn-1" if owner == "transport" else "")
     assert row["transport"]["origin"] == payload["origin"]
     assert ("presence_provenance" in row["transport"]["delivery"]) is (owner == "transport")
+
+
+@pytest.mark.parametrize("reporter", ["bridge", "other-bridge"])
+@pytest.mark.parametrize("sends_as_owner", [False, True])
+@pytest.mark.parametrize("identity", [None, {"reads_as": []}, {
+    "sends_as": {"id": "account", "label": "Mailbox café", "kind": "user"},
+}])
+def test_receipt_keeps_focus_identity_snapshot_without_changing_v1(focus, identity, sends_as_owner, reporter):
+    root, _, _, _ = focus
+    task = task_for(focus)
+    task["metadata"]["focus"].update(identity=identity, identity_owner=sends_as_owner)
+    seed_result(root, task["id"], {**task, "status": "running"})
+    payload = _payload(provider="chat", account_id="a", conversation_id="r", thread_id="",
+                       origin={"kind": "automatic", "task_id": task["id"], "source_event_id": "event1"})
+    recorder = delivery.PresenceDeliveryRecorder(root)
+    assert recorder.record(reporter, payload)["duplicate"] is False
+    row, = _rows(root)
+    sends_as = (identity or {}).get("sends_as")
+    if sends_as and reporter == "bridge":
+        assert row["transport"]["sends_as"] == sends_as
+        assert row["transport"]["sends_as_owner"] is sends_as_owner
+    else:
+        assert "sends_as" not in row["transport"] and "sends_as_owner" not in row["transport"]
+    assert delivery._payload_from_row(row) == (reporter, payload)
+    # Receipt replay uses its original snapshot even after task metadata changes.
+    task["metadata"]["focus"].update(identity={"sends_as": {"id": "new", "label": "New", "kind": "bot"}},
+                                      identity_owner=not sends_as_owner)
+    seed_result(root, task["id"], {**task, "status": "running"})
+    assert delivery.PresenceDeliveryRecorder(root).record(reporter, payload)["duplicate"] is True
+    assert _rows(root) == [row]
+
+
+def test_own_clock_receipt_has_no_focus_identity(tmp_path):
+    wake = json.loads((Path(__file__).parent / "fixtures/wake_document_214a31b6.json").read_text(encoding="utf-8"))
+    assert "finished_at" not in wake and wake["terminal_time"]["occurred_at"] and wake["wake_silent"]
+    seed_result(tmp_path, wake["task_id"], wake)
+    payload = _payload(origin={"kind": "tool", "task_id": wake["task_id"]})
+    delivery.PresenceDeliveryRecorder(tmp_path).record("transport", payload)
+    row, = _rows(tmp_path)
+    assert "sends_as" not in row["transport"] and "sends_as_owner" not in row["transport"]
+    assert delivery._payload_from_row(row) == ("transport", payload)
 
 
 def _turn_payload(binding_id):

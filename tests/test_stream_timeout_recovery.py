@@ -365,8 +365,8 @@ def test_restored_repeat_buys_no_deadline_summary_and_keeps_its_facts(wire_env, 
 
 @pytest.mark.parametrize("linked", [True, False], ids=["reaper_links", "owner_claim_alone"])
 def test_new_id_recovery_keeps_the_predecessors_failure_refs_readable(wire_env, sleeps, monkeypatch, linked):
-    """A successor publishes the predecessor's failure rows; promotion verifies their sources under that
-    owner only along the reaper's reciprocal retry links (same-ID settlement is pinned above)."""
+    """A stored pre-upgrade successor publishes the predecessor's failure rows; promotion verifies their
+    sources under that owner only along its reciprocal retry links (same-ID settlement is pinned above)."""
     from ouroboros import agent_task_pipeline as pipeline, observability as obs
     from ouroboros.task_results import load_task_result
 
@@ -379,7 +379,7 @@ def test_new_id_recovery_keeps_the_predecessors_failure_refs_readable(wire_env, 
     task = {"id": successor, "_attempt": 2, "type": "task", "chat_id": 1, "text": "Research",
             "parent_task_id": PARENT, "root_task_id": PARENT, "delegation_role": "subagent",
             "original_task_id": CHILD, "timeout_retry_from": CHILD}
-    if linked:  # the rows task_reaper._run_retry_admission_transaction writes
+    if linked:  # the rows a pre-upgrade timeout retry admission wrote
         write_task_result(wire_env, successor, "scheduled", original_task_id=CHILD, timeout_retry_from=CHILD)
         write_task_result(wire_env, CHILD, "interrupted", retry_task_id=successor, superseded_by=successor)
     assert wc.attach_recovery(wire_env, task, source_task_id=CHILD, from_attempt=1, cause="idle_timeout")

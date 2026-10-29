@@ -358,7 +358,7 @@ def test_build_onboarding_html_serves_a_real_page_with_linked_modules():
     assert "openai::gpt-5.6-luna" in html
     assert "anthropic::claude-sonnet-5" in html
     assert "minimax::MiniMax-M3" in html
-    assert "minimax::MiniMax-M2.7" in html
+    assert "minimax::MiniMax-M3.1-Flash" in html
     # The wizard's own source is no longer copied into the page body.
     assert "const STEP_ORDER = bootstrap.stepOrder" not in html
 
@@ -587,9 +587,11 @@ def test_wizard_keeps_a_typed_completion_refusal_visible_with_its_real_reason():
     source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
 
     # The typed fields are read by ONE pure reader (node-tested branch by
-    # branch in web/tests/onboarding_agents_step.test.js); the wizard only has
-    # to carry them onto the Error it renders from.
-    assert "readCompletionAnswer({" in source
+    # branch in web/tests/onboarding_agents_step.test.js; the POST around it in
+    # onboarding_completion_attempt.test.js); the wizard only has to carry them
+    # onto the Error it renders from.
+    assert "await postCompletion(ONBOARDING_COMPLETE_ENDPOINT, payload)" in source
+    assert "return readCompletionAnswer({" in (REPO / "web/modules/onboarding_agents_step.js").read_text(encoding="utf-8")
     assert "Object.assign(error, answer.failure);" in source
     assert "completionFailureNotice(error)" in source
     assert "state.presetFailure = notice.canSkip" in source
@@ -662,7 +664,7 @@ def test_setup_contract_has_no_secret_values():
     assert "anthropic/claude-sonnet-5" in suggestions
     assert "anthropic::claude-sonnet-5" in suggestions
     assert "minimax::MiniMax-M3" in suggestions
-    assert "minimax::MiniMax-M2.7" in suggestions
+    assert "minimax::MiniMax-M3.1-Flash" in suggestions
     assert "deepseek::deepseek-v4-pro" in suggestions
     assert "deepseek::deepseek-v4-flash" in suggestions
     assert empty_bootstrap["initialState"]["totalBudget"] == 200.0
@@ -675,7 +677,7 @@ def test_setup_contract_has_no_secret_values():
     initial = bootstrap["initialState"]
     assert initial["providerProfile"] == "minimax"
     assert initial["mainModel"] == "minimax::MiniMax-M3"
-    assert initial["lightModel"] == "minimax::MiniMax-M2.7"
+    assert initial["lightModel"] == "minimax::MiniMax-M3.1-Flash"
 
     deepseek_bootstrap = build_setup_bootstrap({"DEEPSEEK_API_KEY": "ds-hidden-value"}, "web")
     deepseek_initial = deepseek_bootstrap["initialState"]

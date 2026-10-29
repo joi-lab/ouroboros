@@ -705,13 +705,13 @@ def test_terminal_event_reports_failed_bundle_over_older_capture_status(tmp_path
 def test_task_done_carries_the_custody_debt_list_the_row_holds(tmp_path, monkeypatch, open_run):
     """P5 S1: one debt rule on every surface, from one source.
 
-    The owner-facing Reason line names the custody warning only while the row's
-    own ``delegated_runs_unreconciled`` list is non-empty. The durable row
-    carries that list; the live ``task_done`` event did not, so the card had to
-    guess from the stamped code alone and the browser and the host rendered the
-    same record differently. The event now copies the stored list whenever the
-    row has one, and absent stays absent: a record with no list states nothing
-    about the debt, on either surface.
+    The owner-facing headline and Reason line name the custody debt only while the
+    row's own ``delegated_runs_unreconciled`` list is non-empty, and the debt never
+    replaces the task's reason (#1583). The durable row carries that list; the live
+    ``task_done`` event copies the stored list whenever the row has one, and absent
+    stays absent: a record with no list states nothing about the debt, on either
+    surface. The final frame the owner reads first carries the open list beside its
+    own cause too (``progress_meta``, the owed-outbox copy).
     """
     monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *args, **kwargs: None)
     from ouroboros.task_results import write_task_result
@@ -737,7 +737,15 @@ def test_task_done_carries_the_custody_debt_list_the_row_holds(tmp_path, monkeyp
     stored = pipeline.load_task_result(tmp_path, "custody-open")
     expected = ["run-a1"] if open_run else []  # the addressed current fact clears stale stored debt
     assert owed["delegated_runs_unreconciled"] == expected == stored["delegated_runs_unreconciled"]
-    assert (owed["reason_code"] == "delegated_custody_unreconciled") is open_run
+    assert owed["reason_code"] == stored["reason_code"] == "final_message", "the debt never replaces the cause"
+    assert "warning" not in (owed["outcome_axes"].get("objective") or {})
+    from ouroboros.project_dialogue import completion_status_label
+
+    assert completion_status_label({}, owed) == ("Done with warnings" if open_run else "Done")
+    final = next(row for row in owed_events if row["type"] == "send_message")
+    meta = final["progress_meta"]
+    assert meta["reason_code"] == "final_message"
+    assert meta.get("delegated_runs_unreconciled", []) == expected
 
     plain_events = []
     pipeline.emit_task_results(

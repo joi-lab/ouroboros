@@ -1341,7 +1341,7 @@ def _handle_skill_owner_action(
 _REVIEW_SCHEMA = {
     "name": "skill_review",
     "description": (
-        "Run skill review by the review panel on one external skill package "
+        "Run skill review by the review panel (paid; an unchanged snapshot replays free) on one external skill package "
         "using the review pool configuration and scored against the "
         "Skill Review Checklist section in docs/CHECKLISTS.md. Persists the "
         "verdict to data/state/skills/<name>/review.json with a content "
@@ -1405,7 +1405,7 @@ _REVIEW_SCHEMA = {
 _EXEC_SCHEMA = {
     "name": "skill_exec",
     "description": (
-        "Execute a script from an external skill package. The skill must be "
+        "Run one manifest-declared script of a type=script skill. The skill must be "
         "enabled and its review_gate must permit the current bytes: outside "
         "Cyber Pro, a current executable reviewer verdict or a qualified "
         "Advisory author acceptance of these exact bytes (the reviewer status "
@@ -1414,8 +1414,8 @@ _EXEC_SCHEMA = {
         "dependencies still apply. Only type=script "
         "skills execute via this substrate — type=instruction skills are "
         "catalogued + reviewable but have no executable payload by "
-        "design; type=extension skills run IN-PROCESS via the Phase 4 "
-        "extension_loader (calling skill_exec on an extension returns "
+        "design; type=extension skills expose their own tools, routes and "
+        "handlers instead (calling skill_exec on an extension returns "
         "SKILL_EXEC_EXTENSION pointing at that surface). The ``script`` "
         "argument must match a "
         "``name`` entry in the manifest's ``scripts:`` array (SKILL.md "
@@ -1423,8 +1423,8 @@ _EXEC_SCHEMA = {
         "Runtime allowlist: python/python3/bash/node/deno/ruby/go. The subprocess "
         "runs with cwd=skill_dir, a scrubbed env (env_from_settings "
         "keys only), panic-kill tracking, and a timeout from the "
-        "manifest (capped at 300s). v5.1.2 Frame A: OUROBOROS_RUNTIME_MODE "
-        "no longer gates execution — light, advanced, and pro all let "
+        "manifest (capped at 300s). OUROBOROS_RUNTIME_MODE does not gate "
+        "execution — light, advanced, and pro all let "
         "reviewed + enabled skills run. Light still blocks repo "
         "self-modification and the runtime_mode elevation ratchet."
     ),

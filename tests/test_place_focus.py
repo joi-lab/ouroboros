@@ -40,7 +40,7 @@ def test_focus_no_ceiling_host_actor_prompt(focus):
     assert "capability_ceiling" not in task["task_contract"]
     assert task["_is_direct_chat"] and task["_presence_turn"]
     assert meta["root_cost_ceiling_usd"] <= 2 and "configure_presence" in meta["disabled_tools"]
-    template = Path("prompts/FOCUS.md").read_text()
+    template = Path("prompts/FOCUS.md").read_text(encoding="utf-8")
     assert {key for _lit, key, _fmt, _conv in string.Formatter().parse(template) if key} == set(PLACEHOLDERS)
     rendered = frame_focus_content(task, "The untrusted event")
     assert "The untrusted event" in rendered and "Already started: task1" in rendered
@@ -177,7 +177,7 @@ def test_place_arrival_is_context_only_and_deduplicated(focus):
             _accepting_owner_messages=True, _busy=True, _current_task_id="another-author")
         assert offer_to_author(root, task, event)
         assert offer_to_author(root, task, event)
-        rows = [json.loads(line) for line in _mailbox_path(root, "another-author").read_text().splitlines()]
+        rows = [json.loads(line) for line in _mailbox_path(root, "another-author").read_text(encoding="utf-8").splitlines()]
         assert len(rows) == 1 and rows[0]["provenance"] in CONTEXT_ONLY_TASK_PROVENANCES
         messages = []
         deliver_task_message(rows[0], "another-author", None, messages.append)
@@ -307,7 +307,7 @@ def test_new_host_payload_captures_before_attention(focus, monkeypatch, state, f
         assert len(rows) == 1 and rows[0].row["text"] == event.text
         calls.append(kw)
         return SimpleNamespace(outcome="message", text="Hello", task_id="focus", work_ref="")
-    body = {"event": {k: v for k, v in event.__dict__.items() if k not in {"delivery_reporting_version", "continuation_version"}}}
+    body = {"event": {k: v for k, v in event.__dict__.items() if k not in {"delivery_reporting_version", "continuation_version", "identity"}}}
     body["event"]["facts"] = facts
     with TestClient(host_service.create_host_service_app(root, presence_runner=run)) as client:
         response = client.post("/presence/turn", json=body)
@@ -345,7 +345,7 @@ def test_off_retry_keeps_unknown_attempt_custody(focus, monkeypatch):
         raise AssertionError("an unknown attempt must not generate again")
     def run(**kw):
         return run_presence_turn(repo_dir=root, drive_root=root, agent_factory=factory, **kw)
-    body = {"event": {k: v for k, v in event.__dict__.items() if k not in {"delivery_reporting_version", "continuation_version"}}}
+    body = {"event": {k: v for k, v in event.__dict__.items() if k not in {"delivery_reporting_version", "continuation_version", "identity"}}}
     with TestClient(host_service.create_host_service_app(root, presence_runner=run)) as client:
         response = client.post("/presence/turn", json=body)
     assert response.status_code == 409
@@ -360,15 +360,16 @@ def test_owner_projection_tracks_heard_events_and_preserves_choices(focus, monke
     root, place, admission, event = focus
     declaration = {"id": "room", "skill": "bridge", "skill_label": "Chat bridge", "provides": "place",
                    "label": "Chat", "destination": "vendor:Chat", "scope": "account",
-                   "wakes": ["mention"], "icon": {"name": "message-circle"}}
+                   "wakes": ["mention"], "icon": "message-circle",
+                   "icon_spec": {"kind": "host", "name": "message-circle"}}
     monkeypatch.setattr("ouroboros.place_projection.place_declarations", lambda _root: [declaration])
-    monkeypatch.setattr("ouroboros.presence_admission.focus_allowance", lambda _root: {
+    monkeypatch.setattr("ouroboros.consciousness_allowance.allowance_window", lambda _root, **kw: {
         "spend_by_cause": [{"cause": "place:" + place.place_id, "usd": 0.25}]})
     task = capture_presence_event(admission, event, drive_root=root)
     view = places_view(root)
     card, = view["places"]
     assert card["unanswered"] is None and card["last_activity_at"]
-    assert card["spent_24h_usd"] == 0.25 and card["icon"] == declaration["icon"]
+    assert card["spent_24h_usd"] == 0.25 and card["icon"] == declaration["icon_spec"]
     assert view["connectors"][0]["connected"]
     settle_heard(root, task, event)
     assert places_view(root)["places"][0]["unanswered"] is None  # hearing creates no task store

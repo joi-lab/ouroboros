@@ -8,6 +8,7 @@
  * view reads compactly from it. Either way the row ends with the same
  * Project reference: the voice of a row never chooses how the UI points at its Project.
  */
+import { batch, measure } from './layout_batch.js';
 import { createSystemMessageActions } from './ui_helpers.js';
 import { tr } from './i18n.js';
 import { reasonCodesNote, taskPresentation } from './log_events.js';
@@ -29,23 +30,30 @@ export function appendProjectRow(addMessage, msg, text, opts) {
     });
 }
 
-// The fade says "there is more": it appears only when the fold really hides text. The clamp
-// itself is unconditional CSS, so measuring the fade never moves layout. A row mounted while
-// Chat is not the visible page has no layout box (clientHeight 0): it is left alone and
-// measured when Chat is shown; a resize re-measures, because the width decides the height.
+// The fade says "there is more": compare with the seven-line footprint, never the extended
+// painted box. Otherwise answers between seven and nine lines alternate on every refresh.
+// A row mounted while Chat is not the visible page has no layout box (clientHeight 0): it is left alone and
+// measured when Chat is shown; a resize re-measures, because the width decides the height. Answers refreshed in one
+// batch (layout_batch.js: the reading owner's write, a frame's re-measure) are measured together, then marked together,
+// then their heights read together before any margin is written: one layout serves each step for all of them.
 export function refreshProjectAnswerFold(bubble) {
-    const seen = measureFold(bubble);
-    if (seen) applyFold(seen);
+    if (!bubble?.classList.contains('project-answer')) return;
+    measure(() => measureFold(bubble), (seen) => {
+        if (!seen) return;
+        const { message, fold, folded } = seen;
+        bubble.classList.toggle('is-folded', folded);
+        syncFold(bubble, message, folded);
+        // Compensate only the actual extension: a 180px answer borrows 12px, not the full 48px tail.
+        measure(() => (folded ? Math.max(0, parseFloat(getComputedStyle(message).height) - fold) : 0),
+            (tail) => message.style.setProperty('--project-answer-compensation', `${-tail}px`));
+    });
 }
 function measureFold(bubble) {
-    if (!bubble?.classList.contains('project-answer')) return null;
     const message = bubble.querySelector('.message');
     if (!message || !message.clientHeight) return null;
-    return { bubble, message, folded: message.scrollHeight > message.clientHeight + 1 };
-}
-function applyFold({ bubble, message, folded }) {
-    bubble.classList.toggle('is-folded', folded);
-    syncFold(bubble, message, folded);
+    const style = getComputedStyle(message);
+    const fold = parseFloat(style.lineHeight) * parseFloat(style.getPropertyValue('--project-answer-lines'));
+    return { message, fold, folded: message.scrollHeight > fold + 1 };
 }
 
 // Folded text offers no keyboard stops (pointer clicks still reach visible links): the Project
@@ -82,7 +90,7 @@ function refreshFoldsSoon() {
         // would lay it out alone. The rest are measured together, then marked together: one layout serves them all.
         const due = [...document.querySelectorAll('.chat-bubble.project-answer')]
             .filter((bubble) => !bubble.closest('[data-resizing], [data-laid]'));
-        due.map(measureFold).filter(Boolean).forEach(applyFold);
+        batch(() => due.forEach(refreshProjectAnswerFold));
     }));
 }
 function watchFolds() {
@@ -98,9 +106,8 @@ export function decorateProjectRow(bubble, { role = 'system', projectId = '', pr
     completionLimitation = '', limitation = completionLimitation, fold = role === 'assistant' } = {}) {
     if (!bubble || !projectId) return null;
     if (fold) {
-        bubble.classList.add('project-answer');
+        bubble.classList.add('project-answer');  // measured when its markdown is written (chat.js enhanceMountedMarkdown)
         watchFolds();
-        afterLayout(() => refreshProjectAnswerFold(bubble));
     }
     const actions = createSystemMessageActions(projectReference({ id: projectId, name: projectName }));
     const message = bubble.querySelector('.message');

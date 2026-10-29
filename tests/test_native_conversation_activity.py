@@ -9,6 +9,34 @@ from supervisor import workers
 from supervisor.active_activity import get_direct_activity_registry
 
 
+def _native_chat_thread(monkeypatch, actor, chat_id, phases, *, project_id, text="ordinary conversation"):
+    """Hand off phases/errors, not timing guesses; the runner bounds a stuck test."""
+    from supervisor import worker_chat_lane
+
+    def report_error(_admitted, error):
+        raise error  # The direct lane normally logs this instead of propagating it.
+
+    monkeypatch.setattr(worker_chat_lane, "_report_direct_chat_error", report_error)
+
+    def run():
+        try:
+            workers._run_chat_task(actor, chat_id, text, task_metadata={
+                "project_id": project_id, "origin_suppressed": True})
+        except BaseException as error:
+            phases.put(error)
+        finally:
+            phases.put("returned")
+
+    return threading.Thread(target=run)
+
+
+def _next_native_phase(phases, expected):
+    phase = phases.get()
+    if isinstance(phase, BaseException):
+        raise phase
+    assert phase == expected, (expected, phase)
+
+
 def _lane(monkeypatch, tmp_path):
     from supervisor import message_bus, state
 
@@ -186,13 +214,13 @@ def test_native_post_task_retains_activity_and_delivers_answer_early(monkeypatch
     monkeypatch.setattr(workers, "get_event_q", lambda: bus)
     monkeypatch.setattr(workers, "RUNNING", {})
     monkeypatch.setattr(workers, "PENDING", [])
-    entered, release = threading.Event(), threading.Event()
+    phases, release = queue.Queue(), threading.Event()
     synthesis_threads = []
 
     def consolidate(*args, **kwargs):
         synthesis_threads.append(threading.current_thread())
-        entered.set()
-        assert release.wait(10)
+        phases.put("synthesis")
+        release.wait()  # Only the observing test releases this phase, never a timer.
 
     monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", consolidate)
     monkeypatch.setattr(pipeline, "_record_task_facts", lambda *a, **kw: None)
@@ -218,16 +246,13 @@ def test_native_post_task_retains_activity_and_delivers_answer_early(monkeypatch
     # Both ordinary Main and ordinary Project conversation shapes must use
     # the same lifetime; neither has a headless workspace/task marker.
     for project_id in ("", "room"):
-        entered.clear()
         release.clear()
         synthesis_threads.clear()
         actor = Actor()
-        thread = threading.Thread(target=workers._run_chat_task, args=(actor, 1, "ordinary conversation"), kwargs={
-            "task_metadata": {"project_id": project_id, "origin_suppressed": True},
-        })
+        thread = _native_chat_thread(monkeypatch, actor, 1, phases, project_id=project_id)
         try:
             thread.start()
-            assert entered.wait(5)
+            _next_native_phase(phases, "synthesis")
             task_id = actor.task["id"]
             # Use the real callback thread, not a fabricated post-task wait:
             # synthesis belongs to the still-registered direct execution.
@@ -252,6 +277,8 @@ def test_native_post_task_retains_activity_and_delivers_answer_early(monkeypatch
             for synthesis_thread in synthesis_threads:
                 if synthesis_thread is not thread:
                     synthesis_thread.join(timeout=10)
+        _next_native_phase(phases, "returned")
+        thread.join()
         assert not thread.is_alive()
         assert get_direct_activity_registry().snapshot() == []
         assert not post_task_synthesis_in_flight(tmp_path, task_id)

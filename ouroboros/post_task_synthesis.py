@@ -5,8 +5,8 @@ The best-effort work the post-task orchestrator
 task ends: the tool-trace summary, the free host facts row, the fallback
 memory draft or candidate and scratchpad compression,
 plus the shared pre-synthesis usage snapshot and the compact review
-projection. No stage writes lessons, the Pattern Register or the backlog:
-the acting mind authors those (``knowledge_write``). Extracted from
+projection. No stage writes lessons or knowledge notes: the acting mind
+authors those (``knowledge_write``). Extracted from
 agent_task_pipeline.py; the pipeline re-exports every name, so historical
 imports and monkeypatch targets keep working."""
 
@@ -237,10 +237,11 @@ def _pre_synthesis_usage_snapshot(
         from ouroboros.cost_projection import COST_SCOPE_ROOT_TREE, build_cost_presentation
 
         logical_root_id = str(task.get("root_task_id") or task_id)
-        subtree = usage_breakdown(budget_root, root_task_id=logical_root_id)
+        subtree = usage_breakdown(budget_root, root_task_id=logical_root_id, custody_root=env.drive_root, include_custody=True)
         snapshot.update({
             "accounted_upper_bound_usd_with_children": round(float(subtree["accounted_usd"]), 6),
             "cost_presentation": build_cost_presentation(subtree, scope=COST_SCOPE_ROOT_TREE),
+            "cost_custody": subtree.get("cost_custody"),
             "reserved_usd": round(float(subtree["reserved_usd"]), 6),
             "unresolved_upper_bound_usd": round(
                 float(subtree["unresolved_upper_bound_usd"]), 6
@@ -279,7 +280,7 @@ def _compact_review_projection(llm_trace: Dict[str, Any], task: Dict[str, Any] |
 
         records, omitted = task_ledger_records(task or {}, drive_root)
         projection = compact_review_projection(llm_trace.get("review_runs") or [], records=records)
-        if records:
+        if records or omitted == "1+":
             projection["review_records_omitted"] = omitted
         return projection
     except Exception:
@@ -327,12 +328,12 @@ def _record_task_facts(env: Any, task: Dict[str, Any], usage: Dict[str, Any],
             "_is_direct_chat": bool(task.get("_is_direct_chat")), **initiator_meta(task),
             **({"typed_routing_action": str(usage["typed_routing_action"])} if usage.get("typed_routing_action") else {}),
             "text": "", **task_tool_metrics(llm_trace),
-            "rounds": None if usage.get("loop_evidence_unavailable") else int(usage.get("rounds") or 0),
+            "rounds": usage.get("rounds"),
             "outcome_axes": normalize_outcome_axes(usage), "reason_code": str(usage.get("reason_code") or ""),
             "result_ref": {"kind": "task_result", "task_id": task_id, "reader": "get_task_result"},
             "files_rescued": files_rescued,
             **_summary_row_cost_fields(usage), **presence_provenance_fields(task),
-            **({"review_projection": review_projection} if review_projection.get("panels") else {}),
+            **({"review_projection": review_projection} if review_projection.get("panels") or review_projection.get("gaps") or review_projection.get("review_records_omitted") else {}),
         })
     except Exception:
         log.warning("Task facts row was not recorded for %s (non-critical)", task_id, exc_info=True)
@@ -428,7 +429,7 @@ def _run_memory_fallback_draft(env: Any, task: Dict[str, Any], llm: Any, drive_l
             append_jsonl(pathlib.Path(drive_logs) / "events.jsonl", {
                 "ts": utc_now_iso(), "type": "memory_fallback_draft", "task_id": str(task.get("id") or ""),
                 "unit": run.unit.describe() if run.unit else None, "outcome": run.outcome, "kind": run.kind or None,
-                "record_id": run.record_id or None, "input_tokens": run.input_tokens,
+                "record_id": run.record_id or None, "input_tokens": run.input_tokens, "effect": run.effect or None,
                 "accounted_upper_bound_usd": round(float(usage["cost"]), 6) if usage.get("cost") is not None else None,
                 "route": observed_route_stamp(usage) if usage else None})
         except Exception:

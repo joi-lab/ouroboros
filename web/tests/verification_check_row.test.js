@@ -183,7 +183,7 @@ test('live: one row per failed check, counted once, a later pass keeps both fact
         assert.equal(f.checks().length, 1, 'the later pass never erases the earlier failure');
         // The header carries the live count (this DOM stub keeps a stale fold node after
         // any diagnostic row, an existing failure row included; the browser test reads it).
-        assert.match(f.facts(), /<dt>Tool calls<\/dt><dd>2<\/dd>/);
+        assert.match(f.meta(), /2 tool calls/);
         assert.doesNotMatch(f.meta() + f.text(), /error|One of the steps failed/);
         f.log({ ...done, type: 'task_done', status: 'completed', tool_calls: 2, tool_errors: 0, _is_direct_chat: true });
         assert.equal(f.phase(), 'Done', 'a failed check is not a failed task');
@@ -250,7 +250,7 @@ test('a check settled after the terminal row still gets its row, without reopeni
         assert.match(f.checks()[0].innerHTML, /Check did not pass: timed out/);
         // Late success settlement retires the provisional wait notice; no error is resurrected.
         assert.doesNotMatch(f.text() + f.meta(), /operation may still settle|One of the steps failed|1 error/);
-        assert.match(f.facts(), /<dt>Tool calls<\/dt><dd>1<\/dd>/);
+        assert.match(f.meta(), /1 tool call/);
         assert.equal(f.phase(), 'Done');
     } finally { f.close(); }
 });
@@ -383,7 +383,7 @@ test('child live: its own row, counted once on the child, nothing on the root, a
         assert.equal(f.checks(CHILD).length, 1, 'one failed check, one row, on the child');
         assert.match(f.checks(CHILD)[0].innerHTML, /Criterion: CHILD-1/);
         assert.equal(f.checks(TASK).length, 0, 'the root card draws nothing for its child\'s check');
-        assert.match(f.facts(CHILD), /<dt>Tool calls<\/dt><dd>2<\/dd>/);
+        assert.match(f.meta(CHILD), /2 tool calls/);
         assert.doesNotMatch(f.meta(CHILD) + f.text(CHILD), /error|One of the steps failed/);
         assert.doesNotMatch(f.meta(TASK), /error|tool call/);
         assert.equal(f.phase(TASK), 'Working', 'the child\'s check changes no task status');
@@ -445,7 +445,7 @@ test('child reload: the carrier replays the row on the child, and live frames sh
         assert.equal(f.checks(TASK).length, 0);
         assert.deepEqual(f.titles(CHILD).filter((title) => /tool call|Check did not pass/.test(title)),
             ['1 tool call', 'Check did not pass: expected text not found'], 'the evidence row, then its check');
-        assert.match(f.facts(CHILD), /<dt>Tool calls<\/dt><dd>1<\/dd>/);
+        assert.match(f.meta(CHILD), /1 tool call/);
         assert.doesNotMatch(f.meta(CHILD) + f.text(CHILD), /error/);
         assert.equal(f.phase(CHILD), 'Done');
         // A live duplicate after the reload, and a second replay, change nothing.

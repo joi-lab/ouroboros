@@ -22,7 +22,8 @@ quiet start.
 attention cue, shell facts, and system notifications of ``desktop_notifications``,
 whose click opens the window and hands the page its token; it also carries the painted palette to
 the window's native caption (``launcher_appearance``). On macOS the window's title bar and appearance
-follow each document it shows (``launcher_window_chrome``).
+follow each document it shows (``launcher_window_chrome``). The owner's Interface size is the window's own page zoom
+(``launcher_page_zoom``).
 """
 from __future__ import annotations
 
@@ -39,6 +40,7 @@ from ouroboros.config import PANIC_EXIT_CODE, read_version
 from ouroboros.desktop_autostart import BACKGROUND_ENV, keep_running_choice, set_keep_running
 from ouroboros.desktop_notifications import UNAVAILABLE, capability, native_notifier, platform_name, refused
 from ouroboros.launcher_appearance import NativeAppearance
+from ouroboros.launcher_page_zoom import PageZoom
 from ouroboros.launcher_window_chrome import WindowChrome
 from ouroboros.platform_layer import request_native_attention, signal_pid
 
@@ -345,6 +347,7 @@ class Background:
         self.indicator = cls(self) if cls is not None else None
         self.appearance = NativeAppearance()  # the window's caption tint follows its page (Windows)
         self.chrome = WindowChrome()  # the main window's title bar follows its document (macOS)
+        self.zoom = PageZoom(on_changed=lambda: self.chrome.zoom_changed())  # the owner's Interface size here
         self.notifications = native_notifier(self.open_notification, self.indicator)
         self._asking = threading.Lock()
         self._poller = None
@@ -392,6 +395,7 @@ class Background:
         self.window = window
         self.appearance.attach(window)  # every window, indicator or not: its own before_show and close
         self.chrome.attach(window)
+        self.zoom.attach(window)
         window.events.closing += self.closing
         window.events.shown += self._window_shown  # set for a hidden window too (pywebview 5.4)
         if self.indicator is not None:
@@ -607,10 +611,19 @@ class DesktopApi:
         """The page's painted palette for this window's native caption; the newest request wins."""
         return self._background.appearance.request(theme, page, sequence)
 
+    def set_interface_size(self, percent: int = 100, page: float | None = None, sequence: int | None = None) -> dict:
+        """The owner's Interface size for this window, in percent (Settings → Appearance, ⌘/Ctrl + − 0); the newest
+        request wins, and the next window opens at it."""
+        return self._background.zoom.request(percent, page, sequence)
+
     def shell_info(self) -> dict:
         """Installed bundle and loaded shell are separate facts; capabilities are read from this process."""
         return {"shell_version": _SHELL_VERSION, **self._shell_facts, "persistent_storage": PERSISTENT_WEBVIEW_STORAGE,
-                "native_notifications": self._notifier_answer("status")}
+                "native_notifications": self._notifier_answer("status"), "interface_size": self._zoom_info()}
+
+    def _zoom_info(self) -> dict:
+        zoom = getattr(self._background, "zoom", None)
+        return zoom.info() if zoom is not None else {"supported": False}
 
     def request_native_notifications(self) -> dict:
         """The system's one permission question. The page asks it only from the owner's own gesture

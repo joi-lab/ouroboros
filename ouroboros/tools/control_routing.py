@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import uuid
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ouroboros.dialogue_provenance import presence_root_carrier
 from ouroboros.tools.control_events import (
@@ -71,8 +71,23 @@ def _attach_origin_from_metadata(ctx: ToolContext, evt: Dict[str, Any]) -> None:
 
 
 def _attach_drafted_objective(ctx: ToolContext, evt: Dict[str, Any]) -> None:
-    """Keep the routed objective's author separate from the ingress owner corpus."""
+    """Keep the routed objective's author separate from the ingress owner corpus.
+
+    A routing run with neither owner-door stamp opens the new root with this drafted
+    objective and no owner message. Only this producer knows that, so it records
+    ``origin_message_absent``: a later reader cannot tell an absent stamp from a lost
+    one, and a suppressed stamp is owner input that the door did not log.
+
+    The corpus is persisted with the start (its receipt, the queue snapshot, the running
+    record), so each row is the retained owner corpus's text (``_owner_content_projection``):
+    the owner's words verbatim and an image as its reference beside the path of its
+    retained original, never its base64.
+    """
+    from ouroboros.review_evidence_sections import _owner_content_projection
+
     evt["objective_author"] = {"kind": "task", "task_id": str(getattr(ctx, "task_id", "") or "")}
+    if not (evt.get("source_ref") or evt.get("origin_suppressed")):
+        evt["origin_message_absent"] = True
     owner_rows = [dict(row) for row in (getattr(ctx, "_owner_directives", None) or [])
                   if isinstance(row, dict) and row.get("source") in {
                       "owner_mailbox", "owner_quiz_answer", "origin_message", "owner_corpus", "direct_incoming"}]
@@ -85,7 +100,8 @@ def _attach_drafted_objective(ctx: ToolContext, evt: Dict[str, Any]) -> None:
         # (``initial_text``) is never laundered into owner authority.
         owner_rows[:0] = [dict(row) for row in (getattr(ctx, "_owner_directives", None) or [])
                           if isinstance(row, dict) and row.get("source") == "initial_user"]
-    evt["owner_corpus"] = owner_rows
+    rows = [{**row, "content": _owner_content_projection(row.get("content"))} for row in owner_rows]
+    evt["owner_corpus"] = [row for row in rows if row["content"].strip()]
 
 
 def _inherited_project_scope(ctx: ToolContext) -> str:
@@ -217,6 +233,7 @@ def _start_task(
     source: str = "",
     context_requires_self_body_docs: bool = False,
     reasoning_effort: Any = None,
+    context_requires_development: Optional[bool] = None,
 ) -> str:
     """Start separate new work; the caller keeps its identity and obligations."""
     effort_fields, effort_error, effort_note = _root_effort_arg(reasoning_effort, "start_task")
@@ -321,6 +338,9 @@ def _start_task(
         # default (a folder-less task in a folder-ful project stays possible).
         "workspace": workspace_sentinel,
         "context_requires_self_body_docs": context_requires_self_body_docs,
+        # Absent is not false: only an explicit answer overrides the subject-of-work rule (BIBLE P1).
+        **({"context_requires_development": bool(context_requires_development)}
+           if isinstance(context_requires_development, bool) else {}),
         **effort_fields,
         "chat_id": current_chat_id,
         **({"resource_intent": {"kind": "system_repo"}} if intent_system_repo else {}),

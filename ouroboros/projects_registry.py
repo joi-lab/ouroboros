@@ -5,8 +5,10 @@ rediscovery. Store-marker recovery creates fresh incarnations, not lost folders/
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import time
 import uuid
 import pathlib
 import threading
@@ -16,9 +18,11 @@ from typing import Any, Dict, Iterator, List, Optional
 from ouroboros.contracts.chat_id_policy import project_chat_id
 from ouroboros.composer_cognition import ensure_project_cognition, main_cognition, project_cognition
 from ouroboros.contracts.schema_versions import with_schema_version
-from ouroboros.project_facts import sanitize_project_id
+from ouroboros.project_facts import project_display_name, sanitize_project_id
 from ouroboros.store import StoreBusy, open_store
-from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso, strip_markdown
+from ouroboros.store_capture import capture
+from ouroboros import utils
+from ouroboros.utils import atomic_write_json, json_snapshot, read_json_dict, utc_now_iso, strip_markdown
 
 log = logging.getLogger(__name__)
 
@@ -131,20 +135,19 @@ def _save(drive_root: Any, data: Dict[str, Any]) -> None:
     _mark_registry_committed(drive_root)  # after the commit it attests
 
 
-def _load_bindings(drive_root: Any, *, strict: bool = False) -> Dict[str, Any]:
-    if strict:
-        import json
-        try:
-            data = json.loads(_bindings_path(drive_root).read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return {"bindings": {}}
-        if not isinstance(data, dict) or not isinstance(data.get("bindings"), dict):
-            raise ValueError("Project bindings are unavailable")
-    else:
-        data = read_json_dict(_bindings_path(drive_root))
-    if not isinstance(data, dict) or not isinstance(data.get("bindings"), dict):
-        return {"bindings": {}}
-    return data
+_NO_BINDINGS: Dict[str, Any] = {"bindings": {}}  # what a reader of an absent or unreadable store shares
+
+
+def _load_bindings(drive_root: Any, *, strict: bool = False, fresh: bool = False) -> Dict[str, Any]:
+    """Every reader shares one parse per file identity (``json_snapshot``) and never mutates it;
+    the one writer reads a ``fresh`` copy. Strict raises on an unreadable or malformed store."""
+    data = read_json_dict(_bindings_path(drive_root)) if fresh else json_snapshot(_bindings_path(drive_root),
+                                                                                  strict=strict)
+    if isinstance(data, dict) and isinstance(data.get("bindings"), dict):
+        return data
+    if strict and data is not None:
+        raise ValueError("Project bindings are unavailable")
+    return {"bindings": {}} if fresh else _NO_BINDINGS
 
 
 def _save_bindings(drive_root: Any, data: Dict[str, Any]) -> None:
@@ -294,7 +297,7 @@ def bind_task_to_project(
             **origin_fields,
         }
         with _file_write_lock(_bindings_path(drive_root)):
-            data = _load_bindings(drive_root)
+            data = _load_bindings(drive_root, fresh=True)
             existing = data["bindings"].get(tid)
             if isinstance(existing, dict):
                 existing_pid = str(existing.get("project_id") or "")
@@ -319,8 +322,9 @@ def bind_task_to_project(
 
 
 def project_task_bindings(drive_root: Any) -> Dict[str, Dict[str, Any]]:
-    """Copy of the immutable task-to-Project bindings for read models (the cached lens)."""
-    return {str(task_id): dict(row) for task_id, row in _bindings_lens(drive_root).items() if isinstance(row, dict)}
+    """Copy of the immutable task-to-Project bindings for read models (the shared parse)."""
+    return {str(task_id): dict(row) for task_id, row in _load_bindings(drive_root)["bindings"].items()
+            if isinstance(row, dict)}
 
 
 def all_task_bindings(drive_root: Any) -> Dict[str, int]:
@@ -337,9 +341,9 @@ def all_task_project_bindings(drive_root: Any, *, strict: bool = False) -> Dict[
     (F4), not merely to suppress the stray convert button (P2). Strict snapshot
     readers propagate source failures so absence never impersonates completeness."""
     out: Dict[str, Dict[str, Any]] = {}
-    try:  # a strict reader rereads the file; the others share the mtime-keyed lens
+    try:
         names = {row["id"]: row.get("name") or row["id"] for row in _load(drive_root)["projects"]}
-        bindings = _load_bindings(drive_root, strict=True)["bindings"] if strict else _bindings_lens(drive_root)
+        bindings = _load_bindings(drive_root, strict=strict)["bindings"]
         for tid, row in bindings.items():
             if not isinstance(row, dict):
                 continue
@@ -355,6 +359,28 @@ def all_task_project_bindings(drive_root: Any, *, strict: bool = False) -> Dict[
             raise
         log.debug("all_task_project_bindings failed", exc_info=True)
     return out
+
+
+_PROCESS_STAMP = uuid.uuid4().hex[:8]  # this process's code shapes the map it answers
+
+
+def bindings_revision(drive_root: Any) -> str:
+    """An opaque stamp of what ``all_task_project_bindings`` answers in this process: the file
+    identities of the bindings and of the registry naming their projects. ``""`` when no stamp can
+    prove the bytes unchanged: unreadable, or changed within a clock tick (``utils._RACY_NS``)."""
+    started, stamps = time.time_ns(), [_PROCESS_STAMP]
+    for path in (_bindings_path(drive_root), _registry_path(drive_root)):
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            stamps.append(None)
+            continue
+        except OSError:
+            return ""
+        if max(info.st_mtime_ns, info.st_ctime_ns) >= started - utils._RACY_NS:
+            return ""
+        stamps.append(utils.file_identity(info))
+    return hashlib.sha256(repr(stamps).encode("utf-8")).hexdigest()[:16]
 
 
 def project_binding_for_task(drive_root: Any, task_id: str, *, strict: bool = False,
@@ -388,19 +414,16 @@ def project_id_for_task(drive_root: Any, task_id: str, *, strict: bool = False) 
 
     The binding is the ONE truth about a task's project (owner decision B4=A):
     ``task["project_id"]`` and a worker's in-memory ``ctx.project_id`` are
-    copies that a mid-run conversion never reaches. Reads the same mtime/size
-    cached view the live addressing seam already uses, so a hot-path caller
-    pays no extra parse. ``strict=True`` RAISES on an unreadable store instead
+    copies that a mid-run conversion never reaches. Reads the one shared parse
+    the live addressing seam already uses, so a hot-path caller pays no extra
+    parse. ``strict=True`` RAISES on an unreadable store instead
     of reporting "unbound", for the one caller that authorizes creating a
     project and must not do that blind.
     """
     tid = str(task_id or "").strip()
     if not tid:
         return ""
-    bindings = (
-        _load_bindings(drive_root, strict=True)["bindings"] if strict else _bindings_lens(drive_root)
-    )
-    row = bindings.get(tid)
+    row = _load_bindings(drive_root, strict=strict)["bindings"].get(tid)
     return str(row.get("project_id") or "").strip() if isinstance(row, dict) else ""
 
 
@@ -474,8 +497,8 @@ def project_id_for_origin(drive_root: Any, origin_ref: Any, *, strict: bool = Fa
     binding's ``source_ref``, so this reverse lookup needs no new field. A
     malformed ref resolves to "" and never aliases another message.
 
-    Reads the same mtime/size-cached lens ``project_id_for_task`` uses;
-    ``strict=True`` re-reads and RAISES on an unreadable store, for the callers
+    Reads the same shared parse ``project_id_for_task`` uses;
+    ``strict=True`` RAISES on an unreadable store, for the callers
     that authorize creating a project. A binding whose project is no longer
     ACTIVE does not count, unless admission requests ``include_inactive`` to
     preserve positive membership evidence even after a room closes/disappears.
@@ -490,7 +513,7 @@ def project_id_for_origin(drive_root: Any, origin_ref: Any, *, strict: bool = Fa
         return ""
     bindings = bindings_snapshot
     if bindings is None:
-        bindings = _load_bindings(drive_root, strict=True)["bindings"] if strict else _bindings_lens(drive_root)
+        bindings = _load_bindings(drive_root, strict=strict)["bindings"]
     candidates = []
     for task_id, row in bindings.items():
         if not isinstance(row, dict) or origin_key(row.get("source_ref")) != key:
@@ -564,37 +587,14 @@ def _emit_origin_ambiguous(drive_root: Any, key: tuple, candidates: list, chosen
         log.debug("project_origin_ambiguous row failed", exc_info=True)
 
 
-_BINDINGS_LENS_CACHE: Dict[str, tuple] = {}
-
-
-def _bindings_lens(drive_root: Any) -> Dict[str, Any]:
-    """mtime/size-cached read of the bindings store for per-frame routing.
-
-    The live-log addressing seam resolves lineage on every forwarded event
-    (DEVELOPMENT "projection over replay": a per-interaction reader must not
-    reparse a growing store), so the parse is keyed to the file identity the
-    same way ``project_thread_chat_ids`` caches the registry."""
-    path = _bindings_path(drive_root)
-    try:
-        st = path.stat()
-        stamp: Any = (st.st_mtime_ns, st.st_size)
-    except OSError:
-        stamp = None
-    key = str(path)
-    cached = _BINDINGS_LENS_CACHE.get(key)
-    if cached is not None and cached[0] == stamp:
-        return cached[1]
-    bindings = _load_bindings(drive_root)["bindings"]
-    _BINDINGS_LENS_CACHE[key] = (stamp, bindings)
-    return bindings
-
-
 _TASK_LINEAGE: Dict[tuple, Dict[str, Any]] = {}
 _TASK_LINEAGE_LIMIT = 50_000  # a memory bound, not a policy: the facts are re-read on the next sight
 _ROOM_ANSWERS: Dict[str, tuple] = {}
-_LINEAGE_SELECT = ("SELECT t.task_id, t.parent_task_id, t.root_task_id, t.delegation_role, "
-                   "json_extract(b.body, '$.chat_id') FROM tasks t LEFT JOIN task_bodies b ON b.task_id = t.task_id "
-                   "WHERE t.task_id IN (SELECT value FROM json_each(?))")
+# One capture (``store_capture``); ``chat_id`` as text or, from a JSON real, its integer part (what ``int()`` gave).
+_LINEAGE_SELECT = ("SELECT t.task_id, t.parent_task_id, t.root_task_id, t.delegation_role, CASE json_type(b.body, "
+                   "'$.chat_id') WHEN 'real' THEN CAST(json_extract(b.body, '$.chat_id') AS INTEGER) ELSE '' || "
+                   "json_extract(b.body, '$.chat_id') END AS chat_id FROM tasks t LEFT JOIN task_bodies b ON "
+                   "b.task_id = t.task_id WHERE t.task_id IN (SELECT value FROM json_each(?))")
 
 
 def _read_lineage(drive_root: Any, task_ids: Any, *, strict: bool = False) -> Optional[Dict[str, Dict[str, Any]]]:
@@ -606,7 +606,9 @@ def _read_lineage(drive_root: Any, task_ids: Any, *, strict: bool = False) -> Op
     acquisition owner to wait out: contention is not unknown lineage."""
     try:
         with open_store(drive_root, write=False) as txn:
-            records = txn.conn.execute(_LINEAGE_SELECT, (json.dumps(sorted(task_ids)),)).fetchall()
+            captured = capture(txn.conn, _LINEAGE_SELECT, (json.dumps(sorted(task_ids)),),
+                               ("task_id", "parent_task_id", "root_task_id", "delegation_role", "chat_id"))
+        records = captured.tuples()
     except StoreBusy as exc:
         if strict and exc.reason == "contention":
             raise
@@ -642,8 +644,7 @@ class RoomResolver:
 
     def __init__(self, drive_root: Any, *, strict: bool = False) -> None:
         self.root, self.strict = drive_root, strict
-        self.bindings = (_load_bindings(drive_root, strict=True)["bindings"] if strict
-                         else _bindings_lens(drive_root))  # one ``stat`` per resolver
+        self.bindings = _load_bindings(drive_root, strict=strict)["bindings"]  # one ``stat`` per resolver
         key = str(_bindings_path(drive_root))
         cached = None if strict else _ROOM_ANSWERS.get(key)
         if cached is None or cached[0] is not self.bindings:
@@ -718,16 +719,31 @@ class RoomResolver:
             self.answers[tid] = chat
         return chat
 
-    def warm(self, task_ids: Any) -> None:
-        """Read the lineage of every unseen id and of its unseen ancestors, ONE transaction per
-        generation, before the rule walks them one id at a time (a page names dozens)."""
-        wanted = {str(tid) for tid in task_ids if tid}
-        while unseen := {tid for tid in wanted if (str(self.root), tid) not in _TASK_LINEAGE} - self.misses:
-            read = _read_lineage(self.root, unseen)
+    def warm(self, task_ids: Any) -> bool:
+        """Read, ONE transaction per generation, the lineage the rule then walks one id at a time (a page
+        names dozens): every unseen id and the parents and roots of the rows read now, and from a
+        remembered task its parent while the walk goes on there (neither is bound to a Project; a root
+        is only asked for its binding); ``False`` when the store could not answer them all now."""
+        wanted, seen = {str(tid) for tid in task_ids if tid}, set()
+        while wanted:
+            seen |= wanted
+            unseen = {tid for tid in wanted if (str(self.root), tid) not in _TASK_LINEAGE} - self.misses
+            read = _read_lineage(self.root, unseen) if unseen else {}
             if read is None:
-                return
+                return False
             self.misses.update(unseen - read.keys())
-            wanted = {row[key] for row in read.values() for key in ("parent_task_id", "root_task_id") if row[key]}
+            fresh = {row[key] for row in read.values() for key in ("parent_task_id", "root_task_id") if row[key]}
+            walked = {row["parent_task_id"] for tid in wanted - unseen if not self._ends_walk(tid)
+                      and (row := _TASK_LINEAGE.get((str(self.root), tid))) and row["parent_task_id"]}
+            wanted = (fresh | {tid for tid in walked if not self._ends_walk(tid)}) - seen
+        return True
+
+    def _ends_walk(self, task_id: str) -> bool:
+        """The rule's walk ends at a task bound to a Project; a binding that cannot be read ends nothing here."""
+        try:
+            return bool(self._bound(task_id))
+        except Exception:
+            return False
 
 
 def project_chat_for_task_tree(
@@ -867,12 +883,19 @@ def _bounded_presentation_name(value: Any, *, fallback: str = "") -> str:
 
 
 def task_presentation_name(*sources: Any) -> str:
-    """Plain work title from structured task/result rows, without storage reads."""
+    """Plain work title from structured task/result rows, without storage reads.
+
+    A title or coined name is shown whole; a bare request shows its first line, the
+    one derivation admission gives every run (``project_naming.admission_names``)."""
+    from ouroboros.project_naming import clean_model_title
+
     sources = [row for row in sources if isinstance(row, dict)]
     for field in ("title", "suggested_name", "objective", "description"):
         for source in sources:
-            # Strip markdown before flattening the raw request into a plain label.
-            name = _bounded_presentation_name(strip_markdown(str(source.get(field) or "")))
+            # Strip markdown while the lines remain: the first line is the request's name.
+            text = strip_markdown(str(source.get(field) or ""))
+            name = (_bounded_presentation_name(text) if field in ("title", "suggested_name")
+                    else clean_model_title(text, max_len=PROJECT_NAME_MAX))
             if name:
                 return name
     return "Task"
@@ -918,9 +941,7 @@ def task_presentation_snapshot(drive_root: Any, task_id: str, *, task: Any = Non
         # includes deleting/tombstoned history reservations, and those have no
         # room left to open.
         registered = str(project.get("lifecycle") or "") == PROJECT_ACTIVE
-        pname = _bounded_presentation_name(project.get("name"))
-    if pname == pid:
-        pname = ""
+        pname = _bounded_presentation_name(project_display_name(project.get("name"), pid))
     if pid and not pname:
         pname = "Project"
     task_name = task_presentation_name(*sources)
@@ -1237,7 +1258,7 @@ def reconcile_projects(drive_root: Any) -> int:
                 # directory alone is not evidence that the owner ever created a
                 # project room. A durable task binding proves it, and so does the
                 # marker above (written only for rows that once really existed).
-                # Read the bindings through the cached lens ONCE here — this
+                # Read the bindings through the shared parse ONCE here — this
                 # function also runs on the 300s supervisor reconcile tick, not
                 # just at boot. An unreadable bindings file fail-closes to an
                 # empty set (every unbound proj_ dir is skipped this pass,
@@ -1247,7 +1268,7 @@ def reconcile_projects(drive_root: Any) -> int:
                 # per row rather than coerced or aborting the whole reconcile.
                 bound = {
                     sanitize_project_id(row["project_id"])
-                    for row in _bindings_lens(drive_root).values()
+                    for row in _load_bindings(drive_root)["bindings"].values()
                     if isinstance(row, dict) and isinstance(row.get("project_id"), str)
                 }
                 for entry in sorted(projects_root.iterdir()):
@@ -1339,8 +1360,8 @@ def projects_summary(drive_root: Any, *, limit: int = 50, chat_id: Any = None,
 
     out: List[Dict[str, Any]] = []
     cognition = main_cognition()
-    bindings = _load_bindings(drive_root).get("bindings", {})
-    bound = {str(row.get("project_id") or "") for row in bindings.values() if isinstance(row, dict)}
+    bound = {str(row.get("project_id") or "") for row in _load_bindings(drive_root)["bindings"].values()
+             if isinstance(row, dict)}
     if chat_id is not None:
         address = int(chat_id)
         projects = [row for row in list_reserved_projects(drive_root, strict=True)

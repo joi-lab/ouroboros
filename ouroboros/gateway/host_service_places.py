@@ -103,6 +103,14 @@ def _admit_presence(ctx: host.HostServiceContext, skill_name: str, binding_id: s
     )
 
 
+def _outside_origin(admission: Any, provider: str, account_id: str, conversation_id: str, thread_id: str) -> bool:
+    """Whether reported provider facts lie outside the owner-created place/binding origin."""
+    origin = admission.origin
+    return (provider != origin.transport or account_id != origin.account_id
+            or (origin.conversation_id != "*" and conversation_id != origin.conversation_id)
+            or bool(origin.thread_id and thread_id != origin.thread_id))
+
+
 async def _api_presence_turn(request: Request) -> JSONResponse:
     """Capture a connector event and run its matched focus under consciousness authority.
 
@@ -149,29 +157,35 @@ async def _api_presence_turn(request: Request) -> JSONResponse:
             "source_event_id", "provider", "account_id", "conversation_id", "thread_id",
             "conversation_key", "actor", "conversation", "message", "text",
         }
-        if not isinstance(event_payload, dict) or set(event_payload) - {"facts"} != expected:
+        if not isinstance(event_payload, dict) or set(event_payload) - {"facts", "identity"} != expected:
             return _presence_error("invalid presence event", 400, "presence_event_invalid", "rejected")
+
+        from ouroboros.places import validate_presence_identity
+        try:
+            identity = validate_presence_identity(event_payload["identity"]) if "identity" in event_payload else None
+        except ValueError as exc:
+            return _presence_error(str(exc), 400, "presence_identity_invalid", "rejected")
+        actor = event_payload["actor"]
+        if not isinstance(actor, dict) or ("authenticated" in actor and type(actor["authenticated"]) is not bool):
+            return _presence_error("actor must be an object; authenticated must be a boolean", 400,
+                                   "presence_actor_invalid", "rejected")
 
         provider = str(event_payload.get("provider") or "").strip()
         account_id = str(event_payload.get("account_id") or "").strip()
         conversation_id = str(event_payload.get("conversation_id") or "").strip()
         thread_id = str(event_payload.get("thread_id") or "").strip()
-        from ouroboros.places import WAKE_FACTS
+        from ouroboros.places import WAKE_FACTS, declared_wake_signals
         facts = event_payload.get("facts")
-        if "facts" in event_payload and (not isinstance(facts, list) or any(f not in WAKE_FACTS for f in facts)):
+        allowed_facts = set(WAKE_FACTS) | declared_wake_signals(skill_name)
+        if "facts" in event_payload and (not isinstance(facts, list) or any(
+                not isinstance(f, str) or f not in allowed_facts for f in facts)):
             raise ValueError("event.facts must be a list of declared wake facts")
+        from ouroboros.presence_history import source_order
+        source_order(event_payload["message"])  # the provider's order, as history carries it: invalid is a 400
         admission = await host._bounded_host_read(ctx, functools.partial(
             host._admit_presence, ctx, skill_name, str(payload.get("binding_id") or ""),
             provider=provider, account_id=account_id, conversation_id=conversation_id, thread_id=thread_id))
-        if (
-            provider != admission.origin.transport
-            or account_id != admission.origin.account_id
-            or (
-                admission.origin.conversation_id != "*"
-                and conversation_id != admission.origin.conversation_id
-            )
-            or (admission.origin.thread_id and thread_id != admission.origin.thread_id)
-        ):
+        if _outside_origin(admission, provider, account_id, conversation_id, thread_id):
             return _presence_error("presence event does not match its owner-created binding", 403,
                                    "presence_origin_mismatch", "rejected")
         event = PresenceTurnEvent(
@@ -184,7 +198,7 @@ async def _api_presence_turn(request: Request) -> JSONResponse:
             # to choose the concurrency/history identity. Derive that identity
             # from the binding-checked origin facts above.
             conversation_key=conversation_key(provider, account_id, conversation_id, thread_id),
-            actor=dict(event_payload["actor"]) if isinstance(event_payload["actor"], dict) else {},
+            actor=dict(actor),
             conversation=(
                 dict(event_payload["conversation"])
                 if isinstance(event_payload["conversation"], dict)
@@ -195,6 +209,7 @@ async def _api_presence_turn(request: Request) -> JSONResponse:
             delivery_reporting_version=reporting_version,
             continuation_version=continuing,
             facts=tuple(facts) if facts is not None else None,
+            identity=identity,
         )
         if not event.source_event_id or not event.conversation_key or not event.actor:
             return _presence_error("presence event is missing identity facts", 400,
@@ -269,6 +284,57 @@ async def _api_presence_turn(request: Request) -> JSONResponse:
     except Exception as exc:
         log.debug("Host service presence turn failed", exc_info=True)
         return _presence_error(str(exc), 500, "presence_turn_unavailable", "retry")
+
+
+async def _api_presence_history(request: Request) -> JSONResponse:
+    """Record a connector's earlier messages as room history (``presence_history``).
+
+    Same token, grant and place admission as a turn, with its own window and in-flight
+    budget. No attention, task, wake, mailbox or outbox follows; there is no fallback to
+    ``/presence/turn``.
+    """
+    from ouroboros.gateway import host_service as host
+    from ouroboros.presence_admission import PresenceAdmissionError
+    from ouroboros.presence_history import PresenceHistoryInvalid, parse_history_request, record_history
+    ctx: host.HostServiceContext = request.app.state.host_service_context
+    try:
+        skill_name, _token_payload = await host._authenticated(ctx, request.headers.get("x-skill-token", ""), "presence")
+    except host.HostServiceAuthError as exc:
+        return _presence_error(str(exc), 403, "presence_auth_blocked", "blocked")
+    except OSError:
+        return _presence_error("presence authentication unavailable", 500, "presence_auth_unavailable", "retry")
+    if not ctx.rate_limiter.allow(f"{skill_name}:presence_history"):
+        return _presence_error("rate limit exceeded", 429, "presence_rate_limited", "retry")
+    if not ctx._enter_inflight(f"{skill_name}:history"):
+        return _presence_error("too many in-flight presence requests", 429, "presence_capacity_full", "retry")
+    try:
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):  # never a retryable outage
+            raise PresenceHistoryInvalid("payload", "the body must be JSON text in UTF-8") from None
+        parsed = parse_history_request(payload)
+        first = parsed.records[0].event
+        admission = await host._bounded_host_read(ctx, functools.partial(
+            host._admit_presence, ctx, skill_name, parsed.binding_id, provider=first.provider,
+            account_id=first.account_id, conversation_id=first.conversation_id, thread_id=first.thread_id))
+        if _outside_origin(admission, first.provider, first.account_id, first.conversation_id, first.thread_id):
+            return _presence_error("presence history does not match its owner-created binding", 403,
+                                   "presence_origin_mismatch", "rejected")
+        status, body = await run_sync_to_completion(record_history, ctx.data_dir, admission, parsed)
+        return JSONResponse(body, status_code=status)
+    except PresenceHistoryInvalid as exc:
+        return _presence_error(str(exc), 400, exc.code, "rejected", field=exc.field)
+    except PresenceAdmissionError as exc:
+        return _presence_exception(exc, 403 if exc.code == "presence_origin_mismatch" else 409)
+    except store.StoreMigrating:  # an older row may be this event's live capture: duplicates are undecided
+        return _presence_error("saved dialogue history is still importing; retry the same request", 503,
+                               "presence_history_importing", "retry")
+    except Exception:
+        log.warning("Presence history import failed for skill %s", skill_name, exc_info=True)
+        return _presence_error("presence history import unavailable; retry the same request", 503,
+                               "presence_history_unavailable", "retry")
+    finally:
+        ctx._leave_inflight(f"{skill_name}:history")
 
 
 def _presence_work_view(

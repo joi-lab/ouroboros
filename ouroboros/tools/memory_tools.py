@@ -92,10 +92,11 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("memory_map", {
             "name": "memory_map",
             "description": (
-                "Show the memory registry — a map of all data sources "
-                "the agent has access to, with coverage, gaps, and trust levels. "
-                "Use BEFORE generating content to verify you have actual source data, "
-                "not just cached impressions."
+                (
+                'Read memory/registry.md, the optional hand-written source registry: recorded coverage, gaps and trust. '
+                'This is not a discovered integration or file inventory; absence means nothing was recorded. Check '
+                'source availability before relying on cached impressions.'
+            )
             ),
             "parameters": {
                 "type": "object",
@@ -106,8 +107,10 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("memory_update_registry", {
             "name": "memory_update_registry",
             "description": (
-                "Update or create an entry in the memory registry. "
-                "Use after acquiring new data sources or discovering gaps."
+                (
+                "Replace one '### <source_id>' entry in the hand-written memory/registry.md source registry with "
+                'updates, its full new text.'
+            )
             ),
             "parameters": {
                 "type": "object",

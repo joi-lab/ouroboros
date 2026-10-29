@@ -159,4 +159,5 @@ def test_the_manifest_row_cap_is_one_runtime_limit(tmp_path, monkeypatch):
     main = server._main_routing_manifest(_host_ctx(tmp_path))
 
     assert len(room["final_results"]) == 1 and room["omissions"]["final_results"] == 2
-    assert len(main["final_results"]) == 1 and main["omissions"]["final_results"] == 2
+    # Main's scope is the whole store: its window proves more roots exist, it does not count them.
+    assert len(main["final_results"]) == 1 and main["omissions"]["final_results"] is None

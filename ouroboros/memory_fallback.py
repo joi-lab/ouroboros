@@ -1,6 +1,8 @@
 """One signed Light draft: with consciousness on, a candidate from unsealed failed/cancelled work's own rows.
 
-With consciousness off (or unknown), the existing acting-draft selection remains:
+With consciousness off (or unknown), an open lost-Max episode that folding my memory can end
+(``memory_max.memory_can_help``) comes first: one room's oldest run of unfolded pages, whoever
+wrote them, folded into a part (``max_episode_units``); then the existing acting-draft selection:
 
 1. The task's view showed this room's open rows only by address (``shortage_from_trace``,
    ``open_rows``): the room's oldest open segment, up to the newest addressed row (a
@@ -28,6 +30,7 @@ the chronicle: before activation the writer makes no call and creates no file.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import pathlib
@@ -40,7 +43,8 @@ from ouroboros import chat_chain, memory_inventory
 from ouroboros.chronicle_import import row_lineage
 from ouroboros.chronicle_store import ChronicleStore, PublishResult, draft_signer, source_time_span
 from ouroboros.consolidator import LIGHT_ANSWER_CEILING_TOKENS
-from ouroboros.dialogue_provenance import memory_row_header, render_memory_row, render_row_text, row_class
+from ouroboros.dialogue_provenance import (memory_row_header, recorded_finality, render_memory_row, render_row_text,
+                                           row_class)
 from ouroboros.memory_inventory import OpenSegment, ShortageFact, shortage_from_trace
 from ouroboros.utils import extract_trailing_json_object, utc_now_iso
 
@@ -128,7 +132,7 @@ def _light_fit(binding: Mapping[str, Any]) -> Tuple[Optional[int], Callable[[str
     unknown window is no fitting at all (a provider refusal by size is a receipt).
     """
     try:
-        from ouroboros.capability_evidence import is_known
+        from ouroboros.context_window import resolve_window
         from ouroboros.context_fit import (_route_calibration_ratio, estimate_context_prompt_tokens,
                                            resolve_context_fit_route)
         from ouroboros.provider_models import provider_for_model
@@ -138,13 +142,14 @@ def _light_fit(binding: Mapping[str, Any]) -> Tuple[Optional[int], Callable[[str
         route, evidence = resolve_context_fit_route(
             task, allow_fetch=bool(binding["use_local"]) or provider_for_model(binding["model"]) == "claudexor")
         density = _route_calibration_ratio(None, evidence.route_fp, route["model"])
-        window = int(evidence.window_tokens) if is_known(evidence, require_fresh=True) else None
         from ouroboros.response_limits import ResponseLimit
         reserve = ResponseLimit(**(getattr(evidence, "response_limit", {}) or {})).ceiling(ANSWER_RESERVE_TOKENS)
         if binding["use_local"]:
             from ouroboros.llm_local import local_context_limits
 
             _local_window, reserve = local_context_limits(reserve)
+        scope = route.get("window_observation_fp") or evidence.route_fp
+        window = resolve_window(evidence, reserve, observation_fp=scope, bound=bool(scope))
     except Exception:
         log.debug("fallback writer: Light window unknown", exc_info=True)
         return None, _chars_measure
@@ -153,7 +158,7 @@ def _light_fit(binding: Mapping[str, Any]) -> Tuple[Optional[int], Callable[[str
         return ceil(estimate_context_prompt_tokens([{"role": "user", "content": text}], None,
                                                   provider=route["provider"], reasoning_effort="low") * density)
 
-    return (window - reserve if window else None), measure
+    return window.usable, measure
 
 
 # --- which unit ------------------------------------------------------------------------------------
@@ -243,6 +248,31 @@ def _legacy_units(root: pathlib.Path, store: ChronicleStore) -> Iterator[Fallbac
         for _pos, record_id, key, segment in sorted(found, key=lambda item: item[:2]):
             yield FallbackUnit("legacy", segment.room_id, key, segment=segment, record_id=record_id,
                                head_sequence=segment.head_sequence)
+
+
+def max_episode_units(store: ChronicleStore) -> Iterator[FallbackUnit]:
+    """While my memory keeps Max lost (``memory_max.memory_can_help``): a room's runs of unfolded pages no shown
+    account tells (the view's ``told_map``), oldest first, whoever wrote them, the room holding most such text
+    first; one page is a run too, Light judges whether folding it helps, and a run it kept as it is leaves the
+    next one in turn (``select_unit``). Never an account across rooms: that is the mind's."""
+    from ouroboros.memory_view_account import told_map
+
+    told = set(told_map([{"id": r["id"], "replaces": r["selection"].get("replaces") or (),
+                          "selection_sequence": r["selection"]["sequence"]}
+                         for r in store.accounts() if (r.get("selection") or {}).get("shown")]))
+    sizes: Dict[str, int] = {}
+    for record in store.room_records(None, kinds=("page",)):
+        if not record.get("folded_into") and record["id"] not in told:
+            sizes[str(record["room_id"])] = sizes.get(str(record["room_id"]), 0) + len(str(record.get("current_text") or ""))
+    for room in sorted(sizes, key=lambda room: (-sizes[room], room)):
+        head, run = store.room_head(room), []
+        # A told page ends a run: a part's members are adjacent in the room's unfolded order.
+        for ident in [*_unfolded_run(store, room, "page"), None]:
+            if ident is not None and ident not in told:
+                run.append(ident)
+            elif run:
+                yield FallbackUnit("part", room, f"max:{room}:{run[0]}", member_ids=tuple(run), head_sequence=head)
+                run = []
 
 
 def candidate_units(root: Any, store: ChronicleStore, shortage: Optional[ShortageFact], *,
@@ -385,12 +415,17 @@ def _room_label(root: pathlib.Path, room: str) -> str:
 
 
 def _stamp_line(entry: Mapping[str, Any], lane_rows: int) -> str:
-    """One task as the host recorded it: status, outcome, phase and the source of the stamp."""
+    """One task as the host recorded it: status, outcome, phase, the finality and authority its source
+    recorded (a host facts stamp without one says unknown) and the source of the stamp."""
     facts = [f"status {entry.get('status') or 'not recorded'}"]
     for label, key in (("outcome", "outcome"), ("phase", "outcome_phase"), ("review", "review_verdict"),
                        ("reason", "reason_code"), ("objective", "objective_status")):
         if entry.get(key):
             facts.append(f"{label} {entry[key]}")
+    finality = recorded_finality(entry.get("outcome_final"), entry.get("outcome_authority"),
+                                 host_facts=entry.get("source") == "host_task_facts")
+    if finality:
+        facts.append(finality)
     facts.append(f"stamp from {entry.get('source') or 'nothing recorded'}")
     if lane_rows:
         facts.append(f"{lane_rows} host/child row{'' if lane_rows == 1 else 's'} here")
@@ -660,6 +695,7 @@ class FallbackRun:
     usage: Dict[str, Any] = field(default_factory=dict)
     errors: List[Dict[str, Any]] = field(default_factory=list)
     input_tokens: Optional[int] = None
+    effect: str = ""  # a published draft, measured: what it folded, its characters before and after
 
 
 def _parse(text: str, *, part: bool = False) -> Optional[Dict[str, Any]]:
@@ -741,8 +777,12 @@ def run_fallback_draft(env: Any, task: Mapping[str, Any], llm: Any, drive_logs: 
                 fitted.append(_light_fit(binding))
             return fitted[0]
 
-        chosen = select_unit(root, store, shortage_from_trace(trace), allow_legacy=not task.get("_is_direct_chat"),
-                             binding=binding, fit=fit, **({"units": failed_work_units(root, store)} if candidate else {}))
+        shortage, allow_legacy = shortage_from_trace(trace), not task.get("_is_direct_chat")
+        from ouroboros.memory_max import memory_can_help  # the open lost-Max episode memory could end
+        units = (failed_work_units(root, store) if candidate else itertools.chain(
+            max_episode_units(store), candidate_units(root, store, shortage, allow_legacy=allow_legacy))
+            if memory_can_help(root) else None)
+        chosen = select_unit(root, store, shortage, allow_legacy=allow_legacy, binding=binding, fit=fit, units=units)
         if chosen is None:
             return FallbackRun("nothing")
         unit, draft = chosen
@@ -767,6 +807,10 @@ def run_fallback_draft(env: Any, task: Mapping[str, Any], llm: Any, drive_logs: 
             result = _publish(root, store, unit, draft, answer, usage, bound)
             if result.ok:
                 run.outcome, run.record_id = "published", str((result.record or {}).get("id") or "")
+                if unit.kind == "part":
+                    from ouroboros.tools.chronicle import _fold_effect
+
+                    run.effect = _fold_effect(store, "a helper draft folded", draft.member_ids, answer["text"])
                 phase = "receipt_clear_failed"
                 _set_refusal(store, unit.key, None)
             elif result.reason in CONFLICT_REASONS:

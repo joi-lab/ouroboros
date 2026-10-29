@@ -12,11 +12,12 @@ result and the queue snapshot — never a second ledger or scheduler:
   dispatch: none|possible, task}`` — the frozen task an accepted occurrence runs;
 - queued task ``metadata.schedule_occurrence``: identity/timing plus the matching previous-run outcome.
 
-A pass claims under the queue+table locks (briefly), prepares everything
-expensive WITHOUT them (resource intent, folder checks, preflight, memory fork,
-the consciousness allowance read), then rechecks the row, its token and its edit
-fingerprint and admits under the locks: enqueue, a verified receipt, the row
-advanced, a snapshot whose False return counts as failure. A failed durable step
+A pass reads signed receipts and prepares resources outside the queue+table
+locks. Under the locks it rechecks signatures, occurrence identity, edits and
+current controls before enqueue, a committed receipt, the advanced row and a
+snapshot whose False return counts as failure. Conditional receipt writes and
+final policy checks remain locked; this is no general nonblocking-I/O promise.
+A failed durable step
 takes the pending task back out; the next pass reconciles from durable facts
 only; confirmed contention (``contention``) defers the same identity without a
 hold. ``dispatch=possible`` is written BEFORE a worker receives the task, in the
@@ -58,6 +59,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.utils import utc_now_iso
+from supervisor.task_ownership import TaskOwnershipRead, BUSY, CHANGED
 
 log = logging.getLogger(__name__)
 
@@ -150,7 +152,7 @@ def _is_live(task_id: str) -> bool:
         isinstance(row, dict) and str(row.get("id") or "") == task_id for row in q.PENDING)
 
 
-def reconcile(record: Dict[str, Any]) -> tuple[str, Optional[Dict[str, Any]]]:
+def reconcile(record: Dict[str, Any], *, reads: Optional[TaskOwnershipRead] = None) -> tuple[str, Optional[Dict[str, Any]]]:
     """Decide an existing occurrence from durable facts (caller holds the locks).
 
     ``live`` (T pending/running), ``settled`` (occurrence done: T possibly dispatched,
@@ -158,7 +160,8 @@ def reconcile(record: Dict[str, Any]) -> tuple[str, Optional[Dict[str, Any]]]:
     dispatched: prepare the SAME T again), ``reconsider`` (unstarted,
     changed definition/control: evaluate the new due point), ``republish`` (accepted but not in flight
     and never dispatched: re-enqueue the frozen task), or ``hold`` (unknown or
-    missing accepted evidence — never replayed on absence alone)."""
+    missing accepted evidence — never replayed on absence alone), or ``retry``
+    (the prepared receipt changed; observe again next pass)."""
     occ = record["occurrence"]
     task_id, token = str(occ.get("task_id") or ""), str(occ.get("token") or "")
     if occ.get("dispatch") == "possible":
@@ -166,7 +169,9 @@ def reconcile(record: Dict[str, Any]) -> tuple[str, Optional[Dict[str, Any]]]:
     if _is_live(task_id):
         return "live", None
     try:
-        result = _read_back(task_id)
+        result = _read_back(task_id, reads=reads)
+    except ReceiptChanged:
+        return "retry", None
     except Exception as exc:
         if contention(exc):
             raise  # the same occurrence waits a pass; contention is not unreadable evidence
@@ -217,7 +222,8 @@ def _unstarted_claim(occ: Dict[str, Any], result: Dict[str, Any]) -> bool:
     return occ.get("phase") == "claimed" and not result and occ.get("dispatch") != "possible"
 
 
-def owed(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None) -> Optional[bool]:
+def owed(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None,
+         reads: Optional[TaskOwnershipRead] = None) -> Optional[bool]:
     """Whether the row carries an ACCEPTED occurrence that is neither in flight nor
     settled — work its deletion would silently drop. ``None``: missing, unreadable
     or conflicting evidence cannot establish that obligation."""
@@ -225,7 +231,7 @@ def owed(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None) -
     if occ is None or occ.get("dispatch") == "possible":
         return False
     try:
-        result = _read_back(str(occ.get("task_id") or ""), drive_root=drive_root)
+        result = _read_back(str(occ.get("task_id") or ""), drive_root=drive_root, reads=reads)
     except Exception:
         return None
     if _unstarted_claim(occ, result):
@@ -240,14 +246,18 @@ def owed(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None) -
                     and isinstance(admission.get("task"), dict)) else None
 
 
-def work_settled(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None) -> bool:
+def work_settled(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None,
+                 reads: Optional[TaskOwnershipRead] = None) -> bool:
     """Occurrence settlement is not task settlement: keep its control row until both.
 
     A receipt-less claim positively never started, and a row that never admitted
     anything owes nothing: neither needs a queue observation to prove settlement.
-    Otherwise the admitted task must be absent from
-    the queue and settled; a collected result of a task no occurrence still
-    names is settled history. Unreadable or unknown evidence keeps the row.
+    Otherwise the admitted task must be absent from the queue and its result
+    settled. Task rows have no GC, so an absent result is no proof of settlement:
+    bare absence without an occurrence is only a legacy compatibility case.
+    Prepared reads retain owner_pause's refusal for authority seen by this
+    process's fence reads or recorded in quarantine. Quarantine remains evidence
+    across restarts. This refusal and unreadable or unknown evidence keep the row.
     """
     from supervisor.queue_schedules import _schedule_running_or_queued
     from ouroboros.task_status import SETTLED_STATUSES
@@ -256,7 +266,7 @@ def work_settled(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] =
     occ = record.get("occurrence") if isinstance(record.get("occurrence"), dict) else {}
     tid = str(occ.get("task_id") or record.get("last_task_id") or "")
     try:
-        if occ and _unstarted_claim(occ, _read_back(str(occ.get("task_id") or ""), drive_root=root)):
+        if occ and _unstarted_claim(occ, _read_back(str(occ.get("task_id") or ""), drive_root=root, reads=reads)):
             # Only an earlier occurrence's task can be unsettled.
             occ, tid = {}, str(record.get("last_task_id") or "")
             if not tid:
@@ -267,13 +277,14 @@ def work_settled(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] =
             return False
         if not tid:
             return not occ
-        result = _read_back(tid, drive_root=root)
+        result = _read_back(tid, drive_root=root, reads=reads)
         return (not occ) if not result else result.get("status") in SETTLED_STATUSES
     except Exception:
         return False
 
 
-def deletion_settled(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None) -> bool:
+def deletion_settled(record: Dict[str, Any], *, drive_root: Optional[pathlib.Path] = None,
+                     reads: Optional[TaskOwnershipRead] = None) -> bool:
     """Whether withdrawal/GC has settled work: nothing retained still needs the row.
 
     An independent schedule's row has no role once its accepted run starts. A
@@ -282,14 +293,15 @@ def deletion_settled(record: Dict[str, Any], *, drive_root: Optional[pathlib.Pat
     """
     from supervisor.followup_policy import relation_kind
 
-    return relation_kind(record) == "independent" or work_settled(record, drive_root=drive_root)
+    return relation_kind(record) == "independent" or work_settled(record, drive_root=drive_root, reads=reads)
 
 
-def repair_followup_binding(record: Dict[str, Any]) -> bool:
+def repair_followup_binding(record: Dict[str, Any], *, reads: Optional[TaskOwnershipRead] = None) -> bool:
     """Supervisor-only convergence of a resolved, already fired, unrun occurrence.
 
-    The canonical frozen receipt is written/read back before the live row and
-    snapshot. A partial publication stays non-dispatchable at bound_task; another
+    The canonical frozen receipt commits before the live row and
+    snapshot. Unqueued work is rebound by prepare and its admission write instead.
+    A partial publication stays non-dispatchable at bound_task; another
     tick completes the SAME identity. No missing/possible receipt buys a rebind.
     The caller holds queue/table and origin control locks.
     """
@@ -297,15 +309,17 @@ def repair_followup_binding(record: Dict[str, Any]) -> bool:
 
     q = _queue()
     tid = str((record.get("occurrence") or {}).get("task_id") or record.get("last_task_id") or "")
+    live = next((t for t in q.PENDING if str(t.get("id") or "") == tid), None)
     if not tid or relation_kind(record) == "unknown":
         return False
     try:
-        stored = _read_back(tid)
+        stored = _read_back(tid, reads=reads)
+        if live is None:
+            return False  # busy/changed evidence still defers before claiming new work
         receipt = stored.get("schedule_admission") or {}
         frozen = receipt.get("task") or {}
         token = receipt.get("token")
         occ = record.get("occurrence") or {}
-        live = next((t for t in q.PENDING if str(t.get("id") or "") == tid), None)
         if (not token or receipt.get("schedule_id") != record.get("id")
                 or frozen.get("id") != tid or stored.get("status") != "scheduled"
                 or receipt.get("dispatch") != "none" or occ.get("dispatch") == "possible"
@@ -332,7 +346,7 @@ def repair_followup_binding(record: Dict[str, Any]) -> bool:
                 return False
         return True
     except Exception as exc:
-        if contention(exc):
+        if isinstance(exc, ReceiptChanged) or contention(exc):
             raise  # unread is not unbound: the caller defers this row, never claims past it
         log.warning("Fired follow-up %s retains its binding hold", tid, exc_info=True)
         return False
@@ -423,9 +437,16 @@ def prepare(claimed: Dict[str, Any]) -> Dict[str, Any]:
 
 def _prepare(claimed: Dict[str, Any]) -> Dict[str, Any]:
     if claimed.get("stored_task"):
+        from supervisor.followup_policy import bind_task
+
         task = copy.deepcopy(claimed["stored_task"])
         # Already accepted recovery freezes its resource and original incarnation.
-        # The final queue read still checks lifecycle; no new preparation launders it.
+        # Repair only host relationship facts here; the admission writer commits
+        # them before publication, without invalidating this pass's signed read.
+        try:
+            bind_task(_queue().DRIVE_ROOT, task, claimed["record"])
+        except ValueError as exc:
+            return {**claimed, "task": task, "hold": ("followup_binding_unavailable", str(exc))}
         return {**claimed, "task": task, "project_admission": task.get("_project_admission")}
     from supervisor.queue_schedules import _task_from_schedule
 
@@ -624,6 +645,7 @@ def admit(prepared: List[Dict[str, Any]], *, stop: Optional[Callable[[], bool]] 
                             p["schedule_id"], exc_info=not contention(exc))
                 if contention(exc):
                     break  # the money store is held: the rest wait a pass too, without another wait each
+    reads = prepare_receipts([p["record"] for p in prepared], drive_root=q.DRIVE_ROOT)
 
     def defer(item: Dict[str, Any]) -> None:
         if not item.get("stored_task") and not item.get("hold"):
@@ -658,10 +680,13 @@ def admit(prepared: List[Dict[str, Any]], *, stop: Optional[Callable[[], bool]] 
                 defer(item)
                 continue
             try:
-                verdict, stored = reconcile(record)  # CURRENT facts, not the off-lock prepare snapshot
+                verdict, stored = reconcile(record, reads=reads)  # signed facts revalidated under Q
             except Exception as exc:
                 if not contention(exc):
                     raise
+                defer(item)
+                continue
+            if verdict == "retry":
                 defer(item)
                 continue
             changed = True
@@ -687,6 +712,12 @@ def admit(prepared: List[Dict[str, Any]], *, stop: Optional[Callable[[], bool]] 
             prepared_task, enqueued = item["task"], False
             try:
                 with control_guard(q.DRIVE_ROOT, record):
+                    # A resolved relationship must reach the frozen receipt before
+                    # policy checks its binding. This is repair of accepted, unrun
+                    # work; current controls still decide whether it may enqueue.
+                    if (item.get("stored_task") and prepared_task != item["stored_task"]
+                            and not _write_receipt(item, record)):
+                        continue
                     policy = refresh_policy(q.DRIVE_ROOT, data, record)
                     if policy.get("busy"):
                         defer(item)
@@ -760,8 +791,9 @@ def _write_receipt(item: Dict[str, Any], record: Dict[str, Any]) -> bool:
 
     Monotonic: it lands only over absence or over this token's own still-undispatched
     ``scheduled`` receipt — never over a row that says ``dispatch=possible``, a later
-    status or another admission. Verified by reading the file back, not by trusting
-    the writer's return value."""
+    status or another admission. The conditional writer returns the committed
+    document (or the unchanged current one on refusal); verify that result without
+    another full-body read under Q. Its atomic read/modify/write still holds Q."""
     from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
 
     task, occ = item["task"], item["occurrence"]
@@ -775,7 +807,8 @@ def _write_receipt(item: Dict[str, Any], record: Dict[str, Any]) -> bool:
             return incoming
         prior = current.get("schedule_admission") if isinstance(current.get("schedule_admission"), dict) else {}
         if (str(current.get("status") or "") != STATUS_SCHEDULED or prior.get("token") != occ["token"]
-                or prior.get("dispatch") != "none"):
+                or prior.get("schedule_id") != item["schedule_id"]
+                or (prior.get("task") or {}).get("id") != task["id"] or prior.get("dispatch") != "none"):
             return None
         for key in ("_owner_hold", "_consciousness_continuation"):
             if key in current:
@@ -783,7 +816,7 @@ def _write_receipt(item: Dict[str, Any], record: Dict[str, Any]) -> bool:
         return incoming
 
     try:
-        written = write_task_result(
+        stored = write_task_result(
             _queue().DRIVE_ROOT, str(task["id"]), STATUS_SCHEDULED, _field_projector=_accept,
             strict_existing_dict=True,
             root_task_id=str(task["id"]), actor_id="scheduler", delegation_role="root",
@@ -796,27 +829,74 @@ def _write_receipt(item: Dict[str, Any], record: Dict[str, Any]) -> bool:
             result="Scheduled task queued.", metadata=dict(task.get("metadata") or {}),
             schedule_id=item["schedule_id"], schedule_name=str(record.get("name") or ""),
             schedule_admission=receipt,
+            **{key: task[key] for key in ("title", "suggested_name") if task.get(key)},
             **({"reasoning_effort": task["reasoning_effort"]} if task.get("reasoning_effort") else {}),
             **({"billing_group": task["metadata"]["billing_group"]}
                if (task.get("metadata") or {}).get("billing_group") else {}),
             **{key: task[key] for key in ("_owner_hold", "_consciousness_continuation") if key in task})
-        if written is False:
+        if not isinstance(stored, dict):
             return False
-        stored = _read_back(str(task["id"]))
     except Exception as exc:
         if contention(exc):
-            raise  # rolled back or committed-but-unread: ``reconcile`` decides next pass
+            raise  # rolled back or committed-but-unreturned: ``reconcile`` decides next pass
         log.warning("Scheduled admission receipt failed for %s", task.get("id"), exc_info=True)
         return False
     got = stored.get("schedule_admission") if isinstance(stored.get("schedule_admission"), dict) else {}
-    return (str(stored.get("status") or "") == STATUS_SCHEDULED
-            and got == receipt)
+    landed = (stored.get("task_id") == task["id"] and str(stored.get("status") or "") == STATUS_SCHEDULED
+              and got == receipt)
+    if landed and task.get("suggested_name"):
+        from supervisor.worker_chat_lane import _broadcast_task_named
+
+        # The live card is born named (pooled progress frames carry no name); replay reads the document.
+        _broadcast_task_named({"type": "task_named", "task_id": str(task["id"]), "suggested_name": str(task["suggested_name"])})
+    return landed
 
 
-def _read_back(task_id: str, *, drive_root: Optional[pathlib.Path] = None) -> Dict[str, Any]:
-    """The result as it now is ON DISK (strict: unreadable raises, absence is ``{}``)."""
+class ReceiptChanged(ValueError):
+    """A prepared receipt no longer describes this pass; defer without a durable hold."""
+
+
+def prepare_receipts(records: List[Dict[str, Any]], *, drive_root: pathlib.Path) -> TaskOwnershipRead:
+    """One pass's addressed receipts, outside Q; errors remain errors at consumption.
+
+    Body and handoff writers advance the signature. Display-only task-card writes
+    do not, but none of these decisions consumes their line/counter fields.
+    """
+    from ouroboros.store import acquisition_budget
+
+    reads = TaskOwnershipRead(drive_root)
+    task_ids = {str(tid) for row in records for tid in
+                ((row.get("occurrence") or {}).get("task_id"), row.get("last_task_id")) if tid}
+    for tid in sorted(task_ids):
+        try:
+            with acquisition_budget(0):  # an optional observation defers on contention
+                reads.load(tid)
+        except Exception:
+            pass  # TaskOwnershipRead retains the exact failure, never an absent row.
+    return reads
+
+
+def _read_back(task_id: str, *, drive_root: Optional[pathlib.Path] = None,
+               reads: Optional[TaskOwnershipRead] = None) -> Dict[str, Any]:
+    """Strict receipt, or a prepared body after a zero-wait signature check under Q.
+
+    A changed/unprepared identity waits a pass; unreadable is never absence. Other
+    callers keep their strict direct read and its existing locking contract.
+    """
     from ouroboros.task_results import load_task_result
 
+    if reads is not None:
+        if task_id in reads.errors:
+            raise reads.errors[task_id]
+        if task_id not in reads.rows:
+            raise ReceiptChanged(task_id)
+        state = reads.recheck((task_id,))
+        if state == CHANGED:
+            raise ReceiptChanged(task_id)
+        if state == BUSY:
+            from ouroboros.store import StoreBusy
+            raise StoreBusy("schedule receipt signature busy", reason="contention")
+        return reads.prepared(task_id)
     return load_task_result(drive_root if drive_root is not None else _queue().DRIVE_ROOT, task_id, strict=True) or {}
 
 

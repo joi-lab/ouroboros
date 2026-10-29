@@ -150,7 +150,9 @@ def test_late_refused_handoff_cannot_recreate_claim(tmp_path, monkeypatch, route
 
 
 @pytest.mark.parametrize("reason", ["permission_denied", "contention"])
-def test_unavailable_settle_preserves_result_and_unresolved_custody(tmp_path, monkeypatch, reason):
+def test_unavailable_settle_preserves_result_and_owes_the_return(tmp_path, monkeypatch, reason):
+    from ouroboros import custody_owed
+
     registry, _, _ = _registry(tmp_path, monkeypatch)
     patch = task_store.patch_handoff
     writes = []
@@ -172,6 +174,11 @@ def test_unavailable_settle_preserves_result_and_unresolved_custody(tmp_path, mo
     assert len(set(writes)) == 1
     if reason != "contention":
         assert len(writes) == 1
+    # The returned call is owed, never forgotten: the same write lands once the store accepts it.
+    assert custody_owed.pending() == 1 and custody_owed.drain() == 1
+    monkeypatch.setattr(task_store, "patch_handoff", patch)
+    assert custody_owed.drain() == 0 and claims(tmp_path) == {}, "no rerun of the tool, no second claim"
+    assert calls == [True]
 
 
 def test_ambiguous_completion_is_idempotent_and_preserves_other_duties(tmp_path, monkeypatch):

@@ -245,6 +245,11 @@ def _delegated_receipt_counts(value: Any) -> tuple[int, int] | None:
     return counts
 
 
+# Local custody rows are written only by their owners and the retirement writers on the canonical
+# result (``tool_custody``, ``local_custody_repair``); a child's replica carries results, not custody.
+CANONICAL_CUSTODY_FIELDS = ("launch_handoffs", "retired_tool_invocations", "retired_model_consumers")
+
+
 def project_replica_task_result_fields(
     canonical_fields: Dict[str, Any],
     replica_fields: Dict[str, Any],
@@ -269,6 +274,8 @@ def project_replica_task_result_fields(
     # including its absence on historical rows; replicas cannot originate it.
     overlay.pop("canonical_terminal_projection_origin", None)
     overlay.pop("pause_notices", None)  # confirmed host transitions alone own pending chat disclosure
+    for field in CANONICAL_CUSTODY_FIELDS:  # a replica never revives a retired claim nor erases a live one
+        overlay.pop(field, None)
     # Unread-mail custody is a union: a stale replica never drops a canonical row.
     from ouroboros.task_custody import merge_unread_mail
 
@@ -542,9 +549,10 @@ def set_root_post_task_checkpoint(
                 from ouroboros.usage_accounting import usage_breakdown
                 from supervisor.state import reconstruct_task_cost
 
-                cost_fields.update(reconstruct_task_cost(task_id, fields=True, drive_root=authority_root))
+                cost_fields.update(reconstruct_task_cost(task_id, fields=True, drive_root=authority_root,
+                                                         custody_root=env.drive_root))
                 subtree = usage_breakdown(
-                    authority_root, root_task_id=logical_root_id
+                    authority_root, root_task_id=logical_root_id, custody_root=env.drive_root, include_custody=True
                 )
                 accounting = _root_accounting_snapshot(logical_root_id, subtree)
                 subtree_final = bool(subtree.get("cost_final"))
@@ -554,6 +562,7 @@ def set_root_post_task_checkpoint(
                         round(subtree_amount, 6) if subtree_amount is not None else None
                     ),
                     "cost_with_children_partial": not subtree_final,
+                    "cost_custody": subtree.get("cost_custody"),
                     "cost_final": bool(cost_fields.get("cost_final") and subtree_final),
                     # #498: a ROOT's terminal record speaks for its whole tree, so
                     # the carrier is rebuilt from the SUBTREE bucket, replacing the

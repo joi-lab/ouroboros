@@ -28,6 +28,13 @@ def _packed(root, task="wanted"):
     return ref, raw, loose, pack, sidecar
 
 
+def _warm_index(root):
+    """Validate the shared placement cache (building it when absent) the way its owners do: the
+    packer and the readers that need every pack. An addressed handle read never builds or checks it."""
+    with packs.open_index(root):
+        pass
+
+
 def _finish_stream_lease(pack):
     """Close the existing reader's open stream on PACK; its warm placement index stays.
 
@@ -119,7 +126,8 @@ def test_confined_placement_work_stays_constant(tmp_path, monkeypatch, record_pr
     for number in range(count):
         task = f"history-{number:05d}"
         (directory / packs.sidecar_name(task, 1)).write_text(json.dumps({**sidecar, "task_id": task}))
-    assert packs.handle_bytes(root, "zz-target", ref["path"]) == raw  # warm existing SQLite cache
+    _warm_index(root)  # warm existing SQLite cache
+    assert packs.handle_bytes(root, "zz-target", ref["path"]) == raw
     reads, enumerated, scans = [], [], []
     real_open, real_entries, real_sidecar = confined_files.ConfinedDirectory.open, confined_files.ConfinedDirectory.entries, packs.read_sidecar
 
@@ -184,6 +192,7 @@ def test_warm_cache_corruption_preserves_existing_authority(tmp_path, record_pro
     ref, raw, _loose, _pack, _ = _packed(root)
     reader = packs.handle_info if metadata else packs.handle_bytes
     expected = {"size": len(raw), "sha256": ref["sha256"], "loose": False} if metadata else raw
+    _warm_index(root)
     assert reader(root, "wanted", ref["path"]) == expected
     (packs.packs_dir(root) / "wanted.members.json").write_text("{")
     cached = _outcome(lambda: reader(root, "wanted", ref["path"]))
@@ -228,7 +237,8 @@ def test_configured_alias_anchor_keeps_admitted_child_placement_authority(tmp_pa
     root = _placement(anchor, placement, TASK)
     ref, raw, _loose, pack, _ = _packed(root, TASK)
     write_task_result(anchor, TASK, "completed", completion_observations={"source_ref": ref})
-    assert packs.handle_bytes(root, TASK, ref["path"]) == raw  # the existing reader warms the index
+    _warm_index(root)  # the cache owners warm the index
+    assert packs.handle_bytes(root, TASK, ref["path"]) == raw
     _finish_stream_lease(pack)
     (packs.packs_dir(root) / packs.sidecar_name(TASK, 1)).write_text("{")
     assert artifacts.read_actor_source_bytes(anchor, TASK, ref, anchor=anchor) == raw

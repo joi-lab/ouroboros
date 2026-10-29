@@ -280,7 +280,7 @@ def _compose_subagent_text(
             # changes land, never that the child executes them natively itself
             # (the dispatch-time executor note owns execution framing).
             "All changes land inside the write root only. Do NOT commit, run review gates / "
-            "runtime / skills lifecycle, enable tools, or write identity or scratchpad. "
+            "runtime / skills lifecycle, grant yourself tools, or write identity or scratchpad. "
             "You may optionally ask independent reviewers about work in your write root with "
             "review_change; it never approves, commits or integrates that work. "
             + _CHILD_MEMORY_SENTENCE + " Your "

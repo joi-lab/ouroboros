@@ -6,6 +6,7 @@ import { modelRolesHost } from './model_roles.js';
 import { bindSecretReveal } from './settings_secrets.js';
 import { safetySectionHtml } from './settings_safety.js';
 import { consciousnessSectionHtml } from './settings_consciousness.js';
+import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
 // Reads as a sequence: keys → secrets → which API models → who among the agents
 // does what → behavior → technical. "Agents", not "Coding agents" (D-10): the
@@ -33,20 +34,27 @@ const RUNTIME_MODE_OPTIONS = [
     { value: 'cyber_pro', label: 'Cyber Pro' },
 ];
 
-function providerCard({ id, title, icon, hint, body, open = false }) {
+// A provider card: its head is the card's disclosure plus its own Add key (docs/DESIGN.md §6: a
+// section-level action belongs in its group's header), its body the provider's key rows.
+function providerCard(card, body) {
+    const bodyId = `settings-provider-${card.id}-body`;
+    const titleId = `settings-provider-${card.id}-title`;
     return `
-        <details class="settings-provider-card" data-provider-card="${id}" ${open ? 'open' : ''}>
-            <summary>
-                <div class="settings-provider-title">
-                    ${icon ? `<img src="${icon}" alt="" class="settings-provider-icon">` : ''}
-                    <span>${title}</span>
-                </div>
-                <span class="settings-provider-hint">${hint || ''}</span>
-            </summary>
-            <div class="settings-provider-body">
+        <section class="settings-provider-card" data-provider-card="${card.id}">
+            <div class="settings-provider-head">
+                <button type="button" class="settings-provider-toggle" data-provider-toggle aria-expanded="${card.open ? 'true' : 'false'}" aria-controls="${bodyId}">
+                    <span class="settings-provider-title" id="${titleId}">
+                        ${card.icon ? `<img src="${card.icon}" alt="" class="settings-provider-icon">` : ''}
+                        <span>${card.title}</span>
+                    </span>
+                    <span class="settings-provider-hint">${card.hint || ''}</span>
+                </button>
+                <button type="button" class="btn btn-default" data-connection-add="${card.kind}" aria-describedby="${titleId}">Add key</button>
+            </div>
+            <div class="settings-provider-body" id="${bodyId}"${card.open ? '' : ' hidden'}>
                 ${body}
             </div>
-        </details>
+        </section>
     `;
 }
 
@@ -63,151 +71,147 @@ function secretField({ id, settingKey, label, placeholder }) {
     `;
 }
 
-function plainField({ id, label, placeholder }) {
-    return `<div class="form-field ui-field"><label for="${id}">${label}</label><input id="${id}" name="${id}" type="text" class="ui-control" placeholder="${placeholder}"></div>`;
-}
-
-const PROVIDER_CARDS = [
+// API keys: one card per provider kind, one row per key. The built-in key ("Default") edits today's flat
+// settings (`settingKey`; its inputs keep the `id` the setup contract names); a key added in the card is one
+// OUROBOROS_CONNECTIONS row whose fields are its `rowField`s (ouroboros/provider_models.py PROVIDER_KINDS).
+// `credential`: a plain field Remove clears on the built-in key besides its secrets; `required`: an added
+// key cannot be saved without it.
+export const PROVIDER_CARDS = [
     {
-        id: 'openrouter', title: 'OpenRouter', icon: '/static/providers/openrouter.ico', hint: 'Default multi-model router', open: true,
-        fields: [{ id: 's-openrouter', settingKey: 'OPENROUTER_API_KEY', label: 'OpenRouter API Key', placeholder: 'sk-or-...' }],
-        // testInputs must cover BOTH the secret and the plain fields of the card:
-        // the probe runs against what is typed, before anything is saved.
-        testProvider: 'openrouter', testInputs: { 's-openrouter': 'OPENROUTER_API_KEY' },
+        id: 'openrouter', kind: 'openrouter', title: 'OpenRouter', icon: '/static/providers/openrouter.ico', hint: 'Default multi-model router', open: true,
+        fields: [{ id: 's-openrouter', rowField: 'api_key', settingKey: 'OPENROUTER_API_KEY', secret: true, label: 'API key', placeholder: 'sk-or-...' }],
     },
     {
-        id: 'openai', title: 'OpenAI', icon: '/static/providers/openai.svg', hint: 'Official OpenAI API',
-        fields: [{ id: 's-openai', settingKey: 'OPENAI_API_KEY', label: 'OpenAI API Key', placeholder: 'sk-...' }],
-        testProvider: 'openai', testInputs: { 's-openai': 'OPENAI_API_KEY' },
+        id: 'openai', kind: 'openai', title: 'OpenAI', icon: '/static/providers/openai.svg', hint: 'Official OpenAI API',
+        fields: [{ id: 's-openai', rowField: 'api_key', settingKey: 'OPENAI_API_KEY', secret: true, label: 'API key', placeholder: 'sk-...' }],
         note: 'Pick OpenAI as the source in Models or Agents to route a role through this key. If OpenRouter is absent and the shipped defaults are still untouched, Ouroboros auto-remaps them to official OpenAI defaults.',
     },
     {
-        id: 'compatible', title: 'OpenAI Compatible', icon: '/static/providers/openai-compatible.svg', hint: 'Custom OpenAI-style endpoint',
+        id: 'compatible', kind: 'openai-compatible', title: 'OpenAI Compatible', icon: '/static/providers/openai-compatible.svg', hint: 'Custom OpenAI-style endpoint',
         fields: [
-            { id: 's-openai-compatible-key', settingKey: 'OPENAI_COMPATIBLE_API_KEY', label: 'API Key', placeholder: 'Compatible provider key' },
-            { id: 's-openai-compatible-base-url', label: 'Base URL', placeholder: 'https://provider.example/v1' },
+            { id: 's-openai-compatible-base-url', rowField: 'base_url', settingKey: 'OPENAI_COMPATIBLE_BASE_URL', label: 'Base URL', placeholder: 'https://provider.example/v1', credential: true, required: true },
+            { id: 's-openai-compatible-key', rowField: 'api_key', settingKey: 'OPENAI_COMPATIBLE_API_KEY', secret: true, label: 'API key', placeholder: 'No key' },
         ],
-        testProvider: 'openai-compatible',
-        testInputs: {
-            's-openai-compatible-key': 'OPENAI_COMPATIBLE_API_KEY',
-            's-openai-compatible-base-url': 'OPENAI_COMPATIBLE_BASE_URL',
-        },
         note: 'Use this card for custom base URLs. Built-in web search only works with the official OpenAI Responses API, so keep <code>OPENAI_BASE_URL</code> empty when you want <code>web_search</code>.',
     },
     {
-        // advanced: rendered inside the collapsed "More providers" section.
-        // Inputs stay mounted either way — settings.js applyInputValue has no
-        // null guard, so every input id must always exist in the DOM.
-        id: 'cloudru', title: 'Cloud.ru Foundation Models', icon: '/static/providers/cloudru.svg', hint: 'Cloud.ru OpenAI-compatible runtime', advanced: true,
+        // advanced: rendered inside the collapsed "More providers" section. Inputs stay mounted either
+        // way — settings.js applyInputValue has no null guard, so every input id must always exist in the DOM.
+        id: 'cloudru', kind: 'cloudru', title: 'Cloud.ru Foundation Models', icon: '/static/providers/cloudru.svg', hint: 'Cloud.ru OpenAI-compatible runtime', advanced: true,
         fields: [
-            { id: 's-cloudru-key', settingKey: 'CLOUDRU_FOUNDATION_MODELS_API_KEY', label: 'API Key', placeholder: 'Cloud.ru Foundation Models API key' },
-            { id: 's-cloudru-base-url', label: 'Base URL', placeholder: 'https://foundation-models.api.cloud.ru/v1' },
+            { id: 's-cloudru-key', rowField: 'api_key', settingKey: 'CLOUDRU_FOUNDATION_MODELS_API_KEY', secret: true, label: 'API key', placeholder: 'Cloud.ru Foundation Models API key' },
+            { id: 's-cloudru-base-url', rowField: 'base_url', settingKey: 'CLOUDRU_FOUNDATION_MODELS_BASE_URL', label: 'Base URL', placeholder: 'https://foundation-models.api.cloud.ru/v1' },
         ],
-        testProvider: 'cloudru',
-        testInputs: {
-            's-cloudru-key': 'CLOUDRU_FOUNDATION_MODELS_API_KEY',
-            's-cloudru-base-url': 'CLOUDRU_FOUNDATION_MODELS_BASE_URL',
-        },
     },
     {
-        id: 'minimax', title: 'MiniMax', icon: '', hint: 'Direct regional OpenAI-compatible runtime', advanced: true,
+        id: 'minimax', kind: 'minimax', title: 'MiniMax', icon: '', hint: 'Direct regional OpenAI-compatible runtime', advanced: true,
         fields: [
-            { id: 's-minimax-key', settingKey: 'MINIMAX_API_KEY', label: 'API Key', placeholder: 'MiniMax API key' },
-            { id: 's-minimax-region', label: 'Region', placeholder: 'global_en or cn_zh' },
+            { id: 's-minimax-key', rowField: 'api_key', settingKey: 'MINIMAX_API_KEY', secret: true, label: 'API key', placeholder: 'MiniMax API key' },
+            { id: 's-minimax-region', rowField: 'region', settingKey: 'MINIMAX_REGION', label: 'Region', placeholder: 'global_en or cn_zh' },
         ],
-        testProvider: 'minimax',
-        testInputs: { 's-minimax-key': 'MINIMAX_API_KEY', 's-minimax-region': 'MINIMAX_REGION' },
-        note: 'Pick MiniMax as the source in Models or Agents, then choose MiniMax-M3 or MiniMax-M2.7. Leave Region empty for <code>global_en</code>; use <code>cn_zh</code> for the China endpoint.',
+        note: 'Pick MiniMax as the source in Models or Agents, then choose MiniMax-M3 or MiniMax-M3.1-Flash. Leave Region empty for <code>global_en</code>; use <code>cn_zh</code> for the China endpoint.',
     },
     {
-        id: 'deepseek', title: 'DeepSeek', icon: '', hint: 'Direct OpenAI-compatible runtime (v4 family)', advanced: true,
-        fields: [
-            { id: 's-deepseek-key', settingKey: 'DEEPSEEK_API_KEY', label: 'API Key', placeholder: 'sk-...' },
-        ],
-        testProvider: 'deepseek',
-        testInputs: { 's-deepseek-key': 'DEEPSEEK_API_KEY' },
+        id: 'deepseek', kind: 'deepseek', title: 'DeepSeek', icon: '', hint: 'Direct OpenAI-compatible runtime (v4 family)', advanced: true,
+        fields: [{ id: 's-deepseek-key', rowField: 'api_key', settingKey: 'DEEPSEEK_API_KEY', secret: true, label: 'API key', placeholder: 'sk-...' }],
         note: 'Pick DeepSeek as the source in Models or Agents, then choose deepseek-v4-pro or deepseek-v4-flash.',
     },
     {
-        id: 'zai', title: 'Z.ai (GLM)', icon: '', hint: 'Direct OpenAI-compatible runtime', advanced: true,
+        id: 'zai', kind: 'zai', title: 'Z.ai (GLM)', icon: '', hint: 'Direct OpenAI-compatible runtime', advanced: true,
         fields: [
-            { id: 's-zai-key', settingKey: 'ZAI_API_KEY', label: 'API Key', placeholder: 'sk-...' },
-            { id: 's-zai-plan', label: 'Plan', placeholder: 'payg or coding' },
+            { id: 's-zai-key', rowField: 'api_key', settingKey: 'ZAI_API_KEY', secret: true, label: 'API key', placeholder: 'sk-...' },
+            { id: 's-zai-plan', rowField: 'plan', settingKey: 'ZAI_PLAN', label: 'Plan', placeholder: 'payg or coding' },
         ],
-        testProvider: 'zai',
-        testInputs: { 's-zai-key': 'ZAI_API_KEY', 's-zai-plan': 'ZAI_PLAN' },
         note: 'Pick Z.ai as the source in Models or Agents, then choose glm-5.3 or glm-5.3-flash. Coding Plan subscribers: set Plan to <code>coding</code>; the default <code>payg</code> is pay-as-you-go, and a Coding Plan key tested there reports No credits.',
     },
     {
-        id: 'gigachat', title: 'GigaChat', icon: '/static/providers/gigachat.svg', hint: 'Sber GigaChat via the gigachat library', advanced: true,
+        id: 'gigachat', kind: 'gigachat', title: 'GigaChat', icon: '/static/providers/gigachat.svg', hint: 'Sber GigaChat via the gigachat library', advanced: true,
         fields: [
-            { id: 's-gigachat-credentials', settingKey: 'GIGACHAT_CREDENTIALS', label: 'Authorization Key', placeholder: 'Base64 client_id:secret (OAuth)' },
-            { id: 's-gigachat-scope', label: 'Scope', placeholder: 'GIGACHAT_API_PERS' },
-            { id: 's-gigachat-user', label: 'User (basic auth, optional)', placeholder: 'username' },
-            { id: 's-gigachat-password', settingKey: 'GIGACHAT_PASSWORD', label: 'Password (basic auth, optional)', placeholder: 'password' },
-            { id: 's-gigachat-base-url', label: 'Base URL', placeholder: 'https://api.giga.chat/v1' },
-            { id: 's-gigachat-verify-ssl', label: 'Verify SSL Certs', placeholder: 'true / false' },
+            { id: 's-gigachat-credentials', rowField: 'credentials', settingKey: 'GIGACHAT_CREDENTIALS', secret: true, label: 'Authorization key', placeholder: 'Base64 client_id:secret (OAuth)' },
+            { id: 's-gigachat-scope', rowField: 'scope', settingKey: 'GIGACHAT_SCOPE', label: 'Scope', placeholder: 'GIGACHAT_API_PERS' },
+            { id: 's-gigachat-user', rowField: 'user', settingKey: 'GIGACHAT_USER', label: 'User (basic auth, optional)', placeholder: 'username', credential: true },
+            { id: 's-gigachat-password', rowField: 'password', settingKey: 'GIGACHAT_PASSWORD', secret: true, label: 'Password (basic auth, optional)', placeholder: 'password' },
+            { id: 's-gigachat-base-url', rowField: 'base_url', settingKey: 'GIGACHAT_BASE_URL', label: 'Base URL', placeholder: 'https://api.giga.chat/v1' },
+            { id: 's-gigachat-verify-ssl', rowField: 'verify_ssl_certs', settingKey: 'GIGACHAT_VERIFY_SSL_CERTS', label: 'Verify SSL certs', placeholder: 'true / false' },
         ],
-        testProvider: 'gigachat',
-        testInputs: {
-            's-gigachat-credentials': 'GIGACHAT_CREDENTIALS',
-            's-gigachat-scope': 'GIGACHAT_SCOPE',
-            's-gigachat-user': 'GIGACHAT_USER',
-            's-gigachat-password': 'GIGACHAT_PASSWORD',
-            's-gigachat-base-url': 'GIGACHAT_BASE_URL',
-            's-gigachat-verify-ssl': 'GIGACHAT_VERIFY_SSL_CERTS',
-        },
         note: 'Pick GigaChat as the source in Models or Agents to route a role through this account. Authenticate with either an Authorization Key (OAuth, scope <code>GIGACHAT_API_PERS</code>, <code>GIGACHAT_API_B2B</code>, or <code>GIGACHAT_API_CORP</code>) or User + Password.',
     },
     {
-        id: 'anthropic', title: 'Anthropic', icon: '/static/providers/anthropic.png', hint: 'Direct Anthropic API access',
-        fields: [{ id: 's-anthropic', settingKey: 'ANTHROPIC_API_KEY', label: 'Anthropic API Key', placeholder: 'sk-ant-...' }],
-        testProvider: 'anthropic', testInputs: { 's-anthropic': 'ANTHROPIC_API_KEY' },
+        id: 'anthropic', kind: 'anthropic', title: 'Anthropic', icon: '/static/providers/anthropic.png', hint: 'Direct Anthropic API access',
+        fields: [{ id: 's-anthropic', rowField: 'api_key', settingKey: 'ANTHROPIC_API_KEY', secret: true, label: 'API key', placeholder: 'sk-ant-...' }],
         note: 'Pick Anthropic as the source in Models or Agents to route a role directly through this key.',
     },
 ];
 
-// {backend provider id: {DOM input id: settings key}} — settings.js reads the
-// live input values through this map to build the unsaved-credential overrides.
-export const PROVIDER_TEST_INPUTS = Object.fromEntries(
-    PROVIDER_CARDS.filter((card) => card.testProvider).map((card) => [card.testProvider, card.testInputs]),
-);
+/** Every provider secret Accounts renders: Secrets and skill requests never draw a second input for one. */
+export const PROVIDER_SECRET_KEYS = PROVIDER_CARDS.flatMap((card) => card.fields.filter((field) => field.secret)
+    .map((field) => field.settingKey));
 
-function providerSettingsCard(spec) {
-    const fields = (spec.fields || [])
-        .map((field) => {
-            const named = { ...field, label: field.label === "API Key" || field.label === "Base URL"
-                ? `${spec.title} ${field.label}` : field.label };
-            return field.settingKey ? secretField(named) : plainField(named);
-        })
-        .join('');
-    const test = spec.testProvider ? `
-            <div class="settings-action-row">
-                <span class="settings-inline-status" data-provider-test-status="${spec.testProvider}" role="status" aria-live="polite" aria-atomic="true"></span>
-                <button type="button" class="btn btn-default" data-provider-test="${spec.testProvider}" title="Sends one short model request. Provider charges may apply.">Test</button>
+const TEST_TITLE = 'Sends one short model request. Provider charges may apply.';
+
+function connectionFieldHtml(card, field, { stem, value, builtin, keyName }) {
+    const id = builtin ? field.id : `${stem}-${field.rowField.replace(/_/g, '-')}`;
+    // The visible label stays short inside its card; the field's accessible name says whose key it is.
+    const attrs = `id="${id}" name="${builtin && field.secret ? field.settingKey : id}"${builtin && field.secret ? ` data-secret-setting="${field.settingKey}"` : ''}`
+        + ` data-connection-field="${field.rowField}" placeholder="${escapeHtml(field.placeholder)}" aria-label="${escapeHtml([card.title, keyName, field.label].filter(Boolean).join(' '))}"`
+        + `${builtin ? '' : ` value="${escapeHtml(value)}" data-applied-value="${escapeHtml(value)}"`} autocomplete="off" spellcheck="false"`;
+    if (!field.secret) return `<div class="form-field ui-field"><label for="${id}">${field.label}</label><input ${attrs} type="text" class="ui-control"></div>`;
+    return `
+        <div class="form-field ui-field">
+            <label for="${id}">${field.label}</label>
+            <div class="secret-input-row">
+                <input ${attrs} class="secret-input ui-control" type="password">
+                <button type="button" class="btn btn-default secret-toggle" data-target="${id}">Show</button>
+                <button type="button" class="btn btn-default secret-clear" data-target="${id}">Clear</button>
             </div>
-        ` : '';
-    return providerCard({
-        id: spec.id,
-        title: spec.title,
-        icon: spec.icon,
-        hint: spec.hint,
-        open: spec.open,
-        body: `<div class="form-row">${fields}</div>${test}${spec.note ? `<div class="settings-inline-note">${spec.note}</div>` : ''}`,
-    });
+        </div>`;
 }
 
+/**
+ * One API key row (docs/DESIGN.md §6 account-row anatomy): name and status, the meta line, Test /
+ * Disable / Remove docked right, then the key's own fields and its quiet result lines. Without `row.uid` it
+ * is the card's built-in key ("Default"); an added key's row carries its stored row values. The status, meta
+ * and action labels are painted by settings_connections.js from the loaded document.
+ */
+export function connectionRowHtml(card, row = {}) {
+    const builtin = !row.uid;
+    const stem = builtin ? `s-${card.id}-default` : `conn-${row.uid}`;
+    const keyName = builtin ? '' : String(row.label || row.name || '');
+    const values = row.values || {};
+    const text = (value) => (value === undefined || value === null ? '' : String(value));
+    const fields = [
+        builtin ? '' : `<div class="form-field ui-field"><label for="${stem}-label">Name</label><input id="${stem}-label" class="ui-control" type="text" data-connection-label value="${escapeHtml(text(row.label))}" placeholder="e.g. Claude credits" aria-label="${escapeHtml(`${card.title} key name`)}" autocomplete="off" spellcheck="false"></div>`,
+        ...card.fields.map((field) => connectionFieldHtml(card, field, { stem, value: text(values[field.rowField]), builtin, keyName })),
+    ].join('');
+    const identity = builtin ? ' data-builtin="1"'
+        : ` data-uid="${escapeHtml(row.uid)}" data-name="${escapeHtml(text(row.name))}"${row.draft ? ' data-draft="1"' : ''}`;
+    return `
+        <div class="harness-account-row connection-row" data-connection-row data-kind="${card.kind}"${identity} data-enabled="${row.enabled === false ? '0' : '1'}">
+            <div class="harness-account-main">
+                <strong data-connection-title${builtin ? '' : ' data-i18n-skip'}>${builtin ? 'Default' : escapeHtml(keyName || `New ${card.title} key`)}</strong>
+                <span class="ui-status" data-tone="neutral" data-connection-status hidden></span>
+            </div>
+            <div class="harness-account-meta muted" data-connection-meta hidden></div>
+            <div class="harness-account-actions">
+                <button type="button" class="btn btn-default" data-connection-test${builtin ? ` data-provider-test="${card.kind}"` : ''} title="${TEST_TITLE}">Test</button>
+                <button type="button" class="btn btn-default" data-connection-toggle>${row.enabled === false ? 'Enable' : 'Disable'}</button>
+                <button type="button" class="btn btn-default" data-connection-remove>Remove</button>
+            </div>
+            <div class="connection-fields">
+                <div class="form-row">${fields}</div>
+                <div class="settings-inline-status" data-connection-test-status${builtin ? ` data-provider-test-status="${card.kind}"` : ''} role="status" aria-live="polite" aria-atomic="true"></div>
+                <div class="connection-note" data-connection-cache hidden></div>
+            </div>
+        </div>`;
+}
+
+function providerSettingsCard(card) {
+    return providerCard(card, `<div class="connection-rows" data-connection-rows="${card.kind}">${connectionRowHtml(card)}</div>`
+        + `${card.note ? `<div class="settings-inline-note">${card.note}</div>` : ''}`);
+}
+
+// Provider API keys have one input each, in Accounts; this tab keeps the other stored secrets.
 export const SECRET_KEYS = [
-    ['OPENROUTER_API_KEY', 'OpenRouter API Key', 'sk-or-...'],
-    ['OPENAI_API_KEY', 'OpenAI API Key', 'sk-...'],
-    ['OPENAI_COMPATIBLE_API_KEY', 'OpenAI-compatible API Key', 'Compatible provider key'],
-    ['CLOUDRU_FOUNDATION_MODELS_API_KEY', 'Cloud.ru Foundation Models API Key', 'Cloud.ru key'],
-    ['GIGACHAT_CREDENTIALS', 'GigaChat Authorization Key', 'Base64 client_id:secret'],
-    ['GIGACHAT_PASSWORD', 'GigaChat Password (basic auth)', 'password'],
-    ['ANTHROPIC_API_KEY', 'Anthropic API Key', 'sk-ant-...'],
-    ['MINIMAX_API_KEY', 'MiniMax API Key', 'MiniMax key'],
-    ['DEEPSEEK_API_KEY', 'DeepSeek API Key', 'sk-...'],
-    ['ZAI_API_KEY', 'Z.ai API Key (GLM)', 'Z.ai key'],
     ['GITHUB_TOKEN', 'GitHub Token', 'ghp_...'],
     ['OUROBOROS_NETWORK_PASSWORD', 'Network Password', 'Required for LAN/Docker binds'],
 ];
@@ -217,7 +221,7 @@ function secretSettingsSection() {
         <section class="settings-card">
             <h3>Stored Secrets</h3>
             <div class="settings-section-copy">
-                Central place for API keys, bridge tokens, passwords, and future skill-requested secrets.
+                Tokens, passwords and the secrets skills request. Provider API keys are in Accounts.
                 Skills only receive grant-only keys after explicit human approval.
             </div>
             <div class="form-grid two">
@@ -281,6 +285,7 @@ export function renderSettingsPage() {
                     ${renderAgentsServiceBanner()}
                     ${renderAgentAccountsSection()}
                     <h3>API keys</h3>
+                    <div class="settings-section-copy">Each role names the key it uses; keys never rotate. For a second key of the same model, add it as a fallback.</div>
                     ${PROVIDER_CARDS.filter((card) => !card.advanced).map(providerSettingsCard).join('')}
                     <details class="settings-more-providers" id="settings-more-providers">
                         <summary>
@@ -464,7 +469,7 @@ export function renderSettingsPage() {
                     <div class="form-section">
                         <h3>Post-Task Self-Evolution</h3>
                         <div class="settings-section-copy">
-                            After an eligible task, Ouroboros can optionally run one reviewed self-improvement cycle: the worker asks a light model whether to promote a backlog item, writes a durable request, and the supervisor starts a one-shot campaign later on an idle tick if all gates pass.
+                            After an eligible task, Ouroboros can optionally run one reviewed self-improvement cycle: the worker asks the Main model whether one improvement is worth a cycle now, writes a durable request, and the supervisor starts a one-shot campaign later on an idle tick if all gates pass.
                             <br><strong>Configuration authority:</strong> outside Cyber Pro, only the owner can enable this. Cyber Pro also lets the agent configure it; selecting Cyber Pro does not enable evolution automatically. Changes apply on the next task.
                         </div>
                         <div class="settings-effort-card">
@@ -679,15 +684,36 @@ export function renderSettingsPage() {
                         <div class="settings-section-copy">
                             <code>System</code> follows this device's OS appearance and is the default for a new client.
                             <code>Light</code> and <code>Dark</code> pin the palette regardless of the OS.
-                            <br><strong>Per device, not per account:</strong> the choice is stored by this client alone
-                            (the desktop window and each browser keep their own), never sent to the server and never
-                            shared with other devices. Clearing this client's site data returns it to System.
+                            <br><strong>Per device, not per account:</strong> this window or browser keeps the choice
+                            for this Ouroboros, also after it moves to another port; other devices, browsers and
+                            installations keep their own, and the server never stores it. Clearing this client's site
+                            data returns it to System.
                         </div>
                         <div class="settings-effort-card">
                             <label class="theme-choice-label" id="s-appearance-theme-label">Theme</label>
                             <div data-theme-control aria-labelledby="s-appearance-theme-label"></div>
                             <div class="settings-inline-note theme-status" data-theme-status role="status" aria-live="polite"></div>
                             <div class="settings-inline-note" data-shell-storage-status role="status" aria-live="polite"></div>
+                        </div>
+                    </div>
+
+                    <div class="form-section" data-interface-size>
+                        <h3>Interface size</h3>
+                        <div class="settings-section-copy">
+                            Makes everything larger or smaller: text, buttons, cards and widgets.
+                            <br><strong>Per device:</strong> each window and browser keeps its own size.
+                        </div>
+                        <div class="settings-effort-card">
+                            <!-- interface_size.js paints the range this surface allows and applies a size when the slider is let go. -->
+                            <div class="interface-size-range" data-interface-size-row hidden>
+                                <label for="interface-size">Size</label>
+                                <input type="range" id="interface-size" min="50" max="200" step="5" value="100" data-interface-size-input>
+                                <output for="interface-size" data-interface-size-value data-i18n-skip>100%</output>
+                                <div class="settings-toolbar">
+                                    <button type="button" class="btn btn-default btn-sm" data-interface-size-reset>Reset to 100%</button>
+                                </div>
+                            </div>
+                            <div class="settings-inline-note" data-interface-size-note role="status" aria-live="polite"></div>
                         </div>
                     </div>
 
@@ -703,8 +729,8 @@ export function renderSettingsPage() {
                             system and then reports that its notifications and their sound are allowed; it may not
                             follow Focus / Do Not Disturb. Sound off asks for them silently.
                             Test asks the system for permission when it has not been asked yet.
-                            <br><strong>Per device, not per account:</strong> like the theme above, these choices
-                            are stored by this client alone and never sent to the server.
+                            <br><strong>Per device, not per account:</strong> these choices are stored by this
+                            client alone and never sent to the server.
                             Where this system exposes no notifications, or permission is denied, alerts fall back
                             to a browser banner this client allows, or to the app. Do Not Disturb and OS
                             permissions still decide what you see.
@@ -764,7 +790,7 @@ export function renderSettingsPage() {
                              Agents → Delegation (D-10): they bound the agents,
                              not the process pool. Max Workers stays: it is
                              runtime worker processes, not an agent setting. -->
-                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the idle rail and the reaper; the per-task round and lifetime limits are optional — a positive number, or <code>unlimited</code> for none (the fresh-install default). A settings file from an earlier release that never set them keeps the finite limits it ran under until you change them here; startup names the values once. Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
+                        <div class="settings-section-copy">Workers control parallel task capacity. A quiet task is checked on, never stopped for being quiet; the per-task round and lifetime limits are optional — a positive number, or <code>unlimited</code> for none (the fresh-install default). A settings file from an earlier release that never set them keeps the finite limits it ran under until you change them here; startup names the values once. Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
                         <div class="form-grid two">
                             <div class="form-field ui-field">
                                 <label for="s-total-budget">Total Budget (USD)</label>
@@ -1042,6 +1068,10 @@ export function bindSecretInputs(root) {
         const keyInput = customRow?.querySelector('[data-custom-secret-key]');
         bindSecretReveal(input, button, {
             savedSelector: () => {
+                // A key added in a card is read by its connection and field; a draft has nothing saved.
+                const added = input.closest('[data-connection-row][data-uid]');
+                if (added) return added.dataset.draft === '1' ? null
+                    : { connection: `${added.dataset.kind}@${added.dataset.name}`, field: input.dataset.connectionField };
                 const key = customRow?.dataset.originalKey || input.dataset.secretSetting;
                 return key ? { key } : null;
             },

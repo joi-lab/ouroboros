@@ -96,8 +96,6 @@ def test_summary_and_background_token_budgets():
     # facts row buys no model call, so the synthesis leaf holds no summary call.
     synthesis = Path("ouroboros/post_task_synthesis.py").read_text(encoding="utf-8")
     assert "chat_observed" not in synthesis and 'call_type="task_summary"' not in synthesis
-    # The reflection log is a store only: no automatic lesson or register call remains.
-    assert "chat_observed" not in Path("ouroboros/reflection.py").read_text(encoding="utf-8")
 
 
 def test_native_review_character_and_round_caps_are_retired():

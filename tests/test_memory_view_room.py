@@ -155,7 +155,9 @@ def test_the_working_sources_line_lists_exactly_what_the_spec_loads():
     loaded, missing = line.split("Loaded above: ", 1)[1].split(" Not loaded: ", 1)
     assert "the top level of your story" in loaded and "the page of your parent's room" in loaded
     assert "the words of my human that caused this work" in loaded and "raw conversations" in missing
-    assert "knowledge (overview, index, patterns)" in missing and "knowledge" not in loaded
+    knowledge = "knowledge (overview, index, project journal and workpad"
+    assert f"{knowledge}; the index arrives with your first delegation)" in missing and "knowledge" not in loaded
+    assert "patterns" not in line and "knowledge_list, knowledge_read" in missing  # the index's own reader is named
     assert "shared biography" not in line
     # Each field moves its item: the line changes with the spec, never independently of it.
     for field, value, gone, now_missing in (
@@ -171,8 +173,8 @@ def test_the_working_sources_line_lists_exactly_what_the_spec_loads():
         if now_missing:
             assert now_missing in new_missing, field
         if field == "knowledge":
-            assert "knowledge (overview, index, patterns)" in new_loaded
-            assert "knowledge (overview, index, patterns)" not in new_missing
+            assert f"{knowledge})" in new_loaded
+            assert knowledge not in new_missing and "first delegation" not in changed
     nanny = mv.working_sources_line(dataclasses.replace(mv.ROLE_DEFAULTS["nanny"], room_id="1"))
     assert "the top level of your story" in nanny.split(" Not loaded: ", 1)[1]
     # With a captured view the owner's words are named only when their block was drawn.
@@ -347,7 +349,7 @@ def test_lane_two_is_one_host_line_per_root_task_with_typed_facts_by_address(tmp
                      f"get_task_result(task_id='root1'); {_addr(rows[2])}..{_addr(rows[7])}; "
                      f"late review evidence: {_addr(rows[7])}")
     assert by_task["root2"].startswith(f"[{_ts(18)}; host; task root2] host facts for root2: status=running; "
-                                       "result: get_task_result(task_id=root2); rows 1;")
+                                       "final=unknown; result: get_task_result(task_id=root2); rows 1;")
     assert "pres1" not in by_task  # place delivery facts belong only to their conversation
     _place, place_text = _view(tmp_path, {"id": "p", "chat_id": 777, "metadata": PRESENCE})
     assert f"delivery failed: {_addr(rows[15])}" in place_text

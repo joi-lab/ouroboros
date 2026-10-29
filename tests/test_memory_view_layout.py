@@ -19,6 +19,7 @@ import queue
 import pytest
 
 from tests._memory_view_context import blocks, section, world
+from tests.test_doc_context import foreign_tree  # a bound tree body_fact proves foreign (6A: unknown keeps the book)
 
 MAIN = {"id": "tmain", "chat_id": 1}
 WAKE = {"id": "wake", "chat_id": 1, "_is_direct_chat": True,
@@ -67,8 +68,7 @@ def test_b_is_byte_identical_for_main_another_room_and_a_wake(tmp_path):
 def test_full_roles_share_the_first_block_and_only_eligible_tasks_get_the_handbook(tmp_path):
     """A real workspace binding must not invalidate the common governance prefix."""
     env, memory, _rooms = world(tmp_path)
-    project = tmp_path / "project"
-    project.mkdir()
+    project = foreign_tree(tmp_path / "project")
     tasks = {
         "main": ({**MAIN, "_is_direct_chat": True}, True),
         "wake": (WAKE, True),
@@ -120,7 +120,7 @@ def test_route_reprojection_keeps_the_captured_handbook_and_counts_it_in_the_flo
     chapter = env.repo_path("docs/development/rules.md")
     chapter.parent.mkdir()
     chapter.write_text("# Rules\n\nChange rules.\n\n## Detail\n\n" + "handbook body " * 2000, encoding="utf-8")
-    task = {"type": "task", "text": "hi", **MAIN, "workspace_root": "" if book else str(tmp_path / "project")}
+    task = {"type": "task", "text": "hi", **MAIN, "workspace_root": "" if book else str(foreign_tree(tmp_path / "project"))}
     core = context._capture_context_core(env, memory, task, None, None)
     monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_a, **_kw: 1.0)
     route = lambda *_a, **_kw: ({"model": "m", "provider": "p"}, SimpleNamespace(  # noqa: E731
@@ -193,7 +193,7 @@ def test_anthropic_preserves_the_message_seal_and_gives_schemas_only_a_free_slot
 
     monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", mode)
     env, memory, _rooms = world(tmp_path)
-    messages, _cap = _messages(env, memory, {**MAIN, "workspace_root": str(tmp_path / "project") if not book else ""})
+    messages, _cap = _messages(env, memory, {**MAIN, "workspace_root": str(foreign_tree(tmp_path / "project")) if not book else ""})
     seal_task_transcript(messages)
     if long:
         for i in range(6):
@@ -234,11 +234,13 @@ def test_the_view_fact_reaches_the_cap_info_the_task_context_and_one_event(tmp_p
     _messages_out, cap = _messages(env, memory, MAIN, ctx=ctx)
     facts = cap["memory_view"]
     assert facts["role"] == "integrator" and facts["room_id"] == "1"
-    assert facts["store_status"] == {"state": "active"} and facts["legacy_frontier_status"] == "exact"
+    assert facts["store_status"] == {"state": "active", "tail_facts": "filling"}  # open rows read live, no fill yet
+    assert facts["legacy_frontier_status"] == "exact"
     assert facts["spec"]["live_rooms"] == "lines" and facts["blocks"]["live_rooms"] == 4
     assert facts["blocks"]["story_tokens"] > 0 and facts["blocks"]["room_tokens"] > 0
     assert facts["floor"]["mode"] == "max" and facts["floor"]["steps"] == {}
-    assert ctx.memory_view_facts == {key: facts[key] for key in ("role", "room_id", "floor", "story_status")}
+    assert ctx.memory_view_facts == {key: facts[key] for key in ("role", "room_id", "floor", "story_status", "max_room")}
+    assert facts["max_room"]["cause"] == "held"  # the start's Max room rides with the view fact into the trace
     assert VIEW_TRACE_KEY == "memory_view"
     events = [json.loads(line) for line in (memory.drive_root / "logs" / "events.jsonl").read_text(
         encoding="utf-8").splitlines() if '"context_memory_view"' in line]
@@ -269,7 +271,8 @@ def test_a_helpers_role_line_names_exactly_what_its_request_holds(tmp_path, rout
     assert f"the page of your parent's room {alpha}" in loaded and f"## This room ({alpha})" in c
     assert ("the top level of your story" in loaded) == story == ("## My story" in b)
     assert ("the top level of your story" in missing) == (not story)
-    assert "knowledge (overview, index, patterns)" in missing and "## Shared understanding" not in c
+    assert "the index arrives with your first delegation" in missing and "## Shared understanding" not in c
+    assert "## Knowledge base" not in c and "knowledge_list" in missing
     assert "raw conversations" in missing and "### Open conversation" not in c and "## Live rooms" not in c
     assert "the words of my human that caused this work" not in loaded  # no root record: no block drawn
 
@@ -304,13 +307,15 @@ def test_the_tool_schemas_count_in_the_floor_of_every_mode(tmp_path):
     # Unsent book forms share the selected start view, including its resident schema allowance.
 
 
-@pytest.mark.parametrize("actor,owner", [("child", "max"), ("child", "nano"), ("root", "max")])
+@pytest.mark.parametrize("actor,owner", [("child", "max"), ("child", "nano"), ("root", "max"),
+                                         ("child_without_selector", "max")])
 def test_a_nano_floor_names_only_the_path_its_own_request_sends(tmp_path, monkeypatch, actor, owner):
     """The real path: the schemas come from the task's registry under the owner's mode, as the agent
-    passes them (``initial_tool_schemas``), and the plan's Nano projection is the request. A Nano
-    the window chose for the owner's Max sends a child list_available_tools alone: its floor names
-    that and the parent, never enable_tools or chronicle_write. The owner's Nano sends the child enable_tools, and a
-    root always: their floor says memory_read is reachable through it."""
+    passes them (``initial_tool_schemas``), and the plan's Nano projection is the request. A read-only
+    child carries enable_tools in every mode (#1860), so a Nano the window chose for the owner's Max
+    sends it too, as the owner's Nano and a root always do: their floor says memory_read is reachable
+    through it. A child whose contract disables enable_tools sends list_available_tools alone: its
+    floor names that and the parent, never enable_tools or chronicle_write."""
     from types import SimpleNamespace
 
     from ouroboros import context
@@ -327,8 +332,10 @@ def test_a_nano_floor_names_only_the_path_its_own_request_sends(tmp_path, monkey
         "configured_subagent": {"id": "h", "route": {"kind": "api_model"}}})}
     (tmp_path / "registry").mkdir()
     registry = ToolRegistry(repo_dir=tmp_path / "registry", drive_root=tmp_path / "registry")
-    if actor == "child":
+    if actor != "root":
         registry._ctx.task_constraint = TaskConstraint(mode="local_readonly_subagent")
+    if actor == "child_without_selector":
+        registry._ctx.task_contract = {"disabled_tools": ["enable_tools"]}
     schemas = initial_tool_schemas(registry, context_mode=owner)
     core = context._capture_context_core(env, memory, task, None, None)
 
@@ -353,7 +360,7 @@ def test_a_nano_floor_names_only_the_path_its_own_request_sends(tmp_path, monkey
     assert "memory_read" not in sent and ("enable_tools" in floor) == ("enable_tools" in sent), (sent, floor)
     # Sealing is offered only to a request that can call chronicle_write (sent, or loaded by enable_tools).
     assert ("chronicle_write kind=page" in floor) == bool({"chronicle_write", "enable_tools"} & set(sent)), floor
-    if (actor, owner) == ("child", "max"):
+    if actor == "child_without_selector":
         assert sent == ("list_available_tools",)
         assert floor.rstrip().endswith("list_available_tools shows what this task can call, and my parent task can "
                                        "read any address I name to it)")
@@ -402,7 +409,7 @@ def test_codex_keeps_identity_and_my_story_in_the_leading_system_group(tmp_path,
     from tests.test_memory_view_story import _page
 
     env, memory, _rooms = world(tmp_path)
-    task = {**MAIN, "workspace_root": "" if book else str(tmp_path / "project")}
+    task = {**MAIN, "workspace_root": "" if book else str(foreign_tree(tmp_path / "project"))}
     messages, _cap = _messages(env, memory, task)
     wire, target = _codex_wire(messages)
     stable, c = messages[0]["content"][:-1], messages[0]["content"][-1]["text"]
@@ -439,7 +446,7 @@ def test_direct_openai_and_openrouter_keep_all_stable_items_and_one_notice(tmp_p
     monkeypatch.setattr(LLMClient, "_SUPPORTED_PARAMS_FETCHED", True, raising=False)
     monkeypatch.setattr("ouroboros.pricing._fetch_live_rows", lambda *_a, **_kw: {})
     env, memory, _rooms = world(tmp_path)
-    messages, _cap = _messages(env, memory, {**MAIN, "workspace_root": "" if book else str(tmp_path / "project")})
+    messages, _cap = _messages(env, memory, {**MAIN, "workspace_root": "" if book else str(foreign_tree(tmp_path / "project"))})
     stable, c = messages[0]["content"][:-1], messages[0]["content"][-1]["text"]
     tools = [{"type": "function", "function": {"name": "probe", "parameters": {"type": "object", "properties": {}}}}]
     client = LLMClient(api_key="unused")

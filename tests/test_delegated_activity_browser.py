@@ -307,6 +307,7 @@ def test_delegated_rows_live_reconnect_reload_root_child_source_and_final_gap(en
     capture(page, "1350-reconnected")
     assert reconnected == caught_up, "a reconnect adopts the live rows instead of drawing them again"
 
+    ui["errors"].watch(page)  # the reload may cut off the page's own reads (tests/ui_console_errors.py)
     page.reload()
     page.locator(f'#chat-messages .chat-live-card[data-task-id="{ROOT}"]').first.wait_for()
     page.evaluate(EXPAND, [ROOT])
@@ -327,4 +328,4 @@ def test_delegated_rows_live_reconnect_reload_root_child_source_and_final_gap(en
     _evidence("1350-history-pages.json", served)
     _evidence("1350-dom.json", {"live_with_gap": live_snapshot, "caught_up": caught_up, "reconnected": reconnected,
                                 "reloaded": reloaded})
-    assert not ui["errors"], ui["errors"]
+    assert not ui["errors"].unexpected(), ui["errors"].report()

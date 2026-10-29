@@ -26,6 +26,30 @@ SIGNAL_INGRESS = [pytest.param(name, marks=pytest.mark.skipif(
     for name in ("sigint", "sigterm")]
 
 
+@pytest.mark.parametrize("existing", [False, True])
+def test_capture_gate_publishes_only_complete_json(tmp_path, monkeypatch, existing):
+    from tests._server_capture_exit import record
+
+    target = tmp_path / "entered.json"
+    if existing:
+        target.write_text('{"generation": "old"}', encoding="utf-8")
+    writes = []
+    write_bytes = Path.write_bytes
+
+    def interrupted_write(path, data):
+        write_bytes(path, data[:1])
+        writes.append(path)
+        if target.exists():
+            assert json.loads(target.read_text(encoding="utf-8")) == {"generation": "old"}
+        assert target.exists() is existing
+        return write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", interrupted_write)
+    monkeypatch.setattr(Path, "write_text", lambda path, text, **kw: interrupted_write(path, text.encode("utf-8")))
+    record(tmp_path, "entered", announce=False, generation="new")
+    assert writes and json.loads(target.read_text(encoding="utf-8"))["generation"] == "new"
+
+
 def wait_for(predicate, proc, timeout=20):
     deadline = time.monotonic() + timeout
     while not predicate():
@@ -113,7 +137,12 @@ def stop_before_release(proc, gates, ingress, *, imported=False, expected_code=N
     assert stopped["outcome"]["state"] == "completed"
     assert stopped["outcome"]["confirmed"] >= 1
     assert stopped["children"] and all(row["code"] is not None for row in stopped["children"])
-    assert stopped["records"] == []
+    assert stopped["maintenance"] and all(row["code"] is not None for row in stopped["maintenance"])
+    # Server machinery has its own lifecycle, outside the task-owned stop set.
+    # Any ledger remnants must name exactly these proven-exited maintenance children.
+    capture_pids = {row["pid"] for row in stopped["maintenance"]}
+    assert all(row["purpose"] == "maintenance" and not row["owner_task"]
+               and row["host_pid"] in capture_pids for row in stopped["records"])
     expected = expected_code if expected_code is not None else (
         130 if ingress == "sigint" else 143 if ingress == "sigterm" else 0)
     if imported:
@@ -169,8 +198,13 @@ def test_executable_quit_preserves_owed_capture_for_next_generation(tmp_path, en
 
     try:
         with running(tmp_path, "held", entrypoint, ingress) as (proc, gates):
+            # The ordinary capture enters in the maintenance child: allow its cold start, as recovery does.
             wait_for(lambda: all((gates / name).exists() for name in (
-                "ready.json", "ordinary-entered.json", "review-entered.json")), proc)
+                "ready.json", "ordinary-entered.json", "review-entered.json")), proc, timeout=45)
+            # The server names its own process: on Windows proc.pid can be a venv launcher in front of it.
+            server_pid = json.loads((gates / "ready.json").read_text(encoding="utf-8"))["pid"]
+            assert json.loads((gates / "ordinary-entered.json").read_text(encoding="utf-8"))["pid"] != server_pid
+            assert json.loads((gates / "review-entered.json").read_text(encoding="utf-8"))["pid"] == server_pid
             pending()
             stop_before_release(proc, gates, ingress)
             pending()  # Before any cleanup or capture release: the process really ended.
@@ -178,8 +212,7 @@ def test_executable_quit_preserves_owed_capture_for_next_generation(tmp_path, en
             assert not (gates / "review-returned.json").exists()
 
         with running(tmp_path, "recovery", entrypoint) as (proc, gates):
-            # A nonblocking pass can reclaim the dead owner's lock, then retry
-            # on the existing 20 s collection cadence. Keep that policy real.
+            # The new body/child generations reclaim the dead owner's lock and finish owed capture.
             wait_for(lambda: all((gates / name).exists() for name in (
                 "ready.json", "ordinary-entered.json", "review-entered.json")), proc, timeout=45)
             pending()
@@ -194,7 +227,7 @@ def test_executable_quit_preserves_owed_capture_for_next_generation(tmp_path, en
                 assert (evidence / "files" / rc.EVIDENCE_DIRNAME / "result.bin").read_bytes() == EVIDENCE
             assert receipt["source"]["tree"] == sources["review"]["tree"]
             for patch in (cap / "workspace.patch", Path(receipt["evidence_dir"]) / "delta.patch"):
-                content = patch.read_text()
+                content = patch.read_text(encoding="utf-8")
                 assert "check.py" in content and "tracked.txt" not in content
             payload = body.retained_payload(root, ordinary)
             assert payload["primary_output"]["text"] == ANSWER
@@ -204,7 +237,8 @@ def test_executable_quit_preserves_owed_capture_for_next_generation(tmp_path, en
                 "ordinary": asdict(ordinary), "review": receipt, "accounting": rows,
                 "terminal_output": payload,
             }))
-            shutil.copytree(cap, gates / "ordinary-capture")
+            # The live server may release (remove) the disposition lock mid-copy; it is not evidence.
+            shutil.copytree(cap, gates / "ordinary-capture", ignore=shutil.ignore_patterns("disposition.lock"))
             shutil.copytree(Path(receipt["evidence_dir"]), gates / "review-capture")
             proc.stdin.write(b"quit\n")
             proc.stdin.flush()
@@ -232,7 +266,7 @@ def test_closed_output_stream_cannot_hold_executable_capture(tmp_path, stream):
 @pytest.mark.parametrize("ingress", ["pipe", SIGNAL_INGRESS[0]])
 @pytest.mark.timeout(90)
 def test_imported_main_leaves_exit_and_exceptions_to_caller(tmp_path, ingress):
-    """Negative control: the same capture still holds Python without the executable boundary."""
+    """Negative control: imported main returns/raises into a caller that controls its own exit."""
     prepare_capture(tmp_path)
     try:
         with running(tmp_path, "held", "imported", ingress) as (proc, gates):
@@ -243,9 +277,10 @@ def test_imported_main_leaves_exit_and_exceptions_to_caller(tmp_path, ingress):
                 assert json.loads((gates / "main-returned.json").read_text())["result"] == 0
             else:
                 assert "KeyboardInterrupt" in (gates / "console.log").read_text()
+                assert (gates / "main-interrupted.json").is_file()
             (gates / "release").touch()
             assert proc.wait(timeout=10) == (0 if ingress == "pipe" else -signal.SIGINT)
-            assert (gates / "ordinary-returned.json").is_file()
+            assert not (gates / "ordinary-returned.json").exists(), "Stop killed the owned capture child"
     finally:
         save_evidence(tmp_path, f"imported-{ingress}")
 

@@ -19,6 +19,8 @@ def _settings_client(monkeypatch, tmp_path, current: dict):
 
     monkeypatch.setattr(srv, "save_settings", fake_save_settings)
     monkeypatch.setattr(gateway_settings, "_owner_write_settings", fake_save_settings)
+    # The saved document is this store, so an unedited model role is no proposal that moves under a save.
+    monkeypatch.setattr(gateway_settings, "_owner_settings_document", lambda: dict(current))
     monkeypatch.setattr(srv, "_apply_settings_to_env", lambda *_a, **_k: None)
     monkeypatch.setattr(srv, "_start_supervisor_if_needed", lambda *_a, **_k: False)
     monkeypatch.setattr(srv, "apply_runtime_provider_defaults", lambda s: (dict(s), False, []))
@@ -155,7 +157,7 @@ def test_settings_post_model_change_preserves_max_without_capability_probe(monke
 def test_context_mode_compat_migration_truth_table_and_second_start(
     monkeypatch, tmp_path, caplog,
 ):
-    """First load persists only the raw migration; a fresh second start is silent."""
+    """The boot's migrating read persists only the raw migration; a fresh second start is silent."""
     import json
     import logging
     import os
@@ -201,7 +203,7 @@ def test_context_mode_compat_migration_truth_table_and_second_start(
         caplog.clear()
         caplog.set_level(logging.WARNING, logger=context_mode_compat.__name__)
         context_mode_compat._MIGRATION_WARNED_PATHS.clear()
-        loaded = cfg.load_settings()
+        loaded = cfg.load_settings(migrate=True)
         assert loaded["OUROBOROS_CONTEXT_MODE"] == expected_mode
         assert loaded["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
         warnings = [
@@ -226,7 +228,7 @@ def test_context_mode_compat_migration_truth_table_and_second_start(
         # proves silence comes from the first load's disk canonicalization, not memoization.
         context_mode_compat._MIGRATION_WARNED_PATHS.clear()
         caplog.clear()
-        assert cfg.load_settings()["OUROBOROS_CONTEXT_MODE"] == expected_mode
+        assert cfg.load_settings(migrate=True)["OUROBOROS_CONTEXT_MODE"] == expected_mode
         assert not [
             record for record in caplog.records
             if "normalized Low to Max" in record.getMessage()
@@ -261,7 +263,7 @@ def test_context_mode_compat_migration_write_failure_is_honest_and_nonfatal(
     monkeypatch.setattr(context_mode_compat, "write_text_atomic", fail_atomic_write)
     caplog.set_level(logging.WARNING, logger=context_mode_compat.__name__)
 
-    loaded = cfg.load_settings()
+    loaded = cfg.load_settings(migrate=True)
 
     assert loaded["OUROBOROS_CONTEXT_MODE"] == "max"
     assert loaded["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"

@@ -673,9 +673,12 @@ def test_a_due_cadence_finding_its_latch_held_journals_the_duty_stall_with_its_s
     journals it once with the pass thread's stack (its threshold is the pass's cadence, never
     the loop deadline), and the pass's end journals the closing row."""
     import ouroboros.server_maintenance as sm
+    from ouroboros import update_generation_facts
 
     monkeypatch.setattr(sm, "_DUTIES", {})
     monkeypatch.setattr(sm, "_LAST_CANCEL_INTENT_SWEEP", [time.time()])
+    observed = []  # the after-update facts count each journaled stall once
+    monkeypatch.setattr(update_generation_facts, "observe_duty_overrun", observed.append)
     release = threading.Event()
 
     def _slow_custody_pass(stop_event, latch):
@@ -691,7 +694,7 @@ def test_a_due_cadence_finding_its_latch_held_journals_the_duty_stall_with_its_s
         assert sm._CUSTODY_SWEEP_LOCK.locked() and not journal
         last_custody[0] = 0.0  # the next cadence is due while the pass still runs...
         sm._periodic_supervisor_maintenance(last_custody, last_reconcile)
-        assert not journal, "...but the pass has not run a cadence yet: a due tick alone is no stall"
+        assert not journal and not observed, "...but the pass has not run a cadence yet: a due tick alone is no stall"
         sm._DUTIES[id(sm._CUSTODY_SWEEP_LOCK)]["since"] -= 601  # now it has outlived its cadence
         sm._periodic_supervisor_maintenance(last_custody, last_reconcile)
         sm._periodic_supervisor_maintenance(last_custody, last_reconcile)  # journaled once, not per tick
@@ -705,6 +708,7 @@ def test_a_due_cadence_finding_its_latch_held_journals_the_duty_stall_with_its_s
     assert stall["duty"] == "custody-maintenance" and stall["cadence_sec"] == 600
     assert any("_slow_custody_pass" in frame for frame in stall["stack"]), stall
     assert journal[1][1]["duty"] == "custody-maintenance" and journal[1][1]["running_sec"] >= 0
+    assert observed == ["custody-maintenance"]
 
 
 def test_a_reconcile_pass_just_started_after_an_old_end_stamp_is_not_a_stall(monkeypatch, journal):

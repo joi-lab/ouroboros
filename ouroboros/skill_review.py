@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.config import get_auto_grant_enabled
@@ -318,6 +318,7 @@ def review_skill(ctx: Any, skill_name: str, *, persist: bool = True, review_rebu
     from ouroboros.tools.commit_gate import compute_rebuttal_sha256
     from ouroboros.tools.review_change import ReviewChangeArgumentError, run_review_change
     from ouroboros.tools.review_skill import skill_subject
+    from ouroboros.usage_accounting import UsageScope, current_usage_scope, usage_scope
 
     try:
         binding = _resolved_binding or build_resolved_resource_binding(
@@ -360,8 +361,11 @@ def review_skill(ctx: Any, skill_name: str, *, persist: bool = True, review_rebu
     try:
         subject = skill_subject(ctx, skill, content_hash, drive_root=drive_root, governance_root=serving_repo_dir_for(ctx))
         # The panel reads the frozen copy bound to content_hash and mutates no skill state, so other
-        # lifecycle work runs meanwhile; the lane is back before anything below persists.
-        with lend_lifecycle_lane():
+        # lifecycle work runs meanwhile; the lane is back before anything below persists. Every send of the
+        # wave names this skill (its attempt, its llm_usage row, a session seat's start custody a late
+        # collection reads), as ``_usage_rows.REVIEW_CUSTODY_KEYS`` says; the caller's own scope stays.
+        scope = replace(current_usage_scope() or UsageScope(), review_skill=skill.name)
+        with lend_lifecycle_lane(), usage_scope(scope):
             result = run_review_change(ctx, subject="skill", reviewers=reviewers, reason=reason if reason is not None else "",
                                        review_rebuttal=str(review_rebuttal or ""), _frozen_skill=subject, _panel=panel)
     except ReviewChangeArgumentError as exc:

@@ -41,43 +41,80 @@ def invoke(entrypoint, args):
     return EntryPoint(name, scripts[name], "console_scripts").load()()
 
 
+def record(gates, name, *, announce=True, **facts):
+    from ouroboros.utils import atomic_write_json
+
+    row = {"pid": os.getpid(), "monotonic": time.monotonic(), **facts}
+    atomic_write_json(gates / (name + ".json"), row)
+    if announce:
+        print(name, json.dumps(row), flush=True)
+
+
+def await_release(gates):
+    deadline = time.monotonic() + 90
+    while not (gates / "release").exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("bounded capture gate expired")
+        time.sleep(0.02)
+
+
+def gate(gates, kind, action, *, announce=True):
+    @functools.wraps(action)
+    def capture(*args, **kwargs):
+        record(gates, kind + "-entered", announce=announce)
+        await_release(gates)
+        result = action(*args, **kwargs)
+        record(gates, kind + "-returned", announce=announce)
+        return result
+    return capture
+
+
+def capture_child_main(gates, args):
+    """Instrument the real child entrypoint; its custody, lifeline and report stay real."""
+    from ouroboros import delegate_capture_job, maintenance
+
+    delegate_capture_job._capture = gate(
+        gates, "ordinary", delegate_capture_job._capture, announce=False)
+    maintenance.JOBS = {"delegate_capture": maintenance.JOBS["delegate_capture"]}
+    return maintenance.main(args)
+
+
 def main():
     scratch, generation = Path(sys.argv[1]), sys.argv[2]
     entrypoint = sys.argv[3] if len(sys.argv) > 3 else "script"
     gates = scratch / generation
     gates.mkdir(exist_ok=True)
     root = scratch / "data"
-    from ouroboros import claudexor_daemon, headless, owned_shutdown, process_custody
+    from ouroboros import claudexor_daemon, maintenance, owned_shutdown, process_custody
     from ouroboros import review_checking, server_boot, server_entrypoint, server_process, server_restart
     from ouroboros import server_maintenance
     from tests.test_recovered_capture import Engine
 
-    def record(name, **facts):
-        row = {"pid": os.getpid(), "monotonic": time.monotonic(), **facts}
-        (gates / (name + ".json")).write_text(json.dumps(row), encoding="utf-8")
-        print(name, json.dumps(row), flush=True)
+    report = functools.partial(record, gates)
 
     engine = Engine()
     claudexor_daemon.ensure_owned_gateway = lambda **kw: engine
     claudexor_daemon.read_owned_gateway = lambda **kw: engine
     server_boot.start_background_services = lambda *a, **kw: None
 
-    def gate(kind, action):
-        @functools.wraps(action)
-        def capture(*args, **kwargs):
-            record(kind + "-entered")
-            deadline = time.monotonic() + 90
-            while not (gates / "release").exists():
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("bounded capture gate expired")
-                time.sleep(0.02)
-            result = action(*args, **kwargs)
-            record(kind + "-returned")
-            return result
-        return capture
+    review_checking._git_delta = gate(gates, "review", review_checking._git_delta)
+    spawn, captures = process_custody.spawn_supervised, []
+    def instrumented_spawn(argv, **kwargs):
+        capture = argv[1:3] == ["-m", "ouroboros.maintenance"]
+        if capture:
+            argv = [argv[0], "-m", "tests._server_capture_exit", "--capture-child", str(gates), *argv[3:]]
+        process = spawn(argv, **kwargs)
+        if capture:
+            captures.append(process)
+        return process
+    process_custody.spawn_supervised = instrumented_spawn
 
-    headless.write_workspace_patch_artifacts = gate("ordinary", headless.write_workspace_patch_artifacts)
-    review_checking._git_delta = gate("review", review_checking._git_delta)
+    def drive_maintenance():
+        # Providerless boot has no supervisor; drive its existing child owner explicitly.
+        while not maintenance.child._stopped.is_set():
+            if maintenance.child.owed():
+                maintenance.child.tick(root, REPO)
+            time.sleep(.02)
 
     children = []
     ready = server_boot.wait_supervisor_outcome
@@ -90,7 +127,8 @@ def main():
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         children.append(child)
-        record("ready", child_pid=child.pid)
+        report("ready", child_pid=child.pid)
+        threading.Thread(target=drive_maintenance, name="test-maintenance-drive", daemon=True).start()
         threading.Thread(target=server_maintenance._prune_review_checkouts,
                          name="test-review-prune", daemon=True).start()
 
@@ -99,14 +137,21 @@ def main():
 
     def beginning(*args, **kwargs):
         result = begin(*args, **kwargs)
-        record("stop-began", records=owned_shutdown.owned_records(root))
+        report("stop-began", records=owned_shutdown.owned_records(root))
         return result
 
     def stopped(*args, **kwargs):
         result = stop(*args, **kwargs)
-        record("owned-stop", outcome=result,
+        capture_exits = []
+        for child in captures:
+            try:
+                code = child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                code = None
+            capture_exits.append({"pid": child.pid, "code": code})
+        report("owned-stop", outcome=result,
                children=[{"pid": child.pid, "code": child.wait(timeout=2)} for child in children],
-               records=owned_shutdown.owned_records(root))
+               maintenance=capture_exits, records=owned_shutdown.owned_records(root))
         return result
 
     owned_shutdown.begin_owned_stop, owned_shutdown.stop_owned_work = beginning, stopped
@@ -114,7 +159,7 @@ def main():
 
     def bus_stopped():
         bus_stop()
-        record("lifespan-finished")
+        report("lifespan-finished")
 
     server_restart._shutdown_supervisor_event_bus = bus_stopped
     run = server_process._SignalStopServer.run
@@ -124,10 +169,10 @@ def main():
             if early := os.environ.get("OUROBOROS_TEST_EARLY_SIGNAL"):
                 import signal
                 signal.raise_signal(getattr(signal, early))
-                record("early-signal")
+                report("early-signal")
             return run(self, *args, **kwargs)
         finally:
-            record("server-finished")
+            report("server-finished")
 
     server_process._SignalStopServer.run = ran
     bind = server_entrypoint.bound_service_socket
@@ -139,17 +184,27 @@ def main():
             with bind(root, kind, *args, **kwargs) as listener:
                 yield listener
         finally:
-            record(kind + "-socket-closed", closed=listener is not None and listener.fileno() == -1)
+            report(kind + "-socket-closed", closed=listener is not None and listener.fileno() == -1)
             if stream := os.environ.get("OUROBOROS_TEST_BROKEN_STREAM"):
                 getattr(sys, stream).close()  # After real teardown, before command-boundary flushing.
 
     server_entrypoint.bound_service_socket = bound
     # The CLI treats --port 0 as absent; its environment default still supports port 0.
     os.environ["OUROBOROS_SERVER_PORT"] = "0"
-    result = invoke(entrypoint, ["--host", "127.0.0.1", "--port", "0"])
-    record("main-returned", result=result)
+    try:
+        result = invoke(entrypoint, ["--host", "127.0.0.1", "--port", "0"])
+    except KeyboardInterrupt:
+        if entrypoint == "imported":
+            report("main-interrupted", error="KeyboardInterrupt")
+            await_release(gates)  # imported main leaves exception/exit policy to its caller
+        raise
+    report("main-returned", result=result)
+    if entrypoint == "imported":
+        await_release(gates)
     raise SystemExit(result)
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--capture-child"]:
+        raise SystemExit(capture_child_main(Path(sys.argv[2]), sys.argv[3:]))
     main()

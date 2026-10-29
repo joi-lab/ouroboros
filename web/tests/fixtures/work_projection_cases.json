@@ -349,6 +349,202 @@
    "works_complete": true,
    "works_gaps": []
   },
+  "direct_preparing": {
+   "works": [
+    {
+     "work_id": "dp",
+     "room": 1,
+     "name": "",
+     "episode": {
+      "task_id": "dp",
+      "live": true
+     },
+     "activity": "working",
+     "transition": "none",
+     "call": "preparing",
+     "because": [
+      {
+       "code": "turn_context_building",
+       "text": "Building context"
+      }
+     ],
+     "tails": [],
+     "live": true,
+     "turn": [],
+     "release": "self",
+     "stop": {},
+     "refusal": {},
+     "members": {
+      "ids": [
+       "dp"
+      ],
+      "states": {
+       "dp": {
+        "activity": "working",
+        "transition": "none",
+        "call": "preparing",
+        "live": true,
+        "release": "self",
+        "confirmed": true,
+        "turn": [],
+        "because": [
+         {
+          "code": "turn_context_building",
+          "text": "Building context"
+         }
+        ],
+        "tails": []
+       }
+      }
+     },
+     "confirmed": true,
+     "mark": "moving",
+     "kind": "direct",
+     "project_id": "",
+     "since": 100.0,
+     "controls": [
+      {
+       "action": "wrap_up",
+       "target": "dp"
+      },
+      {
+       "action": "hurry",
+       "target": "dp"
+      },
+      {
+       "action": "pause",
+       "target": "dp"
+      },
+      {
+       "action": "stop",
+       "target": "dp",
+       "scope": "cascade"
+      }
+     ],
+     "client_message_id": "cm-prep"
+    }
+   ],
+   "rooms": {
+    "1": {
+     "activity": "working",
+     "transition": "none",
+     "call": "preparing",
+     "turn": [],
+     "amber": false,
+     "mark": "moving",
+     "confirmed": true,
+     "works": [
+      "dp"
+     ]
+    }
+   },
+   "work_summary": {
+    "counts": {
+     "working": 1,
+     "queued": 0,
+     "waiting": 0,
+     "paused": 0,
+     "unknown": 0
+    },
+    "turn": 0,
+    "confirmed": true
+   },
+   "works_complete": true,
+   "works_gaps": []
+  },
+  "direct_requested": {
+   "works": [
+    {
+     "work_id": "dr",
+     "room": 1,
+     "name": "",
+     "episode": {
+      "task_id": "dr",
+      "live": true
+     },
+     "activity": "working",
+     "transition": "none",
+     "call": "working",
+     "because": [],
+     "tails": [],
+     "live": true,
+     "turn": [],
+     "release": "self",
+     "stop": {},
+     "refusal": {},
+     "members": {
+      "ids": [
+       "dr"
+      ],
+      "states": {
+       "dr": {
+        "activity": "working",
+        "transition": "none",
+        "call": "working",
+        "live": true,
+        "release": "self",
+        "confirmed": true,
+        "turn": [],
+        "because": [],
+        "tails": []
+       }
+      }
+     },
+     "confirmed": true,
+     "mark": "moving",
+     "kind": "direct",
+     "project_id": "",
+     "since": 100.0,
+     "controls": [
+      {
+       "action": "wrap_up",
+       "target": "dr"
+      },
+      {
+       "action": "hurry",
+       "target": "dr"
+      },
+      {
+       "action": "pause",
+       "target": "dr"
+      },
+      {
+       "action": "stop",
+       "target": "dr",
+       "scope": "cascade"
+      }
+     ],
+     "client_message_id": "cm-call"
+    }
+   ],
+   "rooms": {
+    "1": {
+     "activity": "working",
+     "transition": "none",
+     "call": "working",
+     "turn": [],
+     "amber": false,
+     "mark": "moving",
+     "confirmed": true,
+     "works": [
+      "dr"
+     ]
+    }
+   },
+   "work_summary": {
+    "counts": {
+     "working": 1,
+     "queued": 0,
+     "waiting": 0,
+     "paused": 0,
+     "unknown": 0
+    },
+    "turn": 0,
+    "confirmed": true
+   },
+   "works_complete": true,
+   "works_gaps": []
+  },
   "paused_by_owner": {
    "works": [
     {
@@ -2546,6 +2742,18 @@
   "external_runs_unconfirmed": {
    "1": "1 external run may still be running",
    "3": "3 external runs may still be running"
+  },
+  "turn_admitted": {
+   "": "Setting up the turn"
+  },
+  "turn_started": {
+   "": "Starting the turn"
+  },
+  "turn_context_building": {
+   "": "Building context"
+  },
+  "turn_context_built": {
+   "": "Context ready"
   }
  }
 }

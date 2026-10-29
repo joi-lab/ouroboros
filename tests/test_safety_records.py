@@ -69,6 +69,7 @@ def test_actual_safety_decisions_produce_panel_chips(supervisor, monkeypatch):
     seed_result(h.ctx.drive_root, "work", {"status": "running", "metadata": h.ctx.task_metadata})
     monkeypatch.setattr(h.module, "_emit_durable_safety_event", records._emit_durable_safety_event)
     monkeypatch.setattr(h.module, "_emit_safety_mode_skip", records._emit_safety_mode_skip)
+    monkeypatch.setattr(view, "wake_ids", lambda *args: ["work"])  # the panel selects wakes through the usage ledger
     assert view.recent_wakes(h.ctx.drive_root, [])[0]["checks"] == []
     assert h.module.check_safety("place_reply", {"text": "hello"}, ctx=h.ctx)[0]
     assert view.recent_wakes(h.ctx.drive_root, [])[0]["checks"] == [{"chip": "checked", "tool": "place_reply"}]

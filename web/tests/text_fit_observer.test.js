@@ -160,3 +160,60 @@ test('elements fitted together are fitted in lockstep: a batch costs a few layou
         restoreDom(env.prior);
     }
 });
+
+test('inside a batch a fitted element shows its whole text at once; only its cut waits for the batch\'s reads', async () => {
+    const env = installDom();
+    const prior = { style: globalThis.getComputedStyle };
+    globalThis.getComputedStyle = () => ({ lineHeight: '20px', fontSize: '14px', whiteSpace: 'normal' });
+    try {
+        const { fitText } = await import(`../modules/text_fit.js?whole=${Date.now()}`);
+        const { batch } = await import('../modules/layout_batch.js');
+        const page = countedPage();
+        const el = page.element(150);
+        const text = `${Array.from({ length: 45 }, (_, i) => `word${i}`).join(' ')}.`;
+        batch(() => {
+            fitText(el, text, 2);
+            assert.equal(el.textContent, text, 'a reader in the same write (a card\'s change projection) sees the new text');
+            assert.equal(page.state.layouts, 0, 'nothing is laid out before the write is done');
+        });
+        assert.ok(el.textContent.endsWith('…') && el.scrollHeight <= 41, el.textContent);
+    } finally {
+        globalThis.getComputedStyle = prior.style;
+        restoreDom(env.prior);
+    }
+});
+
+test('a fitted element that loses its layout is fitted again when it is shown at its old width', async () => {
+    const env = installDom();
+    const frames = [];
+    let report = null;
+    const prior = { raf: globalThis.requestAnimationFrame, ro: globalThis.ResizeObserver, style: globalThis.getComputedStyle };
+    globalThis.requestAnimationFrame = (fn) => { frames.push(fn); return frames.length; };
+    globalThis.getComputedStyle = () => ({ lineHeight: '20px', fontSize: '14px', whiteSpace: 'normal' });
+    globalThis.ResizeObserver = class {
+        constructor(callback) { report = callback; }
+        observe() {}
+        unobserve() {}
+    };
+    try {
+        const { fitText, isCut } = await import(`../modules/text_fit.js?hidden=${Date.now()}`);
+        const el = document.createElement('div');
+        env.mount.append(el);
+        let width = 120;
+        Object.defineProperty(el, 'clientWidth', { configurable: true, get: () => width });
+        // More than one line while it holds several words (a one-line fit).
+        Object.defineProperty(el, 'scrollHeight', { configurable: true, get: () => (el.textContent.includes(' ') ? 60 : 20) });
+        const resize = (to) => { width = to; report([{ target: el }]); frames.splice(0).forEach((fn) => fn()); };
+        fitText(el, 'words that would be fitted', 1);
+        assert.equal(isCut(el), true, 'fitted at its width');
+        resize(0);  // tucked away (a stacked note): no layout, the whole text
+        assert.equal(isCut(el), false, 'an element with no layout shows its whole text');
+        resize(120);  // fanned out again at the width it had
+        assert.equal(isCut(el), true, 'shown again at its old width it is cut again');
+    } finally {
+        globalThis.requestAnimationFrame = prior.raf;
+        globalThis.ResizeObserver = prior.ro;
+        globalThis.getComputedStyle = prior.style;
+        restoreDom(env.prior);
+    }
+});

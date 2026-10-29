@@ -286,6 +286,24 @@ def release_pre_dispatch_attempt(reservation: Any, exc: BaseException, *, expect
     return True
 
 
+def _provider_error_type(error: BaseException, capture: Any) -> str:
+    """The provider's own error type: an explicit ``type`` on the error or its causes (Claudexor's
+    vendorCode), else the capture's value unless that is only an exception class name on the chain,
+    which ``_provider_exception_facts`` substitutes for the classifier as provenance, not a vendor code."""
+    names: set = set()
+    seen: set = set()
+    current: Any = error
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        names.add(type(current).__name__)
+        explicit = getattr(current, "type", None)
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+        current = transport_exception_cause(current)
+    captured = str(getattr(capture, "provider_error_type", "") or "")
+    return "" if captured in names else captured
+
+
 def attempt_custody_event_fields(error: BaseException) -> dict:
     """Additive custody binding for durable error events (nanny-leaf S3).
 
@@ -304,9 +322,9 @@ def attempt_custody_event_fields(error: BaseException) -> dict:
         fields["attempt_custody_state"] = str(getattr(capture, "state", "") or "")
         if stream_incomplete_on_chain(error):
             fields["stream_incomplete"] = True
-        provider_error_type = str(getattr(capture, "provider_error_type", "") or "")
-        if provider_error_type:
-            fields["provider_error_type"] = provider_error_type
+    provider_error_type = _provider_error_type(error, capture)
+    if provider_error_type:
+        fields["provider_error_type"] = provider_error_type
     receipt = getattr(error, "stream_receipt", None)
     receipt = receipt if isinstance(receipt, dict) else {}
     if isinstance(receipt.get("generation_id"), str) and receipt["generation_id"]:

@@ -88,6 +88,7 @@ TASK_DRIVES_DIR = pathlib.Path("task_drives")
 _ARTIFACTS_DIR = pathlib.Path("task_results") / "artifacts"
 _MAILBOX_DIR = pathlib.Path(_OWNER_MAILBOX_DIR)
 _STAGING_DIR = pathlib.Path("state") / "custody_staging"
+DRIVE_ARRIVALS = "drive_arrivals"  # meta: published drive arrivals (a count); set: the arrivals no lap has looked at yet
 _TRASH_DIR = pathlib.Path("state") / "custody_trash"
 # The addressed words a sender is owed; controls (hurry, finalize_now, ...) are not mail.
 UNREAD_MAIL_KINDS = frozenset({"owner_text", "task_message", "quiz_answer", "quiz_closed", "card_input", "relay_entry"})
@@ -1199,6 +1200,74 @@ def settlement_basis(parent: pathlib.Path, task_id: str, task_dir: pathlib.Path,
         identity(_mailbox_path(drive, task_id)), str(__version__)], default=str))
 
 
+def layout_basis(parent: pathlib.Path, base: pathlib.Path, days: int) -> Dict[str, Any]:
+    """What can give a layout's lap work again, cheaply: the layout directory's identity (a drive
+    added or removed moves its mtime), the published drive arrivals (``DRIVE_ARRIVALS``: when the
+    directory moved together with them, the pass looks only at the drives published,
+    ``arrived_drives``; a directory moved without one is a change nobody published, walked whole),
+    the store's terminal-write counter (a task closing, or a closed task written again: the receipts
+    a retained verdict waits on ride row writes; when it moved, the pass looks only at the rows
+    written since, ``task_store.terminal_writes_since``), the server generation (one full lap per
+    boot), the retention setting and the release that judged the last lap. A drive younger than
+    retention is not here: its instant is kept beside the basis."""
+    from ouroboros import __version__
+    from ouroboros.maintenance_retirement import STARTUP
+    from ouroboros.store import TERMINAL_WRITES, open_store
+
+    try:
+        info = base.lstat()
+        directory: Any = [info.st_ino, info.st_mtime_ns]
+    except OSError as exc:
+        directory = type(exc).__name__
+    with open_store(parent, write=False) as txn:
+        terminal, startup, arrivals = txn.meta(TERMINAL_WRITES), txn.meta(STARTUP), txn.meta(DRIVE_ARRIVALS)
+    return json.loads(json.dumps({"directory": directory, "terminal": terminal, "startup": startup,
+                                  "arrivals": arrivals, "days": int(days), "release": str(__version__)}, default=str))
+
+
+def record_drive_arrival(canonical: pathlib.Path, base: pathlib.Path, task_id: str) -> bool:
+    """A drive creator's publication once its drive exists under the layout directory BASE: the
+    layout's next lap looks at this drive alone instead of walking the layout (``layout_basis``,
+    ``headless._prune_drives``). Best-effort, never the creator's failure and never its wait: a store
+    that is absent (a root nothing imported yet), busy, migrating, retired or foreign takes no row,
+    and the layout directory's moved mtime makes the next lap walk whole, as every lap did before the
+    publication existed. The write spends no acquisition budget: a missed publication costs one whole
+    walk, a wait would cost every task creation up to the store's. Returns whether it landed."""
+    from ouroboros.store import acquisition_budget, open_store, probe
+
+    tid = validate_task_id(task_id)
+    try:
+        if probe(canonical)[0] != "present":
+            return False
+        with acquisition_budget(0), open_store(canonical, write=True) as txn:
+            txn.set_meta(DRIVE_ARRIVALS, int(txn.meta(DRIVE_ARRIVALS) or 0) + 1)
+            txn.put_row(DRIVE_ARRIVALS, f"{base.name}/{tid}", {"layout": base.name, "task_id": tid})
+        return True
+    except (StoreError, OSError):  # StoreForeign (install_identity) is a StoreError
+        log.debug("the arrival of drive %s under %s was not published", tid, base.name, exc_info=True)
+        return False
+
+
+def arrived_drives(parent: pathlib.Path, base: pathlib.Path) -> List[str]:
+    """The drives published as arrived under BASE that no lap has looked at yet (``DRIVE_ARRIVALS`` rows,
+    O(drives created since the last lap); the lap that looks at them forgets them, ``forget_arrivals``).
+    Read after ``layout_basis``: a publication landing between the two reads is looked at now, and the
+    next lap, seeing its count alone moved, finds nothing left to look at."""
+    from ouroboros.store import open_store
+
+    with open_store(parent, write=False) as txn:
+        rows = txn.set_rows(DRIVE_ARRIVALS)
+    return sorted({str(facts["task_id"]) for facts in rows.values()
+                   if facts.get("layout") == base.name and facts.get("task_id")})
+
+
+def forget_arrivals(txn: Any, base_name: str, task_ids: List[str]) -> None:
+    """The lap looked at these published arrivals of the layout named BASE_NAME: their rows go, in the
+    transaction that records the lap's facts."""
+    for task_id in task_ids:
+        txn.delete_row(DRIVE_ARRIVALS, f"{base_name}/{task_id}")
+
+
 def rested_verdict(rested: Optional[Dict[str, Any]], parent: pathlib.Path, task_id: str, task_dir: pathlib.Path,
                    drive: pathlib.Path) -> Optional[Dict[str, Any]]:
     """A retained drive's durable verdict while nothing it was read from changed (``settlement_basis``):
@@ -1386,4 +1455,8 @@ def remove_custody_trash(canonical_root: Any, *, stop: Optional[Callable[[], boo
             report["removed"] += 1
         except OSError as exc:
             report["stuck"][entry.name] = [type(exc).__name__]
+    if report["removed"]:  # the bytecode the removed sources left is owed to retirement now
+        from ouroboros.maintenance_retirement import artifact_changed
+
+        artifact_changed(canonical_root, immediate=True)
     return report

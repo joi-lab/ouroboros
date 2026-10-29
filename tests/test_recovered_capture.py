@@ -7,12 +7,15 @@ server ports, live daemon, provider or operator state are used.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from tests._delegate_capture_child import capture_child  # noqa: F401
 
 from ouroboros import delegate_collection as body, delegate_custody as c, delegate_custody_current as current
 from ouroboros import review_checking as rc, review_checking_prune as prune, server_maintenance as maintenance
@@ -76,11 +79,16 @@ def prepared(tmp_path, root, kind="review", *, source_kind="git", operation="op-
         facts = binding["custody"]
     else:
         from ouroboros.subagent_worktrees import provision_execution_snapshot
+        # The copy and its record live on the process roots, where every capture (in-process or a
+        # maintenance child) and release reads them; conftest restores os.environ after the test.
+        os.environ.update(OUROBOROS_DATA_DIR=str(root), OUROBOROS_SUBAGENT_WORKTREE_ROOT=str(tmp_path / "snapshots"))
         snapshot = provision_execution_snapshot(target_root=subject, task_id=kind,
             snapshot_id="ordinary-snapshot", worktree_root=tmp_path / "snapshots", data_dir=root)
+        from ouroboros.delegate_registration_policy import INVESTIGATION_AUTHORITY
+
         facts = dict(snapshot_id=snapshot.snapshot_id, execution_root=snapshot.path,
                      target_root=snapshot.target_root, baseline_sha=snapshot.baseline_sha,
-                     authority_source="acting_constraint")
+                     authority_source=INVESTIGATION_AUTHORITY if kind == "investigation" else "acting_constraint")
         source = {}
     area = Path(facts["execution_root"])
     (area / "check.py").write_bytes(b"# reviewer or delegate output\n")
@@ -236,7 +244,7 @@ def test_relocated_failed_turn_is_captured_without_touching_active_thread(tmp_pa
     assert rc.capture_seat_evidence(root, TASK, "turn-one")["status"] == "capture_failed"
     assert _thread(root, source, "turn-two") == area
     (area / "active.txt").write_bytes(b"live turn")
-    old = rc.seat_dir(root, TASK, "turn-one") / "area"
+    old = rc.seat_dir(root, TASK, "turn-one") / "area.noindex"
     assert old.is_dir() and not (area / "only-old.txt").exists()
     monkeypatch.setattr(rc, "_directory_delta", compare)
     report = prune.prune_review_checkouts(root, {TASK}, now=10**11)
@@ -248,7 +256,7 @@ def test_relocated_failed_turn_is_captured_without_touching_active_thread(tmp_pa
 
 def test_supervisor_reaches_ready_and_real_assignment_while_both_captures_are_blocked(tmp_path, monkeypatch):
     import server
-    from ouroboros import headless, server_liveness, usage_store
+    from ouroboros import server_liveness, subagent_worktrees as worktrees, usage_store
     from supervisor import queue, state, worker_assignment, workspace_preparation
     from tests.test_server_shutdown import _supervisor_harness
     from tests.worker_pool_support import affirm_ready
@@ -275,14 +283,14 @@ def test_supervisor_reaches_ready_and_real_assignment_while_both_captures_are_bl
     monkeypatch.setattr(maintenance, "_CUSTODY_SWEEP_LOCK", threading.Lock())
     entered = {kind: threading.Event() for kind in ("ordinary", "review")}
     release, body_stop, sent = threading.Event(), threading.Event(), []
-    actual_patch, actual_review = headless.write_workspace_patch_artifacts, rc._git_delta
+    actual_patch, actual_review = worktrees.capture_result_commit, rc._git_delta
 
     def barrier(kind, action, *args, **kwargs):
         entered[kind].set()
         assert release.wait(10), "bounded fixture capture barrier was not released"
         return action(*args, **kwargs)
 
-    monkeypatch.setattr(headless, "write_workspace_patch_artifacts",
+    monkeypatch.setattr(worktrees, "capture_result_commit",
                         lambda *a, **kw: barrier("ordinary", actual_patch, *a, **kw))
     monkeypatch.setattr(rc, "_git_delta", lambda *a, **kw: barrier("review", actual_review, *a, **kw))
     app_state = SimpleNamespace(supervisor_ready_event=rec.ready,
@@ -333,12 +341,8 @@ def test_supervisor_reaches_ready_and_real_assignment_while_both_captures_are_bl
         _until(lambda: not maintenance._CUSTODY_SWEEP_LOCK.locked())
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "22.10 hotfix: the rule that kept partial named evidence collectable re-offered every unchanged "
-    "partial capture on the 20 s body cadence and saturated the server; recapture after an interrupted "
-    "retention returns with the follow-up that makes one attempt per evidence generation"))
-def test_body_stop_mid_capture_keeps_named_files_pending_for_the_next_generation(tmp_path, monkeypatch):
-    from ouroboros import headless
+def test_body_stop_mid_capture_keeps_named_files_pending_for_the_next_generation(tmp_path, monkeypatch, capture_child):  # noqa: F811
+    from ouroboros import subagent_worktrees as worktrees
 
     root = tmp_path / "data"
     _install_queue(root, monkeypatch)
@@ -346,26 +350,29 @@ def test_body_stop_mid_capture_keeps_named_files_pending_for_the_next_generation
     engine = Engine()
     quiet_custody(root, monkeypatch, engine)
     maintenance._startup_custody_sweep()
-    actual = headless.write_workspace_patch_artifacts
+    actual = worktrees.capture_result_commit
     entered, release = threading.Event(), threading.Event()
     def blocked(*args, **kwargs):
         entered.set()
         assert release.wait(10)
         return actual(*args, **kwargs)
-    monkeypatch.setattr(headless, "write_workspace_patch_artifacts", blocked)
+    monkeypatch.setattr(worktrees, "capture_result_commit", blocked)
     runtime = body.start_body_runtime(root, gateway_factory=lambda: engine)
     try:
         assert entered.wait(5)
         body.stop_body_runtime(root, wait=False)
-        assert not release.is_set() and runtime.thread.is_alive() and not runtime.active
+        assert not release.is_set() and not runtime.active
+        assert any(thread.is_alive() for thread in capture_child.threads.values())
     finally:
         release.set()
         runtime.close(wait=True)
+        capture_child.drain(root)
     saved = current.run(root, entry.run_id)
-    assert saved.patch_captured and current.collection_pending(saved, root) and area.is_dir()
+    assert saved.capture_job["state"] == "ready" and current.collection_pending(saved, root) and area.is_dir()
+    assert body._read_source(root, saved, saved.capture_job["source"])["capture_interrupted"]
     assert not body.saved_named_evidence(root, saved)[1]
     # A new body resumes just the owed retention from the existing copy/receipts.
-    monkeypatch.setattr(headless, "write_workspace_patch_artifacts", lambda *a, **kw: pytest.fail("product patch already retained"))
+    monkeypatch.setattr(worktrees, "capture_result_commit", lambda *a, **kw: pytest.fail("product patch already retained"))
     runtime = body.start_body_runtime(root, gateway_factory=lambda: engine)
     try:
         _until(lambda: not current.collection_pending(current.run(root, entry.run_id), root))
@@ -392,7 +399,7 @@ def test_stop_and_owner_restart_leave_capture_to_existing_owners(tmp_path, monke
     write_task_result(root, kind, "running", result="work in progress")
     # A capture on either control chain fails loudly; later use the actual collector.
     with monkeypatch.context() as blocked:
-        blocked.setattr("ouroboros.headless.write_workspace_patch_artifacts",
+        blocked.setattr("ouroboros.subagent_worktrees.capture_result_commit",
                         lambda *a, **kw: pytest.fail("bulk capture entered a control chain"))
         blocked.setattr(rc, "_git_delta", lambda *a, **kw: pytest.fail("review capture entered a control chain"))
         if door == "stop":
@@ -401,7 +408,7 @@ def test_stop_and_owner_restart_leave_capture_to_existing_owners(tmp_path, monke
         else:
             monkeypatch.setattr(server_restart, "DATA_DIR", root)
             monkeypatch.setattr(server_restart, "_OWNER_STOP_BEGAN", threading.Event())
-            monkeypatch.setattr(owned_shutdown, "begin_owned_stop", lambda root: None)
+            monkeypatch.setattr(owned_shutdown, "begin_owned_stop", lambda root, **_kw: None)
             monkeypatch.setattr(owned_shutdown, "stop_owned_work", lambda root: None)
             monkeypatch.setattr(claudexor_daemon, "ensure_owned_gateway",
                                 lambda **kw: pytest.fail("Restart must only attach"))

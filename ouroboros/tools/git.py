@@ -489,6 +489,7 @@ def _preflight_and_tests_gate(
     review_rebuttal: str = "",
     goal: str = "",
     scope: str = "",
+    review_only: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Ahead of the panel: the free deterministic checks, the tests preflight, then the author's
     preflight when one row was named (decision 3A). The checks and the tests block as before
@@ -498,7 +499,7 @@ def _preflight_and_tests_gate(
 
     ctx._commit_preflight = {"status": "skipped" if skip_advisory_pre_review else "not_performed", "record_id": ""}
     named = bool(preflight_reviewer) and not skip_advisory_pre_review
-    message = deterministic_preflight(ctx, commit_message, classification_paths or None)
+    message = deterministic_preflight(ctx, commit_message, classification_paths or None, review_only=review_only)
     reason = "infra_failure" if preflight_evidence_unavailable(message) else "preflight"
     _managed_needs_proof = _managed_candidate_needs_proof(ctx)
     # The retired advisory's own tests rule, for every commit: the suite runs unless the author
@@ -1064,6 +1065,8 @@ def _commit_request_refusals(ctx: ToolContext, *, root: str, preflight_reviewer:
         return None, _COMMIT_ROOT_REFUSAL
     if continuation and wake_on is not None:
         return None, "TOOL_ARG_ERROR: wake_on belongs to a new ask; collection retains its saved selection"
+    if continuation and getattr(ctx, "_review_since", ""):
+        return None, "⚠️ TOOL_ARG_ERROR: since_review shapes a new wave's brief; an author continuation dispatches no critic."
     selector = "" if collecting and not (skipped or continuation) else preflight_reviewer
     error = _commit_preflight_choice_error(selector, skipped=skipped, continuation=continuation,
                                          ctx=ctx, goal=goal, scope=scope, review_rebuttal=review_rebuttal)
@@ -1121,12 +1124,13 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                        scope: str = "", review_reference: Optional[dict] = None,
                        author_disposition: Optional[dict] = None, root: str = "",
                        preflight_reviewer: str = "", reviewers: Optional[List[str]] = None, reason: str = "",
-                       wake_on: Any = None) -> str:
+                       wake_on: Any = None, since_review: str = "") -> str:
     """Stage, review, and commit files with unified pre-commit review."""
     from ouroboros import body_candidate  # lazy: the Git tools reach the candidate owner only when committing
     skip_advisory_pre_review = bool(skip_advisory_review or skip_advisory_pre_review)
     preflight_reviewer = str(preflight_reviewer or "").strip()
     _reset_commit_review_state(ctx)
+    ctx._review_since = str(since_review or "").strip()  # read when the wave prepares its history
     ctx._left_review_wait = None  # a new commit act is the author's explicit next choice
     continuation = review_reference is not None or author_disposition is not None
     collecting_reference = review_reference is not None and author_disposition is None
@@ -1134,7 +1138,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
         from ouroboros.tools.review_collection import prepare_commit_collection
         try:
             source = prepare_commit_collection(ctx, review_reference, commit_message=commit_message,
-                mutations=(review_rebuttal, goal, scope, reviewers, reason, preflight_reviewer))
+                mutations=(review_rebuttal, goal, scope, reviewers, reason, preflight_reviewer, ctx._review_since))
             commit_message = source.commit_message
         except ValueError as exc:
             return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=str(exc)))
@@ -1427,20 +1431,16 @@ def _run_git_network_cmd(cmd: List[str], cwd: pathlib.Path) -> str:
 def get_tools() -> List[ToolEntry]:
     from ouroboros.review_doctrine import AUTHOR_DISPOSITION_SCHEMA
     from ouroboros.review_waiting import wake_on_schema
-    reviewed_commit_description = (
-        "Commit already-changed files through the unified reviewed commit workflow: free deterministic checks, "
-        "the tests preflight, then the review panel (both questions). Blocking gates on its verdict; under Advisory or "
+    reviewed_commit_contract = (  # one contract, two leads: the older name keeps it whole for callers that see only that name
+        "free deterministic checks, the tests preflight, then the review panel (both questions). Blocking gates on its verdict; under Advisory or "
         "Cyber Pro every outcome, PASS and pending included, returns before commit/tag/push and the commit is your explicit "
-        "continuation (review_reference + author_disposition). preflight_reviewer optionally buys "
-        "ONE named row's early look at the worktree first (review_change surface=preflight): it informs, never "
+        "continuation (review_reference + author_disposition). preflight_reviewer optionally buys ONE named row's early look at the worktree first (review_change surface=preflight): it informs, never "
         "gates, and its record never answers the panel. Without it the commit records preflight not_performed, "
         "a fact rather than a bypass. reviewers/reason follow strictness: Blocking widens to the whole pool; Advisory "
         "requires at least one ticked reviewer and a reason when narrowed; Cyber Pro composes freely. Unticked advisers never count."
     )
-    skip_advisory_description = (
-        "Record that this commit deliberately goes without a preflight (preflight: skipped). The deterministic "
-        "checks, the tests (see skip_tests) and the panel still run; the opposite of preflight_reviewer."
-    )
+    reviewed_commit_description = "Commit already-changed files of Ouroboros's own body (system_repo) through the unified reviewed commit workflow: " + reviewed_commit_contract
+    legacy_commit_description = "Older name of commit_reviewed: commit changes to Ouroboros's own body through the same reviewed workflow. It runs " + reviewed_commit_contract
     commit_properties = {
         "wake_on": wake_on_schema(),
         **widening_properties(),
@@ -1449,61 +1449,51 @@ def get_tools() -> List[ToolEntry]:
         "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of task-attributed paths. Omitted computes candidates; empty never stages the whole tree."},
         "skip_tests": {"type": "boolean", "default": False, "description": "Skip pre-commit tests."},
         "review_rebuttal": {"type": "string", "default": "", "description": "A NEW content-hashed counter-argument buys one paid re-review within capacity; repeating it is free-refused."},
-        "preflight_reviewer": {"type": "string", "default": "", "description": "One ENABLED catalog row (id or handle; a review-pool member or not) for an early informational look at the worktree before the panel; unknown or disabled is TOOL_ARG_ERROR."},
+        "preflight_reviewer": {"type": "string", "default": "", "description": "One ENABLED catalog row (id or handle; a review-pool member or not) for an early informational look at the worktree before the panel; unknown or disabled, or named beside skip_advisory_review=True or an author continuation, is TOOL_ARG_ERROR before anything is staged."},
         "reviewers": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Enabled catalog ids/handles. Blocking widens a subset to every ticked reviewer. Advisory allows a subset with at least one ticked reviewer and requires reason when narrowed. Cyber Pro composes freely. Omitted means the whole pool. Unticked advisers are heard, not counted; unknown or disabled is TOOL_ARG_ERROR."},
         "reason": {"type": "string", "default": "", "description": "Why these reviewers; required when an Advisory panel is narrowed. Missing reason refuses at $0 before staging."},
-        "skip_advisory_review": {"type": "boolean", "default": False, "description": skip_advisory_description},
+        "skip_advisory_review": {"type": "boolean", "default": False, "description": "Record that this commit deliberately goes without a preflight (preflight: skipped). The deterministic checks, the tests (see skip_tests) and the panel still run; the opposite of preflight_reviewer."},
         "goal": {"type": "string", "default": "", "description": "High-level goal of this change. Used by the panel's coupling questions to judge completeness."}, "scope": {"type": "string", "default": "", "description": "Declared scope boundary. Without a goal it is the intended transformation the panel's coupling questions judge the change against (completeness, forgotten adjacent surfaces)."},
         "review_reference": {"type": "object", "description": "Exact reference a prior commit call of this task returned, for the free explicit Advisory or Cyber Pro continuation."},
         "author_disposition": AUTHOR_DISPOSITION_SCHEMA,
+        "since_review": {"type": "string", "default": "", "description": "A review_record_id of an earlier change review of this repository (another task, or a copy such as a reviewed candidate) to compare with: the panel is shown what changed since its subject, its verdict only as a label of those earlier bytes; no PASS, finding or obligation carries over. Unknown, foreign or unreadable is a stated comparison gap. Omitted: this task's earlier reviews of this checkout."},
     }
     return [
         ToolEntry("commit_reviewed", {"name": "commit_reviewed", "description": reviewed_commit_description,
             "parameters": {"type": "object", "properties": commit_properties, "required": []}}, _commit_reviewed, is_code_tool=True),
-        ToolEntry("vcs_commit_reviewed", {"name": "vcs_commit_reviewed", "description": reviewed_commit_description,
-            "parameters": {"type": "object", "properties": commit_properties, "required": []}}, _commit_reviewed, is_code_tool=True),
-        ToolEntry("vcs_status", {
-            "name": "vcs_status",
-            "description": "git status --porcelain for the selected repository.",
-            "parameters": {"type": "object", "properties": {
-                "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
-                "path": {"type": "string", "default": "", "description": "Optional path filter relative to the selected repository"},
-                "max_chars": {"type": "integer", "default": 0, "description": "Optional output character limit; 0 means no explicit limit"},
-            }, "required": []},
-        }, _git_status, is_code_tool=True),
-        ToolEntry("vcs_diff", {
-            "name": "vcs_diff",
-            "description": "Local git diff. Omit refs for unstaged/staged changes. Base compares to worktree or index; base+head compares two trees, not their merge base. No fetch.",
-            "parameters": {"type": "object", "properties": {
-                "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
-                "base": {"type": "string", "default": "", "description": "Optional local base ref, resolved once to an exact tree."},
-                "head": {"type": "string", "default": "", "description": "Optional local second tree; requires base and staged=false."},
-                "staged": {"type": "boolean", "default": False, "description": "If true, show staged changes (--staged)"},
-                "path": {"type": "string", "default": "", "description": "Optional path filter relative to the selected repository"},
-                "stat": {"type": "boolean", "default": False, "description": "If true, show --stat output"},
-                "name_only": {"type": "boolean", "default": False, "description": "If true, show --name-only output"},
-                "max_chars": {"type": "integer", "default": 0, "description": "Optional output character limit; 0 means no explicit limit"},
-            }, "required": []},
-        }, _git_diff, is_code_tool=True),
+        ToolEntry("vcs_commit_reviewed", {"name": "vcs_commit_reviewed", "description": legacy_commit_description,
+            "parameters": {"type": "object", "properties": commit_properties, "required": []}}, _commit_reviewed, is_code_tool=True, alias_for="commit_reviewed"),
         ToolEntry("vcs_pull_ff", {
             "name": "vcs_pull_ff",
-            "description": "Fetch from origin and fast-forward merge in the selected repository. Safe: never rewrites history.",
+            "description": (
+                "Fetch origin and fast-forward the selected repository's current named branch. Changes the checkout; "
+                'divergence is refused with both SHAs, without merging or rewriting history.'
+            ),
             "parameters": {"type": "object", "properties": {
                 "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
             }, "required": []},
         }, _pull_from_remote, is_code_tool=True, mutates_worktree=True),
         ToolEntry("vcs_restore", {
             "name": "vcs_restore",
-            "description": "Discard uncommitted changes in the selected repository, restoring to HEAD.",
+            "description": (
+                'Restore all uncommitted changes, or paths, to HEAD. Deletes untracked files in scope; ignored files '
+                "stay. confirm=false previews; true executes. Dirty protected paths in Ouroboros's own repository are "
+                'refused.'
+            ),
             "parameters": {"type": "object", "properties": {
                 "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
-                "confirm": {"type": "boolean", "description": "Must be true to execute."},
+                "confirm": {"type": "boolean", "description": "false previews; true executes."},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Specific files to restore"},
             }, "required": ["confirm"]},
         }, _restore_to_head, is_code_tool=True, mutates_worktree=True),
         ToolEntry("vcs_revert", {
             "name": "vcs_revert",
-            "description": "Revert a commit in the selected repository by creating a new undo commit. Safe: no history rewrite.",
+            "description": (
+                'Undo one commit by creating a revert commit. confirm=false previews; true requires a clean worktree. '
+                "Refuses merge commits. In Ouroboros's own repository, protected-path reverts follow the caller's "
+                "effective runtime mode (task limits included) or existing managed-update authority. "
+                "Mechanical revert requires no new review."
+            ),
             "parameters": {"type": "object", "properties": {
                 "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
                 "sha": {"type": "string", "description": "Commit SHA to revert"},
@@ -1533,8 +1523,6 @@ from ouroboros.tools.git_plumbing import (  # noqa: E402,F401
 
 
 from ouroboros.tools.git_review_cycle import (  # noqa: E402,F401
-    _DOC_ONLY_EXTENSIONS,
-    _diff_is_doc_only,
     _finalize_blocked_review,
     _finalize_pending_review,
     _fingerprint_staged_diff,

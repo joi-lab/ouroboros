@@ -7,6 +7,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -75,13 +76,16 @@ def _assert_receipt(actor, area):
     assert not {"area", "refresh_safe", "retention_reason", "release_basis", "process_scope"} & set(receipt)
     evidence = Path(receipt["evidence_dir"])
     assert (evidence / "files" / "check.py").read_bytes() == REVIEWER_EDIT
-    assert (evidence / "files" / checking.EVIDENCE_DIRNAME / "coverage.xml").read_bytes() == COVERAGE
+    coverage = evidence / "files" / checking.EVIDENCE_DIRNAME / "coverage.xml"
+    assert coverage.read_bytes() == COVERAGE
+    # A reviewer's copy keeps its source's mode, so the receipt names the mode the retained file
+    # carries (a writable file reads 0o666 on Windows), never a POSIX default.
     assert receipt["named_evidence"] == [{
         "path": f"{checking.EVIDENCE_DIRNAME}/coverage.xml", "size": len(COVERAGE),
-        "sha256": hashlib.sha256(COVERAGE).hexdigest(),
+        "sha256": hashlib.sha256(COVERAGE).hexdigest(), "mode": stat.S_IMODE(coverage.stat().st_mode),
     }]
     assert "check.py" in receipt["changed"]
-    assert json.loads((evidence / "summary.json").read_text()) == receipt
+    assert json.loads((evidence / "summary.json").read_text(encoding="utf-8")) == receipt
     assert actor["operation_id"] == OPERATION
     assert actor["usage"]["invocation_id"] == INVOCATION
     assert not actor["usage"].get("pending_invocation_id"), "a terminal token must not create a new live wait"

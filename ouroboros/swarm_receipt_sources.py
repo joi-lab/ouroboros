@@ -52,12 +52,23 @@ def tree_inputs(root, root_id, *, task=None):
                 "invocation_id": invocation_id, "task_id": request.get("task_id"),
                 "kind": "delegated_start", "state": "pending", "terminal": False,
                 "start": None, "end": None, "accounted_upper_bound_usd": None, "basis": "retained_start_request"}
-        expected = set((owner.get("swarm_fanout_rollup") or {}).get("child_ids") or ())
-        if expected - set(ids):
-            gaps.append("missing_child_results")
-        if not owner:
-            gaps.append("root_result_absent")
         cursor = txn.meta("subagent_metrics_cursor") or {}
+    # Receipt refresh runs on ordinary producer threads. It uses retained facts;
+    # only an explicit rollup read catches up legacy history.
+    from ouroboros.swarm_rollup import rollup_from_document
+
+    prior = owner.get("swarm_fanout_rollup")
+    known_children = prior.get("child_ids") if isinstance(prior, dict) else None
+    expected = {child for child in known_children if isinstance(child, str)} if isinstance(known_children, list) else set()
+    try:
+        facts = rollup_from_document(owner)
+        expected = set(facts.get("child_ids") or ())
+    except (OSError, ValueError, TypeError, store.StoreError):
+        gaps.append("fanout_history_unavailable")
+    if expected - set(ids):
+        gaps.append("missing_child_results")
+    if not owner:
+        gaps.append("root_result_absent")
     for event in measurements:
         actor = event.get("actor") or {}
         if actor and actor.get("kind") != "api_call":
@@ -79,6 +90,7 @@ def tree_inputs(root, root_id, *, task=None):
 
 def _usage(root, root_id, measurements):
     from ouroboros import usage_store
+    from ouroboros.runtime_limits import USAGE_DISPLAY_LOCK_TIMEOUT_SEC
 
     bindings, accounts = {}, {}
     for event in measurements:
@@ -88,8 +100,11 @@ def _usage(root, root_id, measurements):
             if attempt == (actor.get("usage_ref") or {}).get("observed_attempt_id"):
                 accounts[attempt] = {key: actor[key] for key in ("observed_route", "requested_profile") if key in actor}
     try:
-        with usage_store.read(root, allow_stale=True) as txn:
-            rows = txn.attempts("root_task_id=? OR task_id=?", (root_id, root_id))
+        # A receipt consumes existing money facts. Creating an empty ledger can
+        # append an import event to previously absent fan-out history.
+        with usage_store.hold(root, write=False, migrate=False, timeout_sec=USAGE_DISPLAY_LOCK_TIMEOUT_SEC) as txn:
+            captured = txn.attempt_rows("root_task_id=? OR task_id=?", (root_id, root_id))
+        rows = usage_store.decode_attempts(captured)
         return [{**row, **accounts.get(row["attempt_id"], {}),
                  **({"actor_id": bindings[row["attempt_id"]]} if row["attempt_id"] in bindings else {})}
                 for row in rows], "unknown" if usage_store.integrity_degraded(root) else "complete"

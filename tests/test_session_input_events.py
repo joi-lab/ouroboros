@@ -84,7 +84,10 @@ def test_ordinary_collection_emits_run_split_once_without_repricing(tmp_path, mo
     collect(tmp_path, entry(tmp_path))
     assert ledger_rows(tmp_path) == before and len(before) == 1
     assert before[0]["input_token_usage"] == SPLIT
-    assert before[0]["prompt_tokens"] == 4 and before[0]["cached_tokens"] == 20484
+    # The ledger's input axes are the split (a direct call's meaning); the event keeps the harness's own.
+    assert (before[0]["prompt_tokens"], before[0]["cached_tokens"], before[0]["cache_write_tokens"]) == (20488, 12738, 7746)
+    assert before[0]["harness_tokens"] == {"prompt_tokens": 4, "cached_tokens": 20484}
+    assert (row["prompt_tokens"], row["cached_tokens"]) == (4, 20484)
     assert before[0]["cost_usd"] == 0.0
     assert {row["ledger_attempt_ids"][0] for row in events(tmp_path) if row["type"] == "llm_usage"} == {before[0]["attempt_id"]}
 
@@ -189,8 +192,10 @@ def test_review_chain_observation_is_per_run_not_final_chain_sum(tmp_path, monke
     from ouroboros import delegate_custody_usage as dcu
     from ouroboros.review_execution import AgentSessionReviewExecutor, ReviewAssignment, _combined_session_usage
     monkeypatch.setattr(dcu, "_EMITTED_SESSION_USAGE", {})
-    first, final = terminal()["summary"], terminal({**SPLIT, "total_tokens": None})["summary"]
-    _, _, combined = _combined_session_usage(custody, [first], final)
+    # The fold reads engine run details (summary and attempts), as review_execution passes them.
+    first_detail, final_detail = terminal(), terminal({**SPLIT, "total_tokens": None})
+    first, final = first_detail["summary"], final_detail["summary"]
+    _, _, combined = _combined_session_usage(custody, [first_detail], final_detail)
     assert combined["inputTokens"] == 8  # existing actor aggregate stays unchanged
     assert "inputTokenUsage" not in combined  # never attach final-run split to chain totals
     parts = [session_usage_facts(run, requested_route="claude", summary=value)

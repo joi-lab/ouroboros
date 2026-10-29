@@ -1062,7 +1062,8 @@ def _await_cost_finality(
             )
         except CLIError:
             return result
-        if latest.get("cost_final") or latest.get("cost_with_children_partial") is False:
+        if (latest.get("cost_final") is not False and latest.get("cost_with_children_partial") is not True
+                and (latest.get("cost_final") or latest.get("cost_with_children_partial") is False)):
             return latest
     return latest
 

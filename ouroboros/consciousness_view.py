@@ -1,8 +1,28 @@
 """Read-only consciousness facts from places, current roots and durable results."""
 
+import contextlib
+import json
+import time
 from typing import Any
 
 from ouroboros.usage_origin import cause_label
+
+RECENT_WAKE_LIMIT = 50
+_DISPLAY_ZONE = None  # the server's local zone; the browser fixture generator pins one
+
+
+@contextlib.contextmanager
+def _reading(store_name: str):
+    """Name the store of a ``StoreBusy`` leaving this read on the same exception, so its
+    reason, cause and rollback facts travel unchanged; an inner read's name stands.
+    Helpers both stores share raise identical messages, so only the reader knows the store."""
+    from ouroboros.store import StoreBusy
+
+    try:
+        yield
+    except StoreBusy as exc:
+        exc.store_name = getattr(exc, "store_name", "") or store_name
+        raise
 
 
 def _clock_of(iso_value: Any) -> str:
@@ -10,14 +30,17 @@ def _clock_of(iso_value: Any) -> str:
     from ouroboros.deadline_utils import parse_deadline_ts
 
     parsed = parse_deadline_ts(str(iso_value or ""))
-    return parsed.astimezone().strftime("%H:%M") if parsed is not None else "?"
+    return parsed.astimezone(_DISPLAY_ZONE).strftime("%H:%M") if parsed is not None else "?"
 
 
 def describe_consciousness_state(snapshot: dict, requested_enabled: bool | None) -> dict:
     """Project the alarm clock's snapshot into one honest status + detail line
-    (``None``: the stored control is unknown, never read as off — #1307)."""
+    for the client headline (``None``: stored control is unknown, never off — #1307)."""
+    from ouroboros.deadline_utils import parse_deadline_ts
+
     outcome = str(snapshot.get("last_wake_outcome") or "")
     next_at = _clock_of(snapshot.get("next_wake_at"))
+    deadline = parse_deadline_ts(str(snapshot.get("next_wake_at") or ""))
     if requested_enabled is None:
         status, detail = "unknown", "The stored consciousness control is unknown: runtime state is unavailable or recovering."
     elif not requested_enabled:
@@ -26,6 +49,8 @@ def describe_consciousness_state(snapshot: dict, requested_enabled: bool | None)
         status, detail = "stopped", "Enabled in state, but the alarm clock was not constructed (supervisor init failed)."
     elif snapshot.get("live_wake_task_id"):
         status, detail = "thinking", f"Wake-up {snapshot['live_wake_task_id']} is running as a Main turn."
+    elif snapshot.get("owner_turn_live") and deadline is not None and deadline.timestamp() <= time.time():
+        status, detail = "due", "Due; waiting for current work."
     elif outcome == "skipped:waiting_for_first_conversation":
         status, detail = "waiting_for_first_conversation", "No owner chat is bound yet; the first conversation binds it."
     elif outcome == "skipped:allowance_exhausted":
@@ -61,42 +86,40 @@ def describe_consciousness(clock) -> dict:
     requested = bool(enabled) if known else None
     if clock is not None:
         return clock.details_snapshot(requested)
-    return {**describe_consciousness_state({}, requested), "places": [], "recent_wakes": []}
+    return {**describe_consciousness_state({}, requested), "recent_wakes": []}
 
 
-def place_views(drive_root) -> list[dict]:
-    """One row per configured place; unavailable room counts stay unknown."""
-    from ouroboros import places
+def place_views(drive_root, allowance=None) -> list[dict]:
+    """Stored PlaceSummary facts, using the caller's allowance without connector discovery."""
+    from ouroboros.place_projection import place_view
+    from ouroboros.places import load_places
 
-    views = []
-    room_index = getattr(places, "place_room_index", None)
-    for place in places.load_places(drive_root):
-        view = dict(places.place_summary(place))
-        try:
-            rooms = room_index(drive_root, place.place_id) if room_index else None
-        except Exception:
-            rooms = None
-        view["rooms"] = rooms
-        if rooms is not None:
-            counts = [room.get("unanswered_count") for room in rooms]
-            view["unanswered"] = sum(counts) if all(isinstance(n, int) for n in counts) else None
-        else:
-            view.setdefault("unanswered", None)
-        views.append(view)
-    return views
+    return [place_view(drive_root, place, allowance=allowance, brief=True) for place in load_places(drive_root)]
 
 
-def places_text(views) -> str:
+def places_text(drive_root, views) -> str:
+    from ouroboros.place_arrivals import recent_identity
+    from ouroboros.places import OwnerAccount, owner_account_matches
     if views is None:
         return "unknown (place index unavailable)"
     lines = []
     for view in views:
+        identity = recent_identity(drive_root, view["place_id"])
+        sending = (identity or {}).get("sends_as") or {}
+        owner = sending.get("kind") == "user" and owner_account_matches(
+            (OwnerAccount(**a) for a in view.get("owner_accounts", [])), sending["id"], view.get("account_id", ""))
+        voice = ""
+        if sending:
+            voice = (f'; as Ouroboros (bot {sending["label"]})' if sending["kind"] == "bot"
+                     else f'; writes as {sending["label"]}' + (" (your human's own account)" if owner else ""))
         count = view.get("unanswered")
         addresses = [str(room.get("address") or f'chat_history(chat_id={int(room["room_chat_id"])})')
                      for room in view.get("rooms") or []]
         address = "; ".join(addresses) or ("no captured room" if view.get("rooms") == [] else "room address unknown")
         lines.append(f'{view.get("label") or view["place_id"]} [{view["place_id"]}]: {view["state"]}; '
-                     f'unanswered: {count if count is not None else "unknown"}; {address}')
+                     f'open turns: {count if count is not None else "unknown"}; {address}{voice}')
+        for note in view.get("notes") or []:
+            lines.extend(f'  note ({note["author"]}): {line}' for line in note["text"].splitlines())
     return "\n  ".join(lines) if lines else "none"
 
 
@@ -134,49 +157,121 @@ def first_reply_at(drive_root, task_id: str) -> str | None:
     from ouroboros.deadline_utils import parse_deadline_ts
 
     first = None
-    for stored in dialogue_store.iter_probes(drive_root, "chat", [("task_id", task_id)]):
-        row = stored.row
-        transport = row.get("transport") or {}
-        delivery = transport.get("delivery") or {}
-        receipt = row.get("type") == "presence_delivery" and delivery.get("state") in {"accepted", "delivered"}
-        released = (row.get("direction") == "out" and str(row.get("source") or "").startswith("presence:")
-                    and delivery.get("state") == "authored")
-        if row.get("task_id") != task_id or not (receipt or released):
-            continue
-        stamp = str(delivery.get("reported_at") or row.get("ts") or "")
-        instant = parse_deadline_ts(stamp)
-        if instant is not None and (first is None or instant < first[0]):
-            first = instant, stamp
+    with _reading("dialogue"):  # the lazy iterator reads at its first step and at every page
+        for stored in dialogue_store.iter_probes(drive_root, "chat", [("task_id", task_id)]):
+            row = stored.row
+            transport = row.get("transport") or {}
+            delivery = transport.get("delivery") or {}
+            receipt = row.get("type") == "presence_delivery" and delivery.get("state") in {"accepted", "delivered"}
+            released = (row.get("direction") == "out" and str(row.get("source") or "").startswith("presence:")
+                        and delivery.get("state") == "authored")
+            if row.get("task_id") != task_id or not (receipt or released):
+                continue
+            stamp = str(delivery.get("reported_at") or row.get("ts") or "")
+            instant = parse_deadline_ts(stamp)
+            if instant is not None and (first is None or instant < first[0]):
+                first = instant, stamp
     return first[1] if first else None
 
 
-def recent_wakes(drive_root, places) -> list[dict]:
-    """Wake facts among the 50 newest task rows, with explicit snapshot coverage.
+def wake_ids(drive_root, now: float) -> list[str]:
+    """The allowance's category/time index, newest distinct wake roots first."""
+    from ouroboros import usage_store
+    from ouroboros.consciousness_allowance import ROOT_HORIZON_SEC, _MONEY_KIND
 
-    Task selection is bounded; reply rows use the dialogue task index and checks
-    the five-chip task record. Missing historical evidence stays absent.
+    with usage_store.read(drive_root, allow_stale=True) as txn:
+        return [record[0] for record in txn.conn.execute(
+            "SELECT root_task_id FROM attempts INDEXED BY attempts_category_time "
+            "WHERE category = 'consciousness' AND ts_last_epoch >= ? AND root_task_id != '' "
+            f"AND {_MONEY_KIND} AND state != 'released' AND (ts_dispatched IS NOT NULL "
+            "OR kind IN ('subscription_session', 'external_unmetered')) "
+            f"GROUP BY root_task_id ORDER BY MAX(ts_last_epoch) DESC, root_task_id DESC LIMIT {RECENT_WAKE_LIMIT}",
+            (now - ROOT_HORIZON_SEC,))]
+
+
+def _wake_notes(drive_root, ids: list[str]) -> dict:
+    """One PK-addressed read of the whole results excluded from display documents."""
+    from ouroboros.store import open_store
+
+    with open_store(drive_root, write=False) as txn:
+        return dict(txn.conn.execute(
+            "SELECT task_id, json_extract(body, '$.result') FROM task_bodies "
+            "WHERE task_id IN (SELECT value FROM json_each(?))", (json.dumps(ids),)))
+
+
+def _wake_phase(row: dict, clock_live: bool) -> str:
+    """Terminal card outcome, or the existing work classifier over stored activity facts."""
+    from ouroboros.gateway.work_status import classify_member
+    from ouroboros.project_dialogue import outcome_phase, owner_wait_projection
+    from ouroboros.task_status import FINAL_STATUSES
+    from ouroboros.work_stop import stop_presentation
+
+    status = str(row.get("status") or "")
+    if status in FINAL_STATUSES:
+        return outcome_phase(row, {})
+    phase = {"running": "working", "requested": "queued", "scheduled": "queued",
+             "queued": "queued", "paused": "budget_paused"}.get(status, "working" if clock_live else "unknown")
+    stop = stop_presentation(row)
+    if stop["stop"] or stop["waiting"]:
+        phase = "budget_paused"
+    facts = {**row, "activity_id": row["task_id"], "phase": phase}
+    wait = facts.pop("owner_wait", None) or {}
+    if wait.get("quiz_id"):
+        quiz = (row.get("owner_quiz") or {}).get(wait["quiz_id"]) or {}
+        facts["owner_wait"] = {**owner_wait_projection(wait["quiz_id"], wait, quiz),
+                               "quiz_id": wait["quiz_id"], "quiz_state": quiz.get("state", "unknown")}
+    activity = classify_member(facts, row)["activity"]
+    return "running" if activity == "working" else activity
+
+
+def recent_wakes(drive_root, places, *, live_wake_task_id: str = "", now: float | None = None,
+                 ids: list[str] | None = None) -> list[dict]:
+    """At most 50 wakes that reached a model call in the last 48 h, newest first.
+
+    Wakes that never reached a model call are not listed. Selection uses the
+    allowance's ledger horizon; reservations alone are not calls. Facts come
+    from display documents, whole notes from one PK read, focus replies from
+    the dialogue task index. Missing historical evidence stays unknown.
     """
     from ouroboros.consciousness_authority import wake_cause
-    from ouroboros.cost_projection import cost_projection
-    from ouroboros.consciousness_wake import _clip_preview
-    from ouroboros.task_store import documents_by_ids, newest_ids
+    from ouroboros.task_results import TASK_COST_META_FIELDS
+    from ouroboros.task_status import FINAL_STATUSES
+    from ouroboros.task_store import display_documents
+    from ouroboros.terminal_time import terminal_time_fact
+    from ouroboros.task_finalization import quiet_finish
 
-    ids = newest_ids(drive_root, limit=50)
-    documents = documents_by_ids(drive_root, ids)
+    if ids is None:
+        ids = wake_ids(drive_root, time.time() if now is None else now)
+    if not ids:
+        return []
+    with _reading("task"):
+        documents = display_documents(drive_root, ids)
+        notes = _wake_notes(drive_root, ids)
     rows = []
     for task_id in ids:
-        row = documents[task_id]
-        metadata = row.get("metadata") or {}
-        cause = wake_cause(metadata)
-        if not cause:
+        if task_id not in documents:
             continue
+        row = json.loads(documents[task_id])
+        metadata = row.get("metadata") or {}
+        # Category-only legacy roots use the allowance's own-clock fallback.
+        cause = "focus" if wake_cause(metadata) == "focus" else "own"
         focus = metadata.get("focus") or {}
+        sending = (focus.get("identity") or {}).get("sends_as") if cause == "focus" else None
         place_id = str(focus.get("place_id") or "")
-        rows.append({"task_id": task_id, "cause": cause, "place_id": place_id,
+        usage = (row.get("loop_outcome") or {}).get("usage") or {}
+        rows.append({"task_id": task_id, "cause": cause,
+                     **({"as": {"label": sending["label"], "owner": bool(focus.get("identity_owner"))}} if sending else {}),
+                     "chat_id": row.get("chat_id"), "conversation": str(focus.get("conversation_key") or ""),
                      "place_label": cause_label(f"place:{place_id}", places or ()) if place_id else "",
-                     "started_at": row.get("started_at"), "first_reply_at": first_reply_at(drive_root, task_id),
-                     "finished_at": row.get("finished_at"), "outcome": metadata.get("presence_outcome") or row.get("status", "unknown"),
-                     "accounted_upper_bound_usd": cost_projection(row)["accounted_upper_bound_usd"],
-                     "unmetered": bool(row.get("unknown_unmetered")),
-                     "checks": row.get("safety_checks", []), "summary": _clip_preview(row.get("result"))})
+                     "started_at": row.get("started_at"),
+                     **({"first_reply_at": first_reply_at(drive_root, task_id)} if cause == "focus" else {}),
+                     "ended_at": terminal_time_fact(row)["occurred_at"],
+                     "live": live_wake_task_id == task_id or row.get("status") not in FINAL_STATUSES,
+                     "phase": _wake_phase(row, live_wake_task_id == task_id), "quiet": quiet_finish(row),
+                     **({"tool_calls": row["tool_calls"]} if "tool_calls" in row else {}),
+                     **({"rounds": usage["total_rounds"]} if "total_rounds" in usage else {}),
+                     "checks": row.get("safety_checks", []), "note": notes.get(task_id),
+                     **({"summary": row["wake_summary"]} if isinstance(row.get("wake_summary"), str) and row["wake_summary"] else {}),
+                     **({"said_owner": bool(row["owner_message_sent"])} if "owner_message_sent" in row else {}),
+                     **{k: row[k] for k in TASK_COST_META_FIELDS if k in row}})
     return rows

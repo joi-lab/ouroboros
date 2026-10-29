@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 from jsonschema import Draft202012Validator
 
-from ouroboros.tools import github, github_checks, github_read, github_write
+from ouroboros.tools import github, github_checks, github_read, github_write, github_pr_write, github_workflows
 
 FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "github_tool_selection.jsonl"
 CASES = [json.loads(line) for line in FIXTURE.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -26,14 +26,14 @@ def _validator(tool: str) -> Draft202012Validator:
     return Draft202012Validator(schema)
 
 
-def test_the_suite_has_thirty_to_forty_distinct_cases_over_every_method():
-    assert 30 <= len(CASES) <= 40 and len({c["id"] for c in CASES}) == len(CASES)
+def test_the_suite_has_distinct_cases_over_every_method():
+    assert len(CASES) >= 40 and len({c["id"] for c in CASES}) == len(CASES)
     assert {c["tool"] for c in CASES} == {"github_read", "github_write", "pr_merge"}
     read_methods = {c["args"]["method"] for c in CASES if c["tool"] == "github_read"}
     write_methods = {c["args"]["method"] for c in CASES if c["tool"] == "github_write"}
     assert read_methods == set(github_read.METHODS) and write_methods == set(github_write.METHODS)
     kinds = {c["args"].get("kind") for c in CASES if c["tool"] == "github_read" and c["args"]["method"] == "list"}
-    assert kinds >= {"issue", "pr", "comment", "review_comment", "review", "discussion", "notification", "release", "label"}
+    assert kinds >= {"issue", "pr", "comment", "review_comment", "review", "discussion", "notification", "release", "label", "artifact"}
     assert all(c["request"].strip() for c in CASES)
 
 
@@ -56,7 +56,7 @@ def test_every_expected_call_passes_the_handlers_argument_rules_before_any_gh_la
         launched.append(list(args))
         return github.GhResult(False, "⚠️ GH_ERROR: fixture transport", 1, 503, "exit")
 
-    for module in (github, github_read, github_checks):  # every name the transport is bound to; no real gh, no network
+    for module in (github, github_read, github_checks, github_pr_write, github_workflows):  # every name the transport is bound to; no real gh, no network
         monkeypatch.setattr(module, "_gh_run", no_gh)
     monkeypatch.setattr(github, "github_token_from_env_or_settings", lambda: "ghp_fixture")
     ctx = SimpleNamespace(repo_dir=pathlib.Path("."), drive_root=pathlib.Path("."), task_id="t", _active_builtin_tool_result=None,

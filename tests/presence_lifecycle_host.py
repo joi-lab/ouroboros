@@ -136,6 +136,7 @@ def main(root, generation, mode, scenario="incoming", with_event_bus=False):
     if scenario == "late_child_close_barrier":
         from ouroboros.model_wait import TaskModelWait
         from ouroboros.task_results import load_task_result
+        from ouroboros.utils import atomic_write_json
 
         scenario = "late_child"
         original_close = TaskModelWait.close
@@ -144,8 +145,9 @@ def main(root, generation, mode, scenario="incoming", with_event_bus=False):
             if any(agent.tools._ctx.model_wait_context is waiter for agent in h.agents):
                 terminal = load_task_result(h.data, waiter.task_id)
                 assert terminal["status"] in {"completed", "cancelled", "failed"}
-                (root / "before-author-close.json").write_text(json.dumps({
-                    "task_id": waiter.task_id, "status": terminal["status"], "closed": waiter.closed}))
+                # Published whole (temporary file, then rename): the test polls this marker with a strict read.
+                atomic_write_json(root / "before-author-close.json", {
+                    "task_id": waiter.task_id, "status": terminal["status"], "closed": waiter.closed})
                 assert close_release.wait(30), "test failed to release author teardown"
             return original_close(waiter)
 

@@ -124,7 +124,7 @@ def test_storage_dashboard_real_server_consumer(direct_server_with_data, request
         protected = [path for path, _size in markers.values()] + [data_dir / "state" / "storage_measurement.json"]
         before = _file_snapshots(protected)
         tray = page.locator("[data-storage-tray]")
-        expect(tray).to_contain_text("Copies the app already removes on its own")
+        expect(tray).to_contain_text("Copies and leftovers of finished work")
         assert page.locator("[data-storage-tray] .btn-danger").count() == 0
         with page.expect_response(lambda response: response.url.endswith("/api/storage/free/preview"), timeout=10_000) as previewed:
             page.locator("[data-free-preview]").click()

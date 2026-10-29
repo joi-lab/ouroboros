@@ -493,9 +493,23 @@ def _launch_attempt(queue, candidate, worker, token: str, *, lane: bool, generat
     from supervisor.followup_policy import scheduled_start
     from supervisor.queue_schedules import automatic_acquisitions
     from supervisor.queue_timeouts import _pending_continuation, _deadline_launch_claim, pending_deadline_expirable
+    from ouroboros.work_diagnostics import control_reason
 
     witness = _unsent(candidate)
     with automatic_acquisitions():
+        diagnostic_stop = control_reason(candidate, _pool().DRIVE_ROOT, before_handoff=True)
+        if diagnostic_stop:
+            with queue._queue_lock:
+                held = (_launch_claim_held(queue, candidate, worker, token) if lane
+                        else any(row is candidate for row in _pool().PENDING))
+            if held and diagnostic_stop == "cancelled" and (candidate.get("admitted_dispatch") == "none" or witness is not None):
+                # This launch owner proves it never entered the put. A recovered
+                # source may have published while we held its diagnostic claim.
+                from ouroboros.cancel_intents import request_cancel
+
+                request_cancel(_pool().DRIVE_ROOT, candidate["id"], reason="Diagnostic source authority ended before dispatch",
+                               source="silence_resolved", requested_by="supervisor", scope="single")
+            return False
         # The schedule owner's control (origin Stop, hold, binding) is read before any durable
         # step, under its own short table hold; the put re-reads it inside that hold below.
         with scheduled_start(queue.DRIVE_ROOT, candidate) as allowed:
@@ -534,7 +548,17 @@ def _launch_attempt(queue, candidate, worker, token: str, *, lane: bool, generat
                                           candidate["id"], strict=True) or {}
                 unsubmitted = copy.deepcopy({"task_id": candidate["id"], "task_attempt": candidate["_attempt"],
                     "source": candidate["_working_recovery"], "claim": _deadline_launch_claim(stored)})
-            projections = _commit_launch(queue, candidate, unsubmitted)
+            from ouroboros.server_restart import agent_restart_boundary, agent_restart_holds
+
+            if not agent_restart_boundary.acquire(blocking=False):
+                return None  # the inline caller may own Q: never wait behind an off-lane commit
+            try:
+                with queue._queue_lock:
+                    if witness is None and agent_restart_holds(candidate):
+                        return False
+                projections = _commit_launch(queue, candidate, unsubmitted)
+            finally:
+                agent_restart_boundary.release()
             if projections is None or projections is False:
                 return projections  # unresolved (None) or refused (False): the same row stays queued
             from ouroboros.obligations import drive_started
@@ -696,7 +720,11 @@ def _choose_candidate(queue, remaining, unresolved_invalid_id_set, refused_this_
         cold_holders = cold_project_holders(_pool().PENDING)
         chosen_idx = None
         for i, candidate in enumerate(_pool().PENDING):
+            from ouroboros.server_restart import agent_restart_holds
             from supervisor.events_budget import budget_resume_dispatch_allowed
+
+            if _unsent(candidate) is None and agent_restart_holds(candidate):
+                continue
 
             resume_allowed = budget_resume_dispatch_allowed(queue, candidate)
             # A row its own exact pause or hold keeps queued is not repaired: the selection a paused

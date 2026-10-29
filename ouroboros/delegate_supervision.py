@@ -1196,7 +1196,7 @@ def supervised_wait(
     outage_stamp = ""
     # The loop's own transport, only when it built the observing wait.
     from ouroboros.tools.delegate_terminal_evidence import retained_terminal_result
-    retained_runs = {selected: retained_terminal_result(ctx, selected) for selected in run_ids} if owns_transport else {}
+    retained_runs = {selected: retained_terminal_result(ctx, selected, retry_money=True) for selected in run_ids} if owns_transport else {}
     gateway = None
     live_inputs = {}
     from ouroboros import model_sleep

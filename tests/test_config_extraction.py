@@ -24,9 +24,12 @@ _LEAVES = (settings_defaults, settings_scales, model_slots, review_model_routes,
 # New subscription capabilities belong to the same leaves, but did not exist on
 # the historical extraction's facade and need not add compatibility re-exports.
 _ADDED_OWNERS = {
+    "VALID_SUBAGENTS_MODES": settings_scales,
+    "normalize_subagents_mode": settings_scales,
     "_safety_values": safety_config,
     "_resolved_safety_configuration": safety_config,
     "safety_configuration_requires_owner": safety_config,
+    "normalize_consciousness_safety": safety_config,
     "WORKER_READY_CEILING_SEC": runtime_limits,
     # A spawned direct-Restart successor's bounded wait for its exiting parent's data-root admission.
     "SERVER_ADMISSION_WAIT_SEC": runtime_limits,
@@ -37,6 +40,8 @@ _ADDED_OWNERS = {
     "BUDGET_PROJECTION_RETRY_SEC": runtime_limits,
     # The usage store display read's short wait (then the fact is reported unavailable).
     "USAGE_DISPLAY_LOCK_TIMEOUT_SEC": runtime_limits,
+    # The kill-and-reap bound of one captured local Git read (vcs_read history and identity).
+    "GIT_READ_CAPTURE_TIMEOUT_SEC": runtime_limits,
     "IMMEDIATE_SETTINGS": settings_scales,
     "RESTART_REQUIRED_SETTINGS": settings_scales,
     # An explicit root starting effort is validated against the effort scale it names.
@@ -387,5 +392,6 @@ def test_settings_extraction_size_bounds_have_meaningful_headroom():
     # 538 -> 560: the main-interface key (OUROBOROS_UI_DIR) with its export exclusion and the
     # saved-choice precedence the config read and persist seams share.
     # +7: independent Consciousness level, Supervisor model, owner rules and disk ownership.
-    assert counts["ouroboros.settings_defaults"] <= 567
+    # +1: Main's Subagents mode (OUROBOROS_SUBAGENTS_MODE, default auto).
+    assert counts["ouroboros.settings_defaults"] <= 568
     assert (PACKAGE / "config.py").is_file()

@@ -483,7 +483,8 @@ def test_a_cold_restored_left_review_wakes_with_its_custody_fact(tmp_path, monke
                 "tool_calls": []}, 0.0
     monkeypatch.setattr(loop, "_dispatch_round_model", dispatch)
     outcome = {}
-    kwargs = {**_loop_kwargs(tmp_path, registry, []), "emit_progress": lambda *_a, **_k: None}
+    kwargs = {**_loop_kwargs(tmp_path, registry, [], llm=SimpleNamespace(default_model=lambda: "same-model")),
+              "emit_progress": lambda *_a, **_k: None}  # the checkpoint ran on Main; a cold resume follows it (route_choice)
     worker = threading.Thread(target=lambda: outcome.update(result=loop.run_llm_loop(**kwargs)))
     worker.start()
     worker.join(60 if wake else 2)  # the positive ends by itself: 60 s is only its hang bound

@@ -603,6 +603,12 @@ def _task_from_schedule(record: Dict[str, Any], *, task_id: str = "") -> Dict[st
     for key in ("attachments", "context", "expected_output", "constraints", "deadline_at", "project_id"):
         if key in template:
             task[key] = template[key]
+    # The schedule's name is the run's authored name, as a caller's title is for any admitted run;
+    # an unnamed schedule's run (the host's placeholder included) is named by its request's first line.
+    from ouroboros.project_naming import admission_names
+    from supervisor.schedule_view import authored_name
+    title, coined = admission_names({"title": authored_name(record)}, task["description"])
+    task.update({key: value for key, value in (("title", title), ("suggested_name", coined)) if value})
     from ouroboros.settings_scales import EFFORT_SCALE
 
     # The explicit start the upsert checked; a hand-edited unknown tier keeps the default.
@@ -646,7 +652,7 @@ def _scan_outcomes(root, snapshot):
     """
     from ouroboros.task_results import load_task_result
     from ouroboros.task_status import SETTLED_STATUSES
-    from ouroboros.task_finalization import terminal_host_notice_text
+    from ouroboros.task_finalization import quiet_finish, terminal_host_notice_text
     from ouroboros.terminal_time import terminal_time_fact
     from ouroboros.store import acquisition_budget
 
@@ -661,20 +667,21 @@ def _scan_outcomes(root, snapshot):
             if not result or result.get("status") not in SETTLED_STATUSES:
                 continue
             notice = terminal_host_notice_text(result)
-            silent = result.get("wake_silent") is True
-            # A host notice is the run's public line; a quiet run's own words never are.
-            text = str(notice or ("" if silent else result.get("result")) or "").strip()
+            words = str(result.get("wake_summary") or "").strip()
+            # A host notice is the run's public line, else the sentence it wrote for its human (whole),
+            # else the end of a spoken answer; a quiet run's internal note never is.
+            text = str(notice or ("" if words or result.get("wake_silent") is True else result.get("result")) or "").strip()
             observed[str(row.get("id") or "")] = {
-                "task_id": task_id, "state": result["status"], "quiet": silent and not bool(notice),
+                "task_id": task_id, "state": result["status"], "quiet": quiet_finish(result),
                 "notice": bool(notice), "ended_at": terminal_time_fact(result)["occurred_at"],
-                "line": text.splitlines()[-1][:160] if text else "",
+                "line": text.splitlines()[-1][:160] if text else words,
             }
         except Exception:
             log.debug("schedule result %s not observed this pass", task_id, exc_info=True)
     return observed
 
 
-def _remove_withdrawn(data, root, cutoff_epoch):
+def _remove_withdrawn(data, root, cutoff_epoch, *, reads=None):
     """Stage audited removals only after retention and settled work permit them.
 
     The caller records outcomes after its durable table write. Age is checked
@@ -687,8 +694,8 @@ def _remove_withdrawn(data, root, cutoff_epoch):
         at = _parse_schedule_time(record.get("delete_requested_at"), datetime.timezone.utc)
         if at is None or at.timestamp() >= cutoff_epoch:
             continue
-        if (isinstance(record.get("occurrence"), dict) or owed(record, drive_root=root) is not False
-                or not deletion_settled(record, drive_root=root)):
+        if (isinstance(record.get("occurrence"), dict) or owed(record, drive_root=root, reads=reads) is not False
+                or not deletion_settled(record, drive_root=root, reads=reads)):
             continue
         audit = dict(drive_root=root, operation_id=uuid.uuid4().hex[:12], actor="host", task_id="",
                      action="remove", schedule_id=str(record.get("id") or ""), reason="withdrawal_retention_elapsed")
@@ -702,10 +709,10 @@ def _remove_withdrawn(data, root, cutoff_epoch):
 def check_scheduled_tasks(*, stop: Callable[[], bool] | None = None) -> None:
     """Admit due cron/once schedules through the occurrence protocol.
 
-    Claims and reconciliation run under the queue+table locks; every expensive
-    step (resource intent,
-    folder checks, memory fork, root billing, the allowance read) runs without
-    them; admission rechecks and commits under them again
+    Claims and reconciliation run under the queue+table locks using signed
+    receipt bodies prepared outside them, also for binding repair and retention.
+    Resource preparation, root billing and the allowance run outside them;
+    admission rechecks signatures/controls and commits under them again
     (``supervisor/schedule_occurrence.py``). A due ``kind: "notify"`` row is a
     note: consumed in this pass's one table write, shown after the locks are
     released (``supervisor/schedule_notes.py``), never a task.
@@ -731,6 +738,17 @@ def check_scheduled_tasks(*, stop: Callable[[], bool] | None = None) -> None:
             return
     outcomes = _scan_outcomes(root, snapshot)
     observed = scan_policy(root, snapshot)
+    from ouroboros.retention import age_cutoff, get_gc_retention_days
+
+    cutoff = age_cutoff(get_gc_retention_days())
+    receipt_rows = [row for row, _view in observed.values()]
+    for row in snapshot.get("tasks") or []:
+        # Idle historical rows need no body except when retention can remove them.
+        at = _parse_schedule_time(row.get("delete_requested_at") or (
+            row.get("completed_at") if _is_consumed_once(row) else ""), datetime.timezone.utc)
+        if at is not None and at.timestamp() < cutoff:
+            receipt_rows.append(row)
+    reads = occurrences.prepare_receipts(receipt_rows, drive_root=root)
     claims: List[Dict[str, Any]] = []
     due_notes: List[Dict[str, Any]] = []
     with schedule_transaction(root):
@@ -768,10 +786,10 @@ def check_scheduled_tasks(*, stop: Callable[[], bool] | None = None) -> None:
                 continue
             try:
                 with control_guard(root, record):
-                    occurrences.repair_followup_binding(record)
+                    occurrences.repair_followup_binding(record, reads=reads)
                     view = refresh_policy(root, data, record, observed=view)
             except Exception as exc:
-                if not occurrences.contention(exc):  # contention: this row waits a pass
+                if not isinstance(exc, occurrences.ReceiptChanged) and not occurrences.contention(exc):
                     log.exception("Follow-up policy persistence unavailable")
                 continue
             if view.get("busy"):
@@ -782,12 +800,12 @@ def check_scheduled_tasks(*, stop: Callable[[], bool] | None = None) -> None:
                 if occurrences.holding(record, now_utc):
                     continue
                 try:
-                    verdict, stored = occurrences.reconcile(record)
+                    verdict, stored = occurrences.reconcile(record, reads=reads)
                 except Exception as exc:
                     if occurrences.contention(exc):
                         continue
                     raise
-                changed = changed or verdict != "live"
+                changed = changed or verdict not in {"live", "retry"}
                 if verdict == "reconsider":
                     # Unstarted work follows the current authored timing/control.
                     occurrences.discard_claim(record)
@@ -867,12 +885,10 @@ def check_scheduled_tasks(*, stop: Callable[[], bool] | None = None) -> None:
             changed = True
         # Consumed one-shot receipts age out past the unified GC retention (DEVELOPMENT
         # Runtime Cleanup SSOT; enabled records are never pruned — see the helper).
-        from ouroboros.retention import age_cutoff, get_gc_retention_days
-
-        removals = _remove_withdrawn(data, root, age_cutoff(get_gc_retention_days()))
+        removals = _remove_withdrawn(data, root, cutoff, reads=reads)
         changed = bool(removals) or changed
-        kept, pruned = _prune_consumed_once(list(data.get("tasks") or []),
-                                            age_cutoff(get_gc_retention_days()), work_settled=occurrences.deletion_settled)
+        kept, pruned = _prune_consumed_once(list(data.get("tasks") or []), cutoff,
+            work_settled=lambda row: occurrences.deletion_settled(row, drive_root=root, reads=reads))
         if pruned:
             data["tasks"], changed = kept, True
         if changed:

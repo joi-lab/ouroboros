@@ -86,6 +86,15 @@ def _conversation_keys(place: Any, effect: Any, targets: Mapping[str, list[str]]
             for conversation in conversations for thread in threads]
 
 
+def _call_account(ctx: Any, place: Any, targets: Mapping[str, list[str]]) -> str:
+    account = next(iter(targets.get("account_id", [])), "")
+    if account or place.account_id not in {"", "*"}:
+        return account or place.account_id
+    presence = _metadata(ctx).get("presence") or {}
+    event = presence.get("event") or {}
+    return str(event.get("account_id") or "") if presence.get("transport_skill") == place.connector else ""
+
+
 def dispatch_refusal(ctx: Any, name: str, args: Mapping[str, Any], *, ext_tool: Any = None,
                      is_mcp: bool = False) -> str:
     """The refusal text for this call, ``""`` to allow."""
@@ -118,7 +127,7 @@ def dispatch_refusal(ctx: Any, name: str, args: Mapping[str, Any], *, ext_tool: 
                 "or with configure_presence.")
     if effect.effect == EFFECT_MESSAGE:
         for place in resolved:
-            for key in _conversation_keys(place, effect, targets):
+            for key in _conversation_keys(place, effect, targets, account_id=_call_account(ctx, place, targets)):
                 author = conversation_lease.live_author(key, drive_root=_drive_root(ctx))
                 if author and author != getattr(ctx, "task_id", None):
                     return (_PREFIX + f"Task {author} is authoring this conversation in {place.label or place.place_id}. "
@@ -148,9 +157,16 @@ def call_place_facts(ctx: Any, name: str, args: Mapping[str, Any], *, ext_tool: 
         return {}
     rows = []
     for place in resolved:
-        account = next(iter(targets.get("account_id", [])), "") if name == "place_reply" else ""
+        from ouroboros.place_arrivals import recent_identity
+        account = _call_account(ctx, place, targets)
+        focus = _metadata(ctx).get("focus") or {}
+        same_focus = focus.get("place_id") == place.place_id
+        identity = focus.get("identity") if same_focus else recent_identity(_drive_root(ctx), place.place_id, account)
+        sending = (identity or {}).get("sends_as")
         keys = _conversation_keys(place, effect, targets, account_id=account)
         rows.append({"place_id": place.place_id, "place_label": place.label, "place_state": place.state,
+                     **({"sends_as": dict(sending), "sends_as_owner": sending["kind"] == "user" and (bool(focus.get("identity_owner")) if same_focus
+                         else places.is_owner_account(place, sending["id"], account))} if sending else {}),
                      "conversation_key": keys[0] if len(keys) == 1 else "", "conversation_keys": keys,
                      "notes": [{"text": note.text, "author": note.author} for note in place.notes]})
     return {"effect": effect.effect, "declared": effect.declared, "targets": targets,

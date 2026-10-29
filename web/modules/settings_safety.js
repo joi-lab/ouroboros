@@ -213,8 +213,15 @@ export function checkerTabsText(draft) {
     return listWords([keys.some((key) => key !== 'OUROBOROS_SUBAGENTS') ? 'Models' : '', keys.includes('OUROBOROS_SUBAGENTS') ? 'Agents' : '']);
 }
 
-/** The generic save's answer as the whole Save's effect: the checker's keys, saved first, apply on the next task. */
-export const checkerSaveEffect = (data, draft) => (draft?.checker ? { ...data, no_changes: false, next_task_changed: true } : data);
+/** The generic save's answer as the whole Save's effect: the checker's model, read live, applies at its next check;
+ *  an Agents row (OUROBOROS_SUBAGENTS) applies from the next task. */
+export function checkerSaveEffect(data, draft) {
+    if (!draft?.checker) return data;
+    const keys = Object.keys(draft.checker.settings || {});
+    return { ...data, no_changes: false,
+        ...(keys.some((key) => key !== 'OUROBOROS_SUBAGENTS') ? { immediate_changed: true } : {}),
+        ...(keys.includes('OUROBOROS_SUBAGENTS') ? { next_task_changed: true } : {}) };
+}
 
 async function confirmLowering(kindLabel, current, next, askOwner) {
     const ok = await askOwner({

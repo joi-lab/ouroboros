@@ -1,6 +1,6 @@
 // The Main and Project composer (docs/DESIGN.md "Controls and editable choices", "Composer owner controls",
 // "Chat attachments"): its markup inside the room's input dock, the message field (its growth, Enter, the input
-// recall and the room's draft), Swarm, the room's Context and Effort capsules with their readback, the "+" menu
+// recall and the room's draft), the room's Subagents, Context and Effort capsules with their readback, the "+" menu
 // (Attach file first, then the sections later controls set), the voice and chips slots, the staged attachments with
 // their paste and drop routes, and the send path that turns the draft into the owner's frame. Skills' "+" items and
 // chips follow the live contributions (composer_plus.js, composer_chips.js). The room (chat.js) mounts the markup,
@@ -14,7 +14,6 @@ import { apiClient, apiFetch } from './api_client.js';
 import { bindEnterSubmit, bindMenu } from './ui_interactions.js';
 import { controlIcon, strokeIcon } from './page_icons.js';
 import { renderMobileNavToggle } from './page_header.js';
-import { haptic } from './haptics.js';
 import { createComposerOwnerControls } from './composer_owner_controls.js';
 import { attachChatInputSizing } from './chat_input_sizing.js';
 import { showToast } from './toast.js';
@@ -38,9 +37,7 @@ export function composerMarkup() {
                 <div id="chat-attachment-preview" class="chat-attachment-preview"></div>
                 <div class="chat-toolbar-row">
                     ${renderMobileNavToggle({ inComposer: true })}
-                    <div class="chat-composer-pills" id="chat-composer-pills">
-                        <button class="chat-swarm ui-hit-area" id="chat-swarm" type="button" data-armed="false" title="Swarm: route your next message into a new managed task, run a deep plan review with plan_task, then delegate when parallel work helps. Auto-disarms after sending.">Swarm</button>
-                    </div>
+                    <div class="chat-subagents-mode" id="chat-subagents-mode"></div>
                     <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max"></div>
                     <span class="chat-composer-chips" data-composer-chips hidden></span>
                 </div>
@@ -170,13 +167,14 @@ export function createPlusMenu({ button, hostItems = [] }) {
  * Wires one room's composer once chat.js has mounted `composerMarkup()` and namespaced its ids. `byId(suffix)`
  * resolves a namespaced id; `page` is the room (the drop target and the capsules' docking box); `ws` the shared
  * socket; `replies` the room's reply controller, whose reference rides the frame; `storeKey(base)` the room's
- * sessionStorage key. `refreshState()` re-reads the room's settings after a capsule saves, `onLayout()` re-measures
+ * sessionStorage key. `refreshState()` re-reads the room's settings after a capsule saves, `openSettings(tab)` opens a
+ * Settings tab (the Subagents capsule's way to Agents), `onLayout()` re-measures
  * the room's dock, `onSent({ text, frame, result, views })` shows an accepted send in the feed and returns the row it
  * added (the sent draft rises into it, send_flight.js), and `readingBack()`
  * says whether the owner's own gesture took the room off its newest row (the phone fold reads it: composer_fold.js).
  */
 export function createComposer({ page, byId, ws, replies, chatSessionId, isMain, chatId, projectId, storeKey,
-    refreshState, onLayout, onSent, readingBack }) {
+    refreshState, openSettings = null, onLayout, onSent, readingBack }) {
     const input = byId('input');
     const sendBtn = byId('send');
     const plusBtn = byId('plus');
@@ -254,7 +252,7 @@ export function createComposer({ page, byId, ws, replies, chatSessionId, isMain,
         input.setSelectionRange(cursor, cursor);
     }
 
-    async function sendMessage(planMode = false) {
+    async function sendMessage() {
         let text = input.value.trim();
         if (isPanicFrame({ type: 'chat', content: text })) {
             // Emergency input precedes settings saves, uploads and their disabled Send state.
@@ -276,7 +274,7 @@ export function createComposer({ page, byId, ws, replies, chatSessionId, isMain,
             return;
         }
         if (sendBtn.disabled) return;  // guard against Enter re-entry during async upload
-        if (ownerControls.hasPendingSave()) {  // both room settings land before the next message
+        if (ownerControls.hasPendingSave()) {  // the room's settings land before the next message
             setSendBusy(true, 'Saving');
             try { if (!(await ownerControls.pendingSave())) return; } finally { setSendBusy(false); }
         }
@@ -304,12 +302,10 @@ export function createComposer({ page, byId, ws, replies, chatSessionId, isMain,
             text = composerText(text, uploadedAttachments.map((item) => item.view?.name || item.display_name));
         }
         if (!text) return;
-        const forcePlan = !!planMode && !text.startsWith('/');
         const frame = {
             type: 'chat',
             content: text,
             sender_session_id: chatSessionId,
-            force_plan: forcePlan,
             ...(isMain ? {} : { chat_id: chatId }),
             ...(projectId ? { project_id: projectId } : {}),
             // Structured metadata rides the frame: model staging and native image blocks.
@@ -323,8 +319,6 @@ export function createComposer({ page, byId, ws, replies, chatSessionId, isMain,
             showToast('Connection lost before send. Reconnect and try again.', 'error');
             return;
         }
-        // Send consumes Swarm.
-        if (planMode) setSwarm(false);
         // Where the draft stands, read before the field empties: the sent bubble rises from here (send_flight.js).
         const draft = draftPlace(input.closest('.chat-field'), input);
         if (hasAttachments) attachments.clear();
@@ -336,15 +330,6 @@ export function createComposer({ page, byId, ws, replies, chatSessionId, isMain,
 
     // Send mode lives on DOM so CSS and click/Enter share one source.
     const sendGroup = page.querySelector('.chat-send-group');
-
-    // Swarm requests planning once, then disarms.
-    const swarmBtn = byId('swarm');
-    function swarmArmed() {
-        return swarmBtn?.dataset.armed === 'true';
-    }
-    function setSwarm(armed) {
-        if (swarmBtn) swarmBtn.dataset.armed = armed ? 'true' : 'false';
-    }
 
     function setSendBusy(busy, label = '') {
         sendGroup.dataset.busy = busy ? '1' : '0';
@@ -358,11 +343,11 @@ export function createComposer({ page, byId, ws, replies, chatSessionId, isMain,
         }
     }
 
-    swarmBtn?.addEventListener('click', () => { setSwarm(!swarmArmed()); haptic('tick'); });
-
-    // Each composer owns its room's Context and Effort settings.
+    // Each composer owns its room's Subagents, Context and Effort settings.
     const ownerControls = createComposerOwnerControls({ row: page.querySelector('.chat-toolbar-row'), box: page, byId, apiFetch, showToast,
-        projectId, saveEffortRange: apiClient.ownerEffortRange, refreshState, onLayout, readingBack });
+        projectId, saveEffortRange: apiClient.ownerEffortRange,
+        saveSubagentsMode: apiClient.ownerSubagentsMode,
+        openSettings: () => openSettings?.('agents'), refreshState, onLayout, readingBack });
 
     // Rooms outside the bounded sidebar still read their settings.
     async function refreshProjectCognition() {
@@ -375,10 +360,9 @@ export function createComposer({ page, byId, ws, replies, chatSessionId, isMain,
         finally { cognitionRead = false; }
     }
 
-    // Do not pass MouseEvent as planMode.
-    sendBtn.addEventListener('click', () => sendMessage(swarmArmed()));
+    sendBtn.addEventListener('click', () => sendMessage());
     // The send path admits Panic even while an ordinary upload/save disables Send.
-    bindEnterSubmit(input, sendBtn, () => sendMessage(swarmArmed()));
+    bindEnterSubmit(input, sendBtn, () => sendMessage());
     input.addEventListener('keydown', (e) => {
         if (e.key === 'ArrowUp' && !e.shiftKey) {
             restoreInputHistory(-1);
@@ -445,7 +429,7 @@ export function createComposer({ page, byId, ws, replies, chatSessionId, isMain,
         // After a send, once the feed shows it: the emptied field's height and the room's dock.
         resize: resizeChatInput,
         seedInputHistory,
-        // The room's Context and Effort readback, from Main's state or the named Project.
+        // The room's Subagents, Context and Effort readback, from Main's state or the named Project.
         syncState(data) {
             ownerControls.syncState(data);
             if (projectId && !data?.projects?.some(project => project.id === projectId && project.cognition)) void refreshProjectCognition();

@@ -229,8 +229,15 @@ export function taskSourceDownloadUrl(taskId, ref) {
     return `${url}?source=${encodeURIComponent(path)}`;
 }
 
-export async function resumeTask(taskId) {
-    return fetchJson(`/api/tasks/${encodeURIComponent(taskId)}/resume`, { method: 'POST' });
+/**
+ * Owner Resume. A refusal may list `acceptable_unknown`: held calls whose outcome is unknown; naming
+ * them in `body` goes on without their results (recorded on the task, never run again).
+ * @param {string} taskId
+ * @param {import('./client_contract_types.js').TaskResumeRequest|null} [body]
+ */
+export async function resumeTask(taskId, body = null) {
+    const url = `/api/tasks/${encodeURIComponent(taskId)}/resume`;
+    return body ? jsonPost(url, body) : fetchJson(url, { method: 'POST' });
 }
 
 /**
@@ -437,8 +444,8 @@ export const apiClient = {
     webSearchPreview: (selection = {}) => fetchJson(
         `/api/settings?${new URLSearchParams({ websearch_preview: '1', ...selection })}`, { cache: 'no-store' }),
     /** @returns {Promise<import('./model_route_types.js').ResponseLimitPreview>} */
-    responseLimitPreview: ({ model, local = false, account = '' }) => fetchJson(
-        `/api/settings?${new URLSearchParams({ response_limit_preview: '1', model, local: String(Boolean(local)), account })}`,
+    responseLimitPreview: ({ model, local = false, account = '', role = 'main', window }) => fetchJson(
+        `/api/settings?${new URLSearchParams({ response_limit_preview: '1', model, local: String(Boolean(local)), account, role, ...(window === undefined ? {} : { window: String(window) }) })}`,
         { cache: 'no-store' }),
     /** @param {{key: string}|{mcp_server_id: string, header_name?: string}} selector @returns {Promise<{value: string}>} */
     revealSettingsSecret: (selector) => jsonPost('/api/settings/secret', selector),
@@ -494,6 +501,9 @@ export const apiClient = {
     ownerContextMode: (mode) => jsonPost('/api/owner/context-mode', { mode }),
     /** Save room primary effort and ordered helper bounds. @param {import('./client_contract_types.js').OwnerEffortRangeRequest} range */
     ownerEffortRange: (range) => jsonPost('/api/owner/effort-range', range),
+    /** @param {import('./client_contract_types.js').OwnerSubagentsModeRequest} choice
+     * @returns {Promise<import('./api_types.js').OwnerSubagentsModeResponse>} */
+    ownerSubagentsMode: (choice) => jsonPost('/api/owner/subagents-mode', choice),
     /** @returns {Promise<import('./api_types.js').OwnerSafetyModeResponse>} */
     ownerSafetyMode: (mode) => jsonPost('/api/owner/safety-mode', { mode }),
     logsTail: (name, limit = 2000) => fetchJson(`/api/logs/${encodeURIComponent(name)}?limit=${encodeURIComponent(limit)}`, { cache: 'no-store' }),
@@ -595,4 +605,21 @@ export function previewMcpImport(payload, signal) {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(payload), signal,
     });
+}
+
+/** Passive saved review history; no review or regeneration is dispatched. */
+export function getTaskReviewHistory(taskId, offset = 0) {
+    return fetchJson(`/api/tasks/${encodeURIComponent(taskId)}/reviews?offset=${Number(offset) || 0}`);
+}
+
+/** Exact saved source selected by the owning task/record/seat, never a file path. */
+export function taskReviewSourceUrl(taskId, recordId, seatId, source = {}) {
+    const query = new URLSearchParams({ role: source.role || 'response', part: source.part || '', sha256: source.sha256 || '', domain: source.domain || 'ledger' });
+    return `/api/tasks/${encodeURIComponent(taskId)}/reviews/${encodeURIComponent(recordId)}/${encodeURIComponent(seatId)}?${query}`;
+}
+
+/** A task's saved Skill review as normalized text: Read and Download share it; the server checks the task owns it. */
+export function taskSkillReviewSourceUrl(taskId, jobOrRecordId, skill) {
+    const query = new URLSearchParams({ skill: String(skill || ''), format: 'text' });
+    return `/api/tasks/${encodeURIComponent(taskId)}/reviews/skill/${encodeURIComponent(jobOrRecordId)}?${query}`;
 }

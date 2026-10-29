@@ -100,8 +100,9 @@ export function renderEpisodes(el, episodes = []) {
  * the hidden physical shell/record stays to take late rows. A successor with no card here runs where
  * this chat sees none of its frames (a Main
  * portal's room): `follow(successorId, predecessor)` may mint its card from the facts it holds.
+ * `renamed(record)` hears each title this module writes (a portal's Project reference names itself again).
  */
-export function createTaskEpisodes({ records, reanchor, activity, follow = () => false, expand = () => {} }) {
+export function createTaskEpisodes({ records, reanchor, activity, follow = () => false, expand = () => {}, renamed = () => {} }) {
     const predecessors = new Map();  // successor task id -> predecessor task id
 
     function chainOf(taskId) {
@@ -116,7 +117,8 @@ export function createTaskEpisodes({ records, reanchor, activity, follow = () =>
 
     // Rehome the ORIGINAL content nodes, not snapshots of their DOM or lifecycle. Their physical
     // record/controller still receives late files, reviews and history. Old controls stay in its
-    // hidden shell; only the current card offers work controls.
+    // hidden shell; only the current card offers work controls. The original Reviews door
+    // is a reading control and follows its original host/controller into the disclosure.
     function disclose(record, chain) {
         const host = record.episodeHistoryEl;
         if (!host) return;
@@ -143,7 +145,7 @@ export function createTaskEpisodes({ records, reanchor, activity, follow = () =>
             const codes = disclosure.querySelector('.chat-episode-codes');
             codes.textContent = reasonCodesNote(facts.codes);
             codes.hidden = !codes.textContent;
-            for (const content of [previous.timelineEl, previous.reviewsHostEl, previous.subagentsEl]) {
+            for (const content of [previous.timelineEl, previous.reviewSummaryEl, previous.reviewsHostEl, previous.subagentsEl]) {
                 if (content && content.parentNode !== disclosure) disclosure.appendChild(content);
             }
             const position = host.children[index] || null;
@@ -173,6 +175,7 @@ export function createTaskEpisodes({ records, reanchor, activity, follow = () =>
         }
         if (name && record.titleEl.textContent !== name) {
             record.titleEl.textContent = name;
+            renamed(record);
             // An unnamed successor's own latest line stood in for its title; under the work's name it is the line again.
             renderCollapsedActivity(record, projectCollapsedActivity({ suggestedName: name, headline: record.collapsedActivity,
                 previous: record.collapsedActivity }));
@@ -203,7 +206,7 @@ export function createTaskEpisodes({ records, reanchor, activity, follow = () =>
             const titleChanged = Boolean(record.titleEl && record.titleEl.textContent !== name);
             let changed = record.suggestedName !== name || titleChanged;
             record.suggestedName = name;
-            if (titleChanged) record.titleEl.textContent = name;
+            if (titleChanged) { record.titleEl.textContent = name; renamed(record); }
             // Restore the deferred collapsed activity after naming.
             changed = renderCollapsedActivity(record, projectCollapsedActivity({
                 suggestedName: name, headline: record.collapsedActivity,

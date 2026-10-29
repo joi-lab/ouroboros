@@ -244,6 +244,7 @@ def test_menu_pin_reorders_keyed_rows_without_opening_or_reading_across_reload_a
     assert_flat_and_unlabelled(page)
     page.locator('#primary-sidebar').screenshot(path=str(evidence / f"expanded-{ui['tag']}.png"), animations="disabled")
     # Reload reads the pin from the registry.
+    ui["errors"].watch(page)  # the reload may cut off the page's own reads (tests/ui_console_errors.py)
     page.reload()
     page.locator('.nav-project-item').first.wait_for()
     open_drawer(page, ui["width"])

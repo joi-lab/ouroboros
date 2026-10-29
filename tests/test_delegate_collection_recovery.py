@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._delegate_capture_child import capture_child  # noqa: F401
+
 from ouroboros import delegate_collection as body, delegate_custody as custody, delegate_custody_current as current
 from ouroboros.tools.delegate_terminal_evidence import collect_and_deliver_terminal
 from ouroboros.tools.registry import ToolContext
@@ -234,7 +236,7 @@ def test_owned_unrecorded_start_delivers_exact_terminal_instead_of_renewing_fore
 
 
 @pytest.fixture
-def driven_runtime(tmp_path, monkeypatch):
+def driven_runtime(tmp_path, monkeypatch, capture_child):  # noqa: F811
     """Keep the real driver parked while exercising its real tick and physical jobs on a controlled clock."""
     release, entered = threading.Event(), threading.Event()
     tick = body.BodyRuntime.tick
@@ -255,6 +257,10 @@ def driven_runtime(tmp_path, monkeypatch):
             jobs = list(runtime.collections.values()) + list(runtime.reads.values())
         for job in jobs:
             job.result(timeout=5)
+        if capture_child.drain(tmp_path):
+            tick(runtime)  # server publishes the child's result under its fresh owner check
+            for future in list(runtime.collections.values()):
+                future.result(timeout=5)
     try:
         yield runtime, clock, step
     finally:
@@ -263,7 +269,7 @@ def driven_runtime(tmp_path, monkeypatch):
         runtime.close(wait=True)
 
 
-def test_unchanged_money_debt_waits_for_maintenance_but_facts_and_explicit_request_are_immediate(
+def test_unchanged_money_debt_rests_but_facts_and_explicit_request_are_immediate(
         tmp_path, monkeypatch, driven_runtime, caplog):
     from ouroboros import usage_accounting, config
     runtime, clock, tick = driven_runtime
@@ -286,23 +292,24 @@ def test_unchanged_money_debt_waits_for_maintenance_but_facts_and_explicit_reque
     assert attempts == [0.0], "passive cold ownership checks do not force bookkeeping retries"
     clock[0] += config.BODY_MAINTENANCE_INTERVAL_SEC
     tick()
-    assert len(attempts) == 2
-    runtime.request(entry.run_id)
+    assert len(attempts) == 1, "elapsed time does not change retry eligibility"
+    runtime._collect(entry.run_id, recapture=True)
     tick()
-    assert len(attempts) == 3
+    assert len(attempts) == 2
     body.observe_run(tmp_path, entry, terminal(text="new exact result", seq=6))
     tick()
-    assert len(attempts) == 4
+    assert len(attempts) == 3
     failures = [r for r in custody.custody_rows(tmp_path) if r.get("type") == custody.SETTLE_FAILED]
     assert len(failures) == 2, "one durable report for each changed failed source, no unchanged failure storm"
     warnings = [r for r in caplog.records if "money remains owed" in r.message and r.levelno >= logging.WARNING]
     assert len(warnings) == 2
     monkeypatch.setattr(usage_accounting, "record_subscription_session", lambda *a, **kw: None)
-    runtime.request(entry.run_id)
+    runtime._collect(entry.run_id, recapture=True)
     tick()
     tick()
     assert current.run(tmp_path, entry.run_id).settled
-    assert entry.run_id not in runtime.collection_attempts and entry.run_id not in runtime.collection_failures
+    assert entry.run_id not in runtime.collection_failures
+    assert current.run(tmp_path, entry.run_id).collection_attempt["retry"] == ""
 
 
 def test_new_terminal_observation_is_independent_of_another_runs_paced_collection(tmp_path, monkeypatch, driven_runtime):
@@ -327,6 +334,7 @@ def test_incomplete_output_does_not_republish_identical_preview_on_each_retry(tm
     entry = started(tmp_path)
     detail = terminal()
     detail["primaryOutput"].update(truncated=True, bytes=1000)
+    runtime.gateway_factory = lambda: SimpleNamespace(get_run=lambda *a, **k: detail, close=lambda: None)
     body.collect_terminal(tmp_path, entry.run_id, detail=detail)
     before = [r for r in custody.custody_rows(tmp_path) if r.get("type") == custody.OUTPUT_SPILLED]
     tick()

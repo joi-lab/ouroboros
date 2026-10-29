@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Callable, Collection, Iterable, Literal, Mapping, Tuple
 
 from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID, WEB_UI_CHAT_ID
 
@@ -28,9 +28,9 @@ def is_presence_task(task: Mapping[str, Any]) -> bool:
 
 # A Presence binding's own work is reached through this scope (owner Q1/Q2).
 PRESENCE_OWN_WORK_SCOPE = "own_binding"
-# The one metadata key a DELEGATED descendant of a Presence-bound task carries:
-# the binding it acts for, never the speaker's ``metadata.presence`` (whose
-# presence arms the forced reply, the parser and the conversation context).
+# Work acting for a binding without speaking: delegated descendants and related
+# roots started by a late owner answer. Never stamp the owner turn itself or copy
+# the speaker's ``metadata.presence`` (which arms the external final and context).
 PRESENCE_BINDING_AUTHORITY_KEY = "presence_binding_authority"
 
 
@@ -38,7 +38,7 @@ def presence_record_binding(record: Any) -> str:
     """The nonempty host binding id one task/queue record carries, else ``""``.
 
     The one reader of both carriers: a speaker's ``metadata.presence`` and the
-    ``metadata.presence_binding_authority`` of work a delegated descendant started.
+    ``metadata.presence_binding_authority`` of related work without a speaker route.
     """
 
     metadata = record.get("metadata") if isinstance(record, Mapping) else None
@@ -67,8 +67,8 @@ def presence_related_work(binding_id: str, record: Any) -> bool:
 def presence_metadata_binding(metadata: Any) -> str | None:
     """``None`` for a non-Presence task's metadata; otherwise the binding it acts for (may be empty).
 
-    A Presence turn, promoted or follow-up root speaks from ``metadata.presence``;
-    a delegated descendant holds only the host-inherited binding authority. A
+    A Presence speaker carries ``metadata.presence``; a descendant or related root
+    without a speaker route holds only the host-inherited binding authority. A
     malformed authority carrier is still a Presence one: it narrows to nothing.
     """
 
@@ -115,7 +115,18 @@ def presence_root_carrier(source: Any, *, task_contract: Any = None) -> dict[str
     presence = source.get("presence") if isinstance(source, Mapping) else None
     if isinstance(presence, Mapping) and presence:
         return {"presence": dict(presence)}
-    return presence_binding_authority_metadata(source, task_contract=task_contract)
+    # A private late answer is an ordinary owner turn. Only work it STARTS
+    # inherits the retained source binding, never the external speaker/final.
+    authority = presence_binding_authority_metadata(source, task_contract=task_contract)
+    if not authority and isinstance(source, Mapping):
+        from ouroboros.owner_quiz import late_answer_ref
+        from ouroboros.presence_owner_contact import private_main_contact
+
+        late = late_answer_ref(source.get("late_answer")) or {}
+        block = _mapping(_mapping(late.get("answer_snapshot")).get("quiz"))
+        if private_main_contact(block, late.get("task_id")):
+            return {PRESENCE_BINDING_AUTHORITY_KEY: {"binding_id": block["presence_contact"]["binding_id"]}}
+    return authority
 
 
 def presence_sender_origin(ctx: Any) -> dict[str, str]:
@@ -250,6 +261,39 @@ def row_provenance(row: Mapping[str, Any]) -> Literal["place", "other"]:
     ) else "other"
 
 
+def rooms_read_by_time(root: Any, rows: Iterable[Mapping[str, Any]]) -> set[int]:
+    """The rooms of ``rows`` that read by time: those holding an imported earlier message. A fact of the
+    room, as its endpoint reads it (``place_arrivals.history_import_rooms``), whichever rows were selected."""
+    from ouroboros import dialogue_store
+    from ouroboros.place_arrivals import history_import_rooms
+
+    return history_import_rooms(root, {dialogue_store.facts(row)["chat_id"] for row in rows})
+
+
+def in_reading_order(items: Iterable[Any], timed: Collection[int],
+                     row: Callable[[Any], Mapping[str, Any]] = _mapping) -> list[Any]:
+    """``items`` (append order) as their rooms read them. The rows of a room in ``timed``
+    (``rooms_read_by_time``), imported or live, all take that room's reading order
+    (``place_arrivals.reading_key``: send time, order, position), as ``gateway.history_chronology`` reads
+    the room, though a filter or a sealed page left none of its imports among ``items``; the items of
+    every other room keep their append order and their own addresses. The rooms' sequences interleave by
+    the same key, each keeping its own order."""
+    import heapq
+
+    from ouroboros import dialogue_store
+    from ouroboros.place_arrivals import reading_key
+
+    items = list(items)
+    rooms = [dialogue_store.facts(row(item))["chat_id"] for item in items]
+    timed = set(timed) & set(rooms)
+    if not timed:
+        return items
+    keys = [reading_key(row(item), index) for index, item in enumerate(items)]
+    streams = [[index for index, room in enumerate(rooms) if room not in timed]]
+    streams += [sorted((index for index, room in enumerate(rooms) if room == chat), key=keys.__getitem__) for chat in timed]
+    return [items[index] for index in heapq.merge(*streams, key=keys.__getitem__)]
+
+
 def place_row_facts(row: Mapping[str, Any]) -> dict[str, Any]:
     """Host room/event facts, including the delivery envelope used by older receipts."""
     transport = _mapping(row.get("transport"))
@@ -331,6 +375,10 @@ def dialogue_provenance(entry: Mapping[str, Any]) -> str:
     source = str(entry.get("source") or "").strip()
     if source and not facts:
         facts.append(f"source={source}")
+    imported = _mapping(entry.get("historical_import"))  # ``presence_history``: an earlier message, not an arrival
+    if imported:
+        facts.append("history=imported earlier message" + (
+            ", sent from the connected account itself" if imported.get("authorship") == "platform_account" else ""))
     delivery = _mapping(transport.get("delivery"))
     state = _text(delivery.get("state"))
     if state:
@@ -347,7 +395,13 @@ def dialogue_author(entry: Mapping[str, Any]) -> str:
 
 
 def dialogue_text(entry: Mapping[str, Any]) -> str:
-    """Keep observed delivery metadata distinct from the quoted message body."""
+    """Keep observed delivery metadata distinct from the quoted message body.
+
+    A task summary without text is the host's typed facts row: its recorded facts are
+    its text (``_host_facts_text``), the same words in chat history, its search and
+    memory rows."""
+    if entry.get("type") == "task_summary" and not _text(entry.get("text")):
+        return _host_facts_text(entry)
     text = str(entry.get("text", ""))
     transport = _mapping(entry.get("transport"))
     message = _mapping(transport.get("message"))
@@ -481,14 +535,30 @@ def _question_text(row: Mapping[str, Any], quiz: Mapping[str, Any]) -> str:
             + (f"; recommended ({recommended + 1})" if type(recommended) is int else ""))
 
 
+def recorded_finality(final: Any, authority: Any, *, host_facts: bool) -> str:
+    """``final=…; authority=…`` as a row, its stored facts or a stamp recorded them, copied; a host
+    facts record without a recorded finality (an older row, facts stored before the field), or any
+    record that kept only its authority, reads ``final=unknown``, never a finality it did not record."""
+    known = _text(authority)
+    if isinstance(final, bool):
+        standing = f"final={'true' if final else 'false'}"
+    else:
+        standing = "final=unknown" if host_facts or known else ""
+    return standing + (f"; authority={known}" if standing and known else "")
+
+
 def _host_facts_text(row: Mapping[str, Any]) -> str:
-    """A host facts row has no text: its status fields and result address are the text."""
+    """A host facts row has no text: its status fields, recorded finality and authority, the
+    objective and review statuses of its axes (never the axes themselves, whose policy lists can
+    run to kilobytes) and its result address are the text."""
     task_id = _text(row.get("task_id"))
+    standing = recorded_finality(row.get("outcome_final"), row.get("outcome_authority"),
+                                 host_facts=row.get("summary_kind") == "host_task_facts")
     retained = row.get("presence_recovery")
     if isinstance(retained, Mapping):
         source = row.get("source_event")
         return (f"host observation for Presence turn {task_id or retained.get('turn_ref')}: "
-                + _detail_words(retained, "; ")
+                + _detail_words(retained, "; ") + (f"; {standing}" if standing else "")
                 + "; no completed answer or absence of external effects is established by this observation."
                 + (" Source text: " + json.dumps(row["source_text"], ensure_ascii=False)
                    if isinstance(row.get("source_text"), str) else " Source text unavailable in this observation.")
@@ -496,10 +566,14 @@ def _host_facts_text(row: Mapping[str, Any]) -> str:
                    + json.dumps(dict(source), ensure_ascii=False, sort_keys=True)
                    if isinstance(source, Mapping) else " Source event unavailable in this observation."))
     facts = "; ".join(f"{label}={_text(row.get(key))}" for label, key in _HOST_FACT_FIELDS if _text(row.get(key)))
+    axes = _mapping(row.get("outcome_axes"))
+    statuses = "; ".join(f"{axis}={_text(_mapping(axes.get(axis)).get('status'))}" for axis in ("objective", "review")
+                         if _text(_mapping(axes.get(axis)).get("status")))
     ref = _mapping(row.get("result_ref"))
     reader, ref_task = _text(ref.get("reader")), _text(ref.get("task_id")) or task_id
     result = f"result: {reader}(task_id={ref_task})" if reader and ref_task else ""
-    return f"host facts for {task_id or '(task not recorded)'}: " + "; ".join(part for part in (facts, result) if part)
+    return f"host facts for {task_id or '(task not recorded)'}: " + "; ".join(
+        part for part in (facts, standing, statuses, result) if part)
 
 
 def _detail_words(value: Any, sep: str = ", ") -> str:
@@ -513,8 +587,8 @@ def _detail_words(value: Any, sep: str = ", ") -> str:
 
 
 def render_row_text(row: Mapping[str, Any]) -> str:
-    """The text of one chat row without JSON: quiz options and answers, empty host facts and
-    a Presence delivery's details, as words (``chat_history`` keeps ``dialogue_text``)."""
+    """The text of one chat row without JSON: quiz options and answers and a Presence delivery's
+    details, as words (``chat_history`` keeps ``dialogue_text``, which also renders empty host facts)."""
     message = _mapping(_mapping(row.get("transport")).get("message"))
     if row.get("type") == "presence_delivery" and message:
         return str(row.get("text", "")) + f"\n[Delivery details: {_detail_words(message, '; ')}]"
@@ -527,8 +601,6 @@ def render_row_text(row: Mapping[str, Any]) -> str:
         return _question_text(row, quiz)
     if row.get("type") == "card" and isinstance(row.get("card"), Mapping):  # its id lets a later turn replace it
         return f"[card {_text(row['card'].get('card_id'))}] " + dialogue_text(row)
-    if row.get("type") == "task_summary" and not _text(row.get("text")):
-        return _host_facts_text(row)
     return dialogue_text(row)
 
 
@@ -565,20 +637,54 @@ def task_lineage_lookup(drive_root: Any):
     """
     cache: dict[str, Any] = {}
 
+    def lineage_of(tid: str, result: Any) -> dict[str, Any] | None:
+        from ouroboros.task_results import resolve_task_lineage  # D15->D17 lazy-only
+
+        return resolve_task_lineage(tid, metadata=result) if isinstance(result, dict) and result else None
+
     def lookup(task_id: Any) -> dict[str, Any] | None:
         tid = _text(task_id)
         if tid and tid not in cache:
             from ouroboros.store import StoreError
-            from ouroboros.task_results import load_task_result, resolve_task_lineage  # D15->D17 lazy-only
+            from ouroboros.task_results import load_task_result  # D15->D17 lazy-only
 
             try:
                 result = load_task_result(Path(drive_root), tid, strict=True)
             except (OSError, ValueError, StoreError):
                 result = None
-            cache[tid] = resolve_task_lineage(tid, metadata=result) if isinstance(result, dict) and result else None
+            cache[tid] = lineage_of(tid, result)
         return cache.get(tid)
 
+    def warm(task_ids: Any) -> None:
+        """The same answers for many ids, from ONE read (``task_results.admitted_results``); a store
+        that cannot be read leaves each id to its own lookup, as before."""
+        wanted = sorted({tid for tid in map(_text, task_ids) if tid and tid not in cache})
+        if not wanted:
+            return
+        from ouroboros.store import StoreError
+        from ouroboros.task_results import admitted_results  # D15->D17 lazy-only
+
+        try:
+            results = admitted_results(Path(drive_root), wanted)
+        except (OSError, StoreError):
+            return
+        for tid in wanted:
+            cache[tid] = lineage_of(tid, results.get(tid))
+
+    lookup.warm = warm  # type: ignore[attr-defined]
     return lookup
+
+
+def warm_lineage(lineage: Mapping[str, Any], entries: Iterable[Tuple[Mapping[str, Any], Any]]) -> None:
+    """Read at once the task results ``row_author`` will ask ``lineage_lookup`` about for these
+    ``(row, pos)``: the rows without lineage fields written before the epoch that are neither the owner's
+    (``in``) nor the host's (``system``), as ``row_author`` reaches ``_pre_epoch_author``."""
+    epoch, warm = lineage.get("lineage_epoch"), getattr(lineage.get("lineage_lookup"), "warm", None)
+    if warm is None or not isinstance(epoch, Mapping) or type(epoch.get("pos")) is not int:
+        return
+    warm({_text(row.get("task_id")) for row, pos in entries
+          if type(pos) is int and pos < epoch["pos"] and _direction(row) not in ("in", "system")
+          and not any(_text(row.get(key)) for key in _LINEAGE_FIELDS)})
 
 
 class RoomLabelResolver:
@@ -706,11 +812,13 @@ __all__ = [
     "dialogue_speaker",
     "dialogue_text",
     "memory_row_header",
+    "recorded_finality",
     "render_memory_row",
     "render_row_text",
     "row_author",
     "row_class",
     "task_lineage_lookup",
+    "warm_lineage",
     "RoomLabelResolver",
     "source_continuation_note",
     "is_presence_task",

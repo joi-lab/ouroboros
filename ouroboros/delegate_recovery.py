@@ -102,6 +102,8 @@ def _write(drive_root: Any, row: dict[str, Any]) -> None:
     path = _path(drive_root, str(row.get("task_id") or ""))
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, holders.write_view(row))
+    from ouroboros.maintenance_retirement import artifact_changed
+    artifact_changed(drive_root)
 
 
 def _restart_transaction_path(drive_root: Any, transaction_id: str) -> pathlib.Path:
@@ -251,6 +253,8 @@ def _write_restart_transaction(drive_root: Any, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     row["updated_at"] = utc_now_iso()
     atomic_write_json(path, row)
+    from ouroboros.maintenance_retirement import artifact_changed
+    artifact_changed(drive_root)
 
 
 def acknowledge_observed_restart_exit(
@@ -1162,7 +1166,8 @@ def _adopt_holder(ctx: Any, task: Mapping[str, Any], row: dict, holder: dict, *,
         retry = {"retry_of": pending_id}
         if pending.get("work_order_source_request"):
             retry["work_order_source_request"] = pending["work_order_source_request"]
-        prompt = (pending.get("request") or {}).get("prompt")
+        from ouroboros.delegate_pending import request_body
+        prompt = (request_body(drive, pending) or {}).get("prompt")
         if not isinstance(prompt, str) or not prompt:
             return {**identity, "status": "refused", "reason": "pending_request_prompt_missing"}
         parsed = delegate_payload(exact_start(ctx, prompt, retry))

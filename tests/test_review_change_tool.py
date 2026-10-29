@@ -303,7 +303,7 @@ def test_the_schema_is_the_planned_call() -> None:
     assert entry.name == "review_change" and params["required"] == []
     assert list(params["properties"]) == [
         "wake_on", "review_reference", "root", "workspace_root", "subject", "base", "head", "surface", "answer", "goal", "scope", "author_questions",
-        "reviewers", "reason", "coupling_only", "reviewer_effort", "review_rebuttal", "treat_as_body"]
+        "reviewers", "reason", "coupling_only", "reviewer_effort", "review_rebuttal", "treat_as_body", "since_review"]
     props = params["properties"]
     assert props["root"]["enum"] == ["active_workspace", "system_repo"] and props["root"]["default"] == "active_workspace"
     assert props["subject"]["enum"] == ["index", "worktree", "base..head", "system", "result"]

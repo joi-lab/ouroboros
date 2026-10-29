@@ -268,6 +268,24 @@ def _baseline(slot: Any) -> tuple:
     return previous, tools
 
 
+def departure(slot: Any, messages: Sequence[Mapping[str, Any]], tools: Any) -> Optional[tuple]:
+    """Where the next request departs from the last recorded send: ``(index, cause)``.
+
+    ``(0, "no_baseline")`` without a recorded send or context observation, ``(0, "tools")``
+    when the schemas changed, else the first differing message (``"system"`` at 0,
+    ``"messages"`` later); ``None`` when the request only extends or shortens that send.
+    Everything from the index on is read again, so work placed there costs no extra re-read.
+    """
+    previous, before_tools = _baseline(slot)
+    if not isinstance(previous, list):
+        return 0, "no_baseline"
+    if before_tools is not None and tools_digest(tools) != before_tools:
+        return 0, "tools"
+    index = next((i for i, (old, message) in enumerate(zip(previous, messages))
+                  if old != message_digest(message)), None)
+    return None if index is None else (index, "system" if index == 0 else "messages")
+
+
 def retire_unbound_reasoning(slot: Any, messages: List[Dict[str, Any]], tools: Any) -> Optional[Dict[str, Any]]:
     """Retire bound reasoning from the first change to the recorded send.
 
@@ -275,17 +293,10 @@ def retire_unbound_reasoning(slot: Any, messages: List[Dict[str, Any]], tools: A
     observation. Without either baseline nothing vouches for the signatures.
     Repeated preparation is idempotent and never advances the recorded baseline.
     """
-    previous, before_tools = _baseline(slot)
-    if not isinstance(previous, list):
-        index, cause = 0, "no_baseline"
-    elif before_tools is not None and tools_digest(tools) != before_tools:
-        index, cause = 0, "tools"
-    else:
-        index = next((i for i, (old, message) in enumerate(zip(previous, messages))
-                      if old != message_digest(message)), None)
-        if index is None:
-            return None  # a shortened equal prefix has no surviving later reasoning
-        cause = "system" if index == 0 else "messages"
+    found = departure(slot, messages, tools)
+    if found is None:
+        return None  # a shortened equal prefix has no surviving later reasoning
+    index, cause = found
     from ouroboros.reasoning_artifacts import retire_prefix_bound_reasoning
 
     counts = [retire_prefix_bound_reasoning(message) for message in messages[index:]]

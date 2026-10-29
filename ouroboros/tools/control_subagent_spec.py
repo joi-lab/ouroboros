@@ -27,6 +27,7 @@ def schedule_subagent_properties() -> Dict[str, Any]:
     a returned schema cannot corrupt every later `get_tools()`."""
     from ouroboros.tool_access import SUBAGENT_CAPABILITIES
     from ouroboros.configured_subagents import SESSION_ACCESS_LOWERING
+    from ouroboros.delegate_documents import attachment_parameters
     from ouroboros.settings_scales import EFFORT_SCALE
 
     return {
@@ -51,22 +52,22 @@ def schedule_subagent_properties() -> Dict[str, Any]:
         "access": {"type": "string", "enum": ["inherit", *SESSION_ACCESS_LOWERING], "default": "inherit", "description":
             "inherit (default/omitted) preserves owner-selected Agent-session access; readonly or "
             "workspace_write may only lower it. API-model rows ignore it with disclosure. It grants "
-            "no task or product-write authority: non-acting sessions use evidence-only private copies. "
+            "no task or product-write authority. "
             "Select readonly for read-only session execution; write_surface controls native child/nanny authority."},
         "objective": {"type": "string", "description": "Focused OUTCOME and scope, not a step-by-step script. A harness-dispatched child forwards work to its delegated run; a scripted objective can read as orders to execute natively."},
         "expected_output": {"type": "string", "description": "Concrete handoff expected from the child."},
         "role": {"type": "string", "description": "Optional freeform lineage/UI role, e.g. architecture-reviewer; omission assigns no role."},
-        "context": {"type": "string", "description": "Optional reference context, not instructions: write the orientation it lacks (purpose, prior decisions, material paths). The child starts with my identity, life's top-level account, its room page and my human's originating words, but not this conversation. For a harness-dispatched child this becomes its session's WORK ORDER; that session has none of my memory, so put recipes/details here, not in objective."},
+        "context": {"type": "string", "description": "Optional reference context, not instructions: write the orientation it lacks (purpose, prior decisions, material paths). The child does not see this conversation; input_sources says what it starts with. For a harness-dispatched child this becomes its session's WORK ORDER; that session has none of my memory, so put recipes/details here, not in objective."},
         "input_sources": {
             "type": "string", "enum": ["shared", "declared"],
             "description": (
                 "Omit or shared: the child starts with SYSTEM/BIBLE, book maps, my identity, life's top-level "
                 "account (except Agent-session supervisors), the child's room page, full assignment, "
                 "attachments and my human's originating words verbatim; knowledge and other material "
-                "remain one read away. declared selects only the authored objective/context/constraints "
-                "and full governance/task authority for an independent first position. It excludes "
-                "automatic shared memory, dialogue, project knowledge, inherited parent context and "
-                "attachments; put common evidence in context. Descendants cannot widen inherited "
+                "remain one read away. declared selects only the authored objective/context/constraints, "
+                "my human's originating words verbatim and full governance/task authority for an independent "
+                "first position. It excludes automatic shared memory, dialogue, project knowledge, inherited "
+                "parent context and attachments; put common evidence in context. Descendants cannot widen inherited "
                 "declared. Selection lasts for the task; the assignment defines retention/collaboration, "
                 "and tool results/messages can broaden input. It prescribes no exchange sequence or "
                 "transport, provides no access isolation and makes no claim about provider context or priors."
@@ -78,13 +79,13 @@ def schedule_subagent_properties() -> Dict[str, Any]:
             "enum": sorted(VALID_SUBTASK_MEMORY_MODES),
             "description": (
                 "Child execution-drive seed: forked (default) copies stable identity/WORLD/registry/knowledge "
-                "files, or only shared patterns for a Project child; empty seeds that drive with nothing. "
+                "files, and no knowledge file for a Project child; empty seeds that drive with nothing. "
                 "Ordinary context still uses canonical governance (BIBLE/SYSTEM/reference books) and the "
                 "canonical data root's shared memory: empty means a blank drive, not a blank context. "
                 "shared is disabled for live local subagents. input_sources=declared "
                 "selects automatic inputs independently."),
         },
-        "workspace_root": {"type": "string", "description": "Starting folder (default: parent's). Native readers start here, including Git subdirectories; writable non-acting sessions check a private copy. self_worktree copies this Git source's current files. external_workspace requires explicit write_root to match; genesis requires omission and creates an empty project. Must already be parent-readable; grants no read/write authority."},
+        "workspace_root": {"type": "string", "description": "Starting folder (default: parent's). Native readers start here, including Git subdirectories. external_workspace requires explicit write_root to match; genesis requires omission. Must already be parent-readable; grants no read/write authority."},
         "write_surface": {
             "type": "string",
             # No empty-string member: Google Gemini's function-calling validator
@@ -95,17 +96,25 @@ def schedule_subagent_properties() -> Dict[str, Any]:
             # self_worktree (the trap behind the read-only-audit cancel-storm). It is NOT
             # an acting VALID_WRITE_SURFACES member — it normalizes to the omit path.
             "enum": ["read_only", "self_worktree", "external_workspace", "genesis"],
-            "description": "read_only (default/omitted) keeps the native child/nanny read-only. Non-acting Agent sessions retain configured access in an evidence-only private checking copy; use access='readonly' for read-only session execution. Acting surfaces: self_worktree copies that Git source's current files for parent patch integration; external_workspace: native children write shared files directly; genesis creates a standalone project. See tool description for integration. Acting surfaces require mutative subagents enabled (default ON in advanced/pro).",
+            "description": "read_only (default/omitted) keeps the native child/nanny read-only. Acting surfaces: self_worktree copies that Git source's current files for parent patch integration; external_workspace: native children write shared files directly; genesis creates a standalone project. See tool description for integration. Acting surfaces require mutative subagents enabled (default ON in advanced/pro).",
         },
-        "write_root": {"type": "string", "description": "external_workspace project directory, with or without Git; never runtime data. Delegate installed skills directly via delegate_start(root='skill_payload', bucket=..., skill_name=..., subagent_id=..., prompt=...). Omit for a new cooperative shared Git tree inherited by descendants; integrate_subagent_patch verifies combined files without reapplying. Ignored for self_worktree (source: workspace_root), read_only and genesis (own empty root)."},
+        "write_root": {"type": "string", "description": "external_workspace project directory, with or without Git; never runtime data, including installed skills. Omit for a new cooperative shared Git tree. Ignored for self_worktree (source: workspace_root), read_only and genesis (own empty root)."},
         "directory_strategy": {
             "type": "string", "enum": ["direct", "copy"],
             "description": "Agent-session ordinary folders: direct (default/omitted) works there; copy uses a separate scope_paths copy and returns changes for application. Choose for the task/owner preference. Acting children only; non-acting children omit this and scope_paths (direct without scope also means omitted). Native/API children use shared files, never copy.",
         },
+        "workspace": {
+            "type": "string", "enum": ["copy", "in_place"],
+            "description": "Agent-session Git writers (an acting write_surface): copy (default) gives the harness a private copy whose diff the parent applies or rejects; in_place lets it work directly in the child's own write root, for example a self_worktree copy that is already private: its edits land at once, nothing is captured for apply or reject, undo is through git, and two in-place writers in one folder mix their edits.",
+        },
         "scope_paths": {
             "type": "array", "items": {"type": "string"},
-            "description": "Agent-session ordinary folders: relative inputs for copy (nonempty required), or direct capture footprint including future outputs. ['.'] selects the whole folder. Acting children only; non-acting children omit this and directory_strategy because checking copies are evidence-only, never copied back. Native children declare outputs on file/process tools.",
+            "description": "Agent-session ordinary folders: relative inputs for copy (nonempty required), or direct capture footprint including future outputs. ['.'] selects the whole folder. Acting children only, like directory_strategy. Native children declare outputs on file/process tools.",
         },
+        **attachment_parameters(
+            "Your retained inputs, for an agent_session child only (API children refuse both): the first start of "
+            "the child's work order attaches them; its later starts, continuations and replacements select their own. "
+            "With input_sources=declared only these inputs are copied to the child."),
         "protected_paths_grant": {"type": "boolean", "default": False, "description": "Allow the child to modify protected paths in its self_worktree. Honored only in pro runtime mode; you still re-check at integration."},
         "external_tool_grants": {"type": "array", "items": {"type": "string"}, "description": "Optional extension/MCP tool names to grant this mutative child. Denied by default."},
         "allowed_origins": {
@@ -244,6 +253,30 @@ def _validated_schedule_fields(params: Dict[str, Any], *, ctx: Any = None) -> tu
     if directory_options.get("directory_strategy") == "copy" and not directory_options.get("scope_paths"):
         return {}, "⚠️ TOOL_ARG_ERROR (schedule_subagent): copy requires scope_paths; use ['.'] to select the whole folder."
     from ouroboros.delegate_directory import DIRECTORY_OPTIONS_NEED_WRITE, default_shaped_directory_options
+
+    if "attachment_paths" in params or "attachment_import" in params:  # membership is checked while copying
+        from ouroboros.delegate_documents import DocumentSelectionError, selection_options
+
+        try:
+            new_import = selection_options(params.get("attachment_paths"), params.get("attachment_import"))
+        except DocumentSelectionError as exc:
+            return {}, f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {exc.detail}"
+        if "attachment_paths" in params:
+            directory_options["attachment_paths"] = list(params["attachment_paths"])
+        directory_options["attachment_import"] = "new" if new_import else "reuse"
+        if new_import:  # the first start's one new intent, saved with the task: a restart never mints twice
+            import uuid
+
+            directory_options["document_import_intent"] = uuid.uuid4().hex
+    if params.get("workspace") not in (None, "copy", "in_place"):
+        return {}, "⚠️ TOOL_ARG_ERROR (schedule_subagent): workspace must be copy or in_place."
+    if params.get("workspace") == "in_place":  # the documented default geometry is no folder request, as at delegate_start
+        if str(params.get("write_surface") or "").strip().lower() not in {"self_worktree", "external_workspace", "genesis"} \
+                or not default_shaped_directory_options(directory_options.get("directory_strategy"),
+                                                        directory_options.get("scope_paths")):
+            return {}, ("⚠️ TOOL_ARG_ERROR (schedule_subagent): workspace='in_place' needs an acting Git write_surface "
+                        "and no directory options.")
+        directory_options["workspace"] = "in_place"
 
     # Folder geometry is a WRITE-side request: a read-only child reads the selected
     # folder as it is, and the host's pre-start refuses geometry it can never serve —

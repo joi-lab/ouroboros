@@ -16,16 +16,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros import usage_accounting as ua
+from ouroboros import owner_pause, usage_accounting as ua
+from ouroboros.store import StoreError
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.tools.followup import _handle_schedule_followup, _manage_schedules
 from ouroboros.usage_admission import task_billing_fields
 from supervisor import queue, queue_schedules as schedules
+from supervisor.schedule_occurrence import prepare_receipts
 from supervisor.worker_assignment import _claim_worker_launch
 from tests.test_g1_followup_policy import (  # noqa: F401
     world, register, row, restore, stop, ORIGIN, BINDING, DEADLINE, _assignment_world,
 )
-from tests._store_shared import delete_result
+from tests._store_shared import delete_result, unreadable_result
 
 pytestmark = pytest.mark.serial
 PAST = '2000-01-01T00:00:00+00:00'
@@ -167,25 +169,42 @@ def test_exact_hold_release_on_a_pending_delete_keeps_the_delete_and_lets_the_ta
     assert row(root, sid)['last_task_id'] == task['id'] and pending == [task]
 
 
-@pytest.mark.parametrize('result', ['collected', 'unreadable'])
-def test_a_pending_delete_is_not_kept_forever_by_collected_history(world, monkeypatch, result):  # noqa: F811 - pytest fixture
+@pytest.mark.parametrize('history', ['settled', 'lost', 'unreadable'])
+def test_a_pending_delete_goes_once_settlement_is_proven_and_unknown_keeps_it(world, monkeypatch, history):  # noqa: F811 - pytest fixture
     world, workers, sent = _assignment_world(world, monkeypatch)
     _, root, pending = world
     sid = register(world)['id']
     queue.check_scheduled_tasks()
     [task] = pending
-    assert _claim_worker_launch(queue, task, _worker(sent))
+    assert _claim_worker_launch(queue, task, _worker(sent)) and len(sent) == 1
     pending.clear()
     queue.check_scheduled_tasks()
     assert _delete(root, sid)['status'] == 'withdrawn'
-    path = root / 'task_results' / (task['id'] + '.json')
-    if result == 'collected':
-        delete_result(root, task['id'])  # retention removed settled history; no queue holds the task
+    if history == 'lost':
+        # A fence read (also performed by launch), not an arbitrary body read,
+        # establishes observed authority. Its later loss is not settlement.
+        owner_pause.read_fence(root, task['id'])
+        delete_result(root, task['id'])
     else:
-        path.write_text('{torn')  # unknown stays unknown
+        write_task_result(root, task['id'], 'completed', result='done', metadata=task['metadata'])
+    if history == 'unreadable':
+        switch = unreadable_result(monkeypatch, task['id'], root=root)  # unknown stays unknown
     queue.check_scheduled_tasks()
     kept = {r['id'] for r in schedules.load_schedule_store(root)['tasks']}
-    assert (sid in kept) is (result == 'unreadable')
+    assert (sid in kept) is (history != 'settled')
+    if history == 'settled':
+        # Pruning the control row keeps the task's own history.
+        assert load_task_result(root, task['id'])['status'] == 'completed'
+        return
+    error = prepare_receipts([row(root, sid)], drive_root=root).errors[task['id']]
+    if history == 'lost':
+        assert isinstance(error, ValueError) and str(error) == 'owner_pause_authority_missing'
+        return
+    assert isinstance(error, StoreError) and 'simulated unreadable row' in str(error)
+    switch['on'] = False  # access recovers: the same completed history now settles the row
+    queue.check_scheduled_tasks()
+    assert sid not in {r['id'] for r in schedules.load_schedule_store(root)['tasks']}
+    assert load_task_result(root, task['id'])['status'] == 'completed' and len(sent) == 1
 
 
 def test_positively_unstarted_continuation_claim_is_withdrawn_from_a_worker(world, monkeypatch):  # noqa: F811 - pytest fixture

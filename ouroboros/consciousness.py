@@ -55,7 +55,7 @@ from ouroboros.config import (
 )
 from ouroboros.consciousness_allowance import STATUS_EXHAUSTED, STATUS_UNKNOWN, allowance_window
 from ouroboros.consciousness_authority import is_consciousness_origin, is_own_clock_wake
-from ouroboros.consciousness_wake import bind_wake_observation, observe_wake, render_wake_message, wake_task_metadata
+from ouroboros.consciousness_wake import bind_wake_observation, observe_wake, previous_wake_text, render_wake_message, wake_task_metadata
 from ouroboros.deadline_utils import parse_deadline_ts
 from ouroboros.utils import append_jsonl, utc_now_iso
 
@@ -273,14 +273,15 @@ class BackgroundConsciousness:
         observation = observe_wake(self._drive_root, boundary=self._read_state().get(OBSERVATION_STATE_KEY),
                                    since=self._observation_bootstrap_since, now=now, reason=reason)
         context = self._context_facts(window)
+        previous = previous_wake_text(self._drive_root, self._last_wake_task_id, now=now)
 
         def render(events: str) -> str:
             return render_wake_message(
-                self._repo_dir, reason=reason, last_wake_at=self._last_wake_at, now=now, level=level,
+                self._repo_dir, drive_root=self._drive_root, reason=reason, last_wake_at=self._last_wake_at, now=now, level=level,
                 disabled_tools=list(metadata.get("disabled_tools") or []), spent_usd=window.get("settled_usd"),
                 spent_is_floor=int(window.get("unknown_unmetered") or 0) > 0,
                 daily_usd=window.get("limit_usd") or 0.0, running=len(context["counted_roots"]),
-                max_tasks=get_consciousness_max_tasks(), interval=self._interval(), events=events,
+                max_tasks=get_consciousness_max_tasks(), interval=self._interval(), events=events, previous_wake=previous,
                 **context)
 
         accepted_boundary = None
@@ -347,6 +348,7 @@ class BackgroundConsciousness:
                     or not is_own_clock_wake(self._own_wake)):
                 return
         outcome = "unknown"
+        row = None
         try:
             from ouroboros.task_results import load_task_result
             row = load_task_result(self._drive_root, task_id, strict=True)
@@ -386,6 +388,9 @@ class BackgroundConsciousness:
                     OBSERVATION_BOOTSTRAP_STATE_KEY: self._observation_bootstrap_since}))
             except Exception:
                 log.debug("consciousness: wake completion not persisted", exc_info=True)
+        if (row or {}).get("wake_summary"):
+            from supervisor.worker_chat_lane import _broadcast_task_named
+            _broadcast_task_named({"type": "task_named", "task_id": task_id, "suggested_name": row["wake_summary"]})
 
     def start(self) -> str:
         with self._lock:
@@ -437,7 +442,7 @@ class BackgroundConsciousness:
             log.debug("consciousness: graceful stop of wake %s failed", task_id, exc_info=True)
 
     def status_snapshot(self) -> Dict[str, Any]:
-        wake, _owner = self.live_turns()
+        wake, owner_live = self.live_turns()
         window = self._allowance_view(time.time())
         context = self._context_facts(window)
         values = (self._enabled, get_consciousness_autonomy(), _iso(self._next_wake_at),
@@ -446,23 +451,36 @@ class BackgroundConsciousness:
                   len(context["counted_roots"]), int(get_consciousness_max_tasks()), wake,
                   int(window.get("unknown_unmetered") or 0), bool(window.get("integrity_degraded")))
         places = context.pop("places")
-        return {**dict(zip(SNAPSHOT_KEYS, values)), **context,
+        return {**dict(zip(SNAPSHOT_KEYS, values)), **context, "owner_turn_live": owner_live,
                 "places_brief": [{key: place.get(key) for key in ("place_id", "label", "state", "unanswered")}
                                  for place in places] if places is not None else None}
 
     def details_snapshot(self, requested_enabled: bool | None) -> Dict[str, Any]:
         """The full read-only panel; the state endpoint keeps its small snapshot."""
-        from ouroboros.consciousness_view import describe_consciousness_state, place_views, recent_wakes
+        from ouroboros.consciousness_view import RECENT_WAKE_LIMIT, wake_ids, describe_consciousness_state, recent_wakes
+        from ouroboros.store import StoreBusy
+        from ouroboros.usage_store import UsageLockUnavailable
+
         snapshot = describe_consciousness_state(self.status_snapshot(), requested_enabled)
-        places = place_views(self._drive_root)
-        return {**snapshot, "places": places, "recent_wakes": recent_wakes(self._drive_root, places),
-                "recent_wakes_coverage": "wake turns among the 50 newest task rows"}
+        coverage = "wakes that reached a model call in the last 48 h"
+        try:
+            ids = wake_ids(self._drive_root, time.time())
+            wakes = recent_wakes(self._drive_root, snapshot.get("places_brief"),
+                                 live_wake_task_id=snapshot.get("live_wake_task_id", ""), ids=ids)
+            if len(ids) == RECENT_WAKE_LIMIT:
+                coverage = f"the latest {RECENT_WAKE_LIMIT} " + coverage
+        except UsageLockUnavailable:
+            wakes, coverage = None, "Recent wakes could not be read: usage ledger busy."
+        except StoreBusy as exc:  # the read that met it names the store (consciousness_view._reading)
+            store = getattr(exc, "store_name", "") or "data"  # unnamed stays unknown, never the task store
+            wakes, coverage = None, f"Recent wakes could not be read: {store} store busy."
+        return {**snapshot, "recent_wakes": wakes, "recent_wakes_coverage": coverage}
 
     def _context_facts(self, window) -> dict:
         from ouroboros.consciousness_view import cause_views, place_views, root_views
         from supervisor.queue import live_consciousness_roots
         try:
-            places = place_views(self._drive_root)
+            places = place_views(self._drive_root, window)
         except Exception:
             places = None
         return {"spend_by_cause": cause_views(window.get("spend_by_cause"), places),

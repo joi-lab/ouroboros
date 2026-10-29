@@ -7,7 +7,7 @@ from ouroboros.places import PlaceError, conversation_chat_id, get_place, resolv
 
 
 def record_notice(root, *, place_id: str, conversation_key: str, task_id: str, text: str, identity: str,
-                  transport: dict | None = None):
+                  transport: dict | None = None, held_text: str | None = None):
     from ouroboros import dialogue_store
     from ouroboros.utils import utc_now_iso
     row = {"ts": utc_now_iso(), "direction": "system", "chat_id": conversation_chat_id(conversation_key),
@@ -15,6 +15,9 @@ def record_notice(root, *, place_id: str, conversation_key: str, task_id: str, t
            "type": "place_notice", "client_message_id": "place-notice:" + identity,
            "transport": transport or {"conversation_key": conversation_key},
            "presence_provenance": {"binding_id": place_id, "conversation_key": conversation_key}}
+    if held_text is not None:
+        # A state/autonomy hold precedes the Safety check; it is not a checked draft.
+        row.update(held_text=held_text, held=True, checked=False)
     from ouroboros.presence_runner import _configured_gate
     gate = _configured_gate(root)
     key, lock = gate._conversation("notice:" + conversation_key)
@@ -68,7 +71,7 @@ def reply_hold(root, metadata, task_id, text: str) -> str:
     if message:
         digest = _reply_digest(carrier, text)
         record_notice(root, place_id=carrier["place_id"], conversation_key=carrier["conversation_key"],
-                      task_id=task_id, text=message, identity=f"{task_id}:{digest}:held")
+                      task_id=task_id, text=message, identity=f"{task_id}:{digest}:held", held_text=text)
     return message
 
 

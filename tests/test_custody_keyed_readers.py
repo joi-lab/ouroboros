@@ -197,40 +197,31 @@ def test_every_stored_flag_pair_names_the_same_unread_outputs(tmp_path, monkeypa
     assert len(decoded) == len(kept), "only the kept rows reach Python"
 
 
-def test_a_failed_selection_reads_every_row_into_the_one_shared_state(tmp_path, monkeypatch):
-    """The own-run line has no read of its own: after a failed selection it survives only
-    because the full read lands in the state all three blocks share."""
+def test_a_failed_selection_is_said_with_its_reader_and_replays_no_row(tmp_path, monkeypatch):
+    """The three delegated-run blocks share the ONE selected read; when it fails the block says
+    custody is unavailable, names the addressed reader and skips those blocks (each would replay
+    every row for itself, and an empty replay proves no absence of obligations: an earlier build
+    fell back to that full read; no longer)."""
+    from ouroboros.context_health import build_health_invariants
+
     _seed_health(tmp_path)
     baseline = _delegated_lines(tmp_path, task_id="own")
     assert _named(baseline, "OWN DELEGATED RUN ENDED", tmp_path) == {"run-own"}
     assert "run-nan-complete" in _named(baseline, "NEVER READ", tmp_path)
 
     selections, replays = [], []
-    real_replay = custody.replay
 
     def failing_selection(root, task_id=""):
         selections.append(task_id)
         raise store.StoreBusy("the selected read failed")
 
     monkeypatch.setattr(current, "health_runs", failing_selection)
-    monkeypatch.setattr(custody, "replay", lambda root, rows=None: replays.append(rows) or real_replay(root, rows))
-    assert _delegated_lines(tmp_path, task_id="own") == baseline
-    assert selections == ["own"] and replays == [None], "one full read, shared by the three blocks"
-
-    # The same failure WITHOUT the shared full read leaves only the per-block replays:
-    # the unread and patch lines come back, the own-run line is lost.
-    calls = []
-
-    def first_full_read_fails(root, rows=None):
-        calls.append(rows)
-        if len(calls) == 1:
-            raise store.StoreBusy("the shared full read failed")
-        return real_replay(root, rows)
-
-    monkeypatch.setattr(custody, "replay", first_full_read_fails)
-    degraded = _delegated_lines(tmp_path, task_id="own")
-    assert degraded == [line for line in baseline if "OWN DELEGATED RUN" not in line]
-    assert len(calls) == 3
+    monkeypatch.setattr(custody, "replay", lambda root, rows=None: replays.append(rows) or {})
+    text = build_health_invariants(_env(tmp_path), task_id="own", attempt_key="1")
+    assert _delegated_lines(tmp_path, task_id="own") == [] and selections == ["own", "own"] and replays == []
+    unavailable = [line for line in text.splitlines() if "CUSTODY UNAVAILABLE" in line]
+    assert len(unavailable) == 1 and "StoreBusy: the selected read failed" in unavailable[0]
+    assert "query_data(op='sql', db='current'" in unavailable[0] and "custody_runs" in unavailable[0]
 
 
 def test_both_reads_failing_stays_a_failure_and_rewrites_no_fact(tmp_path, monkeypatch):

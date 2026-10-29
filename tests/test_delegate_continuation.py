@@ -6,13 +6,16 @@ unread result, another actor, a changed or partial work order — is ADVICE in
 the continuing child's prompt and a fact in the parent's started payload. The
 engine continues the stopped work (``continueFrom``); a writing continuation
 runs in the predecessor's undisposed snapshot and supersedes its capture, so
-one cumulative patch is integrated once (closes #1489).
+one cumulative patch is integrated once (closes #1489). A predecessor whose
+checkout was released after its saved capture gets it back from its result
+commit at the hand-over (``tests/test_delegated_released_copies.py``).
 """
 
 from __future__ import annotations
 
 import json
 import pathlib
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -276,6 +279,14 @@ def test_prompt_states_tree_facts_and_advice_and_no_session_claim():
     assert "DIRECTLY" in direct and "read-only" not in direct
     advised = continuation.continuation_prompt({**base, "advice": ["result_unread", "executor_changed"]}, "")
     assert "never read" in advised and "different actor" in advised
+    # An empty writer result closed itself: the successor hears that nothing changed, never "DIRECTLY".
+    empty = continuation.continuation_prompt({**base, "prior_access": "workspace_write", "workspace": "fresh",
+                                              "prior_patch_disposition": custody.NO_CHANGES}, "")
+    assert "changed no files" in empty and "DIRECTLY" not in empty
+    # A checkout restored from the saved result says what is not in it.
+    restored = continuation.continuation_prompt({**base, "workspace": "same_snapshot", "checkout": "recreated"}, "")
+    assert "SAME private snapshot" in restored and "restored from the saved result" in restored
+    assert ".review-evidence/ files are not here" in restored and "restored" not in same
 
 
 # --------------------------------------------------------------------------- delegate_start wiring
@@ -393,7 +404,7 @@ def test_argument_refusals_precede_the_daemon(tmp_path):
 def _snapshot_count():
     from ouroboros import subagent_worktrees
 
-    return sum(1 for row in subagent_worktrees._load_registry(None, strict=True, op="test")
+    return sum(1 for row in subagent_worktrees._records(op="test")
                if row.get("kind") == subagent_worktrees._KIND_DELEGATED_EXEC)
 
 
@@ -441,7 +452,14 @@ def test_readonly_continuation_starts_while_the_writers_patch_awaits_disposition
     assert pred.patch_captured and not pred.patch_disposed and not pred.superseded_by
     assert [row.run_id for row in custody.undisposed_patches(tmp_path)] == [pred.run_id]
     assert _snapshot_count() == count and patch.read_bytes() == original
-    assert (snapshot_root / "waiting.txt").read_text(encoding="utf-8") == "pending disposition\n"
+    # The writer's checkout went with its saved capture; its result stays as commit C.
+    from ouroboros.subagent_worktrees import find_execution_snapshot
+
+    record = find_execution_snapshot(pred.snapshot_id)
+    assert not snapshot_root.exists() and record["result_sha"] == capture["result_commit"]
+    shown = subprocess.run(["git", "show", f"{record['result_sha']}:waiting.txt"], cwd=ctx.workspace_root,
+                           check=True, capture_output=True, text=True).stdout
+    assert shown == "pending disposition\n"
 
 
 def test_a_writing_continuation_runs_in_the_predecessors_snapshot_and_supersedes_its_capture(tmp_path, monkeypatch):

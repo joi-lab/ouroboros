@@ -24,8 +24,8 @@ code. The declared review subject for that commit is the RESOLUTION DELTA:
 Everything a reviewer needs to know about that substitution is DISCLOSED in the
 artifact header: both tree identities, both real merge parents, the conflict
 anchors, and two counters (full candidate paths vs reviewed resolution paths).
-Review binding, advisory freshness, preflight staged lists, doc-only
-classification and the scope snapshot key stay on the FULL candidate — this
+Review binding, advisory freshness, preflight staged lists and the scope
+snapshot key stay on the FULL candidate — this
 module only changes what the reviewers read, never what the gate fingerprints.
 
 ``capture_review_diff`` is the shared capture used by every review consumer:
@@ -64,6 +64,7 @@ from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Seque
 
 from ouroboros.tools import review_binary_context as _rbc
 from ouroboros.tools.review_binary_context import StagedDiffUnavailable
+from ouroboros.unindexed import unindexed
 
 # The staged capture stays resolvable through its owning module at call time:
 # ``review_binary_context.capture_staged_diff`` is a documented patch seam.
@@ -81,7 +82,8 @@ _HARDENED_DIFF_FLAGS = (
 
 def _git_bytes(repo_dir, args: List[str]) -> Tuple[int, bytes, str]:
     """Run git in ``repo_dir`` without GIT_DIFF_OPTS; return (rc, stdout, stderr)."""
-    env = {k: v for k, v in os.environ.items() if k != "GIT_DIFF_OPTS"}
+    from ouroboros.git_observation import host_git_env
+    env = host_git_env({k: v for k, v in os.environ.items() if k != "GIT_DIFF_OPTS"})
     try:
         result = subprocess.run(
             ["git", *args], cwd=str(repo_dir),
@@ -106,11 +108,11 @@ def _decode_diff(raw: bytes) -> str:
         )
 
 
-def _tree_delta_diff(repo_dir, m0_tree: str, staged_tree: str, unified: int) -> str:
-    """The hardened resolution delta between the two pinned trees."""
+def _tree_delta_diff(repo_dir, m0_tree: str, staged_tree: str, unified: int, paths: Sequence[str] = ()) -> str:
+    """The hardened resolution delta between the two pinned trees (``paths``: only those)."""
     rc, raw, err = _git_bytes(repo_dir, [
         "diff", *_HARDENED_DIFF_FLAGS, f"--unified={int(unified)}",
-        m0_tree, staged_tree,
+        m0_tree, staged_tree, *(("--", *paths) if paths else ()),
     ])
     if rc != 0:
         raise StagedDiffUnavailable(
@@ -658,8 +660,9 @@ SUBJECT_KINDS = (SUBJECT_KIND_INDEX, SUBJECT_KIND_WORKTREE, SUBJECT_KIND_RANGE)
 ROOT_KIND_SYSTEM, ROOT_KIND_WORKSPACE = "system_repo", "active_workspace"
 ROOT_KINDS = (ROOT_KIND_SYSTEM, ROOT_KIND_WORKSPACE)
 # Isolated checkouts live under the install's data root (never a foreign repo,
-# never the process temp dir): ``state/review_checkouts/<token>/repo``, beside it the marker
-# naming the task whose round it serves (``review_checking_prune`` retires what no review reads).
+# never the process temp dir): ``state/review_checkouts/<token>/repo.noindex`` (``unindexed``: one made
+# as ``repo`` keeps it), beside it the marker naming the task whose round it serves
+# (``review_checking_prune`` retires what no review reads).
 CHECKOUT_SUBDIR = "review_checkouts"
 CHECKOUT_MARKER = "checkout.json"
 _BINARY_PATCH_FLAGS = ("--binary", "--no-ext-diff", "--no-textconv")
@@ -895,7 +898,7 @@ def isolated_checkout(ctx: Any, spec: ReviewSubjectSpec, *,
                       retain: Optional[Callable[[], Mapping[str, Any]]] = None,
                       token: Optional[Callable[[FrozenSubject], str]] = None) -> Iterator[FrozenSubject]:
     """A detached worktree at the subject's parent with its patch applied to the
-    index, under the install's data root (``state/review_checkouts/<token>/repo``);
+    index, under the install's data root (``state/review_checkouts/<token>/repo.noindex``);
     the yielded subject reads there, so edits in the primary worktree during the
     run cannot change what the reviewers see. The checkout's ``write-tree`` must
     equal the frozen ``tree_sha`` or the subject is refused.
@@ -925,7 +928,7 @@ def isolated_checkout(ctx: Any, spec: ReviewSubjectSpec, *,
     identity = _frozen(ctx, spec, "")
     name = str(token(identity) if token is not None else uuid.uuid4().hex[:12])
     checkout_root = canonical_data_root(ctx) / "state" / CHECKOUT_SUBDIR / name
-    checkout = checkout_root / "repo"
+    checkout = unindexed(checkout_root, "repo")
     frozen = dataclasses.replace(identity, checkout=str(checkout))
     reused = failed = False
     try:
@@ -952,7 +955,7 @@ def round_checkout_repo(ctx: Any, retry_key: str, task_id: str) -> pathlib.Path:
     """Where ``isolated_checkout`` keeps the checkout of this task's round, retained or not."""
     from ouroboros.tool_access_paths import canonical_data_root
 
-    return canonical_data_root(ctx) / "state" / CHECKOUT_SUBDIR / checkout_token(retry_key, task_id=task_id) / "repo"
+    return unindexed(canonical_data_root(ctx) / "state" / CHECKOUT_SUBDIR / checkout_token(retry_key, task_id=task_id), "repo")
 
 
 @contextlib.contextmanager
@@ -1050,17 +1053,18 @@ def assigned_seats(triad_seat_ids: Any, scope_seat_ids: Any) -> Tuple[Tuple[str,
 
 
 def review_round_sha(frozen: FrozenSubject, *, rebuttal_sha: str = "", questions: Sequence[str] = (),
-                     goal: str = "", scope: str = "") -> str:
+                     goal: str = "", scope: str = "", since_review: str = "") -> str:
     """Identity (b), the LOGICAL round of one subject: what the author asked of the
     reviewers this time — the rebuttal (its sha), the author questions, the semantic
-    brief (goal, scope) — and the resolved revisions the record names (parent and
-    head: two commits with one tree are two rounds). It enters identity (a), so a
-    changed brief never reuses an old answer, and identity (c), so a new round is a
-    new physical operation while a retry of the SAME round rejoins the old one."""
+    brief (goal, scope), the earlier review named for comparison (``since_review``) —
+    and the resolved revisions the record names (parent and head: two commits with one
+    tree are two rounds). It enters identity (a), so a changed brief never reuses an old
+    answer, and identity (c), so a new round is a new physical operation while a retry
+    of the SAME round rejoins the old one. Host observations never enter it."""
     from ouroboros.review_ledger import round_sha_of
 
     return round_sha_of(rebuttal_sha=rebuttal_sha, questions=questions, goal=goal, scope=scope,
-                        base=frozen.parent_sha, head=frozen.spec.head)
+                        base=frozen.parent_sha, head=frozen.spec.head, since_review=since_review)
 
 
 def review_reuse_key(frozen: FrozenSubject, *, rules_sha: str, layer: str, assigned: Any, enforcement: str,

@@ -25,6 +25,9 @@ def room_membership(chat_id: int, project_chat_ids: set, source_refs: list,
         row = entry if isinstance(entry, dict) else {}
         if is_a2a_chat_id(entry_chat):
             return False
+        from ouroboros.presence_owner_contact import private_main_row
+        if private_main_row(row):
+            return chat_id == 1
         if row_provenance(row) == "place":
             return chat_id == entry_chat and chat_id != 1
         # A routing refusal belongs to the issuing chat, even when the target

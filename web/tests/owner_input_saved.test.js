@@ -397,7 +397,7 @@ test('a sent attachment message outlives a reload and a room teardown: Send agai
         await first.send('look');
         const [{ frame }] = first.sent;
         assert.deepEqual(Object.keys(tab.kept()[0].frame).sort(),
-            ['attachments', 'chat_id', 'client_message_id', 'content', 'force_plan', 'sender_session_id', 'type']);
+            ['attachments', 'chat_id', 'client_message_id', 'content', 'sender_session_id', 'type']);
         assert.equal(tab.kept()[0].frame.content, 'look\n\n[Attached file: scan.pdf]');
         assert.deepEqual(tab.kept()[0].views, [tab.view]);
         first.instance.destroy();
@@ -500,7 +500,7 @@ test('a tab that cannot keep the copy says so, and Send again still works until 
         unconfirmed.release();
         assert.equal(unconfirmed.count, 0);
 
-        // What a working tab keeps: words, id, routing and upload refs — no surface, no bytes.
+        // What a working tab keeps: words, id, routing and upload refs — no surface, no bytes, no retired one-shot field.
         const kept = new Map();
         const keeping = createUnconfirmedSends({ send: () => ({ status: 'sent' }), root: () => root, onDomWrite: (fn) => fn(),
             showToast: () => {}, storage: { getItem: (key) => kept.get(key) ?? null, setItem: (key, value) => kept.set(key, value),
@@ -508,7 +508,7 @@ test('a tab that cannot keep the copy says so, and Send again still works until 
         keeping.track({ type: 'chat', content: 'y', client_message_id: 'cm-6', chat_id: 7, force_plan: false,
             client_surface: { ua: 'agent' }, image_base64: 'AAAA', attachments: [{ filename: 'f', display_name: 'n', mime: 'm', path: '/x' }] });
         assert.deepEqual(JSON.parse(kept.get('k'))[0].frame, { type: 'chat', content: 'y', client_message_id: 'cm-6', chat_id: 7,
-            force_plan: false, attachments: [{ filename: 'f', display_name: 'n', mime: 'm' }] });
+            attachments: [{ filename: 'f', display_name: 'n', mime: 'm' }] });
         keeping.release();
         assert.equal(kept.size, 1, 'teardown keeps the copy for the next instance');
     } finally {

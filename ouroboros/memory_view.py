@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import functools
 import json
 import logging
 import pathlib
@@ -44,11 +45,12 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from ouroboros import chat_chain, memory_inventory
 from ouroboros.chronicle_import import LEGACY_ROOM_ID, LEGACY_ROOM_LABEL, legacy_frontier, row_lineage
-from ouroboros.chronicle_store import (CHILD_DRAFT_RIGHT, DELEGATED_FOCUS_ROLES, ChronicleStore, draft_signer,
+from ouroboros.chronicle_store import (CHILD_DRAFT_RIGHT, DELEGATED_FOCUS_ROLES, ChronicleStore, capture, draft_signer,
                                        is_late_review_mark, source_time_span)
 from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID
 from ouroboros.dialogue_provenance import (RoomLabelResolver, is_presence_task, render_memory_row, render_row_text,
-                                           row_class)
+                                           row_class, warm_lineage)
+from ouroboros.mark_anchors import describe as describe_anchor
 from ouroboros.memory_view_account import account_entries, account_lines, accounts_line, told_map
 from ouroboros.memory_view_legacy import INDENT, indented as _indented, retold_lines
 from ouroboros.utils import append_jsonl, sha256_text, utc_now_iso
@@ -129,7 +131,7 @@ class ViewSpec:
     origin_words: bool = True  # the owner's words that started a Project, when its rows are not open
     live_rooms: str = "lines"  # none | lines | lines_with_words | directory
     marks: str = "all"  # all | room_and_global | none
-    knowledge: bool = True  # overview, knowledge index, patterns, project journal (rendered by the context)
+    knowledge: bool = True  # overview, knowledge index, project journal (rendered by the context)
     work_room_levels: int = 1
     owner_words: bool = False  # the owner's words that caused a helper's work (owner_words.py)
 
@@ -267,7 +269,7 @@ def view_spec_for_task(task: Mapping[str, Any], drive_root: Any, *, ctx: Any = N
 class MemoryViewSnapshot:
     """Everything a render needs, read once per request; ``snapshot_json`` is its canonical form."""
     spec: ViewSpec
-    store_status: Dict[str, Any]  # {"state": "active" | an import kind, "reason"?}
+    store_status: Dict[str, Any]  # {"state": "active" | an import kind, "reason"?, "tail_facts": "filling"?}
     frontier: Dict[str, Any]  # {"status", "pos"} of the legacy frontier
     story: Tuple[Dict[str, Any], ...] = ()  # legacy records, pages, parts and selected accounts; told_by keeps source addresses, in story order
     room: Optional[Dict[str, Any]] = None  # the current room's facts and texts
@@ -292,6 +294,13 @@ def snapshot_json(snapshot: MemoryViewSnapshot) -> str:
 
 
 def snapshot_from_json(text: str) -> MemoryViewSnapshot:
+    """A captured view's snapshot, parsed once per text: the fit plan, the floor and the wake
+    facts of one build share it, so no consumer mutates it."""
+    return _parsed_view(text)
+
+
+@functools.lru_cache(maxsize=4)  # a memory bound, not a policy: a miss parses again
+def _parsed_view(text: str) -> MemoryViewSnapshot:
     data = json.loads(text)
     data["spec"] = ViewSpec(**data["spec"])
     for name in _TUPLES:
@@ -364,19 +373,19 @@ def _fixes(store: ChronicleStore, record: Mapping[str, Any], fixes: Mapping[str,
             for member in members for fix in fixes.get(str(member), ())]
 
 
-def _story_pages(store: ChronicleStore, label: Callable[..., str],
-                 units: Mapping[str, memory_inventory.LegacyUnit]) -> List[Dict[str, Any]]:
-    """Every acting page and part not folded into a part, and every account my selection shows, all rooms, by the first
-    row of its own room then sequence; the records a shown account tells in its place are marked ``told_by``."""
+def _story_pages(store: ChronicleStore, label: Callable[..., str], units: Mapping[str, memory_inventory.LegacyUnit],
+                 room_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Every acting page and part not folded into a part (``room_id``'s alone, when named), and every account my
+    selection shows, all rooms, by the first row of its own room then sequence; the records a shown account tells in
+    its place are marked ``told_by``."""
     fixes: Dict[str, List[Dict[str, Any]]] = {}
     for record in store.records(kinds=("correction", "decision")):
         if record["kind"] == "correction" or record.get("accepted") is False:
             fixes.setdefault(str(record.get("target_id") or ""), []).append(
                 {"kind": "correction" if record["kind"] == "correction" else "rejection", "id": record["id"],
                  "text": record.get("text"), "reason": record.get("reason")})
-    rooms = sorted({str(record["room_id"]) for record in store.records(kinds=("page", "part"))})
-    records = [record for room in rooms for record in store.room_records(room)
-               if record["kind"] in ("page", "part") and not record.get("folded_into")]
+    records = [record for record in store.room_records(room_id, kinds=("page", "part"))
+               if not record.get("folded_into")]
     from ouroboros.memory_sealing import capture_terminal_rows, terminal_links
     terminal_cache = capture_terminal_rows(store.data_root, records)
     keyed = [((entry.pop("first"), entry["sequence"]), entry) for entry in account_entries(
@@ -404,11 +413,11 @@ def _capture_story(store: ChronicleStore, root: pathlib.Path, label: Callable[..
     Every unfolded retold record keeps its current words, whatever its block: whole in the story until the
     floor turns its room into one line (F3) or a selected account tells it in its place (``told_by``).
     """
-    pointers = {pointer["node_id"]: pointer for pointer in store.legacy_pointer_rows()}
+    pointers = {pointer["node_id"]: pointer for pointer in memory_inventory.legacy_pointers(store)}
     units = memory_inventory.legacy_units(store, root)
     open_rooms = {unit.room_id for unit in units if not unit.folded}
     words = {record["id"]: str(record.get("current_text") or "") for room in sorted(open_rooms)
-             for record in store.room_records(room) if record["kind"] == "legacy"}
+             for record in store.room_records(room, kinds=("legacy",))}
     story, refusals = [], []
     for unit in units:
         if unit.folded:
@@ -454,14 +463,8 @@ Entry = Tuple[Dict[str, Any], Dict[str, Any], int]
 
 
 def _row_texts(root: pathlib.Path, entries: List[Entry]) -> Dict[str, Dict[str, Any]]:
-    """Read exactly the selected row identities from the dialogue store."""
-    rows = {}
-    for address, _meta, _pos in entries:
-        if address["row_sha256"] not in rows:
-            row, _status = chat_chain.resolve_row(root, address)
-            if row is not None:
-                rows[address["row_sha256"]] = row
-    return rows
+    """Read exactly the selected row identities from the dialogue store, together (``rows_by_address``)."""
+    return chat_chain.rows_by_address(root, [address for address, _meta, _pos in entries])
 
 
 def _row_head(entry: Entry, author: Mapping[str, Any]) -> str:
@@ -585,17 +588,18 @@ def _lanes(root: pathlib.Path, entries: List[Entry], lineage: Mapping[str, Any])
 
 def _notes_by_room(store: ChronicleStore) -> Dict[str, List[Dict[str, Any]]]:
     """My notes no page has sealed yet (``note:<id>`` outside the room's sealed set), by room."""
-    rooms = sorted({str(record["room_id"]) for record in store.records(kinds=("note",))})
+    by_room: Dict[str, List[Dict[str, Any]]] = {}
+    for record in store.room_records(None, kinds=("note",)):
+        by_room.setdefault(str(record["room_id"]), []).append(record)
     notes: Dict[str, List[Dict[str, Any]]] = {}
-    for room in rooms:
+    for room in sorted(by_room):
         sealed = store.sealed_row_refs(room)
         kept = [{"id": record["id"], "date": _minute(record.get("ts")).split(" ")[0],
                  "task_id": str(record.get("author", {}).get("task_id") or ""),
                  "role": str(_mapping(_mapping(record.get("author")).get("focus")).get("role") or "mind"),
                  "origin": dict(_mapping(_mapping(record.get("author")).get("focus"))),
                  "text": str(record.get("current_text") or "")}
-                for record in store.room_records(room)
-                if record["kind"] == "note" and f"note:{record['id']}" not in sealed]
+                for record in by_room[room] if f"note:{record['id']}" not in sealed]
         if kept:
             notes[room] = kept
     return notes
@@ -616,14 +620,18 @@ def _capture_room(store: ChronicleStore, root: pathlib.Path, spec: ViewSpec, lab
                   lineage: Mapping[str, Any], story: List[Dict[str, Any]] = ()) -> Dict[str, Any]:
     """The current room: its head and standing facts, page (retold records, pages under parts, notes), origin words, lanes.
 
-    Retold records already whole in my story are not repeated. A selected account carries its records;
-    their detail stays at their source readers rather than reappearing in this room.
+    Retold records already whole in my story are not repeated. A selected account carries its records, a part
+    it tells its members too; their detail stays at their source readers rather than reappearing in this room.
+    A standing part (the mind's, or a helper's draft not pending as a candidate) stands for its members here
+    as in the story: they keep their period and address (``standing``), a viewer with a story only.
     """
     room = str(spec.room_id)
     records = store.room_records(room)
     whole = {e["id"] for e in story if e.get("kind") == "legacy" and e.get("text") and not e.get("told_by")}
-    told = {e["id"]: {**e, "part": None} for e in story if e.get("kind") in ("page", "part") and e.get("told_by")
-            and e["room_id"] == room}
+    told = set(told_map([e for e in story if e.get("kind") == "account"]))  # the latest shown selections
+    told |= {member for record in records if record["kind"] == "part" and record["id"] in told
+             for member in store.folded_members(record["id"])}
+    standing = {record["id"] for record in records if record["kind"] == "part"}  # room_records: no candidate or rejected
     sample = next((meta for _address, meta, _pos in reversed(entries)
                    if meta.get("transport") or meta.get("presence_provenance")), None)
     facts: Dict[str, Any] = {"room_id": room, "label": label(room, sample), "head": store.room_head(room),
@@ -637,25 +645,26 @@ def _capture_room(store: ChronicleStore, root: pathlib.Path, spec: ViewSpec, lab
             # era) predate rooms and were Main's memory: whole and first for every focus that starts with the top
             # level of the life account (a child included); a nanny carries no life account and no story, so it
             # gets neither the text nor a pointer
-            retold[:0] = [record for record in store.room_records(LEGACY_ROOM_ID) if record["kind"] == "legacy"
-                          and _mapping(record.get("metadata")).get("legacy_type") not in ("gap", "cursor_gap")]
+            retold[:0] = [record for record in store.room_records(LEGACY_ROOM_ID, kinds=("legacy",))
+                          if _mapping(record.get("metadata")).get("legacy_type") not in ("gap", "cursor_gap")]
         facts["legacy"] = [{"id": record["id"], "text": str(record.get("current_text") or ""), "period": _legacy_period(
                                 {"covers": record.get("covers"), "range_text": _mapping(record.get("metadata")).get(
                                     "legacy_range_text")}, getattr(unit, "ts_span", None)),
                             "of": LEGACY_ROOM_LABEL if str(record.get("room_id")) == LEGACY_ROOM_ID else ""}
                            for record in retold if not getattr(unit := units.get(record["id"]), "folded", False)
-                           and record["id"] not in whole]
-        own = {} if spec.story else {e["id"]: {**e, "part": None} for e in _story_pages(store, label, units)
+                           and record["id"] not in whole and record["id"] not in told]
+        own = {} if spec.story else {e["id"]: {**e, "part": None} for e in _story_pages(store, label, units, room)
                                       if e["room_id"] == room and e["kind"] != "account"}  # story order: the floor takes the oldest first
         facts["under_parts"] = [own.get(record["id"]) or {"id": record["id"], "kind": record["kind"], "part": record["folded_into"],
-                                 "period": _period((p := memory_inventory.record_period(store, record, units)).span, p.note()), "text": str(record.get("current_text") or "")}
+                                 "period": _period((p := memory_inventory.record_period(store, record, units)).span, p.note()), "text": str(record.get("current_text") or ""),
+                                 **({"standing": True} if spec.story and record["folded_into"] in standing else {})}
                                 for record in (records if spec.story else store.pages_of_room(room)) if record["kind"] in ("page", "part") and record["id"] not in told and (record.get("folded_into") or record["id"] in own)]
         facts["notes"] = list(notes.get(room, ()))
     if spec.origin_words and room.lstrip("-").isdigit() and int(room) in memory_inventory.membership_facts(
             root).project_chat_ids:
         facts["origins"] = _origins(root, room, entries if spec.room_lanes else [])
     if spec.room_lanes and entries:
-        facts["since"] = _minute(entries[0][1].get("ts"))
+        facts["since"] = _minute(facts["facts"]["earliest"])  # the rows' first stored time, not the first row read
         facts["lane1"], facts["lane2"] = _lanes(root, entries, lineage)
     return facts
 
@@ -740,16 +749,21 @@ def _mark_target(target: Any) -> str:
     return f"source {target.get('path') or target.get('kind') or 'not recorded'}{location}"
 
 
+def source_reader(target: Mapping[str, Any], source_read: Any = None) -> str:
+    """The reader a retained-source target names to every focus: the writer's explicit reader, else
+    ``memory_read`` over the compact ref, verified on read. An author's own ``read`` recipe resolves in
+    the author's drive only, so it never travels (BIBLE P1: a source this actor can actually resolve)."""
+    if isinstance(source_read, Mapping):
+        return f"{source_read.get('tool')}({json.dumps(source_read.get('arguments') or {}, ensure_ascii=False, sort_keys=True)})"
+    ref = {key: target[key] for key in ("kind", "root", "path", "size", "sha256", "task_id") if key in target}
+    return f"memory_read(source_ref={json.dumps(ref, ensure_ascii=False, sort_keys=True)})"
+
+
 def _late_review_entry(mark: Mapping[str, Any], label: Callable[..., str], *, own_room: bool = True) -> Dict[str, Any]:
     """A host-kept late review (``late_review_marks``): its words, when it settled, its full source and its release."""
     review, target = _mapping(mark.get("review")), _mapping(mark.get("target_ref"))
-    read = review.get("source_read")
-    ref = {key: target[key] for key in ("kind", "root", "path", "size", "sha256", "task_id") if key in target}  # verified on read
-    reader = (f"{read.get('tool')}({json.dumps(read.get('arguments') or {}, ensure_ascii=False, sort_keys=True)})"
-              if isinstance(read, Mapping) else
-              f"memory_read(source_ref={json.dumps(ref, ensure_ascii=False, sort_keys=True)})")
-    if not own_room:
-        reader = f"memory_read(node_id={json.dumps(mark['id'])})"  # the full mark carries its retained source reader
+    reader = (source_reader(target, review.get("source_read")) if own_room
+              else f"memory_read(node_id={json.dumps(mark['id'])})")  # the full mark names the same reader
     return {"id": mark["id"], "scope": "room", "room": label(mark.get("room_id")),
             "text": str(mark.get("text") or "") if own_room else "",
             "by": "host", "date": _minute(mark.get("ts")).split(" ")[0], "target": _mark_target(target), "quote": "",
@@ -781,7 +795,8 @@ def _capture_marks(store: ChronicleStore, spec: ViewSpec, label: Callable[..., s
         entries.append({"id": mark["id"], "scope": str(mark.get("scope") or "room"),
                         "room": label(mark.get("room_id")), "text": str(mark.get("text") or ""), "by": str(by),
                         "date": _minute(mark.get("ts")).split(" ")[0], "target": _mark_target(mark.get("target_ref")),
-                        "quote": str(mark.get("quote") or "") if mark.get("visibility", "full") == "full" else ""})
+                        "quote": str(mark.get("quote") or "") if mark.get("visibility", "full") == "full" else "",
+                        "anchor": describe_anchor(mark["anchor"]) if isinstance(mark.get("anchor"), dict) else ""})
     return sorted(entries, key=lambda entry: (entry["scope"] == "global", "" if entry["scope"] == "global" else entry["room"]))
 
 
@@ -796,6 +811,8 @@ def _capture_live(store: ChronicleStore, root: pathlib.Path, spec: ViewSpec, lab
         by_room = {spec.room_id: memory_inventory.open_room_rows(root, spec.room_id)}
     else:
         by_room = {}
+    # The authors of rows written before the lineage epoch, read at once for every room (not one task at a time).
+    warm_lineage(lineage, ((meta, pos) for entries in by_room.values() for _address, meta, pos in entries))
     room = (_capture_room(store, root, spec, label, by_room.get(spec.room_id, []), notes, lineage, story)
             if spec.room_id is not None else None)
     live = _live_rooms(store, root, spec, label, by_room, notes, lineage) if spec.live_rooms != "none" else []
@@ -818,9 +835,16 @@ def capture_memory_view(drive_root: Any, task: Mapping[str, Any], spec: ViewSpec
         return MemoryViewSnapshot(spec=spec, store_status=status, frontier={}, room=bare, owner_words=owner_words)
     try:
         store = ChronicleStore(root)
-        frontier = legacy_frontier(store)
-        story, story_status, refusals = _capture_story(store, root, label) if spec.story else ([], {}, [])
-        room, live, marks = _capture_live(store, root, spec, label, story)
+        # One state of the chronicle for every reader (activation may publish: before), with the stored tail facts
+        # the view reads: every row for the live rooms' open rows, else the story's terminal rows.
+        tail = ("all" if spec.live_rooms != "none" else
+                "terminal" if spec.story or spec.room_id is not None and spec.room_page else "none")
+        with capture(root, tail=tail) as derived:
+            frontier = legacy_frontier(store)
+            story, story_status, refusals = _capture_story(store, root, label) if spec.story else ([], {}, [])
+            room, live, marks = _capture_live(store, root, spec, label, story)
+            candidates = tuple({"id": row["id"], "room_id": row["room_id"]} for row in store.pending_candidates()
+                               ) if spec.role == "consciousness" else ()
         if room:
             from ouroboros.owner_words import task_governing_words
 
@@ -838,12 +862,13 @@ def capture_memory_view(drive_root: Any, task: Mapping[str, Any], spec: ViewSpec
         return MemoryViewSnapshot(spec=spec, store_status={"state": "journal_unreadable",
                                                            "reason": f"{type(exc).__name__}: {exc}"},
                                   frontier={}, room=bare, owner_words=owner_words)
+    if any(not read.complete for read in ((derived or {}).get(key) for key in ("tail", "terminal_tail")) if read):
+        status = {**status, "tail_facts": "filling"}  # its rows were read live: the stored tail is not complete
     return MemoryViewSnapshot(spec=spec, store_status=status,
                               frontier={"status": frontier.get("status"), "pos": frontier.get("pos")},
                               story=tuple(story), room=room, live_rooms=tuple(live), marks=tuple(marks),
                               legacy_blocks=story_status, fallback_refusals=tuple(refusals), owner_words=owner_words,
-                              candidates=tuple({"id": row["id"], "room_id": row["room_id"]} for row in store.pending_candidates())
-                              if spec.role == "consciousness" else ())
+                              candidates=candidates)
 
 
 # --- rendering ------------------------------------------------------------------------------------
@@ -1081,7 +1106,8 @@ def _marks_text(marks: List[Dict[str, Any]]) -> str:
     for mark in marks:
         lines.append(f"- [{mark['scope']}; {mark['room']}] " + _indented(mark["text"]).lstrip()
                      + f" — marked by {mark['by']} on {mark['date']}; target {mark['target']}; "
-                     f"memory_mark(release_id='{mark['id']}', reason=…)")
+                     + (f"meets me at {mark['anchor']}; " if mark.get("anchor") else "")
+                     + f"memory_mark(release_id='{mark['id']}', reason=…)")
         if mark.get("quote"):
             lines.append(f"{INDENT}quote: " + _indented(mark["quote"]).lstrip())
     return "\n".join(lines)
@@ -1109,7 +1135,8 @@ def _room_text(room: Mapping[str, Any], gone: Mapping[str, List[str]]) -> str:
         lines += ["", "### Retold before the update (helper retelling, not lived)"]
         lines += [_retold(item, item["id"] in retold) for item in room["legacy"]]
     lines += (["", "### Pages under my parts" if all(i["part"] for i in room["under_parts"]) else "### Pages of this room",
-               *(_retold(item, item["id"] in retold) for item in room["under_parts"])] if room["under_parts"] else [])
+               *(_retold(item, item["id"] in retold or item.get("standing", False)) for item in room["under_parts"])]
+              if room["under_parts"] else [])
     if room["origins"]:
         lines += ["", "### Words that started this work (retention-proof)"]
         lines += [f"[{item['ts'] or 'time not recorded'}; owner; {item['ref']}] " + _indented(item["text"]).lstrip()
@@ -1198,11 +1225,12 @@ def working_sources_line(spec: ViewSpec, snapshot: Optional[MemoryViewSnapshot] 
         missing.append(f"{', '.join(memory)} (my memory is not activated yet: {snapshot.store_status.get('reason')})")
     else:
         loaded += memory
-    (loaded if spec.knowledge else missing).append("knowledge (overview, index, patterns)")
+    (loaded if spec.knowledge else missing).append("knowledge (overview, index, project journal and workpad" + (
+        ")" if spec.knowledge else "; the index arrives with your first delegation)"))  # delegation_knowledge_index
     if spec.owner_words and (snapshot is None or snapshot.owner_words):  # named only when the block was drawn
         loaded.append("the words of my human that caused this work")
     missing += ["the global scratchpad", "earlier task reports"]
     return ("## Working sources\n\n"
             f"Loaded above: {', '.join(loaded)}; your own recent process is loaded below. "
-            f"Not loaded: {', '.join(missing)}; memory_read, chat_history, knowledge_read and get_task_result "
-            "reach them, as they reach your parent.\n" + CHILD_ROLE_TEXT)
+            f"Not loaded: {', '.join(missing)}; memory_read, chat_history, knowledge_list, knowledge_read and "
+            "get_task_result reach them, as they reach your parent.\n" + CHILD_ROLE_TEXT)

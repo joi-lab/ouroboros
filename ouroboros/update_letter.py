@@ -169,6 +169,7 @@ def collect_range_material(
     preview with that exact Git range, not proof of unique code or a preservation promise.
     """
     capture = git or _default_git()
+    from ouroboros.update_qualification import commit_qualification
     spec = f"{base_sha}..{target_sha}"
     material: Dict[str, Any] = {
         "base_sha": base_sha, "target_sha": target_sha,
@@ -179,22 +180,31 @@ def collect_range_material(
     # the bodies of only the newest ``max_bodies`` — git never hands this process the bodies
     # of a whole long history just so most of them can be dropped again.
     commits, material["omitted_commit_chunks"] = _commit_subjects(capture, spec)
+    # Match the post-merge workflow's integration line, including squash commits.
+    rc, out, err = capture(["git", "rev-list", "--first-parent", spec])
+    if rc != 0:
+        raise MaterialUnavailable(f"git rev-list --first-parent {spec} failed (rc={rc}): {str(err)[:200]}")
+    by_sha = {c["sha"]: c for c in commits}
+    material["first_parent_commits"] = [by_sha[sha] for sha in out.split() if sha in by_sha]
     material["local_commits"], material["omitted_local_chunks"] = _commit_subjects(
         capture, f"{target_sha}..{base_sha}")
+    bodies: Dict[str, str] = {}
     if commits and max_bodies > 0:
         rc, out, err = capture([
             "git", "log", "-n", str(int(max_bodies)), "--format=%H%x1f%b%x1e", spec,
         ])
         if rc != 0:
             raise MaterialUnavailable(f"git log bodies {spec} failed (rc={rc}): {str(err)[:200]}")
-        bodies: Dict[str, str] = {}
         for chunk in out.split("\x1e") if out.strip() else []:
             parts = chunk.strip("\n").split("\x1f", 1)
             if len(parts) == 2 and parts[0].strip():
                 bodies[parts[0].strip()] = parts[1].strip()
         for commit in commits[:max_bodies]:
             body = bodies.get(commit["sha"], "")
+            commit["qualification"] = commit_qualification(body)
             commit["body"] = truncate_within_limit(body, COMMIT_BODY_MAX_CHARS) if body else ""
+    for commit in commits:
+        commit["body_read"] = commit["sha"] in bodies
     material["bodies_omitted"] = max(0, len(commits) - max_bodies)
     material["commits"] = commits
 
@@ -307,6 +317,10 @@ def material_text(material: Dict[str, Any]) -> str:
                          f"{material['target_sha']}..{material['base_sha']}]")
     if not lines:
         lines.append("(no commits in this range)")
+    if material.get("qualification"):
+        import json
+        lines.append("\nQualification facts for this exact range (missing evidence is not PASS):\n"
+                     + json.dumps(material["qualification"], ensure_ascii=False))
     return "\n".join(lines)
 
 
@@ -320,7 +334,8 @@ def _request_text(status: Dict[str, Any], material: Dict[str, Any], target_versi
     from ouroboros import get_version
 
     facts = {
-        "running": {"version": get_version(), "sha": _key_from_status(status)["base_sha"]},
+        "running": {"version": get_version(), "sha": status.get("running_sha", status.get("current_sha", ""))},
+        "range": {"base_sha": _key_from_status(status)["base_sha"], "target_sha": _key_from_status(status)["target_sha"]},
         "official_target": {"version": target_version, "sha": _key_from_status(status)["target_sha"]},
         "update_channel": str(status.get("update_channel") or ""),
         "checkout": {"sha": str(status.get("current_sha") or ""),
@@ -332,7 +347,7 @@ def _request_text(status: Dict[str, Any], material: Dict[str, Any], target_versi
         "[UPDATE LETTER REQUEST]\n"
         "An official update of my body is available. Facts (host-attested):\n"
         + json.dumps(facts, ensure_ascii=False, indent=2)
-        + "\n\nMaterial — what changed between the running version and the target:\n"
+        + "\n\nMaterial — what changed in the exact base..target range above:\n"
         + material_text(material)
         + "\n\n(The official_update block in my Runtime context describes the state before "
         "this check; the facts above supersede it.)"
@@ -341,6 +356,10 @@ def _request_text(status: Dict[str, Any], material: Dict[str, Any], target_versi
         "use together. Summarize the whole range, prioritizing meaningful user-visible and operational changes, "
         "not just the latest or merge commit. Distinguish incoming changes from the existing local history; "
         "mention material local customizations separately without promising their preservation before apply. Use only what the material says; "
+        "Name the commits or PRs with non-green or incomplete batteries, author-accepted FAILs, "
+        "missing qualification receipts, or red post-merge runs. State unavailable checks as unknown. "
+        "Keep declared results distinct from host observations; a passed focused test is not a green full battery. "
+        "When all recorded checks passed, say so without inventing a warning. "
         "if the material does not say something, I do not invent it. This paragraph is shown on "
         "the Updates page and becomes part of my own context; the commit history stays readable "
         "for detail. Reply with the paragraph only.\n"
@@ -630,8 +649,9 @@ def runtime_status(status: Dict[str, Any]) -> Dict[str, Any]:
     This reader never fetches or reconstructs that cache's authority.
     """
     from ouroboros.server_process import server_source_baseline
+    from ouroboros.update_generation_facts import projection
 
-    return {**status, "running_sha": server_source_baseline()}
+    return {**status, "running_sha": server_source_baseline(), "after_update": projection()}
 
 
 def _key_from_status(status: Dict[str, Any]) -> Dict[str, str]:
@@ -662,6 +682,9 @@ def refresh_after_check(
             return current
         key = _key_from_status(status)
         checkout_sha = str(status.get("current_sha") or "")
+        def checked(record):
+            return _mark_checked(record, key, drive_root, checkout_sha=checkout_sha,
+                                 running_sha=str(status.get("running_sha", key["base_sha"]) or ""))
         no_update = (not key["target_sha"] or key["base_sha"] == key["target_sha"]
                      or (not status.get("available") and key["base_sha"] == checkout_sha))
         seen = _WRITE_SEQ
@@ -674,7 +697,7 @@ def refresh_after_check(
             # The writer that held the lock may have produced this very letter: share it
             # (one physical attempt for concurrent checks of the same key).
             if _WRITE_SEQ > seen and _LAST_WRITTEN[:2] == (key, _root_id(drive_root)):
-                return _mark_checked(_LAST_WRITTEN[2], key, drive_root, checkout_sha=checkout_sha)
+                return checked(_LAST_WRITTEN[2])
             current = read_record(drive_root)
             if not key["base_sha"]:
                 record = _new_record(key, "")
@@ -682,14 +705,21 @@ def refresh_after_check(
                               error_text="The running server's source baseline is unavailable; no description was requested.")
                 if current:
                     record["last_good"] = shown_letter(current)[0] if shown_letter(current)[1] else None
-                record = _mark_checked(record, key, drive_root, checkout_sha=checkout_sha)
+                record = checked(record)
                 _note_written(key, drive_root, record)
                 return record
             if no_update:
-                return _mark_checked(current, key, drive_root, checkout_sha=checkout_sha)
+                return checked(current)
             shown, text, _last_good = shown_letter(current) if current else ({}, "", None)
-            if shown.get("state") == "ready" and text and shown.get("key") == key:
-                return _mark_checked(current, key, drive_root, checkout_sha=checkout_sha)
+            from ouroboros.update_qualification import range_qualification, refresh_qualification
+
+            qualification = None
+            if shown.get("state") == "ready" and text and shown.get("key") == key and shown.get("qualification"):
+                qualification, changed = refresh_qualification(
+                    shown["qualification"], str(status.get("official_repo_url") or ""),
+                    previous=current.get("qualification"))
+                if not changed:
+                    return checked({**current, "qualification": qualification})
             try:
                 material = collect_range_material(key["base_sha"], key["target_sha"])
             except MaterialUnavailable as exc:
@@ -698,17 +728,22 @@ def refresh_after_check(
                 kind, safe = _classify(exc)
                 record = _new_record(key, "")
                 record.update(error_kind=kind, error_text=safe)
+                if qualification is not None:
+                    record["qualification"] = qualification
                 material = None
             else:
                 if not material.get("commits") and not material.get("releases"):
-                    return _mark_checked(current, key, drive_root, checkout_sha=checkout_sha)
+                    return checked(current)
+                material["qualification"] = qualification or range_qualification(
+                    material, str(status.get("official_repo_url") or ""))
                 record = write_letter(status, material, drive_root=drive_root, llm_client=llm_client)
+                record["qualification"] = material["qualification"]
             if record.get("state") != "ready" and current:
                 # D-KEEP for the supersede case too: a good letter is never lost to a
                 # failed rewrite, whatever range the failed attempt was for.
                 previous_good = current if current.get("state") == "ready" else current.get("last_good")
                 record["last_good"] = previous_good or None
-            record = _mark_checked(record, key, drive_root, checkout_sha=checkout_sha)
+            record = checked(record)
             _note_written(key, drive_root, record)
             return record
         finally:
@@ -732,7 +767,7 @@ def _note_written(key: Dict[str, str], drive_root: Optional[pathlib.Path], recor
 
 def _mark_checked(current: Optional[Dict[str, Any]], key: Dict[str, str],
                   drive_root: Optional[pathlib.Path], *, git: Optional[GitCapture] = None,
-                  checkout_sha: Optional[str] = None) -> Dict[str, Any]:
+                  checkout_sha: Optional[str] = None, running_sha: Optional[str] = None) -> Dict[str, Any]:
     """Record the checked HEAD without touching any letter. A letterless record (``state: none``)
     follows the check it describes — its key and the official target's VERSION — so the Runtime
     fact can name the version an up-to-date install is current with."""
@@ -740,10 +775,10 @@ def _mark_checked(current: Optional[Dict[str, Any]], key: Dict[str, str],
     if record.get("state") == "none":
         record["key"] = key
         record["target_version"] = _version_at(git or _default_git(), key["target_sha"] or key["base_sha"])
-    record["checked_running_sha"] = key["base_sha"]
-    record["target_in_running"] = _shown_target_in_head(record, key["base_sha"], git=git)
+    record["checked_running_sha"] = key["base_sha"] if running_sha is None else running_sha
+    record["target_in_running"] = _shown_target_in_head(record, record["checked_running_sha"], git=git)
     record["checked_head_sha"] = key["base_sha"] if checkout_sha is None else checkout_sha
-    record["target_in_head"] = (record["target_in_running"] if record["checked_head_sha"] == key["base_sha"]
+    record["target_in_head"] = (record["target_in_running"] if record["checked_head_sha"] == record["checked_running_sha"]
                                 else _shown_target_in_head(record, record["checked_head_sha"], git=git))
     atomic_write_json(record_path(drive_root), record)
     return record
@@ -812,6 +847,9 @@ def project_letter(
     key = provenance.get("key") if isinstance(provenance.get("key"), dict) else {}
     base, target = str(key.get("base_sha") or ""), str(key.get("target_sha") or "")
     head, latest = str(head_sha or ""), str(latest_sha or "")
+    qualification = record.get("qualification") or {}
+    evidence_matches = ((qualification.get("base_sha"), qualification.get("target_sha")) != (head, latest)
+                        or qualification == provenance.get("qualification"))
     consumed = bool(record.get("target_in_head")) and head and head == str(record.get("checked_head_sha") or "")
     if head and head == target:
         relation = "applied"
@@ -835,9 +873,10 @@ def project_letter(
         "key": dict(key),
         "has_last_good": bool(last_good and last_good.get("text")),
         "description_current": bool(provenance.get("state") == "ready" and text
-                                    and base and head == base and latest == target),
+                                    and base and head == base and latest == target and evidence_matches),
         "failed_at": str(record.get("written_at") or "") if record.get("state") == "failed" else "",
         "latest_failed_key": dict(record.get("key") or {}) if record.get("state") == "failed" else None,
+        "qualification": qualification or provenance.get("qualification"),
     }
 
 
@@ -870,6 +909,8 @@ def official_update_projection(
 ) -> Dict[str, Any]:
     """The typed fact for the Runtime context: O(1), no git, never raises.
 
+    The retained update's before/after samples are the Runtime section's ``vitals.last_update``
+    (``context_runtime_facts``); the panel reads them through ``runtime_status``.
     ``status`` is honest about freshness. It follows the CHECK, not the letter:
     ``update_available``/``up_to_date`` while the last check still describes this HEAD (the
     availability is the cache's, so an available update may carry a failed letter or none at
@@ -883,6 +924,7 @@ def official_update_projection(
     try:
         from ouroboros import get_version
         from ouroboros.config import DATA_DIR
+        from ouroboros.update_qualification import runtime_letter  # the full record: query_data kind update_letter
 
         head = str(head_sha or "")
         if not head or head == "unknown":
@@ -906,13 +948,13 @@ def official_update_projection(
                 "status": "unchecked", "status_as_of": "",
                 "running": {"version": get_version(), "sha": head},
                 "update_channel": active_channel, "target": None, "behind": None, "ahead": None,
-                "local_changes": "unknown", "letter": project_letter(record, head_sha=head, latest_sha=""),
+                "local_changes": "unknown", "letter": runtime_letter(project_letter(record, head_sha=head, latest_sha="")),
             }
         latest = str(cache.get("latest_sha") or "")
         checked_head = str((record or {}).get("checked_head_sha") or "")
         shown = shown_letter(record)[0] if record else {}
         record_key = shown.get("key") if isinstance(shown.get("key"), dict) else {}
-        letter = project_letter(record, head_sha=head, latest_sha=latest)
+        letter = runtime_letter(project_letter(record, head_sha=head, latest_sha=latest))
         if not cache:
             status = "unchecked"
         elif head and head == checked_head:

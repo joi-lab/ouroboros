@@ -362,7 +362,7 @@ def test_restart_census_refuses_a_maintenance_exit_until_confirmed(tmp_path, mon
     packer._process = child
     monkeypatch.setattr(maintenance, "child", packer)
     monkeypatch.setattr(server, "DATA_DIR", root)
-    monkeypatch.setattr(server, "begin_owned_stop", lambda *_: None)
+    monkeypatch.setattr(server, "begin_owned_stop", lambda *_, **__: None)
     monkeypatch.setattr(server, "stop_owned_work", lambda *_: {"state": "completed"})
     monkeypatch.setattr("supervisor.workers.kill_workers", lambda **_: None)
     monkeypatch.setattr("supervisor.workers.last_worker_exit_census", lambda: {"unconfirmed": []})

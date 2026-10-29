@@ -134,37 +134,38 @@ export function bindPageHeader(header, { lead = null, actions = null } = {}) {
     return () => { offLayout(); observer?.disconnect(); if (frame) view.cancelAnimationFrame(frame); };
 }
 
-/** A bar narrower than this (px) cannot hold Restart, Panic, More and the budget on one row with the status. */
+/** A bar narrower than this (px) cannot hold the status, the consciousness chip, Restart, Panic and the budget. */
 export const HEADER_FULL_ROW_MIN_WIDTH = 640;
 
 /**
- * Main's header controls by the room the bar has (owner Q4=A): a bar wide enough keeps Restart in the row and the
- * budget after the actions; the stack layout, and a docked content column narrower than
- * HEADER_FULL_ROW_MIN_WIDTH, move the same two nodes into the ⋯ menu (the budget first, Restart last), so the bar
- * stays one row and each control keeps its one handler and its one id. The bar's width is measured (a
+ * Main's Restart and budget by the room the bar has (owner 25.10, 4A): a bar wide enough keeps them in its row; the
+ * stack layout, and a docked content column narrower than HEADER_FULL_ROW_MIN_WIDTH, move the same two nodes into the
+ * room status's Shade (`shade.extras`, room_work.js), Restart first, so the bar keeps the status, the consciousness
+ * chip and Panic, and no ⋯. Each control keeps its one handler and its one id. The bar's width is measured (a
  * ResizeObserver), never a viewport breakpoint. Returns the disposer.
  */
-export function bindHeaderControlPlacement({ headerActions, budgetPill = null, bar = headerActions?.closest?.('.app-page-header') } = {}) {
+export function bindHeaderControlPlacement({ headerActions, budgetPill = null, shade = null, bar = headerActions?.closest?.('.app-page-header') } = {}) {
     const restart = headerActions?.querySelector?.('[data-chat-command="restart"]');
     const panic = headerActions?.querySelector?.('[data-chat-command="panic"]');
-    const menu = headerActions?.querySelector?.('.chat-header-menu');
+    const extras = shade?.extras;
     const toolbar = budgetPill?.parentElement || null;
-    if (!restart || !menu) return () => {};
+    if (!restart || !extras) return () => {};
     let placed = '';
     const compact = (layout) => layout === 'stack'
         || (Number(bar?.clientWidth) > 0 && bar.clientWidth < HEADER_FULL_ROW_MIN_WIDTH);
     // Called with the layout name by the layout switch, with entries by the observer, with nothing at bind.
     const place = (arg) => {
-        const next = compact(typeof arg === 'string' ? arg : currentLayout()) ? 'menu' : 'row';
+        const next = compact(typeof arg === 'string' ? arg : currentLayout()) ? 'shade' : 'row';
         if (next === placed) return;
         placed = next;
-        if (next === 'menu') {
-            if (budgetPill) menu.prepend(budgetPill);
-            menu.append(restart);
+        if (next === 'shade') {
+            extras.append(restart);
+            if (budgetPill) extras.append(budgetPill);
         } else {
             headerActions.insertBefore(restart, panic);
             if (budgetPill && toolbar) toolbar.insertBefore(budgetPill, headerActions.nextSibling);
         }
+        shade.update?.();
     };
     place();
     const offLayout = onLayoutChange(place);

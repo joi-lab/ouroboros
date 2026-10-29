@@ -258,9 +258,9 @@ def test_rename_sheet_is_no_alias_and_a_large_namespace_is_retrievable(world):
     assert "rename_worksheet" not in miss.text and "Naming-rule" not in miss.text
     listing = registry.execute_result("list_available_tools", {"namespace": "mcp_excel"}).text
     assert "mcp_excel: 13 callable tools (raw MCP name → callable name):" in listing
-    for raw in EXCEL:
-        assert f"- {raw!r} → mcp_excel__{raw} [loaded]" in listing
-    assert "fixture operation" in listing  # selected namespace includes bounded purpose
+    for raw in EXCEL:  # an unpinned server's schemas load on demand in every mode (#2332)
+        assert f"- {raw!r} → mcp_excel__{raw} [not loaded]" in listing
+    assert "fixture operation" in listing  # a selected namespace gives each complete description
     assert safety == [] and transport.call_calls == []
 
 
@@ -401,13 +401,14 @@ def test_discovery_lists_the_callable_catalog_in_every_mode(world, mode):
 
     overview = registry.execute("list_available_tools", {})
     assert "All tools are already" not in overview
-    loaded = "0" if mode == "nano" else "3"
-    assert f"- mcp_canvas: 3 tools, {loaded} loaded" in overview
+    # An unpinned server starts on demand in every mode; the map and this catalog name its tools.
+    assert "- mcp_canvas: 3 tools, 0 loaded" in overview
     assert "- mcp_excel: 13 tools" in overview and "- builtin:" in overview
     assert "mcp_off" not in overview and "mcp_svc__blocked" not in overview
     selected = registry.execute("list_available_tools", {"namespace": "mcp_canvas"})
-    state = "not loaded" if mode == "nano" else "loaded"
-    assert f"- {CANVAS[0]!r} → mcp_canvas__canvas_get_assignme_df6acab471ce [{state}]" in selected
+    assert f"- {CANVAS[0]!r} → mcp_canvas__canvas_get_assignme_df6acab471ce [not loaded]" in selected
+    assert "all 3 tools" in registry.execute("enable_tools", {"tools": "mcp_canvas"})
+    assert "- mcp_canvas: 3 tools, 3 loaded" in registry.execute("list_available_tools", {})
     # Residency and availability stay distinct: a not-loaded MCP tool is still
     # callable, and its raw name never entered the permanent schema description.
     for schema in registry.schemas():
@@ -435,7 +436,8 @@ def test_builtin_miss_lists_no_hidden_name_and_points_a_readonly_child_to_discov
         'list_available_tools(namespace="builtin") lists them all.')
     assert "run_command" not in miss.text and "write_file" not in miss.text
     listing = registry.execute("list_available_tools", {"namespace": "builtin"})
-    assert "- read_file [loaded]" in listing and "run_command" not in listing
+    # A namespace listing gives complete descriptions (a callable tool's prose may name another); no row lists it.
+    assert "- read_file [loaded]" in listing and not any(line.startswith("- run_command") for line in listing.splitlines())
     assert safety == [] and transport.call_calls == []
 
 

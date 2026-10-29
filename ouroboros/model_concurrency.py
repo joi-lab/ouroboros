@@ -11,8 +11,11 @@ physical sender, so retries, tools, backoff and abandoned logical waits own no s
 
 ``state/model_concurrency/<route digest>/`` contains zero-byte ``*.ticket`` and
 ``*.slot`` files: their names carry enqueue ordinal, PID and a random identity.
-Under a short portable ``queue.lock``, the oldest live ticket may become a slot
-only below the current cap. A process-local counter avoids contending on that lock
+Under a short portable ``queue.lock``, the first live ticket may become a slot
+only below the current cap. A call of a turn the owner awaits sorts ahead of every
+background ticket that has not started (a background ordinal carries an offset);
+each kind keeps its arrival order, and a started call keeps its slot.
+A process-local counter avoids contending on that lock
 while this process already fills the cap. Lowering the cap drains existing calls;
 it never replaces the pool or evicts a live holder. Timeout refuses, never bypasses.
 
@@ -43,6 +46,7 @@ from ouroboros import platform_layer
 from ouroboros.transport_custody import ProviderNotDispatched
 
 _POLL_SEC = 0.05
+_BACKGROUND = 10 ** 18  # a background ticket's ordinal offset: an awaited turn's ticket sorts ahead of it
 _LOCK = threading.Lock()
 _LOCAL: dict[tuple[int, str], _LocalRoute] = {}
 _DEADLINE = contextvars.ContextVar("model_slot_deadline", default=None)
@@ -61,6 +65,16 @@ class ModelSlotTimeout(ModelSlotUnavailable, TimeoutError):
 
 class ModelSlotCancelled(ModelSlotUnavailable):
     """The waiter was cancelled before dispatch."""
+
+
+def _owner_awaits() -> bool:
+    """This call belongs to a turn the owner awaits; an unreadable binding queues it as background."""
+    try:
+        from ouroboros.model_wait import owner_awaits_current_call
+
+        return owner_awaits_current_call()
+    except Exception:
+        return False
 
 
 class _LocalRoute:
@@ -155,6 +169,7 @@ class _Waiter:
         self.directory = _queue_root() / _route_digest(model, use_local, route)
         self.path: Path | None = None
         self.acquired = False
+        self.awaited = _owner_awaits()
         key = (os.getpid(), str(self.directory))
         with _LOCK:
             self.local = _LOCAL.setdefault(key, _LocalRoute())
@@ -218,7 +233,8 @@ class _Waiter:
                 self.remaining()
                 files = self._live_files()
                 if self.path is None:
-                    ordinal = max((number for number, _ in files), default=0) + 1
+                    sequence = max((number % _BACKGROUND for number, _ in files), default=0) + 1
+                    ordinal = sequence if self.awaited else _BACKGROUND + sequence
                     self.path = self.directory / f"{ordinal:020d}-{os.getpid()}-{uuid.uuid4().hex}.ticket"
                     # All facts live in the filename: O_EXCL publishes a complete
                     # record even if the process dies immediately after creation.

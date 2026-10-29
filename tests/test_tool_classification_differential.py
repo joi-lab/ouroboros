@@ -1,14 +1,8 @@
-"""The single classifier answers exactly what the retired loop pair answered,
-except on a table of deltas the owner approved.
+"""Compare the classifier with the retired loop pair, except owner-approved deltas.
 
-The oracle is a golden snapshot of the OLD pair's answers, captured from the tree
-named in ``GOLDEN_SOURCE_SHA``, not a copy of the old parser: a copy is dead code
-that invites cleanup, a data file cannot drift silently.
-
-Both directions fail. An unapproved divergence fails because the cutover would then
-be changing behaviour nobody signed off. An APPROVED delta that no longer fires ALSO
-fails, so the table cannot rot into a permanent excuse list — once a delta is gone,
-its row goes with it.
+The oracle is the OLD pair's golden answers from ``GOLDEN_SOURCE_SHA``.
+An unapproved divergence fails; an approved delta that no longer fires also fails,
+so obsolete exceptions cannot survive silently.
 """
 
 from __future__ import annotations
@@ -24,6 +18,7 @@ from ouroboros._outcome_tool_errors import (
     _BLOCKING_TOOL_STATUSES,
     _NON_BLOCKING_READONLY_BLOCK_STATUSES,
     _NON_BLOCKING_RECOVERABLE_STATUSES,
+    _NON_EFFECT_OBSERVATION_STATUSES,
     _OK_TOOL_STATUSES,
     _POLICY_DENIAL_STATUSES,
     _UNPARTITIONED_BUCKETS,
@@ -361,7 +356,10 @@ def _golden() -> dict[str, dict]:
 # New producer contracts have no historical answer: the recorded old SHA is
 # unavailable. Keep the historical corpus intact and assert the new observed
 # outcome explicitly rather than manufacture old evidence (04-AGENCY S1/S3).
-CURRENT_PRODUCER_CONTRACTS = {
+CURRENT_PRODUCER_CONTRACTS = {"WORLD_SIZE_NOTICE": (False, "ok"),  # the map's size notice rides a successful update_world
+    # tools/tool_discovery.py `enable_tools`: a load none of which fits the route's schema ceiling;
+    # the retired pair never saw it. A physical resource refusal: nothing loaded, every tool stays callable.
+    "TOOL_SCHEMA_LIMIT": (True, "resource_constraint_blocked"),
     # D1 per-target mutation custody: the existing INTEGRATE_ family reports a
     # busy target as a substrate refusal; no historical answer is fabricated.
     "INTEGRATE_DELEGATED_TARGET_BUSY": (True, "integration_blocked"),
@@ -408,6 +406,17 @@ CURRENT_PRODUCER_CONTRACTS = {
     "native:TOOL_ERROR:PR_MERGE_": (True, "error"),
     "native:TOOL_ERROR:PR_MERGE_REFUSED": (True, "error"),
     "native:TOOL_ARG_ERROR:PR_MERGE_REFUSED": (True, "argument_error"),
+    # PR detail markers: native errors vs bare-text legacy warnings; public writes carry the shared receipt.
+    "PR_CREATE_UNKNOWN": (False, "ok"),
+    "PR_EXISTS": (False, "ok"),
+    "PR_PRECHECK_FAILED": (True, "error"),
+    "PR_READY_UNKNOWN": (False, "ok"),
+    "PR_UPDATE_UNKNOWN": (False, "ok"),
+    "native:TOOL_ERROR:PR_CREATE_UNKNOWN": (True, "error"),
+    "native:TOOL_ERROR:PR_EXISTS": (True, "error"),
+    "native:TOOL_ERROR:PR_PRECHECK_FAILED": (True, "error"),
+    "native:TOOL_ERROR:PR_READY_UNKNOWN": (True, "error"),
+    "native:TOOL_ERROR:PR_UPDATE_UNKNOWN": (True, "error"),
     # Saved-setting selection uses the existing process access authority; its new
     # foreground refusal remains blocked through both text and native ACCESS_BLOCKED.
     "PROCESS_ENV_REFERENCE_BLOCKED": (True, "blocked"),
@@ -464,8 +473,9 @@ CURRENT_PRODUCER_CONTRACTS = {
     # refusal changes nothing and is its peers' answer, asserted live.
     "INTEGRATE_DELEGATED_INVESTIGATION_EVIDENCE": (True, "integration_blocked"),
     # #1969: an apply that had to prepare the capture returns it for inspection;
-    # nothing is applied, recorded or released, so it is its peers' answer.
-    "INTEGRATE_DELEGATED_INSPECT_CAPTURE": (True, "integration_blocked"),
+    # nothing is applied, recorded or released. The protocol worked, so the call is
+    # no error, and its own bucket keeps it out of the success set (no effect).
+    "INTEGRATE_DELEGATED_INSPECT_CAPTURE": (False, "inspection_required"),
     # #2070: named evidence that could not all be retained keeps its surviving copy;
     # apply and reject record nothing and change nothing, so it is its peers' answer.
     "INTEGRATE_DELEGATED_EVIDENCE_UNRETAINED": (True, "integration_blocked"),
@@ -558,6 +568,10 @@ CURRENT_PRODUCER_CONTRACTS = {
     # Owner decision (PR #1636): an exact edit that leaves .py/.json unparsable is
     # applied and reported, never refused; the warning is a successful call.
     "SYNTAX_WARNING": (False, "ok"),
+    # #1376: a silence diagnostic's capability gate (registry_guards) is a new producer
+    # after the retired oracle; a refused tool never ran, as for its subagent peers.
+    "DIAGNOSTIC_CAPABILITY_BLOCKED": (True, "blocked"),
+    "native:ACCESS_BLOCKED:DIAGNOSTIC_CAPABILITY_BLOCKED": (True, "blocked"),
 }
 
 
@@ -918,6 +932,7 @@ def test_every_outcome_bucket_is_partitioned() -> None:
         | set(_NON_BLOCKING_RECOVERABLE_STATUSES)
         | set(_NON_BLOCKING_READONLY_BLOCK_STATUSES)
         | set(_OK_TOOL_STATUSES)
+        | set(_NON_EFFECT_OBSERVATION_STATUSES)
         | set(_UNPARTITIONED_BUCKETS)
     )
     unhomed = sorted({spec.outcome_bucket for spec in TOOL_CODE_SPECS.values()} - known)

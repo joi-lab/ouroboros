@@ -104,7 +104,7 @@ print(json.dumps({
 
 @pytest.mark.serial
 def test_pytest_scrubbed_child_keeps_disposable_state_root(tmp_path, monkeypatch):
-    from tests.conftest import _PYTEST_DEFAULTS
+    from tests import conftest as test_conftest
 
     repo = pathlib.Path(__file__).resolve().parents[1]
     fake_home = tmp_path / "home"
@@ -116,13 +116,13 @@ def test_pytest_scrubbed_child_keeps_disposable_state_root(tmp_path, monkeypatch
     }
     for path, content in sentinels.items():
         path.write_bytes(content)
-    # The scrubbed child receives the session's disposable default root, which every
-    # earlier test of this process shares. A queue snapshot one of them left there is
-    # prior history, and a first state is then refused by design
-    # (prior_history_without_state). A fresh disposable default keeps the invariant
-    # under test, the default and never the fake home, independent of what ran before.
-    disposable = tmp_path / "disposable-data"
-    monkeypatch.setitem(_PYTEST_DEFAULTS, "OUROBOROS_DATA_DIR", str(disposable))
+    # This test writes state and a campaign. Give the conftest child-env injector
+    # its own disposable root so earlier serial tests cannot leave it an
+    # unavailable state or a campaign that changes this probe's behavior.
+    disposable_root = tmp_path / "disposable-data"
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(disposable_root))
+    monkeypatch.setitem(test_conftest._PYTEST_DEFAULTS, "OUROBOROS_DATA_DIR", str(disposable_root))
+    monkeypatch.setitem(test_conftest._PYTEST_DEFAULTS, "OUROBOROS_SETTINGS_PATH", str(disposable_root / "settings.json"))
     code = """
 import json
 from supervisor import evolution_lifecycle, state
@@ -152,7 +152,7 @@ print(json.dumps({
 
     payload = json.loads(proc.stdout.strip().splitlines()[-1])
     assert payload["pytest_loaded"] is False
-    assert pathlib.Path(payload["drive_root"]).resolve(strict=False) == disposable.resolve(strict=False)
+    assert pathlib.Path(payload["drive_root"]).resolve(strict=False) == disposable_root.resolve(strict=False)
     assert payload["campaign_id"]
     for path, content in sentinels.items():
         assert path.read_bytes() == content

@@ -26,11 +26,12 @@ export function bridgeChunkBuffer(view) {
 // ReadableStream fed by `data` frames (binary by default), so text/json/blob
 // and incremental body reads all work. No default timeout — `init.timeoutMs`
 // is the author's opt-in bound; `init.signal` aborts through the parent.
-export function moduleBridgeScript(nonce, routeBase = '', initialTheme = '') {
+export function moduleBridgeScript(nonce, routeBase = '', initialTheme = '', assetBase = '') {
     return `
         (() => {
             const nonce = ${JSON.stringify(nonce)};
             const routeBase = ${JSON.stringify(routeBase)};
+            const assetBase = ${JSON.stringify(assetBase)};
             const initialTheme = ${JSON.stringify(initialTheme)};
             const safeExternalUrl = (${safeExternalUrl.toString()});
             let seq = 0;
@@ -317,7 +318,8 @@ export function moduleBridgeScript(nonce, routeBase = '', initialTheme = '') {
                 if (!anchor) return;
                 const href = String(anchor.href || '');
                 const source = blobUrls.get(href) || href;
-                if (!blobUrls.has(href) && !href.startsWith('data:') && !(routeBase && href.startsWith(routeBase))) return;
+                if (!blobUrls.has(href) && !href.startsWith('data:') && !(routeBase && href.startsWith(routeBase))
+                    && !(assetBase && href.startsWith(assetBase))) return;
                 event.preventDefault();
                 download(anchor.download, source).catch((error) => fault('error', error.message, '', 0));
             };
@@ -340,7 +342,8 @@ export function moduleBridgeScript(nonce, routeBase = '', initialTheme = '') {
                 const anchor = event.target?.closest?.('a[href]');
                 if (!anchor || anchor.hasAttribute('download')) return;
                 const target = safeExternalUrl(anchor.getAttribute('href'));
-                if (target === '#' || (routeBase && target.startsWith(routeBase))) return;
+                if (target === '#' || (routeBase && target.startsWith(routeBase))
+                    || (assetBase && target.startsWith(assetBase))) return;
                 event.preventDefault();
                 openExternal(target, true).catch((error) => fault('error', error.message, '', 0));
             };

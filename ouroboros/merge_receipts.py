@@ -46,6 +46,7 @@ from typing import Any, Callable, Dict, List, Optional
 from ouroboros import review_ledger
 from ouroboros.utils import utc_now_iso
 from ouroboros.task_store import patch_document
+from ouroboros.update_qualification import commit_summary, merge_qualification
 
 RECEIPTS_KEY = "merge_receipts"
 _RECEIPTS_CAP = 50
@@ -375,6 +376,10 @@ def public_block(receipt: Dict[str, Any]) -> str:
               f"- CONTRIBUTING checklist in this PR: {review.get('contributor_evidence', 'absent')}",
               "- A review record is evidence, not approval; merges from a shell or the web UI leave no receipt.",
               "<!-- /ouroboros:merge-receipt -->"]
+    if receipt.get("qualification"):
+        lines.insert(-1, commit_summary(receipt["qualification"]))
+    if receipt.get("commit_receipt") == "no_merge_commit_for_rebase":
+        lines.insert(-1, "- Rebase creates no merge commit; this receipt is retained in the PR and task only.")
     return "\n".join(lines)
 
 
@@ -670,6 +675,8 @@ def run_pr_merge(ctx: Any, gh: Gh, gh_api: Gh, *, drive_root: Any, task_id: str,
                        "contributor_evidence": contributor_evidence(pr.get("body") or "", pr.get("comments") or [])},
             "coverage": review_coverage(declared, host_observed, observed["head_sha"], record),
         }
+        receipt["qualification"] = merge_qualification(receipt["review"], review.get("checks"))
+        receipt["commit_receipt"] = ("no_merge_commit_for_rebase" if method == "rebase" else "requested")
         try:
             claimed = write_receipt(drive_root, task_id, receipt, claim=True)
         except Exception as exc:
@@ -690,7 +697,13 @@ def run_pr_merge(ctx: Any, gh: Gh, gh_api: Gh, *, drive_root: Any, task_id: str,
             [*(prior.get("launch_operation_ids") or []), *([operation_id] if operation_id else [])]))
         return {**_finish(ctx, gh, gh_api, drive_root, task_id, recovered), "readback_only": True,
                 "prior_status": str((prior.get("outcome") or {}).get("status") or "")}
-    res = gh(["pr", "merge", str(number), f"--{method}", "--match-head-commit", expected], timeout=120)
+    args = ["pr", "merge", str(number), f"--{method}", "--match-head-commit", expected]
+    body = None
+    if method != "rebase":
+        args += ["--body-file", "-"]
+        body = (_BODY_BLOCK_RE.sub("", str(pr.get("body") or "")).rstrip()
+                + "\n\n" + commit_summary(receipt["qualification"]))
+    res = gh(args, timeout=120, input_data=body)
     receipt.update(state="effect_attempted", effect={
         "ok": bool(getattr(res, "ok", False)), "exit_code": getattr(res, "exit_code", None),
         "http_status": getattr(res, "http_status", None), "failure": str(getattr(res, "failure", "") or ""),

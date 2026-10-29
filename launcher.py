@@ -83,6 +83,8 @@ from ouroboros.launcher_server_reaper import (
     reap_same_install_strays as _reap_same_install_strays_impl,
 )
 from ouroboros.launcher_readiness import wait_for_server as _wait_for_server
+from ouroboros.launcher_window_chrome import paint_room
+from ouroboros.standalone_page import themed_page
 from ouroboros.launcher_windows_runtime import (  # noqa: F401  (re-exported: same objects, prior launcher surface)
     _prepare_windows_webview_runtime,
     _show_windows_message,
@@ -195,6 +197,26 @@ def _bundle_dir() -> pathlib.Path:
     if getattr(sys, "frozen", False):
         return pathlib.Path(sys._MEIPASS)
     return _external_seed_bundle or pathlib.Path(__file__).parent
+
+
+# The layout of a window shown before the server, on the interface's tokens (standalone_page).
+_WINDOW_CSS = """
+body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  background: var(--bg-primary, Canvas); color: var(--text-primary, CanvasText); font-family: var(--font-sans, system-ui); }
+.window { box-sizing: border-box; max-width: 460px; padding: 24px; text-align: center; }
+.window h2 { margin: 0 0 12px; font-size: var(--type-page, 24px); font-weight: 600; line-height: var(--line-title); }
+.window p { margin: 0; font-size: var(--type-body); line-height: var(--line-body); }
+.window .muted { margin-top: 10px; font-size: var(--type-meta); line-height: var(--line-meta); }
+.window .btn { margin: 16px auto 0; }
+.window .ui-status { margin-top: 12px; }
+"""
+
+
+def _window_page(title: str, body: str) -> str:
+    """A window shown before the server: no saved choice can reach it, so it follows the device (macOS),
+    in the web/ shipped with this launcher's own code (the app's when frozen, the checkout's otherwise)."""
+    code_dir = pathlib.Path(sys._MEIPASS) if getattr(sys, "frozen", False) else pathlib.Path(__file__).parent
+    return themed_page(code_dir / "web", title, f'<div class="window">{body}</div>', _WINDOW_CSS)
 
 
 def _exec_source_launcher() -> None:
@@ -330,8 +352,7 @@ def _update_server_process_record_port(pid: int, actual_port: int) -> None:
         if not isinstance(record, dict) or int(record.get("pid") or 0) != int(pid):
             return
         record["port"] = int(actual_port)
-        if "requested_port" not in record:
-            record["requested_port"] = int(actual_port)
+        record.setdefault("requested_port", record["port"])
         record["port_updated_at"] = utc_now_iso()
         atomic_write_json(record_path, record, trailing_newline=True)
     except Exception:
@@ -1161,13 +1182,13 @@ def main(argv=()):
             if not _external_ui:
                 _open_browser_detached(existing_url).join(timeout=5.0)
             return
-        webview.create_window(
+        paint_room(webview.create_window(
             "Ouroboros",
-            html="<html><body style='background:#0f0f11;color:#efeff2;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>"
-            "<div style='text-align:center'><h2>Ouroboros is already running</h2><p>Only one instance can run at a time.</p></div></body></html>",
+            html=_window_page("Ouroboros", "<h2>Ouroboros is already running</h2>"
+                                           "<p>Only one instance can run at a time.</p>"),
             width=420,
             height=200,
-        )
+        ))
         webview.start(private_mode=False)
         return
 
@@ -1266,32 +1287,17 @@ def main(argv=()):
 
         git_window = webview.create_window(
             "Ouroboros — Setup Required",
-            html=(
-                """<html><body style="background:#0f0f11;color:#efeff2;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
-            <div style="text-align:center">
-                <h2>Git is required</h2>
-                <p>Ouroboros needs Git to manage its local repository.</p>
-                <button id="install-btn" style="padding:10px 24px;border-radius:8px;border:none;background:#0ea5e9;color:white;cursor:pointer;font-size:14px">
-                    Install Git (Xcode CLI Tools)
-                </button>
-                <p id="status" style="color:#fbbf24;margin-top:12px"></p>
-            </div></body></html>"""
-                if IS_MACOS
-                else f"""<html><body style="background:#0f0f11;color:#efeff2;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
-            <div style="text-align:center">
-                <h2>Git is required</h2>
-                <p>Ouroboros needs Git to manage its local repository.</p>
-                <p style="color:#94a3b8;font-size:13px;margin-top:8px">{_hint}</p>
-                <button id="install-btn" style="padding:10px 24px;border-radius:8px;border:none;background:#0ea5e9;color:white;cursor:pointer;font-size:14px;margin-top:12px">
-                    Install Git
-                </button>
-                <p id="status" style="color:#fbbf24;margin-top:12px"></p>
-            </div></body></html>"""
-            ),
+            html=_window_page("Ouroboros — Setup Required", (
+                "<h2>Git is required</h2><p>Ouroboros needs Git to manage its local repository.</p>"
+                + ("" if IS_MACOS else f'<p class="muted">{_hint}</p>')
+                + '<button id="install-btn" class="btn btn-primary" type="button">'
+                + ("Install Git (Xcode CLI Tools)" if IS_MACOS else "Install Git")
+                + '</button><p id="status" class="ui-status" role="status"></p>')),
             js_api=GitApi(),
             width=520,
             height=300,
         )
+        paint_room(git_window)
         webview.start(func=_git_page, args=[git_window], private_mode=False)
         if _shutdown_event.is_set():
             return
@@ -1404,22 +1410,16 @@ def main(argv=()):
                 file=sys.stderr,
             )
             sys.exit(1)
-        webview.create_window(
+        paint_room(webview.create_window(
             "Ouroboros — Startup Failed",
-            html=(
-                "<html><body style='background:#0f0f11;color:#efeff2;font-family:system-ui;"
-                "display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>"
-                "<div style='text-align:center;max-width:460px;padding:24px'>"
+            html=_window_page("Ouroboros — Startup Failed", (
                 "<h2>Ouroboros failed to start</h2>"
                 "<p>The local agent server did not become ready.</p>"
-                "<p style='color:#94a3b8;font-size:13px;margin-top:10px'>"
-                "Check launcher.log and agent_stdout.log in the Ouroboros data directory "
-                "for details.</p>"
-                "</div></body></html>"
-            ),
+                '<p class="muted">Check launcher.log and agent_stdout.log in the Ouroboros data directory '
+                "for details.</p>")),
             width=520,
             height=260,
-        )
+        ))
         webview.start(private_mode=False)
         return
 

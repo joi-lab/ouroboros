@@ -39,6 +39,7 @@ class _ExtensionRegistrations:
     # registered; the module endpoint serves these bytes, never the mutable
     # skill directory. Not part of snapshot().
     module_sources: Dict[str, str] = field(default_factory=dict)
+    widget_sources: Dict[str, bytes] = field(default_factory=dict)
     contributions: List[Dict[str, Any]] = field(default_factory=list)
     contribution_problems: List[str] = field(default_factory=list)
     host_sources: Dict[str, bytes] = field(default_factory=dict)
@@ -136,6 +137,7 @@ class _StagedRegistrations:
     # It reaches ``_ExtensionRegistrations.module_sources`` only at the swap, so
     # a refused publication never leaves a half-populated bundle serving bytes.
     module_sources: Dict[str, str] = field(default_factory=dict)
+    widget_sources: Dict[str, bytes] = field(default_factory=dict)
     # None preserves the live contribution capture on companion-only recovery.
     contributions: Optional[List[Dict[str, Any]]] = None
     contribution_problems: List[str] = field(default_factory=list)
@@ -266,6 +268,7 @@ def live_widget_projection(skill_name: Optional[str] = None) -> Optional[List[Di
             rows.append({
                 "tab": dict(copy.deepcopy(value), key=key),
                 "revision": str(bundle.content_hash or "") if bundle is not None else "",
+                "generation": str(bundle.generation_digest or "") if bundle is not None else "",
             })
         return rows
 
@@ -279,6 +282,23 @@ def live_module_sources(skill_name: str) -> Optional[Dict[str, str]]:
     with _lock:
         bundle = _extensions.get(skill_name)
         return None if bundle is None else dict(bundle.module_sources)
+
+
+def live_widget_files(skill: str, tab_id: str, generation: str) -> Optional[Dict[str, bytes]]:
+    """Exact tab declaration and bytes from one publication; never the mutable directory."""
+    with _lock:
+        bundle = _extensions.get(skill)
+        tab = _ui_tabs.get(f"{skill}:{tab_id}")
+        if (bundle is None or skill in _unloading or not generation
+                or bundle.generation_digest != generation or tab is None):
+            return None
+        render = tab["render"]
+        if render.get("entry_type") != "module":
+            return None
+        paths = [render["entry"], *render["assets"]]
+        if any(path not in bundle.widget_sources for path in paths):
+            return None
+        return {path: bundle.widget_sources[path] for path in paths}
 
 
 def live_contribution_projection() -> List[Dict[str, Any]]:

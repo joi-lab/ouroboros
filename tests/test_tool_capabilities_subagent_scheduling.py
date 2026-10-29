@@ -149,8 +149,12 @@ def test_local_readonly_subagent_initial_schemas_are_allowlisted(tmp_path):
     )
 
     names = {s["function"]["name"] for s in initial_tool_schemas(registry)}
-    assert LOCAL_READONLY_SUBAGENT_TOOL_NAMES <= names
-    assert "enable_tools" not in names
+    # A granted compat alias stays callable but is advertised only through its canonical name.
+    aliases = {name for name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES if registry._entries[name].alias_for}
+    assert aliases == {"ocr_pdf"}
+    assert LOCAL_READONLY_SUBAGENT_TOOL_NAMES - aliases <= names
+    assert not aliases & names and {registry._entries[name].alias_for for name in aliases} <= names
+    assert "enable_tools" in names  # loads permitted schemas only (#1860)
     assert "schedule_subagent" in names
     assert "verify_and_record" not in names
     assert "write_file" not in names
@@ -317,7 +321,7 @@ def test_capability_omission_manifest_surfaces_extension_discovery_failure(tmp_p
     monkeypatch.setattr(extension_loader, "_lock", BoomLock())
 
     registry.schemas()
-    tool_discovery.set_registry(registry)
+    monkeypatch.setattr(tool_discovery, "_registry", registry)  # never leak an unrestricted fallback into later tests
     text = tool_discovery._list_available_tools(registry._ctx)
 
     assert "CAPABILITY_OMISSION_MANIFEST" in text

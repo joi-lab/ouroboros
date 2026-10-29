@@ -79,22 +79,37 @@ def _guard_safety_configuration(settings: dict, *, owner_write: bool = False) ->
         raise ValueError("Safety owner rules must be text of at most 64,000 UTF-8 bytes")
     if owner_write or cfg.runtime_mode_at_least(cfg.get_runtime_mode(), "cyber_pro"):
         return
-    previous = cfg._settings_integrity.read_settings_json_verified(cfg.SETTINGS_PATH) or {}
+    previous = normalize_consciousness_safety(
+        cfg._settings_integrity.read_settings_json_verified(cfg.SETTINGS_PATH) or {})
     if safety_configuration_requires_owner(previous, settings):
         raise PermissionError("The resolved Safety Supervisor is owner-controlled; use /api/owner/safety-model, safety-mode or safety-rules.")
+
+
+def normalize_consciousness_safety(raw: dict) -> dict:
+    """Copy saved owner coverage into an absent consciousness field before defaults.
+
+    Pure and idempotent: explicit choices, including full, never follow later edits.
+    """
+    from ouroboros.settings_scales import normalize_safety_mode
+
+    key = "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE"
+    if key in raw or "OUROBOROS_SAFETY_MODE" not in raw:
+        return raw
+    return {**raw, key: normalize_safety_mode(raw["OUROBOROS_SAFETY_MODE"])}
 
 
 def _migrate_consciousness_safety(raw: dict, *, lock_held: bool) -> dict:
     """Persist the upgrade once, on an existing document under its settings lock.
 
     An absent document is fresh; a pinned child snapshot is read-only. Neither
-    is an upgrade. No effective/read-time copy follows later owner edits.
+    is rewritten. Unlike raw reads, this upgrade also persists full when both fields
+    are absent.
     """
     from ouroboros import config as cfg
-    from ouroboros.settings_scales import normalize_safety_mode
     key = "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE"
     if key in raw or not lock_held or os.environ.get("OUROBOROS_SETTINGS_SHA256"):
         return raw
+    from ouroboros.settings_scales import normalize_safety_mode
     from ouroboros.utils import append_jsonl, utc_now_iso, write_text_atomic
 
     cfg._guard_live_settings_write()

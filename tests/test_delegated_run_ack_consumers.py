@@ -11,7 +11,7 @@ callers and the one same-attempt rebuild, not the helper alone:
 * an owner-wait planned restart resumes the SAME attempt through ``run_llm_loop``:
   the first request after it omits the own-run line exactly when the restored
   dialogue carries the terminal wake; otherwise the unread-result line names
-  the output the body collected after the loop exit, without acknowledging a wake;
+  the output the body collected during the attempt, named at the loop's exit, without acknowledging a wake;
 * the row survives the marker-filtered custody chain and the current closed-run
   receipt, so every custody reader replays the same acknowledgement.
 
@@ -141,10 +141,7 @@ def ack_spy(monkeypatch):
 
 # --- the loop's tool-result seam, then a same-attempt cold Resume -------------------
 
-@pytest.mark.parametrize("waited", [True, pytest.param(False, marks=pytest.mark.xfail(strict=True, reason=(
-    "since #2205 the loop-exit release leaves a settled run to the body's collector, which shows the "
-    "result as AVAILABLE without recording the never-read omission; the follow-up decides where that "
-    "omission is recorded")))], ids=["wake-appended", "never-waited"])
+@pytest.mark.parametrize("waited", [True, False], ids=["wake-appended", "never-waited"])
 def test_a_same_attempt_cold_resume_keeps_the_restored_wake_and_its_ack(tmp_path, monkeypatch, ack_spy, waited):
     from ouroboros.gateways import claudexor as gw
     from ouroboros.owner_wait import checkpoint_owner_wait, set_owner_wait
@@ -168,6 +165,12 @@ def test_a_same_attempt_cold_resume_keeps_the_restored_wake_and_its_ack(tmp_path
         return {"role": "assistant", "content": "parking for the owner", "tool_calls": []}, 0.0
 
     monkeypatch.setattr(loop, "_dispatch_round_model", model)
+    if not waited:
+        # The body's collector retains the settled output during the attempt (#2205); the loop's
+        # exit then names the never-read omission.
+        from ouroboros.delegate_collection import collect_terminal
+
+        collect_terminal(tmp_path, "run-1", gateway=engine)
     loop.run_llm_loop(**_loop_kwargs(tmp_path, live, first))
     transcript = live._ctx.messages
     tool_rows = [row for row in transcript if row.get("role") == "tool" and row.get("tool_call_id") == "call-wait"]
@@ -189,10 +192,6 @@ def test_a_same_attempt_cold_resume_keeps_the_restored_wake_and_its_ack(tmp_path
         assert snapshot(tmp_path)["state"]["run-1"].terminal_ack_attempt == "1"
     else:
         assert tool_rows == [] and _acks(tmp_path) == []
-        # Since #2205 the body's collector, not the loop-exit release, collects a settled run's output.
-        from ouroboros.delegate_collection import collect_terminal
-
-        collect_terminal(tmp_path, "run-1", gateway=engine)
 
     # The owner wait parks the transcript the loop actually built; a planned restart picks it up.
     live._ctx._owner_wait_requested = "quiz"

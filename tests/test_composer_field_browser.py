@@ -46,6 +46,8 @@ FACTS = """() => {
 }"""
 # From the press of Send: whether a copy of the bubble flew, where it stood first and a few frames later, and, once it
 # should have landed, whether it left and the sent bubble shows.
+# The copy's place from the moment it appears, every frame until it leaves (or 5 s). The acceptance and the
+# two frames before the flight starts can take long on a loaded runner, so nothing is sampled at a fixed time.
 FLIGHT = """() => new Promise((resolve) => {
     const seen = [];
     const observer = new MutationObserver(() => {
@@ -54,19 +56,28 @@ FLIGHT = """() => new Promise((resolve) => {
     });
     observer.observe(document.body, { childList: true });
     const field = document.querySelector('#page-chat .chat-field').getBoundingClientRect();
+    const userRows = () => document.querySelectorAll('#chat-messages .chat-bubble.user');
+    const before = userRows().length;
     document.querySelector('#page-chat #chat-send').click();
-    const sample = () => { const copy = document.querySelector('.chat-send-flight');
-        if (copy) seen.push(copy.getBoundingClientRect().top); };
-    setTimeout(sample, 120);
-    setTimeout(sample, 220);
-    setTimeout(() => {
+    const started = performance.now();
+    let quiet = 0;
+    const finish = () => {
         observer.disconnect();
-        const rows = document.querySelectorAll('#chat-messages .chat-bubble.user');
+        const rows = userRows();
         const sent = rows[rows.length - 1];
         resolve({ seen, fieldTop: field.top, left: Boolean(document.querySelector('.chat-send-flight')),
             sentTop: sent ? sent.getBoundingClientRect().top : null,
             sentOpacity: sent ? getComputedStyle(sent).opacity : null, sentText: sent ? sent.textContent : '' });
-    }, 900);
+    };
+    const step = () => {
+        const copy = document.querySelector('.chat-send-flight');
+        if (copy && seen.length) seen.push(copy.getBoundingClientRect().top);
+        // The send is accepted once its bubble is in the feed; a flight's copy comes in the same task.
+        quiet = !copy && userRows().length > before ? quiet + 1 : 0;
+        if (quiet >= 3 || performance.now() - started > 5000) { finish(); return; }
+        requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
 })"""
 
 

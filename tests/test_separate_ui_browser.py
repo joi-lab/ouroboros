@@ -841,7 +841,7 @@ def test_update_status_restart_and_panic_are_the_cores_own_process_facts(stack):
             session.shot("2-restarted")
 
             # Panic: the core stops everything and exits; the interface host is untouched.
-            page.locator('[data-chat-command="panic"]').click()
+            page.locator('#page-chat [data-chat-command="panic"]').click()
             expect(page.locator("[data-confirm-ok]")).to_have_count(0)
             exit_code = core.process.wait_exit(90)
             page.wait_for_function(DISCONNECTED, timeout=30_000)

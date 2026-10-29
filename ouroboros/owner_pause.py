@@ -42,7 +42,7 @@ import pathlib
 import threading
 import time
 import uuid
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from ouroboros.store import StoreBusy, StoreError, acquisition_budget, admission_acquisition, physical_acquisition
 
@@ -145,6 +145,17 @@ def read_fence(root_drive: Any, root_task_id: str, *, _observations=None) -> Dic
 
 def fence_closed(fence: Dict[str, Any]) -> bool:
     return str((fence or {}).get("state") or "") in CLOSED_FENCE_STATES
+
+
+def paused_gap(root_drive: Any, task_id: str) -> Dict[str, Any]:
+    """``{"membership_gaps": ...}`` the task's still-closed Pause last named, as its Resume reads it,
+    else ``{}``: the fence's current fact, never the episode's older notice. Never raises."""
+    try:
+        fence = read_fence(root_drive, task_id)
+    except Exception:
+        return {}
+    gaps = fence.get("membership_gaps") if fence_closed(fence) else None
+    return {"membership_gaps": dict(gaps)} if isinstance(gaps, dict) and gaps.get("count") else {}
 
 
 def root_actor(root_drive: Any, root_task_id: str, task_id: str, *, strict: bool = False) -> bool:
@@ -881,31 +892,50 @@ def launch_admission(source: Any, *, root_resume: Optional[Dict[str, Any]] = Non
             _REVIEW_ADMISSION.reset(token)
 
 
-def tree_member_results(root_drive: Any, root_task_id: str) -> Dict[str, Dict[str, Any]]:
+def tree_member_results(root_drive: Any, root_task_id: str, *, linked: Iterable[str] = ()) -> Any:
     """Select complete retained membership, then strictly read its authority.
 
-    The typed ``root_task_id`` column selects the tree without reading a body; rows
-    without a top-level root still need their legacy metadata read. An unavailable
-    store refuses the census. Selection never supplies live status or custody.
+    ``task_store.tree_facts`` selects the tree (``linked``: ids the caller's own queue,
+    custody or model-request sources tie to it) and names the rows it could not read. A
+    member whose strict read refuses or no longer finds its own record joins them as linked:
+    it holds this tree while the others still answer. An unavailable store refuses the census.
+    Selection never supplies live status or custody. Returns a ``TreeCensus``.
     """
+    from ouroboros.store_hot_facts import lineage_root
     from ouroboros.task_results import load_task_result
-    from ouroboros.task_store import tree_facts
+    from ouroboros.task_store import TreeCensus, tree_facts
 
     try:
-        facts = tree_facts(root_drive, root_task_id)
+        census = tree_facts(root_drive, root_task_id, linked=linked)
     except StoreBusy:
         raise
     except StoreError as exc:
         raise ValueError("tree_membership_unreadable") from exc
-    members = {}
-    for task_id in facts:
-        row = load_task_result(root_drive, task_id, strict=True)
-        if row is None:
-            raise ValueError("tree_member_disappeared")
-        if str(row.get("root_task_id") or (row.get("metadata") or {}).get("root_task_id")
-               or task_id) == root_task_id:
+    members, unresolved = {}, dict(census.unresolved)
+    for task_id in census.members:
+        try:
+            row = load_task_result(root_drive, task_id, strict=True)
+        except StoreError:
+            raise
+        except (ValueError, TypeError, AttributeError, KeyError, RecursionError):
+            unresolved[task_id] = {"reason": "record_unreadable", "linked": True}
+            continue
+        if row is None:  # its row without the body that answers for it (or gone since): it alone is unknown
+            unresolved[task_id] = {"reason": "body_missing", "linked": True}
+            continue
+        if lineage_root(row) == root_task_id:
             members[task_id] = row
-    return members
+    return TreeCensus(members, dict(sorted(unresolved.items())))
+
+
+def tree_model_requests(root_drive: Any, root_task_id: str) -> list:
+    """The root's open model attempts (the usage store's open-set index): a census reads them
+    first so their task ids tie damaged rows to this tree. Raises when unreadable: unknown, never none."""
+    from ouroboros import usage_store
+
+    with usage_store.read(root_drive) as txn:  # captured in one step, decoded after the read closed
+        captured = txn.open_attempt_rows(root_task_id=str(root_task_id))
+    return usage_store.decode_attempts(captured)
 
 
 @contextmanager

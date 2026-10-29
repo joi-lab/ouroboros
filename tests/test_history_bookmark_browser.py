@@ -43,9 +43,9 @@ def test_a_deep_place_with_an_open_review_and_line_reopens_at_the_newest_message
             _step(page, feed, automatic=True)  # read on past the card's page while it stays mounted
             if card.get_attribute('data-expanded') != '1':
                 card.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
-            card.locator('[data-review-section-toggle]').click()
+            card.locator('[data-live-review-summary]').click()
             card.locator('[data-review-group-toggle]').click()
-            card.locator('[data-review-attempt-toggle]').first.click()
+            card.locator('[data-review-facts] > summary').first.click()
             detail = card.locator('[data-review-attempt-detail]').first
             detail.wait_for(state='visible')
             line = card.locator('.chat-live-line.expandable').last

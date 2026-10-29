@@ -30,12 +30,14 @@ import { initUpdates } from './modules/updates.js';
 import { initActivity } from './modules/activity.js';
 import { initConsciousnessDashboard } from './modules/consciousness_dashboard.js';
 import { initUpdateStatus } from './modules/update_status.js';
+import { getInterfaceSize } from './modules/interface_size.js';
 import { initDashboard } from './modules/dashboard.js';
 import { initStorage } from './modules/storage.js';
 import { SHELL_ICONS } from './modules/page_icons.js';
 import { renderNavRows, renderProjectsHeader } from './modules/pages.js';
 import { renderPageHeader } from './modules/page_header.js';
-import { isStackLayout, onLayoutChange } from './modules/layout.js';
+import { createRoomHeader, panicButtonHtml } from './modules/chat_header.js';
+import { isStackLayout, measurePinnedBars, onLayoutChange, pinchMagnified } from './modules/layout.js';
 import { createLayerStack } from './modules/layers.js';
 import { afterMotion, reducedMotion } from './modules/motion.js';
 import { createShellMotion } from './modules/shell_motion.js';
@@ -99,15 +101,14 @@ const shellMotion = createShellMotion({ content: document.getElementById('conten
 // follows the Projects, before the version. Nothing below looks a row up before this.
 primarySidebar?.querySelector('.sidebar-head')?.insertAdjacentHTML('beforeend', renderNavRows('head'));
 primarySidebar?.querySelector('.sidebar-foot-meta')?.insertAdjacentHTML('beforebegin', renderNavRows('foot'));
+measurePinnedBars(primarySidebar);  // a short window's row scroll margin under its pinned head and foot
 const navProjectsHeader = primarySidebar?.querySelector('.nav-projects-header');
 if (navProjectsHeader) navProjectsHeader.innerHTML = renderProjectsHeader();
 const navProjectsFacts = navProjectsHeader?.querySelector('.nav-projects-facts');
 const navDrawerBackdrop = document.getElementById('nav-drawer-backdrop');
 const projectPanelBackdrop = document.getElementById('project-panel-backdrop');
 const projectPanel = document.getElementById('project-panel');
-// The Project panel's header is the one page header (page_header.js): name · status … ×; its ☰ is the room's
-// composer row's first control (owner 19.10, 1A). A Project is named by its owner, not by the sidebar, so its name
-// stays visible in every layout (owner Q3=A).
+// The Project panel's bar is the page header (DESIGN "Page header"): name · status, consciousness chip … Panic ×.
 projectPanel?.insertAdjacentHTML('afterbegin', renderPageHeader({
     title: '',
     titleId: 'project-panel-title',
@@ -115,8 +116,9 @@ projectPanel?.insertAdjacentHTML('afterbegin', renderPageHeader({
     showMobileNav: false,
     variant: 'project',
     className: 'project-panel-bar project-inspector-header',
-    trailingHtml: `<button id="project-panel-close" class="shell-icon-control project-panel-close" type="button" title="Close project thread" aria-label="Close project thread">${SHELL_ICONS.close}</button>`,
+    trailingHtml: `${panicButtonHtml()}<button id="project-panel-close" class="shell-icon-control project-panel-close" type="button" title="Close project thread" aria-label="Close project thread">${SHELL_ICONS.close}</button>`,
 }));
+const projectHeader = createRoomHeader({ bar: projectPanel?.querySelector('.project-panel-bar'), ws, openDashboardTab, refreshState: refreshProjectsNav });
 const projectPanelBody = document.getElementById('project-panel-body');
 const projectPanelTitle = document.getElementById('project-panel-title');
 const navProjects = document.getElementById('nav-projects');
@@ -481,9 +483,10 @@ const stateSnapshots = createStateSnapshotSequencer((data, requestedAt, generati
         ?? (data.projects || lastProjectRows).map((project) => project?.chat_id));
     renderProjectsNav(data.projects || lastProjectRows,
         data.project_chat_ids ?? (data.projects ? undefined : Array.from(state.projectChatIds)), projectActivityIndex);
-    applyTaskBindings(data.task_bindings || {});
+    if (data.task_bindings) applyTaskBindings(data.task_bindings);  // null: unchanged, never filled here
     hydrateOpenChatsFromState(data, requestedAt, generation);
     evolution?.hydrateStateSnapshot(data);
+    projectHeader?.update(data);
     observeMainRevision(data.main_visible_revision);
 }, undefined, (requestedAt) => {
     markProjectActivityUnknown();
@@ -664,8 +667,7 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
                 mountEl: projectPanelBody,
                 asPanel: true,
                 title: project.name || project.id,
-                // The panel's Retry reruns the open transaction (fetch, paint, ACK)
-                // against the newest known revision, so a recovered read is also seen.
+                // Retry reads, paints and acknowledges the newest revision.
                 onHistoryRetry: () => acknowledgeProjectAfterPaint(freshProjectRow(project), null, { forcePaint: true }),
                 // Arriving at the newest messages retries a withheld acknowledgement.
                 onReadingLatest: () => acknowledgeProjectAfterPaint(freshProjectRow(project)),
@@ -694,19 +696,14 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
                 if (projectReveals.get(project.id) === reveal) projectReveals.delete(project.id);
             }
         }
-        // Reopened at the newest message; after the panel is shown, so the column
-        // has real geometry. An unread room lands on the message that arrived last
-        // (DESIGN "Unread"). A question opened from Main is revealed below instead.
+        // Once visible, an unread room lands on its newest message (DESIGN "Unread").
         const unread = Math.max(0, Number(freshProjectRow(project).visible_revision) || 0)
             > Math.max(0, Number(state.projectSeenRevision?.[project.id]) || 0);
         if (!(taskId && quizId)) void inst.showLatest?.({ arrive: unread });
-        // ACK only the exact revision whose history was fetched and painted. chat.js
-        // owns the paint receipt; an already-painted instance skips the forced
-        // refetch — the server clamps the ACK, so no repaint is needed.
+        // ACK the exact painted revision; chat.js owns the receipt and skips redundant reads.
         if (taskId && quizId) await revealProjectQuestion(project, inst, taskId, quizId);
         else {
-            // Every showing is a navigation: a plain reopen addresses no question
-            // and so voids a reveal that a hidden pending-work survivor still awaits.
+            // A plain reopen cancels any pending question reveal.
             void inst.revealQuestion?.(taskId, quizId);
             await acknowledgeProjectAfterPaint(project, inst, { forcePaint: !inst.hasPaintedHistory?.() });
         }
@@ -715,9 +712,7 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
     }
 }
 
-// The host names the destination. Resolve it in the full registry and read its exact page BEFORE
-// switching: errors and cancelled lookups keep the current room and all composer state. The page
-// then enters the destination's own pager; ordinary close/reopen still goes to the newest message.
+// Resolve and read the exact destination before switching; failed lookups retain room/composer state.
 async function revealQuotedSource(address, chatId, isCurrent) {
     const navigation = projectNavigationGeneration;
     const current = () => navigation === projectNavigationGeneration && isCurrent();
@@ -731,12 +726,22 @@ async function revealQuotedSource(address, chatId, isCurrent) {
     const page = await apiClient.chatHistory({ chatId, around: address });
     if (!current()) return null;
     if (page?.anchor?.state !== 'found') return page?.anchor || { state: 'unknown' };
-    if (page.anchor.row_address !== address || page.anchor.chat_id !== chatId) return { state: 'unknown' };
+    const matches = address.startsWith('task:') ? chatId === 1 && page.anchor.task_id === address.slice(5)
+        : page.anchor.row_address === address && page.anchor.chat_id === chatId;
+    if (!matches) return { state: 'unknown' };
     if (project) return openProjectPanel(project, { openOnly: true, sourceReveal: { address, page, current: isCurrent } });
     closeProjectPanel({ reveal: true });
     const showing = projectNavigationGeneration;
     return mainChat.revealSource(address, () => showing === projectNavigationGeneration, page);
 }
+
+window.addEventListener('ouro:open-task', async ({ detail }) => {
+    if (!detail?.task_id || detail.chat_id !== 1 || !await showPage('chat')) return;
+    try {
+        const result = await revealQuotedSource(`task:${detail.task_id}`, detail.chat_id, () => state.activePage === 'chat');
+        if (result && result.state !== 'found') showToast(tr('consciousness.task_unavailable', 'This task is unavailable.'), 'warn');
+    } catch { showToast(tr('consciousness.task_unavailable', 'This task is unavailable.'), 'warn'); }
+});
 
 function freshProjectRow(project) {
     return lastProjectRows.find((row) => row.id === project.id) || project;
@@ -1205,7 +1210,7 @@ async function refreshProjectsNav(force = true) {
     const request = await stateSnapshots.gate(force);
     if (!request) return;
     try {
-        const resp = await apiFetch('/api/state', { cache: 'no-store' });
+        const resp = await apiFetch(request.path || '/api/state', { cache: 'no-store' });
         if (!resp.ok) {
             stateSnapshots.fail(request);
             return;
@@ -1358,6 +1363,7 @@ ws.on('open', () => {
     markProjectActivityUnknown();
     refreshProjectsNav(true); // the in-flight read predates the socket: one coalesced post-open read
     pendingBootRead().then(refreshDictionary); // every open, the first too: a frame sent before this subscription was missed (behind the boot read, whose older answer must not land last)
+    loadVersion(); // a page the reload decision keeps may now face a core of another version
 });
 ws.on('close', () => {
     activitySocketDisconnected = true;
@@ -1387,6 +1393,8 @@ const disposeStorage = initStorage({ ...ctx, mount: document.getElementById('das
 initSkills(ctx);
 initWidgets(ctx);
 const updateStatus = initUpdateStatus(ctx);
+// The interface size's one controller: the desktop keys work on every page, the slider lives in Settings.
+getInterfaceSize();
 
 initOnboardingOverlay();
 
@@ -1521,6 +1529,8 @@ if (hashPage && hashPage !== state.activePage) showPage(hashPage);
     const updateVvh = () => {
         const h = viewportHeight();
         if (isStackLayout()) {
+            // A pinch only magnifies: the room keeps the height it had, or it would shrink with the visual viewport.
+            if (pinchMagnified()) return;
             vvhStyle.textContent = ':root{--vvh:' + Math.max(320, Math.ceil(h)) + 'px}';
             if (!focusedKeyboardEditable()) {
                 applyKeyboardState(false);

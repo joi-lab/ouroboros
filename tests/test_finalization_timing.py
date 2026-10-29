@@ -671,5 +671,5 @@ def test_final_answer_discloses_own_custody_before_annotation_and_keeps_failed_p
     assert stored.get("delegate_terminal_reconciliation", {}).get("open_run_ids", []) == (["leaf"] if own_run else [])
     assert stored.get("delegated_runs_unreconciled", []) == (["leaf"] if own_run else [])
     assert ("delegate_terminal_reconciliation" in stored) is own_run
-    assert (stored["reason_code"] == "delegated_custody_unreconciled") is own_run
+    assert stored["reason_code"] == "final_message", "an open debt rides beside the cause, never as it (#1583)"
     assert pending[0]["text"] == "Answer."

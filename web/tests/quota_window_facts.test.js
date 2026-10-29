@@ -84,18 +84,21 @@ test('only an honored exact text scope may turn cached quota into an actor verdi
     assert.equal(sessionRouteVerdict(row, state, nowMs).label, 'Available');
 });
 
-test('native-default subject aliases need the same positive roster as Python inspection', () => {
+test('a default pin never borrows an unprofiled window, whatever the roster says', () => {
+    // #244, as in Python inspection: a null/empty subject is an unprofiled route's
+    // own window, never `claude-default`'s; only the exact subject answers.
     const state = stateFor([]);
     const defaultRow = { route: { ...row.route, credential_profile_id: 'claude-default' } };
     state.snapshot.profiles.profiles[0].profile.profile_id = 'claude-default';
     state.snapshot.availability_scope = { model: 'fable', requestKind: 'text', basis: 'quota_block' };
     state.snapshot.quota[0].availability = { state: 'available' };
-    state.snapshot.quota[0].subject.subject_id = null;
-    assert.equal(sessionRouteVerdict(defaultRow, state, nowMs).label, 'Not checked');
-    state.snapshot.profiles.accountPools = [];
+    for (const pools of [undefined, []]) {
+        state.snapshot.profiles.accountPools = pools;
+        for (const subject of [null, '', 'healthy-sibling']) {
+            state.snapshot.quota[0].subject.subject_id = subject;
+            assert.equal(sessionRouteVerdict(defaultRow, state, nowMs).label, 'Not checked', String(subject));
+        }
+    }
+    state.snapshot.quota[0].subject.subject_id = 'claude-default';
     assert.equal(sessionRouteVerdict(defaultRow, state, nowMs).label, 'Available');
-    state.snapshot.quota[0].subject.subject_id = '';
-    assert.equal(sessionRouteVerdict(defaultRow, state, nowMs).label, 'Available');
-    state.snapshot.quota[0].subject.subject_id = 'healthy-sibling';
-    assert.equal(sessionRouteVerdict(defaultRow, state, nowMs).label, 'Not checked');
 });

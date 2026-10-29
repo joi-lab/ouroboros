@@ -70,6 +70,7 @@ def test_startup_quit_only_cleans_owned_or_identity_proven_server(native_guard, 
     webview.create_window, webview.start = create_window, start
     monkeypatch.setitem(sys.modules, "webview", webview)
     monkeypatch.setattr(launcher_onboarding, 'NativeAppearance', lambda: SimpleNamespace(attach=lambda window: None))
+    monkeypatch.setattr(launcher_onboarding, 'paint_room', lambda window: None)  # the macOS leaf; no events here
     monkeypatch.setattr(launcher_onboarding, 'setup_recovery_menu', lambda *a: [])
     monkeypatch.setattr(launcher.threading, "Thread", lambda **kw: SimpleNamespace(start=lambda: None, join=lambda **kw: None))
     for name in ("_external_ui", "_external_host_update", "_external_seed_bundle", "_launch_argv", "_launch_intent",

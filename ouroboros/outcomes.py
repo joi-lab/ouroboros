@@ -39,6 +39,7 @@ from ouroboros._outcome_tool_errors import (  # explicit re-exports, one stateme
     _is_ignored_readonly_block as _is_ignored_readonly_block,
     _NON_BLOCKING_READONLY_BLOCK_STATUSES as _NON_BLOCKING_READONLY_BLOCK_STATUSES,
     _NON_BLOCKING_RECOVERABLE_STATUSES as _NON_BLOCKING_RECOVERABLE_STATUSES,
+    _NON_EFFECT_OBSERVATION_STATUSES as _NON_EFFECT_OBSERVATION_STATUSES,
     _OK_TOOL_STATUSES as _OK_TOOL_STATUSES,
     _POLICY_DENIAL_STATUSES as _POLICY_DENIAL_STATUSES,
     _RECOVERY_TOOL_NAMES as _RECOVERY_TOOL_NAMES,
@@ -276,7 +277,7 @@ _LEDGER_NON_FAILURE_STATUSES = (
     | frozenset({"refused_out_of_scope"})
     # tool_reported_failure: the tool RAN and answered honestly ({"ok": false} — a
     # diagnostic reporting what it was called to find). A finding, not a failure.
-    | frozenset({"tool_reported_failure"})
+    | frozenset({"tool_reported_failure"}) | _NON_EFFECT_OBSERVATION_STATUSES
 )
 
 
@@ -416,25 +417,45 @@ def infra_failed_axes(reason_code: str, *, lifecycle: str = "failed", review_tri
     )
 
 
-# An undisposed own delegated patch is a DEBT, not a failure: the task's own
-# derived verdicts (execution, review, objective, artifacts) are what it earned
-# and must survive, so the custody fact is ADDED as an objective warning rather
-# than replacing the axes with an infrastructure terminal.
+# An undisposed own delegated run is a DEBT beside the cause, never the cause (#1583):
+# the row keeps the reason and axes it earned, and the debt is its current
+# ``delegated_runs_unreconciled`` list plus the reconciliation envelope, healed from the
+# write side. Rows written earlier carry this code as their ``reason_code`` and objective
+# warning; readers keep those bytes and look beneath them (``recorded_cause``).
 WARN_DELEGATED_CUSTODY_UNRECONCILED = "delegated_custody_unreconciled"
 
 
-def custody_debt_axes(axes: Any) -> Dict[str, Any]:
-    """Add the custody-debt warning to derived axes without rewriting them.
+def recorded_cause(result: Any) -> str:
+    """A terminal row's own cause: its ``reason_code``, or beneath an older custody
+    stamp the typed ``outcome_axes.execution.reason_code`` (``""`` when that is missing
+    too: the cause is unrecorded, never guessed from prose)."""
+    record = result if isinstance(result, dict) else {}
+    reason = str(record.get("reason_code") or "")
+    if reason != WARN_DELEGATED_CUSTODY_UNRECONCILED:
+        return reason
+    axes = record.get("outcome_axes") if isinstance(record.get("outcome_axes"), dict) else {}
+    execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
+    cause = str(execution.get("reason_code") or "")
+    return "" if cause == WARN_DELEGATED_CUSTODY_UNRECONCILED else cause  # a read-back stamp is no cause
 
-    Idempotent: the overlay is applied again when the result row is stored, and
-    ``_merge_objective_warning`` already dedups. Nothing is copied onto the
-    execution axis — the debt list itself lives on the row as
-    ``delegated_runs_unreconciled`` plus the reconciliation envelope."""
-    out = copy.deepcopy(axes) if isinstance(axes, dict) and axes else {}
-    objective = out.setdefault(
-        "objective", {"status": OBJECTIVE_NOT_EVALUATED, "source": "none"})
-    _merge_objective_warning(objective, WARN_DELEGATED_CUSTODY_UNRECONCILED)
-    return out
+
+def current_custody_debt(*records: Any) -> Optional[list]:
+    """The first ``delegated_runs_unreconciled`` list a record carries (a row before its
+    event); ``None`` when none does: absence is not proof of reconciliation."""
+    return next((record["delegated_runs_unreconciled"] for record in records if isinstance(record, dict)
+                 and isinstance(record.get("delegated_runs_unreconciled"), list)), None)
+
+
+def objective_warned(objective: Any, debt: Optional[list]) -> bool:
+    """The headline's objective warning: a nonempty current debt list warns, and an older
+    row's custody warning stops counting once that list is known empty; every other warning,
+    and one beside an absent list, keep the stored word. Twin: log_events.js ``objectiveWarned``."""
+    objective = objective if isinstance(objective, dict) else {}
+    primary = objective.get("warning")
+    if debt or debt is None or primary != WARN_DELEGATED_CUSTODY_UNRECONCILED:
+        return bool(debt) or bool(primary)
+    warnings = objective.get("warnings") if isinstance(objective.get("warnings"), list) else []
+    return any(code and code != WARN_DELEGATED_CUSTODY_UNRECONCILED for code in warnings)
 
 # Tools/roots whose successful use means the turn produced reviewable work.
 # Root-aware write tools: these take a `root` arg, so the scratch-exclusion rule
@@ -747,6 +768,34 @@ def _merge_axis(default: Dict[str, Any], value: Any) -> Dict[str, Any]:
     return merged
 
 
+def _advisory_procedural_refusal(axes: Dict[str, Any], result: Dict[str, Any]) -> bool:
+    """A stored task-acceptance FAIL that was only the Advisory host declining a second panel.
+
+    The record's own decision is ``identical_acceptance_refused`` under explicit
+    ``advisory`` enforcement over a verdict that was not FAIL (``degraded``), and
+    execution is ``ok`` with a nonempty retained answer, not a typed host notice.
+    Execution alone proves no answer. Under Advisory that refusal is a
+    warning, so ``normalize_outcome_axes`` reads the objective as ``best_effort``
+    with the stored status beside it; the review, its verdict and the decision
+    stay as recorded. Any other enforcement (missing included), reason, verdict
+    or execution keeps the stored fail. Twin: ``log_events.advisoryProceduralRefusal``.
+    """
+    objective, review, execution = (axes.get(key) if isinstance(axes.get(key), dict) else {}
+                                    for key in ("objective", "review", "execution"))
+    decision = review.get("acceptance_decision") if isinstance(review.get("acceptance_decision"), dict) else {}
+    signals = review.get("aggregate_signals") if isinstance(review.get("aggregate_signals"), list) else []
+    answer = result.get("result")
+    # Display views omit the body but carry this same existence fact from that row.
+    ready = (isinstance(answer, str) and bool(answer)) if "result" in result else result.get("_result_text_present") is True
+    return (ready
+            and str(result.get("terminal_origin") or "") in {"", "model_final"}
+            and execution.get("status") == EXECUTION_OK and objective.get("status") == OBJECTIVE_FAIL
+            and objective.get("source") == "task_acceptance_review"
+            and objective.get("reason") == decision.get("reason") == REASON_IDENTICAL_ACCEPTANCE_REFUSED
+            and decision.get("status") == ACCEPTANCE_FINALIZED_UNACCEPTED and decision.get("enforcement") == "advisory"
+            and review.get("status") == OBJECTIVE_DEGRADED and "FAIL" not in {str(s).upper() for s in signals})
+
+
 def normalize_outcome_axes(result: Dict[str, Any]) -> Dict[str, Any]:
     """Return canonical axes for new and historical task result records."""
 
@@ -786,6 +835,8 @@ def normalize_outcome_axes(result: Dict[str, Any]) -> Dict[str, Any]:
     elif not legacy and status == "failed":
         execution = EXECUTION_FAILED
         reason = reason or status
+    if str(result.get("reason_code") or "").strip() == WARN_DELEGATED_CUSTODY_UNRECONCILED:
+        reason = ""  # an older custody stamp names no execution cause (#1583): only a typed one stands
     artifact_bundle = result.get("artifact_bundle") if isinstance(result.get("artifact_bundle"), dict) else {}
     explicit_artifact_status = str(artifact_bundle.get("status") or result.get("artifact_status") or "").strip()
     artifact_status = explicit_artifact_status or "not_applicable"
@@ -814,6 +865,9 @@ def normalize_outcome_axes(result: Dict[str, Any]) -> Dict[str, Any]:
         normalized["lifecycle"]["status"] = str(result.get("status") or "")
     if explicit_artifact_status:
         normalized["artifacts"]["status"] = explicit_artifact_status
+    if _advisory_procedural_refusal(axes, result):
+        normalized["objective"] = {**normalized["objective"], "status": OBJECTIVE_BEST_EFFORT,
+                                   "ignored_status": OBJECTIVE_FAIL}
     objective = normalized.get("objective") if isinstance(normalized.get("objective"), dict) else {}
     objective_status = str(objective.get("status") or OBJECTIVE_NOT_EVALUATED)
     objective_source = str(objective.get("source") or "none")
@@ -860,6 +914,7 @@ def public_task_result(result: Dict[str, Any], *, include_outcome_axes: bool = T
                 item_key: item_value
                 for item_key, item_value in value.items()
                 if item_key not in {"result_status", "compat_result_status"}
+                and (parent is not None or item_key not in {"swarm_fanouts", "swarm_fanout_basis"})
             }
             if parent is None:
                 public = clone
@@ -1041,12 +1096,12 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         and usage_reason in BEST_EFFORT_REASON_CODES
         and bool(usage.get("_best_effort_extracted"))
         and text.strip()
-        and not text.lstrip().startswith(("⚠️", "❌"))
     ):
         # Forced finalization (deadline grace / budget / round limit) that
         # actually EXTRACTED a model answer: honest best-effort, not failure.
         # Deterministic structural gate: forced reason code + the loop's typed
-        # "model answer extracted" fact + non-empty non-error text. Host
+        # "model answer extracted" fact + non-empty text. A model may begin
+        # its answer with a warning or cross; typography is not provenance. Host
         # fallback strings (e.g. budget rejection notices) never set the
         # extraction fact and stay failed — no text-shape whitewashing.
         execution_status = EXECUTION_BEST_EFFORT
@@ -1100,7 +1155,7 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
     # The planning gate holds or releases the final answer; it names no objective of its
     # own (plans have no cycle cap, no quorum and no author stop: the stop path is the
     # task's). Its open objections and pending asks ride ``execution.plan_review`` below.
-    plan_gate = _trace_mapping(llm_trace, "force_plan_decision")
+    plan_gate = _trace_mapping(llm_trace, "plan_gate") or _trace_mapping(llm_trace, "force_plan_decision")
     if deferred_child_count and objective.get("status") != OBJECTIVE_FAIL:
         objective.update({
             "status": OBJECTIVE_BEST_EFFORT,

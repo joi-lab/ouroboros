@@ -671,6 +671,9 @@ def test_presence_work_returns_only_correlated_terminal_result(tmp_path: pathlib
         "outcome": "message",
         "text": "late answer",
         "work_ref": work_ref,
+        "task_id": work_ref,
+        "output_ref": "",
+        "child_work_ref": "",
         "delivery_reporting_version": 0,
     }
 
@@ -692,6 +695,8 @@ def test_presence_work_returns_only_correlated_terminal_result(tmp_path: pathlib
     )
     assert deferred.status_code == 200
     assert deferred.json()["text"] == "late deferred answer"
+    assert {key: deferred.json()[key] for key in ("task_id", "output_ref", "child_work_ref")} == {
+        "task_id": work_ref, "output_ref": "", "child_work_ref": ""}
 
     wrong = client.get(
         f"/presence/work/{work_ref}",

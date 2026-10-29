@@ -77,6 +77,8 @@ def test_cached_reply_uses_current_state_without_changing_answer(focus, monkeypa
         assert load_task_result(root, task["id"]) == original
     notices = [r.row for r in dialogue_store.iter_rows(root, "chat") if r.row.get("type") == "place_notice"]
     assert len(notices) == 1 and "Reply held:" in notices[0]["text"]
+    assert notices[0]["held_text"] == "Old unsent reply"
+    assert notices[0]["held"] is True and notices[0]["checked"] is False
 
 
 @pytest.mark.parametrize("as_root", [False, True])
@@ -104,7 +106,37 @@ def test_reply_advises_hold_and_acts_check_follow_the_carrier(focus, monkeypatch
     assert result["outcome"] == ("silent" if level == "observe" else "message")
     assert result["text"] == ("" if level == "observe" else "Deferred public answer")
     assert len(checks) == (0 if level == "observe" else 2)  # projection cannot buy a second check
+    notices = [r.row for r in dialogue_store.iter_rows(root, "chat") if r.row.get("type") == "place_notice"]
+    if level == "observe":
+        notice, = notices
+        assert notice["held_text"] == "Deferred public answer"
+        assert notice["held"] is True and notice["checked"] is False
+    else:
+        assert notices == []
     places.edit_place(root, place.place_id, "set_state", author="owner", state="silent")
     result = runner.build_presence_result_event(task, "Another answer", ctx, terminal_origin="model_final")
     assert result["outcome"] == "silent" and not result["text"]
     assert len(checks) == (0 if level == "observe" else 2)
+
+
+@pytest.mark.parametrize("state,level,held", [("silent", "act", True), ("active", "observe", True), ("active", "act", False)])
+def test_reply_hold_retains_complete_text_before_safety(focus, monkeypatch, state, level, held):
+    root, place, _, _ = focus
+    places.edit_place(root, place.place_id, "set_state", author="owner", state=state)
+    task = task_for(focus)
+    task["metadata"]["consciousness_autonomy"] = level
+    ctx = SimpleNamespace(task_metadata=task["metadata"], task_id=task["id"], drive_root=root)
+    checks = []
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (checks.append(a) or True, ""))
+    monkeypatch.setattr("ouroboros.presence_context.confirmed_delivery_receipts", lambda _: frozenset())
+    text = "Full authored reply café\n" * 400
+    assert prepare_focus_reply(ctx, text) == (True, "")
+    assert len(checks) == (0 if held else 1)
+    rows = [r.row for r in dialogue_store.iter_rows(root, "chat")]
+    if held:
+        notice, = rows
+        assert notice["held_text"] == text and notice["held"] is True and notice["checked"] is False
+        assert notice["text"] == (f"Reply held: {place.label} is Silent" if state == "silent"
+                                  else "Reply held: autonomy is Advises")
+    else:
+        assert rows == []

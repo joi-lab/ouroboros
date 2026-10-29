@@ -496,7 +496,7 @@ def test_server_boot_never_writes_the_settings_file():
     assert "SETTINGS_PATH" not in imported
     # The normalization still runs, still reaches the environment, and only then
     # is the owner's runtime-mode baseline pinned against it.
-    applied_at = source.index("apply_runtime_provider_defaults(load_settings())")
+    applied_at = source.index("apply_runtime_provider_defaults(load_settings(migrate=True))")
     env_at = source.index("_apply_settings_to_env(settings)")
     baseline_at = source.index("initialize_runtime_mode_baseline()")
     assert applied_at < env_at < baseline_at

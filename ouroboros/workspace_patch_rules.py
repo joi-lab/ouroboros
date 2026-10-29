@@ -181,6 +181,6 @@ def format_patch_exclusions(manifest: Any) -> str:
     return (
         f"\n⚠️ {len(entries)} file(s) EXCLUDED from this patch by capture policy: "
         f"{shown}{more}. Excluded content is NOT in this patch: if one is a real "
-        "deliverable, recover it from the child workspace/snapshot while that "
+        "deliverable, recover it from the child workspace/snapshot if that "
         "still exists, or have it re-produced."
     ) + kept

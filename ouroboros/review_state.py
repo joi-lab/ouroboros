@@ -49,14 +49,14 @@ def _commit_readiness_debt_from_dict(d: Dict[str, Any]) -> CommitReadinessDebtIt
 def _record_from_dict(d: Dict[str, Any]) -> AdvisoryRunRecord:
     raw_paths = d.get("snapshot_paths")
     ts = str(d.get("ts", ""))
+    who = {key: str(d.get(key) or "") for key in ("task_id", "bypassed_by_task")}  # absent/null: unknown, apart
     return AdvisoryRunRecord(
-        **{key: str(d.get(key, default)) for key, default in _RUN_STR_DEFAULTS.items()},
+        **{key: str(d.get(key, default)) for key, default in _RUN_STR_DEFAULTS.items() if key not in who}, **who,
         ts=ts,
         items=list(d.get("items") or []),
         execution=(dict(d["execution"]) if isinstance(d.get("execution"), dict)
                    else {} if d.get("execution") is None else {"operation_state": "custody_lost"}),
         snapshot_paths=list(raw_paths) if isinstance(raw_paths, list) else None,
-        task_id=str(d.get("task_id", d.get("bypassed_by_task", ""))),
         attempt=_coerce_int(d.get("attempt", 0)),
         created_ts=str(d.get("created_ts", ts)),
         updated_ts=str(d.get("updated_ts", ts)),

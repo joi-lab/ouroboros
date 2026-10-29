@@ -738,9 +738,13 @@ def test_advanced_commit_blocks_rename_from_protected_path(tmp_path, monkeypatch
 def test_pro_commit_uses_normal_review_for_protected_paths(tmp_path, monkeypatch):
     from ouroboros.tools import git as git_mod
 
-    repo = _git_repo(tmp_path)
+    serving = _git_repo(tmp_path)
+    repo = tmp_path / "candidate"
+    subprocess.run(["git", "worktree", "add", "-qb", "candidate", str(repo)], cwd=serving, check=True)
     (repo / "BIBLE.md").write_text("changed\n", encoding="utf-8")
     ctx = _CommitCtx(repo, tmp_path / "drive")
+    ctx.serving_repo_dir = serving
+    ctx.task_metadata = {"body_candidate": {"path": str(repo)}}
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
     monkeypatch.setenv("OUROBOROS_PRE_PUSH_TESTS", "0")
 
@@ -946,6 +950,7 @@ def test_restore_to_head_does_not_mangle_leading_dot_paths(tmp_path, monkeypatch
 def test_revert_commit_blocks_protected_contract_path(tmp_path, monkeypatch):
     from ouroboros.tools import git as git_mod
 
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     repo = _git_repo(tmp_path)
     (repo / "ouroboros" / "contracts").mkdir(parents=True)
     (repo / "ouroboros" / "contracts" / "plugin_api.py").write_text("old\n", encoding="utf-8")
@@ -956,7 +961,7 @@ def test_revert_commit_blocks_protected_contract_path(tmp_path, monkeypatch):
     ctx = _CommitCtx(repo, tmp_path / "drive")
     result = git_mod._revert_commit(ctx, target_sha, confirm=True)
 
-    assert "REVERT_BLOCKED" in result
+    assert "CORE_PROTECTION_BLOCKED" in result
     assert "ouroboros/contracts/plugin_api.py" in result
 
 

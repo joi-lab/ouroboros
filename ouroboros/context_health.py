@@ -18,8 +18,8 @@ import re
 from collections import Counter
 from typing import Any, Dict, List
 
-from ouroboros.context_budget import SCRATCHPAD_BLOAT_WARN_CHARS
-from ouroboros.utils import iter_jsonl_objects, read_json_dict, read_text
+from ouroboros.jsonl_tail import cached_tail_objects
+from ouroboros.utils import read_json_dict, read_text
 from ouroboros.store import StoreError
 
 log = logging.getLogger(__name__)
@@ -41,7 +41,8 @@ def safe_read(path: pathlib.Path, fallback: str = "") -> str:
 
 
 def _iter_recent_jsonl(path: pathlib.Path, max_bytes: int = 256_000):
-    yield from iter_jsonl_objects(path, tail_bytes=max_bytes)
+    """The log's bounded tail, read once per file identity and shared with the Runtime section's body fact."""
+    yield from cached_tail_objects(path, max_bytes)
 
 
 def _collect_log_analysis_checks(env: Any, checks: List[str]) -> None:
@@ -67,8 +68,6 @@ def _collect_log_analysis_checks(env: Any, checks: List[str]) -> None:
         dupes = {h: tids for h, tids in msg_hash_to_tasks.items() if len(tids) > 1}
         if dupes:
             checks.append(f"CRITICAL: DUPLICATE PROCESSING — {len(dupes)} message(s) appeared in multiple tasks: {', '.join(str(sorted(tids)) for tids in dupes.values())}")
-        else:
-            checks.append("OK: no duplicate message processing detected")
     except Exception:
         pass
 
@@ -98,13 +97,9 @@ def _collect_log_analysis_checks(env: Any, checks: List[str]) -> None:
         if llm_error_models:
             top = ", ".join(f"{model} x{count}" for model, count in llm_error_models.most_common(3))
             checks.append(f"WARNING: PROVIDER/ROUTING ERRORS — {sum(llm_error_models.values())} recent failures ({top}). Reliability or failover may need attention.")
-        else:
-            checks.append("OK: no recent provider/routing errors")
         if local_overflow_models:
             top = ", ".join(f"{model} x{count}" for model, count in local_overflow_models.most_common(3))
             checks.append(f"WARNING: LOCAL CONTEXT OVERFLOW — {sum(local_overflow_models.values())} recent overflow event(s) ({top}). Local context may need more compaction or a larger window.")
-        else:
-            checks.append("OK: no recent local context overflows")
         if remote_overflow_models:
             top = ", ".join(f"{model} x{count}" for model, count in remote_overflow_models.most_common(3))
             checks.append(f"WARNING: REMOTE CONTEXT OVERFLOW — {sum(remote_overflow_models.values())} recent provider context-window rejection(s) ({top}). Switch to low context mode or reduce the prompt footprint before retrying the same request.")
@@ -202,44 +197,19 @@ def _plan_review_note(env: Any, task_id: str) -> str:
         return ""
 
 
-def _memory_health_lines(env: Any) -> List[str]:
-    """Own-memory maintenance signals for the two authored files, identity and scratchpad.
-
-    The old dialogue writer's state lines (unreadable cursor, open nominations, a failed
-    run, a withheld era) left with that writer: its pending nominations are imported as
-    marks the mind releases, and an unreadable cursor is the import's ``cursor_gap``.
-    """
+def _identity_age_line(env: Any) -> str:
+    """When ``identity.md`` was last written, as a fact; whether that is long is the mind's reading
+    (the STALE/THIN identity and EMPTY/BLOATED scratchpad verdicts and their OK lines left with the
+    owner's rule that no threshold stands in for judgment). An absent file is no fact."""
     import time as _time
 
-    lines: List[str] = []
     try:
         identity_path = env.drive_path("memory/identity.md")
         if identity_path.exists():
-            age_hours = (_time.time() - identity_path.stat().st_mtime) / 3600
-            if age_hours > 8:
-                lines.append(f"WARNING: STALE IDENTITY — identity.md last updated {age_hours:.0f}h ago")
-            else:
-                lines.append("OK: identity.md recent")
+            return f"identity.md last updated {(_time.time() - identity_path.stat().st_mtime) / 3600:.1f} h ago"
     except Exception:
         pass
-    try:
-        identity_content = read_text(env.drive_path("memory/identity.md"))
-        if len(identity_content.strip()) < 200:
-            lines.append(f"WARNING: THIN IDENTITY — identity.md is only {len(identity_content)} chars. Cognitive decay signal.")
-    except Exception:
-        pass
-
-    try:
-        sp_len = len(read_text(env.drive_path("memory/scratchpad.md")).strip())
-        if sp_len < 50:
-            lines.append("WARNING: EMPTY SCRATCHPAD — scratchpad is nearly empty. Memory loss signal.")
-        elif sp_len > SCRATCHPAD_BLOAT_WARN_CHARS:
-            lines.append(f"WARNING: BLOATED SCRATCHPAD — {sp_len} chars. Extract durable insights to knowledge base.")
-        else:
-            lines.append(f"OK: scratchpad size ({sp_len} chars)")
-    except Exception:
-        pass
-    return lines
+    return ""
 
 
 def _unread_output_line(custody_root: Any, run: Any, task_id: str) -> str:
@@ -287,9 +257,11 @@ def _foreign_work_line(root: Any, foreign: Dict[str, Dict[str, List[str]]]) -> s
         source = "retention unavailable; exact list: " + json.dumps(foreign, ensure_ascii=False, sort_keys=True)
     severity = "WARNING" if any(work["patches"] for work in foreign.values()) else "INFO"
     return (f"{severity}: OTHER TASKS' DELEGATED WORK — full owner/run list (unread results, undisposed patches, "
-            f"'yours' = matching active target): {source}. Only the owner acknowledges results and decides patches "
-            "while live; after it ends, a live top-level task may reject from any root or apply from the recorded "
-            "target or a fresh payload binding via integrate_delegated_patch.")
+            f"'yours' = matching target geometry, not write authority): {source}. Only the owner acknowledges "
+            "results and decides patches while live; after it ends, a live top-level task may reject from any "
+            "root or apply to the original target when location and current write rights permit "
+            "(payloads need a fresh binding) "
+            "via integrate_delegated_patch.")
 
 
 # One line per own settled run, bounded like ``terminal_custody_notice``.
@@ -350,7 +322,7 @@ def _own_run_outcome_lines(custody_root: Any, custody_state: Any, task_id: str,
 
 
 def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
-                            attempt_key: str = "") -> str:
+                            attempt_key: str = "", view_role: str = "") -> str:
     """Render the health-invariant WARNING block for one reader's context.
 
     Called once when a task's context is built (a task-start snapshot, not
@@ -375,8 +347,15 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
     supervision acknowledgement records it; with ``task_id`` it names the reader's
     OWN settled runs whose terminal payload this attempt's transcript never took
     (``_own_run_outcome_lines``). Empty renders none of those lines.
+
+    ``view_role`` is the reader's memory view role: an integrating one (not a delegated child or
+    nanny) reads the open lost-Max episode (``memory_max.health_line``, one row).
     """
     checks: List[str] = []
+    if view_role:
+        from ouroboros.memory_max import health_line
+
+        checks.extend(filter(None, [health_line(env.drive_root, view_role)]))
 
     try:
         from ouroboros.claudexor_exit_facts import health_line
@@ -435,8 +414,6 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
             pass
         if desync_parts:
             checks.append(f"CRITICAL: VERSION DESYNC — VERSION={ver_file}, {', '.join(desync_parts)}")
-        elif ver_file:
-            checks.append(f"OK: version sync ({ver_file})")
     except Exception:
         pass
 
@@ -447,22 +424,10 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
         accounted = float(usage_breakdown(env.drive_root).get("accounted_usd") or 0.0)
         if state_data.get("budget_drift_alert"):
             checks.append(f"WARNING: BUDGET DRIFT {state_data.get('budget_drift_pct', 0):.1f}% — tracked=${accounted:.2f} vs OpenRouter=${state_data.get('openrouter_total_usd', 0):.2f}")
-        else:
-            checks.append("OK: budget drift within tolerance")
     except Exception:
         checks.append("WARNING: COST ACCOUNTING UNAVAILABLE — budget drift check skipped")
 
-    try:
-        from supervisor.state import per_task_cost_summary
-        costly = [t for t in per_task_cost_summary(5) if t["cost"] > 5.0]
-        for t in costly:
-            checks.append(f"WARNING: HIGH-COST TASK — task_id={t['task_id']} cost=${t['cost']:.2f} rounds={t['rounds']}")
-        if not costly:
-            checks.append("OK: no high-cost tasks (>$5)")
-    except Exception:
-        checks.append("WARNING: COST ACCOUNTING UNAVAILABLE — high-cost task check skipped")
-
-    checks.extend(_memory_health_lines(env))
+    checks.extend(filter(None, [_identity_age_line(env)]))
 
     # state/crash_report.json retired (CPL4-C9, owner 2A): its writer — the
     # crash-rollback path — no longer exists in this tree, so the reader and
@@ -486,26 +451,28 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
     plan_note = _plan_review_note(env, task_id)
     if plan_note:
         checks.append(plan_note)
-    # The three delegated-run blocks below share ONE custody read of the rows they
-    # can name (``health_runs``: own, held, maybe-unread), so a build decodes neither
+    # The three delegated-run blocks below share ONE selected custody read of the rows
+    # they can name (``health_runs``: own, held, maybe-unread), so a build decodes neither
     # every settled run nor each block's own copy (I18); their predicates and order
-    # decide. A failed selection reads every row into the same state, because the
-    # own-run lines have no read of their own; only if that fails too does each
-    # remaining block replay for itself, under its own fail-soft arm.
-    custody_root = None
+    # decide. A read that fails is said as such, with the addressed reader, and those
+    # blocks are skipped: each would otherwise replay every row for itself, and an empty
+    # replay proves no absence of obligations. Containment faults keep their own read.
+    custody_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
     custody_state = None
+    custody_gap = ""
     try:
-        from ouroboros.delegate_custody import replay as replay_custody
         from ouroboros.delegate_custody_current import health_runs
 
-        custody_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
-        try:
-            custody_state = health_runs(custody_root, task_id)
-        except Exception:
-            log.debug("Selected custody read failed; reading every row", exc_info=True)
-            custody_state = replay_custody(custody_root)
-    except Exception:
-        custody_state = None
+        custody_state = health_runs(custody_root, task_id)
+    except Exception as exc:
+        log.debug("Selected custody read failed", exc_info=True)
+        custody_gap = f"{type(exc).__name__}: {str(exc)[:200]}"
+    if custody_gap:
+        checks.append(
+            f"WARNING: CUSTODY UNAVAILABLE — the delegated-run obligations could not be read ({custody_gap}); "
+            "nothing here proves their absence. Read them with query_data(op='sql', db='current', "
+            "query=\"SELECT run_id, task_id, state FROM custody_runs WHERE state='held' OR output_unread=1\")."
+        )
 
     foreign: Dict[str, Dict[str, List[str]]] = {}  # exact source for one line covering all foreign owners
 
@@ -515,7 +482,7 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
     try:
         from ouroboros.delegate_custody import settled_unread_outputs
 
-        for run in settled_unread_outputs(custody_root, custody_state):
+        for run in settled_unread_outputs(custody_root, custody_state) if not custody_gap else ():
             # Owner doctrine D7, made load-bearing: a delegated result that was paid for
             # and never read to EOF is the launched-never-collected class. Not CRITICAL —
             # nothing is live and nothing is mutating — but it stays visible until the
@@ -536,9 +503,9 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
 
     try:
         from ouroboros.delegate_custody import undisposed_patches
-        from ouroboros.delegate_shared import orphan_apply_target_ok
+        from ouroboros.config import get_subagent_projects_root
 
-        for run in undisposed_patches(custody_root, custody_state):
+        for run in undisposed_patches(custody_root, custody_state) if not custody_gap else ():
             # C1: a settled mutating run's work lives in its private snapshot (and its
             # captured patch, once one exists) until someone explicitly applies or
             # rejects it. The GC preserves the material, but preserved-and-invisible is
@@ -553,7 +520,7 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
                     f"settled with its changes captured from a private snapshot of "
                     f"{run.target_root or '?'}"
                 )
-                persist_clause = "The snapshot and patch persist until that disposition."
+                persist_clause = "The saved patch and its pinned commits persist until that disposition."
             else:
                 state_clause = (
                     f"settled with its work preserved in its private snapshot of "
@@ -566,8 +533,12 @@ def build_health_invariants(env: Any, task_id: str = "", active_root: str = "",
             owner = _foreign_owner(run, task_id)
             if owner:
                 foreign_work(owner)["patches"].append(str(run.run_id or "?"))
-                if active_root and orphan_apply_target_ok(run.target_root, active_root):
-                    foreign_work(owner)["yours"].append(str(run.run_id))
+                if active_root and str(run.target_root or "").strip():
+                    target = pathlib.Path(run.target_root).expanduser().resolve()
+                    active = pathlib.Path(active_root).expanduser().resolve()
+                    if target == active or (target.is_relative_to(active) and active.is_relative_to(
+                            pathlib.Path(get_subagent_projects_root()).expanduser().resolve())):
+                        foreign_work(owner)["yours"].append(str(run.run_id))
                 continue
             decide_clause = (
                 f"decide with integrate_delegated_patch(run_id='{run.run_id}', "

@@ -1,32 +1,40 @@
 """Own-work candidate selection and terminal links; neither invents page coverage."""
 from __future__ import annotations
 
-from ouroboros import chat_chain, dialogue_store, memory_inventory
+import json
+
+from ouroboros import chat_chain, memory_inventory
 from ouroboros.chronicle_store import DELEGATED_FOCUS_ROLES
+from ouroboros.dialogue_provenance import recorded_finality
 
 
 def failed_work_units(root, store):
-    from ouroboros.task_results import list_task_results
+    """Candidates over the open rows of finished failures (failed or cancelled) the mind never sealed.
+
+    Every post-task run asks this while consciousness is on, a direct turn's in the server after its
+    answer, so it is addressed by the open rows: they name their tasks, whose typed status alone is
+    read (never a task body); only when one of them failed does the chronicle answer which of them
+    the mind sealed (its page author index) and which rows a pending candidate of their room covers."""
     from ouroboros.memory_fallback import FallbackUnit
     from ouroboros.memory_inventory import OpenSegment
+    from ouroboros.task_store import task_facts
 
-    failed = {str(row.get("task_id") or row.get("id")): row for row in list_task_results(
-        root, statuses=["failed", "cancelled"], strict=True)}
-    if not failed:
-        return []
-    pages = store.records(kinds=["page"])
-    sealed_by_mind = {str(record.get("author", {}).get("task_id") or "") for record in pages
-                      if record.get("author", {}).get("kind") == "mind"}
-    pending = {}
-    for record in store.pending_candidates():
-        pending.setdefault(record["room_id"], set()).update(record["covers"]["rows"])
+    open_rows = memory_inventory.open_rows_by_room(root)
+    named = sorted({str(entry[1].get("task_id") or "") for entries in open_rows.values() for entry in entries} - {""})
+    # The named rows alone, through the primary key: a status filter in SQL lets the planner walk
+    # every failed task through the status index instead.
+    facts = task_facts(root, where="task_id IN (SELECT value FROM json_each(?))", params=(json.dumps(named),)) if named else {}
+    failed = {task_id for task_id, fact in facts.items() if fact["status"] in ("failed", "cancelled")}
+    if failed:
+        failed -= store.mind_page_authors(failed)
     units = []
-    for room, entries in memory_inventory.open_rows_by_room(root).items():
+    for room, entries in open_rows.items():
+        entries = [entry for entry in entries if str(entry[1].get("task_id") or "") in failed]
+        pending = {ref for record in store.pending_candidates(room) for ref in record["covers"]["rows"]} if entries else set()
         by_task = {}
         for entry in entries:
-            task_id = str(entry[1].get("task_id") or "")
-            if task_id in failed and task_id not in sealed_by_mind and entry[0]["row_sha256"] not in pending.get(room, ()):
-                by_task.setdefault(task_id, []).append(entry)
+            if entry[0]["row_sha256"] not in pending:
+                by_task.setdefault(str(entry[1].get("task_id") or ""), []).append(entry)
         for task_id, rows in by_task.items():
             segment = OpenSegment(room, rows[0][0], rows[-1][0], tuple(rows), store.room_head(room))
             units.append(FallbackUnit("page", room, f"candidate:{task_id}:{rows[0][0]['row_sha256'][:12]}",
@@ -47,8 +55,15 @@ def _terminal_after(record):
         (record.get("covers", {}).get("stream_span") or [0, 0])[-1]))
 
 
+# The stored facts a linked row's finality is read from (``dialogue_provenance.recorded_finality``).
+_FINALITY_FACTS = ("summary_kind", "outcome_final", "outcome_authority")
+
+
 def capture_terminal_rows(root, records):
-    """Group the writers' later terminal rows once, through task indexes at one captured boundary."""
+    """Group the writers' later terminal rows once, from the stored facts of the rows after the legacy frontier
+    (``memory_inventory.terminal_rows``): a page's writer ran after the chronicle's activation, so its later
+    terminal rows lie after the frontier. Each is ``(address, {"type", "status", <the finality facts it
+    stored>}, pos)``."""
     starts = {}
     for record in records:
         task_id = _terminal_writer(record)
@@ -57,43 +72,41 @@ def capture_terminal_rows(root, records):
             starts[key] = min(starts.get(key, _terminal_after(record)), _terminal_after(record))
     if not starts:
         return {}
-    upper = dialogue_store.stream_end(root, "chat")
-    lower = chat_chain.position_boundary(root, min(starts.values()) + 1)
-    dialogue_store.require_imported(root, "chat", lower=lower, upper=upper)
-    tasks = {task_id for _room, task_id in starts}
-    facts, grouped, after = memory_inventory.membership_facts(root), {}, lower - 1
-    while entries := dialogue_store.task_rows(root, tasks, stream="chat", after=after, before=upper):
-        for entry in entries:
-            row = entry.row
-            task_id = str(row.get("task_id") or "")
-            host = row.get("type") in ("task_summary", "project_completion_summary")
-            final = row.get("direction") == "out" and not row.get("is_progress") and (
-                row.get("terminal_origin") or row.get("task_terminal_status") or row.get("task_phase") == "finalizing")
-            if task_id not in tasks or not (host or final):
-                continue
-            rooms = memory_inventory.rooms_of_row(memory_inventory.row_meta(row), facts)
-            for address, _row, pos in chat_chain._addressed(root, (entry,)):
-                for room in rooms:
-                    key = (room, task_id)
-                    if key in starts and pos > starts[key]:
-                        grouped.setdefault(key, []).append((address, row, pos))
-        after = entries[-1].seq
+    tasks, first = {task_id for _room, task_id in starts}, min(starts.values())
+    chosen = [(address, meta, pos, status) for address, meta, pos, status in memory_inventory.terminal_rows(root)
+              if pos > first and str(meta.get("task_id") or "") in tasks]
+    facts, grouped = memory_inventory.membership_facts(root), {}
+    # The terminal rows' task lineages in one read a generation, then their rooms.
+    facts.rooms.warm({str(meta.get(key) or "") for _address, meta, _pos, _status in chosen
+                      for key in ("task_id", "parent_task_id", "root_task_id")} - {""})
+    for address, meta, pos, status in chosen:
+        task_id = str(meta["task_id"])
+        for room in memory_inventory.rooms_of_row(meta, facts):
+            if (room, task_id) in starts and pos > starts[(room, task_id)]:
+                finality = {key: meta[key] for key in _FINALITY_FACTS if key in meta}
+                grouped.setdefault((room, task_id), []).append(
+                    (address, {"type": meta.get("type"), "status": status, **finality}, pos))
     return grouped
 
 
 def terminal_links(root, record, cache=None):
-    """Only this page writer's later typed terminal rows, as separately attributed addresses."""
+    """This page writer's later typed terminal rows as one separately attributed line: each row's kind,
+    status and recorded finality (its authority stays in the row), and one reader over their span."""
     task_id = _terminal_writer(record)
     if not task_id:
         return []
-    end, links = _terminal_after(record), []
+    end = _terminal_after(record)
     cache = capture_terminal_rows(root, (record,)) if cache is None else cache
-    for address, row, pos in cache.get((str(record["room_id"]), task_id), ()):
-        if pos <= end:
-            continue
-        addr = chat_chain.format_address(address)
+    rows = [(address, row) for address, row, pos in cache.get((str(record["room_id"]), task_id), ()) if pos > end]
+    if not rows:
+        return []
+    items = []
+    for _address, row in rows:
         speaker = "host summary" if row.get("type") in ("task_summary", "project_completion_summary") else "task final report"
+        finality = recorded_finality(row.get("outcome_final"), row.get("outcome_authority"),
+                                     host_facts=row.get("summary_kind") == "host_task_facts").partition(";")[0]
         status = row.get("status") or row.get("task_terminal_status") or "status not recorded"
-        links.append(f"- Linked {speaker} of task {task_id} ({status}); not page coverage; "
-                     f"memory_read(room_id='{record['room_id']}', rows=true, from='{addr}', to='{addr}')")
-    return links
+        items.append(f"{speaker} ({status}{', ' + finality if finality else ''})")
+    first, last = (chat_chain.format_address(rows[index][0]) for index in (0, -1))
+    return [f"- Later terminal rows of task {task_id} (host-linked, not page coverage): {'; '.join(items)}; "
+            f"memory_read(room_id='{record['room_id']}', rows=true, from='{first}', to='{last}')"]

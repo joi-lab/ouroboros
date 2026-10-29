@@ -1326,11 +1326,15 @@ def get_tools() -> List[ToolEntry]:
         }, _read_file),
         ToolEntry("list_files", {
             "name": "list_files",
-            "description": "List files under a resource root directory.",
+            "description": "List a directory, or use depth/include for a bounded live tree. Gaps make complete=false. "
+                           "Generated subtrees are skipped only in code roots; symlink directories are not followed.",
             "parameters": {"type": "object", "properties": {
                 "path": {"type": "string", "default": "."},
                 "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files", "subagent_projects", "deliverables"], "description": _FILE_ROOT_DESCRIPTION},
                 "max_entries": {"type": "integer", "default": 500},
+                "depth": {"type": "integer", "minimum": 1, "maximum": 20, "default": 1, "description": "Tree levels; depth=1 with no include preserves the ordinary one-directory listing."},
+                "include": {"type": "string", "description": "Optional basename glob, including braces such as *.{py,js}; directories are traversed but not returned as matches."},
+                "max_scan": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 2000, "description": "Opt-in tree's examined-entry bound, not just match count; one additional lookahead detects a cut directory. Packed checkpoints are omitted with a direct listing recipe."},
                 "bucket": {"type": "string", "description": "Required only for root=skill_payload."},
                 "skill_name": {"type": "string", "description": "Required only for root=skill_payload."},
             }, "required": []},
@@ -1338,16 +1342,13 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("write_file", {
             "name": "write_file",
             "description": (
-                "For canonical output use root=artifact_store (created lazily), e.g. path=report.txt. Do not assume its physical directory already exists. "
-                "Write UTF-8 file(s) to a declared resource root. "
-                "With root omitted, relative paths use active_workspace; absolute paths select their permitted physical root, including user_files for home paths. "
-                "OK messages show root:path. "
-                "Overwriting an existing repo file returns the unified diff vs the "
-                "previous version — CHECK IT; invalid .py/.json content is blocked "
-                "before writing (force=true bypasses). "
-                "Use mode='append' to write a large file in chunks across multiple calls "
-                "(useful when the full content exceeds a single LLM output budget). "
-                "Set bucket/skill_name ONLY for root=skill_payload (skill authoring); leave empty for normal file edits."
+                (
+                'Create, overwrite or append UTF-8 files using path+content or files=[...]. Canonical output uses '
+                'root=artifact_store, created lazily. Omitted root selects active_workspace for relative paths and the '
+                'permitted physical root for absolute paths. Repo overwrites return a diff; check it. Invalid '
+                "Python/JSON is blocked unless force=true. Use mode='append' for chunks. bucket/skill_name apply only "
+                'to skill_payload.'
+            )
             ),
             "parameters": {"type": "object", "properties": {
                 "path": {"type": "string"},
@@ -1407,9 +1408,9 @@ def get_tools() -> List[ToolEntry]:
         }, _send_photo),
         ToolEntry("send_video", {
             "name": "send_video",
-            "description": "Send a video to the owner's chat (e.g. an anime animation). Requires a local file_path.",
+            "description": "Send a local video file to the owner's chat, with an optional caption. Requires file_path.",
             "parameters": {"type": "object", "properties": {
-                "file_path": {"type": "string", "description": "Local file path to video (preferred)"},
+                "file_path": {"type": "string", "description": "Local file path to the video."},
                 "caption": {"type": "string", "description": "Optional caption for the video"},
             }, "required": ["file_path"]},
         }, _send_video),
@@ -1444,18 +1445,16 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("search_code", {
             "name": "search_code",
             "description": (
-                "Search for a pattern in the repository code. "
-                "Literal search by default; set regex=True for regular expressions. "
-                "Scoped to path (default: entire active workspace). "
-                "Skips binaries, caches, vendor dirs, and files >1MB. "
-                "Returns up to max_results matches (default 200) with root:file:line context; a long matched "
-                "line shows a window around its first match with that window's read_file range. "
-                "Use this for plain-text/regex matches (prefer it over grep/find-as-search in run_command); "
-                "for symbol-aware lookups (definitions, callers, references, impact) prefer query_code."
+                (
+                'Search literal text (default) or regex under root/path. Returns root:file:line matches with context; '
+                'long lines include a read_file range around the first match. Skips binaries, caches, vendor '
+                'directories and files over 1MB. max_results bounds matches. Use query_code for definitions, callers, '
+                'references or impact.'
+            )
             ),
             "parameters": {"type": "object", "properties": {
                 "query": {"type": "string", "description": "Search pattern (literal or regex)"},
-                "path": {"type": "string", "default": ".", "description": "Subdirectory to search (relative to repo root)"},
+                "path": {"type": "string", "default": ".", "description": "Subdirectory to search, relative to the selected root"},
                 "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files", "subagent_projects", "deliverables"], "description": _FILE_ROOT_DESCRIPTION},
                 "bucket": {"type": "string", "description": "Required only for root=skill_payload."},
                 "skill_name": {"type": "string", "description": "Required only for root=skill_payload."},

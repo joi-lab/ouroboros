@@ -125,7 +125,7 @@ ROWS_RECORDER = """([scope, ms]) => {
     const root = scope === 'main' ? '#page-chat' : '#project-panel';
     let last = '';
     const tick = () => {
-        const surface = document.querySelector(`${root} .rw-surface`);
+        const surface = document.querySelector(`${root} .rw-surface:not(.cx-shade)`);  // the work Shade, not the chip's
         const note = surface?.querySelector('.rw-note');
         const menu = document.querySelector('body > .task-control-menu');
         const state = { hidden: surface ? surface.hidden : null, note: note && !note.hidden ? note.textContent : '',
@@ -218,7 +218,7 @@ LEAKS = r"""(scope) => {
     };
     const shown = (el) => Boolean(el) && !el.hidden && el.getClientRects().length > 0;
     const trigger = root?.querySelector('.rw-trigger');
-    const surface = root?.querySelector('.rw-surface');
+    const surface = trigger ? document.getElementById(trigger.getAttribute('aria-controls')) : null;  // the room's work Shade, never the chip's
     const waitNote = trigger?.querySelector('.rw-sr');
     if (waitNote && !waitNote.hidden) note('trigger .rw-sr (wait note)', waitNote.textContent);
     note('surface[aria-label]', surface?.getAttribute('aria-label'));
@@ -276,11 +276,12 @@ NAMES = """(scope) => {
 
 SHADE_GEOMETRY = """() => { const box = s => { const r = document.querySelector(s).getBoundingClientRect();
         return {x: r.x, y: r.y, right: r.right, bottom: r.bottom}; };
-    const shade = document.querySelector('#project-panel .rw-shade');
+    const shade = document.querySelector('#project-panel .rw-shade:not(.cx-shade)');
     const reachable = [...shade.querySelectorAll('.rw-more, .rw-main[tabindex="0"], .rw-pill')].filter((el) => el.getClientRects().length)
         .every((el) => { const r = el.getBoundingClientRect(); const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
             return Boolean(hit) && (hit === el || el.contains(hit)); });
-    return {bar: box('#project-panel .project-panel-bar'), shade: box('#project-panel .rw-shade'),
+    return {bar: box('#project-panel .project-panel-bar'), shade: box('#project-panel .rw-shade:not(.cx-shade)'),
+            capsule: box('#project-panel .app-page-title-row'),
             panel: box('#project-panel'), vw: innerWidth, vh: innerHeight, reachable,
             overflow: document.documentElement.scrollWidth - innerWidth}; }"""
 
@@ -353,8 +354,9 @@ def test_translated_chrome_long_names_coarse_pointer(branch_ui, width, theme):
     if not (shade and shade["x"] >= -0.5 and shade["x"] + shade["w"] <= geometry["vw"] + 0.5
             and shade["bottom"] <= geometry["vh"] + 0.5):
         problems.append(f"the Shade leaves the viewport: {shade} vw={geometry['vw']} vh={geometry['vh']}")
-    if shade and abs(shade["y"] - bar["bottom"]) > 1.5:
-        problems.append(f"the Shade does not unfold from the bar's bottom edge: {shade} {bar}")
+    capsule = geometry["capsule"]
+    if shade and (abs((shade["y"] - capsule["bottom"]) - 8) > 1.5 or abs(shade["x"] - capsule["x"]) > 1.5):
+        problems.append(f"the work list does not hang under its status capsule: {shade} {capsule} (bar {bar})")
     if geometry["overflow"] > 0:
         problems.append(f"page overflows horizontally by {geometry['overflow']}px")
     if not geometry["reachable"]:
@@ -422,8 +424,9 @@ def test_translated_chrome_long_names_coarse_pointer(branch_ui, width, theme):
     out["shade_leaks"] = leaks(page, "project")
     rw.capture(page, f"coarse-{tag}-project-open")
     shade = out["shade"]
-    if abs(shade["shade"]["y"] - shade["bar"]["bottom"]) > 1.5:
-        problems.append(f"the Shade is not under its bar: {shade}")
+    if (abs((shade["shade"]["y"] - shade["capsule"]["bottom"]) - 8) > 1.5
+            or abs(shade["shade"]["x"] - shade["capsule"]["x"]) > 1.5):
+        problems.append(f"the work list does not hang under its status capsule: {shade}")
     if shade["shade"]["x"] < -0.5 or shade["shade"]["right"] > shade["vw"] + 0.5 or shade["overflow"] > 0:
         problems.append(f"the Shade leaves the viewport: {shade}")
     if not shade["reachable"]:
@@ -471,7 +474,7 @@ def test_open_sheet_repaints_translated_chrome_without_replacing_focus(branch_ui
         page.wait_for_function('(label) => document.querySelector("#page-chat .rw-pill-question").textContent === label', arg=question)
         assert page.evaluate('() => document.activeElement === window.__languageFocusNode'), 'language repaint replaced focus'
         expected = '‹Work in this chat›' if language == 'ru' else 'Work in this chat'
-        assert page.locator('#page-chat .rw-surface').get_attribute('aria-label') == expected
+        assert page.locator('#page-chat .rw-surface:not(.cx-shade)').get_attribute('aria-label') == expected
         assert page.locator('#page-chat .rw-pill-resume').inner_text() == ('‹Resume›' if language == 'ru' else 'Resume')
     record('language-switch', {'focus': page.evaluate(ACTIVE), 'posts': transport.posts})
     assert transport.posts == [] and transport.decision_posts() == []
@@ -1180,7 +1183,7 @@ def test_real_row_hurry_wrap_up_stop_and_restart_with_page_open(direct_server_wi
                 closed = backend._wait_facts(page, "main", lambda f: f["surfaceHidden"], "closed")
                 evidence.record("closed", closed)
                 assert backend._decision_posts(log) == []
-                assert log["pageerrors"] == [], log["pageerrors"]
+                assert log["pageerrors"].unexpected() == [], log["pageerrors"]
             except Exception:
                 for label, path in (("census_on_failure", "/api/state"),
                                     ("bravo_detail_on_failure", f"/api/tasks/{bravo}")):

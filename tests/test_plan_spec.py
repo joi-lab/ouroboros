@@ -1,8 +1,8 @@
 """Contract tests for ``ouroboros.tools.plan_spec`` and ``plan_evidence``: the ONE
 structural path fact (``resolve_constitutional``, the body predicate's installed-body
-half), the bounded evidence manifest every plan ask attaches through, and the spec reads
-(``spec_hash``, ``spec_delta``) the read-only views apply to earlier-schema plan records —
-and domain independence (a plan with zero file paths is first-class)."""
+half), the bounded evidence manifest every plan ask attaches through, and the spec hash
+(``spec_hash``) the read-only views apply to earlier-schema plan records — and domain
+independence (a plan with zero file paths is first-class)."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from ouroboros.tools import plan_evidence, plan_spec
 
 
 # Specs as finished v1/v2 plan records hold them (normalized by the retired spec parser:
-# minted ids, positional invariants); the read-only views diff them with spec_delta.
+# minted ids, positional invariants); the read-only views verify them by spec_hash.
 STORED_CODE_SPEC = {
     "goal": "Add a retry wrapper around the flaky uploader", "in_scope": ["retry wrapper", "unit tests"],
     "non_goals": ["changing the upload protocol"],
@@ -33,14 +33,12 @@ STORED_CODE_SPEC = {
 }
 
 
-def _stored(goal="g", invariants=(), deferred=()):
-    return {"goal": goal, "in_scope": [], "non_goals": [], "acceptance_claims": [], "invariants": list(invariants),
-            "decisions": [], "deferred": [{"id": f"deferred_{i}", "what": what, "why_safe_to_defer": ""}
-                                          for i, what in enumerate(deferred, start=1)],
-            "affected_resources": [], "evidence": [], "normalization_omissions": []}
+def _stored(goal="g"):
+    return {"goal": goal, "in_scope": [], "non_goals": [], "acceptance_claims": [], "invariants": [],
+            "decisions": [], "deferred": [], "affected_resources": [], "evidence": [], "normalization_omissions": []}
 
 
-def test_spec_hash_stable_under_key_order_and_delta_reports_changes():
+def test_spec_hash_stable_under_key_order_and_changed_by_content():
     spec = STORED_CODE_SPEC
     reordered = {k: spec[k] for k in reversed(list(spec))}
     assert plan_spec.spec_hash(spec) == plan_spec.spec_hash(reordered)
@@ -51,26 +49,6 @@ def test_spec_hash_stable_under_key_order_and_delta_reports_changes():
     changed["decisions"][0]["why"] = "different rationale"
     changed["deferred"] = [{"id": "deferred_1", "what": "log wording", "why_safe_to_defer": ""}]
     assert plan_spec.spec_hash(changed) != plan_spec.spec_hash(spec)
-    delta = plan_spec.spec_delta(spec, changed)
-    assert delta["changed"] and delta["goal_changed"]
-    assert delta["ids"]["changed"] == ["decision_1", "deferred_1"]  # deferred_1 now carries the former deferred_2 text
-    assert delta["ids"]["removed"] == ["deferred_2"]
-    assert delta["lists"]["invariants"] == {"added": ["no network in tests"], "removed": []}
-    assert plan_spec.spec_delta(spec, spec)["changed"] is False
-    assert plan_spec.spec_delta(None, spec)["ids"]["added"] == ["claim_1", "claim_2", "decision_1", "deferred_1", "deferred_2"]
-
-
-def test_spec_delta_reports_renumbered_ids():
-    prev = _stored(invariants=["budget <= $10", "no data loss", "deadline Friday"], deferred=["colours", "fonts"])
-    cur = _stored(invariants=["no data loss", "deadline Friday"], deferred=["fonts"])
-    delta = plan_spec.spec_delta(prev, cur)
-    assert delta["renumbered"] == [
-        {"from": "invariant_2", "to": "invariant_1", "text": "no data loss"},
-        {"from": "invariant_3", "to": "invariant_2", "text": "deadline Friday"},
-        {"from": "deferred_2", "to": "deferred_1", "text": "fonts"},
-    ]
-    assert delta["lists"]["invariants"] == {"added": [], "removed": ["budget <= $10"]}
-    assert plan_spec.spec_delta(cur, cur)["renumbered"] == []
 
 
 # The three plan-review waves recorded on the live install while `affected_resources` was still
@@ -105,23 +83,6 @@ def test_stored_specs_from_before_affected_paths_keep_their_recorded_identity():
                 "evidence": list(evidence)}
         assert "affected_paths" not in spec
         assert plan_spec.spec_hash(spec) == spec_digest
-
-
-def test_spec_delta_sees_the_affected_paths_claim_appear_and_then_move():
-    """Absent ("stored before the field existed") and `[]` ("this work changes no files") are
-    different claims, so the delta a view shows must not call them the same."""
-    legacy = {**_stored(), "affected_resources": ["the uploader"]}
-    declares_none = {**legacy, "affected_paths": []}
-    declares_file = {**legacy, "affected_paths": ["ouroboros/uploader.py"]}
-
-    appeared = plan_spec.spec_delta(legacy, declares_none)
-    assert appeared["changed"] and appeared["declared_keys_changed"]
-    assert appeared["prev_hash"] != appeared["hash"]
-
-    moved = plan_spec.spec_delta(declares_none, declares_file)
-    assert moved["changed"] and moved["declared_keys_changed"] is False
-    assert moved["lists"]["affected_paths"] == {"added": ["ouroboros/uploader.py"], "removed": []}
-    assert plan_spec.spec_delta(declares_file, declares_file)["changed"] is False
 
 
 # ------------------------------------------------------------ B2 constitutional

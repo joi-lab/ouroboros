@@ -506,6 +506,7 @@ def _frozen_actor(row: Dict[str, Any], slot: Any) -> Any:
         late_result_pending=pending,
         http_status=http_status,
         coverage=copy.deepcopy(row.get("coverage") or {}) if isinstance(row.get("coverage"), dict) else {},
+        failure_details=copy.deepcopy(row.get("failure_details") or {}) if isinstance(row.get("failure_details"), dict) else {},
         quorum_contribution=bool(row.get("quorum_contribution")),
         operation_state=operation_state,
         recovery_binding=dict(row.get("recovery_binding") or {}),
@@ -834,8 +835,9 @@ def _emit_operation(
             # Both frames share the control FIFO: publish the seat before waking its reader.
             from ouroboros.model_sleep import announce_resumed
 
-            wait = getattr(getattr(entry, "operation", None), "wait", None)
-            if wait is not None:
+            operation = getattr(entry, "operation", None)
+            wait = getattr(operation, "wait", None)
+            if wait is not None and not operation.author_detached:
                 announce_resumed(SimpleNamespace(event_queue=wait.event_queue, task_id=task_id,
                                                   current_chat_id=wait.task.get("chat_id")))
     except Exception:

@@ -5,7 +5,6 @@
     --neutral-rgb: 255, 255, 255;
     --shell-rgb: 15, 15, 17;
     --composer-rgb: 26, 27, 28;
-    --composer-hover-rgb: 31, 31, 33;
     --modal-rgb: 20, 21, 22;
     --menu-rgb: 17, 18, 19;
     --media-rgb: 9, 9, 10;
@@ -97,11 +96,17 @@
     --surface-card: rgba(var(--neutral-rgb), 0.03);
     --surface-card-soft: rgba(var(--neutral-rgb), 0.025);
     --surface-control: rgba(var(--neutral-rgb), 0.04);
-    /* Chart chrome (grid lines, tick/legend text). Chart.js paints to a canvas
-       and cannot read CSS, so these tokens are the SSOT that theme_palette.js
-       copies into every mounted instance — the canvas twin of --diagram-*. */
+    /* Chart chrome (grid lines, tick/legend text) and the four default series of a
+       chart the host draws (widgets, living cards), in the owner's order; a fifth
+       series takes the first again. Chart.js paints to a canvas and cannot read CSS,
+       so these tokens are the SSOT that theme_palette.js copies into every mounted
+       instance — the canvas twin of --diagram-*. */
     --chart-grid: rgba(var(--neutral-rgb), 0.10);
     --chart-text: #a4a4a4;
+    --chart-series-1: #ee6780;
+    --chart-series-2: #60a5fa;
+    --chart-series-3: #3fdca3;
+    --chart-series-4: #fbbf24;
     /* The native select arrow is a data-URI, so its stroke cannot read a token
        at paint time; the whole image is the token instead. Painting a near-white
        arrow on the light surface is what made the arrows look washed out. */
@@ -185,7 +190,6 @@
     --elev-rest: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 20px rgba(0, 0, 0, 0.28);
     --elev-float: 0 2px 8px rgba(0, 0, 0, 0.45), 0 18px 44px rgba(0, 0, 0, 0.5);
     --row-lift-dim: rgba(0, 0, 0, 0.45);  /* the feed under a row lifted by a long press */
-    --chrome-shade-shadow: var(--elev-float);
     --radius-object: 18px;
     --radius-inner: 12px;
     --radius-sheet: 24px;
@@ -197,6 +201,11 @@
     --surface-capsule-hover: rgba(255, 255, 255, 0.135);
     --chip-float: linear-gradient(var(--surface-capsule), var(--surface-capsule)), rgba(var(--shell-rgb), 0.98);
     --chip-float-hover: linear-gradient(var(--surface-capsule-hover), var(--surface-capsule-hover)), rgba(var(--shell-rgb), 0.98);
+    /* The opaque neutral sheet (DESIGN principle 2): the capsule's step over the room's own ink, fully opaque,
+       for a list of rows that must stay readable over any bubble. Both themes read it through these two tokens. */
+    --sheet-float: linear-gradient(var(--surface-capsule), var(--surface-capsule)), rgb(var(--shell-rgb));
+    /* The popups' backing, the same way opaque: the float colour over the room's ink, for menus and dialogs. */
+    --popup-float: linear-gradient(var(--surface-float), var(--surface-float)), rgb(var(--shell-rgb));
     --surface-float: rgba(32, 32, 34, 0.92);
     --surface-tray: rgba(var(--neutral-rgb), 0.045);
     --surface-side: #0f0f11;
@@ -204,6 +213,14 @@
     --voice-owner: #103e7f;
     --voice-ouroboros: #76162b;
     --voice-ouroboros-card: #76162b;
+    /* A note between works (DESIGN "Replies"): the voice one quiet step back toward the room, its hover a step less;
+       the cards peeking below a stack's front card are that material flattened toward the room again, each level
+       more. Flat colours: the ledges carry the rest shadow, which an opacity would fade with them. Written as values
+       (the voice at 74 % / 84 % over the room; the note at 84 % / 66 %), since older WebKit has no color-mix(). */
+    --voice-ouroboros-note: #5b1424;
+    --voice-ouroboros-note-hover: #661527;
+    --relay-ledge-1: #4f1321;
+    --relay-ledge-2: #41121e;
     --tone-crimson: #d32d43;
     --tone-crimson-hover: #c32a3f;
     /* The crimson tone's ink: white on the solid crimson. Its hover deepens rather than lightens, and so does its
@@ -316,7 +333,7 @@
        sidebar's resize handle, the Project panel over the content area (its scrim beneath it; the stack layout's
        full-width Project a step above), the reply mark of a message being swiped, a sent draft rising into its feed
        (send_flight.js), the drawer's way back (its clear
-       scrim over the room's visible quarter), the chat header's menu; popovers (.ui-popup) stay the top of everything. */
+       scrim over the room's visible quarter); popovers (.ui-popup) stay the top of everything. */
     --z-page-header: 5;
     --z-sidebar: 10;
     --z-room: 15;
@@ -327,7 +344,6 @@
     --z-row-reply-mark: 62;
     --z-send-flight: 64;
     --z-drawer-scrim: 68;
-    --z-header-menu: 90;
     --z-popover: 1200;
     /* Quote panel glass (DESIGN "Replies"): the shell colour at one alpha, so a quote reads lighter than the bubble it sits in. */
     --quote-glass: rgba(var(--shell-rgb), 0.7);
@@ -338,7 +354,6 @@
     --neutral-rgb: 32, 35, 43;
     --shell-rgb: 255, 255, 255;
     --composer-rgb: 244, 245, 248;
-    --composer-hover-rgb: 248, 237, 239;
     --modal-rgb: 255, 255, 255;
     --menu-rgb: 250, 251, 253;
     --media-rgb: 244, 245, 248;
@@ -366,6 +381,10 @@
     --focus-accent-border: #bf2f40;
     --chart-grid: rgba(var(--neutral-rgb), 0.14);
     --chart-text: #4a515d;
+    --chart-series-1: #c0284c;
+    --chart-series-2: #2c68d0;
+    --chart-series-3: #1e9c76;
+    --chart-series-4: #bd6a00;
     --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14'%3E%3Cpath d='M3 5l4 4 4-4' fill='none' stroke='%2320232b' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
     --diagram-bg: #ffffff;
     --diagram-primary: #f3e8ec;
@@ -392,6 +411,13 @@
     --voice-owner: #e9eef9;
     --voice-ouroboros: #fdf2f4;
     --voice-ouroboros-card: #fff8f9;
+    /* The note between works: the work card's rose as a value under the note's own name (the card's token stays the
+       card's), hovering to the voice; on white a card behind lies in the front card's shadow, a deeper step of the
+       accent ladder, not a paler one. */
+    --voice-ouroboros-note: #fff8f9;
+    --voice-ouroboros-note-hover: var(--voice-ouroboros);
+    --relay-ledge-1: #faebec;  /* the accent at 10 % over white */
+    --relay-ledge-2: #f7e3e5;  /* the accent at 14 % over white */
     /* The crimson tone is the accent ladder's; its hover stops at 14 % so the ink keeps 4.5:1 on it. */
     --tone-crimson: var(--accent-10);
     --tone-crimson-hover: var(--accent-14);
@@ -813,7 +839,9 @@ textarea.ui-control { resize: vertical; }
     .btn:hover, .btn:active { transform: none; }
 }
 
-/* Measured popup placement is shared; menu/listbox interaction stays separate. */
+/* Measured popup placement and its floating material are shared; menu/listbox interaction stays separate. The paint
+   belongs to the popup itself, so a menu, a dialog and a listbox are one backed sheet on
+   the float shadow: a role below chooses layout, never paint. */
 .ui-popup {
     position: fixed;
     margin: 0;
@@ -827,6 +855,13 @@ textarea.ui-control { resize: vertical; }
     overflow-y: auto;
     overscroll-behavior: contain;
     z-index: var(--z-popover);
+    border: 1px solid transparent;
+    border-radius: var(--radius-object);
+    background: var(--popup-float);
+    color: var(--text-primary);
+    box-shadow: var(--elev-float);
+    -webkit-backdrop-filter: var(--glass);
+    backdrop-filter: var(--glass);
 }
 .ui-model-chooser { display: block; min-width: 0; }
 .ui-model-chooser > .ui-control { width: 100%; }
@@ -834,13 +869,6 @@ textarea.ui-control { resize: vertical; }
     width: var(--ui-popup-anchor-width);
     margin: 0;
     padding: var(--space-1);
-    border: 1px solid transparent;
-    border-radius: var(--radius-object);
-    background: var(--surface-float);
-    color: var(--text-primary);
-    box-shadow: var(--elev-float);
-    -webkit-backdrop-filter: var(--glass);
-    backdrop-filter: var(--glass);
     list-style: none;
 }
 .ui-model-option, .ui-model-empty {
@@ -855,20 +883,13 @@ textarea.ui-control { resize: vertical; }
 .ui-model-option[aria-selected="true"] { color: var(--accent-light); background: var(--accent-12); }
 .ui-model-empty { color: var(--text-meta); }
 
-/* One menu surface, a float sheet like the model list above; callers retain only domain meaning such as danger. */
+/* One menu layout on that sheet; callers retain only domain meaning such as danger. */
 .ui-popup[role="menu"] {
     display: flex;
     flex-direction: column;
     width: max-content;
     min-width: min(160px, var(--ui-popup-max-width));
     padding: var(--space-1);
-    border: 1px solid transparent;
-    border-radius: var(--radius-object);
-    background: var(--surface-float);
-    color: var(--text-primary);
-    box-shadow: var(--elev-float);
-    -webkit-backdrop-filter: var(--glass);
-    backdrop-filter: var(--glass);
 }
 .ui-popup [role^="menuitem"] {
     flex: 0 0 auto;
@@ -913,12 +934,66 @@ textarea.ui-control { resize: vertical; }
     .ui-popup:not([hidden]) { animation: none; }
 }
 
+/* ---- The one hint (DESIGN "Hints", ui_hint.js) ---------------------------------------------------------------------
+   What a control says about itself, on the popups' floating material: it stands above its control and over the page,
+   out of the flow, so showing it, changing its words or hiding it moves nothing. A line of meaning in the meta ink (the
+   value's word primary), a rule line in the secondary ink, and at most one action in the accent ink. */
+.ui-hint {
+    position: absolute;
+    z-index: 1;
+    bottom: calc(100% + var(--space-2));
+    inset-inline-start: var(--ui-hint-shift, 0px);
+    box-sizing: border-box;
+    width: max-content;
+    max-width: min(28rem, calc(100vw - 4 * var(--space-2)));
+    max-width: min(28rem, 100cqi);
+    max-height: var(--ui-hint-room, none);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid transparent;
+    border-radius: var(--radius-lg);
+    background: var(--popup-float);
+    box-shadow: var(--elev-float);
+    -webkit-backdrop-filter: var(--glass);
+    backdrop-filter: var(--glass);
+    color: var(--text-meta);
+    font-family: var(--font-sans);
+    font-size: var(--type-meta);
+    font-weight: 500;
+    line-height: var(--line-meta);
+    letter-spacing: 0;
+    text-align: start;
+    white-space: normal;
+}
+.ui-hint[hidden], .ui-hint [hidden] { display: none; }
+.ui-hint[data-side="below"] { bottom: auto; top: calc(100% + var(--space-2)); }
+.ui-hint[data-cramped="true"] { overflow-y: auto; overscroll-behavior: contain; }
+.ui-hint-line, .ui-hint-rule { margin: 0; }
+.ui-hint-word { margin-inline-end: var(--space-2); color: var(--text-primary); font-weight: 600; }
+.ui-hint-rule { margin-top: 2px; color: var(--text-secondary); }
+.ui-hint-action {
+    display: block;
+    margin-top: var(--space-1);
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent-light);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+}
+.ui-hint-action:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; border-radius: var(--radius-sm); }
+.ui-hint:not([hidden]) { animation: ui-hint-in var(--motion-fade) var(--ease-sheet); }
+@keyframes ui-hint-in { from { opacity: 0; transform: translateY(3px); } }
+@media (prefers-reduced-motion: reduce) {
+    .ui-hint:not([hidden]) { animation: none; }
+}
+
 /* ---- Floating chrome ----------------------------------------------------------------------------------------------
    Controls that float over scrolling content (Main's header group) share one box: height, baseline and the pill
    corner; words, width, weight and tone stay the control's own (DESIGN §5). The group is invisible at rest and its
    padding is cancelled by an equal negative margin, so grouping moves no control. A room's separate capsules keep
-   their own reading backing, and what a bar discloses unfolds from the bar's bottom edge as one
-   Shade (room_work.css), never as a box glued to one control or one group. */
+   their own reading backing, and what a bar discloses hangs under its capsules as one work list (room_work.css),
+   never as a box glued to one control or one group. */
 @media (pointer: coarse) {
     /* A coarse pointer (a phone) raises the shared touch minimum to a finger's 44px, and the whole family with it. */
     :root { --touch-target-min: 44px; --chrome-control-h: var(--touch-target-min); }

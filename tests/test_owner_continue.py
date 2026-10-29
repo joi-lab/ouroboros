@@ -152,6 +152,76 @@ def test_an_accounting_expiry_never_outranks_a_stop_or_a_whole_work_bound(tmp_pa
     assert workers.PENDING == [] and "continued_by" not in load_task_result(tmp_path, "pred-1")
 
 
+_STAMP = "delegated_custody_unreconciled"
+
+
+@pytest.mark.parametrize("stored,admitted,cause_or_refusal", [
+    ({"reason_code": "provider_failure", "delegated_runs_unreconciled": ["run-open"],
+      "outcome_axes": {"execution": {"status": "infra_failed", "reason_code": "provider_failure"}}},
+     True, "provider_failure"),
+    ({"reason_code": _STAMP, "outcome_axes": {"execution": {"status": "infra_failed", "reason_code": "provider_failure"}}},
+     True, "provider_failure"),
+    ({"status": "completed", "reason_code": _STAMP,
+      "outcome_axes": {"execution": {"status": "best_effort", "reason_code": "round_limit"}}}, True, "round_limit"),
+    ({"reason_code": _STAMP, "cancel_origin": {"source": "http_single", "reason": "Stop now"},
+      "outcome_axes": {"execution": {"status": "failed", "reason_code": "provider_failure"}}}, False, "stopped_by_owner"),
+    ({"reason_code": _STAMP, "outcome_axes": {"execution": {"status": "failed", "reason_code": "budget_exhausted"}}},
+     False, "hard_limit_reached"),
+    ({"status": "completed", "reason_code": _STAMP,
+      "outcome_axes": {"execution": {"status": "ok", "reason_code": "final_message"}}}, False, "author_finished"),
+    ({"reason_code": _STAMP, "outcome_axes": {"execution": {"status": "failed"}}}, False, "interruption_cause_unrecorded"),
+    ({"reason_code": _STAMP, "outcome_axes": {"execution": {"status": "failed", "reason_code": _STAMP}}},
+     False, "interruption_cause_unrecorded"),
+], ids=["new-provider-failure", "legacy-provider-failure", "legacy-technical-rail", "legacy-owner-stop",
+        "legacy-hard-bound", "legacy-completed-author", "legacy-missing-cause", "legacy-stamp-read-back-as-cause"])
+def test_continue_reads_a_custody_stamp_by_the_cause_beneath_it(tmp_path, monkeypatch, stored, admitted,
+                                                                cause_or_refusal):
+    """#1583: an open debt never was the cause. A new row keeps its own reason; an older row's
+    custody stamp is read beneath, from its typed execution reason (never prose), and every
+    guard still answers first: a Stop, a hard bound and a finished answer refuse, and a stamped
+    row whose cause was never recorded still refuses, naming the stamp. History keeps its bytes."""
+    from ouroboros.task_results import load_task_result
+    from supervisor.continuation_admission import admit_continuation
+
+    _queue, _state, workers = _install_queue(tmp_path, monkeypatch)
+    _interrupted(tmp_path, reason_code="provider_failure")
+    seed_result(tmp_path, "pred-1", {**load_task_result(tmp_path, "pred-1"), **stored})
+    before = load_task_result(tmp_path, "pred-1")
+    outcome = admit_continuation("pred-1", action_nonce=NONCE)
+    after = load_task_result(tmp_path, "pred-1")
+    assert {key: after.get(key) for key in ("reason_code", "outcome_axes")} == {
+        key: before.get(key) for key in ("reason_code", "outcome_axes")}, "no migration of the stored row"
+    if not admitted:
+        assert outcome["ok"] is False and outcome["error"] == cause_or_refusal
+        assert outcome["cause"] == {"stopped_by_owner": "http_single", "hard_limit_reached": "budget_exhausted",
+                                    "author_finished": "finished", "interruption_cause_unrecorded": _STAMP}[
+            cause_or_refusal], "a refusal names the guard's own fact, or the stamp it could not see beneath"
+        assert workers.PENDING == [] and "continued_by" not in after
+        return
+    assert outcome["ok"] is True and outcome["held"] is False
+    row = next(task for task in workers.PENDING if task["id"] == outcome["successor_task_id"])
+    assert row["metadata"]["continuation"]["cause"] == cause_or_refusal
+    assert _STAMP not in row["text"], "the successor's work order names the real cause"
+
+
+def test_a_legacy_stamped_root_with_a_live_writer_is_held_not_doubled(tmp_path, monkeypatch):
+    """The cause beneath the stamp admits Continue; a writer that really remains unsettled still holds it."""
+    from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
+    from supervisor.continuation_admission import admit_continuation
+
+    _queue, _state, workers = _install_queue(tmp_path, monkeypatch)
+    _interrupted(tmp_path, reason_code=_STAMP,
+                 outcome_axes={"execution": {"status": "infra_failed", "reason_code": "provider_failure"}})
+    assert load_task_result(tmp_path, "pred-1")["reason_code"] == _STAMP
+    write_task_result(tmp_path, "pred-child", STATUS_RUNNING, chat_id=7)
+    workers.RUNNING["pred-child"] = {"task": {"id": "pred-child", "root_task_id": "pred-1",
+                                              "parent_task_id": "pred-1"}, "worker_id": 0, "attempt": 1}
+    ack = admit_continuation("pred-1", action_nonce=NONCE)
+    assert ack["ok"] is True and ack["held"] is True
+    assert ack["blockers"] == [{"kind": "running_member", "task_id": "pred-child"}]
+    assert [task["id"] for task in workers.PENDING] == [ack["successor_task_id"]]
+
+
 def test_a_finished_answer_and_a_live_task_refuse_while_a_technical_limit_admits(tmp_path, monkeypatch):
     from ouroboros.task_results import STATUS_RUNNING, write_task_result
     from supervisor.continuation_admission import admit_continuation

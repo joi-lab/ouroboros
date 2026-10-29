@@ -8,11 +8,11 @@ import { WS } from '../modules/ws.js';
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(setImmediate); };
 const NO_HISTORY = { versions: [], saved_at: '', refresh: { state: 'idle' }, install: {} };
 
-function mountEvolution(env, state = { activePage: 'dashboard', dashboardActiveSubtab: 'evolution' }) {
+function mountEvolution(env, state = { activePage: 'dashboard', dashboardActiveSubtab: 'evolution' }, dialog = undefined) {
     const mount = env.doc.createElement('div');
     env.doc.body.append(mount);
     const ws = new WS('ws://unused');
-    return { ws, dispose: initEvolution({ ws, mount, state }).dispose };
+    return { ws, dispose: initEvolution({ ws, mount, state, dialog }).dispose };
 }
 
 test('Pause stays disabled while its command is in flight, a refused send is said, and light mode keeps Start off', async (t) => {
@@ -236,6 +236,42 @@ test('the campaign follows every state answer of the page: a Pause the runtime a
         assert.equal(chip.textContent, 'Off', 'a disposed page paints nothing');
     } finally {
         evolution?.dispose();
+        globalThis.fetch = savedFetch;
+        env.restore();
+    }
+});
+
+test('Run review… stands beside the campaign and opens the one reviewer picker; only a confirmed choice sends /review', async () => {
+    const env = installDomDouble();
+    const savedFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => Response.json(String(url).startsWith('/api/settings')
+        ? { OUROBOROS_SUBAGENTS: { items: [{ subagent_id: 'row-a', enabled: true }] } }
+        : String(url).includes('evolution-data') ? NO_HISTORY
+            : { runtime_mode: 'advanced', evolution_state: { status: 'disabled', enabled: false } });
+    const asked = [];
+    let answer = { confirmed: false };
+    let dispose;
+    try {
+        const mounted = mountEvolution(env, undefined, async (options) => { asked.push(options); return answer; });
+        dispose = mounted.dispose;
+        const sent = [];
+        mounted.ws.send = (frame) => { sent.push(frame); return { status: 'sent' }; };
+        mounted.ws.emit('open');
+        await flush();
+        const review = env.doc.getElementById('evo-review');
+        assert.deepEqual(review.parent.children.map((node) => node.id), ['evo-start', 'evo-stop', 'evo-review']);
+        assert.equal(review.textContent, 'Run review…');
+        review.click();
+        await flush();
+        assert.equal(asked[0].title, 'Deep self-review', 'the picker /review uses');
+        assert.deepEqual(asked[0].choices.map((choice) => choice.value), ['', 'row-a'], 'the Main model, then the enabled rows');
+        assert.deepEqual(sent, [], 'a cancelled picker sends nothing');
+        answer = { confirmed: true, value: 'row-a' };
+        review.click();
+        await flush();
+        assert.deepEqual(sent, [{ type: 'command', cmd: '/review row-a' }]);
+    } finally {
+        dispose?.();
         globalThis.fetch = savedFetch;
         env.restore();
     }

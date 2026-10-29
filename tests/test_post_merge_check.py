@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import urllib.error
 
 import pytest
@@ -176,20 +177,49 @@ LINTED = "ruff F811 tests/t.py fake_route"
 
 
 def test_lint_findings_name_code_file_and_name_and_say_when_ruff_could_not_run(tmp_path, monkeypatch):
-    """The release's lint gate, run as it runs there; a line number is not part of the id, it moves with edits."""
+    """The release's lint gate on ruff's JSON rows, so no ruff is needed here; a line number is not
+    part of the id, it moves with edits. A ruff that cannot run or answers anything but a list is None."""
+    asked = []
+
+    def ruff(answer, code=0, stderr=""):
+        def run(argv, **kwargs):
+            asked.append((argv, kwargs["cwd"]))
+            if isinstance(answer, BaseException):
+                raise answer
+            return subprocess.CompletedProcess(argv, code, answer, stderr)
+        monkeypatch.setattr(pmc.subprocess, "run", run)
+
+    module = str(tmp_path / "pkg" / "m.py")
+    for line in (5, 9):  # the same two findings before and after an edit above them
+        ruff(json.dumps([{"code": "F401", "filename": module, "location": {"row": 1, "column": 8},
+                          "message": "`os` imported but unused"},
+                         {"code": "F811", "filename": module, "location": {"row": line, "column": 5},
+                          "message": f"Redefinition of unused `loads` from line {line - 3}: `loads` redefined here"}]))
+        found = pmc.lint_findings(tmp_path)
+        assert sorted(found) == ["ruff F401 pkg/m.py os", "ruff F811 pkg/m.py loads"]
+        assert f"from line {line - 3}" in found["ruff F811 pkg/m.py loads"]
+    assert asked[-1] == ([sys.executable, "-m", "ruff", *pmc.LINT_ARGS, "."], tmp_path.resolve())
+    ruff("[]")
+    assert pmc.lint_findings(tmp_path, ["pkg/clean.py"]) == {}
+    assert asked[-1][0][-1] == "pkg/clean.py"
+
+    for answer, code, stderr in (("", 1, f"{sys.executable}: No module named ruff\n"),  # the packaged runtime
+                                 (OSError("no ruff"), 0, ""), (subprocess.TimeoutExpired("ruff", 600), 0, ""),
+                                 ("not json", 0, ""), ('{"code": "F401"}', 0, ""), ("", 0, ""),
+                                 ("[]", 2, "ruff failed: invalid configuration\n")):
+        ruff(answer, code, stderr)
+        assert pmc.lint_findings(tmp_path) is None, (answer, code)
+
+
+def test_lint_findings_read_the_installed_ruff(tmp_path):
+    """The same ids from a real ruff run; only an interpreter without ruff (the packaged runtime) skips."""
+    pytest.importorskip("ruff", reason="ruff is a development dependency; the packaged runtime has none")
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "m.py").write_text("import os\nfrom json import loads\n\n\ndef loads():\n    return 1\n",
                                            encoding="utf-8")
     (tmp_path / "pkg" / "clean.py").write_text("VALUE = 1\n", encoding="utf-8")
-    found = pmc.lint_findings(tmp_path)
-    assert sorted(found) == ["ruff F401 pkg/m.py os", "ruff F811 pkg/m.py loads"]
+    assert sorted(pmc.lint_findings(tmp_path)) == ["ruff F401 pkg/m.py os", "ruff F811 pkg/m.py loads"]
     assert pmc.lint_findings(tmp_path, ["pkg/clean.py"]) == {}
-
-    def missing(*args, **kwargs):
-        raise OSError("no ruff")
-
-    monkeypatch.setattr(pmc.subprocess, "run", missing)
-    assert pmc.lint_findings(tmp_path) is None
 
 
 def test_a_lint_finding_is_failed_without_a_retry_and_ruff_that_cannot_run_is_a_problem(tmp_path):

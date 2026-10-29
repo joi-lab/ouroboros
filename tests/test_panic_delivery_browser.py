@@ -30,7 +30,7 @@ def _typed(page):
 def _facts(page):
     return page.evaluate('''() => {
         // No veil covers the app while the socket comes back (owner 20.10, Q4): the room's own Panic stays its control.
-        const button = document.querySelector('[data-chat-command="panic"]');
+        const button = document.querySelector('#page-chat [data-chat-command="panic"]');
         const box = button?.getBoundingClientRect();
         const hit = box && document.elementFromPoint(box.x + box.width/2, box.y + box.height/2);
         const toast = document.querySelector('#toast-stack .toast');
@@ -93,7 +93,7 @@ def test_real_controls_bridge_first_offline_failure_and_no_successor_replay(pani
     page.wait_for_selector('#chat-input')
     page.wait_for_function('window.__ouroWs?.ws?.readyState === 1')
     page.wait_for_function('(theme) => document.documentElement.dataset.theme === theme', arg=theme)
-    button = page.locator('[data-chat-command="panic"]')
+    button = page.locator('#page-chat [data-chat-command="panic"]')  # every Project bar has its own
     expect(button).to_be_visible()
     panic_messages = lambda: [m for m in messages if m['frame'].get('cmd') == '/panic']
 

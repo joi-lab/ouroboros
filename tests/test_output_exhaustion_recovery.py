@@ -90,7 +90,10 @@ def configured_loop(tmp_path, monkeypatch, client, *, sources=False, exact=False
         kw["messages"] = [{"role": "system", "content": "Required memory and books: KEEP."},
                           {"role": "user", "content": "OWNER WORDS: keep every source."},
                           *_tool("seen", invocation="seen-invocation")]
-        ctx._last_context_observation = _observation(kw["messages"])
+        from ouroboros.tool_policy import initial_tool_schemas
+        # A recorded send carries its tool list too: a missing one would read as a changed one.
+        ctx._last_context_observation = {**_observation(kw["messages"]),
+                                         "tool_schemas": initial_tool_schemas(kw["tools"], context_mode="max")}
         kw["messages"] += [*_tool("unseen", invocation="unseen-invocation", text="UNSEEN-KEEP " * 1500),
             bound_host_row(CONTEXT_FACTS_NAME, "OLD-HOST " * 5000),
             bound_host_row(CONTEXT_FACTS_NAME, "CURRENT-HOST-KEEP")]

@@ -311,8 +311,8 @@ def _accept_owner_directives(ctx: Any, drive_root: Any, task_id: str) -> List[Di
         if msg_id:
             row["msg_id"] = str(msg_id)
         # The typed origin the recorder already resolved (a task message's source task,
-        # and the sibling it was relayed from) travels with the row: every reader of this
-        # one corpus sees a relayed proposal as such, without inferring it from the text.
+        # the sibling it was relayed from, an owner answer's card) travels with the row:
+        # every reader of this one corpus sees a relayed proposal as such, without inferring it from the text.
         row.update({key: str(value) for key, value in (origin or {}).items() if value})
         rows.append(row)
 
@@ -324,7 +324,7 @@ def _accept_owner_directives(ctx: Any, drive_root: Any, task_id: str) -> List[Di
                     str(item.get("source") or "task_local"),
                     item.get("content"),
                     str(item.get("msg_id") or ""),
-                    {key: item.get(key) for key in ("source_task_id", "relayed_from_task_id")},
+                    {key: item.get(key) for key in ("source_task_id", "relayed_from_task_id", "quiz_id")},
                 )
 
     messages = getattr(ctx, "messages", None)

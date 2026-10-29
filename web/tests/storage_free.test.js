@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { confirmCopy, doneSentences, freeSum, goLabel, notStarted, sumComplete, trayHtml, trayState } from '../modules/storage_free.js';
+import { confirmCopy, doneSentences, freeSum, goLabel, notStarted, startsChecked, sumComplete, trayHtml, trayState } from '../modules/storage_free.js';
 
 // Text is escaped through document.createElement, as a browser's innerHTML does.
 globalThis.document = globalThis.document || {
@@ -32,7 +32,7 @@ const AVOIDED = /At least|Excluded|System data|Junk|Clean\b|Prune|%/;
 
 test('the tray rests with one neutral door, lists with the counts first, and names the sum once ready', () => {
     const rest = trayHtml(free('idle'), ui());
-    assert.match(rest, /Temporary space[\s\S]*Copies the app already removes on its own\. Most of Ouroboros is kept on purpose\.[\s\S]*data-free-preview[^>]*>Show what can go</);
+    assert.match(rest, /Temporary space[\s\S]*Copies and leftovers of finished work\. Most of Ouroboros is kept on purpose\.[\s\S]*data-free-preview[^>]*>Show what can go</);
     assert.doesNotMatch(rest, /btn-danger/);
     const listing = trayHtml(free('listing', { done: 1240, total: 1661, groups: [group('work_folders', { bytes: 5.1 * GB, bytes_complete: false }), group('working_copies', { bytes: null, bytes_complete: false })] }), ui());
     assert.match(listing, /Checking what can go · 1,240 of 1,661 folders · 5\.1 GB so far\. Nothing is removed\./);
@@ -158,6 +158,23 @@ test('the confirm dialog carries the sum, the loss sentence and one detail row p
     const one = confirmCopy(free('ready', { groups: both() }), new Set(['working_copies']));
     assert.equal(one.details.rows.length, 1);
     assert.equal(one.confirmLabel, 'Free 2.1 GB');
+});
+
+test('groups that hold saved work start unchecked and are named as lost when checked', () => {
+    assert.deepEqual(['work_folders', 'working_copies', 'review_evidence', 'review_checkouts', 'lost_copies', 'service_folders', 'result_pins']
+        .filter((id) => startsChecked({ id })), ['work_folders', 'working_copies']);
+    const groups = [...both(), group('review_evidence', { count: 40, inside_wait: 0, in_use: 2, bytes: 43 * GB }),
+        group('result_pins', { count: 3, inside_wait: 0, in_use: 0, bytes: 2e5 })];
+    const ready = trayHtml(free('ready', { groups }), ui());
+    assert.match(ready, /Groups that hold saved work start unchecked; each says what goes\./);
+    assert.doesNotMatch(ready, /Nothing here holds results/, 'false once a group holds saved work');
+    assert.match(ready, /Reviewers’ saved files of finished tasks[\s\S]*43 GB[\s\S]*Their verdicts stay in the review results\./);
+    assert.match(ready, /Git marks of results never applied[\s\S]*can still be applied as a plain patch/);
+    const temporary = confirmCopy(free('ready', { groups }), new Set(['work_folders']));
+    assert.match(temporary.body, /Results, messages and the exact model history are kept\./);
+    const saved = confirmCopy(free('ready', { groups }), new Set(['work_folders', 'review_evidence', 'result_pins']));
+    assert.equal(saved.body, 'This removes 50 GB for good. Saved work goes too: Reviewers’ saved files of finished tasks; Git marks of results never applied.');
+    assert.doesNotMatch(saved.body, /are kept/);
 });
 
 test('titles and accessible names are fixed chrome: nothing minted per preview', () => {

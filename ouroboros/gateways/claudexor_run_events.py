@@ -22,7 +22,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, Iterator, List, Optional, Tuple
 
 import httpx
 
@@ -32,9 +32,10 @@ RUN_EVENTS_OPERATION = ("GET", "/v2/runs/:id/events")
 # One wait poll's worth of journal is far below this; a read that reaches it stops at the
 # last whole frame and says so, and the next read resumes from that cursor.
 MAX_READ_BYTES = 8 * 1024 * 1024
-# Catalog answers per exact engine identity (version, build sha): a route cannot appear or
-# vanish without the engine changing, so one catalog read per identity per process.
-_SUPPORT: Dict[Tuple[str, str], bool] = {}
+# The catalog per exact engine identity (version, build sha): a route cannot appear or vanish
+# without the engine changing, so one catalog read per identity per process, shared by every
+# route question (the event stream's here, the compact wait's in ``claudexor_observation``).
+_SUPPORT: Dict[Tuple[str, str], FrozenSet[Tuple[str, str]]] = {}
 _SUPPORT_LOCK = threading.Lock()
 
 
@@ -59,25 +60,35 @@ class RunEventsRead:
     bytes_read: int = 0
 
 
+def engine_identity(gateway: Any) -> Tuple[str, str]:
+    """The exact engine behind a handshaken gateway: ``(version, build sha)``."""
+    return (str(getattr(gateway, "engine_version", "") or ""), str(getattr(gateway, "engine_build_sha", "") or ""))
+
+
+def route_listed(gateway: Any, operation: Tuple[str, str], *, timeout_sec: Optional[float]) -> bool:
+    """Does the engine's catalog list ``operation`` (``(method, path)``)? One catalog read per
+    exact engine identity, shared by every route question; a hole on that read propagates
+    typed, so no caller reads a timeout as "not listed"."""
+    key = engine_identity(gateway)
+    with _SUPPORT_LOCK:
+        listed = _SUPPORT.get(key)
+    if listed is None:
+        listed = frozenset((str(row.get("method") or ""), str(row.get("path") or ""))
+                           for row in gateway.operations(timeout_sec=timeout_sec) if isinstance(row, dict))
+        with _SUPPORT_LOCK:
+            _SUPPORT[key] = listed
+    return operation in listed
+
+
 def run_events_supported(gateway: Any, *, timeout_sec: float) -> bool:
     """Does the handshaken engine behind ``gateway`` list the run event stream?
 
     An unhandshaken transport, or one without the stream seam (an older client or a test
     double), is answered ``False`` without a request: the caller keeps its window view.
     """
-    version = str(getattr(gateway, "engine_version", "") or "")
-    if not version or not callable(getattr(gateway, "open_run_events", None)):
+    if not getattr(gateway, "engine_version", "") or not callable(getattr(gateway, "open_run_events", None)):
         return False
-    key = (version, str(getattr(gateway, "engine_build_sha", "") or ""))
-    with _SUPPORT_LOCK:
-        if key in _SUPPORT:
-            return _SUPPORT[key]
-    method, path = RUN_EVENTS_OPERATION
-    supported = any(row.get("method") == method and row.get("path") == path
-                    for row in gateway.operations(timeout_sec=timeout_sec) if isinstance(row, dict))
-    with _SUPPORT_LOCK:
-        _SUPPORT[key] = supported
-    return supported
+    return route_listed(gateway, RUN_EVENTS_OPERATION, timeout_sec=timeout_sec)
 
 
 def _refusal(response: Any) -> ClaudexorUnavailable:

@@ -45,6 +45,7 @@ from ouroboros.platform_layer import (
 )
 from ouroboros.provider_models import (
     ALL_PROVIDER_CREDENTIAL_KEYS,
+    CONNECTIONS_KEY,
     LEGACY_MODEL_SETTING_KEYS,
     provider_credential_plan,
 )
@@ -182,13 +183,14 @@ def _settings_json_bytes(config: dict) -> bytes:
 
 
 def _is_secret_env_key(key: str) -> bool:
-    """A non-provider secret-shaped env var (token/secret/password/api-key/credentials)."""
+    """A non-provider secret-shaped env var (token/secret/password/api-key/credentials), or the
+    added API keys' rows (``OUROBOROS_CONNECTIONS``), whose fields carry their keys."""
     ku = str(key).upper()
     if ku in _PROVIDER_ENV_KEYS:
         return False
     return (
         "TOKEN" in ku or "SECRET" in ku or "PASSWORD" in ku
-        or ku.endswith("_API_KEY") or ku.endswith("_CREDENTIALS")
+        or ku.endswith("_API_KEY") or ku.endswith("_CREDENTIALS") or ku == CONNECTIONS_KEY
     )
 
 

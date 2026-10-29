@@ -90,14 +90,16 @@ def calibrated_input_token_limit(
         # intact. Zero is absence of evidence, not a zero-token provider limit.
         return int(budget_cap)
     from ouroboros.capability_evidence import resolve_review_token_density
+    from ouroboros.reviewer_window import reviewer_input_limit
 
     density, _ = resolve_review_token_density(
         drive_root if drive_root is not None else review_drive_root(None), model_id
     )
+    usable = reviewer_input_limit(context_window, output_reserve)
     return min(
         budget_cap,
-        int((context_window - output_reserve) / max(1.0, density)),
-        context_window - output_reserve - tokenizer_margin,
+        int(usable / max(1.0, density)),
+        usable - tokenizer_margin,
     )
 
 
@@ -132,6 +134,32 @@ def emit_review_event(ctx: Any, event: dict) -> None:
             pending.append(payload)
     except Exception:
         logger.debug("emit_review_event failed (non-critical)", exc_info=True)
+
+
+def _publish_server_usage(ctx: Any, event: dict) -> bool:
+    """Hand a queue-less SERVER carrier's usage row to the attached server bus when it is emitted.
+
+    Only a carrier declaring ``server_usage_bus`` (the Skills-page and install review contexts) with no
+    task queue takes this path; the supervisor's ordinary ``llm_usage`` handler then writes and streams
+    the row. Its wave may outlive the request, so nothing waits to drain it. A missing inner ``chat_id``
+    takes the carrier's own address (0, the panel; never Main). Best effort like every telemetry row:
+    without an attached bus (another process, shutdown) the row stays undelivered on ``pending_events``
+    and the ledger alone keeps the money.
+    """
+    if getattr(ctx, "event_queue", None) is not None or not getattr(ctx, "server_usage_bus", False):
+        return False
+    try:
+        from supervisor.workers import get_event_q
+
+        bus = get_event_q(create=False)  # the established bus only, never a child-local one nobody drains
+        payload = {"ts": utc_now_iso(), **dict(event)}
+        if payload.get("chat_id") is None:
+            payload["chat_id"] = int(getattr(ctx, "current_chat_id", 0) or 0)
+        bus.put(payload)
+        return True
+    except Exception:
+        logger.debug("review usage kept on pending_events: no attached server bus", exc_info=True)
+        return False
 
 
 def emit_review_usage(
@@ -215,7 +243,8 @@ def emit_review_usage(
             event["prompt_chars"] = int(prompt_chars)
         if extra:
             event.update(dict(extra))
-        emit_review_event(ctx, event)
+        if not _publish_server_usage(ctx, event):
+            emit_review_event(ctx, event)
     except Exception:
         logger.debug("emit_review_usage failed (non-critical)", exc_info=True)
 
@@ -640,6 +669,7 @@ def check_worktree_readiness(
     *, information: "list[str] | None" = None,
 ) -> "list[str]":
     """Run cheap deterministic pre-advisory checks; never crash."""
+    from ouroboros.git_observation import host_git_env
     repo_dir = Path(repo_dir)
     warnings: list = []
 
@@ -649,7 +679,7 @@ def check_worktree_readiness(
         path_args = (["--"] + list(paths)) if paths else []
         status_result = subprocess.run(
             ["git", "status", "--porcelain"] + path_args,
-            cwd=str(repo_dir), capture_output=True, text=True, timeout=10,
+            cwd=str(repo_dir), capture_output=True, text=True, timeout=10, env=host_git_env(),
         )
         if status_result.returncode != 0:
             stderr_text = (status_result.stderr or "").strip()

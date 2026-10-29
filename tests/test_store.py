@@ -544,7 +544,7 @@ def test_readers_decode_bodies_after_the_read_transaction_closed(tmp_path, monke
 def _outside_the_lock(root, monkeypatch, probes):
     """Every mutator input is prepared with NO write transaction open: each prepared input first
     takes and releases the store's write lock itself, which ``StoreBusy``-fails under a mutator."""
-    from ouroboros import swarm_rollup, task_custody
+    from ouroboros import task_custody
 
     def guard(name, real):
         def probe(*args, **kwargs):
@@ -554,25 +554,22 @@ def _outside_the_lock(root, monkeypatch, probes):
             return real(*args, **kwargs)
         return probe
 
-    for module, name in ((task_custody, "capture_unread_mail"), (task_custody, "capture_owner_mail"),
-                         (swarm_rollup, "initial_swarm_rollup")):
+    for module, name in ((task_custody, "capture_unread_mail"), (task_custody, "capture_owner_mail")):
         monkeypatch.setattr(module, name, guard(name, getattr(module, name)))
 
 
 def test_mutator_inputs_are_prepared_before_begin_and_reprepared_outside_when_the_row_moved(tmp_path, monkeypatch):
-    """S3 fix 13 (Grok MINOR, Astra M11): the mailbox captures and the swarm rollup run before
-    ``BEGIN``; a mutator that finds its input missing (a projector turning the row terminal, a
-    first row) rolls back empty and the whole write repeats with the input prepared outside the
-    lock."""
+    """Mailbox captures run before BEGIN; a projector turning a row terminal
+    rolls back empty and repeats with that input prepared outside the lock."""
     from ouroboros import store_import, task_results
 
     store_import.ensure_current_store(tmp_path)
     probes: list = []
     _outside_the_lock(tmp_path, monkeypatch, probes)
-    # A first row that is not create-only: the rollup is prepared on the second round, outside.
+    # A first row needs no history input: its producer-owned fan-out starts empty.
     task_results.write_task_result(tmp_path, "t1", "running")
-    assert probes == ["initial_swarm_rollup"]
-    assert task_results.load_task_result(tmp_path, "t1")["swarm_fanout_rollup"]["through"] == 0
+    assert probes == []
+    assert task_results.load_task_result(tmp_path, "t1")["swarm_fanout_rollup"]["fanout_count"] == 0
     # The projector turns a non-terminal write terminal: the captures are prepared outside, once.
     probes.clear()
     stored = task_results.write_task_result(tmp_path, "t1", "running",

@@ -208,8 +208,8 @@ def test_a_non_integer_window_is_an_argument_error(tmp_path):
 def _supervisor_over_one_stale_task(monkeypatch, tmp_path, *, now: float, ceiling: float, stale_sec: float):
     """The real enforcer, lease handler and executor frames over ONE RUNNING row whose
     last progress stamp is ``stale_sec`` old — deeper than the rail
-    ``max(idle, ceiling + 120)`` — so a supervisor tick that finds no reprieve reaps
-    into ``jobs``."""
+    ``max(idle, ceiling + 120)`` — so a supervisor tick that finds no reprieve dates
+    silence attention (#1376); only a hard rail reaps into ``jobs``."""
     from supervisor import queue as squeue, workers
 
     task_id = "waiter"
@@ -268,7 +268,8 @@ def test_the_idle_rail_spares_a_waiting_task_through_the_executors_tool_lease_an
     (a completed tool call is the task's own work), so the supervisor tick between
     the finished lease and the next model call spares the task and its next
     addressed turn can start. Without a new model round the ordinary idle rail then
-    reaps, one full window after the stamp — the rail is intact, only re-based.
+    dates silence attention one full window after the stamp, never a reap (#1376) —
+    the rail is intact, only re-based.
     """
     now = _time.time()
     ceiling = 1800.0
@@ -293,13 +294,15 @@ def test_the_idle_rail_spares_a_waiting_task_through_the_executors_tool_lease_an
     assert sim.jobs == [] and sim.task_id in sim.running and "finalization_requested_at" not in sim.meta
 
     # The ordinary idle rail is intact: one full window after the stamp with no model
-    # round since, the task is reaped as idle.
+    # round since, the task's silence is dated for attention and it keeps running.
     rail = max(60.0, ceiling + 120.0)
-    sim.tick(sim.meta["last_progress_at"] + rail - 1.0)
-    assert sim.jobs == [] and sim.task_id in sim.running
-    sim.tick(sim.meta["last_progress_at"] + rail + 1.0)
-    assert [job["terminal_reason"] for job in sim.jobs] == ["idle_timeout"]
-    assert sim.jobs[0]["task_id"] == sim.task_id and sim.task_id not in sim.running
+    stamp = sim.meta["last_progress_at"]
+    sim.tick(stamp + rail - 1.0)
+    assert sim.jobs == [] and sim.task_id in sim.running and "silence_attention" not in sim.meta
+    sim.tick(stamp + rail + 1.0)
+    assert sim.jobs == [] and sim.task_id in sim.running and "finalization_requested_at" not in sim.meta
+    assert sim.meta["silence_attention"]["state"] == "pending_attention"
+    assert sim.meta["silence_attention"]["last_progress_at"] == stamp
 
 
 @pytest.mark.parametrize("hard_rail", ["absolute_ceiling", "deadline"])

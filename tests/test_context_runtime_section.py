@@ -1,7 +1,7 @@
 """The runtime section and the user content the context builder emits.
 
 Split verbatim out of ``tests/test_context.py`` by theme. This module owns the
-force-plan notice that must not rewrite the user's text, the light-mode rule and filesystem affordances the runtime section states,
+legacy metadata that must not rewrite the user's text, the light-mode rule and filesystem affordances the runtime section states,
 the workspace rules that preserve system review/commit authority, the host routing
 manifest and manual contract, the improvement backlog digest, and the runtime_env
 block.
@@ -38,52 +38,17 @@ def test_schedule_digest_distinguishes_unreadable_from_empty(tmp_path, root_only
 
 
 @pytest.mark.parametrize("enforcement", ["blocking", "advisory"])
-def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text(
-    monkeypatch, enforcement,
-):
+def test_legacy_force_plan_metadata_leaves_owner_content_unchanged(monkeypatch, enforcement):
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
-    content = build_user_content(
-        {
-            "text": "Fix the marketplace retry flow.",
-            "metadata": {"force_plan": True, "force_plan_source": "swarm"},
-        }
-    )
-
-    assert content.startswith("[SWARM_INITIATIVE]")
-    assert "Source: swarm." in content
-    assert f"Resolved review enforcement: {enforcement}." in content
-    # The obligation is constitutional (BIBLE P3) and the gate is structural
-    # (owner_hurry.force_plan_decision); the ORDER of asking, exploring and
-    # planning belongs to the mind (BIBLE P5/P13), never to a prompt choreography.
-    assert "First call plan_task" not in content
-    assert "whether to ask, explore or plan first is your judgment" in content
-    assert "Under blocking" in content
-    assert "non-mutating preparation" in content
-    assert "begin implementation only after review closes" in content
-    # Fan-out integration mechanics (owner-approved, 2026-08-05): parallel
-    # children cannot see each other's edits, so a plan gives them disjoint
-    # write regions or plans the parent synthesis for the expected overlap.
-    assert "cannot see each other's edits" in content
-    assert "disjoint write regions" in content
-    # Owner intent as prose, not schema (rc-phaseC, P5): the plan must name its
-    # execution shape so reviewers can judge a silent zero-fan-out.
-    assert "State the chosen execution shape explicitly" in content
-    assert "delegation required, optional, or intentionally not used" in content
-    assert content.rstrip().endswith("Fix the marketplace retry flow.")
+    text = "Fix the marketplace retry flow."
+    assert build_user_content({"text": text, "metadata": {"force_plan": True, "force_plan_source": "swarm"}}) == text
 
 
 @pytest.mark.parametrize("obsolete_marker", [False, True])
-def test_managed_force_plan_has_only_the_initiative_context(obsolete_marker):
+def test_managed_legacy_force_plan_leaves_exact_owner_text(obsolete_marker):
     text = "  Investigate the alternatives.\nAsk about the actual constraints.\n"
-    content = build_user_content({
-        "text": text, "id": "managed-root", "root_task_id": "managed-root",
-        "_ephemeral_turn": obsolete_marker,
-        "metadata": {"force_plan": True, "force_plan_source": "swarm"},
-    })
-    assert content.startswith("[SWARM_INITIATIVE]")
-    assert content.count("[SWARM_INITIATIVE]") == 1
-    assert "SWARM_ROUTING_INTENT" not in content
-    assert content.endswith(text)
+    assert build_user_content({"text": text, "managed_task": obsolete_marker,
+                              "metadata": {"force_plan": True, "force_plan_source": "swarm"}}) == text
 
 
 
@@ -359,13 +324,17 @@ def test_improvement_backlog_digest_is_actor_scoped(tmp_path):
         )
         assert "## Improvement Backlog" not in messages[0]["content"][-1]["text"]
 
-    for task_type in ("evolution", "deep_self_review"):
-        messages, _ = build_llm_messages(
-            env=FakeEnv(), memory=Memory(drive_root=tmp_path),
-            task={"id": task_type, "type": task_type, "text": "improve"})
-        dynamic_text = messages[0]["content"][-1]["text"]
-        assert "## Improvement Backlog" in dynamic_text
-        assert "Reduce recurring task friction around REVIEW_BLOCKED" in dynamic_text
+    messages, _ = build_llm_messages(
+        env=FakeEnv(), memory=Memory(drive_root=tmp_path),
+        task={"id": "evolution", "type": "evolution", "text": "improve"})
+    dynamic_text = messages[0]["content"][-1]["text"]
+    assert "## Improvement Backlog" in dynamic_text
+    assert "Reduce recurring task friction around REVIEW_BLOCKED" in dynamic_text
+    # A deep self-review reads its own memory packet (deep_self_review), not this section.
+    messages, _ = build_llm_messages(
+        env=FakeEnv(), memory=Memory(drive_root=tmp_path),
+        task={"id": "deep", "type": "deep_self_review", "text": "review"})
+    assert "## Improvement Backlog" not in messages[0]["content"][-1]["text"]
 
 
 class TestRuntimeEnvSection:
@@ -761,3 +730,149 @@ class TestStorageFact:
         assert "## Runtime context" in section
         assert data["storage"]["bytes"] == latest["bytes"] and data["storage"]["previous_at"] is None
         assert data["storage"]["growth_bytes"] is None
+
+
+class TestVitalsFact:
+    """The body's own dated facts reach the Runtime block beside ``storage``: the last owner turns from
+    the serving process's receipt ring, stall onsets without an observed end, the last busy minute as
+    sums/counts/maxima, the runtime, the retained update, the boot row, one reader and a note. Every
+    absent source omits its key; nothing here is a verdict or a percentage."""
+
+    def _env(self, tmp_path, monkeypatch):
+        from collections import deque
+
+        from supervisor import active_activity
+
+        class FakeEnv:
+            repo_dir = tmp_path / "repo"
+            drive_root = tmp_path
+
+            def drive_path(self, p):
+                return tmp_path / p
+
+        (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "state" / "state.json").write_text('{"spent_usd": 0}', encoding="utf-8")
+        monkeypatch.setattr(active_activity, "_DIRECT_TURNS", deque(maxlen=active_activity.DIRECT_TURNS_KEPT))
+        monkeypatch.setattr("ouroboros.context_runtime_facts._JOURNAL_MODES", {})
+        monkeypatch.delenv("OUROBOROS_IN_WORKER", raising=False)
+        return FakeEnv()
+
+    def _runtime(self, env, task=None):
+        section = build_runtime_section(env, task or {"id": "t1", "type": "task", "_is_direct_chat": True},
+                                        captured_at="2026-10-25T20:00:00+00:00")
+        return section, json.loads(section.split("## Runtime context\n\n", 1)[1])
+
+    @staticmethod
+    def _journal(tmp_path, rows):
+        path = tmp_path / "logs" / "supervisor.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    def test_a_main_direct_turn_reads_its_bodys_dated_facts(self, tmp_path, monkeypatch):
+        from supervisor.active_activity import record_direct_turn
+
+        env = self._env(tmp_path, monkeypatch)
+        self._journal(tmp_path, [
+            {"ts": "2026-10-25T18:00:00+00:00", "type": "boot", "branch": "ouroboros", "sha": "abcdef1234567890"},
+            {"ts": "2026-10-25T19:00:00+00:00", "type": "direct_turn_stall", "execution_id": "turn_a", "task_id": "t0",
+             "phase": "context_building", "stood_sec": 30.0},
+            {"ts": "2026-10-25T19:01:00+00:00", "type": "direct_turn_stall_end", "execution_id": "turn_a", "task_id": "t0",
+             "phase": "context_building", "then": "context_built", "stood_sec": 61.0, "samples": 4,
+             "top_frames": [{"frame": "ouroboros/memory_view.py:_live_rooms", "samples": 4}]},
+            {"ts": "2026-10-25T19:30:00+00:00", "type": "host_duty_stall", "duty": "custody", "running_sec": 120.0},
+            {"ts": "2026-10-25T19:40:00+00:00", "type": "direct_turn_stall", "execution_id": "turn_b", "task_id": "t9",
+             "phase": "started", "stood_sec": 15.0},
+            {"ts": "2026-10-25T19:59:00+00:00", "type": "supervisor_load", "window_sec": 60.0, "max_event_lag_sec": 0.4,
+             "handlers": {"llm_usage": {"count": 3, "total_sec": 0.1, "max_sec": 0.05}},
+             "store_locks": {"dialog": {"write": {"count": 12, "total_sec": 0.42, "max_sec": 0.2,
+                                                   "max_site": "supervisor.message_bus:send:10"}}},
+             "queue_lock": {"count": 5, "hold_total_sec": 0.3, "hold_max_sec": 0.2, "hold_max_site": "supervisor.queue:assign:10"}},
+        ])
+        monkeypatch.setattr("supervisor.state.append_jsonl", lambda path, row, *a, **k: True)
+        monkeypatch.setattr("supervisor.active_activity.utc_now_iso", lambda: "2026-10-25T19:55:00+00:00")  # the receipt's stamp
+        record_direct_turn({"type": "direct_turn", "execution_id": "turn_a", "chat_id": 1, "task_id": "t0",
+                            "accepted_at": "2026-10-25T18:59:00+00:00", "owner_wait_sec": 91.2, "wait_before_entry_sec": 0.8,
+                            "handler_wait_sec": 90.4, "phases": {"accepted": 0.1, "context_building": 61.0},
+                            "slowest_phase": "context_building", "slowest_phase_sec": 61.0, "dispatch": "observed_send",
+                            "meter": {"current.read": 2, "current.read.sec": 0.01, "current.read.max_sec": 0.008,
+                                      "chronicle.locked": 7}, "census": {"direct_turns_at_entry": 0}})
+        section, data = self._runtime(env)
+        vitals = data["vitals"]
+        # The fact's instant is the capture instant printed beside it: not written twice.
+        assert "observed_at" not in vitals and data["context_captured_at"] == "2026-10-25T20:00:00+00:00"
+        from ouroboros.context_runtime_facts import vitals_fact
+
+        stale = vitals_fact(tmp_path, observed_at="2026-10-25T19:00:00+00:00", captured_at="2026-10-25T20:00:00+00:00")
+        assert stale["observed_at"] == "2026-10-25T19:00:00+00:00"  # a snapshot older than the capture names its time
+        assert all(isinstance(value, str) for key, value in vitals.items()
+                   if key not in ("owner_turns", "stalls, no end in window"))
+        assert vitals["owner_turns"] == [
+            "19:55 chat 1 waited 91.2 s, slowest context_building 61.0 s; txns current 2r · chronicle 7 locked; top memory_view.py:_live_rooms"]
+        turn = vitals["owner_turns"][0]
+        assert "observed_send" not in turn and "not written" not in turn  # a seen send is the default basis
+        assert vitals["stalls, no end in window"] == ["duty custody since 19:30", "turn t9 started since 19:40"]
+        assert vitals["busy_minute"] == "19:59: lag ≤0.4 s; holds dialog w12/0.4 s (message_bus:send:10); queue 5/0.3 s"
+        assert vitals["runtime"].startswith("python ") and ", sqlite " in vitals["runtime"]
+        assert vitals["boot"] == "18:00 ouroboros@abcdef123456"
+        assert vitals["note"] == "No verdict here, the weighing is mine; clocks UTC; rows: query_data(kind='supervisor_log', op='jsonl')"
+        assert "last_update" not in vitals
+        for word in ("WARNING", "CRITICAL", "% busy", "current\"", "threshold"):
+            assert word not in json.dumps(vitals), word
+        assert "## Supervisor" not in section
+
+    def test_absent_sources_omit_their_keys_and_a_pooled_worker_reads_the_journals_receipts(self, tmp_path, monkeypatch):
+        env = self._env(tmp_path, monkeypatch)
+        _section, data = self._runtime(env)
+        vitals = data["vitals"]
+        assert set(vitals) <= {"owner_turns_note", "runtime", "wal_gate", "note"}
+        assert {"owner_turns_note", "runtime", "note"} <= set(vitals)
+        assert vitals["owner_turns_note"] == "none since this process started"
+        monkeypatch.setenv("OUROBOROS_IN_WORKER", "1")  # a deep self-review's pooled worker: no ring of its own
+        _section, data = self._runtime(env)
+        assert data["vitals"]["owner_turns_note"] == "none in the journal's tail" and "owner_turns" not in data["vitals"]
+        self._journal(tmp_path, [{"ts": f"2026-10-25T19:5{n}:00+00:00", "type": "direct_turn", "execution_id": f"turn_{n}",
+                                  "chat_id": 1, "owner_wait_sec": float(n), "dispatch": "observed_send"} for n in range(3)])
+        _section, data = self._runtime(env)
+        assert data["vitals"]["owner_turns"] == ["19:51 chat 1 waited 1.0 s", "19:52 chat 1 waited 2.0 s"]
+        assert "owner_turns_note" not in data["vitals"]
+
+    def test_the_journal_per_store_and_the_wal_gate_only_for_a_rollback_store(self, tmp_path, monkeypatch):
+        from ouroboros import context_runtime_facts
+        from ouroboros.task_results import write_task_result
+
+        env = self._env(tmp_path, monkeypatch)
+        write_task_result(tmp_path, "seed", "running")  # a present store, in this test runtime's journal mode
+        _section, data = self._runtime(env)
+        vitals = data["vitals"]
+        journal = vitals["runtime"].split(", journal ", 1)[1]
+        assert "current=wal" in journal or "current=rollback" in journal
+        assert ("wal_gate" in vitals) == ("=rollback" in journal)
+        if "wal_gate" in vitals:
+            assert vitals["wal_gate"] == context_runtime_facts.WAL_GATE and "reinstall" not in vitals["wal_gate"]
+
+    def test_an_unreadable_journal_or_a_failing_source_never_breaks_the_section(self, tmp_path, monkeypatch):
+        env = self._env(tmp_path, monkeypatch)
+        (tmp_path / "logs").mkdir()
+        (tmp_path / "logs" / "supervisor.jsonl").write_bytes(b"\xff{not json\n")
+        _section, data = self._runtime(env)
+        assert "boot" not in data["vitals"] and "stalls" not in data["vitals"]
+
+        def broken(*_a, **_k):
+            raise RuntimeError("ring unavailable")
+
+        monkeypatch.setattr("supervisor.active_activity.direct_turns", broken)
+        section, data = self._runtime(env)
+        assert "vitals" not in data and '"context_captured_at"' in section
+
+    def test_vitals_line_renders_the_same_facts_in_one_line(self):
+        from ouroboros.context_runtime_facts import vitals_line
+
+        assert vitals_line(None) == ""
+        line = vitals_line({"observed_at": "T", "owner_turns": ["turn one", "turn two"],
+                            "stalls, no end in window": ["a stall"], "busy_minute": "M: lag",
+                            "runtime": "python 3.10.22, sqlite 3.51.3", "wal_gate": "",
+                            "last_update": "applied abc: first request before B → after A", "boot": "B o@s", "note": "n"})
+        assert line == ("body as of T; owner turns turn one | turn two; stalls, no end in window a stall; "
+                        "busy minute M: lag; runtime python 3.10.22, sqlite 3.51.3; "
+                        "last update applied abc: first request before B → after A; boot B o@s")
+        assert vitals_line({"runtime": "r", "note": "n"}) == "body; runtime r"  # the capture instant stands beside it

@@ -12,6 +12,8 @@ same under advisory and blocking review enforcement; since decision 3A retired
 the advisory gate, no ``repo_commit_ready`` verdict is projected from the rows.
 """
 
+import pytest
+
 
 def _repo_with_history(tmp_path, name="repo"):
     """A checkout with a tracked file, so ``compute_snapshot_hash`` is stable."""
@@ -102,6 +104,36 @@ def test_a_run_without_a_task_id_stays_unknown_and_is_never_re_attributed(tmp_pa
     assert evidence["foreign_advisory_runs"] == []
     assert [row["task_id"] for row in evidence["recent_advisory_runs"]] == [""]
     assert evidence["recent_advisory_runs"][0]["snapshot_hash"] == "legacy-snapshot"
+
+
+@pytest.mark.parametrize("legacy", [{"bypassed_by_task": "task-b"}, {"task_id": None},
+                                    {"task_id": None, "bypassed_by_task": None}],
+                         ids=["missing-creator-beside-a-bypass", "null-creator", "null-creator-and-bypass"])
+def test_a_legacy_row_without_its_creator_stays_unknown_through_load_save_and_reload(tmp_path, legacy):
+    """The loader once took a missing creator from the bypass actor and turned a null one
+    into the string "None"; either made a legacy row foreign to the task that wrote it.
+    The real state file, read, collected, saved and read again: the creator stays unknown
+    in the repository group, the bypass actor stays its own field."""
+    import json
+
+    from ouroboros.review_evidence import collect_review_evidence
+    from ouroboros.review_state import _STATE_RELPATH, load_state, make_repo_key, save_state
+
+    repo_dir = _repo_with_history(tmp_path)
+    path = tmp_path / _STATE_RELPATH
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"advisory_runs": [{
+        "snapshot_hash": "legacy-snapshot", "commit_message": "legacy advisory", "status": "fresh",
+        "ts": "2026-09-01T10:00:00+00:00", "repo_key": make_repo_key(repo_dir), "items": [], **legacy}]}),
+        encoding="utf-8")
+
+    for _pass in ("as written", "after a save"):
+        evidence = collect_review_evidence(tmp_path, task_id="task-a", repo_dir=repo_dir)
+        assert evidence["foreign_advisory_runs"] == [], _pass
+        assert [row["task_id"] for row in evidence["recent_advisory_runs"]] == [""], _pass
+        save_state(tmp_path, load_state(tmp_path))
+    [saved] = json.loads(path.read_text(encoding="utf-8"))["advisory_runs"]
+    assert (saved["task_id"], saved["bypassed_by_task"]) == ("", legacy.get("bypassed_by_task") or "")
 
 
 def test_an_empty_repo_key_does_not_pull_another_tasks_runs_into_this_task(tmp_path):

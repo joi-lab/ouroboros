@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { bindComposerFileTargets, safeHttpUrl } from '../modules/chat_media.js';
+import { bindComposerFileTargets, decorateContactSource, safeHttpUrl } from '../modules/chat_media.js';
 import { createComposerAttachments } from '../modules/chat_attachments.js';
 import { uploadView } from './helpers/attachment_views.js';
 import { NodeStub, fixture } from './helpers/media_dom.js';
@@ -35,6 +35,30 @@ test('a framed question joins its Project to the voice and ends on its time alon
         fx.controller.destroy();
         fx.restore();
     }
+});
+
+test('private contact source stays in the voice line, separate from authored words', () => {
+    const fx = fixture();
+    try {
+        const body = document.createElement('div');
+        body.className = 'message';
+        body.textContent = 'Exact authored words';
+        const origin = { task_id: 'source-work', binding_id: 'place', source_event_id: 'event',
+            label: '<script>external label</script>', url: 'https://example.test/source' };
+        const bubble = fx.controller.bubbleFrameNode({ role: 'assistant', presence_contact: origin }, body);
+        const link = bubble.querySelector('.sender').querySelector('.md-link');
+        assert.equal(link.textContent, origin.label);
+        assert.equal(link.href, origin.url);
+        assert.equal(link.title, 'Source work: source-work');
+        assert.equal(body.textContent, 'Exact authored words');
+        const replay = fx.controller.bubbleFrameNode({ role: 'assistant', quiz: { presence_contact: origin } }, document.createElement('div'));
+        assert.equal(replay.querySelector('.sender').querySelector('.md-link').href, origin.url);
+        const plain = fx.controller.bubbleFrameNode({ role: 'assistant' }, document.createElement('div'));
+        decorateContactSource(plain, { ...origin, url: 'javascript:alert(1)' });
+        assert.equal(plain.querySelector('.md-link'), null);
+        const unknown = fx.controller.bubbleFrameNode({ role: 'assistant', presence_contact: { label: 'unbound' } }, document.createElement('div'));
+        assert.equal(unknown.querySelector('.sender').children.length, 0);
+    } finally { fx.controller.destroy(); fx.restore(); }
 });
 
 test('photo grouping is keyed by role and task without cross-task merging', () => {

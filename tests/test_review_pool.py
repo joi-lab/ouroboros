@@ -236,7 +236,8 @@ def test_an_empty_pools_main_seat_sends_mains_binding_from_the_settings_the_pool
                                                                                          catalog, local):
     """The Main seat is Main's whole binding — model, local flag, account pin, processing — in the settings the
     pool is read from: the task's own (implicit) or the snapshot a caller hands in, never the process's Main
-    beside it; the provider call carries all of it."""
+    beside it; the provider call carries all of it. Outside any task the route keys read the saved document
+    too (``route_choice``): an environment Main beside a saved one is never the seat."""
     from ouroboros.settings_integrity import task_settings_scope
 
     _write(install, {"OPENAI_API_KEY": "sk-present-key", SUBAGENTS_SETTING: catalog,
@@ -256,7 +257,7 @@ def test_an_empty_pools_main_seat_sends_mains_binding_from_the_settings_the_pool
         expected = ("openai::gpt-5.6-sol", "reviewer:main", "pin-7", "fast", local)
         assert _sent(patch, implicit) == _sent(patch, explicit) == expected
         [ambient] = rsc.review_pool_slots()
-        assert _sent(patch, ambient) == ("openai::ambient-main", "reviewer:main", "", "standard", not local)
+        assert _sent(patch, ambient) == expected  # the saved slots, not the environment's copies beside them
 
 
 def test_captured_empty_processing_and_unspecified_processing_have_distinct_recovery_identities():

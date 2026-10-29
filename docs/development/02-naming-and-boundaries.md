@@ -164,30 +164,31 @@ language-tagged fences and the declared skipped subsections ("External facts: un
 is not no" and this one); the untagged module-tree fence in ARCHITECTURE §1 is
 scanned.
 
-Size is pairwise: a change ends each composed book, entrypoint included, no
-larger than at its event base, so text it adds is paid by shortening the same
-book. With ordinary push/PR CI disabled (ARCHITECTURE §8), manual/tag runs
-lack a per-change base and skip the book comparison; they do not certify this rule.
-Local qualification supplies `OURO_SIZE_RATCHET_BASE_REF` explicitly; review
-checks the actual contribution. The owner's `book-growth` label can exempt it.
-Local surfaces never block: the edit
-tools, `plan_task`, the free `preflight_review(deterministic_only=True)` diagnostic
-and `codebase_health` report the running balance as a fact. Contribution is measured
-against the displayed merge-base of the cached official development ref; an unknown
-base stays unknown, and no network refresh is implied. Free diagnostics label book
+Size is pairwise: a change ends each composed book, entrypoint included,
+`BIBLE.md` and the prompts (`prompts/*.md` as one text) no larger than at its
+event base, so text it adds is paid by shortening the same text. With
+ordinary push/PR CI disabled (ARCHITECTURE §8), manual/tag runs lack a
+per-change base and skip this comparison. Local qualification supplies
+`OURO_SIZE_RATCHET_BASE_REF` explicitly; review checks the actual
+contribution. The owner's `book-growth` label can exempt it. Local surfaces
+never block: the edit tools, `plan_task`, the free
+`preflight_review(deterministic_only=True)` diagnostic and `codebase_health`
+report the balance as a fact. Contribution is measured from the displayed
+merge-base of the cached official development ref; an unknown base stays
+unknown and nothing is fetched. Free diagnostics label book
 bytes as worktree separately from the selected release-metadata source.
 Equivalent historical prose stays review-only under CHECKLISTS item 5.
 
 ### Current state first (ARCHITECTURE invariant 10)
 
 Apply ARCHITECTURE §10 invariant 10 (enforcement: 03 "Projection over replay"). Store transactions
-lease the shared core's per-thread connection, capture rows and end before decoding or external
-work; fork only outside them; lifecycle code quiesces users and calls `store.prepare_handoff`
-before renaming a database or handing it to an older runtime, name-tier callers holding their
-name lock (`tests/test_store_connections.py`, `tests/test_store.py`; the WAL gate both ways, FULL
-unchanged: `tests/test_store_journal.py`). Once per process is not once per installation: an
-installation fact is a durable row, and history-sized work is a named job of the maintenance
-child (`ouroboros/maintenance.py`).
+lease the shared core's per-thread connection, capture rows (`store_capture.py`) and end before
+decoding or external work; fork only outside them; lifecycle code quiesces users and calls
+`store.prepare_handoff` before renaming a database or handing it to an older runtime, name-tier
+callers holding their name lock (`tests/test_store_connections.py`, `tests/test_store.py`; the WAL
+gate both ways, FULL unchanged: `tests/test_store_journal.py`). Once per process is not once per
+installation: an installation fact is a durable row; history-sized work is a named job of the
+maintenance child (`ouroboros/maintenance.py`).
 
 ### Generality and emergence (P13)
 
@@ -206,7 +207,7 @@ fallback prices: they go stale silently and look authoritative. Preserve `cost=N
 and `cost_final=false` when no live source answers the exact route; unknown price is
 neither free nor a model-admission veto, and a known exhausted budget stays enforceable
 (`tests/test_pricing.py`, `tests/test_budget_limits.py`; ARCHITECTURE §6 "Budget
-tracking"; the pricing row of "External facts: unknown is not no").
+tracking"; its "External facts" row).
 
 ### Anti-pattern: content-derived identity for host-minted records
 
@@ -219,10 +220,9 @@ integrity check on a known identity and as content-addressing where the content 
 identity. Enforce the reference as a required typed argument at the consuming seam (a
 valid ref or a closed-enum absence reason; omission raises), so no call site can skip it
 (`bind_task_to_project(..., *, origin)`, `tests/test_projects_v6640.py`); for fuzzy
-entities use `semantic_dedup`, never string equality. That reference is also the
-identity of the work: every task id minted from the same owner message inherits the
-origin's project binding, because a message is one convertible unit (ARCHITECTURE §6
-"Project binding by task and by origin"; `tests/test_retry_project_binding.py`).
+entities use `semantic_dedup`, never string equality. An origin records provenance,
+not shared work identity: moving one task does not move siblings from the same
+message (ARCHITECTURE §6 "Project placement"; `tests/test_one_work_placement.py`).
 
 One named exception: a verification receipt with no ingress point reconciles by one
 typed identity key, never across kinds, because per-component fallbacks are
@@ -294,10 +294,9 @@ is where a deliberate exception states its reason.
 External model/provider facts (inputs, capacity, prices, ids, availability) can change
 without an Ouroboros release.
 
-1. Exact-route evidence, not lists: the route's own metadata, a dated probe
-   beside a provider-keyed wire projection with a recovery path, or the
-   owner's setting. A model name, prefix or family is never that evidence, nor is
-   another route's catalog.
+1. Exact-route evidence, not lists: the route's own metadata or refusal, a dated probe
+   beside a provider-keyed wire projection with a recovery path, or the owner's
+   setting; never a model name, prefix or family, nor another route's catalog.
 2. Unknown is not no. Without evidence the owner's input, the tool and the explicit
    request go through unchanged and the route answers; no shipped literal may drop
    input, refuse a tool, rewrite a saved choice or narrow a request.
@@ -306,19 +305,19 @@ without an Ouroboros release.
 4. A limit of our own transport is a fact about Ouroboros, declared at the lane and
    named as such in what the model reads.
 5. A retained wire fact (the table) keeps source and date, exact scope and what happens
-   when stale either way; requested, sent and provider-reported values stay
-   distinct.
+   when stale either way; requested, sent and provider-reported values stay distinct.
 
-Guards: `tests/test_image_capability_contract.py` keeps unseen models' images on all
-image-capable transports; `tests/test_model_name_invariance.py` keeps unevidenced
-payloads name-independent (exceptions below); `tests/test_tristate_truthiness_guard.py`
-forbids truth-testing yes/no/unknown. This provenance grants no runtime authority;
-probes live in cited docstrings or linked contracts.
+Guards: `tests/test_image_capability_contract.py` keeps unseen models' images on
+image-capable transports, `tests/test_model_name_invariance.py` unevidenced payloads
+name-independent (exceptions below); `tests/test_tristate_truthiness_guard.py` forbids
+truth-testing yes/no/unknown. Provenance grants no runtime authority; probes live in
+cited docstrings or contracts.
 
 | Location | Fact | Evidence & re-probe | If stale |
 |---|---|---|---|
 | `ouroboros/tools/imagegen.py`; `ouroboros/gateways/image_api.py` | Image wire facts | [Dated sources](../IMAGE_GENERATION.md#direct-api-contracts); re-check each exact route | Stale positives refuse requests; negatives hide capability |
-| `ouroboros/llm_attempt.py::supports_message_cache_control` | Message cache controls OpenRouter accepts or translates (`anthropic/`, `google/gemini-`, `openai/`) | `openai/`: OpenRouter caching guide in docstring, no live probe; re-probe before widening, never by name resemblance | False positive invalidates a request; false negative loses the prompt cache |
+| `ouroboros/llm_attempt.py::supports_message_cache_control` | Cache markers OpenRouter accepts or translates (`anthropic/`, `google/gemini-`, `openai/`) | `openai/`: OpenRouter caching guide in docstring, no live probe; re-probe before widening, never by name resemblance | False positive invalidates a request; false negative loses the prompt cache |
+| `ouroboros/request_wire_recovery.py` | A compatible route refuses a cache hint | Its refusal after a repaired success, 14 days per route profile | A fixed server regains hints at expiry |
 | `ouroboros/llm_attempt.py::openai_family_model` | OpenAI's public API checks caches only at message ends without an explicit breakpoint | Docstring probe; before widening, re-probe `cached_tokens` across two conversations, never a substring such as `gpt` | Stale positive moves the cache boundary for a prefix-caching family; stale negative pays cold prefixes |
 | `ouroboros/transcript_prefix.py` | Anthropic prefix binding (Opus 5.5/Fable 5.1/Sonnet 5.5/Haiku 5.5): signed reasoning is bound to system/tools/history; accounts created from 2026-08-31 return 400 on mismatch, older log unless opted in. On prefix changes, Ouroboros retires signed `anthropic-*` blocks on all routes/accounts (owner decision 2026-10-21) | [Anthropic migration guide, Breaking change 3](https://platform.claude.com/docs/en/models/fable-5-1/migration-guide#breaking-changes); direct Opus 5.5 probe 2026-10-21 | Re-probe exact route/account before edits; excess trust causes 400s, excess retirement loses reasoning |
 | `ouroboros/llm_openai_compatible.py` OpenRouter `extra_body.provider.require_parameters` for `anthropic/` | Anthropic models on OpenRouter route only to endpoints accepting every sent parameter | Undated; OpenRouter per-endpoint `supported_parameters` (`/api/v1/models/{author}/{slug}/endpoints`); a declared exception of `tests/test_model_name_invariance.py` | Stale positive narrows failover; stale negative routes to an endpoint that drops or refuses a parameter |
@@ -377,8 +376,7 @@ crashing or rerouting.
 
 Canonical assistant history and tool schemas are function-shaped across providers,
 never a second stored transcript for a provider dialect. Static, semantics-preserving
-wire normalization runs before request-wire binding, and every learned request-shape
-adaptation goes through the one provider-neutral driver
+wire normalization precedes request-wire binding; every learned request-shape
+adaptation uses the one provider-neutral driver
 `ouroboros/request_wire_contract.py` (exact-route identity, closed action vocabulary,
-shared TTL; it never executes provider prose or switches route); explicit `none` is
-never durable.
+shared TTL; no provider prose or route switch); explicit `none` is never durable.

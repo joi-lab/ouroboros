@@ -346,8 +346,9 @@ def test_zero_admission_wait_refuses_immediately_when_recovering(monkeypatch, tm
             owned.ensure_owned_gateway(admission_wait_sec=0)
         assert err.value.code == "daemon_recovery_only"
         assert time.monotonic() - started < 1.0
-        # One reachability handshake (ensure_running) + one admission read.
-        assert state["handshakes"] == 2
+        # The reachability handshake (ensure_running) IS the admission read: its body says
+        # recovery_only and a zero wait refuses at once, with no second handshake.
+        assert state["handshakes"] == 1
     finally:
         server.shutdown()
 
@@ -370,11 +371,11 @@ def test_handshake_without_serving_mode_keeps_todays_path(monkeypatch, tmp_path)
     try:
         gateway = owned.ensure_owned_gateway()
         gateway.close()
-        # ensure_owned_gateway added its single handshake and never polled
-        # (no servingMode field ⇒ normal admission, byte-identical pre-3.4
-        # path), and the mainline reconcile ran once after that handshake.
-        assert states[0]["handshakes"] == 2
-        assert rotation_at == [2]
+        # The spawn loop's reachability handshake is the start's only handshake (no
+        # servingMode field ⇒ normal admission, no admission polls), and the mainline
+        # reconcile ran once on that same gateway.
+        assert states[0]["handshakes"] == 1
+        assert rotation_at == [1]
     finally:
         manager.stop()
         for server in servers:

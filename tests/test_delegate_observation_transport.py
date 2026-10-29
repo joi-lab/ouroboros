@@ -80,13 +80,13 @@ def test_public_wait_reads_response_slower_than_five_seconds(tmp_path, monkeypat
         assert result["status"] == "terminal", result
         assert result["state"] == "succeeded"
         # The route's live-input capability is read ONCE at entry on the same transport
-        # and stamped on the wake; then one handshake per supervision loop, one GET per
-        # tick (S2): the loop holds the transport across quiet ticks. The terminal tick's
-        # new journal tail is drained to the owner before settlement, which negotiates
-        # the run event route once per engine identity (#1350).
+        # and stamped on the wake; then one handshake per supervision loop, one catalog read
+        # per engine identity (#1350: the first beat's question about the compact wait and the
+        # terminal drain's about the run event route share it), one GET per tick (S2): the
+        # loop holds the transport across quiet ticks.
         assert result["leaf_live_input"] == "mid_turn"
-        assert requests == [("GET", "/v2/agent-capabilities"), ("POST", "/v2/handshake")] + [
-            ("GET", "/v2/runs/run-slow")] * (2 if initially_queued else 1) + [("GET", "/v2/operations")]
+        assert requests == [("GET", "/v2/agent-capabilities"), ("POST", "/v2/handshake"), ("GET", "/v2/operations")] + [
+            ("GET", "/v2/runs/run-slow")] * (2 if initially_queued else 1)
     finally:
         server.shutdown()
         server.server_close()
@@ -514,6 +514,115 @@ def test_a_recovery_only_window_keeps_the_transport_instead_of_rehandshaking_int
     assert result["status"] == "terminal" and result["state"] == "succeeded", result
     assert handshakes == ["POST"], "one handshake: the answered transport was kept"
     assert reads == ["GET"] * 3 and sleeps == [delegate_supervision._TICK_SEC] * 2 and notes == []
+
+
+def test_a_busy_answer_to_the_compact_wait_is_an_observation_hole_like_a_read():
+    """The wait-many POST is a read in POST clothing: the engine's typed 503 carries the same
+    observation facts a busy GET does, so the supervised beat keeps it quiet."""
+    with _scripted_gateway(lambda _request: _busy("daemon_busy")) as gateway:
+        with pytest.raises(gateway_module.ClaudexorUnavailable) as caught:
+            gateway.wait_run_attention([{"runId": "run-existing"}], wait_ms=0, timeout_sec=1.0)
+    assert (caught.value.code, caught.value.status_code) == ("daemon_busy", 503)
+    assert caught.value.observation_timeout is True and caught.value.observation_reason == "daemon_busy"
+    assert caught.value.observation_answered is True
+
+
+@pytest.mark.parametrize("body,hole", [
+    ({"code": "store_closed", "message": "closed", "retryable": True}, True),
+    ({"code": "store_maintenance_failed", "message": "failed", "retryable": True}, True),
+    ({"code": "idempotency_status_unavailable", "message": "not now"}, False),
+], ids=["store_closed", "store_maintenance_failed", "plain-503"])
+def test_a_retryable_503_on_the_compact_wait_is_an_observation_hole_and_a_plain_one_is_not(body, hole):
+    with _scripted_gateway(lambda _request: httpx.Response(503, json=body)) as gateway:
+        with pytest.raises(gateway_module.ClaudexorUnavailable) as caught:
+            gateway.wait_run_attention([{"runId": "run-existing"}], wait_ms=0, timeout_sec=1.0)
+    assert caught.value.status_code == 503 and caught.value.code == body["code"]
+    assert caught.value.observation_timeout is hole and caught.value.observation_answered is hole
+    assert caught.value.observation_reason == (body["code"] if hole else "")
+
+
+def _repaired_engine(tmp_path, monkeypatch, *, events, wait_many=None, catalog=None, detail=None, repaired=True,
+                     version="4.8.1"):
+    """One observing beat of the real wait over the real gateway against a scripted engine that
+    lists both observation routes and answers the contract probe as ``repaired`` says (the
+    release number it proves is the same either way); ``events``/``wait_many``/``catalog``
+    answer (or raise for) their route. Returns the beat's result and the owner's activity frames."""
+    from ouroboros import delegate_activity
+
+    delegate_activity.reset_process_memo()
+    ctx = _delegating_ctx(tmp_path, acting=False)
+    frames = []
+    ctx.emit_progress_fn = lambda text, **meta: frames.append(meta)
+    monkeypatch.setattr(delegate.time, "sleep", lambda _s: None)
+    entry = delegate._RunCustody(task_id=ctx.task_id, route_id="fixture", model="fixture",
+                                project_id="fixture", project_owned=False, access="readonly")
+    monkeypatch.setitem(delegate_custody._CUSTODY, "run-x", entry)
+    running = {"lastSeq": 1, "pendingInteractions": [],
+               "summary": {"runId": "run-x", "state": "running", "effectiveAccess": "readonly"},
+               "timeline": [{"type": "message", "title": "hi", "severity": "info"}]}
+    quiet = {"wakeReason": "timeout", "attention": [],
+             "summaries": [{"status": "running", "pending": False, "token": "A" * 43, "problem": None}]}
+
+    def handler(request):
+        path = request.url.path
+        if path == "/v2/handshake":
+            return httpx.Response(200, json={"compatible": True, "protocolMajor": 3,
+                                             "engine": {"version": version, "sha": "f"}})
+        if path == "/v2/agent-capabilities":
+            return httpx.Response(200, json={"harnesses": [{"id": "fixture", "liveInput": "mid_turn"}]})
+        if path == "/v2/operations":
+            return catalog(request) if catalog else httpx.Response(200, json={"operations": [
+                {"method": "POST", "path": "/v2/runs/wait-many"}, {"method": "GET", "path": "/v2/runs/:id/events"}]})
+        if path == "/v2/runs/run-x/events":
+            return events(request)
+        if path == "/v2/runs/wait-many":
+            if json.loads(request.content or b"{}").get("targets") == [{"runId": "capability-probe", "seen": None}]:
+                return (httpx.Response(200, json={"wakeReason": "timeout", "attention": [], "summaries": [
+                    {"status": None, "pending": None, "token": None, "problem": "not_found"}]}) if repaired
+                    else httpx.Response(400, json={"code": "invalid_request",
+                                                   "message": "targets[0].seen: expected string"}))
+            return wait_many(request) if wait_many else httpx.Response(200, json=quiet)
+        assert path == "/v2/runs/run-x", path
+        return detail(request) if detail else httpx.Response(200, json=running)
+
+    monkeypatch.setattr(gateway_module, "ClaudexorGateway", lambda *a, **k: _scripted_gateway(handler))
+    result = json.loads(delegate._delegate_wait(ctx, "run-x", since_seq=0, observation_only=True))
+    delegate_activity.reset_process_memo()
+    return result, frames
+
+
+def _raise(exc):
+    def handler(_request):
+        raise exc
+    return handler
+
+
+@pytest.mark.parametrize("repaired", [False, True])
+@pytest.mark.parametrize("status,code", [(404, "not_found"), (503, "daemon_busy")])
+def test_an_unavailable_stream_keeps_the_provisional_window_on_the_repaired_engine_too(
+        tmp_path, monkeypatch, repaired, status, code):
+    """A journal that cannot be opened hands the beat to the detail read and its degraded window,
+    exactly as on the engine before the compact wait: never a refused wake."""
+    result, frames = _repaired_engine(tmp_path, monkeypatch, repaired=repaired,
+                                      events=lambda _r: httpx.Response(status, json={"code": code}))
+    assert result["status"] == "progress", result
+    sources = [meta["delegated_activity"]["source"] for meta in frames if "delegated_activity" in meta]
+    assert sources == [{"kind": "timeline_window", "reason": f"stream_unavailable:{code}", "provisional": True, "rows": 1}]
+
+
+def test_holes_on_the_repaired_engines_observation_routes_are_quiet(tmp_path, monkeypatch):
+    stream = lambda _r: httpx.Response(200, headers={"content-type": "text/event-stream"}, text=": connected\n\n")  # noqa: E731
+    busy, _frames = _repaired_engine(tmp_path, monkeypatch, events=stream,
+                                     wait_many=lambda _r: _busy("daemon_busy"))
+    assert busy["status"] == "observation_pending" and busy["reason"] == "daemon_busy", busy
+    assert busy["answered"] is True, "the engine itself answered: no outage line"
+    unreachable = _raise(httpx.ConnectError("refused"))
+    gone, _frames = _repaired_engine(tmp_path, monkeypatch, events=stream, catalog=unreachable, detail=unreachable)
+    assert gone["status"] == "observation_pending" and gone["reason"] == "daemon_unreachable", gone
+    # A catalog the daemon cannot answer never refuses the beat by itself: the detail read decides,
+    # and here it answers.
+    decided, frames = _repaired_engine(tmp_path, monkeypatch, events=stream, catalog=unreachable)
+    assert decided["status"] == "progress", decided
 
 
 def test_a_busy_answer_to_a_post_still_wakes_the_model(tmp_path, monkeypatch):

@@ -5,15 +5,17 @@ dispatch; ordinary folders stay live (owner decision 2026-10-17, 1A). Git ``inde
 the real staged index; ``worktree`` freezes tracked/untracked files through a private index
 over HEAD. Ignored ``.review-drive`` evidence gets a retained view at the same moment.
 
-``prepare_seat_area`` keys copies by physical operation: an independent Git clone with
-own refs/stash/config/hooks, borrowed read-only objects, HEAD at the parent and index/worktree
-at the frozen tree; a retained skill view; or an empty folder beside a live workspace.
+``prepare_seat_area`` keys copies by physical operation: a linked worktree of the subject's
+repository (refs, stash, config, hooks and objects are its author's; HEAD and index its own) at
+the frozen parent, index and files at the frozen tree; a retained skill view; or an empty folder
+beside a live workspace. An older seat's independent clone is captured and removed as before.
 Rejoin keeps the copy; remaking uses its frozen tree, original root and retained views.
 
-At terminal, ``capture_seat_evidence`` retains whole Git deltas or changed skill entries
-(same-stat bytes compared), plus whole ``.review-evidence/``; workspace folders have no delta.
-Nothing is applied. Its receipt precedes one-shot deletion regardless of process census
-(owner 2026-10-12). Named gaps release; unreadable/unlistable paths keep copies for recovery.
+At terminal, ``capture_seat_evidence`` retains whole Git deltas (through a host-owned control
+directory over the objects recorded at creation) or changed skill entries, comparing same-stat
+bytes, plus whole ``.review-evidence/``; workspace folders have no delta. Nothing is applied.
+Receipts precede one-shot deletion regardless of process census (owner 2026-10-12).
+Named gaps release; unreadable/unlistable paths keep copies for recovery.
 Threads keep their active copy; a failed predecessor moves under its operation for retry.
 Git omits untracked special entries, ignored outputs outside ``.review-evidence/`` (listed)
 and frozen ``.review-drive`` inputs. Full access is not an OS sandbox.
@@ -34,18 +36,17 @@ import uuid
 from typing import Any, Dict, List, Mapping, Optional
 
 from ouroboros.delegate_start_instructions import EVIDENCE_DIRNAME, scratch_fact
+from ouroboros.unindexed import unindexed  # a seat's copy is born as area.noindex; an existing area keeps its name
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
 log = logging.getLogger(__name__)
 
 # Ignored views a reviewer session reads from its root (review_evidence).
 _IGNORED_EVIDENCE_DIRS = (".review-drive",)
-# The named-evidence bound an evidence-only investigation passes; a named gap keeps its
-# copy. Reviewer seats and candidate runs keep whole outputs, streamed: a copy goes only
-# after what it named is kept.
-EVIDENCE_RETAIN_BYTES = 64 * 1024 * 1024
+_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 SUBJECT_INDEX, SUBJECT_WORKTREE = "index", "worktree"
-# Capture statuses that are a receipt: the copy they describe may go.
+# Capture statuses that are a receipt: the copy they describe may go. Outputs are kept whole,
+# streamed: a copy goes only after what it named is kept.
 _RECEIPTED = ("retained", "partial")
 SEAT_LOCK_NAME, VIEWS_LOCK_NAME = ".lock", ".views.lock"  # cross-process lock files: a seat, the views store
 
@@ -64,29 +65,59 @@ def _checking_area_present(path: pathlib.Path) -> bool:
     return True
 
 
-def _remove_checking_area(path: pathlib.Path) -> None:
-    """Reuse read-only-file recovery, but require proof of deletion before reuse."""
+def _common_dir(path: pathlib.Path, git: Optional[Mapping[str, Any]]) -> Optional[pathlib.Path]:
+    """The repository a linked-worktree copy is registered in: what its marker recorded (``git``), else
+    its own ``.git`` pointer (a copy no reviewer was handed); None for a folder or an older clone."""
+    if git:
+        return pathlib.Path(str(git["common_dir"]))
+    try:
+        admin = path / (path / ".git").read_text(encoding="utf-8").strip().removeprefix("gitdir: ")
+        return (admin / (admin / "commondir").read_text(encoding="utf-8").strip()).resolve()
+    except OSError:  # a clone's .git folder, or no pointer
+        return None
+
+
+def _worktree(common: Optional[pathlib.Path], *args: str) -> bool:
+    """One ``git worktree`` command in a copy's repository (never a global prune); True if it succeeded."""
+    if common is None or not common.is_dir():
+        return False
+    try:
+        return not _git(common, "--git-dir", str(common), "worktree", *args, check=False).returncode
+    except subprocess.SubprocessError:  # a removal past the timeout: the caller finishes it
+        return False
+
+
+def _remove_checking_area(path: pathlib.Path, git: Optional[Mapping[str, Any]] = None) -> None:
+    """Reuse read-only-file recovery, but require proof of deletion before reuse. A linked
+    worktree's registration then goes through ``git worktree remove`` of its now missing path."""
     from ouroboros.subagent_worktrees import _force_rmtree
 
+    common = _common_dir(path, git)  # read before the files, and a copy's own pointer, go
     _force_rmtree(path)  # best-effort; its return value is not a deletion receipt
-    try:
-        path.lstat()  # dangling links and unreadable paths are not absence
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise CheckingAreaUnavailable(f"checking cleanup unverified at {path}: {exc}") from exc
-    raise CheckingAreaUnavailable(f"checking cleanup left a residual at {path}")
+    if _checking_area_present(path):  # dangling links and unreadable paths are not absence
+        raise CheckingAreaUnavailable(f"checking cleanup unverified or residual at {path}")
+    _worktree(common, "remove", "--force", "--force", str(path))
 
 
-def _release_area(area: pathlib.Path, summary: Dict[str, Any]) -> Dict[str, Any]:
-    """Delete a copy whose receipt is durable; a residual is named and retried later."""
+def _move_area(source: pathlib.Path, target: pathlib.Path, git: Optional[Mapping[str, Any]] = None) -> None:
+    """Rename a copy; a linked worktree whose facts ``git`` names moves through Git, so its registration
+    follows it. A move Git refuses is a plain rename: the copy keeps its objects, and Git's own prune
+    drops the stale registration (a pointer the copy could carry is never followed)."""
+    common = pathlib.Path(str(git["common_dir"])) if git else None
+    if not _worktree(common, "move", "--force", "--force", str(source), str(target)):
+        source.rename(target)
+
+
+def _release_area(area: pathlib.Path, summary: Dict[str, Any],
+                  git: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """Delete a copy whose receipt is durable (``git``: its marker's facts); a residual is named and retried later."""
     if not _checking_area_present(area):
         return summary
     try:
         if area.is_symlink():
             area.unlink()  # the link itself, never its target
         else:
-            _remove_checking_area(area)
+            _remove_checking_area(area, git)
     except (CheckingAreaUnavailable, OSError) as exc:
         log.warning("captured review checking copy %s was not removed", area, exc_info=True)
         return {**summary, "area": str(area), "cleanup_error": str(exc)}
@@ -168,14 +199,13 @@ def freeze_checking_source(root: Any, *, data_root: Any, subject: str = SUBJECT_
         else:
             from supervisor.update_candidate import worktree_snapshot_tree
 
-            tree, error = worktree_snapshot_tree(head or "4b825dc642cb6eb9a060e54bf8d69288fbee4904", cwd=str(root_path))
+            tree, error = worktree_snapshot_tree(head or _EMPTY_TREE, cwd=str(root_path))
             if not tree:
                 raise CheckingAreaUnavailable(f"the live tree could not be frozen: {error}")
         return {"kind": "git_tree", "root": str(root_path), "parent": head, "tree": tree,
                 "evidence_views": {name: str(_retained_view(root_path / name, data_root))
                                    for name in _IGNORED_EVIDENCE_DIRS if (root_path / name).is_dir()}}
     return {"kind": "workspace", "root": str(root_path)}  # read in place: nothing is copied
-
 
 
 def frozen_checking_source(frozen: Any, *, data_root: Any) -> Dict[str, Any]:
@@ -269,7 +299,7 @@ def prepare_seat_area(data_root: Any, task_id: str, operation_id: str, source: M
 
 def _prepare_locked(data_root: Any, task_id: str, operation_id: str, source: Mapping[str, Any],
                     home: pathlib.Path) -> str:
-    area, marker = home / "area", home / "checking.json"
+    area, marker = unindexed(home, "area"), home / "checking.json"
     if area.is_symlink():
         raise CheckingAreaUnavailable("checking area was replaced by a symlink; copy retained")
     try:
@@ -286,7 +316,7 @@ def _prepare_locked(data_root: Any, task_id: str, operation_id: str, source: Map
             atomic_write_json(marker, {**recorded, "capture_id": uuid.uuid4().hex, "created_at": utc_now_iso()})
         return str(area)
     if area.exists():  # an interrupted materialization, or a copy its receipt already stands for
-        _remove_checking_area(area)
+        _remove_checking_area(area, recorded.get("git"))
     # The new copy's own generation is durable before the copy exists.
     capture_id = uuid.uuid4().hex if receipt else str(recorded.get("capture_id") or "")
     fresh = {"schema": 1, "created_at": utc_now_iso(), "task_id": task_id, "operation_id": operation_id,
@@ -294,38 +324,49 @@ def _prepare_locked(data_root: Any, task_id: str, operation_id: str, source: Map
     home.mkdir(parents=True, exist_ok=True)
     atomic_write_json(marker, {**fresh, "materializing": True})
     try:
-        _materialize(area, source)
+        facts = _materialize(area, source)
     except (OSError, subprocess.SubprocessError) as exc:
         raise CheckingAreaUnavailable(f"checking copy could not be created: {exc}") from exc
-    atomic_write_json(marker, fresh)
+    atomic_write_json(marker, {**fresh, **({"git": facts} if facts else {})})  # where Git keeps the copy
     return str(area)
 
 
-def _materialize(area: pathlib.Path, source: Mapping[str, Any]) -> None:
-    """A seat's copy: a clone of a frozen tree, a copy of a retained view, or an empty folder."""
+def _materialize(area: pathlib.Path, source: Mapping[str, Any]) -> Dict[str, str]:
+    """A seat's copy (a linked worktree of a frozen tree, a copy of a retained view, or an empty
+    folder); the Git facts its marker records, else ``{}``."""
     kind = source.get("kind")
     if kind == "git_tree":
-        _materialize_git(area, source)
-    elif kind == "directory":
+        return _materialize_git(area, source)
+    if kind == "directory":
         shutil.copytree(str(source["view"]), area, symlinks=True)
     elif kind == "workspace":  # the reviewer reads the folder in place and copies what it runs
         area.mkdir()
     else:
         raise CheckingAreaUnavailable(f"unknown checking source kind {kind!r}")
+    return {}
 
 
-def _materialize_git(area: pathlib.Path, source: Mapping[str, Any]) -> None:
-    from ouroboros.subagent_worktrees import clone_private_checkout
+def _materialize_git(area: pathlib.Path, source: Mapping[str, Any]) -> Dict[str, str]:
+    """A linked worktree of the source's repository: HEAD at the frozen parent (an unborn source gets
+    one fixed root commit of the empty tree, never a branch), index and files at the frozen tree, so
+    ``git diff --cached`` is the subject, plus the frozen views. Returns where Git keeps it."""
+    from ouroboros.subagent_worktrees import _SNAPSHOT_IDENTITY
 
     evidence_views = _frozen_evidence_views(source)
-    clone_private_checkout(pathlib.Path(str(source["root"])), area, head=str(source.get("parent") or ""))
-    _git(area, "read-tree", "--reset", "-u", str(source["tree"]))
+    repo = pathlib.Path(str(source["root"]))
+    base = str(source.get("parent") or "") or _out(_git(
+        repo, "commit-tree", "--no-gpg-sign", _EMPTY_TREE, "-m", "ouroboros: empty base of a review seat",
+        env={**_SNAPSHOT_IDENTITY, "GIT_AUTHOR_DATE": "@0 +0000", "GIT_COMMITTER_DATE": "@0 +0000"}))
+    _git(repo, "worktree", "add", "--force", "--detach", "--no-checkout", str(area), base)
+    common = (area / _out(_git(area, "rev-parse", "--git-common-dir"))).resolve()
+    _git(area, "read-tree", "--reset", "-u", "--no-sparse-checkout", str(source["tree"]))
     applied = _out(_git(area, "write-tree"))
     if applied != source["tree"]:
         raise CheckingAreaUnavailable(
             f"checking copy tree {applied[:12]} is not the frozen tree {str(source['tree'])[:12]}")
     for name, view in evidence_views:
         shutil.copytree(view, area / name, symlinks=True, dirs_exist_ok=True)
+    return {"common_dir": str(common), "objects": str(common / "objects")}
 
 
 def _frozen_evidence_views(source: Mapping[str, Any]) -> List[tuple]:
@@ -378,10 +419,12 @@ def checking_instructions(area: str, source: Mapping[str, Any], root: str = "", 
     """What a writable reviewer seat is told about its copy, the pristine subject and its granted ``scratch``."""
     if source.get("kind") == "git_tree":
         pristine = (f"The frozen subject is tree {source.get('tree')} over parent "
-                    f"{source.get('parent') or '(none)'}: your copy starts with HEAD at that parent and the "
-                    "subject in its index and worktree, so `git diff --cached` is the subject until you change "
-                    f"it, and `git diff {source.get('parent') or '4b825dc642cb6eb9a060e54bf8d69288fbee4904'} "
-                    f"{source.get('tree')}` always is. The original root {source.get('root')} is read-only reference.")
+                    f"{source.get('parent') or '(none: an empty root commit)'}: your copy starts with HEAD at that "
+                    "parent and the subject in its index and worktree, so `git diff --cached` is the subject until "
+                    f"you change it, and `git diff {source.get('parent') or _EMPTY_TREE} {source.get('tree')}` "
+                    f"always is. The original root {source.get('root')} is read-only reference. Your copy is a "
+                    "linked worktree of its repository: branches, tags, stash and Git config are the author's, so "
+                    "create no branch or tag, do not stash and change no Git config; HEAD and the index are yours.")
     elif source.get("kind") == "workspace":
         pristine = (f"The subject is the live folder {source.get('root')}: read it in place by absolute path and "
                     "do not write it. Your folder starts empty; copy into it what you want to run.")
@@ -398,96 +441,21 @@ def checking_instructions(area: str, source: Mapping[str, Any], root: str = "", 
         "to the reviewed candidate or creates an obligation to apply it, and your verdict is about the "
         f"subject, not about your edits. {pristine} Put any file worth keeping (logs, outputs, "
         f"reproductions) under {EVIDENCE_DIRNAME}/ in your {place}: the host retains {kept} as evidence "
-        f"before releasing or refreshing the {place}. Disposable process state (test scratch, "
-        f"package-manager temporaries) goes outside every Git working tree ({scratch_fact(granted=scratch)}). Do not "
+        f"before releasing or refreshing the {place}. Disposable process state (virtual environments, dependency "
+        "installs, caches, test scratch, package-manager temporaries) goes outside every Git working tree "
+        f"({scratch_fact(granted=scratch)}). Do not "
         "write the original root or any other project; full access, where granted, is not an OS sandbox."
     )
 
 
-def _retain_files(area: pathlib.Path, paths: List[str], files_dir: pathlib.Path, budget: List[float],
-                  gaps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Copy regular files byte-exact into the evidence store within the caller's byte budget."""
-    kept: List[Dict[str, Any]] = []
-    for relative in paths:
-        source = area / relative
-        if source.is_symlink() or not source.is_file():
-            continue
-        size = source.stat().st_size
-        if size > budget[0]:
-            gaps.append({"path": relative, "size": size, "reason": "evidence_budget_exceeded"})
-            continue
-        target = files_dir / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-        budget[0] -= size
-        kept.append({"path": relative, "size": size, "sha256": _sha(target)})
-    return kept
-
-
-def named_evidence_witness(area: pathlib.Path) -> str:
-    """Stat identity of the copy's evidence folder (paths, types, sizes, times); "" when it cannot be
-    listed. A retained summary is reused only while it is unchanged. Not a byte proof: it assumes the
-    run's processes stopped writing, so a same-size rewrite within one timestamp tick, or a write
-    after the final check, goes unseen."""
-    rows: List[str] = []
-    try:
-        declared = area / EVIDENCE_DIRNAME
-        seen = declared.lstat()
-        rows.append(f"{EVIDENCE_DIRNAME}\0{seen.st_mode}\0{seen.st_size}\0{seen.st_mtime_ns}\0{seen.st_ctime_ns}")
-        if declared.is_symlink() or not declared.is_dir():
-            return hashlib.sha256(rows[0].encode()).hexdigest()  # never walk a linked root
-        for current, dirs, files in os.walk(area / EVIDENCE_DIRNAME, onerror=_raise_walk_error, followlinks=False):
-            for name in sorted(dirs + files):
-                seen = (pathlib.Path(current) / name).lstat()
-                rows.append(f"{(pathlib.Path(current) / name).relative_to(area).as_posix()}\0{seen.st_mode}\0"
-                            f"{seen.st_size}\0{seen.st_mtime_ns}\0{seen.st_ctime_ns}")
-    except OSError:
-        return ""
-    return hashlib.sha256("\n".join(sorted(rows)).encode("utf-8", "surrogateescape")).hexdigest()
-
-
-def retain_named_evidence(area: pathlib.Path, files_dir: pathlib.Path, budget: List[float],
-                          gaps: List[Dict[str, Any]], *, product_paths=()) -> List[Dict[str, Any]]:
-    """Retain declared checking outputs independently of product-patch filters.
-
-    Links are not dereferenced: a linked output is a gap and keeps the working
-    copy, not a receipt claiming its target's bytes were retained. So is an entry
-    that is neither a file nor a folder; a folder that cannot be listed raises.
-    Baseline-owned ``product_paths`` belong to capture, including symlinks; never retain them here.
-    """
-    declared = area / EVIDENCE_DIRNAME
-    if EVIDENCE_DIRNAME in product_paths and (declared.is_symlink() or not declared.is_dir()):
-        return []
-    if declared.is_symlink():
-        gaps.append({"path": EVIDENCE_DIRNAME, "reason": "evidence_symlink"})
-        return []
-    if declared.exists() and not declared.is_dir():
-        gaps.append({"path": EVIDENCE_DIRNAME, "reason": "evidence_root_not_directory"})
-        return []
-    paths: List[str] = []
-    if declared.is_dir():
-        for current, dirs, files in os.walk(declared, onerror=_raise_walk_error, followlinks=False):
-            for name in sorted(dirs + files):
-                path = pathlib.Path(current) / name
-                relative = path.relative_to(area).as_posix()
-                if relative in product_paths:
-                    continue
-                if path.is_symlink():
-                    gaps.append({"path": relative, "reason": "evidence_symlink"})
-                elif path.is_file():
-                    paths.append(relative)
-                elif name in files:
-                    gaps.append({"path": relative, "reason": "unsupported_entry_type"})
-    return _retain_files(area, sorted(paths), files_dir, budget, gaps)
-
-
 def _git_delta(area: pathlib.Path, source: Mapping[str, Any], evidence: pathlib.Path,
-               budget: List[float], gaps: List[Dict[str, Any]]) -> Dict[str, Any]:
+               gaps: List[Dict[str, Any]], git: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     from ouroboros.subagent_worktrees import (
         payload_capture_git_env, payload_git_metadata_refusal, stage_raw_payload_inventory,
     )
 
-    refusal = payload_git_metadata_refusal(area)
+    # A linked worktree's objects are where its marker recorded them; its own ``.git`` file is never read.
+    refusal = "" if git else payload_git_metadata_refusal(area)
     if refusal:
         raise CheckingAreaUnavailable(refusal)
     excluded = (EVIDENCE_DIRNAME, *_IGNORED_EVIDENCE_DIRS)
@@ -495,7 +463,7 @@ def _git_delta(area: pathlib.Path, source: Mapping[str, Any], evidence: pathlib.
     # The reviewer owns its config and index. Capture through the existing
     # host-owned control directory: only immutable objects are borrowed, and
     # raw hashing never invokes .gitattributes clean/process/eol conversions.
-    with payload_capture_git_env(area) as env:
+    with payload_capture_git_env(area, objects=pathlib.Path(str(git["objects"])) if git else None) as env:
         _git(area, "read-tree", str(source["tree"]), env=env)
         gitlinks = {}
         for entry in _git(area, "ls-files", "--stage", "-z", env=env).stdout.split(b"\0"):
@@ -532,7 +500,7 @@ def _git_delta(area: pathlib.Path, source: Mapping[str, Any], evidence: pathlib.
                 if any(path.iterdir()):
                     # The frozen gitlink is retainable without trusting a
                     # nested repository's controls. Its populated worktree is
-                    # not in this patch: keep the copy and disclose that gap.
+                    # not in this patch: the receipt discloses that gap.
                     gaps.append({"path": relative, "reason": "nested_git_worktree_not_captured"})
             elif path.is_dir() and os.path.lexists(path / ".git"):
                 raise CheckingAreaUnavailable(f"cannot retain new nested Git checking output {relative}")
@@ -557,15 +525,8 @@ def _git_delta(area: pathlib.Path, source: Mapping[str, Any], evidence: pathlib.
             area, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z",
             env=env).stdout.split(b"\0") if raw]
         ignored = [path for path in ignored if pathlib.PurePosixPath(path).parts[0] not in excluded]
-    patch_size, patch_sha = patch.stat().st_size, _sha(patch)
-    if patch_size > budget[0]:
-        gaps.append({"path": "delta.patch", "size": patch_size, "reason": "evidence_budget_exceeded"})
-        patch.unlink()  # area is retained; no partial patch is presented as complete
-    else:
-        budget[0] -= patch_size
-    return {"after_tree": after, "patch_sha256": patch_sha, "patch_bytes": patch_size,
-            "listing_warning": listing_warning,
-            "patch_retained": patch.exists(),
+    return {"after_tree": after, "patch_sha256": _sha(patch), "patch_bytes": patch.stat().st_size,
+            "listing_warning": listing_warning, "patch_retained": True,
             "changed": changed.splitlines(), "ignored_not_retained": ignored}
 
 
@@ -585,16 +546,14 @@ def _open_regular(path: pathlib.Path) -> Any:
 def _same_bytes(left: pathlib.Path, right: pathlib.Path) -> bool:
     """Chunked equality; an unreadable side raises, because uncompared bytes are not unchanged."""
     with _open_regular(left) as one, _open_regular(right) as two:
-        while True:
-            chunk = one.read(1 << 20)
+        for chunk in iter(lambda: one.read(1 << 20), b""):
             if chunk != two.read(1 << 20):
                 return False
-            if not chunk:
-                return True
+        return not two.read(1)
 
 
 def _directory_delta(area: pathlib.Path, source: Mapping[str, Any], evidence: pathlib.Path,
-                     budget: List[float], gaps: List[Dict[str, Any]]) -> Dict[str, Any]:
+                     gaps: List[Dict[str, Any]]) -> Dict[str, Any]:
     view = pathlib.Path(str(source["view"]))
 
     def entries(root: pathlib.Path) -> Dict[str, Dict[str, Any]]:
@@ -630,17 +589,12 @@ def _directory_delta(area: pathlib.Path, source: Mapping[str, Any], evidence: pa
             gaps.append({"path": path, "reason": "unsupported_entry_type"})
     # Links are data, never dereferenced into the files store; directory modes
     # and removals survive in the receipt even after a successful copy release.
+    from ouroboros.delegate_named_evidence import retain_files
+
     delta = {path: {"before": before.get(path), "after": after.get(path)}
              for path in sorted(set(changed) | set(removed))}
-    metadata_bytes = len(json.dumps(delta, sort_keys=True).encode("utf-8"))
-    if metadata_bytes > budget[0]:
-        gaps.append({"path": "directory-entries", "size": metadata_bytes, "reason": "evidence_budget_exceeded"})
-        delta = {}  # the original copy keeps the complete metadata
-    else:
-        budget[0] -= metadata_bytes
-    kept = _retain_files(area, [path for path in changed
-                               if pathlib.PurePosixPath(path).parts[0] != EVIDENCE_DIRNAME],
-                         evidence / "files", budget, gaps)
+    kept = retain_files(area, [path for path in changed
+                              if pathlib.PurePosixPath(path).parts[0] != EVIDENCE_DIRNAME], evidence / "files")
     return {"changed": changed, "removed": removed, "files": kept, "entries": delta}
 
 
@@ -674,18 +628,18 @@ def capture_seat_evidence(data_root: Any, task_id: str, operation_id: str) -> Di
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as exc:  # a marker that exists but cannot be read is not absence
-        return {"status": "capture_failed", "area": str(home / "area"), "error": f"checking marker unreadable: {exc}"}
+        return {"status": "capture_failed", "area": str(unindexed(home, "area")), "error": f"checking marker unreadable: {exc}"}
     try:
         with _seat_locked(seat_dir(data_root, task_id, f"thread:{seat}") if seat else home):
             return _capture_locked(data_root, task_id, operation_id)
     except OSError as exc:
-        return {"status": "capture_failed", "area": str(home / "area"), "error": f"seat lock unavailable: {exc}"}
+        return {"status": "capture_failed", "area": str(unindexed(home, "area")), "error": f"seat lock unavailable: {exc}"}
 
 
 def _capture_locked(data_root: Any, task_id: str, operation_id: str) -> Dict[str, Any]:
     """``capture_seat_evidence`` for a caller that already holds the seat lock."""
     home = seat_dir(data_root, task_id, operation_id)
-    area, evidence = home / "area", home / "evidence"
+    area, evidence = unindexed(home, "area"), home / "evidence"
     try:
         marker = json.loads((home / "checking.json").read_text(encoding="utf-8"))
         source = marker.get("source") or {}
@@ -701,10 +655,10 @@ def _capture_locked(data_root: Any, task_id: str, operation_id: str) -> Dict[str
     # A failed predecessor moves under its operation; its local copy wins after a crash too.
     thread_copy = bool(thread_seat and not _checking_area_present(area))
     if thread_copy:
-        area = seat_dir(data_root, task_id, f"thread:{thread_seat}") / "area"
+        area = unindexed(seat_dir(data_root, task_id, f"thread:{thread_seat}"), "area")
     prior = _receipt(data_root, task_id, operation_id)
     if prior.get("status") in _RECEIPTED:
-        return prior if thread_copy else _release_area(area, prior)
+        return prior if thread_copy else _release_area(area, prior, marker.get("git"))
     if area.is_symlink():
         return {"status": "capture_failed", "area": str(area),
                 "error": "checking area was replaced by a symlink; target was not read"}
@@ -719,7 +673,6 @@ def _capture_locked(data_root: Any, task_id: str, operation_id: str) -> Dict[str
     if not area.is_dir():  # already captured and released: the retained summary answers
         return prior or {"status": "released_without_summary", "evidence_dir": str(evidence)}
     gaps: List[Dict[str, Any]] = []
-    budget = [float("inf")]  # reviewers retain whole outputs; only investigations pass a bound
     delta: Dict[str, Any] = {}
     errors = []
     try:
@@ -728,16 +681,21 @@ def _capture_locked(data_root: Any, task_id: str, operation_id: str) -> Dict[str
             marker["capture_id"] = uuid.uuid4().hex
             evidence = _capture_directory(home, marker)
         evidence.mkdir(parents=True, exist_ok=True)
-        compare = {"git_tree": _git_delta, "directory": _directory_delta}.get(str(source.get("kind")))
+        kind = str(source.get("kind"))
         try:  # a workspace seat's folder started empty: what it publishes is its output
-            if compare is None and source.get("kind") != "workspace":
+            if kind == "git_tree":
+                delta = _git_delta(area, source, evidence, gaps, marker.get("git"))
+            elif kind == "directory":
+                delta = _directory_delta(area, source, evidence, gaps)
+            elif kind != "workspace":
                 raise CheckingAreaUnavailable("the original checking source is unknown; copy retained")
-            delta = compare(area, source, evidence, budget, gaps) if compare else {}
         except Exception as exc:
             errors.append(f"{type(exc).__name__}: {exc}")
         # Named outputs still matter when the repository delta cannot be read.
         try:
-            delta["named_evidence"] = retain_named_evidence(area, evidence / "files", budget, gaps)
+            from ouroboros.delegate_named_evidence import retain_named_evidence
+
+            delta["named_evidence"] = retain_named_evidence(area, evidence / "files", gaps)
         except Exception as exc:
             errors.append(f"{type(exc).__name__}: {exc}")
         summary = {"status": "capture_failed" if errors else "partial" if gaps else "retained",
@@ -764,7 +722,7 @@ def _capture_locked(data_root: Any, task_id: str, operation_id: str) -> Dict[str
 
             _force_rmtree(evidence)  # copies keep read-only modes, which Windows refuses to unlink
         return {"status": "capture_failed", "area": str(area), "error": f"{type(exc).__name__}: {exc}"}
-    return summary if thread_copy or errors else _release_area(area, summary)
+    return summary if thread_copy or errors else _release_area(area, summary, marker.get("git"))
 
 
 def _receipt_path(data_root: Any, task_id: str, operation_id: str) -> pathlib.Path:
@@ -825,14 +783,11 @@ def _retire_previous_turn(data_root: Any, task_id: str, previous: Mapping[str, A
     if not receipt:
         raise CheckingAreaUnavailable("the previous thread turn could not be captured; copy retained")
     if receipt.get("status") == "capture_failed":  # its bytes stay with that turn, never block this one
-        area.rename(home / "area")
+        _move_area(area, unindexed(home, "area"), previous.get("git"))
 
 
 def _thread_locked(data_root: Any, task_id: str, seat: str, source: Mapping[str, Any], operation_id: str) -> str:
     home = seat_dir(data_root, task_id, f"thread:{seat}")
-    area = home / "area"
-    if area.is_symlink():
-        raise CheckingAreaUnavailable("thread checking area was replaced by a symlink; copy retained")
     marker_path = home / "checking.json"
     try:
         previous = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -840,6 +795,9 @@ def _thread_locked(data_root: Any, task_id: str, seat: str, source: Mapping[str,
         previous = {}  # a copy without a marker was never handed to a reviewer
     except (OSError, ValueError) as exc:
         raise CheckingAreaUnavailable(f"thread checking marker unreadable ({exc}); copy retained") from exc
+    area = unindexed(home, "area", previous.get("area"))  # its engine thread is bound to the recorded path
+    if area.is_symlink():
+        raise CheckingAreaUnavailable("thread checking area was replaced by a symlink; copy retained")
     previous_op = str(previous.get("operation_id") or "")
     if previous_op == operation_id and (previous or area.exists()):
         if previous.get("source") != dict(source):
@@ -850,16 +808,16 @@ def _thread_locked(data_root: Any, task_id: str, seat: str, source: Mapping[str,
         _retire_previous_turn(data_root, task_id, previous, area)
     staging = home.parent / f".next-{home.name}.{uuid.uuid4().hex}"
     try:
-        _materialize(staging, source)
+        facts = _materialize(staging, source)
         if area.exists():
-            _remove_checking_area(area)
-        staging.rename(area)
+            _remove_checking_area(area, previous.get("git"))
+        _move_area(staging, area, facts)
     finally:
         if staging.exists():
             _remove_checking_area(staging)
     marker = {"schema": 1, "created_at": utc_now_iso(), "task_id": task_id,
               "operation_id": operation_id, "thread_seat": seat, "source": dict(source), "area": str(area),
-              "thread_id": str(previous.get("thread_id") or "")}
+              "thread_id": str(previous.get("thread_id") or ""), **({"git": facts} if facts else {})}
     atomic_write_json(marker_path, marker)
     if operation_id:
         operation_home = seat_dir(data_root, task_id, operation_id)

@@ -39,20 +39,22 @@ def _seed_target(tmp_path: pathlib.Path) -> pathlib.Path:
     target = tmp_path / "target"
     target.mkdir()
     _git(target, "init")
-    (target / "tracked.txt").write_text("one\n", encoding="utf-8")
+    (target / "tracked.txt").write_text("one\n", encoding="utf-8", newline="\n")  # LF: the tests compare bytes
     _git(target, "add", "-A")
     _git(target, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "seed")
-    (target / "tracked.txt").write_text("one\ntwo\n", encoding="utf-8")   # unstaged mod
-    (target / "staged.txt").write_text("staged\n", encoding="utf-8")
-    _git(target, "add", "staged.txt")                                     # staged add
-    (target / "untracked.txt").write_text("loose\n", encoding="utf-8")    # eligible
-    (target / ".env").write_text("SECRET=1\n", encoding="utf-8")          # sensitive
+    (target / "tracked.txt").write_text("one\ntwo\n", encoding="utf-8", newline="\n")   # unstaged mod
+    (target / "staged.txt").write_text("staged\n", encoding="utf-8", newline="\n")
+    _git(target, "add", "staged.txt")                                                   # staged add
+    (target / "untracked.txt").write_text("loose\n", encoding="utf-8", newline="\n")    # eligible
+    (target / ".env").write_text("SECRET=1\n", encoding="utf-8", newline="\n")          # sensitive
     return target
 
 
 class TestProvision:
-    def test_snapshot_captures_the_real_tree_and_vetoes_sensitive(self, tmp_path):
+    def test_snapshot_captures_the_real_tree_and_only_gitignore_hides_a_file(self, tmp_path):
         target = _seed_target(tmp_path)
+        (target / ".gitignore").write_text("build.log\n", encoding="utf-8")
+        (target / "build.log").write_text("generated\n", encoding="utf-8")
         snaps, data = tmp_path / "snaps", tmp_path / "data"
         before_status = _git(target, "status", "--porcelain").stdout
         handle = provision_execution_snapshot(
@@ -64,9 +66,10 @@ class TestProvision:
         assert (exec_root / "tracked.txt").read_text(encoding="utf-8") == "one\ntwo\n"
         assert (exec_root / "staged.txt").read_text(encoding="utf-8") == "staged\n"
         assert (exec_root / "untracked.txt").read_text(encoding="utf-8") == "loose\n"
-        # The SAME sensitive veto patch capture applies: .env never rides.
-        assert not (exec_root / ".env").exists()
-        assert any(e.get("path") == ".env" for e in handle.excluded_untracked)
+        # No copy-in veto: every untracked file .gitignore does not hide rides, `.env` included;
+        # an ignored file stays out, and nothing is named for what git simply took.
+        assert (exec_root / ".env").read_text(encoding="utf-8") == "SECRET=1\n"
+        assert not (exec_root / "build.log").exists() and handle.excluded_untracked == ()
         # The target itself is untouched: same status, same HEAD, staged still staged.
         assert _git(target, "status", "--porcelain").stdout == before_status
         # The baseline is pinned by a protected ref and matches the handle.
@@ -76,6 +79,26 @@ class TestProvision:
         entry = find_execution_snapshot("snapA", data_dir=data)
         assert entry is not None and entry["kind"] == "delegated_exec"
         assert entry["target_root"] == str(target.resolve())
+
+    def test_an_ignored_file_is_never_hashed_into_the_shared_odb(self, tmp_path):
+        # A linked worktree shares the target's object database: only what the snapshot
+        # commit stages (tracked plus untracked files .gitignore does not hide) is hashed.
+        target = _seed_target(tmp_path)
+        (target / ".gitignore").write_text(".env\n", encoding="utf-8")
+        secret_sha = _git(target, "hash-object", ".env").stdout.strip()
+        assert secret_sha
+        handle = provision_execution_snapshot(
+            target_root=target, task_id="t1", snapshot_id="snapV",
+            worktree_root=tmp_path / "snaps", data_dir=tmp_path / "data")
+        exec_root = pathlib.Path(handle.path)
+        assert not (exec_root / ".env").exists()
+        for root in (target, exec_root):
+            assert _git(root, "cat-file", "-e", f"{secret_sha}^{{blob}}",
+                        check=False).returncode != 0, f"ignored blob is reachable from {root}"
+        # The eligible tree is still complete.
+        assert (exec_root / "untracked.txt").read_text(encoding="utf-8") == "loose\n"
+        assert (exec_root / "staged.txt").read_text(encoding="utf-8") == "staged\n"
+        assert (exec_root / "tracked.txt").read_text(encoding="utf-8") == "one\ntwo\n"
 
     def test_unborn_target_snapshots_without_a_parent(self, tmp_path):
         target = tmp_path / "fresh"
@@ -237,24 +260,25 @@ class TestCaptureAndIntegrate:
         out = _integrate_delegated_patch(ctx, "run-1", "apply", "")
         assert "INTEGRATE_CONFLICT" in out, out
         assert "YOU own this conflict" in out
-        # Conflict material persists: no disposition, snapshot + patch intact.
+        # Conflict material persists: no disposition, the record (pins B and C) and the saved
+        # patch; the checkout itself was released once the capture was saved.
         assert entry.patch_disposed == ""
-        assert find_execution_snapshot("snapX") is not None
-        assert exec_root.exists()
+        assert find_execution_snapshot("snapX")["result_sha"] and not exec_root.exists()
         custody._CUSTODY.clear()
 
-    def test_no_changes_run_disposes_cleanly(self, tmp_path, monkeypatch):
+    def test_no_changes_run_closes_itself_at_capture(self, tmp_path, monkeypatch):
         from ouroboros.tools.delegate import _capture_terminal_patch
         from ouroboros.tools.subagent_integration import _integrate_delegated_patch
 
         target, ctx, handle = self._provisioned(tmp_path, monkeypatch)
         entry = _isolated_entry(ctx, target, handle)
         capture = _capture_terminal_patch(ctx, entry)
-        assert capture["status"] == "ready_no_changes"
+        assert capture["status"] == "ready_no_changes" and capture["disposition"] == custody.NO_CHANGES
+        assert entry.patch_disposed == custody.NO_CHANGES
+        assert find_execution_snapshot("snapX") is None and not pathlib.Path(handle.path).exists()
+        assert _git(target, "for-each-ref", "refs/ouroboros").stdout == ""
         out = _integrate_delegated_patch(ctx, "run-1", "apply", "")
-        assert "no captured file changes" in out, out
-        assert entry.patch_disposed == "applied"
-        assert find_execution_snapshot("snapX") is None
+        assert out.startswith("OK:") and "no_changes" in out, out
         custody._CUSTODY.clear()
 
     def test_unsettled_run_cannot_be_integrated(self, tmp_path, monkeypatch):
@@ -374,10 +398,9 @@ class TestCaptureAndIntegrate:
         out = _integrate_delegated_patch(ctx, "run-1", "apply", "")
         assert "INTEGRATE_DISPOSITION_UNWRITTEN" in out, out
         assert "Do NOT call integrate_delegated_patch again" in out
-        # The apply DID happen and is not denied; the snapshot survives for it.
+        # The apply DID happen and is not denied; the record and its pins survive for it.
         assert (target / "newfile.py").exists()
-        assert find_execution_snapshot("snapX") is not None
-        assert pathlib.Path(handle.path).exists()
+        assert find_execution_snapshot("snapX")["result_sha"] and not pathlib.Path(handle.path).exists()
         custody._CUSTODY.clear()
 
     def test_unwritten_disposition_on_reject_changes_nothing(self, tmp_path, monkeypatch):
@@ -441,34 +464,11 @@ class TestProtectedPathScope:
         custody._CUSTODY.clear()
 
 
-class TestSensitiveVeto:
-    def test_vetoed_content_is_never_hashed_into_the_shared_odb(self, tmp_path):
-        # F6: `git add -A` writes a blob for EVERY untracked file — including
-        # `.env` — into the TARGET's object database, which the execution worktree
-        # shares. Removing the index entry afterwards does not unwrite the object,
-        # so the secret stayed readable by hash from inside the run's root.
-        target = _seed_target(tmp_path)
-        secret_sha = _git(target, "hash-object", ".env").stdout.strip()
-        assert secret_sha
-        handle = provision_execution_snapshot(
-            target_root=target, task_id="t1", snapshot_id="snapV",
-            worktree_root=tmp_path / "snaps", data_dir=tmp_path / "data")
-        exec_root = pathlib.Path(handle.path)
-        assert not (exec_root / ".env").exists()
-        for root in (target, exec_root):
-            assert _git(root, "cat-file", "-e", f"{secret_sha}^{{blob}}",
-                        check=False).returncode != 0, f"vetoed blob is reachable from {root}"
-        # The eligible tree is still complete.
-        assert (exec_root / "untracked.txt").read_text(encoding="utf-8") == "loose\n"
-        assert (exec_root / "staged.txt").read_text(encoding="utf-8") == "staged\n"
-        assert (exec_root / "tracked.txt").read_text(encoding="utf-8") == "one\ntwo\n"
-
-
 class TestLegacyRetry:
     def test_pre_isolation_mutating_retry_is_refused(self, tmp_path, monkeypatch):
         # F5: a stored PRE-C1 row has no snapshot binding and its recorded body's
         # scope.root IS the live tree — replaying it would write straight into the
-        # shared tree in the in-place regime C1 retired.
+        # shared tree, an UNRECORDED in-place run (only workspace='in_place' records one).
         from ouroboros.tools.delegate import _delegate_start
 
         target = _seed_target(tmp_path)
@@ -599,7 +599,8 @@ class TestOrphanReconciliation:
         owner worker died. ``started=False`` stops one row earlier (accepted
         POST, no STARTED row — the pending-invocation class)."""
         target = _seed_target(tmp_path)
-        data = tmp_path / "data"
+        data = tmp_path / "data"  # the copy's roots, as capture and release read them (env restored):
+        os.environ.update(OUROBOROS_DATA_DIR=str(data), OUROBOROS_SUBAGENT_WORKTREE_ROOT=str(tmp_path / "snaps"))
         handle = provision_execution_snapshot(
             target_root=target, task_id=task_id, snapshot_id=snapshot_id,
             worktree_root=tmp_path / "snaps", data_dir=data)
@@ -820,7 +821,8 @@ class TestLazyCaptureAtDisposition:
     def _stranded_absent(self, tmp_path, *, snapshot_id, task_id):
         """A stranded mutating run whose daemon answers 404 (state unknowable)."""
         target = _seed_target(tmp_path)
-        data = tmp_path / "data"
+        data = tmp_path / "data"  # the copy's roots, as capture and release read them (env restored):
+        os.environ.update(OUROBOROS_DATA_DIR=str(data), OUROBOROS_SUBAGENT_WORKTREE_ROOT=str(tmp_path / "snaps"))
         handle = provision_execution_snapshot(
             target_root=target, task_id=task_id, snapshot_id=snapshot_id,
             worktree_root=tmp_path / "snaps", data_dir=data)
@@ -931,8 +933,7 @@ class TestLazyCaptureAtDisposition:
         def _broken_capture(*_a, **_kw):
             raise RuntimeError("diff machinery broke")
 
-        monkeypatch.setattr(
-            "ouroboros.headless.write_workspace_patch_artifacts", _broken_capture)
+        monkeypatch.setattr("ouroboros.subagent_worktrees.capture_result_commit", _broken_capture)
         custody.reconcile_orphaned_runs(
             drive, set(), gateway_factory=lambda: _AbsentGateway())
         custody._CUSTODY.clear()
@@ -980,6 +981,11 @@ class TestLazyCaptureAtDisposition:
         assert "CHILD-EDIT" in cap.read_text(encoding="utf-8")
         assert custody.replay(data)["run-inv-can"].patch_captured is True
         custody._CUSTODY.clear()
+
+
+def _git_failure(*_a, **_kw):  # the result-commit capture's own failure: git exits non-zero
+    from ouroboros.subagent_worktrees import GitFailed
+    raise GitFailed(128, ["git", "diff-tree", "-p"], b"", b"fatal: diff exploded")
 
 
 def _failed_manifest_capture(root, out_dir, *, task=None):
@@ -1034,11 +1040,11 @@ class TestCaptureHonesty:
 
         target, ctx, handle, drive = self._settled_run(
             tmp_path, monkeypatch, snapshot_id="snapHon", run_id="run-hon")
-        monkeypatch.setattr("ouroboros.headless.write_workspace_patch_artifacts",
-                            _failed_manifest_capture)
+        monkeypatch.setattr("ouroboros.subagent_worktrees.capture_result_commit", _git_failure)
         entry = custody.replay(drive)["run-hon"]
         block = capture_terminal_patch_for_drive(drive, entry)
         assert block["status"] == "failed"
+        assert block["note"] == "capture failed: fatal: diff exploded"  # git's own words, as text
         assert entry.patch_captured is False
         custody._CUSTODY.clear()
         assert custody.replay(drive)["run-hon"].patch_captured is False
@@ -1108,8 +1114,7 @@ class TestCaptureHonesty:
         assert custody.replay(drive)["run-old"].patch_captured is True  # poisoned row
         # The honest path re-captures instead of trusting the row; the diff
         # machinery is still broken, so the retry also yields a failed manifest.
-        monkeypatch.setattr("ouroboros.headless.write_workspace_patch_artifacts",
-                            _failed_manifest_capture)
+        monkeypatch.setattr("ouroboros.subagent_worktrees.capture_result_commit", _git_failure)
         out = _integrate_delegated_patch(ctx, "run-old", "reject", "discard it")
         assert "INTEGRATE_DELEGATED_CAPTURE_FAILED" in out, out
         custody._CUSTODY.clear()
@@ -1136,9 +1141,9 @@ class TestCaptureHonesty:
         assert pathlib.Path(handle.path).exists()
         custody._CUSTODY.clear()
 
-    def test_ready_no_changes_reject_still_releases_the_snapshot(self, tmp_path, monkeypatch):
-        # (d) regression pin: rejecting a READY_NO_CHANGES capture is legitimate
-        # (nothing to lose) and must keep releasing the snapshot.
+    def test_ready_no_changes_closes_itself_and_a_later_reject_is_ok(self, tmp_path, monkeypatch):
+        # (d) a READY_NO_CHANGES capture is usable and closes itself (no_changes); a later
+        # reject has nothing to lose and answers OK instead of a disposition error.
         from ouroboros.tools.delegate import _capture_terminal_patch
         from ouroboros.tools.subagent_integration import _integrate_delegated_patch
 
@@ -1151,10 +1156,10 @@ class TestCaptureHonesty:
         capture = _capture_terminal_patch(ctx, entry)
         assert capture["status"] == "ready_no_changes"
         assert entry.patch_captured is True  # ready_no_changes IS a usable capture
+        assert entry.patch_disposed == custody.NO_CHANGES and find_execution_snapshot("snapNC") is None
         out = _integrate_delegated_patch(ctx, "run-nc", "reject", "nothing to keep")
-        assert "🚫 Rejected" in out, out
-        assert entry.patch_disposed == "rejected"
-        assert find_execution_snapshot("snapNC") is None
+        assert out.startswith("OK:") and "no_changes" in out, out
+        assert entry.patch_disposed == custody.NO_CHANGES
         custody._CUSTODY.clear()
 
 
@@ -1368,10 +1373,9 @@ class TestApplyIntentAmbiguity:
             out2 = _integrate_delegated_patch(ctx, "run-amb", decision, "discard it")
             assert "INTEGRATE_DELEGATED_APPLY_AMBIGUOUS" in out2, (decision, out2)
             custody._CUSTODY.clear()
-        # No false rejection was recorded; material persists.
+        # No false rejection was recorded; material persists (record, pins, saved patch).
         assert custody.replay(drive)["run-amb"].patch_disposed == ""
-        assert find_execution_snapshot("snapAmb") is not None
-        assert pathlib.Path(handle.path).exists()
+        assert find_execution_snapshot("snapAmb")["result_sha"] and not pathlib.Path(handle.path).exists()
         # The tree honestly still carries the applied, staged patch.
         assert "CHILD-EDIT" in (target / "tracked.txt").read_text(encoding="utf-8")
         staged = _git(target, "diff", "--cached", "--name-only").stdout
@@ -1394,7 +1398,7 @@ class TestApplyIntentAmbiguity:
         replayed = custody.replay(drive)["run-retry"]
         assert replayed.patch_apply_pending is False  # resolved: tree unmutated
         # The nanny reconciles the tree back, restarts, retries: apply works.
-        (target / "tracked.txt").write_text("one\ntwo\n", encoding="utf-8")
+        (target / "tracked.txt").write_text("one\ntwo\n", encoding="utf-8", newline="\n")  # the seed's LF bytes
         out2 = _integrate_delegated_patch(ctx, "run-retry", "apply", "")
         assert "✅ Integrated" in out2, out2
         custody._CUSTODY.clear()

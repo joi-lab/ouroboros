@@ -39,8 +39,6 @@ _MOVED_OWNERS = {
     "_release_git_lock": git_plumbing,
     "_sanitize_git_error": git_plumbing,
     "_unstage_binaries": git_plumbing,
-    "_DOC_ONLY_EXTENSIONS": git_review_cycle,
-    "_diff_is_doc_only": git_review_cycle,
     "_finalize_blocked_review": git_review_cycle,
     "_fingerprint_staged_diff": git_review_cycle,
     "_handle_revalidation_failure": git_review_cycle,
@@ -99,8 +97,6 @@ def test_git_catalog_schema_bytes_and_handler_owners_are_stable():
     assert tuple(entry.name for entry in entries) == (
         "commit_reviewed",
         "vcs_commit_reviewed",
-        "vcs_status",
-        "vcs_diff",
         "vcs_pull_ff",
         "vcs_restore",
         "vcs_revert",
@@ -111,11 +107,13 @@ def test_git_catalog_schema_bytes_and_handler_owners_are_stable():
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode()
-    # Reviewed commit aliases disclose strictness-keyed panels; vcs_diff keeps base/head;
+    # Reviewed commit aliases disclose strictness-keyed panels; vcs_read diff keeps base/head;
     # full_tests distinguishes local adoption from full-only publication consumers;
     # S3 collection permits omitted commit_message; S5 adds author doctrine; D4 adds wake_on.
+    # Target merge retains the contributor tool affordances and target review/mail contracts.
+    # Mechanical revert names effective mode/task or managed-update authority, without fresh review.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "fa28f8b6a1cd2a03b036393cb587e8dda3956c7822b48e6fdb4772a0d316b474"
+        "6865d432fa0ac00af83d27322f356e4ef0e6636e7f9c9c3a8783de7845fe206e"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)
@@ -124,8 +122,6 @@ def test_git_catalog_schema_bytes_and_handler_owners_are_stable():
         # The public handler names the call's review record in every outcome (DEVELOPMENT 05).
         "commit_reviewed": ("ouroboros.tools.git", "_commit_reviewed"),
         "vcs_commit_reviewed": ("ouroboros.tools.git", "_commit_reviewed"),
-        "vcs_status": ("ouroboros.tools.git_vcs_ops", "_git_status"),
-        "vcs_diff": ("ouroboros.tools.git_vcs_ops", "_git_diff"),
         "vcs_pull_ff": ("ouroboros.tools.git_vcs_ops", "_pull_from_remote"),
         "vcs_restore": ("ouroboros.tools.git_vcs_ops", "_restore_to_head"),
         "vcs_revert": ("ouroboros.tools.git_vcs_ops", "_revert_commit"),

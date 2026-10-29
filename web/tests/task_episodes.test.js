@@ -198,3 +198,42 @@ test('an unknown episode code is inside its disclosure, never in the summary, an
         assert.equal(first.timelineEl.parentNode, disclosure);
     } finally { restoreDom(prior); }
 });
+
+
+test('the original Reviews reading door follows its host, never the old work controls', () => {
+    const { prior } = installDom();
+    try {
+        const first = card('t-1', 1000, 'Audit');
+        const next = card('t-2', 5000, 'Continue: Audit');
+        const third = card('t-3', 9000, 'Continue: publish');
+        first.timelineEl = document.createElement('div');
+        first.reviewSummaryEl = document.createElement('button');
+        first.reviewsHostEl = document.createElement('div');
+        first.footEl = document.createElement('div');
+        const oldStop = document.createElement('button');
+        oldStop.dataset.cancelRun = 't-1';
+        first.footEl.append(first.reviewSummaryEl, oldStop);
+        next.episodeHistoryEl = document.createElement('div');
+        third.episodeHistoryEl = document.createElement('div');
+        const records = new Map([first, next, third].map(record => [record.groupId, record]));
+        const episodes = createTaskEpisodes({ records, reanchor: () => false, activity: () => null });
+        episodes.note(first, { status: 'failed', continued_by: { state: 'admitted', successor_task_id: next.groupId } });
+        const disclosure = first.episodeDisclosure;
+        const door = first.reviewSummaryEl;
+        const host = first.reviewsHostEl;
+        assert.deepEqual([...disclosure.children].slice(-3), [first.timelineEl, door, host]);
+        assert.equal(oldStop.parentNode, first.footEl, 'old work control remains in its hidden physical shell');
+        episodes.sync(next);
+        assert.deepEqual([...disclosure.children].slice(-3), [first.timelineEl, door, host], 'sync never reorders or copies them');
+        const late = document.createElement('p');
+        host.appendChild(late);
+        episodes.note(next, { status: 'failed', continued_by: { state: 'admitted', successor_task_id: third.groupId } });
+        assert.equal(first.episodeDisclosure, disclosure);
+        assert.equal(disclosure.parentNode, third.episodeHistoryEl);
+        assert.equal(first.reviewSummaryEl, door);
+        assert.equal(door.parentNode, disclosure);
+        assert.equal(first.reviewsHostEl, host);
+        assert.equal(late.parentNode, host, 'the original controller still owns late content');
+        assert.equal(oldStop.parentNode, first.footEl);
+    } finally { restoreDom(prior); }
+});

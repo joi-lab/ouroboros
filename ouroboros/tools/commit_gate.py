@@ -1056,10 +1056,11 @@ def release_diagnostics(ctx: ToolContext, paths: Optional[List[str]], source: st
                 "message": "deterministic_only requires explicit source=worktree or source=index."}
     from ouroboros import body_candidate
     from ouroboros.commit_admission import release_metadata_diagnostics
-    from ouroboros.reference_books import BOOK_ENTRYPOINTS, book_balance_note
+    from ouroboros.reference_books import BOOK_ENTRYPOINTS, book_balance_note, ruled_text_paths
 
     repo = pathlib.Path(ctx.repo_dir)
-    note = (book_balance_note(repo, paths if paths is not None else BOOK_ENTRYPOINTS.values())
+    note = (book_balance_note(repo, paths if paths is not None
+                              else [*BOOK_ENTRYPOINTS.values(), *ruled_text_paths(repo)])
             if (repo / "ouroboros" / "reference_books.py").is_file() else "")
     return {**release_metadata_diagnostics(
         repo, paths, source=source, neutral_allowed=True if source == "index" else body_candidate.is_bound(ctx)),
@@ -1067,11 +1068,21 @@ def release_diagnostics(ctx: ToolContext, paths: Optional[List[str]], source: st
             "book_balance": {"source": "worktree", "note": note}}
 
 
-def deterministic_preflight(ctx: ToolContext, commit_message: str, paths: Optional[List[str]]) -> str:
+def _neutral_commit_allowed(ctx: ToolContext) -> bool:
+    """Prepared body contributions and authorized adoption of the selected official release."""
+    from ouroboros import body_candidate
+    from ouroboros.tools.registry_guards import _authorized_managed_update_resolver
+
+    return body_candidate.is_bound(ctx) or _authorized_managed_update_resolver(ctx)
+
+
+def deterministic_preflight(ctx: ToolContext, commit_message: str, paths: Optional[List[str]],
+                            *, review_only: bool = False) -> str:
     """The free checks that ran ahead of the retired advisory delivery, kept whole for every
     commit: size headroom, the staged change's diff pulse (the text the panel's seats read
     first) and readiness (information and warnings), release metadata of the staged index,
-    and the syntax of staged ``.py`` files. Returns the blocking message or ""."""
+    and the syntax of staged ``.py`` files. A non-committing cycle reviews the prepared
+    contribution form too; it grants no commit authority. Returns the blocking message or ""."""
     from ouroboros.commit_admission import release_metadata_preflight, syntax_preflight_staged_py_files
     from ouroboros.review import diff_pulse
     from ouroboros.tools.review_helpers import check_worktree_readiness
@@ -1091,7 +1102,8 @@ def deterministic_preflight(ctx: ToolContext, commit_message: str, paths: Option
                 "task_id": str(getattr(ctx, "task_id", "") or "")})
         except Exception:
             pass
-    return (release_metadata_preflight(repo_dir, commit_message, paths, source="index")
+    return (release_metadata_preflight(repo_dir, commit_message, paths, source="index",
+                                       neutral_allowed=review_only or _neutral_commit_allowed(ctx))
             or syntax_preflight_staged_py_files(repo_dir, list(paths or [])) or "")
 
 
@@ -1273,7 +1285,8 @@ def bind_author_commit_candidate(ctx: ToolContext, commit_message: str, pre_fing
     )
     ctx._author_commit_record = author
     staged = git_mod.run_cmd(["git", "diff", "--cached", "--name-status"], cwd=ctx.repo_dir)
-    return _preflight_check(commit_message, format_name_status_for_preflight(staged), ctx.repo_dir)
+    return _preflight_check(commit_message, format_name_status_for_preflight(staged), ctx.repo_dir,
+                            neutral_allowed=_neutral_commit_allowed(ctx))
 
 
 def record_bound_commit_success(ctx: ToolContext, commit_message: str, started_at: float, before: dict, after: dict) -> None:
@@ -1399,6 +1412,7 @@ def _review_ledger_facts(ctx: ToolContext, commit_message: str, *, goal: str, sc
             surface="commit_gate", goal=goal or commit_message, task_id=task_id,
             retry_key=str(getattr(ctx, "_current_review_retry_key", "") or "")), {}, ""),
         "repo_dir": str(ctx.repo_dir), "goal": goal, "scope": scope, "commit_message": commit_message,
+        "since_review": str(getattr(ctx, "_review_since", "") or ""),
         "binding": dict(pre_fingerprint.get("binding") or {}),
         "binding_fingerprint": str(pre_fingerprint.get("fingerprint") or ""),
         "review_contract_fingerprint": str(getattr(ctx, "_current_review_contract_fingerprint", "") or ""),

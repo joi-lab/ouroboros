@@ -14,16 +14,24 @@ and the next locked update folds in (the directory holds only such contended reg
 ``begin_owned_stop`` is called first by every shutdown door (owner Restart, the lifespan
 teardown, the emergency exit): it starts the generation's one grace deadline and stamps
 ``stop_requested_at`` on every target before any other owner waits, so a launcher kill at the
-grace still leaves every pending stop recorded. ``stop_owned_work`` is the generation's one
-stop. The first caller starts it; a later caller joins it until completion or the shared
-deadline and never starts a second one. It stops through the existing typed kill helpers,
-forgets what the existing liveness predicates confirm, stamps the rest ``unconfirmed_since``
-without waiting for a lock once the deadline passed, and returns: the exit owner exits. A target recorded
-after the stop began (the owner Restart stops before the server exits) is born stamped. The
-next start's ``finish_unconfirmed_stops`` retries every stamped record under the same bound
-before admission and before any extension or replacement process starts; what it cannot
-confirm stays recorded and counted. Records an older release left on disk are indexed once by
-``start_inherited_import`` on a background thread, so no start waits on that walk.
+grace still leaves every pending stop recorded. Between the two, the generation's first explicit
+door cause replaces ``state/shutdown_entry.json``: one lock-free atomic write, best effort; a
+cause-less or later door keeps it. It records entering shutdown, never an exit, a finished
+cleanup or Resume authority; the ``server_shutdown`` row still follows terminal custody. The next
+start reports that record and claims the file for its own generation, so an older cause never
+explains a death before any door; that death stays uncaused, as does a planned restart's worker
+stop before its teardown (its restart transaction records it).
+
+``stop_owned_work`` is the generation's one stop. The first caller starts it; a later caller
+joins it until completion or the shared deadline and never starts a second one. It stops through
+the existing typed kill helpers, forgets what the existing liveness predicates confirm, stamps the
+rest ``unconfirmed_since`` without waiting for a lock once the deadline passed, and returns: the
+exit owner exits. A target recorded after the stop began (the owner Restart stops before the
+server exits) is born stamped. The next start's ``finish_unconfirmed_stops`` retries every
+stamped record under the same bound before admission and before any extension or replacement
+process starts; what it cannot confirm stays recorded and counted. Records an older release left
+on disk are indexed once by ``start_inherited_import`` on a background thread, so no start waits
+on that walk.
 """
 
 from __future__ import annotations
@@ -42,7 +50,9 @@ log = logging.getLogger(__name__)
 
 OWNED_PROCESSES_FILENAME = "owned_processes.json"
 PENDING_DIRNAME = "owned_processes.pending"
+SHUTDOWN_ENTRY_FILENAME = "shutdown_entry.json"
 _SCHEMA_VERSION = 1
+_RESTART_CAUSES = frozenset({"restart_requested", "owner_restart"})
 _EXECUTOR_KINDS = ("foreground", "service")
 _POLL_SEC = 0.05  # liveness re-check granularity of process_custody.stop_ledgered_processes
 
@@ -56,6 +66,8 @@ class _Stop:
         self.deadline: Optional[float] = None  # set by the first shutdown door (begin or stop)
         self.started = False
         self.outcome: Optional[Dict[str, Any]] = None
+        self.entry_lock = threading.Lock()  # orders the entry file's boot claim and first cause; never the deadline
+        self.entry: Dict[str, Any] = {}  # this generation's shutdown_entry.json record: its claim, then its cause
 
 
 _GENERATION_STOP = _Stop()  # one per server process; a test starts a fresh one
@@ -94,6 +106,10 @@ def installation_root(drive_root: Any) -> pathlib.Path:
 
 def owned_processes_path(root: Any) -> pathlib.Path:
     return pathlib.Path(root) / "state" / OWNED_PROCESSES_FILENAME
+
+
+def shutdown_entry_path(root: Any) -> pathlib.Path:
+    return pathlib.Path(root) / "state" / SHUTDOWN_ENTRY_FILENAME
 
 
 def _pending_files(root: Any, *, strict: bool = False) -> Dict[pathlib.Path, Dict[str, Any]]:
@@ -553,9 +569,81 @@ def _run_stop(root: pathlib.Path, deadline: float) -> Dict[str, Any]:
             "elapsed_sec": round(time.monotonic() - started, 3)}
 
 
-def begin_owned_stop(drive_root: Any = None) -> None:
+def _generation_record() -> Dict[str, Any]:
+    """The identity a shutdown entry carries: the process generation the restart transaction uses."""
+    from ouroboros.delegate_recovery import _PROCESS_GENERATION
+
+    return {"schema_version": _SCHEMA_VERSION, "generation": _PROCESS_GENERATION, "supervisor_pid": os.getpid()}
+
+
+def _record_shutdown_entry(root: pathlib.Path, cause: str) -> None:
+    """Write this generation's first explicit shutdown cause once; a failure is logged, never raised."""
+    stop = _GENERATION_STOP
+    if stop.entry.get("cause"):
+        return  # a later door: no wait, the first cause stays
+    with stop.entry_lock:  # held only by this generation's boot claim or a racing door's one write
+        if stop.entry.get("cause"):
+            return
+        try:
+            stop.entry = {**(stop.entry or _generation_record()), "entered_at": utc_now_iso(),
+                          "cause": cause, "restart_exit": cause in _RESTART_CAUSES}
+            atomic_write_json(shutdown_entry_path(root), stop.entry)
+        except Exception:
+            log.warning("Shutdown entry (%s) not written; the shutdown continues", cause, exc_info=True)
+
+
+def claim_shutdown_entry(root: Any) -> Dict[str, Any]:
+    """Report the previous generation's shutdown entry, then claim the file for this generation.
+
+    ``entered``: it entered a shutdown door with ``cause`` (no proof of its exit or cleanup);
+    ``no_entry``: it claimed the file and recorded no cause; ``absent`` or ``unreadable``;
+    ``current``: the file is already this generation's (a door may precede the boot step).
+    Diagnostic only, never raised: the custody retry that follows must run regardless."""
+    stop, path = _GENERATION_STOP, shutdown_entry_path(root)
+    try:
+        with stop.entry_lock:
+            if stop.entry:
+                return {"state": "current"}
+            claim = {**_generation_record(), "started_at": utc_now_iso()}
+            try:
+                previous: Any = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                previous = None
+            except (OSError, ValueError):
+                previous = "unreadable"
+            if isinstance(previous, dict) and previous.get("generation") == claim["generation"]:
+                return {"state": "current"}
+            stop.entry = claim
+            try:
+                atomic_write_json(path, claim)
+            except Exception:
+                log.warning("Shutdown entry %s not claimed; the previous record is removed", path, exc_info=True)
+                path.unlink(missing_ok=True)  # an older cause must not outlive the generation that read it
+    except Exception:
+        log.warning("Shutdown entry %s was not read or claimed", path, exc_info=True)
+        return {"state": "failed"}
+    if previous is None:
+        return {"state": "absent"}
+    if not isinstance(previous, dict) or previous.get("schema_version") != _SCHEMA_VERSION \
+            or not previous.get("generation"):
+        log.warning("Previous shutdown entry %s was unreadable", path)
+        return {"state": "unreadable"}
+    if previous.get("cause"):
+        log.info("Previous server generation %s (pid %s) entered its shutdown at %s with cause %s; "
+                 "an entry, not a confirmed exit", previous["generation"], previous.get("supervisor_pid"),
+                 previous.get("entered_at"), previous["cause"])
+        return {"state": "entered", "previous": previous}
+    log.warning("Previous server generation %s (pid %s, started %s) recorded no shutdown entry: it ended "
+                "before an ordinary shutdown door or the entry was not written (Panic and a planned "
+                "restart's worker stop keep their own records)", previous["generation"],
+                previous.get("supervisor_pid"), previous.get("started_at"))
+    return {"state": "no_entry", "previous": previous}
+
+
+def begin_owned_stop(drive_root: Any = None, *, cause: str = "") -> None:
     """A shutdown door was entered: start the generation's one grace deadline (if no door did
-    yet) and persist ``stop_requested_at`` on every target before any other owner waits."""
+    yet), record the first explicit ``cause`` without any file lock, and persist
+    ``stop_requested_at`` on every target before any other owner waits."""
     if drive_root is None:
         from ouroboros.config import resolve_data_dir
         drive_root = resolve_data_dir()
@@ -565,6 +653,8 @@ def begin_owned_stop(drive_root: Any = None) -> None:
         if stop.deadline is None:
             stop.deadline = time.monotonic() + _stop_budget_sec()
         deadline = stop.deadline
+    if cause:
+        _record_shutdown_entry(root, cause)
     try:
         _stamp(root, "stop_requested_at", _is_stop_target,
                timeout_sec=max(0.0, min(2.0, deadline - time.monotonic())))
@@ -666,12 +756,14 @@ def import_inherited_records(drive_root: Any) -> Optional[int]:
 def finish_unconfirmed_stops(drive_root: Any) -> Dict[str, Any]:
     """The next start's bounded retry of every stop a previous generation requested.
 
-    Retries each record stamped ``stop_requested_at`` or ``unconfirmed_since`` under the
+    First reports the previous generation's shutdown entry (``claim_shutdown_entry``). Retries
+    each record stamped ``stop_requested_at`` or ``unconfirmed_since`` under the
     stop's own deadline, forgets confirmed exits, keeps the rest stamped and writes one
     ``owned_stops_finished`` supervisor row when there was work. It never walks the disk."""
     counts: Dict[str, Any] = {"retried": 0, "confirmed": 0, "unconfirmed": 0}
     try:
         root = installation_root(drive_root)
+        claim_shutdown_entry(root)
         pending = [dict(entry) for entry in _read_document(root)["records"].values()
                    if entry.get("stop_requested_at") or entry.get("unconfirmed_since")]
         if pending:

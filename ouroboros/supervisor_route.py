@@ -3,6 +3,8 @@
 The leaf owns ``configured_subagent``; its supervisor owns schema 2 of the
 existing ``parent_cognitive_route``. Neither dispatch nor restore reselects a
 roster row. An empty account is captured Auto intent, never an observed account.
+``follows_role`` names the role a following parent handed down (the nanny
+follows it live, ``route_choice``); a frozen model is the parent's own choice.
 """
 
 from __future__ import annotations
@@ -27,7 +29,8 @@ def validate_cognitive_route(raw: Any) -> dict:
                 or any(not isinstance(route.get(key), str) for key in required_strings)
                 or type(route.get("use_local_model")) is not bool
                 or not route["source_role"]
-                or route.get("chosen_by") not in ("inherited", "parent_fallback", "delegator")):
+                or route.get("chosen_by") not in ("inherited", "parent_fallback", "parent_switch", "delegator")
+                or not isinstance(route.get("follows_role", ""), str)):
             raise ValueError("The complete schema-2 cognitive binding is required")
         route["processing_preference"] = normalize_processing_preference(route["processing_preference"])
         if route["chosen_by"] == "delegator":
@@ -101,8 +104,12 @@ def _selected_cognition(ctx: Any, selected: dict, settings: dict) -> dict:
 
 
 def _inherited_cognition(ctx: Any, settings: dict) -> dict:
+    """The parent's actual send binding, with its route choice: a parent following its role hands the role
+    down (``follows_role``, the nanny follows it live); a parent on its own route (``switch_model``, a
+    wait-card choice) hands a frozen ``parent_switch``; an adopted fallback stays ``parent_fallback``."""
     from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option, task_model_binding, task_processing_preference
     from ouroboros.provider_models import provider_for_model
+    from ouroboros.route_choice import follows
 
     metadata = getattr(ctx, "task_metadata", None) or {}
     plan = getattr(ctx, "context_fit_plan", None)
@@ -117,13 +124,17 @@ def _inherited_cognition(ctx: Any, settings: dict) -> dict:
         pin = model_role_option(MODEL_ACCOUNTS_KEY, role, settings=settings)
     if local or provider_for_model(model) != "claudexor":
         pin = ""
+    choice = getattr(ctx, "route_choice", None)
+    followed = follows(choice) if isinstance(choice, dict) else ""
+    chosen_by = ("parent_fallback" if role.startswith("fallback:")
+                 else "parent_switch" if isinstance(choice, dict) and not followed else "inherited")
     return validate_cognitive_route({
         "schema": 2, "model": model,
         "effort": str(getattr(ctx, "active_effort", "") or metadata.get("reasoning_effort") or ""),
         "use_local_model": local, "source_role": role,
         "credential_profile_id": str(pin or ""),
         "processing_preference": task_processing_preference(task, model_role=role),
-        "chosen_by": "parent_fallback" if role.startswith("fallback:") else "inherited",
+        "chosen_by": chosen_by, "follows_role": followed if chosen_by == "inherited" else "",
     })
 
 
@@ -137,4 +148,9 @@ def cognitive_route_provenance(route: Any) -> str:
         return f"chosen by the delegator ({row})" if row else "chosen by the delegator"
     if chosen == "parent_fallback":
         return "parent's fallback"
-    return "inherited" if chosen == "inherited" else ""
+    if chosen == "parent_switch":
+        return "parent's own choice"
+    if chosen == "inherited":
+        followed = str(route.get("follows_role") or "")
+        return f"inherited (follows {followed})" if followed else "inherited"
+    return ""

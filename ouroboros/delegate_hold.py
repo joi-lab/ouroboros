@@ -54,7 +54,7 @@ _CONTROL_WAKE_KINDS = frozenset({"finalize_now"})
 _NON_WAKE_STATUSES = frozenset({"refused", "fault"})
 # Inter-cycle backoff floor: repeated unknown outcomes on resume rounds must not
 # tighten into a paid dispatch loop. Deliberately BELOW the 60s idle-rail floor
-# so this plain bounded sleep can never race the idle reaper (the interruptible
+# so this plain bounded sleep can never outlast the silence window (the interruptible
 # owner surface is the supervised_wait right after it).
 _HOLD_BACKOFF_CAP_SEC = 15.0
 _ACK_ATTEMPTS = 3
@@ -241,8 +241,8 @@ def _append_wake_receipt(
             "(it was never resent and stays billed at its reserved upper bound). The "
             f"task held on the live leaf run {run_id} instead of dying; this wake is "
             "the new material input for THIS round — judge it (read results, wait "
-            "again, cancel, or integrate). Never rebuild the leaf's work on metered "
-            "tokens. Use retry_of to resolve an unknown start; a new prompt is independent work.\n" + body
+            "again, cancel, or integrate). Never rebuild the leaf's work. "
+            "Use retry_of to resolve an unknown start; a new prompt is independent work.\n" + body
         ),
     })
 

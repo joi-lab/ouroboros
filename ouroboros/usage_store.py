@@ -47,6 +47,7 @@ from ouroboros.store import (
     TIER_ENFORCED, TIER_NAME, busy as _busy, file_identity as _identity, fsync_directory as _fsync_directory,
     process_lock as _process_lock,
 )
+from ouroboros.store_capture import Captured, capture
 from ouroboros.usage_ledger import (
     LEDGER_REL, LOCK_REL, QUARANTINE_REL, USAGE_LOCK_TIMEOUT_SEC, UsageAccountingError, UsageExportInProgress,
     UsageLedgerCorrupt, UsageLockUnavailable,
@@ -71,6 +72,11 @@ _TASK_PAGE_SQL = ("SELECT attempt_id, state, settle_reason, model, provider, ts_
                   "WHERE task_id=? AND category=? AND seq_first<? ORDER BY seq_first DESC LIMIT ?")
 _TASK_CURSOR_SQL = "SELECT seq_first FROM attempts WHERE attempt_id=? AND task_id=? AND category=?"
 
+# One root's money rows of a recent window by range, never the root's whole life (the consciousness
+# allowance, ``consciousness_allowance``); a store an older body created gains it at the lifespan boot.
+ROOT_TIME_INDEX = "CREATE INDEX IF NOT EXISTS attempts_root_time ON attempts(root_task_id, ts_last_epoch)"
+DIRTY_REVISION_INDEX = "CREATE INDEX IF NOT EXISTS dirty_owners_revision ON dirty_owners(revision)"
+
 _SCHEMA = f"""
 CREATE TABLE attempts (
   attempt_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, seq INTEGER NOT NULL, seq_first INTEGER NOT NULL,
@@ -94,6 +100,7 @@ CREATE INDEX attempts_group ON attempts(billing_group_id);
 CREATE INDEX attempts_task ON attempts(task_id);
 CREATE INDEX attempts_open ON attempts(state) WHERE {_OPEN_PREDICATE};
 CREATE INDEX attempts_category_time ON attempts(category, ts_last_epoch);
+{ROOT_TIME_INDEX};
 CREATE INDEX attempts_review ON attempts(review_skill, review_wave_id);
 CREATE INDEX attempts_route ON attempts(subscription_route);
 CREATE TABLE summaries (
@@ -114,6 +121,7 @@ CREATE INDEX summaries_accounted ON summaries(scope, accounted_num);
 CREATE TABLE bindings (scope TEXT NOT NULL, key TEXT NOT NULL, binding TEXT NOT NULL,
   PRIMARY KEY (scope, key)) WITHOUT ROWID;
 CREATE TABLE dirty_owners (owner_id TEXT PRIMARY KEY, revision INTEGER NOT NULL) WITHOUT ROWID;
+{DIRTY_REVISION_INDEX};
 CREATE TABLE one_shots (attempt_id TEXT PRIMARY KEY, kind TEXT, task_id TEXT, root_task_id TEXT,
   subscription_route TEXT, source TEXT, category TEXT, identity TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
@@ -136,6 +144,7 @@ _NONE_KEY = "__none__"  # column-mapped keys present with an explicit None
 _DERIVED = ("revision", "seq_first", "ts_reserved", "ts_dispatched", "ts_final", "ts_last_epoch", "late_receipt",
             "weight", "has_root_limit", "has_group_limit", "extra")
 _COLUMNS = tuple(dict.fromkeys((*_FIELDS.values(), *_DERIVED)))
+_ATTEMPT_CAPTURE = ("extra", "revision", *dict.fromkeys(_FIELDS.values()))  # what ``_decode`` reads: no REAL column
 
 
 def _encode(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -167,6 +176,11 @@ def _encode(row: Dict[str, Any]) -> Dict[str, Any]:
     columns["extra"] = json.dumps(durable_literals(extra), ensure_ascii=False, sort_keys=True,
                                   separators=(",", ":"))
     return columns
+
+
+def decode_attempts(captured: Captured) -> List[Dict[str, Any]]:
+    """``Txn.attempts``' rows from ``Txn.attempt_rows``, decoded after the read closed, in write order (``seq``)."""
+    return [_decode(record) for record in captured.rows(key=lambda record: record["seq"])]
 
 
 def _decode(record: Any) -> Dict[str, Any]:
@@ -265,6 +279,24 @@ def _bucket_record(scope: str, key: str, bucket: Bucket) -> tuple:
             bucket.physical, _json(bucket.ttls), _json(bucket.caps))
 
 
+_BUCKET_CAPTURE = tuple(column for column in _SUMMARY_COLUMNS if column != "accounted_num")  # REAL: ordering only
+
+
+class SummaryRows:
+    """``Txn.bucket``/``Txn.buckets`` over the rows ``Txn.summary_rows`` captured, decoded after the read closed."""
+
+    def __init__(self, captured: Captured) -> None:
+        self._rows = {(record["scope"], record["key"]): _bucket_of(record) for record in captured.rows()}
+
+    def bucket(self, scope: str, key: str = "") -> Bucket:
+        return self._rows.get((scope, str(key))) or Bucket()
+
+    def buckets(self, scope: str, prefix: Optional[str] = None) -> Dict[str, Bucket]:
+        under = "" if prefix is None else f"{prefix}|"  # every key, or the keys under "<prefix>|" without it
+        return {key[len(under):]: bucket for (held, key), bucket in sorted(self._rows.items())
+                if held == scope and key.startswith(under)}
+
+
 def _bucket_of(record: Any) -> Bucket:
     from decimal import Decimal
 
@@ -346,12 +378,40 @@ class Txn:
         return [_decode(record) for record in self.conn.execute(
             f"SELECT * FROM attempts WHERE {where} ORDER BY seq", tuple(params))]
 
+    def attempt_rows(self, where: str = "1", params: Sequence[Any] = ()) -> Captured:
+        """``attempts``' rows in ONE step (``store_capture``), for ``decode_attempts`` after the read closed: an
+        addressed selection (a root, a task, the open set); ``attempts()`` of every row steps row by row."""
+        return capture(self.conn, f"SELECT {', '.join(_ATTEMPT_CAPTURE)} FROM attempts WHERE {where}", params,
+                       _ATTEMPT_CAPTURE)
+
     def open_attempts(self, *, root_task_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """The open set (partial index): reserved/dispatched/unresolved rows
         and abandoned settlements that keep their late-receipt right."""
+        return decode_attempts(self.open_attempt_rows(root_task_id=root_task_id))
+
+    def open_attempt_rows(self, *, root_task_id: Optional[str] = None) -> Captured:
+        """``open_attempts``' rows captured (``attempt_rows``), for ``decode_attempts`` after the read closed."""
         if root_task_id is None:
-            return self.attempts(_OPEN_PREDICATE)
-        return self.attempts(f"{_OPEN_PREDICATE} AND root_task_id=?", (str(root_task_id),))
+            return self.attempt_rows(_OPEN_PREDICATE)
+        return self.attempt_rows(f"{_OPEN_PREDICATE} AND root_task_id=?", (str(root_task_id),))
+
+    def summary_rows(self, reads: Sequence[Tuple[str, str, str]]) -> Captured:
+        """The summary rows ``reads`` names, in ONE step, for ``SummaryRows`` after the read closed: ``(scope,
+        key, "key")`` one row, ``(scope, prefix, "prefix")`` the keys under ``"<prefix>|"``, ``(scope, "",
+        "scope")`` every key of the scope (``bucket``/``buckets``' selections)."""
+        terms, params = [], []
+        for scope, key, how in dict.fromkeys(reads):
+            if how == "key":
+                terms.append("(scope=? AND key=?)")
+                params += [scope, key]
+            elif how == "prefix":
+                terms.append("(scope=? AND key>=? AND key<?)")
+                params += [scope, f"{key}|", f"{key}}}"]
+            else:
+                terms.append("scope=?")
+                params.append(scope)
+        return capture(self.conn, f"SELECT {', '.join(_BUCKET_CAPTURE)} FROM summaries "
+                       f"WHERE {' OR '.join(terms) or '0'}", params, _BUCKET_CAPTURE)
 
     def task_attempt_page(self, task_id: str, category: str, *, after: str = "",
                           limit: int) -> Optional[List[Dict[str, Any]]]:
@@ -411,18 +471,20 @@ class Txn:
     def dirty_owner_ids(self) -> List[str]:
         return [owner for owner, _revision in self.dirty_owners()]
 
-    def dirty_owners(self) -> List[Tuple[str, int]]:
+    def dirty_owners(self, *, since: Optional[int] = None) -> List[Tuple[str, int]]:
         """The owners whose stored cost projection may be behind
         (``dirty_owners``) that own a non-review attempt or imported aggregate
         (rows under a review's own custody, ``_usage_rows.REVIEW_CUSTODY_KEYS``,
         never made an owner a candidate). Each owner's check is an indexed
-        lookup of its own rows."""
+        lookup of its own rows. ``since`` selects only newer writes in this epoch."""
+        changed = "d.revision > ? AND " if since is not None else ""
+        order = "revision, owner_id" if since is not None else "owner_id"
         return [(record["owner_id"], record["revision"]) for record in self.conn.execute(
-            "SELECT owner_id, revision FROM dirty_owners AS d WHERE EXISTS (SELECT 1 FROM attempts AS a "
+            "SELECT owner_id, revision FROM dirty_owners AS d WHERE " + changed + "EXISTS (SELECT 1 FROM attempts AS a "
             "WHERE (a.task_id = d.owner_id OR a.root_task_id = d.owner_id) "
             "AND COALESCE(a.kind, 'attempt') IN ('attempt', 'usage_baseline_group') "
             "AND COALESCE(a.review_skill, '') = '' "
-            "AND COALESCE(a.review_slot_id, '') = '') ORDER BY owner_id")]
+            "AND COALESCE(a.review_slot_id, '') = '') ORDER BY " + order, (() if since is None else (since,)))]
 
     def keys(self, scope: str) -> List[str]:
         """Every key of one summary scope (no bucket decoded)."""
@@ -649,7 +711,12 @@ def _commit(conn: sqlite3.Connection) -> None:
         raise UsageAccountingError(f"usage store commit failed: {exc}") from exc
 
 
-def store_tier(root: pathlib.Path, *, wait_sec: float, migrate: bool = True) -> str:
+def _remaining_wait(seconds, remaining_sec):
+    """A caller-owned deadline narrows admission; ordinary waits keep their contract."""
+    return min(seconds, remaining_sec()) if remaining_sec is not None else seconds
+
+
+def store_tier(root: pathlib.Path, *, wait_sec: float, migrate: bool = True, remaining_sec=None) -> str:
     """The lock tier of the ready store. A missing store is migrated first
     (``migrate_from_journal``; ``migrate=False`` reports it unavailable
     instead). A caller that finds the import already running waits only its own
@@ -664,7 +731,7 @@ def store_tier(root: pathlib.Path, *, wait_sec: float, migrate: bool = True) -> 
     if cached is not None:
         forget(root)
     lock = _process_lock(path)
-    if not lock.acquire(timeout=max(0.0, wait_sec)):
+    if not lock.acquire(timeout=max(0.0, _remaining_wait(wait_sec, remaining_sec))):
         error = UsageLockUnavailable("usage store migration in progress", reason="contention")
         error.rollback_confirmed = True  # this caller acquired neither lock nor transaction
         raise error
@@ -674,7 +741,7 @@ def store_tier(root: pathlib.Path, *, wait_sec: float, migrate: bool = True) -> 
                 raise UsageLockUnavailable("usage store not migrated yet", reason="contention")
             migrate_from_journal(root)
         identity, tier = _identity(path), _header_tier(path)
-        if identity is None or tier is None or (_stored_meta(path, tier, wait_sec).get("import") or {}).get("status") != "completed":
+        if identity is None or tier is None or (_stored_meta(path, tier, wait_sec, remaining_sec=remaining_sec).get("import") or {}).get("status") != "completed":
             raise UsageLedgerCorrupt(f"usage store unreadable or without a completed import: {path}")
         _READY[str(path)] = (identity, tier)
         return tier
@@ -682,15 +749,18 @@ def store_tier(root: pathlib.Path, *, wait_sec: float, migrate: bool = True) -> 
         lock.release()
 
 
-def _stored_meta(path: pathlib.Path, tier: str, wait_sec: float) -> Dict[str, Any]:
+def _stored_meta(path: pathlib.Path, tier: str, wait_sec: float, *, remaining_sec=None) -> Dict[str, Any]:
     """``meta.import`` and ``meta.export`` of a store file (``{}`` for one that cannot be read)."""
     with contextlib.ExitStack() as stack:
         if tier == TIER_NAME:
-            stack.enter_context(_named_lock(path.parent.parent, LOCK_REL.name, timeout_sec=wait_sec, stale_sec=90.0))
+            stack.enter_context(_named_lock(path.parent.parent, LOCK_REL.name,
+                                            timeout_sec=_remaining_wait(wait_sec, remaining_sec), stale_sec=90.0))
         if path.name == STORE_REL.name:
-            conn = stack.enter_context(_core.connection(path, tier, wait_sec=wait_sec, opener=_connect))
+            conn = stack.enter_context(_core.connection(path, tier, wait_sec=_remaining_wait(wait_sec, remaining_sec), opener=_connect))
         else:  # retired copies must be closed before abandonment can rename them back
-            conn = stack.enter_context(contextlib.closing(_connect(path, tier, wait_sec=wait_sec)))
+            conn = stack.enter_context(contextlib.closing(_connect(path, tier, wait_sec=_remaining_wait(wait_sec, remaining_sec))))
+        if remaining_sec is not None:
+            conn.execute(f"PRAGMA busy_timeout = {int(_remaining_wait(wait_sec, remaining_sec) * 1000)}")
         try:
             records = conn.execute("SELECT key, value FROM meta WHERE key IN ('import', 'export')").fetchall()
         except sqlite3.OperationalError as exc:
@@ -713,18 +783,24 @@ def _sha256_file(path: pathlib.Path) -> Optional[str]:
 
 @contextlib.contextmanager
 def hold(root: pathlib.Path | str, *, timeout_sec: float = USAGE_LOCK_TIMEOUT_SEC,
-         write: bool = True, migrate: bool = True, exporting: bool = False) -> Iterator[Txn]:
+         write: bool = True, migrate: bool = True, exporting: bool = False, remaining_sec=None) -> Iterator[Txn]:
     """Bounded money acquisition (``_usage_wait``); timeout raises UsageLockUnavailable.
     Writes use BEGIN IMMEDIATE and wait for readers at COMMIT. An export mark
     refuses writes with UsageExportInProgress; only export/abandonment use exporting=True.
     Receipt callbacks run after the transaction and name lock have closed.
+    ``remaining_sec`` optionally narrows each acquisition to a caller's one deadline
+    (query_data SQL); it never enlarges a wait or changes other callers' defaults.
     """
     root = pathlib.Path(root)
-    tier = store_tier(root, wait_sec=timeout_sec, migrate=migrate)
+    tier = store_tier(root, wait_sec=timeout_sec, migrate=migrate, remaining_sec=remaining_sec)
     with contextlib.ExitStack() as stack:
         if tier == TIER_NAME:
-            stack.enter_context(_named_lock(root, LOCK_REL.name, timeout_sec=timeout_sec, stale_sec=90.0))
-        conn = stack.enter_context(_core.connection(root / STORE_REL, tier, wait_sec=timeout_sec, opener=_connect))
+            stack.enter_context(_named_lock(root, LOCK_REL.name,
+                                            timeout_sec=_remaining_wait(timeout_sec, remaining_sec), stale_sec=90.0))
+        conn = stack.enter_context(_core.connection(root / STORE_REL, tier,
+                                                    wait_sec=_remaining_wait(timeout_sec, remaining_sec), opener=_connect))
+        if remaining_sec is not None:
+            conn.execute(f"PRAGMA busy_timeout = {int(_remaining_wait(timeout_sec, remaining_sec) * 1000)}")
         txn = Txn(conn, root, write=write)
         handoff = False
         try:  # the enforced tier's COMMIT waits for readers to drain
@@ -846,6 +922,8 @@ def migrate_from_journal(root: pathlib.Path | str, *, initialize_journal: bool =
                 report = {"status": "already_completed", **_retire_journal(root, status)}
                 if initialize_journal and not stored.get("export"):  # an exporting store stays as it is handed off
                     report["journal_selected"] = _select_journal(root, path, tier)
+                    report["window_index"] = _ensure_read_index(root, path, tier, "attempts_root_time", ROOT_TIME_INDEX)
+                    report["dirty_owner_index"] = _ensure_read_index(root, path, tier, "dirty_owners_revision", DIRTY_REVISION_INDEX)
             else:
                 tier = TIER_ENFORCED if kernel_file_locks_enforced(root / LOCK_REL) else TIER_NAME
                 report = _import(root, path, tier)
@@ -857,6 +935,25 @@ def migrate_from_journal(root: pathlib.Path | str, *, initialize_journal: bool =
     except Exception:
         log.warning("usage store migration report not recorded", exc_info=True)
     return report
+
+
+def _ensure_read_index(root: pathlib.Path, path: pathlib.Path, tier: str, name: str, ddl: str) -> str:
+    """A read index on a store an older body created: built once at the lifespan boot while
+    writers are quiescent, never by a reader; ``present`` costs one schema lookup. A failed build
+    leaves readers on existing indexes (same answer, broader scan) until the next boot."""
+    try:
+        with contextlib.ExitStack() as stack:
+            if tier == TIER_NAME:
+                stack.enter_context(_named_lock(root, LOCK_REL.name, timeout_sec=USAGE_LOCK_TIMEOUT_SEC, stale_sec=90.0))
+            conn = stack.enter_context(_core.connection(path, tier, wait_sec=USAGE_LOCK_TIMEOUT_SEC, opener=_connect))
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (name,)).fetchone():
+                return "present"
+            with _core.transaction(conn, write=True, commit_wait_sec=USAGE_LOCK_TIMEOUT_SEC):
+                conn.execute(ddl)
+        return "created"
+    except (sqlite3.Error, _core.StoreError, UsageAccountingError) as exc:
+        log.warning("usage store index %s deferred to the next boot: %s", name, exc)
+        return f"deferred: {type(exc).__name__}"
 
 
 def _select_journal(root: pathlib.Path, path: pathlib.Path, tier: str) -> bool:

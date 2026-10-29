@@ -28,7 +28,7 @@ function skill(overrides = {}) {
 
 test('one head: the name opens the detail sheet, marks stay beside it, the who line names the source', () => {
     const html = renderInstalledSkillCard(row('weather'));
-    assert.match(html, /<button type="button" class="skills-card-name" data-skill="weather" data-skill-action="open_detail">weather<span class="skills-card-name-more" aria-hidden="true">›<\/span><\/button>/);
+    assert.match(html, /<button type="button" class="skills-card-name" data-skill="weather" data-skill-action="open_detail"><span data-i18n-authored>weather<\/span><span class="skills-card-name-more" aria-hidden="true">›<\/span><\/button>/);
     assert.match(html, /data-official-mark[^>]*>[\s\S]*?Official<\/button>/, 'Official comes from the install record');
     assert.match(installedWhoHtml(row('weather')), /^Ouroboros · v0\.3\.1 · installed .* by Ouroboros$/);
     assert.match(installedWhoHtml(row('telegram')), /^Built in · v1\.3\.0 · came with Ouroboros /);
@@ -322,4 +322,15 @@ test('made here means created on this computer without an install record', () =>
     assert.equal(isMadeHere(row('zoom_meeting')), true);
     assert.equal(isMadeHere(row('weather')), false);
     assert.equal(isMadeHere(row('telegram')), false);
+});
+
+test('skill titles prefer the optional title, then connector label, then canonical id', () => {
+    const connector = { connects: ['Mail'], contributes: [{ provides: 'place', label: 'Mailbox' }] };
+    for (const [fields, expected] of [[{ ...connector, title: 'Email tools' }, 'Email tools'],
+        [connector, 'Mailbox'], [{ connects: ['Mail'] }, 'demo'], [{}, 'demo']]) {
+        const html = renderInstalledSkillCard(skill(fields));
+        assert.ok(html.includes(`<span data-i18n-authored>${expected}</span>`));
+        assert.match(html, /data-skill="demo"/);
+        assert.match(html, /skills-detail-label">ID<\/span><span class="skills-detail-value"><code data-i18n-authored>demo<\/code><\/span>/);
+    }
 });

@@ -189,7 +189,7 @@ def test_ordinary_terminal_audit_publishes_locators_without_reading_any_payload(
         observation = row["terminal_observation"]
         assert observation["source_read"]["arguments"]["task_id"] == "kid"
         assert observation["complete"] is True and observation["content_kind"] == "terminal_observation"
-        assert "read" not in observation
+        assert "read" not in observation, "the stored receipt keeps its original immutable shape"
         assert not {"accounting", "patch", "answer_preview", "engine_continuity", "gaps"} & set(row)
     assert rows["run-out"]["staged_output"]["complete"] is True
 

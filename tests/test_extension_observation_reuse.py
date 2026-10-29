@@ -66,6 +66,8 @@ def _read_counts(monkeypatch):
     def text(path, *args, **kwargs):
         if path.name in {"SKILL.md", "skill.json"}:
             counts["manifest_text"] += 1
+        elif path.name == "enabled.json":
+            counts["enabled"] += 1
         return real_text(path, *args, **kwargs)
 
     def parse(*args, **kwargs):
@@ -93,6 +95,9 @@ def test_dispatch_reuses_locations_but_keeps_each_fresh_state_read(
     supervisor = SimpleNamespace(stop_skill=lambda name: None, snapshot=lambda: {})
     monkeypatch.setattr(loader, "get_global_supervisor", lambda: supervisor if supervisor_present else None)
     dispatch = _consumer(live_route, surface, monkeypatch)
+    on = 2  # harmless enabled peers: their manifests stay fresh reads in every observation
+    for index in range(on):
+        skill_loader.save_enabled(live_route["drive_root"], f"peer_{index:02d}", True)
     counts = _read_counts(monkeypatch)
     observations = 1 if surface == "http" else 3 if surface == "ws" and supervisor_present else 2
     for peers in (12, 60):
@@ -103,10 +108,13 @@ def test_dispatch_reuses_locations_but_keeps_each_fresh_state_read(
                 skill_loader.save_enabled(live_route["drive_root"], f"peer_{index:02d}", False)
         counts.clear()
         assert dispatch()
+        # Every peer's enablement and the subject are read fresh per observation; an OFF
+        # peer's manifest is neither read nor parsed, since an OFF peer cannot conflict.
         assert counts == {
             "locations": observations,
-            "manifest_text": observations * (peers + 2),
-            "peer_parse": observations * (peers + 1),
+            "enabled": observations * (peers + 1),
+            "manifest_text": observations * (on + 1),
+            "peer_parse": observations * on,
             "hash:fresh_ext": observations,
         }, (surface, supervisor_present, peers, counts)
 
@@ -129,13 +137,13 @@ def test_schema_enumeration_checks_a_skill_once_and_reads_again_next_time(live_r
         names = {row["function"]["name"] for row in registry.schemas()}
         assert {key for key in _tools if key.startswith(name)} <= names
         assert counts["locations"] == 1
-        assert counts["peer_parse"] == 13
+        assert counts["enabled"] == 13 and counts["peer_parse"] == 0  # twelve OFF peers, read fresh
         assert counts["hash:fresh_ext"] == 1
     skill_loader.save_enabled(live_route["drive_root"], "fresh_ext", False)
     counts.clear()
     assert not any(row["function"]["name"].startswith(name) for row in registry.schemas())
     assert counts["locations"] == 1
-    assert counts["peer_parse"] == 13
+    assert counts["enabled"] == 13 and counts["peer_parse"] == 0
 
 
 @pytest.mark.parametrize("surface", ["http", "ws", "tool"])

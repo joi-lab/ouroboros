@@ -227,17 +227,17 @@ def test_enabled_server_with_no_tools_surfaces_capability_omission(registry):
     assert "svc" in server_ids
 
 
-def test_list_non_core_tools_empty_when_mcp_is_already_initial(registry):
+def test_list_non_core_tools_names_an_unpinned_server_and_not_a_pinned_one(registry):
     fake = _FakeTransport(
         [{"name": "ping", "description": "Ping", "input_schema": {"type": "object", "properties": {}}}]
     )
     _wire_singleton(fake)
     mcp_client.reconfigure_from_settings(_settings(_good_server(id="svc")))
     mcp_client.get_manager().refresh_server("svc")
+    assert "mcp_svc__ping" in [item["name"] for item in list_non_core_tools(registry)]  # on demand (#2332)
 
-    entries = list_non_core_tools(registry)
-    names = [item["name"] for item in entries]
-    assert "mcp_svc__ping" not in names
+    mcp_client.reconfigure_from_settings(_settings(_good_server(id="svc", schemas_at_start=True)))
+    assert "mcp_svc__ping" not in [item["name"] for item in list_non_core_tools(registry)]
 
 
 def test_get_schema_by_name_returns_mcp_tool(registry):

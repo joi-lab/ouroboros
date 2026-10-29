@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import pathlib
 from typing import Any, Dict, List, Optional, Tuple
@@ -530,8 +531,9 @@ def _load_local_image_payload(ctx: ToolContext, file_path: str, *, retain_origin
     if retain_original:
         # Retain the admitted bytes BEFORE decoding/conversion, even on refusal.
         from ouroboros.image_preparation import retain_original as retain
+        from ouroboros.tool_access import canonical_data_root
         try:
-            source_path = str(retain(pathlib.Path(ctx.drive_root) / "uploads" / "views", raw, fp.name))
+            source_path = str(retain(canonical_data_root(ctx) / "uploads" / "views", raw, fp.name))
         except OSError:
             log.warning("Could not retain image original; source stays at %s", fp, exc_info=True)
     from ouroboros.image_preparation import image_mime
@@ -539,6 +541,7 @@ def _load_local_image_payload(ctx: ToolContext, file_path: str, *, retain_origin
         payload = _image_payload_from_bytes(raw, image_mime(raw))
         if retain_original:
             payload["source_path"] = source_path
+            payload["source_sha256"] = hashlib.sha256(raw).hexdigest()
         return payload, ""
     except _ProviderCapExceeded as e:
         return None, _refuse(ctx, f"{e}. Original: {source_path}", code="VLM_ERROR")
@@ -635,7 +638,8 @@ def _emit_usage(ctx: ToolContext, usage: Dict[str, Any], model: str) -> None:
         log.debug("Failed to emit VLM usage event", exc_info=True)
 
 
-def attach_local_image_to_context(ctx: ToolContext, path: str, *, stamp: Any = None) -> Tuple[bool, str]:
+def attach_local_image_to_context(ctx: ToolContext, path: str, *, stamp: Any = None,
+                                  observation: Optional[dict] = None) -> Tuple[bool, str]:
     """Attach a LOCAL image file to the active conversation as a native image block.
 
     The single implementation behind BOTH the agent-called ``view_image`` tool and
@@ -660,6 +664,8 @@ def attach_local_image_to_context(ctx: ToolContext, path: str, *, stamp: Any = N
 
     src_name = pathlib.Path(path).name
     source_path = payload["source_path"]
+    if observation is not None:
+        observation.update(source_path=source_path, source_sha256=payload["source_sha256"])
     caption = f"[image: {src_name}; original: {source_path}" + (f"; {payload['note']}]" if payload.get("note") else "]")
     from ouroboros.loop import _append_or_merge_user_content
 
@@ -670,6 +676,7 @@ def attach_local_image_to_context(ctx: ToolContext, path: str, *, stamp: Any = N
             "image_url": {"url": f"data:{mime};base64,{b64}"},
             "_caption": caption,
             "_source_path": source_path,
+            "_source_sha256": payload["source_sha256"],
         },
     ], stamp=stamp or ctx)  # a batch eviction of sent images names its origin on the live slot
     return True, (
@@ -692,7 +699,11 @@ def _view_image(ctx: ToolContext, path: str = "") -> str:
     (no URL / no base64), same trust boundary as read_file. Prefer this over
     vlm_query when you need to reason about the image yourself (charts, renders,
     screenshots, photos, scanned/printed text)."""
-    _ok, message = attach_local_image_to_context(ctx, path)
+    observation = {}
+    ok, message = attach_local_image_to_context(ctx, path, observation=observation)
+    if ok:
+        return _publish_tool_result(ctx, ToolResult(status="ok", code="OK", text=message,
+                                    meta={"image_attachment": {"status": "attached", **observation}}))
     return message
 
 
@@ -703,7 +714,7 @@ def get_tools() -> List[ToolEntry]:
             schema={
                 "name": "analyze_screenshot",
                 "description": (
-                    "Analyze the last browser screenshot using a Vision LLM. "
+                    "Ask a vision model, in a separate call, about this task's last browser screenshot. "
                     "Must call browse_page(output='screenshot') or browser_action(action='screenshot') first. "
                     "Returns a text description and analysis of the screenshot. "
                     "Use this to verify UI, check for visual errors, or understand page layout. "
@@ -736,7 +747,7 @@ def get_tools() -> List[ToolEntry]:
             schema={
                 "name": "vlm_query",
                 "description": (
-                    "Analyze any image using a Vision LLM. "
+                    "Ask a vision model, in a separate call, to analyze one image (not your own native view; see view_image). "
                     "Provide one of: file_path (local file, preferred — avoids large base64 in arguments), "
                     "image_url (public URL), or image_base64 (base64-encoded PNG/JPEG). "
                     "Use file_path for files already on disk (e.g. data/uploads/ attachments). "

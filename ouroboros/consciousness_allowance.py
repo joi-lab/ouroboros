@@ -11,8 +11,10 @@ root's rows) names a consciousness root; the window is then every money row
 ``usage_baseline_group`` aggregate or a ``legacy_*`` row) under one of those
 roots whose transition timestamp lies in the last 24 h, open rows included,
 reduced by the ONE money reducer ``_usage_rows._summary``. Both selections are
-addressed (the ``(category, ts_last)`` and ``root_task_id`` indexes), so the
-answer never depends on unrelated history. ``settled_usd`` — the KNOWN spend,
+addressed ranges (the ``(category, ts_last_epoch)`` and ``(root_task_id,
+ts_last_epoch)`` indexes), so the tick that admits a wake reads the same rows
+with a day of usage history or a month, and a root still at work is read for its
+last day, never its whole life. ``settled_usd`` — the KNOWN spend,
 confirmed prices and disclosed estimates — is the number that decides (owner
 Q4-A, #1487), the same rule as every other money limit: a reservation or the
 upper bound of an unresolved call is shown beside it as ``accounted_usd``
@@ -46,7 +48,7 @@ _MONEY_KIND = "COALESCE(NULLIF(kind, ''), 'attempt') IN ('attempt', 'subscriptio
 
 
 def _window_rows(txn: Any, now_ts: float) -> tuple:
-    """(roots, their 24 h money rows, root causes), with addressed selections."""
+    """(roots, their 24 h money rows captured per root for ``decode_attempts``, root causes), addressed selections."""
     discovered = list(txn.conn.execute(
         "SELECT DISTINCT root_task_id, category, json_extract(extra, '$.consciousness_cause') AS cause "
         "FROM attempts WHERE category IN ('consciousness', 'consciousness_task') "
@@ -55,10 +57,8 @@ def _window_rows(txn: Any, now_ts: float) -> tuple:
                 for record in discovered}
     causes = {root: root_cause(txn, root) or fallback for root, fallback in defaults.items()}
     roots = sorted(causes)
-    rows: list = []
-    for root in roots:
-        rows.extend(txn.attempts(f"root_task_id = ? AND ts_last_epoch >= ? AND {_MONEY_KIND}",
-                                 (root, now_ts - WINDOW_SEC)))
+    rows = [txn.attempt_rows(f"root_task_id = ? AND ts_last_epoch >= ? AND {_MONEY_KIND}", (root, now_ts - WINDOW_SEC))
+            for root in roots]  # captured here, decoded after the read closed (``allowance_window``)
     return roots, rows, causes
 
 
@@ -76,8 +76,9 @@ def allowance_window(
     try:
         root = _drive_root(drive_root)
         with usage_store.read(root, allow_stale=allow_stale) as txn:
-            roots, rows, root_causes = _window_rows(txn, now_ts)
-            degraded = usage_store.integrity_degraded(root)
+            roots, captured, root_causes = _window_rows(txn, now_ts)
+        degraded = usage_store.integrity_degraded(root)
+        rows = [row for part in captured for row in usage_store.decode_attempts(part)]
     except Exception as exc:  # noqa: BLE001 — every read failure is the one typed outcome
         return {"status": STATUS_UNKNOWN, "error": f"{type(exc).__name__}: {exc}",
                 "limit_usd": limit, "settled_usd": None, "accounted_usd": None, "remaining_usd": None,

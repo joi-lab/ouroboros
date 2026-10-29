@@ -461,11 +461,13 @@ def light_cognitive_or_root_redirect(tool_name: str, args: dict[str, Any]) -> st
             parts = pathlib.PurePosixPath(str(path_text or "").replace("\\", "/")).parts
             if len(parts) >= 2 and parts[0].lower() == "memory":
                 area = parts[1].lower()
-                if area.startswith("identity") or area.startswith("scratchpad") or area == "knowledge":
+                if (area.startswith("identity") or area.startswith("scratchpad") or area == "knowledge"
+                        or area == "world.md"):
                     return (
                         "⚠️ COGNITIVE_TOOL_REQUIRED: cognitive memory is not written via "
                         f"{tool_name!r}. Use the dedicated first-class tools (always available in "
-                        "light mode): update_identity for memory/identity.md, update_scratchpad for "
+                        "light mode): update_identity for memory/identity.md, update_world for "
+                        "memory/WORLD.md, update_scratchpad for "
                         "memory/scratchpad.md, knowledge_write for memory/knowledge/<topic>.md. They "
                         "apply the correct structure (journaling, timestamped blocks, index "
                         "maintenance). Read the current state before writing (Bible P12)."

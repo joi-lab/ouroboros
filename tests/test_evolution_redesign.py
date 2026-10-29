@@ -850,7 +850,8 @@ def test_evolution_restart_uses_local_commit_not_origin_and_blocks_dirty_tree(tm
 
     result = _request_restart(ctx, "   ")
 
-    assert "Restart requested" in result
+    assert result.startswith("RESTART_UNCONFIRMED:"), "the diagnostic marker is not a supervisor ACK"
+    assert ctx.pending_events[-1]["phase"] == "intent"
     marker = json.loads((tmp_path / "state" / "pending_restart_verify.json").read_text())
     assert marker["reason"] == "agent_requested_restart"
     assert ctx.pending_restart_is_evolution is True

@@ -114,7 +114,7 @@ def add_last_task(q, schedule_id, task_id):
 
 def test_held_store_defers_the_pass_while_unrelated_queue_consumers_finish(q, monkeypatch):
     """Probe01 reversed: the held store no longer holds Q; nothing durable changes until release."""
-    from supervisor import schedule_occurrence as occurrences
+    from ouroboros import task_results
 
     seed_history(q)
     _row(q, "admitted", intent={"kind": "system_repo"})
@@ -124,12 +124,13 @@ def test_held_store_defers_the_pass_while_unrelated_queue_consumers_finish(q, mo
     _row(q, "due", intent={"kind": "system_repo"})
     add_last_task(q, "due", "old-0")  # an enabled legacy row: its binding repair reads the store
     before, audits = table_bytes(q), len(events(q.root))
-    entered, real_read, consumers = threading.Event(), occurrences._read_back, []
+    entered, real_read, consumers = threading.Event(), task_results.load_task_result, []
 
-    def read(task_id, **kwargs):  # the barrier: the pass is inside a Q-held store read
-        if q.queue._queue_lock._is_owned():
+    def read(root, task_id, **kwargs):
+        if kwargs.get("signed"):  # the pass reached its off-Q receipt preparation
+            assert not q.queue._queue_lock._is_owned()
             entered.set()
-        return real_read(task_id, **kwargs)
+        return real_read(root, task_id, **kwargs)
 
     def unrelated():
         consumers.append(q.queue.enqueue_task({"id": "unrelated", "type": "task", "chat_id": 0,
@@ -137,10 +138,10 @@ def test_held_store_defers_the_pass_while_unrelated_queue_consumers_finish(q, mo
                                               restoring_snapshot=True))
         consumers.append(q.queue.persist_queue_snapshot(reason="audit05_consumer"))
 
-    monkeypatch.setattr(occurrences, "_read_back", read)
+    monkeypatch.setattr(task_results, "load_task_result", read)
     with held_store(q.root):
         scheduler, scheduled, errors = run_off_thread(automatic_pass, "audit05-schedule")
-        assert entered.wait(5), "the pass never reached its Q-held store read"
+        assert entered.wait(5), "the pass never prepared its receipt reads"
         competitor, competed, competitor_errors = run_off_thread(unrelated, "audit05-enqueue")
         assert scheduled.wait(5) and competed.wait(5), "a held store must delay neither the pass nor Q readers"
         assert not errors and not competitor_errors, (errors, competitor_errors)
@@ -148,7 +149,7 @@ def test_held_store_defers_the_pass_while_unrelated_queue_consumers_finish(q, mo
         assert table_bytes(q) == before and len(events(q.root)) == audits
         rows = _rows(q)
         assert not rows["due"].get("occurrence") and not rows["admitted"].get("hold")
-    monkeypatch.setattr(occurrences, "_read_back", real_read)
+    monkeypatch.setattr(task_results, "load_task_result", real_read)
     automatic_pass()  # released: the same occurrence republishes, the due row claims and admits once
     ids = [task["id"] for task in q.pending]
     assert ids.count(admitted["id"]) == 1 and len(ids) == 3
@@ -284,7 +285,7 @@ def test_contention_after_preparation_forks_once_and_admits_once(q, tmp_path, mo
     _project(q, folder=folder)
     _row(q, "s1", intent={"kind": "explicit_resource", "root": str(folder)}, project_id="proj")
     forks = count_forks(monkeypatch)
-    real_prepare, real_write, real_read = occurrences.prepare, task_results.write_task_result, occurrences._read_back
+    real_prepare, real_write = occurrences.prepare, task_results.write_task_result
     holder = contextlib.ExitStack()
     armed = [True]
 
@@ -299,17 +300,16 @@ def test_contention_after_preparation_forks_once_and_admits_once(q, tmp_path, mo
         if armed[0] and arm == "rolled_back" and fields.get("schedule_admission"):
             armed[0] = False
             holder.enter_context(held_store(q.root))
-        return real_write(root, task_id, status, **fields)
-
-    def read(task_id, **kwargs):
-        if armed[0] and arm == "committed_unread" and kwargs == {} and real_read(task_id).get("schedule_admission"):
+        stored = real_write(root, task_id, status, **fields)
+        if armed[0] and arm == "committed_unread" and fields.get("schedule_admission"):
             armed[0] = False
-            holder.enter_context(held_store(q.root))
-        return real_read(task_id, **kwargs)
+            # The commit stands, but its acknowledgement was lost. No readback is
+            # needed on success; this unknown outcome still reconciles next pass.
+            raise store.StoreBusy("committed receipt reply unavailable", reason="contention")
+        return stored
 
     monkeypatch.setattr(occurrences, "prepare", prepare)
     monkeypatch.setattr(task_results, "write_task_result", write)
-    monkeypatch.setattr(occurrences, "_read_back", read)
     with holder:
         with pytest.raises(queue_schedules.ScheduleLockTimeout) if arm == "table_held" else contextlib.nullcontext():
             automatic_pass()
@@ -444,9 +444,11 @@ def test_the_offloop_duty_never_holds_the_tick_and_runs_single_flight(q, monkeyp
         assert release.wait(5)
 
     monkeypatch.setattr(queue_schedules, "check_scheduled_tasks", slow_pass)
-    # Other cadences are not due in this tick: only the schedule duty starts.
+    # Other cadences are not due in this tick: only the schedule duty starts. The maintenance child is owed on a
+    # process's first look, so without this its thread would outlive the test whenever this test runs first.
     monkeypatch.setattr(server_maintenance, "_LAST_CANCEL_INTENT_SWEEP", [time.time()])
     monkeypatch.setattr(server_maintenance, "_LAST_COLD_CUSTODY_SWEEP", [time.time()])
+    monkeypatch.setattr(server_maintenance, "_tick_maintenance_child", lambda: None)
     stop_event = threading.Event()
     stamps = [time.time(), time.time()]
     try:

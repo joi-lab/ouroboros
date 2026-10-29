@@ -223,14 +223,14 @@ def test_models_auto_does_not_borrow_largest_context_or_processing_modes(account
     page, row, _, field, account = editor(ui, "Models")
     row.locator("summary").click()
     note = row.locator("[data-model-context-note]")
-    page.wait_for_function("() => document.querySelector('[data-model-role=main] [data-model-context-note]').textContent.includes('272,000')")
+    assert "272,000" not in note.inner_text()  # Window authority comes from the server preview, not this catalog.
     assert "Fast is not advertised" in row.locator("[data-processing-capability]").inner_text()
     account.select_option("")
     assert {"catalog-only-a", "catalog-only-b"} <= set(suggestions(page, field, {"catalog-shared", "catalog-only-a", "catalog-only-b"}))
-    assert "not known" in note.inner_text()
+    assert "unknown" in note.inner_text() or "not known" in note.inner_text()
     assert "1,000,000" not in note.inner_text()
     account.select_option("work")
-    page.wait_for_function("() => document.querySelector('[data-model-role=main] [data-model-context-note]').textContent.includes('1,000,000')")
+    assert "1,000,000" not in note.inner_text()
     assert row.locator("[data-processing-capability]").inner_text() == ""
     assert field.input_value() == "catalog-shared"
     roles.capture(page, "account-catalog-exact-context-processing")

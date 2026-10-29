@@ -508,9 +508,10 @@ def test_the_export_writes_the_whole_document_once_fields_live_in_rows(tmp_path)
         body = json.loads(txn.body_text("done1"))
         assert body["launch_handoffs"] == {} and body["model_waits"] == {}  # the keys keep their place, emptied
         assert txn.handoffs("done1") == {"launch_handoffs": {"op1": claim}, "model_waits": {},
-                                         "retired_model_consumers": {}}
+                                         "retired_model_consumers": {}, "swarm_fanouts": {}}
         assert txn.load("done1")["launch_handoffs"] == {"op1": claim}
         assert "retired_model_consumers" not in txn.load("done1")  # a key the file lacked stays absent
+        assert "swarm_fanouts" not in txn.load("done1")
     for task_id in ("root1", "child1", "done1"):
         task_result_path(root, task_id).unlink()
     export_facts(root)

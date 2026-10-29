@@ -99,6 +99,8 @@ def save_view(path: Path, drive: Any, task_id: str, view: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(path, data)
         view["_base"] = deepcopy({key: value for key, value in view.items() if key != "_base"})
+    from ouroboros.maintenance_retirement import artifact_changed
+    artifact_changed(path.parent.parent.parent)
 
 
 def merge_cursor(current: dict, before: dict, after: dict) -> dict:

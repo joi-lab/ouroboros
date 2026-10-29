@@ -9,6 +9,7 @@ import pytest
 from ouroboros import budget_pause, owner_pause, owner_wait
 from ouroboros.control_actor import mind_control
 from ouroboros.task_results import load_task_result, write_task_result
+from ouroboros.tool_custody import owner_proof
 from supervisor import owner_pause_control as control
 from supervisor.events_budget import install_exact_budget_pause
 from tests._budget_pause_exact_helpers import _install_queue, _loop_ctx
@@ -100,12 +101,13 @@ def _model_recipients(root, monkeypatch, *, ended):
 
     monkeypatch.setenv("TOTAL_BUDGET", "1000")
     pid, birth = _dead_process_identity() if ended else (os.getpid(), platform_layer.process_start_time(os.getpid()))
+    proof = {} if ended else {"local_answer_owner_proof": owner_proof()}  # this live image's session
     for _ in range(4):
         receiver = model_wait.TaskModelWait(task={"id": "child-run", "_attempt": 1}, drive_root=root,
                                             event_queue=None, worker_slot_held=True)
         monkeypatch.setattr(receiver, "bind_answer_consumer", lambda receiver=receiver: {
             "local_answer_consumer_id": receiver.answer_consumer_id, "local_answer_owner_pid": pid,
-            "local_answer_owner_birth": birth, "local_answer_task_attempt": 1})
+            "local_answer_owner_birth": birth, "local_answer_task_attempt": 1, **proof})
         with ua.usage_scope(ua.UsageScope(drive_root=root, task_id="child-run", root_task_id="root-1")):
             with model_wait.operation_wait_scope(receiver):
                 attempt = ua.reserve_attempt(ua.AttemptRequest(model="m", provider="t", reservation_usd=.2))
@@ -139,7 +141,8 @@ def test_c1_four_bound_model_receivers_are_unknown_until_addressed_resume(tmp_pa
     else:
         assert result["error"] == "owner_pause_effects_unsettled"
         assert len([b for b in result["blockers"] if b["kind"] == "model_handoff"]) == 4
-        assert "a model request has no recorded result" in result["message"]
+        assert "a model answer for task child-run is awaited by a live worker" in result["message"]
+        assert "acceptable_unknown" not in result, "a live receiver is never offered to go on past"
     assert ua.read_usage_records(tmp_path, final_only=False) == before, "repair cannot re-execute or settle unknown cost"
 
 
@@ -157,7 +160,8 @@ def test_c1_warm_author_and_completed_child_custody(tmp_path, monkeypatch, recip
             os.getpid(), platform_layer.process_start_time(os.getpid()))
         write_task_result(tmp_path, "child-run", "completed", launch_handoffs={"verify": {
             "tool": "verify_and_record", "task_id": "child-run", "root_task_id": "root-1", "state": "claimed",
-            "local_owner": {"pid": pid, "process_birth": birth, "task_attempt": 1}}})
+            "local_owner": {"pid": pid, "process_birth": birth, "task_attempt": 1},
+            **({"owner_proof": owner_proof()} if recipient == "live" else {})}})
     assert control.request_owner_pause("root-1", request_id="pause-c")["ok"]
     # Already-launched reviews have completed; the retained author stack executes nothing.
     for event, extra in ((delegate_custody.STARTED, {}), (delegate_custody.SETTLED, {"state": "succeeded"})):
@@ -182,5 +186,7 @@ def test_c1_warm_author_and_completed_child_custody(tmp_path, monkeypatch, recip
     elif recipient == "live":
         assert result["error"] == "owner_pause_effects_unsettled"
         assert any(b["kind"] == "tool_handoff" and b["task_id"] == "child-run" for b in result["blockers"])
-        assert "has not returned" in result["message"]
+        # The live recipient is worded by what is known, never as a call that «has not returned».
+        assert "verify_and_record call of task child-run is in a live worker" in result["message"]
+        assert "has not returned" not in result["message"]
     assert all(t["id"] != "child-run" for t in workers.PENDING), "Resume never restarts the completed author"

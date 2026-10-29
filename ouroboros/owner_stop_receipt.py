@@ -130,7 +130,7 @@ def retained_run_facts(root: Any, row: Any) -> dict:
         "accounting": {
         "settled": bool(row.settled), "ledger_recorded": bool(row.ledger_recorded),
         "cost_usd": row.cost_usd if row.spend_disclosed else None,
-        "cost_final": bool(row.spend_disclosed and not row.spend_estimated)},
+        "cost_final": bool(row.spend_disclosed and not row.spend_estimated and not row.cost_partial)},
         "patch": {"captured": bool(row.patch_captured),
                   "disposition": row.patch_disposed or "not_recorded",
                   "apply_pending": bool(row.patch_apply_pending)},
@@ -522,8 +522,13 @@ def _run_line(row: dict) -> str:
     return "; ".join(parts)
 
 
-def _prompt_run(row: dict) -> str:
+def _prompt_run(row: dict, reader_task_id: str = "", publisher_task_id: str = "") -> str:
     """Bound a run's presentation, naming exactly what the full source keeps."""
+    from ouroboros.delegate_output import project_output_readers
+
+    publisher = str(row.get("owner_task_id") or publisher_task_id or "")
+    own = bool(reader_task_id and publisher == reader_task_id)
+    row = project_output_readers(row, publisher)
     facts = {key: row[key] for key in ("staged_output", "other_staged_outputs", "terminal_observation", "other_terminal_observations",
                                      "engine_locator", "engine_continuity", "patch") if key in row}
     text = _run_line(row)
@@ -531,6 +536,21 @@ def _prompt_run(row: dict) -> str:
         text += "\n  Output excerpt (the run's own words): " + row["answer_preview"]
         if row.get("answer_preview_omitted_chars"):
             text += f" … ({row['answer_preview_omitted_chars']} preview characters omitted)"
+    # The actionable reader precedes the potentially large fact block, so the
+    # display bound cannot leave only an inaccessible staging-file recipe.
+    for key in ("staged_output", "terminal_observation", "other_staged_outputs", "other_terminal_observations"):
+        refs = row.get(key)
+        for ref in refs if isinstance(refs, list) else [refs]:
+            reader = ((ref.get("direct_read") if own else None) or ref.get("source_read")
+                      if isinstance(ref, dict) else None)
+            if isinstance(reader, dict):
+                label = ("Read retained source to EOF with read_file: " if reader.get("tool") == "read_file" else
+                         "Read retained source (metadata, then source_start_char/source_end_char): ")
+                text = label + json.dumps(reader) + "\n  " + text
+                break
+        else:
+            continue
+        break
     if facts:
         text += "\n  Material facts: " + json.dumps(facts, ensure_ascii=False, sort_keys=True)
     limit = 1800
@@ -560,7 +580,8 @@ def receipt_text(audit: Mapping[str, Any], *, prompt: bool = False, owner_row: b
             rows.append("Root delegated custody could not be verified.")
         rows.extend(f"{receipt.get('task_id')}: {label} {item}" for label, item in _unconfirmed(audit))
     for run in _rows(receipt.get("runs")):
-        rows.append(_prompt_run(run) if prompt else _run_line(run))
+        rows.append(_prompt_run(run, str(receipt.get("task_id") or ""), str(receipt.get("task_id") or ""))
+                    if prompt else _run_line(run))
     for child in _rows(receipt.get("children")):
         tid = child.get("task_id")
         row = f"{tid} ({child.get('status') or 'unknown'}): "
@@ -579,7 +600,8 @@ def receipt_text(audit: Mapping[str, Any], *, prompt: bool = False, owner_row: b
             rows.append(f"{tid}: delegated custody unknown")
         rows.extend(f"{tid}: {label} {item}" for label, item in _unconfirmed(custody))
         for run in _rows(custody.get("terminal_runs")):
-            rows.append(f"{tid} / " + (_prompt_run(run) if prompt else _run_line(run)))
+            rows.append(f"{tid} / " + (_prompt_run(run, str(receipt.get("task_id") or ""), str(tid or ""))
+                                      if prompt else _run_line(run)))
     if not rows:
         return ""
     title = "[CHILD_RESULTS] Retained work at Wrap up:" if prompt else "Retained work at Wrap up:"

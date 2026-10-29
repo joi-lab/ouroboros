@@ -64,7 +64,8 @@ def test_foreign_obligations_share_one_line_with_a_readable_exact_list(tmp_path,
     assert "DELEGATED RESULT NEVER READ" not in text and "DELEGATED PATCH AWAITS DISPOSITION" not in text
     assert "integrate_delegated_patch(run_id='run-p'" not in text
     assert "after it ends, a live top-level task may reject from any root" in rows[0]
-    assert "apply from the recorded target or a fresh payload binding" in rows[0]
+    assert "apply to the original target when location and current write rights permit" in rows[0]
+    assert "payloads need a fresh binding" in rows[0]
     assert "read_file" not in text
 
 
@@ -144,8 +145,8 @@ def test_one_custody_read_per_health_invariant_build(tmp_path, monkeypatch):
 # The recovery root's prompt carried sixteen near-identical abstract rows: the
 # foreign branch keys on task identity alone, so it printed the rule even where
 # the run's recorded target WAS that reader's own active root. `active_root` is
-# threaded from the call site (the module has no ctx) and answered with the same
-# predicate the apply gate asks, so the two can never disagree.
+# threaded from the call site (the module has no ctx); 'yours' keeps the exact-or-
+# nested relationship, not the apply gate's wider orphan geometry or write rights.
 
 
 def _foreign_patch_targeting(monkeypatch, target_root):
@@ -204,3 +205,12 @@ def test_failed_foreign_list_retention_discloses_the_gap_and_keeps_the_list(tmp_
     text = context_health.build_health_invariants(_env(tmp_path), task_id="task-other")
     assert "retention unavailable; exact list:" in text
     assert '"task-owner"' in text and '"run-u"' in text and '"run-p"' in text
+
+
+def test_sibling_host_targets_are_not_mislabelled_as_this_readers_own_folder(tmp_path, monkeypatch):
+    projects_root = tmp_path / "projects"
+    target, active = projects_root / "A", projects_root / "B"
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROJECTS_ROOT", str(projects_root))
+    _foreign_patch_targeting(monkeypatch, target)
+    text = context_health.build_health_invariants(_env(tmp_path), task_id="other", active_root=str(active))
+    assert _foreign_source(tmp_path, text)["task-owner"]["yours"] == []

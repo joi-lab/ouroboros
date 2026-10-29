@@ -164,7 +164,7 @@ test('before the installed listing is read, the catalog\'s own join says install
 test('a card: name opens the sheet, Official only on endorsed entries, unknown popularity is said, categories under All', () => {
     const labels = new Map(CATALOG.categories.map((cat) => [cat.id, cat.label]));
     const weather = renderBrowseCard(item('ouroboros/weather'), { state: { status: 'S', action: 'A' }, categoryLabels: labels });
-    assert.match(weather, /data-browse-action="open" data-item="ouroboros\/weather">weather/);
+    assert.match(weather, /data-browse-action="open" data-item="ouroboros\/weather"><span data-i18n-authored>weather/);
     assert.match(weather, /data-official-mark/);
     assert.match(weather, />▲ 25 votes</);
     assert.match(weather, /<span class="ui-chip skills-chip" data-tone="neutral">City &amp; services<\/span>/);
@@ -204,4 +204,16 @@ test('a skill that writes into your chat without a place says its messages count
     assert.match(renderBrowseCard(bridge, { state: browseCardState(bridge) }), /<div class="skills-card-facts">Messages from here count as yours<\/div>/);
     const place = { ...bridge, connects: ['A2A'] };
     assert.doesNotMatch(renderBrowseCard(place, { state: browseCardState(place) }), /count as yours/);
+});
+
+test('Browse uses the optional title or connector label while retaining its canonical id', () => {
+    const base = item('ouroboros/weather');
+    const connector = { connects: ['Mail'], contributes: [{ provides: 'place', label: 'Mailbox' }] };
+    for (const [extra, title] of [[{ ...connector, title: 'Email tools' }, 'Email tools'], [connector, 'Mailbox'], [{ connects: ['Mail'] }, 'weather'], [{}, 'weather']]) {
+        const candidate = { ...base, ...extra };
+        const html = renderBrowseCard(candidate, { source: SOURCES.get(candidate.source_id), state: browseCardState(candidate) });
+        assert.ok(html.includes(`<span data-i18n-authored>${title}</span>`));
+        assert.match(html, /skills-card-who"><span data-i18n-authored>weather<\/span>/);
+        assert.match(html, /data-item="ouroboros\/weather"/);
+    }
 });

@@ -12,6 +12,7 @@ import contextlib
 import contextvars
 import json
 import os
+import uuid
 from dataclasses import dataclass, replace as dataclass_replace
 from typing import Any, Mapping, Optional
 
@@ -171,11 +172,21 @@ def model_visible_subagent_catalog(settings: Mapping[str, Any]) -> dict[str, Any
     return {"rows": rows}
 
 
+def subagents_availability(settings: Mapping[str, Any]) -> str:
+    """Global catalog availability for the capsule; never rewrites room choices."""
+    if model_visible_subagent_catalog(settings):
+        return "available"
+    return "unsaved" if offered_subagents(settings).source in {SOURCE_UNDECIDED, SOURCE_INVALID} else "disabled"
+
+
 def current_model_visible_subagent_catalog() -> dict[str, Any]:
     """Read the current normalized settings and return the stable catalog."""
 
     from ouroboros.config import runtime_settings
+    from ouroboros.settings_integrity import effective_subagents_mode
 
+    if effective_subagents_mode() == "off":
+        return {}
     return model_visible_subagent_catalog(
         effective_runtime_subagent_settings(runtime_settings())
     )
@@ -558,6 +569,21 @@ def apply_task_start_settings_or_disclose(task_id: str, emit_live_log: Any) -> T
                      "could not be recovered."),
         )
     return previous
+
+
+SUBAGENTS_OFF_DETAIL = "Subagents are off in this chat; my human can switch the Subagents capsule."
+
+
+def _require_room_subagents() -> None:
+    from ouroboros.settings_integrity import actor_subagents_availability, live_subagents_mode
+
+    if live_subagents_mode() == "off":
+        raise SubagentSelectionError("subagents_off_in_room", SUBAGENTS_OFF_DETAIL)
+    availability = actor_subagents_availability()
+    if availability in {"disabled", "unsaved"}:
+        raise SubagentSelectionError(
+            "subagents_disabled" if availability == "disabled" else "subagent_configuration_unsaved",
+            "Subagents are off in Settings.")
 
 
 def _resolution(
@@ -1123,9 +1149,15 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
     work_order_source_request = options.pop("work_order_source_request", None)
     access = options.pop("access", None)
     try:
+        # An admitted actor's bound physical leaf and custody retries finish its
+        # existing work. An explicit selector is a new admission, even in a child.
+        if not retry_token and not (isinstance(bootstrap, dict) and compiled_work_order and not selected_id):
+            _require_room_subagents()
         if str(options.get("retry_of") or "").strip() and (
             selected_id or selected_snapshot is not None or access is not None
             or options.get("mode") is not None or options.get("override_plan_readiness") is not None
+            or options.get("workspace") is not None or options.get("attachment_paths") is not None
+            or options.get("attachment_import") is not None
         ):
             raise SubagentSelectionError(
                 "retry_selector_conflict",
@@ -1162,6 +1194,19 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
                 access = inherited_access(ctx, options["continue_from"])
             selected_snapshot = validate_subagent_snapshot(selected_snapshot, access=access)
         effort_choice = _leaf_effort_choice(ctx, selected_snapshot, effort_request, effort_choice, retry_token)
+        from ouroboros.delegate_documents import DocumentSelectionError, selection_options, task_inputs
+
+        try:  # argument refusals before the daemon is touched; the start re-reads the same rows
+            saved_intent = options.pop("_document_intent", None)
+            if selection_options(options.get("attachment_paths"), options.pop("attachment_import", None)):
+                # One explicit new intent per invocation; the work order's first start keeps its saved one,
+                # which never supersedes an input this task already imported.
+                options["_document_intent"] = str(saved_intent or uuid.uuid4().hex)
+                options["_document_first_start"] = bool(saved_intent)
+            if options.get("attachment_paths"):
+                task_inputs(ctx, options["attachment_paths"])
+        except DocumentSelectionError as exc:
+            raise SubagentSelectionError(exc.code, exc.detail) from exc
     except SubagentSelectionError as exc:
         from ouroboros.delegate_shared import _fail
 
@@ -1191,7 +1236,8 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
             _initial_bootstrap=bool(options.pop("_initial_bootstrap", False)),
             **{key: options.pop(key) for key in (
                 "directory_strategy", "scope_paths", "continue_from", "continue_carrier", "mode",
-                "override_plan_readiness", "_plan_answers") if key in options},
+                "override_plan_readiness", "_plan_answers", "workspace", "attachment_paths", "_document_intent",
+                "_document_first_start") if key in options},
         )
         # Every configured-session start lands here — the host's pre-start
         # (charter, owner 2026-08-28/29) and any model-issued retry/replacement
@@ -1332,6 +1378,16 @@ def delegate_start_entry(ctx: Any, prompt: str = "", _resolved_binding: Any = No
         bound.pop("subagent_id", None)
         if "mode" not in bound and bootstrap.get("delegated_mode"):
             bound["mode"] = bootstrap["delegated_mode"]
+        if not bootstrap.get("physical_started") and not bootstrap.get("initial_invocation_id") \
+                and bound.get("attachment_paths") is None:
+            # The parent's documents belong to this work order's first physical start, whoever makes
+            # it: after a host attempt refused unrun, or in a restored episode that started nothing.
+            # The saved choice and new-import intent come along unless this call names its own.
+            from ouroboros.delegate_documents import first_start_selection
+
+            saved = first_start_selection(bootstrap)
+            bound.update(saved if bound.get("attachment_import") is None else
+                         {key: value for key, value in saved.items() if key == "attachment_paths"})
         bound.update({
             "snapshot": dict(bootstrap.get("snapshot") or {}),
             "compiled_work_order": True,
@@ -1339,7 +1395,7 @@ def delegate_start_entry(ctx: Any, prompt: str = "", _resolved_binding: Any = No
             "_coordination_context": str(prompt or ""),
             # The dispatch's effort decision reaches the first physical start unchanged.
             "effort_fact": dict(bootstrap.get("effort_fact") or {}),
-            **{key: bootstrap[key] for key in ("directory_strategy", "scope_paths")
+            **{key: bootstrap[key] for key in ("directory_strategy", "scope_paths", "workspace")
                if key in bootstrap},
         })
         if _resolved_binding is not None:

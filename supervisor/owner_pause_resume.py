@@ -10,7 +10,8 @@ from ouroboros.utils import utc_now_iso
 from ouroboros.work_stop import release_refusal
 
 
-def resume_terminal_tree(task_id: str) -> dict | None:
+def resume_terminal_tree(task_id: str, *, gaps: list | None = None) -> dict | None:
+    """``gaps`` receives the damaged rows this Resume's tree census ties to no tree."""
     from ouroboros.owner_pause import FENCE_RELEASED, fence_closed, launch_lock, read_fence, set_fence_state
     from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
     from supervisor import queue as q
@@ -46,7 +47,7 @@ def resume_terminal_tree(task_id: str) -> dict | None:
     if refusal := release_refusal(observed_control_stop(root, row, budget=q.BUDGET_ROOT_FENCES,
                                                        owner=fence), control_actor()):
         return refusal
-    if refusal := _late_phase_refusal(q, root, task_id, row, fence):
+    if refusal := _late_phase_refusal(q, root, task_id, row, fence, gaps=gaps):
         return refusal
     with q._queue_lock:
         state = _root_resume_state(q, task_id, root)

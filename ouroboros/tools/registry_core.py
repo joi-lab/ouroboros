@@ -32,7 +32,7 @@ from ouroboros.runtime_mode_policy import (
     protected_paths_in,
     protected_write_block_message,
 )
-from ouroboros.tool_policy import name_miss_guidance, tool_namespace
+from ouroboros.tool_policy import name_miss_guidance, tool_namespace, usable_selectors
 from ouroboros.tool_capabilities import (
     ACTING_SUBAGENT_MODE,
     acting_tool_names_for_context,
@@ -41,6 +41,7 @@ from ouroboros.tool_capabilities import (
     LOCAL_READONLY_SUBAGENT_MODE,
     LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
     META_TOOL_NAMES,
+    TASK_DIAGNOSTIC_TOOL_NAMES,
 )
 from ouroboros.tool_access import (
     active_tool_profile,
@@ -140,6 +141,20 @@ _SYSTEM_INTRINSIC_REPO_MUTATION_TOOLS = frozenset({
     "stage_adaptations",
     "stage_pr_merge",
 })
+
+
+def _alias_hidden(ctx: Any, entry: ToolEntry) -> bool:
+    """Hide exact duplicate spellings only outside sealed name-bound grants.
+
+    A Presence ceiling may select the old name alone, or bind the two names
+    differently. Keep its exact schema and dispatch identity, not a renamed grant.
+    Older aliases retain their existing presentation contract.
+    """
+    if entry.name in {"vcs_commit_reviewed", "ocr_pdf"} and entry.alias_for:
+        from ouroboros.presence_authority import presence_ceiling_from_context
+
+        return presence_ceiling_from_context(ctx) is None
+    return bool(entry.alias_for)
 
 
 def _presence_tool_allowed(ctx: Any, name: str) -> bool:
@@ -315,7 +330,7 @@ class ToolRegistry:
         "project_journal", "presence",
         "recent_tasks",
         "query_code", "query_data", "review", "review_change", "search", "services", "shell", "skill_exec", "skill_publish",
-        "skill_preflight", "skill_source_tools", "subagent_integration", "task_tree", "tool_discovery", "verify", "vision",
+        "skill_preflight", "skill_source_tools", "subagent_integration", "task_tree", "tool_discovery", "vcs_read", "verify", "vision",
     ]
 
     def _load_modules(self) -> _ToolCatalog:
@@ -437,6 +452,10 @@ class ToolRegistry:
         Restoring cognition clears auto-start activity, not this eligibility.
         The private host marker binds the exception; the handler proves custody.
         """
+        from ouroboros.work_diagnostics import context_ref
+
+        if context_ref(self._ctx):
+            return name in TASK_DIAGNOSTIC_TOOL_NAMES | schema_selection_tools_for_context(self._ctx)
         if name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES | schema_selection_tools_for_context(self._ctx):
             return True
         if name != "verify_and_record" or not self._is_local_readonly_subagent():
@@ -449,6 +468,10 @@ class ToolRegistry:
         )
 
     def initial_tool_names(self) -> frozenset[str]:
+        from ouroboros.work_diagnostics import context_ref
+
+        if context_ref(self._ctx):
+            return TASK_DIAGNOSTIC_TOOL_NAMES | schema_selection_tools_for_context(self._ctx)
         if self._is_local_readonly_subagent():
             names = set(LOCAL_READONLY_SUBAGENT_TOOL_NAMES | schema_selection_tools_for_context(self._ctx))
             if self._readonly_tool_allowed("verify_and_record"):
@@ -466,7 +489,7 @@ class ToolRegistry:
         return [
             e.name
             for e in self._entries.values()
-            if not e.alias_for  # compat aliases are callable, never advertised
+            if not _alias_hidden(self._ctx, e)
             if e.name not in disabled  # declarative tool policy (task_contract.disabled_tools)
             if _presence_tool_allowed(self._ctx, e.name)
             if _builtin_tool_availability(e.name, self._ctx)[0]
@@ -507,9 +530,9 @@ class ToolRegistry:
             elif entry.name in {"browse_page", "browser_action"}:
                 schema = copy.deepcopy(entry.schema)
                 if entry.name == "browse_page":
-                    schema["description"] = "Open an HTTP(S) URL (external, or localhost on non-Ouroboros ports) or a parent-readable file:// path in a headless browser. Returns page content as text, html, markdown, or screenshot (base64 PNG) — use it with analyze_screenshot to visually verify your own built apps. The Ouroboros API ports, private/link-local IPs, and other URL schemes are blocked for subagents. Use viewport to test mobile layouts (e.g. '375x812')."
+                    schema["description"] = "Open an HTTP(S) URL (external, or localhost on non-Ouroboros ports) or a parent-readable file:// path in this task's own headless Playwright browser (not the owner's signed-in Chrome) and return its content as text, html, markdown, or screenshot (base64 PNG) — use it with analyze_screenshot to visually verify your own built apps. The Ouroboros API ports, private/link-local IPs, and other URL schemes are blocked for subagents. Use viewport to test mobile layouts (e.g. '375x812')."
                 if entry.name == "browser_action":
-                    schema["description"] = "Perform action on the current browser page (external HTTP(S), localhost on non-Ouroboros ports, or a parent-readable file:// page). Actions: click (selector), fill (selector + value), select (selector + value), screenshot (base64 PNG), scroll (value: up/down/top/bottom). JavaScript evaluate is unavailable to local-readonly subagents."
+                    schema["description"] = "Act on the page open in this task's headless browser (from browse_page: external HTTP(S), localhost on non-Ouroboros ports, or a parent-readable file:// page). Actions: click (selector), fill (selector + value), select (selector + value), screenshot (base64 PNG), scroll (value: up/down/top/bottom), wait (selector + state, without navigation). JavaScript evaluate is unavailable to local-readonly subagents."
                     props = schema.get("parameters", {}).get("properties", {})
                     action_schema = props.get("action", {})
                     if isinstance((action_enum := action_schema.get("enum")), list):
@@ -643,6 +666,10 @@ class ToolRegistry:
         ``record`` (``schemas()`` only) writes shadow collisions to the omission
         ledger; a name-miss read leaves it untouched. A loader failure raises.
         """
+        from ouroboros.work_diagnostics import context_ref
+
+        if context_ref(self._ctx):
+            return []
         from ouroboros.extension_loader import _lock as _ext_lock, _tools as _ext_tools, is_extension_live as _ext_is_live
 
         grants = self._acting_tool_grants() if self._is_acting_subagent() else None
@@ -663,6 +690,10 @@ class ToolRegistry:
 
     def _mcp_rows(self, *, record: bool) -> List[Dict[str, Any]]:
         """Current published MCP rows under the task's unchanged capability filters."""
+        from ouroboros.work_diagnostics import context_ref
+
+        if context_ref(self._ctx):
+            return []
         from ouroboros.mcp_client import ensure_configured_from_settings as _mcp_ensure_configured, get_manager as _mcp_get_manager
 
         _mcp_ensure_configured()
@@ -706,10 +737,11 @@ class ToolRegistry:
         built_in = [
             schema
             for entry in self._entries.values()
-            if not entry.alias_for  # compat aliases are callable, never advertised
+            if not _alias_hidden(self._ctx, entry)
             if entry.name not in disabled_tools  # declarative tool policy (task_contract.disabled_tools)
             if _presence_tool_allowed(self._ctx, entry.name)
             if entry.name not in unavailable_tools
+            if registry_guards._builtin_network_allowed(self._ctx, entry.name)
             if not local_readonly_subagent or self._readonly_tool_allowed(entry.name)
             if not acting_subagent or entry.name in acting_tool_names_for_context(self._ctx, self._entries)
             for schema in self._schemas_for_entry(entry)
@@ -758,13 +790,13 @@ class ToolRegistry:
         # Core tools plus meta-tools for enabling extended tools.
         result = []
         for e in self._entries.values():
-            if e.alias_for:  # compat aliases are callable, never advertised
+            if _alias_hidden(self._ctx, e):
                 continue
             if e.name in disabled_tools:  # declarative tool policy (task_contract.disabled_tools)
                 continue
             if not _presence_tool_allowed(self._ctx, e.name):
                 continue
-            if e.name in unavailable_tools:
+            if e.name in unavailable_tools or not registry_guards._builtin_network_allowed(self._ctx, e.name):
                 continue
             if local_readonly_subagent and not self._readonly_tool_allowed(e.name):
                 continue
@@ -809,7 +841,9 @@ class ToolRegistry:
             return "outside this presence task's positive capability ceiling"
         if requested not in self._entries:
             return None
-        if self._entries[requested].alias_for:
+        if not registry_guards._builtin_network_allowed(self._ctx, requested):
+            return "resource_blocked (network=false)"
+        if _alias_hidden(self._ctx, self._entries[requested]):
             # Mirrors get_schema_by_name: a compat alias is callable but never
             # advertised — discovery answers as for any non-public name.
             return None
@@ -836,11 +870,13 @@ class ToolRegistry:
         if not _presence_tool_allowed(self._ctx, requested):
             return None
         entry = self._entries.get(requested)
-        if entry and entry.alias_for:
+        if entry and _alias_hidden(self._ctx, entry):
             # Compat aliases are callable, never advertised — discovery answers
             # as it does for any non-public name.
             return None
         if entry:
+            if not registry_guards._builtin_network_allowed(self._ctx, requested):
+                return None
             available, reason, detail = _builtin_tool_availability(requested, self._ctx)
             if not available:
                 if reason:
@@ -856,6 +892,9 @@ class ToolRegistry:
             if acting_subagent and requested not in acting_tool_names_for_context(self._ctx, self._entries):
                 return None
             return self._schema_for_entry(entry)
+        from ouroboros.work_diagnostics import context_ref
+        if context_ref(self._ctx):
+            return None  # No diagnostic extension/MCP discovery, even for a schema-only request.
         try:
             from ouroboros.extension_loader import parse_extension_surface_name as _ext_parse_name
         except Exception:
@@ -899,6 +938,15 @@ class ToolRegistry:
                 return _dynamic_tool_schema(mcp_tool)
         return None
 
+    def on_demand_schema_names(self) -> frozenset:
+        """Visible MCP tools whose server the owner did not pin: their schemas start unloaded (#2332)."""
+        if not _resource_allowed(self._ctx, "network"):
+            return frozenset()
+        try:
+            return frozenset(row["name"] for row in self._mcp_rows(record=False) if not row.get("schemas_at_start"))
+        except Exception:
+            return frozenset()  # the same failure keeps MCP out of schemas(), recorded there
+
     def callable_rows(self, namespace: str = "") -> Optional[List[Dict[str, Any]]]:
         """Tools this task can dispatch now, as ``name`` rows (MCP rows add ``raw_name``).
 
@@ -909,11 +957,13 @@ class ToolRegistry:
         extension/MCP catalog could not be read (an unselected failing surface is
         left out, its failure being ``schemas()``'s recorded omission).
         """
+        from ouroboros.mcp_schema import annotation_marks
+
         disabled = _disabled_tools(self._ctx)
         rows: List[Dict[str, Any]] = [
             {"name": name} for name in self.available_tools()
             if name not in registry_guards._WEB_TOOLS or _resource_allowed(self._ctx, "web")
-            if name not in {"vcs_pull_ff", "generate_image", "list_image_models", "recover_image"} or _resource_allowed(self._ctx, "network")
+            if registry_guards._builtin_network_allowed(self._ctx, name)
         ]
         for surface in ("ext_", "mcp_"):
             if namespace and not namespace.startswith(surface) or not _resource_allowed(self._ctx, "network"):
@@ -921,7 +971,8 @@ class ToolRegistry:
             try:
                 rows += ([{"name": tool["name"]} for tool in self._extension_rows(record=False)] if surface == "ext_"
                          else [{"name": tool["name"], "raw_name": str(tool.get("raw_name") or ""),
-                                "raw_description": str(tool.get("raw_description") or "")}
+                                "raw_description": str(tool.get("raw_description") or ""),
+                                "marks": annotation_marks((tool.get("metadata") or {}).get("annotations"))}
                                for tool in self._mcp_rows(record=False)])
             except Exception:
                 if namespace:
@@ -955,7 +1006,7 @@ class ToolRegistry:
 
             identity = naming_rule_matches(requested, rows)
         guidance = name_miss_guidance(requested or name, namespace, rows, identity=identity,
-                                      discovery="list_available_tools" in self.available_tools())
+                                      discovery="list_available_tools" in usable_selectors(self))
         return _replace_tool_result(reason, text="\n".join([reason.text, *guidance]))
 
     @staticmethod

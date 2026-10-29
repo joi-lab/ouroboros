@@ -116,8 +116,10 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
     "llm_usage": _handled(
         "supervisor.events_budget", "ouroboros/agent.py",
         "ouroboros/pricing.py", "ouroboros/tools/search.py", "ouroboros/tools/vision.py",
-        "ouroboros/tools/skill_publish.py", idle_input=True, lane=TELEMETRY_LANE,
-        note="the producer's per-task endpoint stamps lineage and chat by value; "
+        "ouroboros/tools/skill_publish.py", "ouroboros/tools/review_helpers.py", idle_input=True,
+        lane=TELEMETRY_LANE,
+        note="the producer's per-task endpoint stamps lineage and chat by value (a queue-less server "
+             "review's row, put on the bus directly, carries its usage scope and its carrier's chat); "
              "the handler fills a missing field from RUNNING only as a fallback"),
     "log_event": _handled(
         "supervisor.events_worker_reports", "ouroboros/utils.py", lane=TELEMETRY_LANE,
@@ -193,6 +195,9 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
     "typing_start": _handled(
         "supervisor.events_chat_delivery", "ouroboros/agent.py", "ouroboros/model_sleep.py",
         note="a start, or the same attempt running again after a wait (``announce_resumed``)"),
+    "ui_i18n_updated": _handled(
+        "supervisor.events_worker_reports", "ouroboros/tools/control_ui_translation.py",
+        note="the memory file is already written; the host broadcasts the same-named frame to its windows"),
 
     # --- telemetry_only: recorded in the ledger, no runtime action follows -----
     "plan_task_deadline_skip": _telemetry(
@@ -223,7 +228,7 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
     # --- server_intercept -----------------------------------------------------
     "restart_request": EventDisposition(
         SERVER_INTERCEPT, "ouroboros.server_liveness",
-        ("ouroboros/agent_task_pipeline.py", "supervisor/evolution_lifecycle.py"),
+        ("ouroboros/tools/control_events.py", "ouroboros/agent_task_pipeline.py", "supervisor/evolution_lifecycle.py"),
         "restarting the process is not something the supervisor thread can do to "
         "itself, so the loop's bounded drain routes this one to the server's restart "
         "handler before dispatch",

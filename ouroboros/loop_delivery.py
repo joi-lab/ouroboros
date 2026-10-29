@@ -136,11 +136,11 @@ def _compute_subagent_handoff(tools: Any, drive_root: Any, task_id: str, content
         # Exact-hash dispositions suppress the unchanged result only: if
         # status, result, trace, or artifact identity changes, the disposition
         # goes stale and this reminder re-opens without parsing prose.
+        from ouroboros.loop_forced_finalization import HANDLED_CHILD_DISPOSITIONS
+
         children = [
             child for child in children
-            if _loop()._child_disposition_state(child) not in {
-                "integrated", "irrelevant", "deferred", "discarded", "cancelled",
-            }
+            if _loop()._child_disposition_state(child) not in HANDLED_CHILD_DISPOSITIONS
         ]
         from ouroboros.tools.join_ledger import _child_result_sha256
 
@@ -264,6 +264,9 @@ def delivery_evidence_fingerprint(
     root_task_id = str(root_task_id or metadata.get("root_task_id") or task_id)
     status_root = status_root or metadata.get("budget_drive_root") or getattr(tool_ctx, "budget_drive_root", None) or getattr(tool_ctx, "drive_root", None)
     children = _loop()._load_direct_child_results(pathlib.Path(status_root), task_id, root_task_id) if status_root and task_id else []
+    # Unclaimed host attention (#1376) is no evidence of the answer: a diagnostic that
+    # answers or is withdrawn re-arms nothing. Reading past a settled cancellation, only
+    # the author's current exact-hash claim keeps a diagnostic here.
     children = [
         {
             "task_id": str(child.get("task_id") or child.get("id") or ""),
@@ -272,6 +275,7 @@ def delivery_evidence_fingerprint(
             "disposition": _loop()._child_disposition_state(child),
         }
         for child in children
+        if _loop()._child_disposition_state({**child, "parent_decision": ""}) != "host_attention"
     ]
     receipt_root = getattr(tool_ctx, "drive_root", None) or status_root
     evidence = {
@@ -764,10 +768,41 @@ def _hold_delivery_for_skill_action(
 
 
 class _ParsedObject(dict):
-    """A parsed JSON object that remembers which of its keys were duplicated."""
+    """A parsed JSON object that remembers which of its keys were duplicated, and whether one of its
+    own pairs, a repeated key's included, is the ``delivery_control`` key or an ``action`` of exactly
+    finish/stop (``control_pair``)."""
 
     duplicate_keys: set
     has_duplicate_keys: bool
+    control_pair: bool
+
+
+def _parse_pairs(raw: str) -> Tuple[Any, bool]:
+    """One linear JSON parse whose objects are ``_ParsedObject``: ``(payload, any key duplicated)``,
+    ``(None, False)`` when the body is not JSON."""
+
+    has_duplicate_keys = False
+
+    def _unique_object(pairs: List[Tuple[str, Any]]) -> "_ParsedObject":
+        nonlocal has_duplicate_keys
+        result = _ParsedObject()
+        result.duplicate_keys = set()
+        result.control_pair = False
+        for key, value in pairs:
+            if key in result:
+                result.duplicate_keys.add(key)
+                has_duplicate_keys = True
+            result[key] = value
+            result.control_pair = result.control_pair or key == "delivery_control" or (
+                key == "action" and value in ("finish", "stop"))
+        return result
+
+    try:
+        return json.loads(raw, object_pairs_hook=_unique_object), has_duplicate_keys
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+        # RecursionError: a degenerate deeply-nested blob (repetition-loop
+        # model output) must classify as not-a-control, not crash the round.
+        return None, False
 
 
 def _parse_delivery_control_object(
@@ -781,25 +816,7 @@ def _parse_delivery_control_object(
     forced armed malformed-body rule without widening history-gated parsing.
     """
 
-    has_duplicate_keys = False
-
-    def _unique_object(pairs: List[Tuple[str, Any]]) -> "_ParsedObject":
-        nonlocal has_duplicate_keys
-        result = _ParsedObject()
-        result.duplicate_keys = set()
-        for key, value in pairs:
-            if key in result:
-                result.duplicate_keys.add(key)
-                has_duplicate_keys = True
-            result[key] = value
-        return result
-
-    try:
-        payload = json.loads(raw, object_pairs_hook=_unique_object)
-    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
-        # RecursionError: a degenerate deeply-nested blob (repetition-loop
-        # model output) must classify as not-a-control, not crash the round.
-        return None, False
+    payload, has_duplicate_keys = _parse_pairs(raw)
     if not isinstance(payload, dict):
         return None, False
     payload.has_duplicate_keys = has_duplicate_keys
@@ -904,6 +921,15 @@ def _resolve_forced_delivery_control_body(
     return candidate.full_text if retained else "", retained, True, True, False
 
 
+def _array_wrapped_control(body: str) -> bool:
+    """Whether a whole-body JSON array holds a control envelope as a DIRECT element: an object one of
+    whose own pairs is the ``delivery_control`` key or an ``action`` of exactly finish/stop, so a
+    repeated key cannot hide the verb. Never unwrapped or executed; nested data, strings quoting an
+    envelope and other verbs stay ordinary JSON."""
+    payload = _parse_pairs(body)[0] if body.startswith("[") else None
+    return isinstance(payload, list) and any(getattr(item, "control_pair", False) for item in payload)
+
+
 def _parse_delivery_control_body(
     raw: str,
 ) -> Tuple[Optional[Dict[str, Any]], bool, bool]:
@@ -912,16 +938,20 @@ def _parse_delivery_control_body(
     Returns ``(parsed, duplicate_protocol_key, embedded)``. Normalization
     strips one whole-body markdown fence (shared with
     ``observability._is_delivery_control_payload``). ``embedded`` is True only
-    when the protocol object sits as a balanced trailing JSON object carrying
-    the ``delivery_control`` key at the very END of surrounding prose — a
-    protocol attempt mixed with text, never a valid control. A control object
-    quoted MID-prose is NOT matched and stays prose (disclosed residual)."""
+    when a protocol object sits in a container other than the one exact
+    object: a balanced trailing JSON object carrying the ``delivery_control``
+    key at the very END of surrounding prose, or a direct element of a
+    whole-body JSON array (``_array_wrapped_control``) — a protocol attempt,
+    never a valid control. A control object quoted MID-prose is NOT matched and
+    stays prose (disclosed residual)."""
     from ouroboros.observability import strip_protocol_fence
 
     body = strip_protocol_fence(raw)
     parsed, duplicate_protocol_key = _parse_delivery_control_object(body)
     if duplicate_protocol_key or isinstance(parsed, dict):
         return parsed, duplicate_protocol_key, False
+    if _array_wrapped_control(body):
+        return None, False, True
     # Trailing scan: ONE O(n) string-aware pass over the body (fenced and
     # double-fenced tails peeled, duplicate keys flagged, RecursionError
     # degraded, bounded line-anchor retries after an unbalanced prose brace
@@ -974,7 +1004,7 @@ def _plan_review_only_awaited(llm_trace: Dict[str, Any]) -> bool:
 
     The finalization notice and this fact read the SAME decision, so an only-awaited
     wave keeps its loud notice and is a gap, never a degradation of the task."""
-    plan_gate = llm_trace.get("force_plan_decision")
+    plan_gate = llm_trace.get("plan_gate", llm_trace.get("force_plan_decision"))
     return isinstance(plan_gate, dict) and plan_gate.get("review_only_awaited") is True
 
 
@@ -1083,7 +1113,7 @@ def _no_tool_final_answer(
 
     stopping = (getattr(tools._ctx, "_completion_selected", None) or {}).get("action") == "stop"
     if not stopping:
-        if _loop()._enforce_swarm_actions(
+        if _loop()._enforce_plan_gate(
             str(content or ""), messages, tools, llm_trace, emit_progress,
         ):
             return held()
@@ -1165,7 +1195,7 @@ def _no_tool_final_answer(
             return held()
 
     _loop()._project_child_result_dispositions(limit_ctx, llm_trace)
-    plan_suffix = _loop()._force_plan_disclosure(tools._ctx, llm_trace)
+    plan_suffix = _loop()._plan_gate_disclosure(tools._ctx, llm_trace)
     # The forced rails already type this fact; the single degraded_reason slot below
     # cannot hold it beside an unsettled child, so the normal rail types it too.
     if plan_suffix:  # absent = not open: a clean result carries no key (pinned usage shapes)
@@ -1285,6 +1315,8 @@ def _no_tool_final_answer(
         limit_ctx.accumulated_usage["terminal_origin"] = _loop().TERMINAL_ORIGIN_MODEL_FINAL
     if getattr(candidate, "quiet", False):  # only this exit accepts a wake's silent finish
         limit_ctx.accumulated_usage.update(wake_silent=True, terminal_origin=_loop().TERMINAL_ORIGIN_MODEL_FINAL)
+    if summary := (getattr(tools._ctx, "_completion_selected", None) or {}).get("wake_summary"): limit_ctx.accumulated_usage["wake_summary"] = summary
+    if getattr(tools._ctx, "_owner_message_sent", False): limit_ctx.accumulated_usage["owner_message_sent"] = True
     from ouroboros.swarm_receipt import retain_comparison
     retain_comparison(tools._ctx)
     return _loop()._handle_text_response(str(content or ""), llm_trace, limit_ctx.accumulated_usage)

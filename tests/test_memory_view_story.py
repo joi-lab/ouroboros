@@ -11,9 +11,12 @@ fixture with three rooms besides Main and twenty rows.
 """
 from __future__ import annotations
 
+import json
 import re
+from types import SimpleNamespace
 
-from ouroboros import chat_chain
+from ouroboros import chat_chain, chronicle_store
+from ouroboros import memory_inventory as mi
 from ouroboros import memory_view as mv
 from ouroboros.chronicle_store import ChronicleStore
 from tests import _memory_inventory_shared as shared
@@ -396,3 +399,24 @@ def test_a_pages_verified_quotes_stand_under_its_text_and_a_page_without_quotes_
     assert block.split("\n")[1:3] == ["  The owner asked to go on.", f"- quote (human, {quote['address']}): next please"]
     plain_block = text.split(f"page {plain}", 1)[1].split("### ", 1)[0]
     assert "The room started." in plain_block and "- quote (" not in plain_block
+
+
+def test_a_view_without_the_story_reads_its_own_rooms_pages_alone(tmp_path, monkeypatch):
+    """A view that prints no story (a nanny's) takes its room's pages and parts from that room's records: the
+    entries the whole story gives the room, and no other room's page read."""
+    rooms = shared.world(tmp_path)
+    alpha, beta = str(rooms["alpha"]), str(rooms["beta"])
+    _page(tmp_path, alpha, 13, 13, text="Alpha's page.")
+    _part(tmp_path, "1", [_page(tmp_path, "1", 10, 11, text="Main's page."), _page(tmp_path, "1", 12, 12)])
+    _page(tmp_path, beta, 14, 14, text="Beta's page.")
+    store, label = ChronicleStore(tmp_path), mv._labeler(tmp_path)
+    units = {unit.record_id: unit for unit in mi.legacy_units(store, tmp_path)}
+    whole = mv._story_pages(store, label, units)
+    parsed, real = [], json.loads
+    monkeypatch.setattr(chronicle_store, "json", SimpleNamespace(dumps=json.dumps,
+                                                                 loads=lambda text: parsed.append(text) or real(text)))
+    for room, others in (("1", ("Alpha's page.", "Beta's page.")), (alpha, ("Main's page.", "Beta's page."))):
+        parsed.clear()
+        own = mv._story_pages(store, label, units, room)
+        assert own == [entry for entry in whole if entry["kind"] == "account" or entry["room_id"] == room] and own
+        assert not [text for text in parsed if any(other in text for other in others)]

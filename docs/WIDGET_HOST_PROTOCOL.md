@@ -6,20 +6,20 @@ A widget written for Ouroboros only works in your interface if your host keeps e
 
 ## 1. What the core gives you
 
-- **Cards:** `GET /api/widgets` returns `ui_tabs`, one `WidgetTab` per card: `key`, `skill`, `tab_id`, `title`, `icon`, `ws_prefix`, `render`, `span`, `grid_span` and `revision`.
-- **A module card's `render`:** `{kind: "module", entry, start, appearance?, height?, max_height?}`.
-  - `entry` is the file name of the reviewed script. Build its URL from the name's letters, digits, `.`, `_` and `-` only, as the builtin host does.
+- **Cards:** `GET /api/widgets` returns `ui_tabs`, one `WidgetTab` per card: `key`, `skill`, `tab_id`, `title`, `icon`, `ws_prefix`, `render`, `span`, `grid_span`, `revision` and `generation` (live skill tabs).
+- **A module card's `render`:** `{kind: "module", entry, entry_type?, assets?, start, appearance?, height?, max_height?}`.
+  - `entry` is the reviewed script: a bare filename for classic entries, a skill-relative path for ESM entries. ESM paths retain their `/` separators; segment characters are ASCII letters, digits, `.`, `_` and `-` (CREATING_SKILLS defines the bounds).
   - `start` is `auto`, `manual` or `retain` (§7).
   - `appearance` (`host`, `independent` or `fixed`) records the author's intent only. It changes nothing in the host.
   - `height` is a fixed frame height (320 to 8192 pixels). Without it the frame sizes itself (§5).
   - `max_height` lowers the self-sizing ceiling (320 to 8192, default 8192).
-- **The script:** `GET /api/extensions/{skill}/module/{entry}` answers the reviewed source as JavaScript text. It is never cached and any origin may load it. `409` means the skill has no live bundle; `404` means the file was not captured.
+- **Classic sources:** `GET /api/extensions/{skill}/module/{entry}` answers captured JavaScript text, without caching and with any-origin CORS; network authentication still applies. `409` means no live bundle, `404` no captured file. ESM uses the lease below.
 - **Change signals:**
-  - `revision` is the skill's live content hash. A card whose `revision` changed while it runs is stopped (§6) and started again.
+  - `revision` is the skill's live content hash. A card whose `revision` changed while it runs is stopped (§6) and started again. `generation` names the live publication: an `entry_type: "module"` card's file lease is bound to it, so in board and chat mounts such a card also restarts when it changes, even with unchanged bytes. Classic cards ignore it.
   - An `extension_lifecycle` WebSocket frame means "read `GET /api/widgets` again". A card that left the list is stopped.
 - **The owner's launch choice:** `GET /api/ui/preferences` returns `widget_start_mode`, keyed `"<skill>:<tab_id>"`. It overrides the card's own `start`. `POST /api/ui/preferences` with `{widget_start_mode}` saves it.
 
-Fetch the script with the owner's session, from the page. The builtin host gives up after 25 seconds and shows a retryable error.
+For a classic entry, fetch the script with the owner's session, from the page. The builtin host gives up after 25 seconds and shows a retryable error.
 
 ## 2. Building the frame
 
@@ -33,10 +33,10 @@ Create one `<iframe>` per running card with exactly these attributes:
 
 Never add `allow-same-origin`: the frame stays an opaque origin with no direct access to the page's cookies, storage or DOM. Cookie attachment to asset requests is browser-dependent; use the host fetch bridge, not a promise that passive requests are always anonymous. Never add top navigation, popups, forms or modals.
 
-Set the frame's `srcdoc` property (not an attribute string) to this document, in this order:
+Set the frame's `srcdoc` property (not an attribute string) to this document, in this order. `BASE` is empty for classic entries; `ENTRY` is the script element described below:
 
 ```html
-<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="POLICY"></head><body><div id="root"></div><script>BRIDGE</script><script>RESIZE</script><script>MODULE</script></body></html>
+<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="POLICY">BASE</head><body><div id="root"></div><script>BRIDGE</script><script>RESIZE</script>ENTRY</body></html>
 ```
 
 - **`POLICY`** is the document policy below, with `ORIGIN` the page's own origin (for example `https://ouro.example`) and `SKILL` the URL-encoded skill name. An opaque frame's `'self'` matches nothing, so the sources are absolute.
@@ -47,7 +47,57 @@ Set the frame's `srcdoc` property (not an attribute string) to this document, in
 
 - **`BRIDGE`** is your bootstrap (§3). It must run before the module.
 - **`RESIZE`** is your size reporter (§5), or empty when the card has a fixed `height`.
-- **`MODULE`** is the script text, with every `</script` written as `<\/script` and every `<!--` as `<\!--`. It runs as a classic script, even when the file is named `.mjs`.
+- **`ENTRY`** for classic mode is `<script>MODULE</script>`, with the script text with every `</script` written as `<\/script` and every `<!--` as `<\!--`. It runs as a classic script, even when the file is named `.mjs`.
+
+### Opt-in native ESM files
+
+`entry_type: "module"` is explicit. Omission or `"classic"` preserves classic
+semantics regardless of suffix. `entry` plus `assets` form the finite browser
+file set defined in CREATING_SKILLS. No recursive discovery or HTML runtime is
+part of this mode.
+
+The authenticated parent posts `{skill, tab_id, generation}` to
+`/api/widgets/asset-leases`. Success is `{token, base_url, expires_in: 120,
+renew_after: 40}`; `base_url` is `/api/widget-assets/TOKEN/`. Resolve it against
+the parent's origin as `ASSET_BASE`. Refused/stale publications answer 409;
+invalid fields/body answer 400/413; foreign or opaque origins answer 403.
+
+Set `BASE` to `<meta name="referrer" content="no-referrer"><base href="ASSET_BASE">`
+and the iframe's `referrerPolicy` to `no-referrer`. Set `ENTRY` to
+`<script type="module" crossorigin="anonymous" src="ENTRY_URL"></script>`,
+where `ENTRY_URL` resolves `render.entry` from `ASSET_BASE`; escape attributes.
+Use this policy (the bootstrap still runs first):
+
+```
+default-src 'none'; script-src 'unsafe-inline' 'wasm-unsafe-eval' blob: ASSET_BASE; worker-src blob:; style-src 'unsafe-inline' ASSET_BASE; img-src data: blob: ASSET_BASE; media-src data: blob: ASSET_BASE; font-src data: blob: ASSET_BASE; base-uri ASSET_BASE
+```
+
+Only GET/HEAD under that URL reads declared captured bytes. Responses and
+refusals carry `no-store`, `nosniff`, `Referrer-Policy: no-referrer`, explicit MIME
+and `Access-Control-Allow-Origin: null` without credentials; SVG/document loads
+are sandboxed. Invalid paths answer 400, unavailable/unlisted files 404 and
+non-read methods 405. No cookie bypasses an invalid lease.
+
+Renew the same URL every 40 seconds with `{token}` at
+`POST /api/widgets/asset-leases/renew`; the response has the same shape. Revoke
+with `{token}` at `POST /api/widgets/asset-leases/revoke` (idempotent `{ok:true}`).
+These controls require the issuing parent authentication context and reject
+opaque/cross-site browser requests. They must never enter the child bridge's
+allowlist. A lease cannot renew itself. Stop/disposal sends revoke after the
+bounded save handshake; pagehide sends a keepalive revoke. Failed renewal ends
+the mount. An expired lease cannot be revived; reopening requires a new mount.
+
+Reads and renewal check the same publication plus current enable/review/grant
+readiness. Unload/reload, disable or authority withdrawal invalidates it; logout
+revokes leases of that authentication context, password changes revoke all,
+and restart drops the in-memory table. Logout/password changes also cancel
+already admitted mints waiting for a worker; this does not change cookie session
+validation. A crash/network loss falls back to expiry,
+at most 120 seconds from the last accepted renewal. Already delivered or
+authorized in-flight bytes cannot be recalled. The widget can share its URL;
+renewal extends a copied URL too. HTTP exposes it in transit; HTTPS protects
+transport. It grants no main session or APIs. Redact the token in access/fault
+logs, including at a separate reverse proxy.
 
 ## 3. The bootstrap inside the frame
 
@@ -57,8 +107,8 @@ Before the module runs, the bootstrap must provide what `CREATING_SKILLS.md` pro
 - `window.fetch` replaced by the same bridged `fetch`;
 - `window.__ouroWidgetOnDispose(fn)`, which registers a dispose hook (a hook registered while disposing runs at once);
 - `window.open(url)` routed to `openExternal`, returning `null`;
-- a click on an `<a download>` whose `href` is a frame-created `blob:` URL, a `data:` URL or a URL under the skill's prefix becomes `download`;
-- a trusted click on any other `<a href>` outside the skill's prefix becomes `openExternal`;
+- a click on an `<a download>` whose `href` is a frame-created `blob:` URL, a `data:` URL or a URL under the skill's route or this mount's asset prefix becomes `download`;
+- a trusted click on any other `<a href>` outside those prefixes becomes `openExternal`;
 - a fault channel: listeners on `window` for `error`, `unhandledrejection` and `securitypolicyviolation` post `ouro-widget-error`. Post at most 10 faults per frame, and each distinct kind and message once.
 
 Every message the bootstrap posts goes to `window.parent` with target origin `'*'` and carries the mount's `nonce` (§4). It accepts only messages whose `event.source` is `window.parent` and whose `nonce` matches.
@@ -100,8 +150,8 @@ Generate a fresh random `nonce` string for every mount and embed it in the boots
 ## 5. What the page does for each message
 
 **Fetch:**
-1. Resolve `url` against the page's origin. Refuse, with the `error` text `module widget fetch outside extension route prefix`, unless the result has the page's origin and its path starts with `/api/extensions/<skill>/` for this card's skill.
-2. Send the request from the page with the owner's session (`credentials: "same-origin"`), the upper-cased method, the headers and the body. Use `redirect: "error"`: the prefix is checked once, so a followed redirect could carry the request and the session anywhere.
+1. Resolve `url` against `ASSET_BASE` for ESM, the page's origin for classic. Refuse, with the `error` text `module widget fetch outside extension route prefix`, unless the result has the page's origin and its path starts with `/api/extensions/<skill>/` for this card's skill, or with this mount's `ASSET_BASE` for GET/HEAD only.
+2. Use `credentials: "omit"` for asset reads, the owner's session (`credentials: "same-origin"`) for skill routes. Send the upper-cased method, the headers and the body. Use `redirect: "error"`: the prefix is checked once, so a followed redirect could carry the request and the session anywhere.
 3. Post `headers` with the status, status text and every response header.
 4. Read the body one chunk per `ouro-widget-fetch-pull`. Post each chunk as a `data` phase with its bytes as a transferred `ArrayBuffer`. Post `end` when the body ends. A `HEAD` request and a 204, 205 or 304 answer have no body.
 5. On any failure post `error`.
@@ -114,13 +164,13 @@ There is no default timeout. A positive `init.timeoutMs` aborts the request afte
 
 **Size.** Only a card without a fixed `height` sizes itself. The frame starts at 320 pixels. On `ouro-widget-resize`, set the frame's height to `min(ceiling, max(320, height + 2))`, where `ceiling` is `max_height` (default 8192) and the 2 pixels are the frame border. Ignore a height that is not a positive number. With a fixed `height`, ignore these messages. The builtin size reporter measures `#root` with a `ResizeObserver`, reports in the next animation frame, posts only a changed integer height, and hides the document's vertical scrollbar below the ceiling.
 
-**Downloads.** A `Blob` or a `data:` URL is saved as it is. A URL must have the page's origin and lie under the skill's prefix; anything else fails. Answer with `result: {ok: true, ...}` or `{ok: false, error}`.
+**Downloads.** A `Blob` or a `data:` URL is saved as it is. A URL must have the page's origin and lie under the skill's prefix or this mount's asset prefix; anything else fails. The builtin host streams a skill-route URL and reads an asset URL with `credentials: "omit"`, saving its finite captured bytes like a `Blob`. Answer with `result: {ok: true, ...}` or `{ok: false, error}`.
 
 **External links.** Open the link only while the page has a user activation. Answer with `result: {ok: true, ...}`, `{ok: false, degraded, ...}` when only a fallback (such as copying the link) was possible, or `{ok: false, error}`. The frame treats `ok` or `degraded` as success.
 
 **Faults.** Show the fault in the card's status (a card in a message shows it there) and leave the card running. The builtin host additionally posts it once per kind and message, at most 10 per mount, to `POST /api/widgets/fault` (`WidgetFaultRequest`): this card's own `skill`, `tab_id` and `revision`, `where: "board"` or `"message"`, and the frame's `kind`, `message` (clipped to 500 characters), `source` (200) and `line`; a value that is not a string is sent as `""`, a line that is not a whole number from 0 as `0`. Never take who the widget is from the message, and count per mount, not per frame: the widget's own code can read the nonce and post directly. Reporting is optional for other clients. A report is best effort: no retry, and a refusal changes nothing on the card. Until the stop finishes (§6) the frame still reports.
 
-The server normalizes unpaired UTF-16 surrogates in the clipped text to U+FFFD before writing UTF-8; valid emoji remain intact.
+Both page and server redact capability-bearing asset URLs. The server normalizes unpaired UTF-16 surrogates in the clipped text to U+FFFD before writing UTF-8; valid emoji remain intact.
 
 ## 6. Stopping a widget
 

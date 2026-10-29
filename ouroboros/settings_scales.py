@@ -224,6 +224,14 @@ def normalize_runtime_mode(value: Any) -> str:
     return text if text in VALID_RUNTIME_MODES else default_val
 
 
+VALID_SUBAGENTS_MODES = ("off", "auto", "swarm")
+
+
+def normalize_subagents_mode(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in VALID_SUBAGENTS_MODES else str(SETTINGS_DEFAULTS["OUROBOROS_SUBAGENTS_MODE"])
+
+
 VALID_SAFETY_MODES = ("full", "light", "off")
 
 
@@ -240,6 +248,7 @@ _SAFETY_MODE_RANK = {"full": 2, "light": 1, "off": 0}
 # Effect vocabulary shared by the owner gateway and task-local runtime readers.
 IMMEDIATE_SETTINGS = frozenset({
     "TOTAL_BUDGET",
+    "OUROBOROS_SUBAGENTS_MODE",  # live room rounds/admissions; never a task snapshot authority
     # The interface language is read live by the gateway (every /api/ui/i18n read) and by
     # the Telegram skill; a running task's runtime block keeps the tag it started with.
     "OUROBOROS_UI_LANGUAGE",

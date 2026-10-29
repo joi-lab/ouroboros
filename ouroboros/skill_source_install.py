@@ -365,7 +365,8 @@ def run_in_lane(drive_root: pathlib.Path, kind: str, target: str, runner: Callab
 
 
 def start_review(drive_root: pathlib.Path, name: str, *, repo_dir: Optional[pathlib.Path] = None,
-                 reviewers: Optional[List[str]] = None, reason: str = "", chosen_by: str = "owner", panel: Any = None) -> None:
+                 reviewers: Optional[List[str]] = None, reason: str = "", chosen_by: str = "owner", panel: Any = None,
+                 ctx: Any = None) -> None:
     """Start the ordinary review job of an install in the background.
 
     The review lends the lifecycle lane out while its panel reads the frozen payload; when it leaves no
@@ -373,24 +374,57 @@ def start_review(drive_root: pathlib.Path, name: str, *, repo_dir: Optional[path
     (``skill_review_runner``). An interrupted review stays an honest interrupted job, never an acceptance.
     """
     from ouroboros.reviewer_slot_config import compose_review_panel
+    from ouroboros.marketplace.install import _MarketplaceReviewCtx
+    from ouroboros.model_wait import TaskModelWait, current_model_wait, operation_wait_scope
+    from ouroboros.config import REPO_DIR
+    import contextvars
+    import copy
+
     panel = panel or compose_review_panel(reviewers or (), reason, surface="skill", chosen_by=chosen_by)
+    # Capture the real caller before returning from install/update. The review
+    # runs later, but its authority, money and room still belong to this task.
+    # A separate carrier keeps the runner's temporary review fields out of the
+    # author's next tool call; contextvars retain the host's usage/source scope.
+    review_ctx = copy.copy(ctx) if ctx is not None else _MarketplaceReviewCtx(
+        pathlib.Path(drive_root), pathlib.Path(repo_dir or REPO_DIR))
+    if ctx is not None:
+        review_ctx.task_metadata = dict(getattr(ctx, "task_metadata", None) or {})
+        review_ctx.messages = list(getattr(ctx, "messages", None) or [])
+        review_ctx.pending_events = []
+        review_ctx.owner_wait_callback = review_ctx.review_wait_callback = None
+    caller_context = contextvars.copy_context()
+    # This worker owns no author slot. Give the ordinary review operation a
+    # frozen task frame, without the author's live waits/typing or call clocks.
+    # Its own operation wait still retains Stop, Pause, custody and billing.
+    parent = current_model_wait()
+    review_wait = None
+    if ctx is not None and parent is not None:
+        task = {key: value for key, value in parent.task.items()
+                if not str(key).startswith("_") or key in {"_attempt", "_presence_turn"}}
+        task = copy.deepcopy({**task, "metadata": review_ctx.task_metadata})
+        review_wait = TaskModelWait(task=task, drive_root=parent.drive_root,
+                                   event_queue=parent.event_queue, worker_slot_held=False)
+        review_wait.canonical_root = parent.canonical_root
+        review_wait.author_detached = True
+        review_wait.overrides.update(copy.deepcopy(parent.overrides))
+        review_ctx.model_wait_context = review_wait
+    source = "tool" if ctx is not None else "skills"
     digest = str(((read_install_record(drive_root, name) or {}).get("release") or {}).get("digest") or "")
     def _run() -> None:
-        try:
-            from ouroboros.config import REPO_DIR, get_skills_repo_path
-            from ouroboros.marketplace.install import _MarketplaceReviewCtx
-            from ouroboros.skill_review_runner import run_skill_review_lifecycle_blocking
+        with operation_wait_scope(review_wait):
+            try:
+                from ouroboros.config import get_skills_repo_path
+                from ouroboros.skill_review_runner import run_skill_review_lifecycle_blocking
 
-            ctx = _MarketplaceReviewCtx(pathlib.Path(drive_root), pathlib.Path(repo_dir or REPO_DIR))
-            run_skill_review_lifecycle_blocking(ctx, name, source="skills", repo_path=get_skills_repo_path(), _panel=panel)
-        except Exception:
-            log.warning("Review after install failed for %s", name, exc_info=True)
-        finally:
-            if update_backup_path(drive_root, name).exists():
-                run_in_lane(drive_root, "update_settle", name, lambda: settle_pending_update(
-                    drive_root, name, expected_digest=digest))
+                run_skill_review_lifecycle_blocking(review_ctx, name, source=source, repo_path=get_skills_repo_path(), _panel=panel)
+            except Exception:
+                log.warning("Review after install failed for %s", name, exc_info=True)
+            finally:
+                if update_backup_path(drive_root, name).exists():
+                    run_in_lane(drive_root, "update_settle", name, lambda: settle_pending_update(
+                        drive_root, name, expected_digest=digest))
 
-    threading.Thread(target=_run, daemon=True, name=f"skill-install-review-{name}").start()
+    threading.Thread(target=caller_context.run, args=(_run,), daemon=True, name=f"skill-install-review-{name}").start()
 
 
 def settle_pending_updates_at_startup(drive_root: pathlib.Path) -> None:

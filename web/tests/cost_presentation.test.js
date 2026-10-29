@@ -49,9 +49,9 @@ test('the budget pill asks for the owner only while a spending-limit stop waits 
     // The fact rides beside the money, whatever the ledger read says.
     assert.equal(headerBudgetPresentation({ accounting: { available: false }, main_attention: [stopped] }).attention, true);
     assert.equal(headerBudgetPresentation({ ...atLimit, main_attention: null }).attention, false);
-    // chat.js writes it on the pill and the stylesheet keeps amber for it alone; Panic stays danger.
-    const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    assert.match(chat, /budgetPill\.dataset\.attention = budget\.attention \? '1' : '0'/);
+    // The bar's owner (chat_header.js) writes it on the pill and the stylesheet keeps amber for it alone; Panic stays danger.
+    const header = readFileSync(new URL('../modules/chat_header.js', import.meta.url), 'utf8');
+    assert.match(header, /budget\.dataset\.attention = view\.attention \? '1' : '0'/);
     const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
     const rules = (selector) => [...css.matchAll(/([^{}]+)\{([^}]*)\}/g)]
         .filter(([, head]) => head.includes(selector)).map(([, head, body]) => `${head.trim()} { ${body.trim()} }`);

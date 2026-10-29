@@ -259,7 +259,13 @@ def test_exact_provider_canary_matrix_logical_turns_and_attempt_bound():
         1 + int(row.continue_to_final)
         for row in matrix
         if row.credential_required
-    ) == 11
+    ) == 7
+    # Release 7.9.0: four OpenRouter routes the CI key cannot reach are optional and skipped, never silently.
+    assert [row.canary_id for row in matrix if row.skip_reason] == [
+        "openrouter_gemini", "openrouter_opus", "openrouter_fable", "openrouter_gpt"
+    ]
+    assert not any(row.credential_required for row in matrix if row.skip_reason)
+    assert {row.canary_id for row in matrix if row.credential_required} >= {"anthropic_direct", "openai_direct_main"}
 
 
 def test_direct_anthropic_named_tool_choice_projects_without_type_error():
@@ -293,7 +299,7 @@ def test_openai_models_follow_default_ssot_without_allowlist(monkeypatch):
 
 
 def test_required_and_optional_credential_policy(monkeypatch):
-    required = next(row for row in provider_canary_matrix() if row.canary_id == "openrouter_gemini")
+    required = next(row for row in provider_canary_matrix() if row.canary_id == "openrouter_grok")
     optional = next(row for row in provider_canary_matrix() if row.canary_id == "minimax_direct")
     monkeypatch.delenv(required.credential_env, raising=False)
     monkeypatch.delenv(optional.credential_env, raising=False)

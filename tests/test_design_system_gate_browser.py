@@ -270,9 +270,10 @@ def test_every_page_and_settings_tab_meets_shell_contract(gate_ui, tmp_path, wid
 
 def test_main_header_keeps_one_row_whatever_width_its_words_set(gate_ui, tmp_path):
     """DESIGN "Page header": one row that never wraps. At the first docked width Main's bar is narrow (Restart and
-    the budget wait in ⋯) and this Mac's face left its commands about ten pixels; a wider face (Linux WebKit set
-    them two rows high) moves nothing onto a second row and nothing out of the bar: the commands keep their place
-    and the status yields, its word dropping whole while its mark stays. A word too wide for its place drops."""
+    the budget wait in the status Shade since More ended, #2324) and this Mac's face left its commands about ten
+    pixels; a wider face (Linux WebKit set them two rows high) moves nothing onto a second row and nothing out of the
+    bar: the commands keep their place and the status yields, its word dropping whole while its mark stays. A word
+    too wide for its place drops."""
     page = seed_page(gate_ui, 720, 844)
     facts = {}
     try:
@@ -309,7 +310,7 @@ def test_main_header_keeps_one_row_whatever_width_its_words_set(gate_ui, tmp_pat
         page.close()
     for step, fact in facts.items():
         assert fact['height'] <= 56.1, (step, fact)
-        assert fact['commands'] == ['Panic', 'More'] and not fact['outside'], (step, fact)
+        assert fact['commands'] == ['Panic'] and not fact['outside'], (step, fact)
         # The word shows whole or not at all, and its mark stays in the bar either way.
         assert fact['mark'] and (fact['dropped'] != fact['wordShown']) and not fact['wordClipped'], (step, fact)
     assert facts['wide-word']['dropped'], facts

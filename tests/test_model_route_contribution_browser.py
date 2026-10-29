@@ -82,6 +82,39 @@ def test_settings_search_and_exact_response_maximum(route_ui):
     assert not route_ui['errors']
 
 
+@pytest.mark.parametrize('retired', [True, False])
+def test_settings_window_history_disagreement_and_clear(route_ui, tmp_path, retired):
+    from ouroboros import capability_evidence as ce
+
+    route = dict(provider='openai-compatible', model='openai-compatible::future', base_url='https://compatible.invalid/v1')
+    ack = ce.record_owner_ack(tmp_path, **route, window_tokens=1000000,
+        note='owner-confirmed via context-mode toggle' if retired else 'typed')
+    ce._store_evidence(tmp_path, 'probes', ack['route_fp'], ce.CapabilityEvidence(
+        400000, 'confirmed', 'provider_metadata', ack['route_fp'], ts=ce.utc_now_iso()).to_json())
+    page = route_ui['page']
+    page.goto(route_ui['url'] + '/#settings')
+    page.locator('[data-settings-tab="models"]').click()
+    main = page.locator('[data-model-role="main"]')
+    main.locator('summary').click()
+    page.wait_for_function("() => !document.querySelector('[data-model-role=main] [data-window-clear]').hidden")
+    note = main.locator('[data-model-context-note]')
+    assert ('old confirmation 1,000,000' in note.inner_text()) is retired
+    assert ('not used' in note.inner_text()) is retired
+    assert ('server metadata says 400,000' in note.inner_text()) is not retired
+    assert ('window 400,000' if retired else 'window 1,000,000') in note.inner_text()
+    page.set_viewport_size({'width': 390, 'height': 844})
+    note.scroll_into_view_if_needed()
+    assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+    roles.capture(page, f'window-authority-{retired}')
+    with page.expect_response('**/api/owner/capability-ack') as cleared:
+        main.locator('[data-window-clear]').click()
+    assert cleared.value.json()['ack']['removed']
+    page.wait_for_function("() => document.querySelector('[data-model-role=main] [data-window-clear]').hidden")
+    assert 'old confirmation' not in note.inner_text() and 'window 400,000' in note.inner_text()
+    assert not ce.list_owner_acks(tmp_path)
+    assert not route_ui['errors']
+
+
 @pytest.mark.parametrize('edit_order', ['before_toggle', 'pending_preview', 'reopen'])
 def test_response_maximum_preview_keeps_owner_draft(route_ui, edit_order):
     from playwright.sync_api import expect

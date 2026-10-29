@@ -427,7 +427,7 @@ def _compact_annotations_locked(drive_root: Any, path: pathlib.Path) -> None:
     rows.sort(key=lambda row: str(row.get("ts") or ""))
     tmp = path.with_name(f".{path.name}.tmp.{uuid.uuid4().hex}")
     data = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows).encode("utf-8")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)
     try:
         view = memoryview(data)
         while view:
@@ -436,6 +436,13 @@ def _compact_annotations_locked(drive_root: Any, path: pathlib.Path) -> None:
     finally:
         os.close(fd)
     replace_atomic(tmp, path)
+
+
+# One owner-routing receipt's fields (#968): its row below, its live frame (`send_routing_ack`) and its history
+# replay state this one set; the destination part names the room and the works its words reached.
+ROUTING_DESTINATION_FIELDS = ("project_id", "project_chat_id", "project_name", "target_task_ids", "target_titles")
+ROUTING_RECEIPT_FIELDS = ("action", "target", "target_label", "status", "routing_token", "cause", "options",
+                          "attachment_manifest", "reasoning_effort", *ROUTING_DESTINATION_FIELDS)
 
 
 def append_chat_annotation(
@@ -526,7 +533,7 @@ def append_chat_annotation(
                 if require_latest_token is not None and latest_token not in set(require_latest_token):
                     return False  # a NEWER routing attempt owns the card now
         data = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644)
         try:
             view = memoryview(data)
             while view:
@@ -549,12 +556,12 @@ def routing_target_label(
     if not target:
         return ""
     try:
+        from ouroboros.project_facts import project_display_name
         from ouroboros.projects_registry import get_reserved_project, task_presentation_snapshot
 
         if action == "project_route":
             project = get_reserved_project(drive_root, target) or {}
-            name = str(project.get("name") or "").strip()
-            return name if name and name != target else "Project"
+            return project_display_name(project.get("name"), target) or "Project"
         return task_presentation_snapshot(
             drive_root, target, task=task, project_id=project_id,
         )["target_label"]
@@ -865,9 +872,11 @@ def outcome_phase(result: Dict[str, Any], event: Dict[str, Any]) -> str:
     Durable host rows read exactly what ``log_events.js`` paints, over
     NORMALIZED axes; web/tests/fixtures/outcome_phase_parity.json pins both.
     """
-    from ouroboros.outcomes import REASON_OWNER_REQUESTED_FINALIZATION, normalize_outcome_axes
+    from ouroboros.outcomes import (REASON_OWNER_REQUESTED_FINALIZATION, current_custody_debt, normalize_outcome_axes,
+                                    objective_warned)
     from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
     from ouroboros.task_status import FINAL_STATUSES
+    from supervisor.owner_stop import owner_stop_ending
 
     record = {**event, **{key: value for key, value in result.items() if value not in (None, "")}}
     sources = [s.get("outcome_axes") for s in (event, result) if isinstance(s.get("outcome_axes"), dict)]
@@ -883,14 +892,22 @@ def outcome_phase(result: Dict[str, Any], event: Dict[str, Any]) -> str:
     lifecycle = axis.get("lifecycle") or status
     if lifecycle in {"cancelled", "cancel_requested"}:
         return "cancelled"
+    command, ending = owner_stop_ending(record)  # Stop now is Stopped whatever it kept
+    if command == "stop_now":
+        return "cancelled"
+    unanswered = ending == "stop"  # a Wrap up without an answer: its own failure is the stop
     author_finished = axis.get("objective") == "pass" and (axes.get("objective") or {}).get("source") == "author_acceptance"
-    if (lifecycle == "failed" or axis.get("execution") in {"failed", "infra_failed"}
+    if (((lifecycle == "failed" or axis.get("execution") == "failed") and not unanswered)
+            or axis.get("execution") == "infra_failed"
             or axis.get("objective") == "fail" or (axis.get("review") == "fail" and not author_finished)
             or {axis.get("artifacts"), str(record.get("artifact_status") or "").lower()} & {"failed", "missing"}):
         return "error"
+    if unanswered:
+        return "cancelled"
     if str(record.get("reason_code") or "") == REASON_OWNER_REQUESTED_FINALIZATION:
         return "done"
-    if (lifecycle == "rejected_duplicate" or bool((axes.get("objective") or {}).get("warning"))
+    debt = current_custody_debt(result, event)  # the current list, never a stamp (#1583)
+    if (lifecycle == "rejected_duplicate" or objective_warned(axes.get("objective"), debt)
             or axis.get("execution") in {"degraded", "best_effort"}
             or axis.get("objective") in {"degraded", "best_effort"}
             or (axis.get("review") == "degraded" and not author_finished)):
@@ -1129,22 +1146,20 @@ def _completion_excerpt(result: Dict[str, Any], *, chat_id: Any = None,
 def _custody_debt_reason(reason: str, result: Dict[str, Any], event: Dict[str, Any]) -> tuple:
     """Current debt stands beside the execution cause, including a retained rail.
 
-    Write-side healing preserves reason_code, so only the record's current debt
-    list names a debt. Absence is not proof of reconciliation. When the stored
-    reason is the custody overlay, recover the execution reason beneath it.
+    The debt is the record's current list, never its reason (#1583), and healing
+    rewrites only that list. Absence is not proof of reconciliation. An older row's
+    custody stamp is read beneath, from its typed execution reason.
     """
-    from ouroboros.outcomes import WARN_DELEGATED_CUSTODY_UNRECONCILED
+    from ouroboros.outcomes import WARN_DELEGATED_CUSTODY_UNRECONCILED, current_custody_debt
 
-    debt: Any = None
     execution_reason = ""
     for source in (result, event):
-        if debt is None and isinstance(source.get("delegated_runs_unreconciled"), list):
-            debt = source["delegated_runs_unreconciled"]
         axes = source.get("outcome_axes") if isinstance(source.get("outcome_axes"), dict) else {}
         execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
-        execution_reason = execution_reason or str(execution.get("reason_code") or "")
+        typed = str(execution.get("reason_code") or "")  # a stamp read back as the cause names none
+        execution_reason = execution_reason or ("" if typed == WARN_DELEGATED_CUSTODY_UNRECONCILED else typed)
     return (execution_reason if reason == WARN_DELEGATED_CUSTODY_UNRECONCILED else reason,
-            WARN_DELEGATED_CUSTODY_UNRECONCILED if debt else "")
+            WARN_DELEGATED_CUSTODY_UNRECONCILED if current_custody_debt(result, event) else "")
 
 
 # The open-review classes that state a standing limitation (never the merely awaited case).
@@ -1211,9 +1226,10 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any], *, includ
     of ``taskReasonDetail`` and ``taskReasonCodes``.
     """
     from ouroboros.outcomes import (
-        ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, REASON_FINAL_MESSAGE,
-        REASON_OWNER_REQUESTED_FINALIZATION, plan_review_awaiting,
+        ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, REASON_FINAL_MESSAGE, REASON_OWNER_REQUESTED_FINALIZATION,
+        WARN_DELEGATED_CUSTODY_UNRECONCILED, WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW, plan_review_awaiting,
     )
+    from ouroboros.tool_error_words import residual_tool_errors_phrase
 
     decision: Dict[str, Any] = {}
     veto: Dict[str, Any] = {}
@@ -1242,11 +1258,17 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any], *, includ
     raw_reason = str(result.get("reason_code") or event.get("reason_code") or "")
     origin = result.get("cancel_origin") or event.get("cancel_origin")
     phase = outcome_phase(result, event)
+    from supervisor.owner_stop import owner_stop_ending
+    stopped = owner_stop_ending({"reason_code": raw_reason, "cancel_origin": origin,
+                                 "outcome_axes": {"execution": execution}})[1] == "stop"
     reason, custody = _custody_debt_reason(raw_reason, result, event)
-    if reason in {REASON_FINAL_MESSAGE, ""}:
-        reason = str(execution.get("reason_code") or reason)
+    typed = str(execution.get("reason_code") or "")
+    if reason in {REASON_FINAL_MESSAGE, ""} and typed != WARN_DELEGATED_CUSTODY_UNRECONCILED:
+        reason = typed or reason
     review_cause = (cause if status and (status != ACCEPTANCE_ACCEPTED or cause in TASK_CAUSE_PHRASES)
-                    and (phase in {"done", "warn"} or recorded_author_stop(decision)) else "")
+                    and (phase in {"done", "warn"} or recorded_author_stop(decision)
+                         or (phase == "error" and status != ACCEPTANCE_ACCEPTED and not custody
+                             and reason in {REASON_FINAL_MESSAGE, ""})) else "")
     # Author-accepted completion is not reviewer approval. Required mode, explicit
     # debts and unknown enforcement are not inferred optional from a reason string.
     trigger = str(review.get("trigger") or "").removesuffix("_after_agent_tool").removesuffix("_after_agent_advisory")
@@ -1260,9 +1282,9 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any], *, includ
     held = phase == "error" and str(objective.get("source") or "").startswith("plan_review_")
     if reason == "foreign_install_root" and (result.get("reason_detail") or event.get("reason_detail")):
         clause = str(result.get("reason_detail") or event["reason_detail"])
-    elif raw_reason == REASON_OWNER_REQUESTED_FINALIZATION:
-        clause = review_cause = ""  # an owner-requested stop carries its own marker
-    elif phase == "cancelled" and isinstance(origin, dict) and origin:
+    elif raw_reason == REASON_OWNER_REQUESTED_FINALIZATION and not stopped:
+        clause = review_cause = ""  # a Wrap up's answer carries its own marker
+    elif (phase == "cancelled" or stopped) and isinstance(origin, dict) and origin:
         # The recorded cause and the relation the record PROVES (#1061).
         from supervisor.cancel_publication import cancel_cause_clauses
 
@@ -1289,7 +1311,9 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any], *, includ
     excluded = {"", "delegated_custody_unreconciled", "terminal_delivery_unknown", "terminal_delivery_exhausted"}
     if not include_review_details:
         excluded.add("receipt_absent")
-    warning_clauses = [TASK_CAUSE_PHRASES.get(str(w), str(w)) for w in warnings if str(w) not in excluded]
+    named = residual_tool_errors_phrase(execution)  # the failure the record holds, in owner words
+    warning_clauses = [(str(w) == WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW and named) or TASK_CAUSE_PHRASES.get(str(w), str(w))
+                       for w in warnings if str(w) not in excluded]
     record = {**event, **result}
     bundle = record.get("artifact_bundle") if isinstance(record.get("artifact_bundle"), dict) else {}
     artifact_status = bundle.get("status") or record.get("artifact_status") or artifacts.get("status")
@@ -1300,8 +1324,13 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any], *, includ
     if (objective.get("status") == "best_effort" and not clause and not objective.get("deferred_count")
             and raw_reason != REASON_OWNER_REQUESTED_FINALIZATION and review_cause in {"", "previous_revision_accepted"}):
         warning_clauses.append(TASK_CAUSE_PHRASES["partial_result"])
+    remainder = (execution.get("mutation_attribution") or {}).get("uncommitted_remainder") or {}
+    count = remainder.get("count")
+    remainder_clause = ("Uncommitted files in the saved candidate could not be checked" if remainder.get("state") == "unknown"
+                        else f"{count} uncommitted file{'s' if count != 1 else ''} remain{'s' if count == 1 else ''} in the saved candidate"
+                        if remainder.get("state") == "known" and type(count) is int and count > 0 else "")
     line = _join_cause_clauses([clause, *warning_clauses, _cause_phrase(review_cause, undescribed),
-                                _author_stop_rationale(decision, completion),
+                                _author_stop_rationale(decision, completion), remainder_clause,
                                 *_incident_cause_clauses(decision, reason),
                                 *_terminal_limitations(result, event, reason, held=held),
                                 TASK_CAUSE_PHRASES.get(custody, custody) if custody else ""])

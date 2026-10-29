@@ -24,6 +24,7 @@ from .lib.telegram_api import (
     TelegramTransportError,
     is_transient_telegram_error,
     markdown_to_telegram_html,
+    message_chunks,
     next_telegram_retry_delay,
     _LOCALIZED_TEXTS,
     _MAX_TELEGRAM_UPLOAD_BYTES,
@@ -33,11 +34,11 @@ from .lib.telegram_state import (
     _get_silent_msg, _set_silent_msg, _clear_silent_msg, _subagent_cards_enabled,
     _mirror_progress_enabled, _render_subagent_card, _data_dir,
     _jsonl_tail, _load_runtime_state, _read_json_file, _child_row_held_for_root,
-    _mirror_options, _owner_message_seen, _owner_ingress_fields, _same_silent_episode,
+    _mirror_options, _owner_message_seen, _owner_ingress_fields, _replaceable_progress, _quiet_progress,
 )
 from .lib import telegram_i18n, telegram_inbound, telegram_quiz
 from .lib.telegram_health import _collect_health, _build_menu_tasks
-from .lib.telegram_notifier import _make_notifier, _notify_enabled, _completion_text, _relay_text
+from .lib.telegram_notifier import _make_notifier, _notify_enabled, _completion_text, _relay_text, _routing_notice_text
 from .lib.telegram_typing import TypingCue, host_reply_preparation
 from .lib.miniapp_registration import _read_status, register as register_miniapp
 from .scripts.telegram_settings import (
@@ -769,7 +770,7 @@ async def _poller(api) -> None:
                                 # Clear any stale tracked message id for this chat so the
                                 # next outbound starts a fresh bubble in either direction.
                                 _clear_silent_msg(api, cb_chat_id)
-                                toast_key = "silent_toggled_on" if new_value == "on" else "silent_toggled_off"
+                                toast_key = "quiet_toggled_on" if new_value == "on" else "quiet_toggled_off"
                                 await client.answer_callback_query(cb_id, text=_LOCALIZED_TEXTS[lang][toast_key])
                                 header, keyboard = _build_menu_settings(api, command_mode, lang)
                                 await _edit_panel(api, client, cb_chat_id, cb_message_id, header, keyboard)
@@ -1060,7 +1061,7 @@ def _make_outbound(api, cue: TypingCue | None = None):
             sub_event = str(event.get("subagent_event") or "").strip().lower()
             if sub_event:
                 if _subagent_cards_enabled(local_settings):
-                    await _render_subagent_card(api, client, chat_id, event, sub_event, lang)
+                    await _render_subagent_card(api, client, chat_id, event, sub_event, lang, quiet=_is_silent_mode_enabled(local_settings))
                 return
 
             # Card-internal host rows: the web shows them inside a task card, and
@@ -1078,38 +1079,17 @@ def _make_outbound(api, cue: TypingCue | None = None):
                                              and event.get("terminal_receipt") != "retained_work")) and not _mirror_progress_enabled(local_settings):
                 return
 
-            # Routing receipts are typed annotations (suppress_bubble, no text). A landed act stays silent except for a
-            # file it could not attach (no message line here to carry it); an actionable refusal is a numbered list (#198)
-            # the owner answers in plain words (the LLM router reads it from history, P5) or on the web picker card.
+            # A routing receipt is a typed annotation (suppress_bubble, no text): its owner notice is ONE message
+            # answering the owner's message, and a landed act stays silent. A refusal's paired System row stays in the
+            # web, and is skipped here only when it says this ACK carried its notice.
+            if event.get("role") == "system" and event.get("routing_notice_carrier") == "routing_ack":
+                return
             if str(event.get("annotation_type") or "") == "routing_ack":
-                from supervisor.steering import _relayed_owner_message
-
-                # Named owner relays have only the annotation; synthetic acts
-                # already get their separate steer_not_delivered System row.
-                if (event.get("action") == "steer_task" and event.get("cause")
-                        and _relayed_owner_message(str(event.get("client_message_id") or ""))):
-                    line = " · ".join(str(event[key]) for key in ("target_label", "cause") if event.get(key))
-                    await client.send_message(chat_id, line, parse_mode="")
-                    return
-                if str(event.get("status") or "") != "needs_manual_target":
-                    names = [str(row.get("label") or "file") for row in event.get("attachment_manifest") or [] if isinstance(row, dict) and row.get("status") == "rejected"]
-                    if names:
-                        await client.send_message(chat_id, _LOCALIZED_TEXTS[lang].format("attachments_not_attached", names=", ".join(names)), parse_mode="")
-                    return
-                raw_options = event.get("options") if isinstance(event.get("options"), list) else []
-                from ouroboros.project_dialogue import routing_option_label
-
-                labels = [routing_option_label(option) for option in raw_options]
-                labels = [label for label in labels if label][:8]
-                if not labels:
-                    return
-                lines = ["Choose a target for the last message:"]
-                lines.extend(f"{index}. {label}" for index, label in enumerate(labels, 1))
-                if len(raw_options) > len(labels):
-                    lines.append(f"…and {len(raw_options) - len(labels)} more in the web chat.")
-                lines.append("Reply with a number, or tap an option in the web chat.")
-                _clear_silent_msg(api, chat_id)
-                await client.send_message(chat_id, "\n".join(lines), parse_mode="")
+                notice, picker = _routing_notice_text(event, lang)
+                if notice:
+                    if picker:
+                        _clear_silent_msg(api, chat_id)
+                    await client.send_message(chat_id, notice, parse_mode="")
                 return
 
             text = str(event.get("text") or "").strip()
@@ -1133,32 +1113,32 @@ def _make_outbound(api, cue: TypingCue | None = None):
             # formatting; an absent/True hint renders markdown→HTML as before.
             parse_mode = "" if completion_summary or relayed or event.get("markdown") is False else "HTML"
 
-            # A host receipt must neither replace nor become the tracked agent reply.
-            silent_on = _is_silent_mode_enabled(local_settings) and event.get("role") != "system"
-            tracked_msg_id = _get_silent_msg(api, chat_id) if silent_on else 0
+            # Silent mode mutes each authored message and the final answer, each its own message, and technical
+            # progress, the host's typed notes included; only a one-message progress note is tracked, for the next
+            # note of its episode to replace. Any other host row, a typed problem among them, keeps its sound and run.
+            host_row = event.get("role") == "system" and not _quiet_progress(event)
+            quiet = _is_silent_mode_enabled(local_settings) and not host_row
+            single = quiet and event.get("is_progress") is True and len(message_chunks(text, parse_mode)) == 1
+            tracked_msg_id = _get_silent_msg(api, chat_id) if single else 0
 
             # An answer never lands under, or revives, the typing it ends (DESIGN §9).
             async with _cue_message(cue, chat_id) as delivered:
-                # Silent mode: try to edit the previously tracked message in-place.
-                # editMessageText returns False on any failure (too old, deleted,
-                # identical content, parse error) so we fall back to sendMessage.
-                if silent_on and tracked_msg_id and _same_silent_episode(api, chat_id, tracked_msg_id, event):
+                # editMessageText returns False on any failure (too old, deleted, parse error): send instead.
+                if tracked_msg_id and _replaceable_progress(api, chat_id, tracked_msg_id, event):
                     edited = await client.edit_message_text(chat_id, tracked_msg_id, text, parse_mode=parse_mode)
                     if not edited and parse_mode:
                         edited = await client.edit_message_text(chat_id, tracked_msg_id, text, parse_mode="")
                     if edited:
                         delivered()
                         return
-                    # Edit failed (likely too old or already identical) — clear
-                    # tracking and fall through to sendMessage path.
-                    _clear_silent_msg(api, chat_id)
-
-                msg_id = await client.send_message(chat_id, text, parse_mode=parse_mode)
+                msg_id = await client.send_message(chat_id, text, parse_mode=parse_mode, **({"disable_notification": True} if quiet else {}))
                 if msg_id:
                     delivered()
 
-            if silent_on and msg_id:
-                _set_silent_msg(api, chat_id, msg_id)
+            if single and msg_id:
+                _set_silent_msg(api, chat_id, msg_id)  # an edit of a split note would erase its last part
+            elif not host_row:
+                _clear_silent_msg(api, chat_id)
         except Exception as exc:
             api.log("error", f"Telegram outbound error: {exc}")
     return handle
@@ -1405,6 +1385,7 @@ def _make_quiz(api, cue: TypingCue | None = None):
                     client, chat_id, body=body, compact=compact,
                     hint_text=telegram_quiz.hint(lang) if labels else telegram_quiz.hint_open(lang),
                     keyboard=telegram_quiz.quiz_keyboard(token, labels),
+                    reserve=telegram_quiz.answered_edit_reserve(lang),
                 )
                 delivered()
                 if overflowed:
@@ -1505,12 +1486,12 @@ def register(api):
                          "placeholder": "all"},
                         {"name": "TELEGRAM_CHAT_ID", "label": "Telegram Chat ID", "type": "text", "placeholder": "required for 'all' mode"},
                         {"name": "TELEGRAM_MAX_UPDATES_PER_POLL", "label": "Max updates per poll", "type": "number", "placeholder": "20"},
-                        {"name": "TELEGRAM_SILENT_MODE", "label": "Silent mode (edit-in-place)", "type": "select",
+                        {"name": "TELEGRAM_SILENT_MODE", "label": "Silent mode", "type": "select",
                          "options": [
                              {"value": "off", "label": "Off"},
-                             {"value": "on", "label": "On (edit in place)"},
+                             {"value": "on", "label": "On (without sound)"},
                          ],
-                         "help": "On replaces the previous thought in place instead of sending a new message.",
+                         "help": "On sends replies, the final answer and progress without sound; a progress update replaces the one just before it. Questions, files and problems keep their sound.",
                          "placeholder": "off"},
                         {"name": "TELEGRAM_SUBAGENT_CARDS", "label": "Subagent cards", "type": "select",
                          "options": [

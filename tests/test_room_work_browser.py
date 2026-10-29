@@ -31,7 +31,7 @@ pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 ROOM_FACTS = """(scope) => {
     const root = scope === 'main' ? document.querySelector('#page-chat') : document.querySelector('#project-panel');
     const trigger = root?.querySelector('.rw-trigger');
-    const surface = root?.querySelector('.rw-surface');
+    const surface = trigger ? document.getElementById(trigger.getAttribute('aria-controls')) : null;  // the room's work Shade, never the chip's
     const text = (el) => (el?.textContent || '').replace(/\\s+/g, ' ').trim();
     const shown = (el) => Boolean(el) && !el.hidden, markOf = (el) => (shown(el) ? `${el.dataset.shape} ${el.dataset.hue}` : '');
     const rows = [...(surface?.querySelectorAll('.rw-row') || [])].map((row) => {
@@ -225,7 +225,9 @@ class Transport:
                 raw[task_id] = {"running": pausing, **raw.get(task_id, {})}
                 fences.setdefault(item.get("root_task_id") or task_id, {
                     "state": "requested" if pausing else "paused", "parked_members": [] if pausing else [task_id]})
+        # Consciousness facts show each bar's chip: one more neighbour no word may move (DESIGN bible 6).
         return {"sha": "room-work-fixture", "supervisor_ready": ready, "active_chat_activities": rows,
+                "bg_consciousness_enabled": True, "bg_consciousness_state": {"status": "sleeping", "next_wake_at": "2026-10-25T14:20:00"},
                 "active_chat_activities_complete": self.complete, "projects": self.projects,
                 "project_chat_ids": [p["chat_id"] for p in self.projects],
                 **work_fields(rows, raw, results=self.results, fences=fences, complete=self.complete)}
@@ -1007,13 +1009,11 @@ def test_project_shade_hold_outside_press_switch_and_latest_root(room_ui):
     # The room waits for the host's verification: the row says Waiting, and the hold's own label beside it.
     assert (held["word"], held["secondary"], held["tone"]) == ("Waiting", "Waiting for Project access", "held"), held
     settle_unfold(page, "project")
-    geometry = page.evaluate("""() => { const box = s => document.querySelector(s).getBoundingClientRect();
-        const bar = box('#project-panel .project-panel-bar'), shade = box('#project-panel .rw-shade'), panel = box('#project-panel');
-        return {bar: [bar.left, bar.bottom, bar.right], shade: [shade.left, shade.top, shade.right, shade.bottom],
-                panel: [panel.left, panel.right], vh: innerHeight}; }""")
-    assert abs(geometry["shade"][1] - geometry["bar"][1]) <= 1.5, geometry
-    assert geometry["shade"][0] >= geometry["panel"][0] - 0.5 and geometry["shade"][2] <= geometry["panel"][1] + 0.5
-    assert geometry["shade"][3] <= geometry["vh"], geometry
+    geometry = page.evaluate(_BAR_GEOMETRY, "project")
+    shade, panel = geometry["shade"], page.locator("#project-panel").bounding_box()
+    assert_hangs_under_capsule(shade, geometry["capsule"], "the held Project's list")
+    assert shade["x"] >= panel["x"] - 0.5 and shade["x"] + shade["w"] <= panel["x"] + panel["width"] + 0.5, (shade, panel)
+    assert shade["bottom"] <= geometry["vh"], geometry
     capture(page, "project-open")
     # The first outside press on the dimmed Main only dismisses the Shade, never the room.
     backdrop = page.locator("#project-panel-backdrop")
@@ -1127,13 +1127,14 @@ _BAR_GEOMETRY = """(scope) => {
     const neighbours = [...bar.querySelectorAll('button, .chat-budget-pill')]
         .filter((el) => visible(el) && el !== trigger && !trigger.contains(el) && !el.closest('.rw-shade-anchor'))
         .map((el) => ({ name: el.id || el.dataset.chatCommand || String(el.className).split(' ')[0], ...box(el) }));
-    const shade = bar.parentElement.querySelector('.rw-shade') || bar.querySelector('.rw-shade');
+    const shade = document.getElementById(trigger.getAttribute('aria-controls'));  // the work Shade, not the chip's
     const alpha = (color) => { const m = color.match(/rgba?\\(([^)]+)\\)/); if (!m) return color === 'transparent' ? 0 : 1;
         const parts = m[1].split(/[ ,/]+/).filter(Boolean); return parts.length > 3 ? parseFloat(parts[3]) : 1; };
     const reachable = [...(shade?.querySelectorAll('.rw-more, .rw-main') || [])].filter(visible).every((el) => {
         const r = el.getBoundingClientRect(); const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
         return Boolean(hit) && (hit === el || el.contains(hit)); });
-    return { bar: box(bar), title: box(title), trigger: box(trigger), neighbours, word: badge.textContent.trim(),
+    return { bar: box(bar), capsule: box(bar.querySelector('.app-page-title-row')), title: box(title), trigger: box(trigger),
+             neighbours, word: badge.textContent.trim(),
              clipped: badge.scrollWidth > badge.clientWidth + 0.5, note: !trigger.querySelector('.rw-sr').hidden,
              shade: shade && !shade.hidden ? box(shade) : null, shadeAlpha: shade ? alpha(getComputedStyle(shade).backgroundColor) : null,
              reachable, vw: innerWidth, vh: innerHeight, overflow: document.documentElement.scrollWidth - innerWidth };
@@ -1180,7 +1181,7 @@ def settle_unfold(page, room):
     """Wait until the room's Shade has finished unfolding (its 170 ms entrance slides it 6px), so geometry reads its
     resting place rather than a frame of the animation."""
     root = "#page-chat" if room == "main" else "#project-panel"
-    page.wait_for_function("""(root) => { const s = document.querySelector(`${root} .rw-shade`);
+    page.wait_for_function("""(root) => { const s = document.querySelector(`${root} .rw-shade:not(.cx-shade)`);
         return Boolean(s) && !s.hidden && !(s.getAnimations?.() || []).some((a) => a.playState === 'running'); }""",
                            arg=root, timeout=10_000)
     settle_frames(page)
@@ -1251,6 +1252,13 @@ def test_header_words_never_move_a_neighbour_or_resize_the_bar(room_ui, width, h
     evidence(f"bar-words-console-{tag}", transport.console)
 
 
+def assert_hangs_under_capsule(shade, capsule, what):
+    """The work list is a sheet of its own under the bar's capsules: from the status capsule's left edge, a gap
+    (``--space-2``, 8px) below it (DESIGN "Room work status")."""
+    assert abs((shade["y"] - capsule["bottom"]) - 8) <= 1.5, (what, "a gap below the status capsule", shade, capsule)
+    assert abs(shade["x"] - capsule["x"]) <= 1.5, (what, "from the status capsule's left edge", shade, capsule)
+
+
 def assert_project_backing(page):
     facts = page.locator("#project-panel").evaluate("""el => {
         const s = getComputedStyle(el);
@@ -1305,7 +1313,7 @@ def test_shade_geometry_light_dark_and_screenshots(room_ui, width, height, theme
         assert abs(opened["bar"]["h"] - closed["bar"]["h"]) <= 0.5, ("opening never resizes the bar", closed, opened)
         shade, bar = opened["shade"], opened["bar"]
         assert shade, opened
-        assert abs(shade["y"] - bar["bottom"]) <= 1.5, ("the Shade unfolds from the bar's bottom edge", shade, bar)
+        assert_hangs_under_capsule(shade, opened["capsule"], f"{room} {tag}")
         assert shade["x"] >= bar["x"] - 0.5 and shade["x"] + shade["w"] <= bar["x"] + bar["w"] + 0.5, (shade, bar)
         assert shade["x"] >= 0 and shade["x"] + shade["w"] <= opened["vw"] and shade["bottom"] <= opened["vh"], opened
         assert opened["shadeAlpha"] == 1, "content never shows through the Shade"

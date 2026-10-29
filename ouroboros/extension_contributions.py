@@ -23,28 +23,34 @@ HOST_ASSET_TYPES = {
 }
 
 
-def _capture_host_sources(skill, revision: str) -> dict[str, bytes]:
+def capture_browser_sources(skill, revision: str, *, paths: set[str] | None = None,
+                            max_bytes: int | None = None) -> dict[str, bytes]:
     """The page assets of the reviewed release, read while hashing it: the bytes captured are the bytes whose
     release digest (skill_identity, the skill's ``content_hash``) equals ``revision``."""
     root = skill.skill_dir.resolve()
     bucket = payload_bucket(root)
     sources, digests = {}, []
+    captured_bytes = 0
     for path in _iter_payload_files(root, manifest_entry=skill.manifest.entry, manifest_scripts=skill.manifest.scripts):
         rel = path.relative_to(root).as_posix()
-        capture = (rel.startswith("ui/") and path.suffix in HOST_ASSET_TYPES
+        capture = (rel in paths if paths is not None else
+                   rel.startswith("ui/") and path.suffix in HOST_ASSET_TYPES
                    and not any(part.startswith(".") for part in rel.split("/")))
         digest, content = hashlib.sha256(), bytearray()
         with path.open("rb") as stream:
             while chunk := stream.read(64 * 1024):
                 digest.update(chunk)
                 if capture:
+                    captured_bytes += len(chunk)
+                    if max_bytes is not None and captured_bytes > max_bytes:
+                        raise ValueError(f"browser files exceed {max_bytes} bytes")
                     content.extend(chunk)
         digests.append((rel, digest.digest()))
         if capture:
             sources[rel] = bytes(content)
     declaration = release_declaration(root, skill.manifest, bucket=bucket)
     if release_digest_from_file_digests(digests, declaration, bucket=bucket) != revision:
-        raise ValueError("payload changed while capturing host modules; reload the reviewed revision")
+        raise ValueError("payload changed while capturing browser files; reload the reviewed revision")
     return sources
 
 
@@ -59,7 +65,7 @@ def stage_contributions(api, skill, revision: str) -> None:
     sources = {}
     if (icon == "ui/icon.svg" or any(entry["icon"] == "ui/icon.svg" or entry["render"]["kind"] == "host" for entry in entries)):
         try:
-            sources = _capture_host_sources(skill, revision)
+            sources = capture_browser_sources(skill, revision)
         except (OSError, ValueError, RuntimeError) as exc:
             problems.append(f"contributes: {exc}")
         available = []
@@ -118,5 +124,17 @@ def project_contributions(skill: str, entries: list[dict], revision: str, label:
         render = row["render"]
         render["url"] = (prefix + f"ui/{quote(revision, safe='')}/" + quote(render.pop("entry"), safe="/")
                          if render["kind"] == "host" else "")
-        rows.append(row)
+        rows.append(project_place_status(row) if row.get("provides") == "place" else row)
     return rows
+
+
+def project_place_status(row: dict) -> dict:
+    """Expose the manifest's labels without executing its status source."""
+    return {**row, "labels": {fact["id"]: fact["label"] for fact in row.get("facts", []) if isinstance(fact, dict)}}
+
+
+def live_place_declarations() -> list[dict]:
+    """Read published manifest facts without dispatching any connector route."""
+    from ouroboros.extension_registry_state import live_contribution_projection
+
+    return [project_place_status(row) for row in live_contribution_projection() if row.get("provides") == "place"]

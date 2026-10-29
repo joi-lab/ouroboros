@@ -266,6 +266,41 @@ def test_the_marks_source_reader_survives_retention_packing_its_bytes(tmp_path):
     assert "PACKED-CRITIQUE" in source and f"sha256 {record['source_ref']['sha256'][:12]}" in source
 
 
+def test_a_foreign_focus_reads_the_marks_source_by_the_named_reader_never_the_authors_recipe(tmp_path):
+    """The producer's ``read_file(root='artifact_store')`` recipe resolves in the author's drive only (the
+    26.10 consciousness wake tried it and the digest as a CAS blob); the full mark names the reader every
+    focus has, for marks already stored with that recipe too, and the packed bytes read through it."""
+    from ouroboros import evidence_packer
+
+    shared.world(tmp_path)
+    seed_result(tmp_path, "main1", {"status": "completed", "chat_id": 1})
+    record = _record(tmp_path, "main1", 1, "FOREIGN-CRITIQUE")
+    assert '"tool": "read_file"' in json.dumps(record["source_ref"])  # the author-relative recipe stays stored
+    mark_id = publish_late_review(tmp_path, record).mark_id
+    evidence_packer.run_pass(tmp_path)  # no loose file is left at the author-relative path either
+    node = _memory_read(_ctx(tmp_path, "wake1", meta=WAKE), node_id=mark_id)
+    assert '"tool": "read_file"' not in node, "the author's recipe never reaches another focus"
+    shown = json.loads(re.search(r"\nsource: memory_read\(source_ref=(\{.*?\})\)", node).group(1))
+    assert shown["task_id"] == "main1" and shown["size"] == record["source_ref"]["size"]
+    assert "FOREIGN-CRITIQUE" in _memory_read(_ctx(tmp_path, "wake1", meta=WAKE), source_ref=shown)
+    plain = json.loads(_memory_mark(_ctx(tmp_path, "main1"), text="mine", task_id="main1"))
+    assert "\nsource: " not in _memory_read(_ctx(tmp_path, "main1"), node_id=plain["mark_id"])  # other targets unchanged
+
+
+def test_a_retained_source_is_read_without_the_chronicle_and_other_modes_still_wait(tmp_path, monkeypatch):
+    from ouroboros.tools import chronicle
+
+    shared.world(tmp_path)
+    ref, _data = _source(tmp_path, "main1", "NO-CHRONICLE-NEEDED")
+
+    def pending(_root):
+        raise chronicle._NotActivated({"kind": "import_pending"})
+
+    monkeypatch.setattr(chronicle, "_activated", pending)
+    assert "NO-CHRONICLE-NEEDED" in _memory_read(_ctx(tmp_path, "wake1"), source_ref={**ref, "task_id": "main1"})
+    assert "memory is not active" in _memory_read(_ctx(tmp_path, "wake1"), room_id=1)
+
+
 def _owed_rows(root):
     from ouroboros import store
     from ouroboros.late_review_marks import OWED_SET
@@ -291,6 +326,8 @@ def _sweep(root, monkeypatch):
     monkeypatch.setattr(preparation, "recover_interrupted_preparations", lambda *_a, **_kw: None)
     monkeypatch.setattr(maintenance_child, "tick", lambda *_a, **_kw: None)
     maintenance._run_periodic_reconcile_sweep([0], latch=SimpleNamespace(release=lambda: None))
+    from ouroboros.maintenance import run_job
+    run_job(root, "ended_plan_asks")
 
 
 def test_a_failed_publication_stays_owed_and_one_replay_after_restart_places_it_once(tmp_path, monkeypatch):
@@ -534,6 +571,8 @@ def test_an_unreadable_producer_keeps_the_seat_pending_until_a_later_pass_places
         fault.setattr(observability, "read_call_payload", unreadable)
         _sweep(h.drive, monkeypatch)
     assert _plan_marks(h.drive) == [] and _participant(h, "s1")["status"] == "pending"
+    from ouroboros.maintenance_jobs import record
+    record(h.drive, "ended_plan_asks", state="pending")  # explicit source repair
     _sweep(h.drive, monkeypatch)
     [mark] = _plan_marks(h.drive)
     assert mark["review"]["subject"]["seat_id"] == "s1"

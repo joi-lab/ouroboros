@@ -385,7 +385,7 @@ def test_base_head_subject_reads_an_isolated_checkout_in_the_data_root(tmp_path)
 
     with isolated_checkout(ctx, spec) as frozen:
         checkout = pathlib.Path(frozen.checkout)
-        assert checkout.is_dir() and checkout.parent.parent == checkouts_root and checkout.name == "repo"
+        assert checkout.is_dir() and checkout.parent.parent == checkouts_root and checkout.name == "repo.noindex"
         assert frozen.review_root == str(checkout) and not frozen.is_system_index
         assert (frozen.spec.base, frozen.spec.head) == (base, head)  # resolved to exact shas
         assert frozen.parent_sha == base and frozen.tree_sha == _out(foreign, "rev-parse", f"{head}^{{tree}}")

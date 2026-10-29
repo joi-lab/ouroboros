@@ -2,11 +2,15 @@
 import { fetchJson } from './api_client.js';
 import {
     agentsStepHtml,
+    EARLIER_SAVE_KEPT_TEXT,
+    EARLIER_SAVE_OTHER_VALUES_TEXT,
+    completionAttemptId,
     completionFailureNotice,
     createAgentsStep,
     familyLabels,
     onboardingSettingsDraft,
-    readCompletionAnswer,
+    postCompletion,
+    readCompletionAttempt,
 } from './onboarding_agents_step.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 import { bindLanguageSettings, languageBlockHtml, saveLanguageChoice } from './settings_language.js';
@@ -88,10 +92,12 @@ import { createStarterSkillsRow } from './onboarding_starter_skills.js';
         recoveryPrepared: false,
         recoveryMain: '',
         presetFailure: null,
-        // Set when completion answered 503 `settings_save_timeout`: the save is
-        // still running in the server, so the wizard offers "Check status"
-        // instead of a blind retry (a second write over an unknown first).
-        saveUnknown: false,
+        // The id of the last save whose outcome is unknown (503 `settings_save_timeout`, a lost or
+        // unreadable answer): "Check status" reads back exactly that attempt instead of a blind retry
+        // (a second write over an unknown first). Any new explicit save replaces it; one refused before
+        // writing anything hands it back. `saveAttemptDraft` is the values that attempt carried.
+        saveAttempt: '',
+        saveAttemptDraft: '',
         // Set once completion SUCCEEDED but the receipt says the saved runtime
         // mode needs a restart, in the one shell that cannot restart anything.
         completedRestartMode: '',
@@ -634,6 +640,20 @@ import { createStarterSkillsRow } from './onboarding_starter_skills.js';
     }
 
     function catalogDraft() { return agentsStep?.availableSubagents || state.availableSubagents; }
+    // Everything one explicit save sends but its attempt id (the staged language is applied after, on its own): Start
+    // posts it, and a confirmed attempt completes the wizard only while this still equals what that attempt sent.
+    function completionPayload() {
+        return {
+            // Observations are not authority: the endpoint re-proves eligibility.
+            subscriptionsConnected: state.agentsConnected.length > 0,
+            skipSubscriptionPresets: state.skipSubscriptionPresets,
+            ...draftSettings(),
+            // Completion validates this visible draft and never replaces it.
+            OUROBOROS_SUBAGENTS: catalogDraft(),
+            ...(agentsStep?.allowEmptyReviewPool ? { [ALLOW_EMPTY_REVIEW_POOL]: true } : {}),
+            ...starterSkills.payload(),
+        };
+    }
 
     function reviewerSummary(row) {
         const account = row.route?.credential_profile_id;
@@ -992,9 +1012,9 @@ import { createStarterSkillsRow } from './onboarding_starter_skills.js';
             </div>
             <div class="panel-card">
                 <h3>Runtime mode takes effect at the next boot</h3>
-                <p>Ouroboros saved <code>${escapeHtml(state.completedRestartMode)}</code> as the runtime mode for the next boot, but this
+                <div class="wizard-inline-note">Ouroboros saved <code>${escapeHtml(state.completedRestartMode)}</code> as the runtime mode for the next boot, but this
                 process is still running the mode it started with. Restart Ouroboros to run in the mode you chose.
-                Opening the app now works — it simply runs in the previous mode until you do.</p>
+                Opening the app now works — it simply runs in the previous mode until you do.</div>
                 <div class="wizard-runtime-strip">
                     <button type="button" class="btn btn-primary" id="open-app-btn">Open Ouroboros in the current mode</button>
                 </div>
@@ -1035,7 +1055,7 @@ import { createStarterSkillsRow } from './onboarding_starter_skills.js';
         // running in the server) makes "Check status" the primary action and
         // the re-submit an explicit, secondary "Retry save" — never the default
         // button beside it, which re-POSTed a second write over the first.
-        const saveUnknown = state.currentStep === 'summary' && state.saveUnknown;
+        const saveUnknown = state.currentStep === 'summary' && Boolean(state.saveAttempt);
         const nextLabel = state.currentStep === 'summary'
             ? (state.saving ? 'Saving...' : (saveUnknown ? 'Retry save' : 'Start Ouroboros'))
             : 'Continue';
@@ -1053,7 +1073,7 @@ import { createStarterSkillsRow } from './onboarding_starter_skills.js';
                     ${renderStepContent()}
                     ${state.completedRestartMode ? '' : `
                     <div class="wizard-footer">
-                        <div class="footer-copy">${escapeHtml(meta.footer)}</div>
+                        <div class="footer-copy">${escapeHtml(saveUnknown ? 'The last save did not return a confirmed result.' : meta.footer)}</div>
                         <div class="footer-actions">
                             <button class="btn btn-secondary" id="back-btn" type="button" ${index === 0 || state.saving || state.preparingRecovery ? 'disabled' : ''}>Back</button>
                             ${state.currentStep === 'accounts' ? `<button class="btn btn-secondary" id="quick-start-btn" type="button" ${hasModelSubscription() ? '' : 'hidden'}>Review &amp; start</button>` : ''}
@@ -1371,69 +1391,50 @@ import { createStarterSkillsRow } from './onboarding_starter_skills.js';
         render();
     }
 
+    let checkOwner = 0;   // the newest "Check status"; an older one's answer is never acted on
+
     async function checkSaveStatus() {
-        // Completion answered 503 `settings_save_timeout`: its body kept running in the server past the shared writer
-        // bound, so whether the bytes landed is UNKNOWN (`saved: null`) and a retry would be a second write. Re-read the
-        // readiness probe the overlay itself gates on — 204 means a startup-ready provider is on disk, i.e. the
-        // transaction landed — and proceed exactly as a completion receipt would; otherwise stay open.
+        // The completion's answer did not say what happened (503 `settings_save_timeout`, `saved: null`, a lost or unreadable
+        // reply). Read back THIS attempt by the id the wizard sent, never the readiness probe a provider saved earlier already
+        // passes: only its own receipt completes, exactly as the reply would have; a recorded failure shows as that reply
+        // would have; stored-but-finishing and unconfirmed keep the draft and send nothing.
+        if (state.saving || !state.saveAttempt) return;
+        const owner = ++checkOwner;
+        const attempt = state.saveAttempt;
         state.error = '';
         render();
-        let status = 0;
-        try {
-            const response = await fetch('/api/onboarding', { method: 'GET', headers: { Accept: 'application/json' } });
-            status = response.status;
-        } catch (error) {
-            state.error = `Could not check the save status: ${String(error?.message || error)}. Try again in a moment.`;
-            render();
-            return;
+        const outcome = await readCompletionAttempt(attempt);
+        // Retry save (a new attempt), a newer check or leaving the page retired this answer: it touches nothing of theirs.
+        if (disposed || owner !== checkOwner || attempt !== state.saveAttempt) return;
+        if (!['completed', 'failed'].includes(outcome.state)) { state.error = outcome.text; return render(); }
+        if (outcome.state === 'completed' && state.saveAttemptDraft !== JSON.stringify(completionPayload())) {
+            // That save is confirmed, but the values shown changed after it was sent: its receipt does not complete them.
+            Object.assign(state, { saveAttempt: '', saveAttemptDraft: '', error: EARLIER_SAVE_OTHER_VALUES_TEXT });
+            return render();
         }
-        if (status === 204) {
-            // The transaction landed. Its staged language needs the settings lock the finishing save may still hold: while that writer answers busy, stay with the draft so the next check applies it.
-            if (!(await applyStagedLanguage())) {
-                state.error = 'Setup is saved. The interface language is still being applied — check again in a moment. If this repeats, choose English or a code such as pt-BR in the control above and check again.';
-                return render();
-            }
-            state.saveUnknown = false;
-            await agentsStep?.disposeForCompletion();
-            agentsStep = null;
-            // The receipt's `restart_required` never arrived: the boot-pinned
-            // mode is what the page loaded with, so a changed choice is treated
-            // as needing a restart — the honest side to err on.
-            announceCompletion({
-                runtime_mode: state.runtimeMode,
-                restart_required: trim(state.runtimeMode) !== trim(INITIAL_STATE.runtimeMode),
-            });
-            return;
-        }
-        state.error = 'Setup is not complete yet — the save may still be running in the server. Check again in a moment; if it never completes, finish setup again.';
+        // Acted on as the save's own reply is: Start/Retry stay held, as in saveWizard, until it has settled.
+        state.saving = true;
         render();
+        if (outcome.state === 'failed') return showCompletionFailure(outcome.failure);
+        // Its staged language needs the settings lock the finishing save may still hold: while that writer answers busy, stay with the draft so the next check applies it.
+        if (!(await applyStagedLanguage())) {
+            state.saving = false;
+            state.error = 'Setup is saved. The interface language is still being applied — check again in a moment. If this repeats, choose English or a code such as pt-BR in the control above and check again.';
+            return render();
+        }
+        state.saveAttempt = '';
+        await agentsStep?.disposeForCompletion();
+        agentsStep = null;
+        if (!disposed) announceCompletion(outcome.receipt);
     }
 
     async function completeOnboardingAtomically(payload) {
         // The atomic completion (D-8): server-side fresh-install proof, the
         // structural provider gate, optional agent-preset compilation, a single
-        // persist, then supervisor start.
-        const response = await fetch(ONBOARDING_COMPLETE_ENDPOINT, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        });
-        // A body that will not parse is UNKNOWN, not empty. Substituting `{}`
-        // made a 200 carrying HTML (a proxy error page, a login redirect) look
-        // like a completion, and `{}` being truthy meant the caller announced
-        // success with `restart_required` silently gone.
-        let data = null;
-        let parsed = true;
-        try {
-            data = await response.json();
-        } catch (err) {
-            parsed = false;
-        }
-        if (!data || typeof data !== 'object') { data = {}; parsed = false; }
-        // ONE reader for both answers (typed refusal, success envelope); the branches are node-tested in onboarding_agents_step.js.
-        const answer = readCompletionAnswer({
-            status: response.status, ok: response.ok, parsed, data,
-        });
+        // persist, then supervisor start. ONE reader for every answer — typed
+        // refusal, success envelope, a body that will not parse (unknown, never
+        // `{}`), none at all — node-tested in onboarding_agents_step.js.
+        const answer = await postCompletion(ONBOARDING_COMPLETE_ENDPOINT, payload);
         if (answer.failure) {
             const error = new Error(answer.failure.message);
             Object.assign(error, answer.failure);
@@ -1497,32 +1498,37 @@ import { createStarterSkillsRow } from './onboarding_starter_skills.js';
         if (state.error) return syncCurrentStepActionState();
         state.saving = true;
         state.error = '';
+        // This save supersedes an earlier unknown one, so a late answer to that never confirms this one,
+        // and it retires a check still reading that one.
+        const earlier = { attempt: state.saveAttempt, draft: state.saveAttemptDraft };
+        state.saveAttempt = '';
+        checkOwner += 1;
         render();
-        const payload = {
-            // Observations are not authority: the endpoint re-proves eligibility.
-            subscriptionsConnected: state.agentsConnected.length > 0,
-            skipSubscriptionPresets: state.skipSubscriptionPresets,
-            ...onboardingSettingsDraft({ state, providerFields: PROVIDER_FIELDS, budgetFields: BUDGET_FIELDS, modelSlots: MODEL_SLOTS, trim }),
-            // Completion validates this visible draft and never replaces it.
-            OUROBOROS_SUBAGENTS: catalogDraft(),
-            ...(agentsStep?.allowEmptyReviewPool ? { [ALLOW_EMPTY_REVIEW_POOL]: true } : {}),
-            ...starterSkills.payload(),
-        };
+        const attempt = completionAttemptId();
+        const sent = completionPayload();
+        const draft = JSON.stringify(sent);
+        const payload = { ...sent, attempt_id: attempt };
         try {
             await saveWizardPayload(payload);
             starterSkills.destroy();
         } catch (error) {
-            // The wizard STAYS OPEN with the real reason. A typed preset refusal
-            // wrote nothing, so the offered escape is honest: finish without the
-            // agent defaults and keep everything editable in Settings.
-            const notice = completionFailureNotice(error);
-            if (notice.saved) await applyStagedLanguage();   // the settings landed (a later step failed): the staged language goes with them
-            state.saving = false;
-            state.presetFailure = notice.canSkip ? { code: notice.code } : null;
-            state.saveUnknown = Boolean(notice.saveUnknown);
-            state.error = notice.text;
-            render();
+            await showCompletionFailure(error, { attempt, draft }, earlier);
         }
+    }
+
+    // The wizard STAYS OPEN with the real reason. A typed preset refusal wrote nothing, so the offered escape is
+    // honest: finish without the agent defaults and keep everything editable in Settings. An unknown outcome keeps
+    // its attempt for "Check status"; a refusal that wrote nothing keeps the earlier unknown one, and says so.
+    async function showCompletionFailure(error, sent = {}, earlier = {}) {
+        const notice = completionFailureNotice(error);
+        if (notice.saved) await applyStagedLanguage();   // the settings landed (a later step failed): the staged language goes with them
+        state.saving = false;
+        state.presetFailure = notice.canSkip ? { code: notice.code } : null;
+        const kept = notice.saveUnknown ? sent : (notice.saved === false && earlier.attempt ? earlier : {});
+        state.saveAttempt = kept.attempt || '';
+        state.saveAttemptDraft = kept.draft || '';
+        state.error = kept === earlier ? `${notice.text} — ${EARLIER_SAVE_KEPT_TEXT}` : notice.text;
+        render();
     }
 
     function bindEvents() {

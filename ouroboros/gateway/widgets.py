@@ -48,11 +48,33 @@ class WidgetTab(TypedDict):
     span: int
     grid_span: int
     revision: str
+    generation: NotRequired[str]
     pinned_card: NotRequired[bool]
 
 
 class WidgetsResponse(TypedDict):
     ui_tabs: List[WidgetTab]
+
+
+class WidgetAssetLeaseRequest(TypedDict):
+    skill: str
+    tab_id: str
+    generation: str
+
+
+class WidgetAssetTokenRequest(TypedDict):
+    token: str
+
+
+class WidgetAssetRevokeResponse(TypedDict):
+    ok: bool
+
+
+class WidgetAssetLeaseResponse(TypedDict):
+    token: str
+    base_url: str
+    expires_in: int
+    renew_after: int
 
 
 class WidgetFaultRequest(TypedDict):
@@ -109,9 +131,10 @@ def widget_tabs() -> List[WidgetTab]:
         # revision comes straight from the live tab (frame geometry stays in
         # ``render``, which is where the page reads it).
         card: Dict[str, Any] = {
-            name: tab.get(name) for name in WidgetTab.__annotations__ if name not in {"revision", "pinned_card"}
+            name: tab.get(name) for name in WidgetTab.__annotations__ if name not in {"revision", "generation", "pinned_card"}
         }
         card["revision"] = row["revision"]
+        card["generation"] = row["generation"]
         tabs.append(card)  # type: ignore[arg-type]
     return tabs
 
@@ -156,8 +179,11 @@ def _fault_record(body: Dict[str, Any]) -> Dict[str, Any] | None:
     record = {name: body[name] for name in WidgetFaultRequest.__annotations__}
     # JS clips UTF-16 units: a boundary can split an emoji. Keep the bounded
     # report, replacing only unpaired surrogates before the UTF-8 log writer.
+    from ouroboros.gateway.widget_assets import redact_asset_links
+
     for name in ("message", "source"):
         record[name] = record[name].encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+        record[name] = redact_asset_links(record[name])
     return record
 
 

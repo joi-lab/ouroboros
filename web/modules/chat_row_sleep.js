@@ -26,13 +26,14 @@ const ADDED_FRAMES = 2;     // a row added is laid out by the next frame; it sle
 const CHANGED_FRAMES = 30;  // a row that changes often (a streaming answer, a live card) stays awake while it does
 const HELD_FRAMES = 12;     // a width that held this long has stopped moving (chat_reading_position.js)
 // What changes a row's size besides its text and children: its classes, a part hidden or opened, an inline size,
-// a picture's source, a note a deck tucks away or brings back (chat_relay_deck.js).
-const RESIZING = ['class', 'hidden', 'open', 'style', 'src', 'data-deck-tucked'];
+// a picture's source, a note a deck tucks away or brings back, the ledges a stack's front card reserves room for
+// (chat_relay_deck.js).
+const RESIZING = ['class', 'hidden', 'open', 'style', 'src', 'data-deck-tucked', 'data-deck-edges'];
 // What on the page's root restyles every row: the theme, the layout, the language and its direction.
 const RESTYLING = ['data-theme', 'data-layout', 'lang', 'dir'];
 const ROWS = '.chat-bubble, .chat-live-card';  // the rows that sleep; a history control or notice never does
 const NEAR = '100% 0px';  // within the feed's own height above and below its view
-const WINDOW_SIZED = '.chat-review-attempt-detail, .skill-review-full, .widget-json pre, .widget-chart-canvas';
+const WINDOW_SIZED = '.review-facts[open] > .review-facts-body, .skill-review-full, .widget-json pre, .widget-chart-canvas';
 
 // `onRestyle`: the room's reading owner places the passage again once a restyle (theme, layout, language, fonts) has
 // woken every row: rows far from the view change size at once, which WebKit's scroll anchoring does not absorb.

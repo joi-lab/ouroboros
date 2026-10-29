@@ -75,28 +75,28 @@ def _skill_finalization_message(drive_root: pathlib.Path, llm_trace: Dict[str, A
     )
 
 
-def _force_plan_decision(
+def _plan_gate_decision(
     ctx: Any,
     _llm_trace: Dict[str, Any],
     *,
     hard_rail: str = "",
 ) -> Dict[str, Any]:
-    """Project force-plan finalization from existing review + policy SSOTs."""
-    from ouroboros.owner_hurry import force_plan_decision
+    """Project plan finalization from existing review + policy SSOTs."""
+    from ouroboros.owner_hurry import plan_gate_decision
 
-    return force_plan_decision(
+    return plan_gate_decision(
         ctx, _llm_trace, hard_rail=hard_rail,
         enforcement=_loop().get_review_enforcement(),
     )
 
 
-def _force_plan_reminder(decision: Dict[str, Any]) -> str:
+def _plan_gate_reminder(decision: Dict[str, Any]) -> str:
     from ouroboros.owner_hurry import plan_review_reminder
 
     return plan_review_reminder(decision)
 
 
-def _force_plan_disclosure(
+def _plan_gate_disclosure(
     ctx: Any,
     llm_trace: Dict[str, Any],
     *,
@@ -107,11 +107,11 @@ def _force_plan_disclosure(
     # permission; forced rails recompute with their explicit rail input.
     from ouroboros.owner_hurry import plan_review_disclosure
 
-    projected = llm_trace.get("force_plan_decision")
+    projected = llm_trace.get("plan_gate", llm_trace.get("force_plan_decision"))
     decision = (
         projected
         if not forced_reason and isinstance(projected, dict)
-        else _loop()._force_plan_decision(ctx, llm_trace, hard_rail=forced_reason)
+        else _loop()._plan_gate_decision(ctx, llm_trace, hard_rail=forced_reason)
     )
     return plan_review_disclosure(decision, forced_reason)
 
@@ -211,10 +211,15 @@ def _inject_round_checkpoints(
     budget_remaining_usd: Optional[float] = None,
     cost_ceiling: Optional["task_pacing.CostCeiling"] = None,
     active_use_local: bool = False,
+    llm_trace: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Inject this round's time and cost threshold notices AFTER owner messages, so a
     notice joins the LLM-call tail (a normal user turn, never a paid round of its
-    own). Returns whether any was injected."""
+    own), then the locators of timed-out calls that settled since (``late_tool_results``):
+    this already-authorized send carries them, nothing is scheduled for them.
+    Returns whether any was injected."""
+    from ouroboros.late_tool_results import deliver_late_results
+
     time_budget = _maybe_inject_time_budget_milestone(
         messages, tools, event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
         accumulated_usage=accumulated_usage,
@@ -225,7 +230,8 @@ def _inject_round_checkpoints(
         accumulated_usage=accumulated_usage, round_idx=round_idx, active_use_local=active_use_local,
         event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
     )
-    return bool(time_budget or cost_budget)
+    late = deliver_late_results(messages, tools._ctx, llm_trace, drive_logs, _loop()._append_or_merge_user_message)
+    return bool(time_budget or cost_budget or late)
 
 
 def _forced_delegation_note(tools_ctx: Any, llm_trace: Dict[str, Any]) -> str:

@@ -33,16 +33,18 @@ from urllib.parse import quote, urlencode
 
 import httpx
 
-from ouroboros.gateways.claudexor_maintenance import ClaudexorMaintenanceGateway
-from ouroboros.gateways import claudexor_metadata as metadata
-from ouroboros.effort_evidence import validated_effort_resolution, validated_prompt_cache_ttl
-from ouroboros.observability import timed_phase
-
 from ouroboros.config import (
     CLAUDEXOR_MIN_VERSION,
     CLAUDEXOR_PROTOCOL_MAJOR,
     get_claudexor_quota_refresh_timeout_sec,
 )
+from ouroboros.effort_evidence import validated_effort_resolution, validated_prompt_cache_ttl
+from ouroboros.gateways import claudexor_metadata as metadata
+from ouroboros.gateways.claudexor_identity import validated_catalog_match
+from ouroboros.gateways.claudexor_maintenance import ClaudexorMaintenanceGateway
+from ouroboros.gateways.claudexor_observation import ClaudexorObservationGateway
+from ouroboros.gateways.claudexor_uploads import ClaudexorUploadGateway
+from ouroboros.observability import timed_phase
 
 log = logging.getLogger(__name__)
 
@@ -63,9 +65,8 @@ _READ_TIMEOUT_SEC = 60.0
 # itself to (measured, 4.51s of wall against a 4.2s window, and that was a fast daemon).
 # Five seconds is a real answer from a healthy loopback daemon and a rounding error
 # against the finalization grace the clamp reserves. It bounds the READ phase only:
-# `_request` applies the caller bound to every HTTPX phase. Strict review polls add
-# their total wall-clock bound outside this phase-local adapter.
-# Passed per request via ``_request(timeout_sec=...)``; it never changes the default.
+# `_request` applies the caller bound to every HTTPX phase. Strict review polls add their
+# total wall-clock bound outside this phase-local adapter. Passed per request, never the default.
 SHORT_POLL_TIMEOUT_SEC = 5.0
 # The httpx failures a READ-ONLY observer may retry as the same unresolved read: the
 # socket delivered no daemon answer, so nothing is known about the run and nothing
@@ -210,6 +211,9 @@ def run_failure_error(run_id: str, run_state: str, failure: Any) -> ClaudexorUna
     exc = (_window_exhausted_refusal(code, message, failure.get("resetsAt"))
            or ClaudexorUnavailable(code or f"run_{run_state or 'unknown'}", message))
     exc.reported_cause = run_failure_cause(failure)
+    from ouroboros.observability import redact_projection
+
+    exc.failure_details = redact_projection(failure).value
     return exc
 
 
@@ -427,7 +431,7 @@ def run_message_supported(operations: list[dict]) -> bool:
     )
 
 
-class ClaudexorGateway(ClaudexorMaintenanceGateway):
+class ClaudexorGateway(ClaudexorUploadGateway, ClaudexorMaintenanceGateway, ClaudexorObservationGateway):
     """Thin typed client over the Claudexor ``/v2`` control API."""
 
     def __init__(self, endpoint: Optional[DaemonEndpoint] = None, *, home: Optional[pathlib.Path] = None):
@@ -725,8 +729,7 @@ class ClaudexorGateway(ClaudexorMaintenanceGateway):
             if status.get("uploadId") != upload_id:
                 raise ClaudexorUnavailable("malformed_response", "Model upload status identity mismatch")
             if status.get("state") == "open":
-                self._request("PUT", f"{path}/bytes", content_body=data,
-                              headers={"Content-Type": "application/octet-stream"})
+                self.put_upload_bytes(upload_id, data)
             elif status.get("state") != "uploaded":
                 raise ClaudexorUnavailable("model_upload_unavailable", "Model upload is not ready for finalization")
         resource = _model_object(self._request(
@@ -1534,12 +1537,9 @@ def attempt_containment(run_dir: str) -> List[AttemptContainment]:
 
 
 def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, Any]:
-    """Read the final attempt's route and effort facts from engine-owned telemetry.
-
-    The summary's model and harnesses echo the request; its route/authRoute
-    projections may borrow facts from earlier attempts. Only the unique row
-    named by final_attempt_id belongs to the delivered result. Missing facts
-    stay unknown, never filled from another attempt or the request.
+    """Read one final attempt's raw model/harness/profile and effort/cache facts.
+    Summary/authRoute may borrow earlier attempts; request echoes never fill gaps.
+    Catalog proof only supplements this run-bound row's observed identity.
     """
     summary = detail.get("summary") if isinstance(detail, dict) else None
     if not isinstance(summary, dict) or not isinstance(run_id, str) or not run_id.strip():
@@ -1548,6 +1548,7 @@ def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, Any]:
     if not isinstance(run_dir, str) or not run_dir.strip():
         return {}
     import yaml  # type: ignore
+
     from ouroboros.delegate_custody_usage import held_run_names
 
     try:
@@ -1575,6 +1576,8 @@ def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, Any]:
         facts["effort_resolution"] = validated_effort_resolution(row["effort_resolution"])
     if "prompt_cache_ttl" in row:
         facts["prompt_cache_ttl"] = validated_prompt_cache_ttl(row["prompt_cache_ttl"])
+    if "observed_model_catalog_match" in row:
+        facts["observed_model_catalog_match"] = validated_catalog_match(row["observed_model_catalog_match"], facts)
     return facts
 
 

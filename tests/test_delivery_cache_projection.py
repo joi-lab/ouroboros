@@ -2,6 +2,8 @@
 from copy import deepcopy
 from dataclasses import replace
 import json
+import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -90,8 +92,13 @@ def test_real_png_auto_batches_share_eviction_projection_with_fit_and_all_wire_b
     for wire in _wires(messages, monkeypatch).values():
         assert _images(wire["messages"]) == _images(messages)
         assert "_host_context_kind" not in json.dumps(wire)
+        assert "_source_sha256" not in json.dumps(wire)
     assert [m["role"] for m in messages[len(before):len(before) + len(rows)]] == ["tool"] * len(rows)
-    assert all(row["image_attachment"] == {"status": "attached"} for row in trace["tool_calls"])
+    for row, original in zip(trace["tool_calls"], originals[MAX_LIVE_IMAGE_BLOCKS:]):
+        fact = row["image_attachment"]
+        assert fact["status"] == "attached"
+        assert Path(fact["source_path"]).read_bytes() == original
+        assert fact["source_sha256"] == hashlib.sha256(original).hexdigest()
     assert [path.read_bytes() for path in paths] == originals
     # Direct attachments share the same sequence of high-water batch evictions.
     ctx.messages = deepcopy(initial)

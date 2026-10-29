@@ -213,6 +213,28 @@ def read_source(drive_root: Any, task_id: str, ref: Dict[str, Any]) -> bytes:
     return read_actor_source_bytes(drive_root, str(entry.get("task_id") or task_id), entry.get("ref"))
 
 
+class ReviewSourceChanged(ValueError):
+    """The exact selected source is no longer named by its owning record."""
+
+
+def read_selected_source(drive_root: Any, task_id: str, record_id: str, seat_id: str, *,
+                         role: str, part: str, sha256: str) -> bytes:
+    """Resolve an exact owned seat source, including an earlier selection after settlement."""
+    record = load_record(drive_root, record_id)
+    if not record or record.get("task_id") != task_id:
+        raise LookupError("Review does not belong to this task.")
+    seats = [row for row in record.get("rows") or [] if isinstance(row, dict) and row.get("seat_id") == seat_id]
+    if len(seats) != 1:
+        raise LookupError("Saved reviewer seat is unavailable.")
+    sources = [*seats[0].get("source_refs", []), *seats[0].get("historical_source_refs", [])]
+    selected = next((s for s in sources if isinstance(s, dict) and s.get("role") == role
+                     and str(s.get("part") or "") == part and s.get("status") == "retained"
+                     and isinstance(s.get("ref"), dict) and s["ref"].get("sha256") == sha256), None)
+    if selected is None:
+        raise ReviewSourceChanged("The selected saved review source changed or is unavailable.")
+    return read_source(drive_root, task_id, selected)
+
+
 def source_ref_resolvable(drive_root: Any, task_id: str, ref: Dict[str, Any]) -> bool:
     """Cheap existence+size check of one retained ref (the full read verifies sha)."""
     if not isinstance(ref, dict):
@@ -239,7 +261,8 @@ def record_sources_resolvable(drive_root: Any, payload: Dict[str, Any]) -> bool:
     except ValueError:
         return False
     task_id = str(payload.get("task_id") or "")
-    refs = [ref for row in payload.get("rows") or [] for ref in (row or {}).get("source_refs") or []]
+    refs = [ref for row in payload.get("rows") or [] for key in ("source_refs", "historical_source_refs")
+            for ref in (row or {}).get(key) or []]
     refs.extend([((payload.get("brief") or {}).get("dispute_input") or {}).get("rebuttal"),
                  (payload.get("author_decision") or {}).get("source_ref")])
     return all(source_ref_resolvable(drive_root, task_id, ref) for ref in refs if isinstance(ref, dict) and "role" in ref)
@@ -489,13 +512,15 @@ def newest_rotation_ts(drive_root: Any) -> str:
 
 
 def _index_rows(drive_root: Any, *, task_id: str = "", surface: str = "", limit: Optional[int] = None,
-                hot_only: bool = False) -> List[Dict[str, Any]]:
+                hot_only: bool = False, exact_task: bool = False) -> List[Dict[str, Any]]:
     seen: Dict[str, int] = {}
     out: List[Dict[str, Any]] = []
     paths = [index_path(drive_root)] + ([] if hot_only else [*reversed(_index_segments(drive_root))])
     for row in _newest_rows(paths):
         record_id = str(row.get("record_id") or "")
         if not record_id or (task_id and task_id not in (row.get("task_id"), row.get("root_task_id"))):
+            continue
+        if exact_task and row.get("task_id") != task_id:
             continue
         if surface and str(row.get("surface") or "") != surface:
             continue
@@ -508,6 +533,14 @@ def _index_rows(drive_root: Any, *, task_id: str = "", surface: str = "", limit:
         if limit is not None and len(out) >= limit:
             break
     return out
+
+
+def task_record_page(drive_root: Any, task_id: str, *, offset: int = 0, limit: int = 20,
+                     hot_only: bool = False) -> tuple:
+    """Exact-task index page and next offset; stop after one matching lookahead row."""
+    rows = _index_rows(drive_root, task_id=task_id, exact_task=True, limit=offset + limit + 1, hot_only=hot_only)
+    end = offset + limit
+    return rows[offset:end], end if len(rows) > end else None
 
 
 def recent_records(drive_root: Any, task_id: str = "", limit: int = 20, *, hot_only: bool = False,
@@ -561,8 +594,11 @@ def normalize_model_name(text: Any) -> str:
     if not value or value == UNKNOWN:
         return UNKNOWN
     if "::" in value:
-        provider, _, value = value.partition("::")
-        if provider == "claudexor":
+        from ouroboros.provider_models import parse_model_route
+
+        claudexor = parse_model_route(value).kind == "claudexor"
+        value = value.partition("::")[2]
+        if claudexor:
             value = value.partition("=")[2] or value
     return value.rsplit("/", 1)[-1].split(":", 1)[0] or UNKNOWN
 
@@ -918,7 +954,7 @@ def _apply_raw(seat: Dict[str, Any], raw: Dict[str, Any]) -> None:
     seat.update(status=status,
                 parts_answered=[p for p in seat["parts"] if seat["answers"][p]["status"] == ANSWER_RESPONDED],
                 usd=raw.get("cost_usd"),  # reported money and operation completion are separate facts
-                raw_text=str(raw.get("raw_text") or ""),
+                raw_text=str(raw.get("raw_text") or (raw.get("error") if not answered else "") or ""),
                 critical_count=sum(int(seat["answers"][p].get("critical") or 0) for p in seat["parts"]),
                 operation_state=str(raw.get("operation_state") or ("settled" if answered else status)))
     seat.update(review_cost_facts(seat["usd"], route=seat["requested"]["route"], model=seat["requested"]["model"]))
@@ -926,6 +962,8 @@ def _apply_raw(seat: Dict[str, Any], raw: Dict[str, Any]) -> None:
         seat["outcome"] = dict(outcome)
     else:
         seat.pop("outcome", None)  # A legacy terminal cannot retain an earlier pending interpretation.
+    for key in TYPED_FAILURE_FACT_KEYS:
+        seat.pop(key, None)  # A settling answer must not inherit a pending timeout's failure facts.
     seat.update({key: raw[key] for key in TYPED_FAILURE_FACT_KEYS if key in raw})
     if not answered and not seat_open(seat) and not seat.get("reported_cause"):
         # The row outlives the raw answer and the side files: a failed seat keeps its producer's own
@@ -1019,9 +1057,32 @@ def _retain_wave_sources(drive_root: Any, task_id: str, record_id: str, rows: Li
         # One retained text, named by every seat that was given it, each with ITS parts.
         seat["source_refs"].append(dict(refs[sha], seat_id=seat["seat_id"], part=",".join(seat["parts"])))
     for seat in rows:
-        if seat.get("raw_text"):
-            seat["source_refs"].append(retain_text_source(drive_root, task_id, record_id=record_id, seat_id=seat["seat_id"],
-                                                          role="response", part=",".join(seat["parts"]), text=seat["raw_text"]))
+        _retain_seat_text(drive_root, task_id, record_id, seat)
+
+
+def _retain_seat_text(drive_root: Any, task_id: str, record_id: str, seat: dict) -> None:
+    """Pending notes remain historical evidence; only terminal answers/failures are current sources."""
+    if seat.get("raw_text"):
+        pending = seat_open(seat)
+        role = "pending" if pending else "response" if seat.get("status") in ANSWERED_STATUSES else "failure"
+        seat.setdefault("historical_source_refs" if pending else "source_refs", []).append(retain_text_source(
+            drive_root, task_id, record_id=record_id, seat_id=seat["seat_id"], role=role,
+            part=",".join(seat["parts"]), text=seat["raw_text"]))
+
+
+def seat_text_source(seat: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The one saved text a reader shows for a seat, selected without reading: the current ``response``,
+    else the current ``failure`` note, else the text kept in ``historical_source_refs`` (a ``pending`` note
+    or a displaced original), so an older note never replaces a received answer. Within a group the newest
+    retained source wins; a group without one yields its newest source, whose status names the gap."""
+    current = [s for s in seat.get("source_refs") or [] if isinstance(s, dict)]
+    history = [s for s in seat.get("historical_source_refs") or []
+               if isinstance(s, dict) and s.get("role") in ("response", "failure", "pending")]
+    for sources in ([s for s in current if s.get("role") == "response"],
+                    [s for s in current if s.get("role") == "failure"], history):
+        if sources:
+            return next((s for s in reversed(sources) if s.get("status") == "retained"), sources[-1])
+    return None
 
 
 def _checklist_facts(*, layer: str = "", body_fact: str = "", how: str = "") -> Dict[str, Any]:
@@ -1075,11 +1136,13 @@ def reuse_key_digest(*, surface: str, kind: str, root: str, diff_sha: str, tree_
 
 
 def round_sha_of(*, rebuttal_sha: str = "", questions: Any = (), goal: str = "", scope: str = "",
-                 base: str = "", head: str = "") -> str:
+                 base: str = "", head: str = "", since_review: str = "") -> str:
     """The logical-round digest over a record's own fields — the same bytes
-    ``review_subject.review_round_sha`` hashes from a frozen subject."""
+    ``review_subject.review_round_sha`` hashes from a frozen subject. A named
+    ``since_review`` joins only when given, so every earlier round keeps its digest."""
     fields = {"rebuttal_sha": str(rebuttal_sha or ""), "questions": [str(item) for item in (questions or [])],
-              "goal": str(goal or ""), "scope": str(scope or ""), "base": str(base or ""), "head": str(head or "")}
+              "goal": str(goal or ""), "scope": str(scope or ""), "base": str(base or ""), "head": str(head or ""),
+              **({"since_review": str(since_review)} if since_review else {})}
     return hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
@@ -1186,7 +1249,7 @@ def build_wave_record(facts: Dict[str, Any], *, surface: str, record_id: str = "
         contract_fp=contract_fp, round_sha=round_sha_of(
             rebuttal_sha=str(facts.get("rebuttal_sha256") or ""), questions=facts.get("author_questions") or [],
             goal=str(facts.get("goal") or ""), scope=str(facts.get("scope") or ""),
-            base=subject["base"], head=subject["head"]))
+            base=subject["base"], head=subject["head"], since_review=str(facts.get("since_review") or "")))
     return ReviewLedgerRecord(
         record_id=record_id, state=STATE_PENDING if pending else STATE_SETTLED, ts=utc_now_iso(), task_id=task_id,
         root_task_id=str(facts.get("root_task_id") or ""), review_wave_id=str(facts.get("review_wave_id") or ""),
@@ -1194,6 +1257,7 @@ def build_wave_record(facts: Dict[str, Any], *, surface: str, record_id: str = "
         brief={"goal": str(facts.get("goal") or ""), "scope": str(facts.get("scope") or ""),
                "parts": [part for part in ALL_PARTS if any(part in (seat.get("parts") or []) for seat in rows)],
                "author_questions": list(facts.get("author_questions") or []), "checklist": checklist,
+               **({"since_review": str(facts["since_review"])} if facts.get("since_review") else {}),
                "dispute_input": dispute_input},
         enforcement=enforcement, mode=str(facts.get("mode") or ""),
         enforcement_blocks=bool(facts.get("enforcement_blocks")),
@@ -1240,6 +1304,15 @@ def _merge_evidence(*groups: Iterable[Any]) -> list:
     return list(merged.values())
 
 
+def _settled_sources(prior: dict, fresh: dict) -> dict:
+    """Keep dispatch prompts, replace current answer/failure refs, retain all displaced originals."""
+    current = [s for s in fresh.get("source_refs") or [] if s.get("role") != "prompt"]
+    old = [s for s in prior.get("source_refs") or [] if s.get("role") != "prompt" and s not in current]
+    return {"source_refs": [s for s in prior.get("source_refs") or [] if s.get("role") == "prompt"] + current,
+            "historical_source_refs": _merge_evidence(prior.get("historical_source_refs") or [],
+                                                     fresh.get("historical_source_refs") or [], old)}
+
+
 def settle_pending_payload(prior: Dict[str, Any], fresh: Dict[str, Any]) -> Dict[str, Any]:
     """The payload that settles a pending record: provenance is the dispatching
     attempt's (``prior`` — ``PROVENANCE_FIELDS`` and, per seat, ``ROW_PROVENANCE_FIELDS``
@@ -1269,9 +1342,9 @@ def settle_pending_payload(prior: Dict[str, Any], fresh: Dict[str, Any]) -> Dict
         if conflict or (not seat_open(kept) and seat_open(row)):
             rows.append(kept)
             continue
-        refs = [ref for ref in kept.get("source_refs") or [] if str(ref.get("role") or "") != "response"]
-        refs += [ref for ref in row.get("source_refs") or [] if str(ref.get("role") or "") == "response"]
-        merged = {**kept, **row, **{field: kept[field] for field in ROW_PROVENANCE_FIELDS if field in kept}, "source_refs": refs}
+        from ouroboros.review_records import TYPED_FAILURE_FACT_KEYS
+        merged = {**{k: v for k, v in kept.items() if k not in TYPED_FAILURE_FACT_KEYS}, **row,
+                  **{field: kept[field] for field in ROW_PROVENANCE_FIELDS if field in kept}, **_settled_sources(kept, row)}
         if not row.get("outcome"):
             merged.pop("outcome", None)
         rows.append(merged)
@@ -1361,12 +1434,11 @@ def settle_from_collected(drive_root: Any, record_id: str, raws: Iterable[Dict[s
                 if not raw.get("outcome") and isinstance(policy, dict) and isinstance(raw.get("answers"), dict):
                     raw = {**raw, "answers": {part: apply_severity_policy(answer, policy)
                                               for part, answer in raw["answers"].items()}}
+                seat["source_refs"] = []  # the collected reply's own refs; the merge keeps dispatch and history
                 _apply_raw(seat, raw)
                 applied.append(raw)
-                if seat.get("raw_text"):
-                    seat.setdefault("source_refs", []).append(retain_text_source(
-                        drive_root, task_id, record_id=record_id, seat_id=str(seat["seat_id"]), role="response",
-                        part=",".join(seat.get("parts") or []), text=seat["raw_text"]))
+                _retain_seat_text(drive_root, task_id, record_id, seat)
+                seat.update(_settled_sources(row, seat))
             seat.pop("raw_text", None)
             rows.append(seat)
         still_open = any(seat_open(seat) for seat in rows)
@@ -1476,9 +1548,9 @@ __all__ = [
     "build_rows", "build_wave_record",
     "distinct_model_facts", "find_reusable", "index_path", "index_row", "ledger_dir", "ledger_root", "load_record",
     "mark_provenance_unknown", "new_record_id", "normalize_model_name", "note_author_decision",
-    "note_commit_landing", "panel_facts", "read_source",
+    "note_commit_landing", "panel_facts", "read_source", "read_selected_source", "task_record_page",
     "recent_records", "record_path", "record_sources_resolvable", "reduce_verdict", "retain_text_source", "reuse_key_digest",
     "revise_record", "row_verdict", "rows_from_plan", "seat_findings", "seat_open", "settle_from_collected",
-    "settle_pending_payload", "single_question_part",
+    "seat_text_source", "settle_pending_payload", "single_question_part",
     "CouplingOutcome", "coupling_outcome", "seat_parts", "source_ref_resolvable", "write_record",
 ]

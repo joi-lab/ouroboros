@@ -1,8 +1,9 @@
 """The paid skill-smoke consumer: one ordinary author task, never a Python agent loop.
 
 Only the existing public skill_review tool buys review. Two paid cycles are the
-conservative ceiling (infrastructure failures consume it too); ambiguous/pending
-work is red, not retried by starting another task. The task policy is a tool
+conservative ceiling (infrastructure failures consume it too); a first review that
+settled without any verdict may spend the second on one plain retry; other
+ambiguous/pending work is red, not retried by starting another task. The task policy is a tool
 boundary, not OS confinement. The server has a fresh HOME/state, no enabled
 payload and no turn-on intent. Its tree stops before the caller tests enablement.
 """
@@ -18,7 +19,7 @@ import sys
 from devtools.benchmarks.common.server_runner import IsolatedServer, _api, alarm_deferred, seed_owner_state
 from ouroboros.process_containment import ProcessContainer
 from ouroboros.provider_models import ACTIVE_MODEL_SETTING_KEYS, ALL_PROVIDER_CREDENTIAL_KEYS
-from ouroboros.review_records import review_slot_awaiting, review_slot_unresolved
+from ouroboros.review_records import TYPED_FAILURE_FACT_KEYS, review_slot_awaiting, review_slot_unresolved
 from ouroboros.observability import redact_projection, read_call_manifest_ref, read_blob_ref
 from ouroboros.secret_masking import redact_known_values
 from ouroboros.skill_loader import find_skill, load_enabled, save_enabled
@@ -143,19 +144,46 @@ Only if source evidence substantively refutes the negative finding, state that
 argument in skill_review(skill={name!r}, review_rebuttal=<your evidence-grounded argument>).
 At most ONE substantive reassessment is permitted. Do not reroll a review, invent
 an argument, treat trusted/preflight as proof of correctness, change reviewers or
-settings, accept author_disposition, or enable/execute the skill. Pending/unknown
-or a failed review stays RED; no transport resubmission. The two-paid-cycle ceiling
+settings, accept author_disposition, or enable/execute the skill. A review that
+settled without any verdict (the reviewer's answer was empty or unreadable) is no
+opinion: you may spend the second paid cycle on one more review,
+skill_review(skill={name!r}, review_rebuttal=<one sentence: the previous review
+returned no verdict>), and say so. After any verdict there is no such retry.
+Otherwise pending/unknown or a failed review stays RED. The two-paid-cycle ceiling
 also counts infrastructure attempts. Do not start another task to reset it.
 Preserve the original findings and your reasoning in your final answer. Your prose
 cannot grant PASS: the independent persisted review gate is the CI authority.
 """
 
 
+def _seat_text(data: Path, task_id: str, row: dict) -> tuple[str, dict]:
+    """The one saved text a reader shows for a seat (``review_ledger.seat_text_source``), read exactly.
+
+    The source facts say what it is: ``role`` (response, failure or pending note), ``current``
+    (False for history, never the seat's answer) and ``status``: ``retained`` (read), ``empty``,
+    ``unreadable`` (with the error) or ``absent`` (the seat saved no text).
+    """
+    source = review_ledger.seat_text_source(row)
+    if source is None:
+        return "", {"status": "absent"}
+    facts = {"role": source.get("role"), "current": any(source is ref for ref in row.get("source_refs") or []),
+             "status": source.get("status")}
+    if facts["status"] == "empty":
+        return "", facts
+    try:
+        if facts["status"] != "retained":
+            raise ValueError(str(source.get("error") or "the text was not retained"))
+        return review_ledger.read_source(data, task_id, source).decode("utf-8"), facts
+    except (OSError, ValueError) as exc:
+        return "", {**facts, "status": "unreadable", "error": f"{type(exc).__name__}: {exc}"}
+
+
 def load_review_waves(data: Path, name: str) -> list[dict]:
     """Read current shared paid stamps and their exact ledger records after tree reap.
 
-    A missing record or retained source is evidence loss, not a legacy-history
-    fallback. The small CI projection also exports the full reviewer responses.
+    A missing record or an answered seat's retained response is evidence loss,
+    not a legacy-history fallback. The small CI projection also exports each
+    seat's saved answer, failure or pending note with its source and failure facts.
     """
     state = _load_state_unlocked(data, strict_attempt_authority=True)
     waves = []
@@ -172,16 +200,15 @@ def load_review_waves(data: Path, name: str) -> list[dict]:
         # export dangling private refs or a journal's lossy response preview.
         actors = legacy_actor_records(review_result(record, reused=False))
         for row, actor in zip(record.get("rows") or [], actors):
-            responses = []
             for ref in row.get("source_refs") or []:
-                if ref.get("role") not in {"prompt", "response"}:
-                    continue  # transport observability refs are not ledger text refs
-                text = review_ledger.read_source(data, record["task_id"], ref).decode("utf-8")
-                if ref.get("role") == "response":
-                    responses.append(text)
-            if row.get("status") in {"responded", "partial"} and not responses:
-                raise ValueError("reviewer response source unavailable")
-            actor["raw_text"] = "\n".join(responses)
+                if ref.get("role") == "prompt":  # transport observability refs are not ledger text refs
+                    review_ledger.read_source(data, record["task_id"], ref)
+            text, source = _seat_text(data, record["task_id"], row)
+            if row.get("status") in {"responded", "partial"} and (source.get("role"), source.get("current"),
+                                                                   source["status"]) != ("response", True, "retained"):
+                raise ValueError(f"reviewer response source unavailable: {source.get('error') or source['status']}")
+            actor.update(raw_text=text, raw_text_source=source,
+                         **{key: row[key] for key in TYPED_FAILURE_FACT_KEYS if row.get(key) not in (None, "")})
         rebuttal = (brief.get("dispute_input") or {}).get("rebuttal")
         if rebuttal and rebuttal.get("status") != "empty":
             review_ledger.read_source(data, record["task_id"], rebuttal)
@@ -207,9 +234,13 @@ def assert_review_evidence(data: Path, name: str, original_hash: str, task_id: s
     history = load_review_waves(data, name)
     paid = [row for row in history if row.get("paid")]
     assert 1 <= len(paid) <= REVIEW_CYCLES, "missing review or paid-cycle ceiling exceeded"
+    verdicts = {"clean", "warnings", "blockers"}
+    # A first wave that settled without any verdict is no opinion: it buys one retry, the second paid cycle, whose
+    # one-line note says so (an identical request does not reach the reviewer again: razzant/ouroboros#2410).
+    retried = len(paid) == 2 and paid[0].get("status") not in verdicts
     expected_group = f"task:{task_id}:{name}"
     contracts = set()
-    for row in paid:
+    for index, row in enumerate(paid):
         assert (row.get("group_id") == expected_group and row.get("root_task_id") == task_id
                 and row.get("attempt_root_task_id") == task_id), "review group drift"
         assert row.get("content_hash") == original_hash, "review material drift"
@@ -219,7 +250,7 @@ def assert_review_evidence(data: Path, name: str, original_hash: str, task_id: s
         assert fingerprint and fingerprint == row.get("attempt_contract_fingerprint"), "review panel/contract drift"
         contracts.add(fingerprint)
         assert (row.get("state") == "settled" and not row.get("late_result_pending")
-                and row.get("status") in {"clean", "warnings", "blockers"}), "pending/unknown review stays red"
+                and (row.get("status") in verdicts or retried and index == 0)), "pending/unknown review stays red"
         actors = row.get("raw_actor_records")
         assert actors, "missing independent reviewer evidence"
         stack = list(actors)
@@ -235,7 +266,7 @@ def assert_review_evidence(data: Path, name: str, original_hash: str, task_id: s
                 assert actor.get("operation_state") in {"settled", "late_settled"}, "reviewer settlement is unknown"
     assert len(contracts) == 1, "review panel/contract drift"
     assert not paid[0].get("rebuttal_sha256"), "initial review was replaced by a rebuttal"
-    if len(paid) == 2:
+    if len(paid) == 2 and not retried:
         assert paid[0]["status"] == "blockers" and paid[1].get("rebuttal_sha256"), "not one substantive rebuttal"
     review_path = data / "state" / "skills" / name / "review.json"
     review = json.loads(review_path.read_text(encoding="utf-8"))
@@ -253,7 +284,7 @@ def assert_review_evidence(data: Path, name: str, original_hash: str, task_id: s
 
 
 def persist_author_evidence(root: Path, evidence: dict, credential: str) -> list[str]:
-    """Export judgment text, not the private runtime tree or dangling source refs."""
+    """Export redacted evidence, not the private runtime tree or dangling source refs."""
     errors = []
     try:
         write_record(root / "author-evidence.json", evidence)
@@ -261,7 +292,7 @@ def persist_author_evidence(root: Path, evidence: dict, credential: str) -> list
         errors.append(f"SKILL_SMOKE_EVIDENCE_INCOMPLETE: local: {type(exc).__name__}: {exc}")
         diagnostics_incomplete(errors[-1], root)
         report_diagnostic(redact_known_values(errors[-1], [credential]))
-    actor_keys = {"model_id", "status", "raw_text", "parsed_items", "failure_code",
+    actor_keys = {"model_id", "status", "raw_text", "raw_text_source", "parsed_items", *TYPED_FAILURE_FACT_KEYS,
                   "operation_state", "late_result_pending", "raw_results"}
 
     def actors(rows):

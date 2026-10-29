@@ -432,11 +432,22 @@ async def _api_identity(request: Request) -> JSONResponse:
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
     name, description = await asyncio.to_thread(_identity_facts, ctx)
+    from ouroboros.places import WAKE_FACTS
     from ouroboros.presence_continuation import CONTINUATION_VERSION
+    from ouroboros.presence_history import HISTORY_IMPORT_VERSION, SOURCE_ORDER_VERSION
+    from ouroboros.presence_owner_contact import MAIN_CONTACT_VERSION
+    from ouroboros.presence_recovery import WORK_OUTPUT_VERSION
 
     return JSONResponse({"ok": True, "name": name, "description": description,
                          "presence_delivery_version": DELIVERY_VERSION, "places_version": 1,
                          "presence_continuation_version": CONTINUATION_VERSION,
+                         "presence_main_contact_version": MAIN_CONTACT_VERSION,
+                         "presence_work_output_version": WORK_OUTPUT_VERSION,
+                         "presence_history_import_version": HISTORY_IMPORT_VERSION,
+                         "presence_source_order_version": SOURCE_ORDER_VERSION,
+                         "presence_wake_facts": list(WAKE_FACTS),
+                         "presence_wake_signals": 1,
+                         "presence_identity": 1,
                          "notify_version": NOTIFY_VERSION})
 
 
@@ -800,6 +811,7 @@ def _presence_staged_files(
 from ouroboros.gateway.host_service_places import (  # noqa: E402
     _admit_presence as _admit_presence,
     _api_presence_delivery as _api_presence_delivery,
+    _api_presence_history as _api_presence_history,
     _api_presence_turn as _api_presence_turn,
     _api_presence_work as _api_presence_work,
     _api_presence_place as _api_presence_place,
@@ -1303,6 +1315,7 @@ def create_host_service_app(
             Route("/presence/place", _api_presence_place, methods=["GET"]),
             Route("/presence/turn", _api_presence_turn, methods=["POST"]),
             Route("/presence/delivery", _api_presence_delivery, methods=["POST"]),
+            Route("/presence/history", _api_presence_history, methods=["POST"]),
             Route("/presence/work/{work_ref}", _api_presence_work, methods=["GET", "POST"]),
             Route("/ui/ws-message", _api_ws_message, methods=["POST"]),
             Route("/notify", _api_notify, methods=["POST"]),

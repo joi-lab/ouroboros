@@ -144,6 +144,8 @@ export function createReplyQuote(raw, { onJump = null, onCancel = null, composer
 // ---- The clamp of a long quotation (a relay panel's text) ----
 let nextClampId = 0;
 const CLAMP_LINES = 6;
+/** His words on a note card (chat_relay_deck.js): two lines until the note is opened, which the deck fits them to. */
+export const RELAY_CARD_LINES = 2;
 
 /**
  * Clamp `text` to six lines (cut on a word, never `.…`; text_fit.js) and add a `Show all` / `Show less` toggle
@@ -196,7 +198,7 @@ function createRelayPanel(quote, relayId, { onDomWrite, formatTime, card }) {
     if (text) {
         if (card) {
             text.classList.add('chat-clamp');
-            fitText(text, quote.text, 3);
+            fitText(text, quote.text, RELAY_CARD_LINES);
         } else clampWithToggle(text, head, { onDomWrite });
     }
     return root;
@@ -204,7 +206,7 @@ function createRelayPanel(quote, relayId, { onDomWrite, formatTime, card }) {
 
 /**
  * A relay's panel: the owner's complete words, labelled with where and when he wrote them (`You · Main · 00:37`),
- * clamped to six lines with `Show all` in the head, or three lines when a note card owns their expansion.
+ * clamped to six lines with `Show all` in the head, or two lines when a note card owns their expansion.
  * The words stay selectable text (not inside a button). A relay
  * that passes several of his messages shows one such panel per message, in the host's order, inside one block.
  */

@@ -215,7 +215,8 @@ class _MessageShapingMixin:
         sealed = allow_message_cache_control and any(isinstance(m.get("cache_control"), dict) for m in cleaned)
         for msg in cleaned:
             for key in ("acceptance_observation", "_acceptance_observation", "review_feedback",
-                        STABLE_PREFIX_BLOCKS_KEY, TOOL_RESULT_RECORD_KEY, REVIEW_HISTORY_MESSAGE_KEY, REVIEW_CONTEXT_INDEX_KEY):
+                        STABLE_PREFIX_BLOCKS_KEY, TOOL_RESULT_RECORD_KEY, REVIEW_HISTORY_MESSAGE_KEY, REVIEW_CONTEXT_INDEX_KEY,
+                        "_review_image_id"):
                 msg.pop(key, None)
             msg.pop("nativeContinuation", None)
             boundary = msg.pop("cache_control", None)
@@ -226,44 +227,44 @@ class _MessageShapingMixin:
             # Unsealed caller prompts and marker-free lanes retain their shape.
             if sealed and msg.get("role") == "user" and isinstance(msg.get("content"), str) and msg["content"].strip():
                 msg["content"] = [{"type": "text", "text": msg["content"]}]
-            if allow_message_cache_control and isinstance(boundary, dict) and msg.get("role") in {"user", "tool"}:
+            role = msg.get("role")
+            if isinstance(msg.get("content"), list) and ((role == "tool" and flatten_tool_content_blocks) or (
+                role != "user" and flatten_non_user_content_blocks
+            )):
+                # String-only roles: text blocks fold into one string, so host
+                # metadata and block markers never reach the wire either; a row's
+                # seal mark renders after the fold (only that row becomes one block).
+                msg["content"] = "".join(
+                    block.get("text", "") if isinstance(block, dict) else str(block)
+                    for block in msg["content"]
+                )
+            if allow_message_cache_control and isinstance(boundary, dict) and role in {"user", "tool"}:
                 msg["content"] = cls._content_with_cache_boundary(msg.get("content"), boundary)
             content = msg.get("content")
             if not isinstance(content, list):
                 continue
-            role = msg.get("role")
-            if (role == "tool" and flatten_tool_content_blocks) or (
-                role != "user" and flatten_non_user_content_blocks
-            ):
-                # String-only roles: text blocks fold into one string, so host
-                # metadata and cache markers never reach the wire either.
-                msg["content"] = "".join(
-                    block.get("text", "") if isinstance(block, dict) else str(block)
-                    for block in content
-                )
-            else:
-                for block in content:
-                    if isinstance(block, dict):
-                        # Strict providers reject cache markers on empty text.
-                        empty_text = (
-                            block.get("type") == "text"
-                            and not str(block.get("text") or "").strip()
+            for block in content:
+                if isinstance(block, dict):
+                    # Strict providers reject cache markers on empty text.
+                    empty_text = (
+                        block.get("type") == "text"
+                        and not str(block.get("text") or "").strip()
+                    )
+                    if (allow_message_cache_control
+                            and isinstance(block.get("cache_control"), dict)
+                            and not empty_text):
+                        # Keep TTL only where the route documents it.
+                        ttl = str(block["cache_control"].get("ttl") or "")
+                        block["cache_control"] = (
+                            {"type": "ephemeral", "ttl": ttl}
+                            if allow_cache_ttl and ttl in _VALID_CACHE_TTLS
+                            else {"type": "ephemeral"}
                         )
-                        if (allow_message_cache_control
-                                and isinstance(block.get("cache_control"), dict)
-                                and not empty_text):
-                            # Keep TTL only where the route documents it.
-                            ttl = str(block["cache_control"].get("ttl") or "")
-                            block["cache_control"] = (
-                                {"type": "ephemeral", "ttl": ttl}
-                                if allow_cache_ttl and ttl in _VALID_CACHE_TTLS
-                                else {"type": "ephemeral"}
-                            )
-                        else:
-                            block.pop("cache_control", None)
-                        # Known host metadata never leaves the send copy.
-                        for key in ("_caption", "_source_path", "_original_image_url", "_context_capsule"):
-                            block.pop(key, None)
+                    else:
+                        block.pop("cache_control", None)
+                    # Known host metadata never leaves the send copy.
+                    for key in ("_caption", "_source_path", "_source_sha256", "_review_image_id", "_original_image_url", "_context_capsule"):
+                        block.pop(key, None)
         return cleaned
 
     # Provider-private reasoning blocks are valid only on their producing family.
@@ -368,29 +369,60 @@ class _MessageShapingMixin:
         return marker + str(content or "")
 
     @staticmethod
-    def _is_deferrable_image_user_turn(msg: Dict[str, Any]) -> bool:
-        """True for a USER message whose content carries an image block but NO tool_result
-        block and NO tool_call_id — i.e. a mid-round injected image (view_image /
-        native screenshot) that must not split an assistant tool_use from its matching
-        tool_result. A user turn that IS a tool answer (Anthropic-style tool_result content
-        block, or an OpenAI tool message) is never deferred (the negative guard)."""
-        if str(msg.get("role") or "").strip().lower() != "user":
-            return False
-        if msg.get("tool_call_id"):
-            return False
-        content = msg.get("content")
-        if not isinstance(content, list):
-            return False
-        has_image = False
-        for block in content:
-            if not isinstance(block, dict):
+    def _order_complete_tool_episodes(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """On a send copy, put a complete unambiguous batch's answers first.
+
+        An episode ends at the next assistant or EOF. Inspect the whole episode:
+        a late duplicate/foreign answer invalidates it even after all expected
+        answers arrived. Call IDs are local to that episode. User answers with
+        native tool_result blocks move whole, including any attached image.
+        Missing/ambiguous IDs and incomplete batches retain their input order.
+        No image predicate: eviction/captioning must not reorder earlier answers.
+        """
+        out = []
+        start = 0
+        while start < len(messages):
+            opening = messages[start]
+            out.append(opening)
+            start += 1
+            if str(opening.get("role") or "").lower() != "assistant":
                 continue
-            btype = str(block.get("type") or "")
-            if btype == "tool_result":
-                return False  # this user turn answers a tool call — never defer it
-            if btype in {"image_url", "image"}:
-                has_image = True
-        return has_image
+            calls = opening.get("tool_calls") or []
+            ids = [call.get("id") if isinstance(call, dict) else None for call in calls]
+            native_ids = ([block.get("id") for block in opening["content"]
+                           if isinstance(block, dict) and block.get("type") == "tool_use"]
+                          if isinstance(opening.get("content"), list) else [])
+            if ids and native_ids:
+                continue  # two competing call declarations are not an unambiguous episode
+            ids = ids or native_ids
+            if not ids or any(not isinstance(cid, str) or not cid.strip() for cid in ids) or len(set(ids)) != len(ids):
+                continue
+            end = start
+            while end < len(messages) and str(messages[end].get("role") or "").lower() != "assistant":
+                end += 1
+            answers, others, seen = [], [], []
+            valid = True
+            for msg in messages[start:end]:
+                role = str(msg.get("role") or "").lower()
+                content = msg.get("content")
+                native = ([block.get("tool_use_id") for block in content
+                           if isinstance(block, dict) and block.get("type") == "tool_result"]
+                          if role == "user" and isinstance(content, list) else [])
+                result_ids = [msg.get("tool_call_id")] if role == "tool" else native
+                if result_ids:
+                    valid = (valid and not (native and msg.get("tool_call_id"))
+                             and all(isinstance(cid, str) and cid in ids for cid in result_ids))
+                    seen.extend(result_ids)
+                    answers.append(msg)
+                else:
+                    valid = valid and role in {"user", "system"} and not msg.get("tool_call_id")
+                    others.append(msg)
+            if valid and len(seen) == len(ids) and len(set(seen)) == len(ids):
+                out.extend(answers + others)
+            else:
+                out.extend(messages[start:end])
+            start = end
+        return out
 
     @classmethod
     def _normalize_system_message_placement(cls, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -406,13 +438,9 @@ class _MessageShapingMixin:
         between an assistant tool-call message and its tool results, it is
         buffered until after the adjacent tool-result block.
 
-        The same buffer also defers a mid-round image-bearing USER turn (P4a):
-        view_image / native-screenshot injection can append a user(image) message
-        between an assistant tool_use and its tool_result, which violates every
-        provider's tool-call adjacency contract. Buffering it (then flushing after
-        the window closes) keeps the tool_result adjacent to its tool_use. This is
-        the single send-time chokepoint every provider builder funnels through, so
-        the fix covers Anthropic/OpenAI/Gemini/GigaChat at once (Bible P2/P7).
+        Complete tool episodes are ordered structurally first, independent of
+        image representation. Notice demotion/buffering remains separate and
+        also applies to incomplete episodes. Canonical history is never changed.
         """
         out: List[Dict[str, Any]] = []
         buffered_notices: List[Dict[str, Any]] = []
@@ -425,17 +453,9 @@ class _MessageShapingMixin:
                 out.extend(buffered_notices)
                 buffered_notices = []
 
-        for original in messages:
+        for original in cls._order_complete_tool_episodes(messages):
             msg = copy.deepcopy(original)
             role = str(msg.get("role") or "").strip().lower()
-
-            # P4a: defer an image-bearing user turn that lands inside an open
-            # tool_use↔tool_result window — BEFORE the generic clear below, so it is
-            # buffered (kept in order with any demoted system notice) rather than
-            # inserted between the tool_calls and their results.
-            if awaiting_tool_results and cls._is_deferrable_image_user_turn(msg):
-                buffered_notices.append(msg)
-                continue
 
             if awaiting_tool_results and role not in {"tool", "system"}:
                 awaiting_tool_results = False

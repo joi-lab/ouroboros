@@ -9,7 +9,7 @@
 // a second Continue — new work goes through the conversation).
 
 import { continueTask, fetchTaskDetail } from './api_client.js';
-import { heldWorkFacts } from './task_control_menu.js';
+import { announceMembershipGap, heldWorkFacts } from './task_control_menu.js';
 import { ensureLiveActionsEl, ownLiveActionsEl } from './chat_activity.js';
 import { fmt, tr, tx } from './i18n.js';
 import { taskDoneIsTerminal, taskReasonPhrase } from './log_events.js';
@@ -76,6 +76,7 @@ export async function continueTaskAction(taskId, { request = continueTask, stora
             ? `Continue accepted; it starts by itself when the earlier attempt's work finishes: ${
                 heldWorkFacts(ack.blockers) || 'earlier work is not proven settled'}.`
             : 'Continue accepted.', 'ok');
+        announceMembershipGap(ack.membership_gaps, 'continue', toast);  // a replay answers its admission's gap too
         return successor;
     } catch (exc) {
         const body = exc?.body || {};
@@ -114,7 +115,7 @@ export function continueControlSuccessor(record) {
  * card that did not complete cleanly (a best-effort completion may be a
  * technical limit), the card reads the full detail once to learn the offer.
  */
-export function syncContinueAction(record, detail, { read = fetchTaskDetail } = {}) {
+export function syncContinueAction(record, detail, { read = fetchTaskDetail, write = (fn) => fn() } = {}) {
     if (!detail || typeof detail !== 'object') return false;
     if (!('continuation_offer' in detail)) {
         const status = String(detail.task_terminal_status || detail.status || '').toLowerCase();
@@ -126,7 +127,7 @@ export function syncContinueAction(record, detail, { read = fetchTaskDetail } = 
                     const offer = full?.continuation_offer;
                     if (!offer || typeof offer !== 'object' || Array.isArray(offer)) {
                         offerReads.delete(record);  // null is the production reader's failure result
-                    } else if (record.root?.isConnected) syncContinueAction(record, full, { read });
+                    } else if (record.root?.isConnected) write(() => syncContinueAction(record, full, { read, write }));
                 })
                 .catch(() => { offerReads.delete(record); });  // a later terminal row retries
         }

@@ -91,6 +91,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python scripts/post_merge_check.py route --evidence-dir "$RUNNER_TEMP/post-merge" --run-url "$RUN_URL"
+      # Independent of affected-module selection: every merge exercises the complete
+      # k=30 cost contract, including rest, scale shapes and producer boundaries.
+      - name: Cost contract (rest law, scale shapes and producer boundaries; k=30)
+        id: cost_contract
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && steps.setup_node.outcome == 'success' }}
+        timeout-minutes: 8
+        run: python -m pytest -q -o addopts="" -m "scale and not integration" tests/test_cost_contract.py --ci-evidence-dir "$RUNNER_TEMP/post-merge/cost-contract"
       - name: Upload the evidence
         if: ${{ !cancelled() }}
         continue-on-error: true

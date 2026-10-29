@@ -57,7 +57,8 @@ PAINT = """el => {
         reachable:!!hit && (hit===el || el.contains(hit)),overflow:el.scrollWidth-el.clientWidth,
         rest:token('--elev-rest','boxShadow'),float:token('--elev-float','boxShadow'),
         capsule:token('--surface-capsule','backgroundColor'),hover:token('--surface-capsule-hover','backgroundColor'),
-        neutralHover:token('--bg-hover','backgroundColor'),focus:token('--focus-accent-border','color'),
+        neutralHover:token('--bg-hover','backgroundColor'),quietHover:token('--tone-quiet-hover','backgroundColor'),
+        focus:token('--focus-accent-border','color'),
         ok:token('--status-ok-fg','color'), contrast:window.__contrast.of(el)};
 }"""
 
@@ -108,7 +109,7 @@ def button_states(page, control, *, quiet=False, floating=False, card=False, dis
     if floating:
         assert hover["filter"].count('brightness') == 1 and pressed["filter"].count('brightness') == 2
     if quiet:
-        assert hover["bg"] == hover["neutralHover"], hover
+        assert hover["bg"] == hover["quietHover"], hover
     result = {"rest": rest, "hover": hover, "press": pressed, "focus": focus}
     if disable:
         control.evaluate("el=>el.disabled=true")
@@ -258,7 +259,8 @@ def test_shared_controls_material_and_real_actions(room_ui, theme, width):
         control = page.locator(selector).first
         reveal(page, control)
         rw.capture(page, prefix + "-" + name)
-        results[name] = button_states(page, control, quiet=name == "copy", floating=name == "photo",
+        # Copy and the Reviews tray's Retry read (a `.review-read` link-button since #2278) are quiet controls.
+        results[name] = button_states(page, control, quiet=name in ("copy", "retry"), floating=name == "photo",
                                       card=name.endswith("File"), disable=name != "photo")
     disabled = page.locator('.chat-bubble.user .chat-file-card:disabled')
     assert paint(disabled)["shadow"] == "none"
@@ -329,8 +331,9 @@ def test_shared_controls_material_and_real_actions(room_ui, theme, width):
     update = page.locator('#update-pill')
     update.wait_for()
     results["update"] = button_states(page, update)
-    for tone, token in [('neutral', '--surface-capsule'), ('warn', '--tone-amber'),
-                        ('ok', '--tone-green'), ('error', '--tone-red')]:
+    # The pill's palette: neutral, the owner's amber (local changes) and the failure's red. A confirmed success has no
+    # capsule (owner 1B), so no green tone is drawn for it.
+    for tone, token in [('neutral', '--surface-capsule'), ('warn', '--tone-amber'), ('error', '--tone-red')]:
         update.evaluate('(el,tone)=>el.dataset.tone=tone', tone)
         update.hover()
         value = paint(update)
@@ -343,12 +346,12 @@ def test_shared_controls_material_and_real_actions(room_ui, theme, width):
     assert results["update-local"]["bg"] == results["update-warn"]["bg"]
     update.evaluate("el=>{el.dataset.tone='error';}")
     assert paint(update)["bg"] == results["update-error"]["bg"]
-    # Exercise the current controller as well as its palette: real stage/outcome
-    # refreshes must keep the shared button material and retain the panel result.
+    # Exercise the current controller as well as its palette: real stage/outcome refreshes keep the shared button
+    # material, a failed or unconfirmed outcome keeps its close, and a confirmed success draws no capsule at all while
+    # the panel retains its record.
     for outcome, text, tone in [('', 'Checking update…', 'neutral'),
-                                ('failed', 'Update failed', 'error'),
                                 ('unknown', 'Update outcome unconfirmed', 'neutral'),
-                                ('applied', 'Update completed', 'ok')]:
+                                ('failed', 'Update failed', 'error')]:
         update_status['update_progress'] = {'operation_id': 'material-proof',
             'active': not outcome, 'stage': 'checking', 'outcome': outcome,
             'concluded_by': 'boot', 'current_generation': True}
@@ -356,20 +359,36 @@ def test_shared_controls_material_and_real_actions(room_ui, theme, width):
         page.wait_for_function("text=>document.querySelector('#update-pill')?.textContent===text", arg=text)
         assert update.get_attribute('data-tone') == tone
         assert 'has-local' not in (update.get_attribute('class') or '')
+        assert page.locator('.update-notice-close').is_visible() == bool(outcome), 'only a concluded outcome offers its close'
         borderless(paint(update))
         results['controller-' + (outcome or 'checking')] = paint(update)
     rw.capture(page, prefix + "-update")
+    update_status['update_progress'] = {'operation_id': 'material-proof', 'active': False, 'stage': 'checking',
+        'outcome': 'applied', 'concluded_by': 'boot', 'current_generation': True}
+    transport.send({'type': 'update_progress_changed'})
+    # A confirmed success wears nothing and never masks the newer version this fixture announces ...
+    page.wait_for_function("document.querySelector('#update-pill')?.textContent==='Update available'")
+    assert update.get_attribute('data-tone') is None
+    assert page.locator('.update-notice-close').count() == 1 and not page.locator('.update-notice-close').is_visible()
+    # ... and with nothing newer to announce there is no capsule at all.
+    update_status['available'] = False
+    transport.send({'type': 'update_progress_changed'})
+    page.wait_for_function("document.querySelector('#update-pill')?.hidden===true")
+    assert not [t for t in page.locator('.toast').all_inner_texts() if 'update' in t.lower()], 'a confirmed success announces nothing'
+    update_status['available'] = True
+    # The capsule's destination: with a failure showing, pressing it opens Dashboard -> Updates, and hiding the notice
+    # there changes nothing in the record.
+    update_status['update_progress']['outcome'] = 'failed'
+    transport.send({'type': 'update_progress_changed'})
+    page.wait_for_function("document.querySelector('#update-pill')?.textContent==='Update failed'")
     update.click()
     page.locator('#page-dashboard').wait_for()
     if width == 390:
         rw.setup_browser.wait_drawer_closed(page)
     updates_selected = page.locator('[data-dashboard-tab="updates"]').get_attribute('aria-selected') == 'true'
     assert updates_selected
-    page.locator('#updates-attempt-dismiss').click()
-    page.wait_for_function("document.querySelector('#update-pill').textContent==='Update available'")
-    assert update.get_attribute('data-tone') is None
-    assert page.locator('#updates-attempt-dismiss').is_hidden()
-    assert page.locator('#page-dashboard').get_by_text('Update completed.', exact=True).is_visible()
+    assert page.locator('#updates-attempt-dismiss').count() == 0, 'the hide lives on the notice, never in the panel'
+    assert 'The update did not complete.' in page.locator('#page-dashboard').inner_text()
     results["updateNavigation"] = {"dashboardVisible": True, "updatesSelected": updates_selected}
     rw.capture(page, prefix + "-update-destination")
     assert not [path for path, _ in room_ui["posts"] if '/update/' in path]

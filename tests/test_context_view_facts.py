@@ -3,7 +3,7 @@ from dataclasses import replace
 
 from ouroboros import capability_evidence as ce
 from ouroboros.context_window import record_observation, resolve_window
-from ouroboros.context_view_facts import window_fact, wake_facts
+from ouroboros.context_view_facts import memory_facts, window_fact
 from ouroboros import memory_view as mv
 from tests.test_memory_view_lever import plan
 from tests._memory_view_synthetic import live_room
@@ -25,11 +25,14 @@ def test_source_changes_on_numbered_refusal_and_later_acceptance(tmp_path, monke
     assert "metadata" in window_fact(other, 65536) and "accepted" not in window_fact(other, 65536)
 
 
-def test_wake_counts_captured_open_rooms_and_other_roles_do_not():
+def test_memory_line_names_the_memory_for_every_integrating_focus_and_none_for_helpers():
     p, snap = plan()
-    assert wake_facts(p, "max") == ""
+    line = memory_facts(p, "max")  # no Max room fact in this receipt: the memory alone
+    assert line.startswith("memory: story ") and "pages not yet in a part or account 2" in line
+    assert "Max room" not in line and "drafts awaiting" not in line
+    for role in ("child", "nanny"):
+        helper = replace(snap, spec=replace(snap.spec, role=role))
+        assert memory_facts(replace(p, core=replace(p.core, memory_view_json=mv.snapshot_json(helper))), "max") == ""
     wake = replace(snap, spec=replace(snap.spec, role="consciousness"), live_rooms=(live_room(1),))
     p = replace(p, core=replace(p.core, memory_view_json=mv.snapshot_json(wake)))
-    facts = wake_facts(p, "max")
-    assert "unsealed rooms 2" in facts and "characters" in facts and "%" in facts
-    assert "drafts awaiting a decision 0" in facts
+    assert "drafts awaiting a decision 0" in memory_facts(p, "max")

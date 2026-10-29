@@ -362,7 +362,7 @@ def pending_tool_call_ids(messages: List[Dict[str, Any]]) -> List[str]:
 from ouroboros.external_runs import (  # noqa: E402,F401 -- the pause's historical import surface
     EXTERNAL_RUNNING, EXTERNAL_STOP_CONFIRMED, EXTERNAL_STOP_REQUESTED, EXTERNAL_STOP_UNKNOWN,
     STOP_POLICIES, STOP_POLICY_ALL, STOP_POLICY_OBSERVE, STOP_POLICY_TASK_OWNED,
-    observe_task_runs, task_owned_runs_open,
+    episode_fields, observe_task_runs, owner_pause_runs, task_owned_runs_open,
 )
 
 
@@ -410,15 +410,15 @@ def local_producer_observation(ctx: Any, *, timeout_sec: float) -> Dict[str, Any
     stays in the checkpoint, so Resume continues the same panel. While not
     ``quiescent`` the task stays fenced/nonterminal and keeps its native worker.
     """
+    from ouroboros import custody_owed  # a write still owed is named, never certified; quiescence is physical
     review = drain_local_review_attempts(str(ctx.task_id), timeout_sec=timeout_sec)
     tool_futures = drain_local_tool_futures(ctx, timeout_sec=timeout_sec)
     return {
-        "dispatch_fence": "closed",
-        "review_attempts": review,
+        "dispatch_fence": "closed", "review_attempts": review,
         "tool_futures": tool_futures,
         "quiescent": bool(review.get("drained")) and review.get("registry") == "ok"
                      and bool(tool_futures.get("drained")),
-    }
+        "publication_pending": custody_owed.labels() if custody_owed.drain() else []}
 
 
 # --- durable row --------------------------------------------------------------------
@@ -696,7 +696,7 @@ def _exact_continuation_row(limit_ctx: Any, ctx: Any, *, pause_id: str, rail: st
         from ouroboros.owner_pause import SETTLEMENT_EXTERNAL_RUNNING, SETTLEMENT_SETTLED
 
         settlement = {"settlement": SETTLEMENT_EXTERNAL_RUNNING if task_owned_runs_open(external)
-                      else SETTLEMENT_SETTLED,
+                      else SETTLEMENT_SETTLED, **episode_fields({}, external, starts=True),  # this Pause's participants
                       "owner_fence_id": str(getattr(ctx, "_owner_pause_fence_id", "") or "")}
     sleep = getattr(ctx, "_model_sleep", None) if reason == REASON_SLEEP else None
     if isinstance(sleep, dict):
@@ -1347,6 +1347,8 @@ def _resume_disclosure(ctx: Any, row: Dict[str, Any], state: Dict[str, Any], gra
         f"\n- run {run.get('run_id')}: {run.get('state')} (stop outcome: {run.get('stop_outcome') or 'n/a'})"
         for run in external if isinstance(run, dict)
     ) or "\n- none"
+    if owner_runs := owner_pause_runs(ctx, row, external_observation):  # an owner Pause's participants (#1562)
+        external_basis, external_lines = "its participants, read now", "\n" + owner_runs
     pending = pending_tool_call_ids(messages)
     abandoned = [str(item) for item in ((row.get("resume_point") or {}).get("abandoned_model_attempts") or [])]
     if str(row.get("reason") or "") == REASON_SLEEP and not pending:
@@ -1363,6 +1365,9 @@ def _resume_disclosure(ctx: Any, row: Dict[str, Any], state: Dict[str, Any], gra
                 + json.dumps(external, ensure_ascii=False))})
         model_sleep.append_question_notice(ctx, str((row.get("sleep_ready") or {}).get("reason") or ""), messages,
                                            shown=external if row.get("external_custody") else ())
+        if owner_runs:  # the owner's Pause stopped or observed these runs while it slept
+            messages.append({"role": "user", "content": "[SYSTEM NOTICE]\nWhile you slept the owner's Pause stopped or observed "
+                             "these delegated runs (current custody; engine facts are evidence, never a grant):\n" + owner_runs})
         return
     kind = {REASON_OWNER: "owner Pause", REASON_AUTHORITY: f"technical pause ({str(row.get('rail')).replace('_', ' ')})"}.get(
         str(row.get("reason") or ""), "budget pause")

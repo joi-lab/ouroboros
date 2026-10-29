@@ -275,6 +275,9 @@ class ProcessContainer:
         # The pid `spawn` started and the group it leads: known WITHOUT having to be read.
         self._root = 0
         self._pgid = 0
+        # Whether ``spawn`` ever created its root. ``reap`` consumes ``_root``, never this: a caller
+        # whose ``spawn`` raised tells "created, then stopped at launch" from "never created".
+        self.root_created = False
         # The root's start time: nothing the container spawned can predate it.
         self._start_ticks = 0
         self._suspended = False
@@ -327,6 +330,7 @@ class ProcessContainer:
         except BaseException:
             self.reap()
             raise
+        self.root_created = True
         # Knowledge no scan can re-derive: enumeration claims members by READING them, so a root
         # turning nondumpable before the first scan is in no list. `start_new_session` makes it its
         # own group LEADER (pgid == pid); enumerating any OTHER pgid would report bystanders.

@@ -164,7 +164,7 @@ def test_readers_resolve_loose_then_pack_and_blob_shared_with_active_task_stays_
     from ouroboros.tools.core_file_tools import _list_dir, _read_source_text
     store_dir = task_artifact_dir_path(root, "task-a", create=False) / CHECKPOINTS
     listed = _list_dir(task_artifact_dir_path(root, "task-a", create=False), CHECKPOINTS)
-    assert listed == [str(pathlib.Path(CHECKPOINTS) / pathlib.PurePosixPath(handle_a['path']).name)]
+    assert listed == [str(pathlib.PurePosixPath(CHECKPOINTS) / pathlib.PurePosixPath(handle_a['path']).name)]  # slashes on any OS
     extent = {}
     assert _read_source_text(store_dir / pathlib.PurePosixPath(handle_a["path"]).name, extent).startswith("# focus")
     assert extent["source_revision"] == handle_a["sha256"] and _handle_path(root, "task-a", handle_a).exists()
@@ -311,7 +311,11 @@ def test_index_is_a_cache_rebuilt_from_sidecars(root):
         assert conn.execute("SELECT count(*) FROM handles").fetchone()[0] == 1
     index.write_bytes(b"not a database at all")
     packs._VALIDATED.clear()
+    # A handle is addressed by its task: its own sidecar answers, and the damaged cache is
+    # left to the readers that need every pack (a blob lookup here, the packer's pass).
     assert read_actor_source_bytes(root, "task-a", handle).startswith(b"# focus")
+    assert index.read_bytes() == b"not a database at all"
+    assert obs.read_blob_ref(root, refs[1])["message"]["content"].startswith("answer")
     with contextlib.closing(sqlite3.connect(index)) as conn:
         assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
     # a stale index schema is rebuilt without changing the sidecar format

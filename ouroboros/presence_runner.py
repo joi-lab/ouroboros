@@ -77,6 +77,7 @@ class PresenceTurnEvent:
     # (``presence_continuation``): 1 lets the transport take the initial envelope early.
     continuation_version: int = 0
     facts: tuple[str, ...] | None = None
+    identity: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -768,14 +769,23 @@ def _log_dialogue(
     event: PresenceTurnEvent,
     task: Mapping[str, Any],
     task_id: str,
-) -> None:
+    ts: str = "",
+    historical_import: Mapping[str, Any] | None = None,
+) -> Any:
+    """Write one room row; an inbound one returns its store receipt. ``ts``/``historical_import``:
+    an imported earlier message keeps its provider send time and immutable marker (``presence_history``).
+    Every new arrival, live or imported, keeps its provider send time and order (``source_order``)."""
     from types import SimpleNamespace
     from ouroboros import chat_chain
     from ouroboros.dialogue_provenance import presence_provenance_from_task
+    from ouroboros.presence_history import source_order_block
 
     state = read_json_dict(drive_root / "state" / "state.json") or {}
+    at = ts or utc_now_iso()
+    block = source_order_block(event.message, received=at, sent=ts if historical_import is not None else "") \
+        if direction == "in" else None
     row = {
-        "ts": utc_now_iso(),
+        "ts": at,
         "session_id": state.get("session_id"),
         "direction": direction,
         **({"type": "place_arrival"} if direction == "in" and task["metadata"].get("focus") else {}),
@@ -784,8 +794,9 @@ def _log_dialogue(
         "text": text,
         "format": "markdown" if direction == "out" else "",
         "source": f"presence:{event.provider}",
-        "sender_label": str(event.actor.get("display_name") or event.actor.get("username") or ""),
-        "sender_session_id": str(event.actor.get("platform_actor_id") or event.actor.get("id") or ""),
+        **({"sender_label": str(event.actor.get("display_name") or event.actor.get("username") or ""),
+            "sender_session_id": str(event.actor.get("platform_actor_id") or event.actor.get("id") or "")}
+           if direction == "in" else {}),
         "client_message_id": event.source_event_id,
         "presence_event_identity": presence_event_identity(str(task["metadata"]["presence"]["binding_id"]), event),
         "transport": {
@@ -804,7 +815,11 @@ def _log_dialogue(
         **({"place_id": task["metadata"]["presence"]["place_id"]}
            if task["metadata"]["presence"].get("place_id") else {}),
         **{key: task[key] for key in ("attachment_manifest", "attachment_manifest_ref") if key in task},
+        **({"historical_import": dict(historical_import)} if historical_import is not None else {}),
+        **({"source_order": block} if block is not None else {}),
     }
+    if direction == "in" and (identity := getattr(event, "identity", None)) is not None:
+        row["transport"]["identity"] = identity
     if direction == "in" and not task["metadata"].get("focus"):
         # Retain the transport's exact contextual observations before publishing their address.
         # They remain dated context of this event, never additional incoming speech or work.
@@ -818,9 +833,9 @@ def _log_dialogue(
     # the store, and a turn whose row cannot be written fails before the model runs (the transport retries).
     if direction != "in":
         dialogue_store.append_quietly(drive_root, "chat", row)  # the reply: best effort, retry buffer
-        return
+        return None
     try:
-        dialogue_store.append(drive_root, "chat", row)
+        return dialogue_store.append(drive_root, "chat", row)
     except (StoreError, OSError, ValueError) as exc:
         log.warning("Presence inbound row not stored in %s", drive_root, exc_info=True)
         raise PresenceTurnError("chat_log_unwritable", "chat") from exc
@@ -1049,6 +1064,15 @@ def run_presence_turn(
             return _run_current()
         finally:
             try:
+                # Inline turns emit no task_done. Only a proven terminal row ends
+                # the question/wait projections; an unknown attempt stays unknown.
+                terminal = _stored_turn(Path(drive_root), task_id, identity)
+                if terminal.get("status") in {STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED}:
+                    from supervisor.queue_transitions import reconcile_terminal_task_projections
+                    reconcile_terminal_task_projections(Path(drive_root), task_id)
+            except Exception:
+                log.warning("Presence %s terminal projections remain unconfirmed", task_id, exc_info=True)
+            try:
                 from supervisor.queue_transitions import release_turn_acceptance_fence  # no task_done ends a turn
                 release_turn_acceptance_fence(Path(drive_root), task_id)  # before "not live": no open row outlives it
             finally:  # a turn whose release failed still stops reading live
@@ -1127,9 +1151,7 @@ def run_presence_turn(
 
         bind_review_wait(agent, lease=lease, event=event, task_id=task_id, identity=identity,
                          drive_root=Path(drive_root))
-        # The generic agent's RUNNING writer logs and continues on failure. Presence cannot:
-        # after a crash, absence of that row would otherwise authorize a second model/tool effect.
-        # This existing task-result authority is published and read back BEFORE handle_task.
+        # Read back RUNNING before execution: absence could authorize a duplicate after a crash.
         from ouroboros.task_results import write_task_result
         from ouroboros.task_status import execution_owner_record
 
@@ -1153,16 +1175,23 @@ def run_presence_turn(
         except (OSError, ValueError, StoreError) as exc:
             raise PresenceTurnError("presence_start_unwritable", "source_event_id", turn_ref=task_id) from exc
         try:
+            from supervisor.worker_chat_lane import name_wake_on_admission
+            name_wake_on_admission(drive_root, task)
             lease.intake_agent = agent
             events = agent.handle_task(task)
+            # Unlike a pooled worker, this runner has no end-of-task event drain.
+            # Private owner contact still uses the existing durable delivery owners
+            # when there was no live queue (or its enqueue acknowledgement failed).
+            from ouroboros.presence_owner_contact import flush_owner_events
+            flush_owner_events(Path(drive_root), events)
         except BaseException:  # its executor ended without a terminal: record that end, never a re-run
             _notify_unresolved_turn(Path(drive_root), task_id)
             raise
-        # The model can have a draft reply before every allowed route refuses quota, and the
-        # terminal write can fail after the start barrier. The durable terminal cause, not that
-        # draft or the presence_result envelope, determines whether the transport may
-        # acknowledge the original event; a row still RUNNING here is an unproven effect.
+        # Only the durable terminal proves the outcome; a draft or RUNNING row cannot authorize acknowledgement.
         terminal = _stored_turn(Path(drive_root), task_id, identity)
+        if terminal.get("wake_summary"):
+            from supervisor.worker_chat_lane import _broadcast_task_named
+            _broadcast_task_named({"type": "task_named", "task_id": task_id, "suggested_name": terminal["wake_summary"]})
         row = next((item for item in events if item.get("type") == "presence_result"), None)
         refusal = _terminal_refusal(terminal)
         if refusal:

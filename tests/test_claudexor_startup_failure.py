@@ -802,15 +802,24 @@ def test_a_real_child_killed_by_a_signal_carries_the_raw_return_code(monkeypatch
 
 def _track_sweep_threads(monkeypatch) -> list:
     """Capture the threads the sweep starts (the retry runs on one) so tests can join them."""
+    from collections import OrderedDict
     import threading
 
-    from ouroboros import server_maintenance as sm
+    from ouroboros import dialogue_retry, server_maintenance as sm
     from supervisor import active_activity, queue
 
-    # This fixture owns only the daemon-retry duty, with no cold actors.
+    # This fixture owns only the daemon-retry duty, with no cold actors and no maintenance child
+    # (whose own thread would outlive the test; it has its own tests).
+    monkeypatch.setattr(sm, "_tick_maintenance_child", lambda: None)
     monkeypatch.setattr(queue, "RUNNING", {})
     monkeypatch.setattr(queue, "PENDING", [])
     monkeypatch.setattr(active_activity, "get_direct_activity_registry", lambda: SimpleNamespace(actors=lambda: []))
+    # Own both halves of the delivery wake handshake too. A prior test can leave
+    # either process-global half set, which would add an unrelated replay duty.
+    monkeypatch.setattr(sm, "_DELIVERY_WAKE", threading.Event())
+    monkeypatch.setattr(dialogue_retry, "_rows", OrderedDict())
+    monkeypatch.setattr(dialogue_retry, "_bytes", 0)
+    monkeypatch.setattr(dialogue_retry, "_requested", threading.Event())
 
     threads: list = []
 

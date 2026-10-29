@@ -40,8 +40,6 @@ def test_route_fingerprint_does_not_embed_or_rotate_with_credentials():
 def test_unknown_is_fail_closed(tmp_path):
     ev = ce.probe(tmp_path, provider="anthropic", model="claude-opus-4-8", allow_fetch=False)
     assert ev.status == ce.STATUS_UNPROBEABLE
-    assert ce.confirms_at_least(ev, ce.ONE_MILLION) is False
-    assert ce.confirms_at_least(None) is False
 
 
 def test_owner_ack_is_asserted_and_route_scoped(tmp_path):
@@ -50,11 +48,9 @@ def test_owner_ack_is_asserted_and_route_scoped(tmp_path):
     ev = ce.probe(tmp_path, provider="anthropic", model="claude-opus-4-8", options={"beta": "1m"}, allow_fetch=False)
     assert ev.status == ce.STATUS_ASSERTED
     assert ev.window_tokens == 1_000_000
-    assert ce.confirms_at_least(ev) is True
     # The SAME model on a DIFFERENT route (no beta) is NOT covered by the ack.
     other = ce.probe(tmp_path, provider="anthropic", model="claude-opus-4-8", allow_fetch=False)
     assert other.status == ce.STATUS_UNPROBEABLE
-    assert ce.confirms_at_least(other) is False
 
 
 def test_confirmed_probe_below_threshold_fails_closed(tmp_path):
@@ -62,8 +58,6 @@ def test_confirmed_probe_below_threshold_fails_closed(tmp_path):
     ce.record_owner_ack(tmp_path, provider="gigachat", model="GigaChat-3-Ultra", window_tokens=131_072)
     ev = ce.probe(tmp_path, provider="gigachat", model="GigaChat-3-Ultra", allow_fetch=False)
     assert ev.window_tokens == 131_072
-    assert ce.confirms_at_least(ev, ce.ONE_MILLION) is False  # known but < 1M
-    assert ce.confirms_at_least(ev, 131_072) is True
 
 
 def test_revoke_owner_ack(tmp_path):
@@ -86,33 +80,31 @@ def test_local_health_confirmed(tmp_path, monkeypatch):
 def test_provider_outage_keeps_prior_confirmed(tmp_path, monkeypatch):
     """A transient provider outage must NEVER erase a prior CONFIRMED record
     (module invariant) — it is kept, surfaced as stale (v6.33.0 P4)."""
-    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 1_000_000)
+    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: (1_000_000, ce.utc_now_iso()))
     ev1 = ce.probe(tmp_path, provider="openrouter", model="x/y", allow_fetch=True)
     assert ev1.status == ce.STATUS_CONFIRMED and ev1.window_tokens == 1_000_000
     # Provider now unreachable: metadata 0 + a transport failure.
-    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 0)
+    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: (0, ce.utc_now_iso()))
     monkeypatch.setattr(ce, "_metadata_fetch_transport_failed", lambda *a, **k: True)
     ev2 = ce.probe(tmp_path, provider="openrouter", model="x/y", allow_fetch=True, force=True)
     assert ev2.window_tokens == 1_000_000          # not erased
     assert ev2.status == ce.STATUS_CONFIRMED
     assert ev2.stale is True
-    assert ce.confirms_at_least(ev2, ce.ONE_MILLION) is True
 
 
 def test_transport_failure_records_status_failed(tmp_path, monkeypatch):
     """Provider unreachable (no prior record) -> STATUS_FAILED, distinct from a
     route with no metadata source. STATUS_FAILED is fail-closed for the >=1M gate."""
-    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 0)
+    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: (0, ce.utc_now_iso()))
     monkeypatch.setattr(ce, "_metadata_fetch_transport_failed", lambda *a, **k: True)
     ev = ce.probe(tmp_path, provider="openrouter", model="x/y", allow_fetch=True)
     assert ev.status == ce.STATUS_FAILED
-    assert ce.confirms_at_least(ev, ce.ONE_MILLION) is False
 
 
 def test_no_metadata_source_is_unprobeable_not_failed(tmp_path, monkeypatch):
     """A route with no metadata source and no outage stays UNPROBEABLE (owner-ack
     path), NOT FAILED — the two must not be conflated."""
-    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 0)
+    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: (0, ce.utc_now_iso()))
     monkeypatch.setattr(ce, "_metadata_fetch_transport_failed", lambda *a, **k: False)
     ev = ce.probe(tmp_path, provider="anthropic", model="claude-opus-4-8", allow_fetch=True)
     assert ev.status == ce.STATUS_UNPROBEABLE
@@ -205,55 +197,23 @@ def test_provider_metadata_window_routes_openai_compatible(monkeypatch):
     win = ce._provider_metadata_window("openai-compatible", "m", "http://x/v1", allow_fetch=True)
     # The route's provider travels with the probe, so only an openai-compatible
     # gateway's /models is ever read for image input (never MiniMax's).
-    assert win == 4096 and seen["hit"] == ("m", "http://x/v1", "openai-compatible")
+    assert win[0] == 4096 and seen["hit"] == ("m", "http://x/v1", "openai-compatible")
     # gigachat stays unprobeable (no per-model window in its /models)
-    assert ce._provider_metadata_window("gigachat", "GigaChat", "", allow_fetch=True) == 0
+    assert ce._provider_metadata_window("gigachat", "GigaChat", "", allow_fetch=True) == (0, "")
 
 
-def test_probe_threads_api_key_through_metadata_and_generative(tmp_path, monkeypatch):
-    """First-run onboarding passes the in-flight OPENAI_COMPATIBLE_API_KEY to
-    probe(api_key=...) because it is not yet on disk. Confirm the key reaches BOTH
-    the metadata probe and (on fall-through) the generative probe for an
-    openai-compatible route."""
+def test_probe_threads_api_key_through_metadata(tmp_path, monkeypatch):
+    """Onboarding's unsaved API key reaches metadata discovery."""
     seen = {}
 
-    def _fake_meta(model, base_url, allow_fetch, api_key=None, provider=""):
-        seen["meta_key"] = api_key
-        return 0  # force fall-through to the generative probe
+    def metadata(model, base_url, allow_fetch, api_key=None, provider=""):
+        seen["key"] = api_key
+        return 0
 
-    def _fake_gen(provider, model, base_url="", api_key=None):
-        seen["gen_key"] = api_key
-        return 0, ce.STATUS_UNPROBEABLE, "stub"
-
-    monkeypatch.setattr(ce, "_openai_compatible_metadata_window", _fake_meta)
-    monkeypatch.setattr(ce, "_generative_probe_window", _fake_gen)
-    ce.probe(
-        tmp_path, provider="openai-compatible", model="m", base_url="http://x/v1",
-        allow_fetch=True, allow_generative=True, force=True, api_key="THEKEY",
-    )
-    assert seen["meta_key"] == "THEKEY"
-    assert seen["gen_key"] == "THEKEY"
-
-
-# --- v6.46.0: generative context-window probe + cloudru base_url fix ---
-
-def test_classify_generative_probe_response_no_network():
-    from ouroboros.capability_evidence import (
-        classify_generative_probe_response as C,
-        STATUS_CONFIRMED, STATUS_UNPROBEABLE, STATUS_FAILED,
-    )
-    # 4xx overflow reject WITH a parseable limit -> CONFIRMED at that number (free path).
-    win, st, _ = C(400, "This model's maximum context length is 1048576 tokens. However you requested 2000000 tokens")
-    assert (win, st) == (1048576, STATUS_CONFIRMED)
-    win, st, _ = C(400, "Input length (160062 tokens) is longer than the model's context length (59862 tokens)")
-    assert (win, st) == (59862, STATUS_CONFIRMED)
-    # 4xx WITHOUT a number (e.g. Zhipu code 1261, or a 413 size reject) -> owner-ack.
-    assert C(400, "error code 1261 prompt too long")[1] == STATUS_UNPROBEABLE
-    # 200: the oversized input was ACCEPTED (possibly paid) -> never auto-confirm; owner-ack.
-    assert C(200, "", canaries=["A"], echoed_text="A", usage_prompt_tokens=100, sent_token_estimate=100)[1] == STATUS_UNPROBEABLE
-    # transport / 5xx / unknown -> transient FAILED.
-    assert C(503, "bad gateway")[1] == STATUS_FAILED
-    assert C(None, "timeout")[1] == STATUS_FAILED
+    monkeypatch.setattr(ce, "_openai_compatible_metadata_window", metadata)
+    ce.probe(tmp_path, provider="openai-compatible", model="m", base_url="http://x/v1",
+             allow_fetch=True, force=True, api_key="THEKEY")
+    assert seen["key"] == "THEKEY"
 
 
 def test_active_main_route_sets_cloudru_base_url():
@@ -836,29 +796,18 @@ def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
 
 
 def test_freshness_is_an_explicit_axis_of_the_owned_predicate(tmp_path, monkeypatch):
-    """The >=1M question and the "is this still current" question are ONE predicate
-    with an explicit knob, not one predicate plus a re-derivation at each call site.
-
-    `probe` already documents that a stale record "reads as unknown for >=1M gates",
-    but `confirms_at_least` never checked `stale` — so the gate that AUTHORIZES a
-    blocking review accepted an outage-carried record, while the gate beside it
-    hand-rolled the freshness test in a local boolean."""
-    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 1_000_000)
+    """An outage preserves history but cannot make stale evidence current."""
+    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: (1_000_000, ce.utc_now_iso()))
     fresh = ce.probe(tmp_path, provider="openrouter", model="x/y", allow_fetch=True)
     assert fresh.stale is False
     assert ce.is_known(fresh, require_fresh=True) is True
-    assert ce.confirms_at_least(fresh, ce.ONE_MILLION, require_fresh=True) is True
 
     # Provider now unreachable: the prior record is KEPT (module invariant) but stale.
-    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 0)
+    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: (0, ce.utc_now_iso()))
     monkeypatch.setattr(ce, "_metadata_fetch_transport_failed", lambda *a, **k: True)
     stale = ce.probe(tmp_path, provider="openrouter", model="x/y", allow_fetch=True, force=True)
     assert stale.stale is True and stale.window_tokens == 1_000_000
 
-    # Restricting gates keep it (never downgrade the owner's horizon on a blip)...
-    assert ce.confirms_at_least(stale, ce.ONE_MILLION) is True
-    # ...authorizing gates do not.
-    assert ce.confirms_at_least(stale, ce.ONE_MILLION, require_fresh=True) is False
     assert ce.is_known(stale, require_fresh=True) is False
     assert ce.is_known(stale) is True
 
@@ -917,7 +866,7 @@ def test_a_failed_probe_is_retried_once_its_throttle_expires_and_not_before(tmp_
 
     def fake_metadata(*_a, **_k):
         fetches.append(1)
-        return 1_000_000
+        return 1_000_000, ce.utc_now_iso()
 
     monkeypatch.setattr(ce, "_provider_metadata_window", fake_metadata)
     monkeypatch.setattr(ce, "_metadata_fetch_transport_failed", lambda *a, **k: True)
@@ -947,7 +896,6 @@ def test_a_failed_probe_is_retried_once_its_throttle_expires_and_not_before(tmp_
     retried = ce.probe(tmp_path, provider="openrouter", model="x/y", allow_fetch=True)
     assert fetches, "an expired failure record must be retried"
     assert retried.status == ce.STATUS_CONFIRMED and retried.window_tokens == 1_000_000
-    assert ce.confirms_at_least(retried, ce.ONE_MILLION, require_fresh=True) is True
 
 
 def test_expired_probe_records_drop_on_write(tmp_path):

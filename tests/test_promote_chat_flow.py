@@ -841,7 +841,7 @@ def test_promote_success_relocates_pre_admitted_attachment_to_child_drive(
     ).exists()
 
 
-def test_promote_worker_persists_swarm_intent_on_managed_root(tmp_path, monkeypatch):
+def test_promote_worker_ignores_legacy_swarm_flags(tmp_path, monkeypatch):
     import supervisor.workers as workers
 
     monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
@@ -862,8 +862,7 @@ def test_promote_worker_persists_swarm_intent_on_managed_root(tmp_path, monkeypa
     }, ctx)
 
     assert outcome["status"] == "scheduled"
-    assert enqueued[0]["metadata"]["force_plan"] is True
-    assert enqueued[0]["metadata"]["force_plan_source"] == "swarm"
+    assert "force_plan" not in enqueued[0].get("metadata", {})
 
 
 def test_route_to_project_event_emits_route_receipt_action(tmp_path, monkeypatch):
@@ -1221,6 +1220,12 @@ def test_restart_drain_defers_then_completes_without_sleeping(tmp_path, monkeypa
     performed = []
     monkeypatch.setattr(server, "_perform_supervisor_restart", lambda ctx, **kw: performed.append(True))
     server._pending_restart.clear()
+    # The drain path records its admission intent in the module-global
+    # _AGENT_RESTART; a leftover "ready" record from a sibling test makes
+    # agent_restart_pending() True and short-circuits the drain before it
+    # reaches the live-task check. Reset it so each drain test is isolated.
+    from ouroboros import server_restart
+    monkeypatch.setattr(server_restart, "_AGENT_RESTART", {})
 
     now = __import__("time").time()
     ctx = types.SimpleNamespace(
@@ -1255,6 +1260,8 @@ def test_restart_drain_no_live_tasks_restarts_immediately(tmp_path, monkeypatch)
     performed = []
     monkeypatch.setattr(server, "_perform_supervisor_restart", lambda ctx, **kw: performed.append(True))
     server._pending_restart.clear()
+    from ouroboros import server_restart
+    monkeypatch.setattr(server_restart, "_AGENT_RESTART", {})
 
     ctx = types.SimpleNamespace(
         RUNNING={},
@@ -1283,6 +1290,8 @@ def test_restart_drain_uses_generic_queue_heartbeat_not_retired_planning_knob(
     performed = []
     monkeypatch.setattr(server, "_perform_supervisor_restart", lambda ctx, **kw: performed.append(True))
     server._pending_restart.clear()
+    from ouroboros import server_restart
+    monkeypatch.setattr(server_restart, "_AGENT_RESTART", {})
 
     ctx = types.SimpleNamespace(
         RUNNING={
@@ -2291,7 +2300,9 @@ def test_handle_steer_task_stale_target_notifies_visibly(tmp_path, monkeypatch):
         notices, ("gone", "sub"), ("target_unknown", "subagent_target"),
     ):
         assert cid == room
-        assert kwargs == {"role": "system", "system_type": "steer_not_delivered", "task_id": target}
+        # No bridge handed an ACK over, so this row carries the notice and replies to no owner row.
+        assert kwargs == {"role": "system", "system_type": "steer_not_delivered", "task_id": target,
+                          "progress_meta": {"routing_notice_carrier": "system", "reply_to": {}}}
         assert routing_refusal_cause("steer_task", "needs_manual_target", reason) in text
         assert "I'll" not in text and "Couldn't steer task" not in text
     assert drain_owner_entries(tmp_path, "gone") == []
@@ -2337,12 +2348,11 @@ def test_decision_turn_metadata_injects_running_tasks_and_client_id(tmp_path):
     assert md["client_message_id"] == "cm-9"
     assert md["current_chat"]["chat_id"] == 1
     assert [t["task_id"] for t in md["current_chat"]["running_tasks"]] == ["a"]
-    # No running tasks + no client id -> no routing facts, only the live-works
-    # present every new head receives (an honest, incomplete empty roster here).
+    # No running tasks + no client id -> no routing facts at all (the head's
+    # context capture builds its own live-works present).
     empty_ctx = types.SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING={})
     md = server._decision_turn_metadata(empty_ctx, 1, "", {"k": "v"})
-    assert {key: value for key, value in md.items() if key != "live_works_present"} == {"k": "v"}
-    assert md["live_works_present"]["works"] == [] and md["live_works_present"]["incomplete"] is True
+    assert md == {"k": "v"}
 
 
 # --- Q10=A (owner, 2026-08-08): file-less project promotes auto-provision -----
@@ -2489,16 +2499,19 @@ def test_promote_provisioning_failure_loud_fails_not_silent_fileless(tmp_path, m
 
 def test_swarm_intent_survives_admission_to_the_finalization_read(swarm_host):  # noqa: F811 -- imported fixture
     """Host-admitted Swarm intent survives through the actual efficiency reader."""
-    import server
+    from supervisor.events import _handle_promote_chat_to_task
     from ouroboros.agent_task_pipeline import _build_swarm_efficiency
-    from tests.test_swarm_host_admission import incoming_case
+    from tests.test_swarm_host_admission import incoming_case, promotion_event
 
+    swarm_host.monkeypatch.setenv("OUROBOROS_SUBAGENTS_MODE", "swarm")
     case = incoming_case(swarm_host, "main")
-    server._route_owner_message(swarm_host.bridge, swarm_host.ctx, case.incoming)
+    _handle_promote_chat_to_task(promotion_event(case), swarm_host.ctx)
     assert swarm_host.attempts == []
     assert len(swarm_host.pending) == 1
     task = swarm_host.pending[0]
-    assert task["metadata"]["force_plan_source"] == "swarm"
+    assert "force_plan_source" not in task.get("metadata", {})
+    assert task["metadata"]["subagents_mode"] == "swarm"
+    swarm_host.monkeypatch.setenv("OUROBOROS_SUBAGENTS_MODE", "off")  # telemetry keeps admission, runtime reads live
     block = _build_swarm_efficiency(types.SimpleNamespace(drive_root=str(swarm_host.root)), task)
     assert block == {
         "intent_source": "swarm",
@@ -2574,7 +2587,8 @@ def test_steer_refusal_keeps_a_distinct_reason_for_every_other_cause(
     text, kwargs = sent[0]
     assert routing_refusal_cause("steer_task", "needs_manual_target", reason) in text
     assert "I'll" not in text and "Couldn't steer task" not in text
-    assert kwargs == {"role": "system", "system_type": "steer_not_delivered", "task_id": "target-1"}
+    assert kwargs == {"role": "system", "system_type": "steer_not_delivered", "task_id": "target-1",
+                      "progress_meta": {"routing_notice_carrier": "system", "reply_to": {}}}
 
 
 def test_steer_reaches_a_queue_resident_direct_turn(tmp_path, monkeypatch):

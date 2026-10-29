@@ -253,3 +253,33 @@ def test_a_claudexor_account_reads_the_acceptances_its_receipts_wrote(tmp_path, 
     catalog.update(account="c", window=1_000_000)  # an acceptance under a stated total keeps T - R
     accept(start(), 200_000)
     assert start().window_record.usable == 934_464 and start().window_record.accepted == 200_000
+
+
+def test_observation_writes_bound_the_frontier_without_changing_resolution(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(ce, "utc_now_iso", lambda: now.isoformat())
+    monkeypatch.setattr(ce, "utc_now", lambda: now)
+    evidence = ce.CapabilityEvidence(1_000_000, "asserted", "user_setting", "r")
+    # Simulate an old unbounded store. Reading preserves it; the next write compacts it.
+    rows = [{"accepted": n, "refused": 0, "kind": "input", "ts": now.isoformat()}
+            for n in range(100_000, 1_000_000, 100_000)]
+    ce._save(tmp_path, {"main_windows": {"r": {"observations": rows}}})
+    assert resolve_window(evidence, 65_536, root=tmp_path).accepted == 900_000
+    assert len(ce._load(tmp_path)["main_windows"]["r"]["observations"]) == 9
+    for refusal in range(200_000, 500_000, 10_000):
+        record_observation(tmp_path, "r", refused=refusal)
+        assert resolve_window(evidence, 65_536, root=tmp_path).usable == refusal - 65_536
+        record_observation(tmp_path, "r", accepted=refusal - 1)
+        assert resolve_window(evidence, 65_536, root=tmp_path).source.startswith("refusal")
+        record_observation(tmp_path, "r", accepted=refusal + 1)
+        result = resolve_window(evidence, 65_536, root=tmp_path)
+        assert result.usable == 934_464 and result.accepted == 900_000
+        frontier = ce._load(tmp_path)["main_windows"]["r"]["observations"]
+        assert len(frontier) == 3 and frontier[0] == rows[-1]
+    record_observation(tmp_path, "r", refused=400_000)
+    assert resolve_window(evidence, 65_536, root=tmp_path).usable == 334_464
+    assert resolve_window(replace(evidence, route_fp="other"), 65_536, root=tmp_path).usable == 934_464
+    now += timedelta(seconds=ce._CONFIRMED_TTL_SEC + 1)
+    assert resolve_window(evidence, 65_536, root=tmp_path).usable == 934_464

@@ -43,7 +43,7 @@ from ouroboros.settings_scales import (
     EFFORT_SCALE, EFFORT_RANGE_KEYS, EFFORT_FORMAT_KEY, normalize_effort_document, OPTIONAL_BOUND_LEGACY, UNLIMITED,  # noqa: F401
     PROMPT_CACHE_TTL_SCALE, defaults_for_settings_document, optional_bound_value,  # noqa: F401
     REVIEW_POOL_DEFAULT_EFFORT,  # noqa: F401
-    VALID_RUNTIME_MODES,  # noqa: F401
+    VALID_RUNTIME_MODES, VALID_SUBAGENTS_MODES, normalize_subagents_mode,  # noqa: F401
     VALID_SAFETY_MODES,  # noqa: F401
     _RUNTIME_MODE_RANK,  # noqa: F401
     _SAFETY_MODE_RANK,  # noqa: F401
@@ -82,6 +82,7 @@ from ouroboros.review_model_routes import (
 )
 from ouroboros.runtime_limits import (
     ARTIFACT_COMPRESSION_TIMEOUT_SEC, EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC, WORKER_SPAWN_GRACE_SEC,  # noqa: F401
+    GIT_READ_CAPTURE_TIMEOUT_SEC,  # noqa: F401
     WORKER_READY_WINDOW_SEC,  # noqa: F401
     WORKER_READY_MAX_ATTEMPTS, WORKER_READY_CEILING_SEC,  # noqa: F401
     SUPERVISOR_EVENT_BATCH_MAX_EVENTS, SUPERVISOR_EVENT_BATCH_MAX_SEC, BUDGET_PROJECTION_RETRY_SEC,  # noqa: F401
@@ -508,8 +509,10 @@ def _guard_safety_mode_lowering(settings: dict, *, allow_safety_lowering: bool =
     owner-only outside Cyber Pro (mirrors the context-mode ratchet, BIBLE P3)."""
     if runtime_mode_at_least(get_runtime_mode(), "cyber_pro"):
         return
+    raw = _settings_integrity.read_settings_json_verified(SETTINGS_PATH)
+    previous = normalize_consciousness_safety(raw if isinstance(raw, dict) else {})
     for key in ("OUROBOROS_SAFETY_MODE", "OUROBOROS_CONSCIOUSNESS_SAFETY_MODE"):
-        previous_mode = normalize_safety_mode(_settings_file_value(key, "full"))
+        previous_mode = normalize_safety_mode(previous.get(key, "full"))
         next_mode = normalize_safety_mode(settings.get(key, previous_mode))
         if _SAFETY_MODE_RANK[next_mode] < _SAFETY_MODE_RANK[previous_mode] and not allow_safety_lowering:
             raise PermissionError(
@@ -652,6 +655,8 @@ def _coerce_setting_value(key: str, value):
         return normalize_runtime_mode(value)
     if key == "OUROBOROS_UPDATE_CHANNEL":
         return normalize_update_channel(value)
+    if key == "OUROBOROS_SUBAGENTS_MODE":
+        return normalize_subagents_mode(value)
     if key == "OUROBOROS_CONTEXT_MODE":
         return normalize_context_mode(value)
     if key in OPTIONAL_BOUND_LEGACY:  # document spelling: "unlimited" or a positive int; a typo is finite
@@ -659,7 +664,7 @@ def _coerce_setting_value(key: str, value):
     # Trim so whitespace-only config is not treated as a configured skills repo.
     if key == "OUROBOROS_SKILLS_REPO_PATH":
         return str(value or "").strip()
-    if key == "MCP_SERVERS":
+    if isinstance(default, list):  # MCP_SERVERS, OUROBOROS_CONNECTIONS: a list of row objects
         if isinstance(value, str):
             try:
                 value = json.loads(value)
@@ -691,6 +696,7 @@ def verify_settings_integrity() -> str | None:
 
 from ouroboros.safety_config import (  # noqa: F401 -- the settings API stays config.*
     get_safety_mode, safety_configuration, _guard_safety_configuration, _migrate_consciousness_safety,
+    normalize_consciousness_safety,
 )
 
 log = logging.getLogger(__name__)
@@ -717,7 +723,8 @@ def normalize_settings_raw(raw: dict) -> dict:
 
     A settings document on disk is written by whatever release the owner last used, so a
     reader's first job is to translate it into today's vocabulary: coerce every known key to
-    the type its default declares, fold the deprecated per-subsystem retention keys into the
+    the type its default declares, seed absent consciousness coverage from saved owner coverage,
+    fold the deprecated per-subsystem retention keys into the
     unified one, seed the shared review-cycle cap from the retired acceptance-pass count,
     turn the former review lanes into reviewer rows of the subagent catalog (``review_pool_migration``:
     pure, once per document digest; one that cannot finish keeps its keys for the owner's next save),
@@ -740,7 +747,7 @@ def normalize_settings_raw(raw: dict) -> dict:
     (``retired_key_sets_seen`` -> ``server_maintenance._startup_retired_settings_notice``)."""
     from ouroboros.retention import LEGACY_RETENTION_KEYS, pick_legacy_retention_seed
 
-    loaded = coerce_settings_raw(raw)
+    loaded = normalize_consciousness_safety(coerce_settings_raw(raw))
     # Prefer a CUSTOMIZED legacy retention value so a rename never orphans it; an
     # all-defaults file collapses to the unified default.
     if "OUROBOROS_GC_RETENTION_DAYS" not in loaded:
@@ -791,8 +798,9 @@ def serialize_settings(settings: dict) -> str:
     return json.dumps(settings, ensure_ascii=False, indent=2)
 
 
-def load_settings() -> dict:
-    fd = _acquire_settings_lock()
+def load_settings(*, migrate: bool = False) -> dict:
+    """A read takes no lock file and writes nothing; ``migrate`` (boot, onboarding) persists the compatibility upgrades."""
+    fd = _acquire_settings_lock() if migrate else None
     try:
         return load_settings_lock_held(_settings_lock_held=fd is not None)
     finally:
@@ -800,19 +808,15 @@ def load_settings() -> dict:
 
 
 def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
-    """The same read, for a caller that ALREADY holds the settings lock. The lock is not
-    re-entrant, so a nested ``load_settings()`` burns the full 2s timeout and then reads
-    anyway; a write-path precondition needs the effective settings as of NOW, so it reads here.
-
-    ``load_settings`` passes whether it actually acquired the best-effort read lock. Direct
-    callers are lock-owning write preconditions, so the default remains true. A raw context
-    compatibility migration is persisted only while that lock is held; the write contains
-    the raw mapping plus the normalized pair, never a defaults-merged settings document."""
+    """The same read, for a caller that ALREADY holds the (not re-entrant) settings lock: a write
+    precondition needs the effective settings as of NOW. Only under that lock (a writer, or a
+    ``load_settings(migrate=True)`` that acquired it) are the raw compatibility upgrades persisted: the
+    raw mapping plus the normalized pair, never a defaults-merged document; a lock-free read writes nothing."""
     from ouroboros.review_pool_migration import apply_at_read_seam, environment_overridable_keys
     from ouroboros.server_runtime import SAVED_MODEL_ROLE_KEYS, authored_model_slots, propose_unauthored_model_slots
     loaded: dict = {}
     try:
-        raw = _settings_integrity.read_settings_json_verified(SETTINGS_PATH)
+        raw = _settings_integrity.read_settings_json_verified(SETTINGS_PATH, behind_writer=not _settings_lock_held)
     except SettingsIntegrityError:
         raise
     except Exception:
@@ -842,7 +846,7 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
             continue
         if raw_env == "" and key not in OPTIONAL_BOUND_LEGACY:
             continue
-        if key in loaded and key not in env_wins and settings.get(key) not in {None, ""}:
+        if key in loaded and key not in env_wins and settings.get(key) not in (None, "", []):  # a list row setting too
             continue
         settings[key] = _coerce_setting_value(key, raw_env)
         env_authored.add(key)

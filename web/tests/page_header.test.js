@@ -44,7 +44,7 @@ test('one header: no icon, no caption line, the tabs are written under the row, 
     }
 });
 
-test('Restart and the budget are the same nodes, placed by layout: the row on a desk, the ⋯ menu on a phone', () => {
+test('Restart and the budget are the same nodes, placed by layout: the row on a desk, the status Shade on a phone', () => {
     const node = (name, parent) => {
         const el = { name, children: [], parentElement: null,
             get nextSibling() { const i = this.parentElement.children.indexOf(this); return this.parentElement.children[i + 1] || null; },
@@ -60,32 +60,42 @@ test('Restart and the budget are the same nodes, placed by layout: the row on a 
     const actions = node('actions', toolbar);
     const restart = node('restart', actions); restart.sel = '[data-chat-command="restart"]';
     const panic = node('panic', actions); panic.sel = '[data-chat-command="panic"]';
-    const details = node('details', actions);
-    const menu = node('menu', details); menu.sel = '.chat-header-menu';
     const budget = node('budget', toolbar);
     const status = node('status', toolbar);
+    // The room status control (room_work.js): its Shade's end slot, repainted after each move.
+    let repaints = 0;
+    const shade = { extras: node('extras'), update: () => { repaints += 1; } };
     const listeners = new Map();
     globalThis.window = { ouroLayout: { layout: 'stack' }, addEventListener: (t, fn) => listeners.set(t, fn), removeEventListener: (t) => listeners.delete(t) };
     globalThis.document = { documentElement: { dataset: {} } };
-    const dispose = bindHeaderControlPlacement({ headerActions: actions, budgetPill: budget });
-    assert.deepEqual(menu.children.map((c) => c.name), ['budget', 'restart'], 'stack: the budget first, Restart last, inside ⋯');
-    assert.deepEqual(actions.children.map((c) => c.name), ['panic', 'details']);
+    const dispose = bindHeaderControlPlacement({ headerActions: actions, budgetPill: budget, shade });
+    assert.deepEqual(shade.extras.children.map((c) => c.name), ['restart', 'budget'], 'stack: Restart, then the budget, in the status Shade');
+    assert.deepEqual(actions.children.map((c) => c.name), ['panic'], 'Panic stays in the bar; no ⋯');
+    assert.equal(repaints, 1, 'the Shade learns its slot changed');
     globalThis.window.ouroLayout.layout = 'docked';
     listeners.get('ouro:layout-changed')({ detail: { layout: 'docked' } });
-    assert.deepEqual(actions.children.map((c) => c.name), ['restart', 'panic', 'details'], 'docked: Restart back before Panic');
+    assert.deepEqual(actions.children.map((c) => c.name), ['restart', 'panic'], 'docked: Restart back before Panic');
     assert.deepEqual(toolbar.children.map((c) => c.name), ['actions', 'budget', 'status'], 'the budget back after the actions');
+    assert.deepEqual(shade.extras.children, [], 'the Shade keeps nothing of the row');
     // A docked bar too narrow for the full row (a narrow content column) moves them too; a wide one keeps the row.
     const bar = { clientWidth: 500 };
-    const narrow = bindHeaderControlPlacement({ headerActions: actions, budgetPill: budget, bar });
-    assert.deepEqual(menu.children.map((c) => c.name), ['budget', 'restart'], 'a 500px bar: inside ⋯');
+    const narrow = bindHeaderControlPlacement({ headerActions: actions, budgetPill: budget, shade, bar });
+    assert.deepEqual(shade.extras.children.map((c) => c.name), ['restart', 'budget'], 'a 500px bar: in the Shade');
     narrow();
-    bar.clientWidth = 900;
-    const wide = bindHeaderControlPlacement({ headerActions: actions, budgetPill: budget, bar });
-    assert.deepEqual(actions.children.map((c) => c.name), ['restart', 'panic', 'details'], 'a 900px bar: the row');
+    const wideToolbar = node('toolbar');
+    const wideActions = node('actions', wideToolbar);
+    node('restart', wideActions).sel = '[data-chat-command="restart"]';
+    node('panic', wideActions).sel = '[data-chat-command="panic"]';
+    const wideShade = { extras: node('extras') };
+    const wide = bindHeaderControlPlacement({ headerActions: wideActions, budgetPill: node('budget', wideToolbar),
+        shade: wideShade, bar: { clientWidth: 900 } });
+    assert.deepEqual(wideActions.children.map((c) => c.name), ['restart', 'panic'], 'a 900px bar: the row');
+    assert.deepEqual(wideShade.extras.children, []);
     wide();
     dispose();
     assert.equal(listeners.size, 0);
     assert.equal(typeof bindHeaderControlPlacement({ headerActions: null }), 'function', 'no actions: a no-op disposer');
+    assert.equal(typeof bindHeaderControlPlacement({ headerActions: actions }), 'function', 'no Shade (a Project bar): a no-op disposer');
     delete globalThis.window; delete globalThis.document;
 });
 

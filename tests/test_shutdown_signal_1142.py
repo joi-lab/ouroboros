@@ -283,6 +283,11 @@ def _check_real_shutdown(tmp_path, *, launcher_pipe):
                      if row.get("type") == "server_shutdown"]
     cause = "launcher_quit" if launcher_pipe else "external_signal"
     assert shutdown_rows and shutdown_rows[-1].get("cause") == cause, shutdown_rows
+    # The door's entry, written before any wait, names the same cause the late row confirms.
+    from datetime import datetime
+    entry = json.loads((data_dir / "state" / "shutdown_entry.json").read_text(encoding="utf-8"))
+    assert (entry["cause"], entry["restart_exit"]) == (cause, False), entry
+    assert datetime.fromisoformat(entry["entered_at"]) <= datetime.fromisoformat(shutdown_rows[-1]["ts"])
     assert elapsed < LAUNCHER_STOP_GRACE_SEC, elapsed
 
 

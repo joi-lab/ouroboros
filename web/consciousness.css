@@ -54,6 +54,49 @@ textarea.ui-control.consciousness-owner-words {
 .consciousness-more[open] > summary .consciousness-marker { transform: rotate(90deg); }
 .consciousness-more-body { display: flex; flex-direction: column; gap: var(--space-3); margin-top: var(--space-3); }
 
+/* ---- the bar's chip and its Shade (consciousness_status.js; DESIGN "Page header") ------------------------------- */
+/* One of the bar's capsules, Panic's material (style.css): the brain, then the next wake, Off or Evolving, then its one
+   mark. It keeps its width; the room's title yields first. Off greys the brain, and its word unless a campaign runs. */
+.cx-chip { gap: 6px; font-variant-numeric: tabular-nums; }
+.cx-chip[hidden], .cx-chip-word[hidden] { display: none; }
+.cx-chip-glyph { display: inline-flex; flex: none; }
+.cx-chip-glyph svg { display: block; width: 18px; height: 18px; }
+/* It leads the bar's end group, so a status word that grows or shrinks never moves it (DESIGN bible 6). */
+:is(.chat-page-header, .project-panel-bar) > .cx-chip { margin-inline-start: auto; }
+:is(.chat-page-header, .project-panel-bar) > .cx-chip:not([hidden]) + :is(.app-page-actions, .app-page-trailing) { margin-inline-start: 0; }
+:root[data-theme] .cx-chip.ui-chrome-control[data-off="true"] .cx-chip-glyph,
+:root[data-theme] .cx-chip.ui-chrome-control[data-off="true"]:not([data-evolving="true"]) .cx-chip-word { color: var(--text-meta); }
+:root[data-theme] .cx-chip.ui-chrome-control[data-open="1"] { background: var(--chip-float-hover); }
+/* Its sheet is the work list's (room_work.css .rw-shade): its own opaque material hung under the bar's capsules, at
+   most 40rem wide and ending under the bar's last control, so it opens under the chip. */
+.rw-shade.cx-shade { left: auto; width: min(40rem, calc(100% - var(--rw-left, 0px) - var(--rw-right, 0px))); }
+.cx-body {
+    display: flex; flex-direction: column; gap: var(--space-2); box-sizing: border-box;
+    padding: var(--space-3) var(--space-4) var(--space-4);
+}
+.cx-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); }
+.cx-head-words { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.cx-kicker, .cx-wakes-title { margin: 0; font-size: var(--type-meta); line-height: var(--line-meta); color: var(--text-meta); }
+.cx-state { margin: 0; font-size: var(--type-section); line-height: var(--line-title); font-weight: 600; color: var(--text-primary); }
+.cx-money, .cx-wakes-note { margin: 0; font-size: var(--type-body); line-height: var(--line-body); color: var(--text-secondary); }
+.cx-wakes-title { margin-top: var(--space-2); }
+.cx-wakes { display: flex; flex-direction: column; gap: var(--space-1); margin: 0; padding: 0; list-style: none; }
+.cx-wake {
+    display: grid; grid-template-columns: auto minmax(0, 1fr) auto; column-gap: var(--space-3); align-items: baseline;
+    font-size: var(--type-body); line-height: var(--line-body); color: var(--text-primary);
+}
+.cx-wake-time { color: var(--text-meta); font-variant-numeric: tabular-nums; }
+.cx-wake-text { min-width: 0; overflow-wrap: anywhere; color: var(--text-primary); }
+.cx-wake-outcome { font-size: var(--type-meta); color: var(--text-meta); }
+.cx-doors { display: flex; flex-wrap: wrap; gap: var(--space-4); margin-top: var(--space-2); }
+.cx-door {
+    padding: 0; border: 0; border-radius: var(--radius-xs); background: transparent; cursor: pointer;
+    font: inherit; font-size: var(--type-body); line-height: var(--line-body); font-weight: 600; color: var(--tone-crimson-word);
+}
+.cx-door:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+@media (hover: hover) { .cx-door:hover { text-decoration: underline; text-underline-offset: 3px; } }
+:is(.cx-money, .cx-toggle, .cx-wakes, .cx-wakes-note, .cx-door)[hidden] { display: none; }
+
 /* ---- Settings › Behavior › Consciousness ------------------------------------------------------------------------ */
 .consciousness-levels { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
 .consciousness-levels li { color: var(--text-meta); font-size: var(--type-body); line-height: var(--line-body); }
@@ -174,19 +217,33 @@ textarea.ui-control.consciousness-owner-words {
 .consciousness-wakes { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; }
 .consciousness-wake {
     display: grid;
-    grid-template-columns: 48px minmax(0, 1fr) auto;
+    grid-template-columns: auto minmax(0, 1fr) auto;
     column-gap: var(--space-3);
     align-items: start;
     padding: var(--space-3) 0;
 }
 .consciousness-wake + .consciousness-wake { border-top: 1px solid var(--surface-border-soft); }
+.consciousness-wake-time::after { content: " ·"; }
 .consciousness-wake-time { color: var(--text-meta); font-size: var(--type-body); line-height: var(--line-body); font-variant-numeric: tabular-nums; }
 .consciousness-wake-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .consciousness-wake-head { color: var(--text-meta); font-size: var(--type-body); line-height: var(--line-body); overflow-wrap: anywhere; }
 .consciousness-wake-where, .consciousness-wake-own { color: var(--text-primary); font-weight: 600; }
 .consciousness-wake-own { display: inline-flex; align-items: center; gap: 6px; }
-.consciousness-wake-did { color: var(--text-primary); font-size: var(--type-body); line-height: var(--line-body); }
+.consciousness-wake-summary { margin: 0; overflow-wrap: anywhere; color: var(--text-primary); font-size: var(--type-body); line-height: var(--line-body); }
+.consciousness-wake-lead { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-meta); font-size: var(--type-body); line-height: var(--line-body); }
+.consciousness-wake-facts { margin: var(--space-1) 0; color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta); overflow-wrap: anywhere; }
+.consciousness-wake-facts.is-line { margin: 0; }
 .consciousness-wake-checks { display: flex; flex-wrap: wrap; gap: var(--space-1); }
+.consciousness-wake-checks .skills-chip { white-space: normal; overflow-wrap: anywhere; }
+.consciousness-wake-more { min-width: 0; font-size: var(--type-body); line-height: var(--line-body); }
+.consciousness-wake-more > summary { display: list-item; width: fit-content; margin-inline-start: 1em; color: var(--text-meta); cursor: pointer; border-radius: var(--radius-xs); }
+.consciousness-wake-more > summary:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+.consciousness-wake-note-label { margin: var(--space-2) 0 var(--space-1); color: var(--text-meta); font-size: var(--type-meta); font-weight: 600; }
+.consciousness-wake-note { overflow-wrap: anywhere; color: var(--text-primary); }
+.consciousness-wake-note > :first-child { margin-top: 0; }
+.consciousness-wake-note > :last-child { margin-bottom: var(--space-2); }
+.consciousness-wake-note pre { max-width: 100%; overflow: auto; }
+.consciousness-wake-note img { max-width: 100%; }
 .consciousness-wake-cost {
     color: var(--text-meta);
     font-size: var(--type-meta);
@@ -199,6 +256,7 @@ textarea.ui-control.consciousness-owner-words {
    a place row puts its spend under the meta. */
 @container consciousness (max-width: 560px) {
     .consciousness-wake { grid-template-columns: minmax(0, 1fr) auto; row-gap: var(--space-1); }
+    .consciousness-wake-time::after { content: none; }
     .consciousness-wake-time { grid-column: 1; grid-row: 1; }
     .consciousness-wake-cost { grid-column: 2; grid-row: 1; }
     .consciousness-wake-main { grid-column: 1 / -1; grid-row: 2; }
@@ -216,6 +274,7 @@ textarea.ui-control.consciousness-owner-words {
 .place-sheet-section { display: flex; flex-direction: column; gap: var(--space-2); width: 100%; max-width: 720px; margin: 0 auto; }
 .place-sheet-section > h3 { margin: 0; color: var(--text-primary); font-size: var(--type-section); line-height: var(--line-title); font-weight: 600; }
 .place-sheet-section p { margin: 0; color: var(--text-primary); font-size: var(--type-body); line-height: var(--line-body); overflow-wrap: anywhere; }
+.place-history-plain { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-primary); font-size: var(--type-body); line-height: var(--line-body); }
 .place-sheet-section .place-sheet-note, .place-sheet-note { color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta); }
 .place-sheet-status { margin: 0; font-size: var(--type-meta); line-height: var(--line-meta); }
 .place-sheet-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
@@ -231,8 +290,10 @@ textarea.ui-control.consciousness-owner-words {
     color: var(--system-text);
 }
 .place-wake-list, .place-note-list { display: flex; flex-direction: column; gap: var(--space-2); margin: 0; padding: 0; list-style: none; }
-.place-wake-item { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); color: var(--text-primary); font-size: var(--type-body); line-height: var(--line-body); }
-.place-wake-item > .btn { margin-inline-start: auto; }
+.place-wake-item { display: flex; flex-wrap: nowrap; align-items: center; min-height: 32px; gap: var(--space-2); color: var(--text-primary); font-size: var(--type-body); line-height: var(--line-body); }
+.place-wake-toggle { display: flex; align-items: center; flex: 1 1 auto; min-width: 0; gap: var(--space-2); cursor: pointer; }
+.place-wake-toggle > span { min-width: 0; overflow-wrap: anywhere; }
+.place-wake-item > .ui-chip { flex: 0 0 auto; margin-inline-start: auto; }
 .place-wake-offers { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
 .place-accounts { display: flex; flex-direction: column; gap: var(--space-2); }
 .place-account .harness-account-meta, .place-connector-row .harness-account-meta { color: var(--text-meta); }
@@ -247,6 +308,7 @@ textarea.ui-control.consciousness-owner-words {
 .place-note-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2); }
 .place-field-row { display: flex; align-items: center; gap: var(--space-2); }
 .place-field-row .ui-control { flex: 1 1 auto; min-width: 0; }
+.place-field-row .ui-model-chooser { flex: 1 1 auto; min-width: 0; }
 .place-field-row .btn { flex: 0 0 auto; }
 .place-disconnect-confirm { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3) var(--space-4); border-radius: var(--radius-inner); background: var(--surface-tray); }
 @container placesheet (max-width: 480px) {
@@ -257,3 +319,29 @@ textarea.ui-control.consciousness-owner-words {
 /* ---- Skills cards: a connector wears the icon its connector ships ----------------------------------------------- */
 .skills-card-icon { display: inline-flex; flex: 0 0 auto; align-self: center; color: var(--text-primary); margin-inline-end: 2px; }
 .skills-card-icon svg { display: block; }
+
+/* The selected conversation replaces the editor inside its sheet. Authored voices use the mockup's reading rows. */
+.place-sheet-editor { display: flex; flex-direction: column; gap: var(--space-5); }
+.place-sheet-editor[hidden] { display: none; }
+.place-room-row { grid-template-columns: minmax(0, 1fr) auto; }
+.place-room-row > .place-sheet-note { grid-column: 1 / -1; }
+.place-convo { gap: var(--space-3); }
+.place-convo-rows { display: flex; flex-direction: column; gap: var(--space-4); }
+.place-convo-row { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.place-convo-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--space-2); color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta); }
+.place-convo-who { color: var(--text-primary); font-size: var(--type-body); line-height: var(--line-body); font-weight: 600; overflow-wrap: anywhere; }
+.place-convo-row.is-assistant .place-convo-who { color: var(--assistant-sender); }
+.place-convo-row.is-owner .place-convo-who { color: var(--user-sender); }
+.place-convo-row time { font-variant-numeric: tabular-nums; }
+.place-convo-fact::before { content: '·'; margin-inline-end: var(--space-2); }
+.place-convo-text { color: var(--text-primary); font-size: var(--type-body); line-height: var(--line-body); overflow-wrap: anywhere; }
+.place-convo-text.chat-markdown > :first-child { margin-top: 0; }
+.place-convo-text.chat-markdown > :last-child { margin-bottom: 0; }
+.place-convo-row.is-system { padding: var(--space-2) var(--space-4); border-radius: var(--radius-inner); background: var(--system-bubble-bg); }
+.place-convo-row.is-system .place-convo-who { color: var(--system-sender); }
+.place-convo-row.is-system .place-convo-text { color: var(--system-text); }
+.place-convo-edge { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); }
+@container placesheet (max-width: 480px) {
+    .place-room-row { grid-template-columns: minmax(0, 1fr); gap: var(--space-1); }
+    .place-room-row .consciousness-place-facts { text-align: start; }
+}

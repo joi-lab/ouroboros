@@ -30,6 +30,9 @@ CLAUDEXOR_STOP_EXIT_WAIT_SEC = 5.0
 EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC = 3600.0
 # Transport bound for one optional ditto process; expiry leaves the original patch intact.
 ARTIFACT_COMPRESSION_TIMEOUT_SEC = 120.0
+# Kill-and-reap bound for one captured local Git read (vcs_read history/identity); it sits
+# inside the default ToolEntry envelope so the reader reports and reaps before the loop abandons.
+GIT_READ_CAPTURE_TIMEOUT_SEC = 300.0
 
 
 EXTENSION_STREAM_CHUNK_BYTES = 64 * 1024
@@ -125,9 +128,10 @@ def get_max_workers() -> int:
 
 
 def get_task_idle_timeout_sec() -> int:
-    """Idle window before a task is eligible for an activity-based stop: it has made
-    no REAL progress (its own last_progress_at) AND has no progressing subtree for
-    this long. The periodic 30s process heartbeat is liveness, NOT progress."""
+    """Silence window: a managed task with no REAL progress (its own last_progress_at)
+    AND no progressing subtree for this long gets dated attention, never a stop (#1376).
+    It also bounds a direct-chat turn's outage and accounting waits. The periodic 30s
+    process heartbeat is liveness, NOT progress."""
     return _clamped_number_setting("OUROBOROS_TASK_IDLE_TIMEOUT_SEC", low=60, cast=int)
 
 
@@ -448,9 +452,9 @@ def get_search_code_wall_sec() -> float:
 def get_finalization_grace_sec(settings: Optional[dict] = None) -> int:
     """Grace window in seconds: env, else the ``settings`` argument, else the
     shipped default — the ``_clamped_number_setting`` shape. Deliberately NO
-    ``load_settings()`` fallback: a READ must never persist settings, and that
-    call runs the context-mode compatibility migration, which can WRITE a
-    normalized file under read-only observers (``task_pacing._reserve_sec``)."""
+    ``load_settings()`` fallback: the caller's document or the environment
+    answers, so a read-only observer (``task_pacing._reserve_sec``) reads no
+    settings file."""
     raw = runtime_setting("OUROBOROS_FINALIZATION_GRACE_SEC")
     if raw is None and isinstance(settings, dict):
         raw = settings.get("OUROBOROS_FINALIZATION_GRACE_SEC")

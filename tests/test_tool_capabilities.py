@@ -141,11 +141,13 @@ def test_top_level_workspace_focus_has_tool_and_schema_parity(tmp_path, monkeypa
         LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
     )
 
-    assert LOCAL_READONLY_SUBAGENT_TOOL_NAMES <= names, (
+    # Exact callable aliases intentionally have no second advertised schema.
+    aliases = {entry.name for entry in registry._entries.values() if entry.alias_for in names}
+    assert LOCAL_READONLY_SUBAGENT_TOOL_NAMES <= names | aliases, (
         f"read-only child tools missing from the workspace tool surface: "
         f"{sorted(LOCAL_READONLY_SUBAGENT_TOOL_NAMES - names)}"
     )
-    assert ACTING_SUBAGENT_TOOL_NAMES <= names, (
+    assert ACTING_SUBAGENT_TOOL_NAMES <= names | aliases, (
         f"acting child tools missing from the workspace tool surface: "
         f"{sorted(ACTING_SUBAGENT_TOOL_NAMES - names)}"
     )

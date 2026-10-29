@@ -42,8 +42,10 @@ def shipped_builtin_tools():
 @integration
 @pytest.mark.parametrize(
     "canary",
-    [pytest.param(canary, marks=pytest.mark.required_provider if canary.credential_required
-                  else pytest.mark.optional_provider) for canary in _PROVIDER_CANARIES],
+    [pytest.param(canary, marks=[pytest.mark.required_provider if canary.credential_required
+                                 else pytest.mark.optional_provider,
+                                 *([pytest.mark.skip(reason=canary.skip_reason)] if canary.skip_reason else [])])
+     for canary in _PROVIDER_CANARIES],
     ids=[canary.canary_id for canary in _PROVIDER_CANARIES],
 )
 def test_full_registry_provider_contract(canary, shipped_builtin_tools, request):

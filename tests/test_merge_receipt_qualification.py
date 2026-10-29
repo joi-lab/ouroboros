@@ -546,7 +546,9 @@ def test_a_matching_review_record_covers_the_head_and_names_its_source(world, mo
     asked = install_ledger(monkeypatch, {RECORD_ID: record})
     out = record_merge(world, review_record_id=RECORD_ID, review_task_ids=["review-1"])
     assert asked == [(world.root.resolve(), RECORD_ID)]
-    assert ["pr", "merge", "7", "--squash", "--match-head-commit", HEAD] in world.gh.calls
+    call = next(c for c in world.gh.calls if c[:2] == ["pr", "merge"])
+    assert call[:6] == ["pr", "merge", "7", "--squash", "--match-head-commit", HEAD]
+    assert call[6:] == ["--body-file", "-"] and "Ouroboros-Qualification:" in world.gh.merge_inputs[0]
     (receipt,) = _receipts(world)
     assert receipt["coverage"]["status"] == "covers_head" and receipt["coverage"]["gaps"] == []
     review = receipt["review"]

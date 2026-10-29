@@ -482,7 +482,7 @@ def test_the_eslint_layer_is_exact_pinned_and_lockfile_frozen():
     assert set(dev) == {"eslint", "globals"}, "the layer needs eslint and its globals tables, nothing else"
     for name, version in dev.items():
         assert re.fullmatch(r"\d+\.\d+\.\d+", version), f"{name} is not exact-pinned: {version!r}"
-    assert package["scripts"]["lint:undef"] == "eslint --max-warnings=0 app.js modules tests"
+    assert package["scripts"]["lint:undef"] == "eslint --max-warnings=0 app.js theme.js modules tests"
     lock = json.loads((web / "package-lock.json").read_text(encoding="utf-8"))
     assert lock["lockfileVersion"] >= 3
     for name, version in dev.items():
@@ -503,6 +503,8 @@ def test_the_eslint_config_carries_only_no_undef_over_the_gate_scope():
     for body in rules:
         assert re.findall(r"'([a-z-]+)'\s*:", body) == ["no-undef"], body
     assert "files: ['app.js', 'modules/**/*.js']" in config
+    # The classic script every page runs before CSS is linted as the script it is, like the walker reads it.
+    assert re.search(r"files: \['theme\.js'\],\s*languageOptions: \{[^}]*sourceType: 'script'", config)
     assert "globals.browser" in config and "globals.es2022" in config
     for name in ("Chart", "marked", "DOMPurify", "mermaid", "hljs"):
         assert f"{name}: 'readonly'" in config, f"vendored <script> global {name} missing from the ESLint layer"

@@ -109,6 +109,47 @@ export function taskReasonPhrase(code) {
     return TASK_CAUSE_PHRASES[raw] ? tr(`task.cause.${raw}`, TASK_CAUSE_PHRASES[raw]) : raw;
 }
 
+// The steps that most often stay failed at an ending; any other reads "A tool step". Python twin:
+// ouroboros/tool_error_words.py (outcome_phase_parity pins both).
+const TOOL_NOUNS = {
+    run_command: 'A command',
+    run_script: 'A script',
+    read_file: 'A file read',
+    list_files: 'A folder listing',
+    query_data: 'A data query',
+    github_read: 'A GitHub read',
+    query_code: 'A code search',
+    search_code: 'A code search',
+    pr_merge: 'A pull request merge',
+    review_change: 'A review request',
+    finish_task: 'A finish request',
+};
+const LISTED = 20;  // outcomes keeps at most this many errors per list
+
+/** The residual-warning clause naming the first recorded tool error in plain words (never a tool
+ *  name, its result text or a path), or '' when the record names none. */
+export function residualToolErrorsPhrase(execution = {}) {
+    const list = (key) => (Array.isArray(execution?.[key]) ? execution[key].filter((item) => item && typeof item === 'object') : []);
+    const unresolved = list('unresolved_tool_errors'), cosmetic = list('cosmetic_tool_errors');
+    const first = (unresolved.length ? unresolved : cosmetic)[0];
+    if (!first) return '';
+    const noun = tr(`task.tool_noun.${Object.hasOwn(TOOL_NOUNS, first.tool) ? first.tool : 'other'}`, TOOL_NOUNS[first.tool] || 'A tool step');
+    const status = String(first.status || ''), code = Number.isInteger(first.exit_code) ? first.exit_code : null;
+    const signal = first.signal ?? '';
+    const subject = status === 'unknown_tool' ? tr('task.tool_error.unknown_tool', 'A call named a tool that does not exist')
+        : status === 'non_zero_exit' && signal !== '' ? fmt('{noun} was stopped by signal {signal}', { noun, signal })
+            : status === 'non_zero_exit' ? (code !== null ? fmt('{noun} returned exit code {code}', { noun, code })
+                : fmt('{noun} returned a non-zero exit code', { noun }))
+                : status.endsWith('timeout') ? fmt('{noun} timed out', { noun })
+                    : status === 'argument_error' ? fmt('{noun} was called with invalid arguments', { noun })
+                        : fmt('{noun} failed', { noun });
+    const more = unresolved.length + cosmetic.length - 1;
+    const tail = unresolved.length >= LISTED || cosmetic.length >= LISTED ? tr('task.tool_error.more_capped', ', plus more tool errors')
+        : more === 1 ? tr('task.tool_error.more_one', ', plus 1 more tool error')
+            : more ? fmt(', plus {n} more tool errors', { n: more }) : '';
+    return fmt('{subject}{tail}; the result has not been evaluated.', { subject, tail });
+}
+
 // Details retain unknown codes once, in order; their visible cause never guesses. Twin: project_dialogue._cause_phrase.
 export function describedCause(code, undescribed) {
     const raw = String(code || '');

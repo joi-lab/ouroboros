@@ -779,8 +779,10 @@ def test_uv_project_commands_validate_lock_freshness(path):
 
 
 def test_generated_runtime_lock_keeps_lf_on_windows():
-    attributes = _read(".gitattributes").splitlines()
-    assert "requirements-runtime.lock text eol=lf" in attributes
+    """The regenerated lock keeps LF in a Windows checkout, so the clean-tree bundle gate sees no false edit."""
+    attributes = subprocess.run(["git", "check-attr", "eol", "--", "requirements-runtime.lock"], cwd=REPO_ROOT,
+                                capture_output=True, text=True, check=True).stdout
+    assert attributes.strip() == "requirements-runtime.lock: eol: lf", attributes
 
 
 # ---------------------------------------------------------------------------

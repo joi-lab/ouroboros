@@ -280,7 +280,7 @@ def test_routing_recent_text_rows_report_only_missing_parts_of_the_window(tmp_pa
     from types import SimpleNamespace
     from ouroboros import server_routing_context as routing
 
-    monkeypatch.setattr(routing, "_addressable_root_tasks", lambda *args: [])
+    monkeypatch.setattr(routing, "addressable_roots", lambda *args: routing.RootSnapshot())
     monkeypatch.setattr(routing, "_recent_root_results", lambda *args: ([], {}))
     seed(tmp_path, archives={"chat_20261016T000000.jsonl": [owner("archive")]})
     ds.ensure(tmp_path)
@@ -305,7 +305,7 @@ def test_routing_recent_text_discloses_recorded_invalid_intervals(tmp_path, monk
     from types import SimpleNamespace
     from ouroboros import server_routing_context as routing
 
-    monkeypatch.setattr(routing, "_addressable_root_tasks", lambda *args: [])
+    monkeypatch.setattr(routing, "addressable_roots", lambda *args: routing.RootSnapshot())
     monkeypatch.setattr(routing, "_recent_root_results", lambda *args: ([], {}))
     seed(tmp_path, live={"chat": [owner(), "{broken\n"]})
     ds.ensure(tmp_path)

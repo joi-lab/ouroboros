@@ -1,7 +1,7 @@
 /** One stack of layers over the room (docs/DESIGN.md "Shell", plan P2).
  *
  * A layer is anything that lies over the page and is dismissed as one thing: the phone drawer and the Project panel.
- * Dialogs, menus and the Shade keep their own focus traps and Escape. Every way of leaving ends in the same place:
+ * Dialogs, menus and the work list keep their own focus traps and Escape. Every way of leaving ends in the same place:
  * Escape, the scrim, × call `pop()`, which closes exactly one layer, the top one, through the layer's own `onClose`;
  * the browser's or Android's Back and Telegram's Back call `back()`, which first gives an open dialog over the layer
  * its Escape (the dialog is what is on top) and otherwise pops. The owner of a layer's
@@ -110,7 +110,7 @@ export function createLayerStack({ win = globalThis.window, doc = globalThis.doc
         if (stack.length) back('history');
     };
 
-    // ---- Escape closes the top layer unless something inside already took the key (a menu, the Shade, a dialog)
+    // ---- Escape closes the top layer unless something inside already took the key (a menu, the work list, a dialog)
     const onKeydown = (event) => {
         if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || !stack.length) return;
         if (doc?.querySelector?.('dialog[open]')) return;  // a native modal dialog owns Escape until it adapts

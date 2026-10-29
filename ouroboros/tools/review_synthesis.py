@@ -325,7 +325,7 @@ def per_slot_input_token_limits(
         if not key or (key in limits and row is not None):
             raise ValueError("Reviewer capacity requires unique stable slot IDs")
         window = (
-            int(context_window)
+            context_window
             if context_window is not None
             else reviewer_context_window(str(model), **binding)
         )

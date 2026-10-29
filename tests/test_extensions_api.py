@@ -133,7 +133,7 @@ def _patch_lifespan_for_drive_root_test(monkeypatch, srv, settings: dict, reques
     monkeypatch.setattr(srv.store_switch, "_run", tracked_import)
     monkeypatch.setattr(srv.server_boot, "serve_host_service", no_host_listener)
     request.addfinalizer(join_imports)
-    monkeypatch.setattr(srv, "load_settings", lambda: dict(settings))
+    monkeypatch.setattr(srv, "load_settings", lambda **_k: dict(settings))
     monkeypatch.setattr(srv, "save_settings", lambda *_a, **_k: None)
     monkeypatch.setattr(srv, "apply_runtime_provider_defaults", lambda s: (s, False, []))
     monkeypatch.setattr(srv, "_apply_settings_to_env", lambda *_a, **_k: None)

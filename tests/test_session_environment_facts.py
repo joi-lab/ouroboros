@@ -235,7 +235,8 @@ def test_a_writable_reviewer_copy_gets_its_own_facts_and_a_folder_read_in_place_
     area = pathlib.Path(binding["execution"]["workspaceRoot"])
     text = binding["instructions"]
     assert f"Dependency files in {area} (sha256): pyproject.toml {_digest(area / 'pyproject.toml')}" in text
-    assert "where this copy's .gitignore ignores it" in text and "none known to the host" in text
+    assert "outside this copy, since its changes are retained as evidence" in text and "none known to the host" in text
+    assert ".gitignore ignores it" not in text  # an environment inside the copy would become evidence
     assert f"UV_CACHE_DIR={package_downloads_root(data) / 'uv'}" in text
     from ouroboros.review_session_preparation import seat_environment_facts
 

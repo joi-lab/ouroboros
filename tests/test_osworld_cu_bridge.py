@@ -81,7 +81,7 @@ def test_connection_switching_ext_tools_are_denied_vm_control_stays():
 
     def ext(n):
         return extension_surface_name("unix_computer_use", n)
-    for n in ("add_connection", "activate_connection", "use_local", "clear_active_connection"):
+    for n in ("add_connection", "activate_connection", "use_local"):
         assert ext(n) in disabled, f"{n} must be denied to the untrusted task"
     # v6.81.1: list_connections/test_connection JOIN the denied set — both echo the
     # bridge URL, and a trace showed an agent using that URL to hunt for the grader.
@@ -1391,9 +1391,11 @@ def test_module_grandfather_matcher_uses_exact_repo_relative_paths():
     from ouroboros.review import module_is_grandfathered
     # Exact runtime helpers accept only actual repo-relative paths. Compatibility
     # section-prefix decoding belongs solely to compute_complexity_metrics.
-    assert module_is_grandfathered("skills/unix_computer_use/plugin.py")
-    assert not module_is_grandfathered("repo/skills/unix_computer_use/plugin.py")
-    # a DIFFERENT plugin.py (future skill) is NOT exempted by the path-qualified entry
+    assert module_is_grandfathered("supervisor/workers.py")
+    assert not module_is_grandfathered("repo/supervisor/workers.py")
+    # 0.5.3 split the computer-use plugin under the cap: its giant entry is gone, so nothing exempts it now,
+    # and a DIFFERENT plugin.py (future skill) was never exempted by a path-qualified entry.
+    assert not module_is_grandfathered("skills/unix_computer_use/plugin.py")
     assert not module_is_grandfathered("skills/other_skill/plugin.py")
     assert not module_is_grandfathered("repo/skills/other_skill/plugin.py")
     # The Restart extraction retired server.py's debt; no same-basename is exempt.
@@ -1634,7 +1636,7 @@ def test_gate_phase_removes_the_mutating_tools_and_keeps_the_reading_ones():
     # click through them. A test iterating the same incomplete set cannot catch that class,
     # so this list is the independent statement of what "mutating" means.
     mutating_tools = ("click", "double_click", "triple_click", "move", "left_click_drag",
-                      "mouse_down", "mouse_up", "type_text", "key", "hold_key", "scroll")
+                      "mouse_down", "mouse_up", "type_text", "key", "hold_key", "scroll", "activate_app")
     assert set(mutating_tools) == set(rcb._GUI_ACTION_TOOLS), \
         "a click alias was registered without updating _GUI_ACTION_TOOLS (or vice versa)"
     for mutating in mutating_tools:
@@ -1867,7 +1869,7 @@ def test_the_bench_agent_cannot_reach_the_bridge_url():
     for tool in ("list_connections", "test_connection"):
         assert extension_surface_name(rcb.SKILL_NAME, tool) in disabled, tool
     # The success path of the remote screenshot must not emit the bridge URL.
-    src = pathlib.Path(plugin.__file__).read_text(encoding="utf-8")
+    src = (pathlib.Path(plugin.__file__).parent / "remote.py").read_text(encoding="utf-8")
     shot = src[src.index("def _osworld_screenshot"):src.index("def _test_osworld")]
     assert '"target": target' not in shot, "the bridge URL is back in the screenshot result"
 

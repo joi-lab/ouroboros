@@ -921,8 +921,10 @@ def test_normalized_session_counters_are_carried_whole_or_not_at_all(tmp_path, r
     """A repaired counter would read exactly like a measured one (BIBLE P1)."""
     row = _settled_session_row(tmp_path, reported)
     assert row.get("input_token_usage") == expected
-    # The legacy axes and the settled cash keep their own meanings either way.
-    assert row["prompt_tokens"] == 300 and row["cached_tokens"] == 130
+    # The input axes are the split, unknown where it is; the harness's counters and the cash stay as reported.
+    assert (row["prompt_tokens"], row["cached_tokens"]) == ((expected or {}).get("total_tokens"),
+                                                          (expected or {}).get("cache_read_tokens"))
+    assert row["harness_tokens"] == {"prompt_tokens": 300, "cached_tokens": 130}
     assert row["cost_usd"] == 0.0 and row["cost_final"] is True
 
 

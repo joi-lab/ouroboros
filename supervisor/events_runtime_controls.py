@@ -426,7 +426,9 @@ def _handle_owner_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
         from ouroboros.gateway.task_decision import _send_quiz_state
         ack = evt["quiz_ack"]
         block = quiz_states(ctx.DRIVE_ROOT, ack["task_id"]).get(ack["quiz_id"]) or {}
+        # The recorded winner rides with the delivery: a card rebuilt from this fact keeps its answer.
         _send_quiz_state(ack["quiz_id"], ack["task_id"], str(block.get("state") or "answered"),
+                         answered_index=block.get("answered_index"), comment=str(block.get("comment") or ""),
                          question_delivery=question_delivery_projection(block))
         return
     if evt.get("relay_ack"):

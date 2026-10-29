@@ -406,8 +406,18 @@ class GateReceipt:
 # that frozen request on a pending rejoin — never rebuilt from a later ctx. A wave
 # nobody supplied one for (a standalone ``review_change``, a legacy pending wave)
 # stays ``unobserved``. It enters no retry, reuse or contract identity.
+#
+# ``status`` is the proof claim alone (the ledger's ``tests`` is its projection);
+# ``observed`` (present only when non-empty) keeps what a ``not_run`` would otherwise
+# erase: the latest run of this process that minted no green proof, a green run of
+# other bytes or another workload, a review-preparation finding the wave continued
+# past. Each names its source and how it relates to the subject; none is ever proof.
+# A runner diagnosis or a finding is frozen whole, credentials redacted: the runner
+# already bounds its diagnosis (``max_output``, tail kept), so no second cut drops
+# the failing test it names; the run's result.json keeps the unredacted text.
 EXHIBIT_KEY = "preflight_execution"
 UNOBSERVED = {"status": "unobserved"}
+_LISTED_FAILED = 10
 
 
 def execution_exhibit(ctx: Any, *, otherwise: str = "") -> dict:
@@ -421,22 +431,27 @@ def execution_exhibit(ctx: Any, *, otherwise: str = "") -> dict:
     else its own: a completed run may have minted no proof of the tested subject.
     ``lanes`` are the lanes the proof's run observed running tests, ``empty_lanes``
     those it observed collecting none; an undisclosed outcome names no lane, since
-    the recipe says which lanes were started, not which ran a test.
+    the recipe says which lanes were started, not which ran a test. A ``not_run``
+    keeps the run it is about in ``observed``: the latest run of this process when it
+    minted no green proof, or the green run whose proof covers other bytes.
     """
     from ouroboros.commit_admission import PreflightTestProof, preflight_test_proof_matches
 
     proof = getattr(ctx, "_preflight_test_proof", None)
     completed = getattr(ctx, "_preflight_tests_passed", None) is True
     if not completed or not isinstance(proof, PreflightTestProof):
+        run = None if completed else _latest_run(ctx)
         return {"status": "not_run", "reason": otherwise or (
             "the run completed but minted no proof of the tested subject" if completed
-            else "no green hermetic run (disabled or no applicable suite)")}
+            else "no green hermetic run covers this candidate" if run
+            else "no green hermetic run (disabled or no applicable suite)"), **({"observed": [run]} if run else {})}
     try:
         bound = preflight_test_proof_matches(ctx, ctx.repo_dir, require_full=False)
     except Exception:
         bound = False
     if not bound:
-        return {"status": "not_run", "reason": "the green run's proof does not cover this candidate"}
+        return {"status": "not_run", "reason": "the green run's proof does not cover this candidate",
+                "observed": [_green_run(ctx, proof)]}
     event = dict(getattr(ctx, "_preflight_test_disclosure", None) or {})
     if (event.get("head"), event.get("tree"), event.get("index_tree")) != (proof.head, proof.tree, proof.index_tree):
         event = {}
@@ -456,23 +471,218 @@ def execution_exhibit(ctx: Any, *, otherwise: str = "") -> dict:
             **({"receipt_origin": dict(receipt["origin"])} if evidence == "receipt" and receipt.get("origin") else {})}
 
 
-def bind_execution_exhibit(exhibit: Any, frozen: Any) -> dict:
+def _redacted(text: Any) -> str:
+    """The whole text, credentials redacted (``observability.redact_projection``)."""
+    from ouroboros.observability import redact_projection
+
+    return str(redact_projection(str(text or "")).value)
+
+
+def _live_relation(ctx: Any, tested: dict, proof: Any = None) -> dict:
+    """``tested`` against the live candidate of ``ctx.repo_dir``; a green ``proof`` also
+    against its workload and selection, the rest of what that proof binds."""
+    from ouroboros.commit_admission import capture_preflight_test_subject
+
+    try:
+        repo = pathlib.Path(ctx.repo_dir)
+        selection = None
+        if proof is not None and proof.selection is not None:
+            from ouroboros.test_selection import refresh_selection
+
+            selection = refresh_selection(repo, proof.selection)
+        current = capture_preflight_test_subject(repo, selection=selection)
+    except Exception:
+        current = None
+    if current is None:
+        return {"relation": "unknown", "differs": [], "compared_with": "the live candidate, which could not be bound"}
+    differs = [key for key, value in (("head", current.head), ("tree", current.tree),
+                                      ("index_tree", current.index_tree)) if tested.get(key) != value]
+    relation = "other_bytes" if differs else "same_bytes"
+    if proof is not None:
+        differs += [key for key in ("workload", "selection") if getattr(proof, key) != getattr(current, key)]
+    return {"relation": relation, "differs": differs, "compared_with": "the live candidate"}
+
+
+def _green_run(ctx: Any, proof: Any) -> dict:
+    """A green run whose proof does not cover the live candidate: what it did cover."""
+    from ouroboros.commit_admission import workload_fingerprint
+
+    event = dict(getattr(ctx, "_preflight_test_disclosure", None) or {})
+    tested = {"head": proof.head, "tree": proof.tree, "index_tree": proof.index_tree}
+    if (event.get("type"), event.get("head"), event.get("tree"), event.get("index_tree")) != (
+            "preflight_test_proof", proof.head, proof.tree, proof.index_tree):
+        event = {}
+    return {"source": "hermetic_tests", "outcome": "passed", "repository": str(pathlib.Path(ctx.repo_dir).resolve()),
+            "tier": proof.tier, **{key: event[key] for key in ("rule", "base", "policy") if event.get(key)},
+            "tested": tested, "workload_fingerprint": workload_fingerprint(proof.workload),
+            **({"evidence": event["evidence"]} if event.get("evidence") else {}), **_live_relation(ctx, tested, proof)}
+
+
+def _latest_run(ctx: Any) -> Optional[dict]:
+    """The latest hermetic run of this process, which minted no green proof: the runner's
+    attempt row (``preflight_inventory.record_failed_attempt``) and the terminal record
+    the runner wrote beside its evidence (``result.json``). ``None`` when this process
+    holds no run, or its latest run returned without a failure (skipped, no suite)."""
+    from ouroboros.preflight_inventory import attempt_outcome
+
+    latest = str(getattr(ctx, "_preflight_test_evidence", "") or "")
+    if not latest:
+        return None
+    row = getattr(ctx, "_preflight_test_disclosure", None)
+    row = row if isinstance(row, dict) and (row.get("type"), row.get("evidence")) == (
+        "preflight_test_attempt", latest) else {}
+    try:
+        terminal = json.loads((pathlib.Path(latest) / "result.json").read_text(encoding="utf-8"))
+        problem = "" if isinstance(terminal, dict) else "not a JSON object"
+    except (OSError, ValueError) as exc:
+        terminal, problem = None, type(exc).__name__  # the seats' text names no host path
+    terminal = terminal if not problem else None
+    if not row and terminal is not None and not terminal.get("verdict"):
+        return None
+    run = {"source": "hermetic_tests", "outcome": row.get("outcome") or (
+        attempt_outcome(terminal) if terminal is not None else "no_terminal"),
+           "repository": str(pathlib.Path(ctx.repo_dir).resolve()),
+           **{key: row[key] for key in ("tier", "rule", "base", "policy", "omitted_files", "workload_fingerprint")
+              if row.get(key)},
+           **({"selected_modules": len(row["files"])} if isinstance(row.get("files"), list) else {}),
+           "lanes": row.get("lanes") or [], "evidence": latest,
+           "terminal": "read" if terminal is not None else f"unavailable ({problem})"}
+    if row.get("candidate"):
+        run["tested"] = {"head": row.get("head"), "tree": row["candidate"], "index_tree": row.get("index_tree")}
+        run.update(_live_relation(ctx, run["tested"]))
+    else:
+        run.update(relation="unknown", differs=[], compared_with="no tested checkout was bound before the run stopped")
+    failed = [node for lane in (row.get("inventory") or {}).values() if isinstance(lane, dict)
+              for node in lane.get("failed") or []]
+    if failed:
+        run.update(failed_tests=failed[:_LISTED_FAILED], failed_listed=len(failed))
+    if terminal is not None and str(terminal.get("verdict") or ""):
+        run.update(diagnosis=_redacted(terminal["verdict"]))
+    return run
+
+
+def with_preparation_finding(exhibit: Any, message: str, *, continued_under: str) -> dict:
+    """The wave's exhibit plus a deterministic review-preparation finding the wave
+    continued past (Advisory, Cyber Pro): seats read it beside the test facts. Those
+    checks stop at their first finding, so nothing after it is claimed either way."""
+    exhibit = dict(exhibit) if isinstance(exhibit, dict) and exhibit else dict(UNOBSERVED)
+    observed = [entry for entry in exhibit.get("observed") or [] if isinstance(entry, dict)]
+    exhibit["observed"] = [*observed, {"source": "review_preparation", "outcome": "finding",
+                                       "continued_under": continued_under, "stops_at_first_finding": True,
+                                       "message": _redacted(message)}]
+    return exhibit
+
+
+def _of_repository(entry: dict, root: str) -> bool:
+    """Whether an observation is about the subject's repository: its tested HEAD is a
+    commit there, or, with no tested checkout, it ran in this checkout or a linked one."""
+    head = str((entry.get("tested") or {}).get("head") or "")
+    if not root:
+        return True
+    if head:
+        from ouroboros.git_observation import host_git_env
+
+        try:
+            return subprocess.run(["git", "cat-file", "-e", f"{head}^{{commit}}"], cwd=root, env=host_git_env(),
+                                  capture_output=True, timeout=30).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+    from ouroboros.workspace_copies import source_is_system_repo
+
+    return entry.get("source") != "hermetic_tests" or bool(
+        entry.get("repository") and source_is_system_repo(entry["repository"], root))
+
+
+def bind_execution_exhibit(exhibit: Any, frozen: Any, *, public: bool = False) -> dict:
     """A caller-supplied exhibit for one ``review_change`` subject: kept when its tested
     checkout IS the frozen subject (HEAD = the materialized parent, tree = the subject
-    tree — a base..head proposal is tested on its base, never on its own head)."""
+    tree — a base..head proposal is tested on its base, never on its own head).
+
+    Every observation is related to the subject by that same rule; a green run of other
+    bytes joins them, never as this subject's result, and one about another repository
+    is left out. A ``public`` exhibit, the author's own process, with nothing left for
+    this repository stays ``unobserved``."""
     if not isinstance(exhibit, dict) or not exhibit:
         return dict(UNOBSERVED)
+    subject = (str(getattr(frozen, "parent_sha", "") or ""), str(getattr(frozen, "tree_sha", "") or ""))
     tested = exhibit.get("tested") or {}
-    if exhibit.get("status") == "passed" and (tested.get("head"), tested.get("tree")) != (
-            str(getattr(frozen, "parent_sha", "") or ""), str(getattr(frozen, "tree_sha", "") or "")):
-        return {"status": "not_run", "reason": "the supplied test execution names another subject"}
-    return dict(exhibit)
+    observed = [dict(entry) for entry in exhibit.get("observed") or [] if isinstance(entry, dict)]
+    bound = {key: value for key, value in exhibit.items() if key != "observed"}
+    if exhibit.get("status") == "passed" and (tested.get("head"), tested.get("tree")) != subject:
+        bound = {"status": "not_run", "reason": "the supplied test execution names another subject"}
+        observed.insert(0, {"source": "hermetic_tests", "outcome": "passed", "tier": exhibit.get("tier", "full"),
+                            "tested": dict(tested), "lanes": list(exhibit.get("lanes") or [])})
+    root = str(getattr(getattr(frozen, "spec", None), "root", "") or "")
+    kept = []
+    for entry in observed:
+        if not _of_repository(entry, root):
+            continue
+        tested_bytes = entry.get("tested") or {}
+        if tested_bytes.get("head") and tested_bytes.get("tree"):
+            differs = [key for key, value in zip(("head", "tree"), subject) if tested_bytes.get(key) != value]
+            entry.update(relation="other_bytes" if differs else "same_bytes", compared_with="the review subject",
+                         differs=differs + [key for key in entry.get("differs") or [] if key in ("workload", "selection")])
+        kept.append(entry)
+    if public and not kept and bound.get("status") != "passed":
+        return dict(UNOBSERVED)
+    return {**bound, **({"observed": kept} if kept else {})}
+
+
+_OUTCOMES = {
+    "failed": "FAILED: a lane exited red",
+    "interrupted": "INTERRUPTED: a lane process started, but the run stopped before an accepted verdict",
+    "not_started": "NOT STARTED: no lane process was created",
+    "start_unknown": ("START UNKNOWN: the first lane failed before the runner could tell whether its process "
+                      "was created, so neither a start nor its absence is claimed"),
+    "no_terminal": "NO TERMINAL RECORD: its result could not be read, so no outcome is claimed",
+    "passed": "PASSED",
+}
+
+
+def _quoted(text: Any) -> list:
+    """Producer text as data: a candidate's output can never open a host-looking heading."""
+    return ["    | " + line for line in str(text or "").splitlines()]
+
+
+def _observation_lines(entry: dict) -> list:
+    if entry.get("source") == "review_preparation":
+        return [f"- Review preparation's deterministic checks reported a finding and this wave continued under "
+                f"{entry.get('continued_under') or 'non-blocking enforcement'}. Those checks stop at their first "
+                "finding: no result of a later one is claimed. Finding (whole; credentials redacted):",
+                *_quoted(entry.get("message"))]
+    tested, differs = entry.get("tested") or {}, list(entry.get("differs") or [])
+    where = {"same_bytes": "on the bytes of this candidate", "unknown": "on a checkout that was not compared ("
+             + str(entry.get("compared_with") or "unbound") + ")"}.get(
+        str(entry.get("relation")), f"on OTHER bytes (differs: {', '.join(differs)})")
+    if entry.get("relation") == "same_bytes" and differs:
+        where += f" under another workload (differs: {', '.join(differs)})"
+    scope = str(entry.get("tier") or "unknown tier") + (
+        f", {entry['selected_modules']} selected modules" if entry.get("selected_modules") is not None else "")
+    line = f"- Hermetic tests ({scope}): {_OUTCOMES.get(str(entry.get('outcome')), str(entry.get('outcome')))}, {where}"
+    if tested:
+        line += f"; tested HEAD {tested.get('head')}, tree {tested.get('tree')}, index {tested.get('index_tree')}"
+    line += (". Not proof here: the status above is the only proof claim." if entry.get("outcome") == "passed" else
+             ". Evidence about those bytes, not a result of this candidate." if entry.get("relation") == "other_bytes"
+             else ".")
+    lines = [line]
+    if entry.get("failed_tests"):
+        lines.append(f"  Failed tests ({len(entry['failed_tests'])} of {entry.get('failed_listed')} the run listed): "
+                     + json.dumps(entry["failed_tests"]))
+    if entry.get("lanes"):
+        lines.append("  Lanes: " + json.dumps(entry["lanes"], sort_keys=True))
+    if entry.get("diagnosis"):  # the run's evidence path stays the author's; no seat is granted it
+        lines += ["  Runner diagnosis (whole, as the runner recorded it; credentials redacted):",
+                  *_quoted(entry["diagnosis"])]
+    elif str(entry.get("terminal") or "").startswith("unavailable"):
+        lines.append(f"  Runner diagnosis: none shown, its result.json is {entry['terminal']}.")
+    return lines
 
 
 def execution_section(exhibit: Any) -> str:
     """The seat-visible text of a frozen exhibit; ``""`` when none was supplied."""
     exhibit = exhibit if isinstance(exhibit, dict) else {}
     status = exhibit.get("status")
+    observed = [entry for entry in exhibit.get("observed") or [] if isinstance(entry, dict)]
     if status == "passed":
         tested = exhibit.get("tested") or {}
         how = {"executed": "executed by the hermetic runner in this process",
@@ -485,21 +695,33 @@ def execution_section(exhibit: Any) -> str:
                            + "): historical, not re-executed now"),
                }.get(str(exhibit.get("evidence")), "not disclosed")
         lanes, empty = exhibit.get("lanes") or [], exhibit.get("empty_lanes") or []
-        observed = (f": lanes {', '.join(lanes)}, green with proven process containment" if lanes
-                    else "; which of its lanes ran tests is not disclosed")
+        observed_lanes = (f": lanes {', '.join(lanes)}, green with proven process containment" if lanes
+                          else "; which of its lanes ran tests is not disclosed")
         if empty:
-            observed += f"; lanes {', '.join(empty)} collected no tests, so no test ran there"
+            observed_lanes += f"; lanes {', '.join(empty)} collected no tests, so no test ran there"
         scope = ""
         if exhibit.get("tier") == "selected" and isinstance(exhibit.get("files"), list):
             scope = (f" over {len(exhibit['files'])} selected test modules ({exhibit.get('omitted_files', 0)} "
                      f"not run; {exhibit.get('rule', 'floor, direct importers and widening')})")
-        return ("## Preflight test execution (host fact)\n"
-                f"The {exhibit.get('tier', 'full')} hermetic test gate passed{scope}{observed}.\n"
+        text = ("## Preflight test execution (host fact)\n"
+                f"The {exhibit.get('tier', 'full')} hermetic test gate passed{scope}{observed_lanes}.\n"
                 f"Tested checkout: HEAD {tested.get('head')}, tree {tested.get('tree')}, index "
                 f"{tested.get('index_tree')}. Evidence: {how}.\n"
                 "Unsigned host fact, not a verdict: decide yourself which further checks this change needs.")
-    if status == "not_run":
+    elif status == "not_run" and not observed:
         return ("## Preflight test execution (host fact)\n"
                 f"NOT_RUN: {exhibit.get('reason') or 'no hermetic run covers this candidate'}. "
                 "No passing test result is claimed for this candidate.")
-    return ""
+    elif status == "not_run":
+        text = ("## Preflight test execution (host fact)\n"
+                "No passing test result is claimed for this candidate (proof status NOT_RUN: "
+                f"{exhibit.get('reason') or 'no hermetic run covers this candidate'}). NOT_RUN names the missing "
+                "proof only; the runs and checks below did happen.")
+    elif observed:
+        text = "## Preflight test execution (host fact)\nNo test execution was supplied for this subject."
+    else:
+        return ""
+    if observed:
+        text += "\nObserved (host facts, not verdicts, never proof):\n" + "\n".join(
+            line for entry in observed for line in _observation_lines(entry))
+    return text

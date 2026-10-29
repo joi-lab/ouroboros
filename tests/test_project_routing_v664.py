@@ -152,7 +152,7 @@ def test_project_fast_route_stages_attachment_in_actor_child_drive(tmp_path):
     assert notices == [] and "status=staged" in metadata["_attachment_report"]
 
 
-def test_project_swarm_bypasses_single_root_mailbox_for_new_managed_root(tmp_path, monkeypatch):
+def test_project_legacy_swarm_flag_uses_ordinary_new_head_for_pending_root(tmp_path, monkeypatch):
     import server
     from ouroboros.owner_mailbox import drain_owner_messages
     from ouroboros.projects_registry import create_project
@@ -195,15 +195,10 @@ def test_project_swarm_bypasses_single_root_mailbox_for_new_managed_root(tmp_pat
     server._process_bridge_updates(Bridge(), 0, ctx)
 
     assert drain_owner_messages(tmp_path, "pending-root") == []
-    assert len(calls) == 1 and calls[0][0] == "promote"
-    event = calls[0][1]
-    assert event["force_plan"] is True
-    assert event["project_id"] == "racer" and event["chat_id"] == chat_id
-    assert event["objective"] == "deeply fix the new issue"
-    assert "routing_contract" not in event
+    assert calls == ["direct"]
 
 
-def test_main_swarm_admits_root_in_main_without_model_routing(tmp_path, monkeypatch):
+def test_main_legacy_swarm_flag_uses_ordinary_owner_decision(tmp_path, monkeypatch):
     import server
     from ouroboros.projects_registry import create_project
 
@@ -233,13 +228,10 @@ def test_main_swarm_admits_root_in_main_without_model_routing(tmp_path, monkeypa
         lambda event, _ctx: calls.append(("promote", event)) or {"status": "scheduled"},
     )
     monkeypatch.setattr("supervisor.message_bus.log_chat", lambda *_a, **_k: None)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     server._process_bridge_updates(Bridge(), 0, ctx)
 
-    assert [kind for kind, _kwargs in calls] == ["promote"]
-    event = calls[0][1]
-    assert event["project_id"] == "" and event["chat_id"] == 1
-    assert event["objective"] == "audit and fix it"
-    assert "routing_contract" not in event
+    assert [kind for kind, _kwargs in calls] == ["direct"]
 
 
 def test_project_zero_call_followup_advances_active_fence_then_falls_through_when_sealed(
@@ -658,30 +650,38 @@ def test_main_manifest_offers_owner_roots_not_swarm_children(tmp_path):
     assert not [tid for tid in offered if tid.startswith("child")]
     # The OLDEST owner root survives the cap the two children used to consume.
     assert "root00" in offered
-    assert manifest["omissions"]["children"] == 2
-    assert manifest["omissions"]["final_results"] == 0
+    assert manifest["omissions"]["children"] is None  # Main never counts the whole store
+    assert manifest["omissions"]["final_results"] == 0  # the window proves no root was cut
 
 
 def test_omissions_count_children_ordered_after_the_cap(tmp_path):
     """The child count must not be a by-product of the capped loop: children older
     than the 16th root were skipped but counted nowhere, and the cap number silently
-    absorbed them (A26 requires the two omissions to stay separate)."""
+    absorbed them (A26 requires the two omissions to stay separate). A room counts
+    over its own project's rows; Main's scope is the whole store, which the intake
+    on the supervisor loop never walks, so both of its omissions read "not counted"."""
     import server
+    from ouroboros.projects_registry import create_project
+    from ouroboros.server_routing_context import _project_routing_manifest
     from ouroboros.task_results import write_task_result
 
+    create_project(tmp_path, "racer", name="Racer")
     for index in range(17):
         write_task_result(tmp_path, f"root{index:02d}", "completed", objective=f"owner work {index}",
-                          ts=f"2026-08-20T00:00:{index:02d}Z")
+                          project_id="racer", ts=f"2026-08-20T00:00:{index:02d}Z")
     for index in range(2):
         write_task_result(tmp_path, f"child{index}", "completed", objective="helper work",
-                          parent_task_id="root16", root_task_id="root16",
+                          parent_task_id="root16", root_task_id="root16", project_id="racer",
                           delegation_role="subagent", ts=f"2026-08-01T00:00:{index:02d}Z")
 
-    manifest = server._main_routing_manifest(_ctx(tmp_path))
+    room = _project_routing_manifest(_ctx(tmp_path), "racer")
+    assert len(room["final_results"]) == 16
+    assert room["omissions"]["children"] == 2      # counted even though they sort last
+    assert room["omissions"]["final_results"] == 1  # exactly the root cut by the cap
 
-    assert len(manifest["final_results"]) == 16
-    assert manifest["omissions"]["children"] == 2      # counted even though they sort last
-    assert manifest["omissions"]["final_results"] == 1  # exactly the root cut by the cap
+    main = server._main_routing_manifest(_ctx(tmp_path))
+    assert [row["task_id"] for row in main["final_results"]] == [row["task_id"] for row in room["final_results"]]
+    assert main["omissions"]["children"] is None and main["omissions"]["final_results"] is None
 
 
 def _recent_dialogue(tmp_path):
@@ -919,14 +919,15 @@ def test_task_presentation_snapshot_prefers_human_names_and_keeps_machine_ids(tm
     }
 
 
-def test_task_presentation_snapshot_rejects_id_only_project_name_and_is_neutral(tmp_path):
+def test_task_presentation_snapshot_reads_project_for_a_never_named_row_and_keeps_readable_ids(tmp_path):
     from ouroboros.projects_registry import (
         bind_task_to_project,
         create_project,
         task_presentation_snapshot,
     )
 
-    project = create_project(tmp_path, "opaque-project-id", name="opaque-project-id")
+    # A row that was never named carries its minted id as the name: that shape reads Project.
+    project = create_project(tmp_path, "proj_0a1b2c3d4e5f", name="proj_0a1b2c3d4e5f")
     bind_task_to_project(
         tmp_path,
         "opaque-task-id",
@@ -940,6 +941,49 @@ def test_task_presentation_snapshot_rejects_id_only_project_name_and_is_neutral(
     assert snapshot["project_name"] == "Project"
     assert snapshot["task_name"] == "Task"
     assert snapshot["target_label"] == "Project › Task"
+    # An owner's own readable id is the name, as the sidebar and the Project reference show it.
+    readable = create_project(tmp_path, "community-watch", name="community-watch")
+    bind_task_to_project(tmp_path, "watch-task", readable["id"], readable["chat_id"],
+                         origin={"absent": "system"})
+    assert task_presentation_snapshot(tmp_path, "watch-task")["target_label"] == "community-watch › Task"
+
+
+def test_project_display_name_shares_the_never_named_rule_with_the_reference():
+    import json
+    from pathlib import Path
+
+    from ouroboros.project_facts import project_display_name
+
+    fixture = Path(__file__).resolve().parents[1] / "web" / "tests" / "fixtures" / "project_display_name_parity.json"
+    for case in json.loads(fixture.read_text(encoding="utf-8"))["cases"]:
+        assert project_display_name(case["name"], case["id"]) == case["expected"], case
+
+
+def test_a_request_without_a_title_is_named_by_its_first_line_not_a_cut_of_the_whole_request():
+    from ouroboros.projects_registry import task_presentation_name
+
+    request = ("# Community watch — one six-hourly GitHub pass\n\nThe owner renewed this workflow in Main: "
+               "resume it now and every six hours.")
+    assert task_presentation_name({"description": request}) == "Community watch — one six-hourly GitHub pass"
+    # An authored title still wins over the request, whole.
+    assert task_presentation_name({"title": "Watch", "description": request}) == "Watch"
+
+
+def test_a_scheduled_run_takes_the_schedule_name_as_its_authored_name():
+    from supervisor import queue as squeue
+
+    named = squeue._task_from_schedule({
+        "id": "community-watch-6h", "name": "Community watch — GitHub every six hours",
+        "task": {"text": "# Community watch — one six-hourly GitHub pass\n\nRead the knowledge first."},
+    })
+    assert (named["title"], named["suggested_name"]) == ("Community watch — GitHub every six hours",) * 2
+    unnamed = squeue._task_from_schedule({"id": "plain", "task": {"text": "# Nightly check\n\nRun the battery."}})
+    assert "title" not in unnamed  # a derived name never outranks one coined later (admission_names)
+    assert unnamed["suggested_name"] == "Nightly check"
+    # The host's placeholder for an unnamed follow-up names no work: the run reads its request.
+    followup = squeue._task_from_schedule({"id": "followup-0dac19ae-1", "name": "Follow-up of task 0dac19ae",
+                                           "task": {"text": "Check whether CI on the PR passed\nIf green, report it."}})
+    assert "title" not in followup and followup["suggested_name"] == "Check whether CI on the PR passed"
 
 
 def test_task_presentation_snapshot_reads_existing_title_from_durable_live_queue(tmp_path):

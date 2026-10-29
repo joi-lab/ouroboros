@@ -132,12 +132,14 @@ def _git_show_staged(repo_dir, path: str) -> Optional[str]:
 
 
 def _preflight_check(commit_message: str, staged_files: str,
-                     repo_dir) -> Optional[str]:
+                     repo_dir, *, neutral_allowed: Optional[bool] = None) -> Optional[str]:
     """Fast deterministic review preflight for common incomplete staged diffs.
 
     Only exact mechanical checks live here — ones that compare real staged
     artifacts (version-carrier sync, README changelog row, P9 history limits,
-    conftest.py hygiene). Two lexical heuristics were deliberately removed
+    conftest.py hygiene). Standalone prepared-index review admits neutral
+    contributions; commit callers pass their candidate or managed-update authority.
+    Two lexical heuristics were deliberately removed
     (issue #447): the commit-message version-reference guess (its "version"
     substring test matched "conversion") and the ".py under ouroboros/ or
     supervisor/ requires tests/ staged" predicate (it refused comment-only
@@ -177,6 +179,7 @@ def _preflight_check(commit_message: str, staged_files: str,
     release_error = format_release_metadata_preflight(release_metadata_diagnostics(
         repo_dir, sorted(active_staged), source="index",
         read_text=lambda path: _git_show_staged(repo_dir, path), deleted=sorted(staged_set - active_staged),
+        neutral_allowed=neutral_allowed,
     ))
     if release_error:
         return release_error
@@ -512,14 +515,14 @@ def _triad_governance_usable_window(api_models: list, api_slots: list) -> int:
     the QUORUM limit the fit ladder already sizes the packet with (one SSOT),
     never the narrowest row — one small slot degrades its own seat instead of
     stripping the whole panel's rules."""
-    from ouroboros.reviewer_window import reviewer_window_binding
+    from ouroboros.reviewer_window import reviewer_input_limit, reviewer_window_binding
 
     usable: dict = {}
     for model, slot in zip(api_models, api_slots):
         window = reviewer_context_window(model, **(binding := reviewer_window_binding(slot)))
         output_reserve, tokenizer_margin = window_scaled_reserves(
             window, output_reserve=_review_output_budget(), tokenizer_margin=50_000, model_id=model, binding=binding)
-        usable[slot.slot_id] = max(0, int(window) - int(output_reserve) - int(tokenizer_margin))
+        usable[slot.slot_id] = max(0, reviewer_input_limit(window, output_reserve) - int(tokenizer_margin))
     return _quorum_input_token_limit(list(usable), usable) if usable else 0
 
 
@@ -698,6 +701,9 @@ def _prepare_unified_review(ctx: ToolContext, commit_message: str,
         )
         if result is not None:
             return None, result, True
+        from ouroboros.preflight_receipts import with_preparation_finding  # the seats see what the wave continued past
+        ctx._preflight_execution = with_preparation_finding(getattr(ctx, "_preflight_execution", None), preflight_err,
+            continued_under="Advisory enforcement" if review_enforcement_blocks("blocking") else "Cyber Pro")
 
     rebuttal_section = build_rebuttal_section(review_rebuttal)
 
@@ -1050,13 +1056,15 @@ def _dispatch_unified_review(ctx: ToolContext, commit_message: str, prepared: di
     quorum = verdict["quorum"]
     if verdict["aggregate"] in ("QUORUM_FAILED", "NOT_DISPATCHED"):  # a wave that sent nothing ($0) has no quorum
         ctx._last_review_block_reason = "review_quorum"
-        unavailable_str = ", ".join(failed_actors or errored_models or (sorted(  # each $0 refusal names its cause
-            {str(r.get("raw_text") or "") for r in triad_raw}) if verdict["aggregate"] == "NOT_DISPATCHED" else []))
+        from ouroboros.review_records import review_failure_summary
+
+        unavailable_str = "\n".join(review_failure_summary(row) for row in triad_raw
+                                    if row.get("status") != "responded") or ", ".join(errored_models)
         blocked_msg = (
             f"⚠️ REVIEW_BLOCKED: Only {quorum['responded']} of {quorum['assigned']} review "
             f"models responded successfully (minimum {quorum['required']} required). "
-            f"Unavailable/failed: {unavailable_str}.\n"
-            "Retry the commit — transient model failures usually resolve quickly."
+            f"Unavailable/failed:\n{unavailable_str}\n"
+            "No retry recommendation is inferred from these failures."
         )
         return _handle_review_block_or_warning(
             ctx, blocking_review, blocked_msg,

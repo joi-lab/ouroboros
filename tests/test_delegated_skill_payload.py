@@ -18,6 +18,7 @@ import subprocess
 import pytest
 
 from ouroboros import delegate_custody as custody
+from ouroboros.unindexed import COPIES
 from tests._governance_docs_shared import architecture_text
 from ouroboros.subagent_worktrees import (
     find_execution_snapshot,
@@ -924,23 +925,24 @@ def test_snapshot_root_under_runtime_data_refuses_provisioning(tmp_path):
 
 
 def test_registry_save_failure_leaves_no_orphan_snapshot_dir(tmp_path, monkeypatch):
-    """Gate fix 7: a registry-write failure removes the snapshot directory —
-    an unregistered directory would be invisible to disposal/retention."""
+    """Gate fix 7: a failed record write removes the snapshot directory —
+    an unrecorded directory would be invisible to disposal/retention."""
     import ouroboros.subagent_worktrees as worktrees
 
     data = tmp_path / "data"
     skill = _seed_skill(data)
 
     def _boom(*_a, **_k):
-        raise OSError("registry disk full")
+        raise OSError("record disk full")
 
-    monkeypatch.setattr(worktrees, "_save_registry", _boom)
-    with pytest.raises(OSError, match="registry disk full"):
+    monkeypatch.setattr(worktrees, "_put_record", _boom)
+    with pytest.raises(OSError, match="record disk full"):
         provision_payload_snapshot(
             target_root=skill, task_id="t1", snapshot_id="snapReg",
             worktree_root=tmp_path / "snaps", data_dir=data)
-    leftovers = list((tmp_path / "snaps").glob("dlgp_*")) if (tmp_path / "snaps").exists() else []
+    leftovers = [*(tmp_path / "snaps").glob("dlgp_*"), *(tmp_path / "snaps").glob(f"{COPIES}/dlgp_*")]
     assert leftovers == [], leftovers
+    assert worktrees.find_execution_snapshot("snapReg", data_dir=data) is None
 
 
 def test_first_wins_is_keyed_on_the_first_shape_carrying_row(tmp_path):
@@ -1111,7 +1113,7 @@ def test_symlinked_git_dir_is_typed_capture_failure(tmp_path, monkeypatch):
 
 def test_schema_and_docs_split_git_staging_from_payload_live_apply():
     """Sol P2-3 pin: integrate_delegated_patch's schema and the deep-delegation
-    docs describe the Git lane as staged-into-active-root and the payload lane
+    docs describe the Git lane as staged-into-recorded-target and the payload lane
     as a live non-Git CAS apply — no universal 'staged' claim covers both."""
     from ouroboros.tools.subagent_integration import get_tools
 
@@ -1120,7 +1122,7 @@ def test_schema_and_docs_split_git_staging_from_payload_live_apply():
     assert "LIVE apply into the non-Git payload" in desc
     assert "nothing is staged into your active root" in desc
     decision = entry.schema["parameters"]["properties"]["decision"]["description"]
-    assert "STAGED into your active root" in decision
+    assert "STAGED into the recorded target" in decision
     assert "applied LIVE into the non-Git payload" in decision
     arch = architecture_text()
     for identifier in ("integrate_delegated_patch", "integrate_payload_patch",

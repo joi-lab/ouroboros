@@ -152,21 +152,26 @@ async def broadcast_ws(msg: dict) -> None:
             log.debug("Failed to emit broadcast_partial_failure event", exc_info=True)
 
 
-def broadcast_ws_sync(msg: dict) -> None:
-    """Thread-safe sync wrapper for broadcasting."""
+def broadcast_ws_sync(msg: dict) -> bool:
+    """Thread-safe sync wrapper for broadcasting. ``True`` when a running server loop took the
+    frame; ``False`` in a process without one (a pooled worker) or once the loop stopped."""
     loop = _event_loop
-    if loop is None:
-        return
+    if loop is None or not loop.is_running():
+        # A stopped loop would hold the coroutine without running it (lost, then never
+        # awaited at close) and a closed one refuses it: neither gets one built.
+        return False
     coro = broadcast_ws(msg)
     try:
         asyncio.run_coroutine_threadsafe(coro, loop)
     except RuntimeError:
-        # A closed or already-stopped loop never schedules the coroutine. The
+        # A loop that closed after the check never schedules the coroutine. The
         # broadcast is deliberately a no-op then, but the coroutine object must
         # still be closed here: dropped un-awaited it emits "coroutine
         # 'broadcast_ws' was never awaited" from whatever code is running when
         # it is collected, blaming an innocent caller for this line.
         coro.close()
+        return False
+    return True
 
 
 async def _dispatch_extension_message(
@@ -411,18 +416,15 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                                 "level": "warning", "message": "Panic emergency owner is unavailable."}}))
                         continue  # Never enter ordered chat acceptance or ordinary command admission.
                     if msg_type == "chat":
-                        force_plan = bool(msg.get("force_plan"))
                         client_surface = normalize_client_surface(msg.get("client_surface"))
                         task_metadata: dict[str, Any] = {
-                            "force_plan": force_plan,
-                            "force_plan_source": "swarm" if force_plan else "",
                             "reply_to": msg.get("reply_to", ""),
                         }
                         # Attachment inspection belongs to the ordered acceptance
                         # worker, so this socket can receive Panic during disk I/O.
                         if client_surface is not None:
                             # Sending-surface observables ride task_metadata
-                            # (the force_plan rail): they pass the bus whitelist
+                            # through the bus whitelist
                             # nested, reach direct/ephemeral/queued turns, and
                             # land in chat.jsonl at the canonical-row writer.
                             client_surface["received_at"] = utc_now_iso()

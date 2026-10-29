@@ -16,7 +16,7 @@ import pytest
 
 from tests.candidate_checkout import (
     assert_served_candidate as _assert_served_candidate,
-    candidate_checkout, require_candidate_interpreter, verify_checkout,
+    case_checkout, require_candidate_interpreter, verify_checkout,
 )
 from ouroboros.test_environment import isolated_environment
 from ouroboros.test_evidence import diagnostic_directory
@@ -63,17 +63,21 @@ def _open_review_checkpoint(card, *, open_card=True):
     if open_card:
         card.locator(":scope > [data-live-summary-button] [data-live-disclosure]").click()
     assert card.is_visible()
+    door = card.locator(":scope > [data-live-foot] [data-live-review-summary]")
+    door.wait_for(state="visible", timeout=5_000)
+    assert door.get_attribute("aria-expanded") == "false"
+    door.click()
+    assert door.get_attribute("aria-expanded") == "true"
     section = card.locator(":scope > [data-live-reviews-host] [data-review-section]")
     section.wait_for(state="visible", timeout=5_000)
-    assert section.get_attribute("data-expanded") == "0"
-    section.locator("[data-review-section-toggle]").click()
     assert section.get_attribute("data-expanded") == "1"
     group = section.locator("[data-review-group]").first
     assert group.locator("[data-review-group-toggle]").get_attribute("aria-expanded") == "false"
     group.locator("[data-review-group-toggle]").click()
-    attempt = group.locator("[data-review-attempt-toggle]").first
-    attempt.click()
-    assert attempt.get_attribute("aria-expanded") == "true"
+    facts = group.locator("[data-review-facts]")
+    assert facts.get_attribute("open") is None
+    facts.locator(":scope > summary").click()
+    assert facts.get_attribute("open") is not None
 
 
 def _free_port() -> int:
@@ -269,13 +273,10 @@ def _run_docker_ui_assertions(url: str) -> None:
 
 
 @pytest.fixture()
-def direct_server_with_data(tmp_path):
-    if os.environ.get("OUROBOROS_RUN_UI_SMOKE") != "1":
-        pytest.skip("set OUROBOROS_RUN_UI_SMOKE=1 to run browser UI smoke")
-    checkout = tmp_path / "repo"
-    # Static/VERSION sentinels prove each boot's origin.
-    with candidate_checkout(pathlib.Path(REPO_ROOT), checkout, origin_proof=True) as candidate, \
-            MockLLMServer() as llm:
+def direct_server_with_data(tmp_path, ui_candidate_checkout):
+    # The session's copy (tests/conftest.py) in this case's custody; its sentinels prove each boot's origin.
+    with case_checkout(pathlib.Path(REPO_ROOT), ui_candidate_checkout) as candidate, MockLLMServer() as llm:
+        checkout = candidate.path
         port = _free_port()
         data_dir = tmp_path / "data"
         data_dir.mkdir(parents=True)
@@ -369,7 +370,7 @@ def direct_server_with_data(tmp_path):
                 "candidate_sentinel": candidate.sentinel_bytes,
                 "candidate_version": candidate.version_text,
                 # Seed only while stopped: live ticks overwrite snapshots.
-                "stop_server": stop_server, "start_server": start_server,
+                "stop_server": stop_server, "start_server": start_server, "candidate": candidate,
             }
         finally:
             stop_server()
@@ -918,6 +919,7 @@ def test_ui_smoke_phase3_declarative_widgets_and_settings(direct_server_with_dat
                 )
                 section.wait_for(state="visible", timeout=30_000)
                 settings_form = section.locator('[data-extension-settings-form]')
+                settings_form.locator('[data-extension-settings-edit-anyway]').click()  # POST-only: values unknown (#1552)
                 settings_form.locator('select[name="mode"]').select_option("fast")
                 settings_form.locator('input[name="token"]').fill("discard-me")
                 save = settings_form.locator('button[type="submit"]')
@@ -998,14 +1000,177 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
             from tests._work_projection_shared import with_work_fields
 
             def vouch_running(route):
-                # The running card's work is the server's too, as a real one always is: its census row keeps the
-                # chip saying Working between frames. A work no census lists loses the chip at every state read
-                # and takes it back with the next frame, which would move the band under any one frame.
-                body = route.fetch().json()
-                body["active_chat_activities"] = [*body.get("active_chat_activities", []), {
-                    "activity_id": "running-act", "chat_id": 1, "project_id": "", "client_message_id": "",
-                    "kind": "managed_task", "phase": "working", "started_at": 1.0}]
-                route.fulfill(content_type="application/json", body=json.dumps(with_work_fields(body)))
+                # Census membership keeps Working stable between frames.
+                if draining:  # its width is closing (#2120): the read passes through
+                    route.fallback()
+                    return
+                in_flight.append(route)
+                try:
+                    body = route.fetch().json()
+                    body["active_chat_activities"] = [*body.get("active_chat_activities", []), {
+                        "activity_id": "running-act", "chat_id": 1, "project_id": "", "client_message_id": "",
+                        "kind": "managed_task", "phase": "working", "started_at": 1.0}]
+                    route.fulfill(content_type="application/json", body=json.dumps(with_work_fields(body)))
+                finally:
+                    in_flight.remove(route)
+
+            def check_width(page, width):
+                page.add_init_script(f"({_CAPTURE_TEST_SOCKET})();({_OBSERVE_STATE_READS})()")
+                page.route("**/api/state*", vouch_running)
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                _wait_socket_open_quiescent(page)  # the frames below live on the test socket only
+                named = page.locator('.chat-live-card[data-task-id="named-act"]')
+                named.wait_for(state="attached", timeout=30_000)
+                unnamed = page.locator('.chat-live-card[data-task-id="unnamed-act"]')
+                unnamed.wait_for(state="attached", timeout=30_000)
+                page.wait_for_function(
+                    "() => document.querySelector('.chat-live-card[data-task-id=\"named-act\"]"
+                    " [data-live-title]')?.textContent === 'Data Analysis'",
+                    timeout=30_000,
+                )
+                _emit_ws_frame(page, {
+                    "type": "chat", "role": "assistant", "is_progress": True,
+                    "chat_id": 1, "task_id": "running-act", "suggested_name": "Short task",
+                    "content": "Short update", "ts": "2026-07-29T10:00:02+00:00",
+                })
+                running = page.locator('.chat-live-card[data-task-id="running-act"]')
+                running.wait_for(state="attached", timeout=30_000)
+                assert running.locator('[data-live-title]').text_content().strip() == "Short task"
+                assert named.get_attribute("data-expanded") == "0"
+                named_activity = named.locator('[data-live-activity]')
+                activity_text = named_activity.text_content().strip()
+                assert activity_text
+                assert len(activity_text) <= 240
+                assert activity_text.endswith(("…", "..."))
+                assert unique_tail not in activity_text
+                assert named_activity.get_attribute("title") is None
+                geometry = named.evaluate(
+                    """card => {
+                        const facts = selector => {
+                            const el = card.querySelector(selector);
+                            const style = getComputedStyle(el);
+                            const lineHeight = parseFloat(style.lineHeight);
+                            const rect = el.getBoundingClientRect();
+                            return { lines: rect.height / lineHeight, width: rect.width };
+                        };
+                        return {
+                            title: facts('[data-live-title]'),
+                            activity: facts('[data-live-activity]'),
+                            clientWidth: card.clientWidth,
+                            scrollWidth: card.scrollWidth,
+                        };
+                    }"""
+                )
+                assert geometry["title"]["lines"] <= 2.2, geometry
+                assert geometry["activity"]["lines"] <= 3.2, geometry
+                assert geometry["scrollWidth"] <= geometry["clientWidth"] + 1, geometry
+                named_meta = named.locator('[data-live-meta]').inner_text().split()
+                # Final ledger: the plain amount, never the open-ledger ceiling.
+                assert "$0.42" in named_meta and "up" not in named_meta, named_meta
+
+                unnamed_activity = unnamed.locator('[data-live-activity]')
+                assert "Doing things without a name" in unnamed.locator('[data-live-title]').text_content()
+                assert unnamed_activity.text_content().strip() == ""
+                assert not unnamed_activity.is_visible()
+                bands = page.evaluate(
+                    """() => Object.fromEntries(['named-act', 'unnamed-act', 'running-act'].map(id => {
+                        const card = document.querySelector(`.chat-live-card[data-task-id="${id}"]`);
+                        const facts = selector => {
+                            const node = card.querySelector(selector);
+                            const style = getComputedStyle(node);
+                            const height = node.getBoundingClientRect().height;
+                            const lineHeight = parseFloat(style.lineHeight);
+                            return {height, lines: height / lineHeight,
+                                display: style.display, visibility: style.visibility};
+                        };
+                        return [id, {
+                            title: facts('[data-live-title]'),
+                            activity: facts('[data-live-activity]'),
+                            meta: facts('[data-live-meta]'),
+                            finished: card.dataset.finished === '1',
+                            clipped: card.scrollHeight > card.clientHeight + 1,
+                            reviews: card.querySelector('[data-live-review-summary]')?.textContent || '',
+                        }];
+                    }))"""
+                )
+                assert bands["named-act"]["finished"] is True, bands
+                assert bands["unnamed-act"]["finished"] is False, bands
+                assert bands["running-act"]["finished"] is False, bands
+                assert all(0.9 <= bands[task_id]["title"]["lines"] <= 1.2 for task_id in bands), bands
+                assert 2.9 <= bands["named-act"]["activity"]["lines"] <= 3.2, bands
+                assert 0.9 <= bands["running-act"]["activity"]["lines"] <= 1.2, bands
+                assert bands["unnamed-act"]["activity"]["display"] == "none", bands
+                # Empty activity reserves no band, even after finish; an unnamed turn uses its note as title.
+                _emit_ws_frame(page, {
+                    "type": "chat", "role": "assistant", "is_progress": True,
+                    "chat_id": 1, "task_id": "done-empty",
+                    "content": "Quick task", "ts": "2026-07-29T10:00:03+00:00",
+                })
+                done_empty = page.locator('.chat-live-card[data-task-id="done-empty"]')
+                done_empty.wait_for(state="attached", timeout=30_000)
+                _emit_ws_frame(page, {
+                    "type": "chat", "role": "system", "system_type": "task_summary",
+                    "chat_id": 1, "task_id": "done-empty", "content": "Done",
+                    "ts": "2026-07-29T10:00:04+00:00",
+                })
+                page.wait_for_function(
+                    "() => document.querySelector('.chat-live-card[data-task-id=\"done-empty\"]')"
+                    "?.dataset.finished === '1'",
+                    timeout=30_000,
+                )
+                fold = done_empty.evaluate(
+                    """card => { const node = card.querySelector('[data-live-activity]');
+                        return {text: node.textContent, display: getComputedStyle(node).display,
+                            height: card.getBoundingClientRect().height}; }"""
+                )
+                assert fold["text"].strip() == "", fold
+                assert fold["display"] == "none", fold
+                running_height = running.evaluate("el => el.getBoundingClientRect().height")
+                assert fold["height"] <= running_height - 20, (fold, running_height)
+                assert all(bands[task_id]["meta"]["lines"] >= 0.9 for task_id in bands), bands
+                button_height = "el => el.getBoundingClientRect().height"
+                before_reviews = running.locator(":scope > [data-live-summary-button]").evaluate(button_height)
+                # Acceptance arrives through task-detail logs.
+                _emit_ws_frame(page, {"type": "log", "chat_id": 1, "data": {
+                    "type": "task_metrics_event", "task_id": "running-act",
+                    "ts": "2026-07-29T10:00:03+00:00",
+                    "review_projection": {"panels": [{
+                        "panel_id": "act-review", "surface": "task_acceptance",
+                        "aggregate_signal": "PASS", "reason": "smoke", "actors": [],
+                    }]},
+                }})
+                page.wait_for_function(
+                    "() => document.querySelector('.chat-live-card[data-task-id=\"running-act\"]"
+                    " [data-live-review-summary]')?.textContent === 'Reviews 1'",
+                    timeout=10_000,
+                )
+                row = running.evaluate(
+                    """card => {
+                        const btn = card.querySelector(':scope > [data-live-summary-button]');
+                        const r = (s) => card.querySelector(`:scope > [data-live-foot] ${s}`).getBoundingClientRect();
+                        return {height: btn.getBoundingClientRect().height, metaBottom: r('[data-live-meta]').bottom,
+                            reviewTop: r('[data-live-review-summary]').top};
+                    }"""
+                )
+                # The quiet count leads the action row under the meta; the summary keeps its height.
+                assert row["reviewTop"] >= row["metaBottom"] - 2, row
+                assert abs(row["height"] - before_reviews) <= 1, row
+                assert all(not bands[task_id]["clipped"] for task_id in bands), bands
+                assert all("Reviews" not in bands[task_id]["reviews"] for task_id in bands), bands
+
+                named.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
+                line_toggle = named.locator(':scope > [data-live-timeline] .chat-live-line-toggle').first
+                line_toggle.wait_for(state="visible", timeout=5_000)
+                line_toggle.click()
+                page.wait_for_function(
+                    "tail => document.querySelector('.chat-live-card[data-task-id=\"named-act\"]')"
+                    ".innerText.includes(tail)",
+                    arg=unique_tail,
+                )
+                page.screenshot(
+                    path=str(diagnostic_directory(data_dir.parent, "ui-smoke") / f"compact-activity-{browser_engine}-{width}.png"),
+                    full_page=True,
+                )
 
             try:
                 for width, height, mobile in [(1440, 1000, False), (390, 844, True)]:
@@ -1015,166 +1180,18 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
                         has_touch=mobile,
                     )
                     page = context.new_page()
-                    page.add_init_script(f"({_CAPTURE_TEST_SOCKET})();({_OBSERVE_STATE_READS})()")
-                    page.route("**/api/state*", vouch_running)
-                    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                    _wait_socket_open_quiescent(page)  # the frames below live on the test socket only
-                    named = page.locator('.chat-live-card[data-task-id="named-act"]')
-                    named.wait_for(state="attached", timeout=30_000)
-                    unnamed = page.locator('.chat-live-card[data-task-id="unnamed-act"]')
-                    unnamed.wait_for(state="attached", timeout=30_000)
-                    page.wait_for_function(
-                        "() => document.querySelector('.chat-live-card[data-task-id=\"named-act\"]"
-                        " [data-live-title]')?.textContent === 'Data Analysis'",
-                        timeout=30_000,
-                    )
-                    _emit_ws_frame(page, {
-                        "type": "chat", "role": "assistant", "is_progress": True,
-                        "chat_id": 1, "task_id": "running-act", "suggested_name": "Short task",
-                        "content": "Short update", "ts": "2026-07-29T10:00:02+00:00",
-                    })
-                    running = page.locator('.chat-live-card[data-task-id="running-act"]')
-                    running.wait_for(state="attached", timeout=30_000)
-                    assert running.locator('[data-live-title]').text_content().strip() == "Short task"
-                    assert named.get_attribute("data-expanded") == "0"
-                    named_activity = named.locator('[data-live-activity]')
-                    activity_text = named_activity.text_content().strip()
-                    assert activity_text
-                    assert len(activity_text) <= 240
-                    assert activity_text.endswith(("…", "..."))
-                    assert unique_tail not in activity_text
-                    assert named_activity.get_attribute("title") is None
-                    geometry = named.evaluate(
-                        """card => {
-                            const facts = selector => {
-                                const el = card.querySelector(selector);
-                                const style = getComputedStyle(el);
-                                const lineHeight = parseFloat(style.lineHeight);
-                                const rect = el.getBoundingClientRect();
-                                return { lines: rect.height / lineHeight, width: rect.width };
-                            };
-                            return {
-                                title: facts('[data-live-title]'),
-                                activity: facts('[data-live-activity]'),
-                                clientWidth: card.clientWidth,
-                                scrollWidth: card.scrollWidth,
-                            };
-                        }"""
-                    )
-                    assert geometry["title"]["lines"] <= 2.2, geometry
-                    assert geometry["activity"]["lines"] <= 3.2, geometry
-                    assert geometry["scrollWidth"] <= geometry["clientWidth"] + 1, geometry
-                    named_meta = named.locator('[data-live-meta]').inner_text().split()
-                    # Final ledger: the plain amount, never the open-ledger ceiling.
-                    assert "$0.42" in named_meta and "up" not in named_meta, named_meta
-
-                    unnamed_activity = unnamed.locator('[data-live-activity]')
-                    assert "Doing things without a name" in unnamed.locator('[data-live-title]').text_content()
-                    assert unnamed_activity.text_content().strip() == ""
-                    assert not unnamed_activity.is_visible()
-                    bands = page.evaluate(
-                        """() => Object.fromEntries(['named-act', 'unnamed-act', 'running-act'].map(id => {
-                            const card = document.querySelector(`.chat-live-card[data-task-id="${id}"]`);
-                            const facts = selector => {
-                                const node = card.querySelector(selector);
-                                const style = getComputedStyle(node);
-                                const height = node.getBoundingClientRect().height;
-                                const lineHeight = parseFloat(style.lineHeight);
-                                return {height, lines: height / lineHeight,
-                                    display: style.display, visibility: style.visibility};
-                            };
-                            return [id, {
-                                title: facts('[data-live-title]'),
-                                activity: facts('[data-live-activity]'),
-                                meta: facts('[data-live-meta]'),
-                                finished: card.dataset.finished === '1',
-                                clipped: card.scrollHeight > card.clientHeight + 1,
-                                reviews: card.querySelector('[data-live-review-summary]')?.textContent || '',
-                            }];
-                        }))"""
-                    )
-                    assert bands["named-act"]["finished"] is True, bands
-                    assert bands["unnamed-act"]["finished"] is False, bands
-                    assert bands["running-act"]["finished"] is False, bands
-                    assert all(0.9 <= bands[task_id]["title"]["lines"] <= 1.2 for task_id in bands), bands
-                    assert 2.9 <= bands["named-act"]["activity"]["lines"] <= 3.2, bands
-                    assert 0.9 <= bands["running-act"]["activity"]["lines"] <= 1.2, bands
-                    assert bands["unnamed-act"]["activity"]["display"] == "none", bands
-                    # Useful root activity sizes naturally up to three lines; empty activity
-                    # reserves no band on either running or finished cards. An uncoined turn
-                    # promotes its only note to the title, so the collapsed line stays empty
-                    # while the block still stands on that row of work.
-                    _emit_ws_frame(page, {
-                        "type": "chat", "role": "assistant", "is_progress": True,
-                        "chat_id": 1, "task_id": "done-empty",
-                        "content": "Quick task", "ts": "2026-07-29T10:00:03+00:00",
-                    })
-                    done_empty = page.locator('.chat-live-card[data-task-id="done-empty"]')
-                    done_empty.wait_for(state="attached", timeout=30_000)
-                    _emit_ws_frame(page, {
-                        "type": "chat", "role": "system", "system_type": "task_summary",
-                        "chat_id": 1, "task_id": "done-empty", "content": "Done",
-                        "ts": "2026-07-29T10:00:04+00:00",
-                    })
-                    page.wait_for_function(
-                        "() => document.querySelector('.chat-live-card[data-task-id=\"done-empty\"]')"
-                        "?.dataset.finished === '1'",
-                        timeout=30_000,
-                    )
-                    fold = done_empty.evaluate(
-                        """card => { const node = card.querySelector('[data-live-activity]');
-                            return {text: node.textContent, display: getComputedStyle(node).display,
-                                height: card.getBoundingClientRect().height}; }"""
-                    )
-                    assert fold["text"].strip() == "", fold
-                    assert fold["display"] == "none", fold
-                    running_height = running.evaluate("el => el.getBoundingClientRect().height")
-                    assert fold["height"] <= running_height - 20, (fold, running_height)
-                    assert all(bands[task_id]["meta"]["lines"] >= 0.9 for task_id in bands), bands
-                    button_height = "el => el.getBoundingClientRect().height"
-                    before_reviews = running.locator(":scope > [data-live-summary-button]").evaluate(button_height)
-                    # A root card's acceptance evidence rides the log channel (task detail seam).
-                    _emit_ws_frame(page, {"type": "log", "chat_id": 1, "data": {
-                        "type": "task_metrics_event", "task_id": "running-act",
-                        "ts": "2026-07-29T10:00:03+00:00",
-                        "review_projection": {"panels": [{
-                            "panel_id": "act-review", "surface": "task_acceptance",
-                            "aggregate_signal": "PASS", "reason": "smoke", "actors": [],
-                        }]},
-                    }})
-                    page.wait_for_function(
-                        "() => document.querySelector('.chat-live-card[data-task-id=\"running-act\"]"
-                        " [data-live-review-summary]')?.textContent === 'Reviews 1'",
-                        timeout=10_000,
-                    )
-                    row = running.evaluate(
-                        """card => {
-                            const btn = card.querySelector(':scope > [data-live-summary-button]');
-                            const r = (s) => card.querySelector(`:scope > [data-live-foot] ${s}`).getBoundingClientRect();
-                            return {height: btn.getBoundingClientRect().height, metaBottom: r('[data-live-meta]').bottom,
-                                reviewTop: r('[data-live-review-summary]').top};
-                        }"""
-                    )
-                    # The quiet count leads the action row under the meta; the summary keeps its height.
-                    assert row["reviewTop"] >= row["metaBottom"] - 2, row
-                    assert abs(row["height"] - before_reviews) <= 1, row
-                    assert all(not bands[task_id]["clipped"] for task_id in bands), bands
-                    assert all("Reviews" not in bands[task_id]["reviews"] for task_id in bands), bands
-
-                    named.locator(':scope > [data-live-summary-button] [data-live-disclosure]').click()
-                    line_toggle = named.locator(':scope > [data-live-timeline] .chat-live-line-toggle').first
-                    line_toggle.wait_for(state="visible", timeout=5_000)
-                    line_toggle.click()
-                    page.wait_for_function(
-                        "tail => document.querySelector('.chat-live-card[data-task-id=\"named-act\"]')"
-                        ".innerText.includes(tail)",
-                        arg=unique_tail,
-                    )
-                    page.screenshot(
-                        path=str(diagnostic_directory(data_dir.parent, "ui-smoke") / f"compact-activity-{browser_engine}-{width}.png"),
-                        full_page=True,
-                    )
-                    context.close()
+                    in_flight, draining = [], []
+                    try:
+                        check_width(page, width)
+                    finally:
+                        try:  # its callbacks finish, none starting, with the routes still set (#2120)
+                            draining.append(time.monotonic() + 30)
+                            while in_flight and time.monotonic() < draining[0]:
+                                page.wait_for_timeout(20)
+                            assert not in_flight, in_flight
+                            page.unroute_all(behavior="wait")
+                        finally:
+                            context.close()
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -1851,18 +1868,18 @@ def test_ui_smoke_desktop_composer_chips_above_input_send_inside(direct_server):
                             toolbar: rect('.chat-toolbar-row'),
                             send: rect('.chat-send-group'),
                             sendButton: rect('.chat-send-inline'),
-                            swarm: rect('.chat-swarm'),
+                            subagents: rect('.chat-subagents-mode'),
                             contextMode: rect('.chat-context-mode'),
                         };
                     }"""
                 )
                 # v6.32.0 composer redesign (owner: "чипы правильнее НАД полем ввода"):
-                # the chips row (Swarm + Low/Max) sits ABOVE the text input...
+                # the capsules row (Subagents, Context, Effort) sits ABOVE the text input...
                 assert metrics["toolbar"]["bottom"] <= metrics["input"]["top"] + 4, metrics
-                assert metrics["swarm"]["bottom"] <= metrics["input"]["top"] + 4, metrics
+                assert metrics["subagents"]["bottom"] <= metrics["input"]["top"] + 4, metrics
                 assert metrics["contextMode"]["bottom"] <= metrics["input"]["top"] + 4, metrics
-                # ...the two chips share that row (aligned tops)...
-                assert abs(metrics["swarm"]["top"] - metrics["contextMode"]["top"]) <= 2, metrics
+                # ...the capsules share that row (aligned tops)...
+                assert abs(metrics["subagents"]["top"] - metrics["contextMode"]["top"]) <= 2, metrics
                 # ...and the Send button stays INSIDE the input's vertical band (same text row).
                 assert metrics["send"]["top"] >= metrics["input"]["top"] - 4, metrics
                 assert metrics["send"]["bottom"] <= metrics["input"]["bottom"] + 4, metrics
@@ -1898,10 +1915,9 @@ def test_ui_smoke_mobile_composer_toolbar_does_not_overlap_input(direct_server):
                         return {
                             input: rect('#chat-input'),
                             toolbar: rect('.chat-toolbar-row'),
-                            pills: rect('.chat-composer-pills'),
                             send: rect('.chat-send-group'),
                             sendButton: rect('.chat-send-inline'),
-                            swarm: rect('.chat-swarm'),
+                            subagents: rect('.chat-subagents-mode'),
                             contextMode: rect('.chat-context-mode'),
                             paddingRight: inputStyle.paddingRight,
                         };
@@ -1917,7 +1933,7 @@ def test_ui_smoke_mobile_composer_toolbar_does_not_overlap_input(direct_server):
                 assert metrics["toolbar"]["bottom"] <= metrics["input"]["top"] + 1, metrics
                 assert metrics["send"]["top"] >= metrics["input"]["top"] - 1, metrics
                 assert metrics["send"]["bottom"] <= metrics["input"]["bottom"] + 1, metrics
-                assert abs(metrics["swarm"]["height"] - metrics["sendButton"]["height"]) <= 1, metrics
+                assert abs(metrics["subagents"]["height"] - metrics["sendButton"]["height"]) <= 1, metrics
                 assert abs(metrics["contextMode"]["height"] - metrics["sendButton"]["height"]) <= 1, metrics
                 assert metrics["paddingRight"] != "256px", metrics
             finally:
@@ -3595,7 +3611,7 @@ def test_ui_smoke_dismiss_overlapping_settle_never_freezes_the_card(direct_serve
                     """
                 )
                 assert result["cardCount"] == 1
-                assert result["verdict"] == "Connected."
+                assert result["verdict"] == "Signed in."
                 assert "Could not cancel" not in result["html"]
                 assert (len(creates), result["deletes"], len(gets), len(reconciles)) == (1, 1, 1, 0)
             finally:

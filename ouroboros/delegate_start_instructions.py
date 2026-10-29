@@ -57,7 +57,7 @@ UNPROVEN_BOUNDARY_INSTRUCTION = (
 )
 
 # The one name of the folder whose files the host retains as named evidence before it
-# releases a copy (`review_checking.retain_named_evidence` reads it from here); a session
+# releases a copy (`delegate_named_evidence.retain_named_evidence` reads it from here); a session
 # is told it, never asked to guess.
 EVIDENCE_DIRNAME = ".review-evidence"
 
@@ -220,6 +220,10 @@ def execution_binding_text(execution_root: str, authority_root: str,
         f"work order remains byte-identical; sha256={digest}): "
         f"the private execution root for this run is {execution}: your work product — every file "
         "and patch change you make — goes only under it, by relative paths or absolute paths under it. "
+        + ("This copy is a linked worktree of the author's repository: its branches, tags, stash and Git config "
+           "are the author's, so create no branch or tag, do not stash and change no Git config. Files Git "
+           "ignores here, and what Git repositories or submodules inside the copy hold, are not part of what is "
+           "captured: `git add -f` an ignored file you must deliver. " if evidence_root is None else "")
         + disposable_state_instruction(evidence, granted=granted_scratch) + " The stable authority/project root "
         f"{authority or '(unknown)'} is a read-only identity/reference until the "
         "parent explicitly integrates the captured result. Do not write, patch, "
@@ -241,6 +245,17 @@ def directory_copy_binding_instruction(authority_root: str, binding_sha256: str 
         "directory/cwd for your work product; the selected authority folder "
         f"{authority} is a read-only source reference. Do not write to that "
         "authority folder directly. " + disposable_state_instruction("", investigation=investigation)
+    )
+
+
+def in_place_binding_instruction(root: str) -> str:
+    """Tell an in-place Git writer that its host's own folder is its working tree."""
+    return (
+        "\n\nDELEGATED IN-PLACE BINDING (typed host fact): you work directly in "
+        f"{str(root or '').strip() or '(unknown)'}, your host task's own folder, as it chose. Every change lands "
+        "there as you make it and nothing is captured for a separate apply. Your host may be working there too: "
+        "change only what the assignment needs; never reset, clean, stash, check out or commit. Keep test "
+        "scratch, environments and caches outside every Git working tree, " + scratch_fact() + "."
     )
 
 

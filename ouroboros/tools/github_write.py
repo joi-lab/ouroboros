@@ -1,11 +1,11 @@
-"""The methods of ``github_write``: comment, create_issue, update, review, resolve_thread and api.
+"""The methods of ``github_write``: comment, create_issue, create_pr, update, review, resolve_thread and api.
 
 Not a tool module: ``github.py`` registers the tool and owns the transport this module calls.
 Every write returns ONE receipt ``{effect, target, url, id, actor, at, outcome}`` as JSON behind one
 human line; ``actor`` is GitHub's acting identity or null, and local times are labelled. The response is read back against what was
 sent where that is cheap. A send whose answer never came (timeout, 5xx, reset) is looked up once by
 its exact body, target and acting identity; found → confirmed, otherwise the outcome stays ``unknown`` and the text
-says so — nothing is resent. A 4xx is ``not_applied``: GitHub refused and nothing changed.
+says so — nothing is resent. A direct API 4xx is ``not_applied``; CLI PR writes need separate readback even after a 4xx.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from ouroboros.tools.registry import ToolContext
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 from ouroboros.utils import utc_now_iso
 
-METHODS = ("comment", "create_issue", "update", "review", "resolve_thread", "api")
+METHODS = ("comment", "create_issue", "create_pr", "update", "review", "resolve_thread", "api")
 REVIEW_EVENTS = {"APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED", "COMMENT": "COMMENTED"}
 STATE_REASONS = ("completed", "not_planned", "reopened", "duplicate")
 HTTP_METHODS = ("POST", "PATCH", "PUT", "DELETE")
@@ -86,7 +86,8 @@ class _Write:
     # ---- the receipt --------------------------------------------------------------------------
     def receipt(self, effect: str, target: str, *, response: Optional[dict] = None, res: Optional[GhResult] = None,
                 readback: Optional[dict] = None, url: object = None, oid: object = None, actor: object = _RESPONSE_ACTOR,
-                at: object = None, lookup: str = "", extra: Optional[dict] = None) -> str:
+                at: object = None, lookup: str = "", extra: Optional[dict] = None,
+                settlement: Optional[str] = None, result_status: Optional[str] = None) -> str:
         """Publish the one receipt shape; ``res`` is the failed transport answer when there is one."""
         if res is not None and res.failure in ("target", "cli_missing"):
             return res.text  # the transport already published its typed refusal; nothing was sent
@@ -98,7 +99,22 @@ class _Write:
             "actor": _actor(response) if actor is _RESPONSE_ACTOR else actor,
             "at": at if at is not None else response.get("created_at") or response.get("submitted_at") or response.get("updated_at"),
         }
-        if res is None or res.ok:
+        # CLI PR commands may fail after an effect, or succeed before a differing readback.
+        # Their separate readback owns settlement; direct API methods retain response semantics.
+        if settlement is not None:
+            receipt["outcome"] = settlement
+            status = result_status or ("error" if res is not None and not res.ok else "ok")
+            code = "OK" if status == "ok" else "TOOL_ERROR"
+            outcome = {"confirmed": "completed", "not_applied": "completed_no_effect", "unknown": "unknown"}[settlement]
+            prefix = ""
+            if res is not None and not res.ok:
+                receipt.update(error=res.text, failure=res.failure, exit_code=res.exit_code, http_status=res.http_status)
+            if settlement == "unknown":
+                prefix = "⚠️ GH_WRITE_UNKNOWN: the effect is unconfirmed; do not resend. "
+                receipt["lookup"] = lookup
+            if readback is not None:
+                receipt["readback"] = readback
+        elif res is None or res.ok:
             receipt["outcome"] = "confirmed"
             if readback is not None:
                 receipt["readback"] = readback
@@ -186,10 +202,15 @@ def _validate_expect(write: _Write) -> str:
         return ""
     if not isinstance(expect, dict):
         return write.refuse("⚠️ TOOL_ARG_ERROR: expect must be an object with head_sha, state and/or updated_at.")
-    unknown = set(expect) - {"head_sha", "state", "updated_at"}
+    pr_method = write.method == "create_pr" or (write.method == "update" and write.args.get("kind") == "pr"
+                and any(key in write.args for key in ("title", "body", "base", "draft")))
+    allowed = {"head_sha", "base_sha"} if pr_method else {"head_sha", "state", "updated_at"}
+    unknown = set(expect) - allowed
     if unknown:
         return write.refuse("⚠️ TOOL_ARG_ERROR: unknown expect key(s): " + ", ".join(sorted(unknown)) + ".")
-    supported = write.method in ("update", "review") or (write.method == "comment" and write.args.get("kind") != "discussion")
+    if "base_sha" in expect and write.method != "create_pr" and write.args.get("base") is None:
+        return write.refuse("⚠️ TOOL_ARG_ERROR: expect.base_sha requires the PR base to check.")
+    supported = write.method in ("create_pr", "update", "review") or (write.method == "comment" and write.args.get("kind") != "discussion")
     if write.method == "api":
         supported = write.number() is not None and write.args.get("kind") in (None, "", "issue", "pr")
     if expect and not supported:
@@ -282,6 +303,13 @@ def _create_issue(write: _Write) -> str:
 
 
 def _update(write: _Write) -> str:
+    if write.args.get("kind") == "pr" and (any(key in write.args for key in ("title", "body", "base", "draft"))
+                                           or not any(key in write.args for key in ("state", "state_reason", "labels"))):
+        from ouroboros.tools.github_pr_write import update
+
+        return update(write)
+    if any(key in write.args for key in ("base", "draft")):
+        return write.refuse("⚠️ TOOL_ARG_ERROR: base and draft updates require kind='pr'.")
     number = write.number()
     if number is None:
         return write.refuse("⚠️ TOOL_ARG_ERROR: target must be the positive issue or pull request number.")
@@ -490,6 +518,10 @@ def run_write(ctx: ToolContext, method: str = "", repo: str = "", **args: Any) -
     write = _Write(ctx, method, repo, **args)
     if error := _validate_expect(write):
         return error
+    if method == "create_pr":
+        from ouroboros.tools.github_pr_write import create
+
+        return create(write)
     return {"comment": _comment, "create_issue": _create_issue, "update": _update, "review": _review,
             "resolve_thread": _resolve_thread, "api": _api}[method](write)
 
@@ -500,10 +532,14 @@ SCHEMA: Dict[str, Any] = {
         "Write to GitHub as the configured identity (see github_read whoami) on the active Project or an explicit repo. "
         "Every call returns one receipt {effect, target, url, id, actor, at, outcome}, actor known or null, local time "
         "labelled, and a read-back of what was sent; an answer that never came is looked up once and otherwise reported "
-        "outcome='unknown' (never resend; reconcile with github_read first); a GitHub 4xx is 'not_applied'. "
+        "outcome='unknown' (never resend; reconcile with github_read first); a direct API 4xx is 'not_applied'. "
         "Methods: comment = a conversation comment on an issue or pull request (target = number; kind='discussion' "
         "comments on a discussion, reply_to = its comment node id; reply_to = a review comment id answers inline in a PR "
-        "code thread); create_issue = a new issue (title, body, labels); update = title, body, state open|closed, "
+        "code thread); create_issue = a new issue (title, body, labels); create_pr = open a PR from an existing head "
+        "into base with title, body, draft and required expect={head_sha,base_sha}. update kind='pr' edits title/body/base "
+        "with expect.head_sha (base also needs expect.base_sha), or toggles draft with expect.head_sha in a separate call. "
+        "These PR writes precheck and read back each field: not a server-side compare-and-swap; no push/fork/merge, "
+        "and a failed CLI send or unverified readback stays unknown. Other updates change title, body, state open|closed, "
         "state_reason (completed, not_planned, reopened, duplicate) or labels (replaces) of an issue or PR; review = submit "
         "a pull request review (event APPROVE|REQUEST_CHANGES|COMMENT, body, inline comments [{path, line, body}]); "
         "resolve_thread = resolve or unresolve a review thread by its node id (from github_read get include=['threads']); "
@@ -513,13 +549,16 @@ SCHEMA: Dict[str, Any] = {
     ),
     "parameters": {"type": "object", "properties": {
         "method": {"type": "string", "enum": list(METHODS),
-                   "description": "comment | create_issue | update | review | resolve_thread | api (see the tool description)"},
+                   "description": "comment | create_issue | create_pr | update | review | resolve_thread | api"},
         "kind": {"type": "string", "enum": ["issue", "pr", "discussion"],
                  "description": "comment: 'discussion' targets a discussion number; issue and pr share one conversation route"},
         "target": {"type": ["integer", "string"], "default": "",
                    "description": "issue/PR/discussion number; for resolve_thread the review thread node id"},
-        "body": {"type": "string", "default": "", "description": "Markdown text: comment body, issue body, review body"},
-        "title": {"type": "string", "default": "", "description": "create_issue / update: the title"},
+        "body": {"type": "string", "description": "Markdown body; PR update: omitted leaves it, empty clears it"},
+        "title": {"type": "string", "description": "create_issue / create_pr / update: the title"},
+        "head": {"type": "string", "description": "create_pr: existing branch or OWNER:BRANCH; a fork uses the same repository name"},
+        "base": {"type": "string", "description": "create_pr / update kind=pr: base branch; requires expect.base_sha"},
+        "draft": {"type": "boolean", "description": "create_pr: default false; update kind=pr: true makes draft, false makes ready; separate from field edits"},
         "state": {"type": "string", "enum": ["open", "closed", "resolved", "unresolved"],
                   "description": "update: open|closed; resolve_thread: resolved (default) | unresolved"},
         "state_reason": {"type": "string", "enum": list(STATE_REASONS), "description": "update: why it is closed or reopened"},
@@ -534,7 +573,7 @@ SCHEMA: Dict[str, Any] = {
         "reply_to": {"type": ["integer", "string"], "default": "",
                      "description": "comment: review comment id to answer inline (PR), or discussion comment node id"},
         "expect": {"type": "object", "default": {}, "properties": {
-            "head_sha": {"type": "string"}, "state": {"type": "string"}, "updated_at": {"type": "string"}},
+            "head_sha": {"type": "string"}, "base_sha": {"type": "string"}, "state": {"type": "string"}, "updated_at": {"type": "string"}},
                    "description": "Preconditions read from github_read; a changed target refuses before sending"},
         "http_method": {"type": "string", "enum": list(HTTP_METHODS), "default": "POST", "description": "api: the REST verb"},
         "route": {"type": "string", "default": "", "description": "api: REST route, e.g. repos/{owner}/{repo}/issues/7/labels"},

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -237,22 +238,28 @@ def test_widgets_keep_iframe_sandbox_locked_down():
     ):
         assert forbidden not in source, forbidden
     assert "render.kind === 'module'" in source
-    # The module document CSP: sources are ABSOLUTE (an opaque frame's 'self' is
-    # nothing), scripts run inline / from blob: / from this skill's module
-    # prefix with 'wasm-unsafe-eval', workers from blob:, passive image / media
-    # / font loads from data: / blob: / this skill's route prefix — and nothing
-    # else: no connect-src (falls to default-src 'none'; the parent bridge is the
-    # frame's one request path) and never plain 'unsafe-eval'.
-    assert "export function moduleFrameCsp(skill, origin = window.location.origin)" in module
+    # The module document CSP, one builder per entry mode. Sources are ABSOLUTE (an
+    # opaque frame's 'self' is nothing). Classic: scripts run inline / from blob: /
+    # from this skill's module prefix with 'wasm-unsafe-eval', workers from blob:,
+    # passive image / media / font loads from data: / blob: / this skill's route
+    # prefix. ESM, only with a lease: the same shape over this mount's file URL
+    # alone, which also serves stylesheets and is the only document base. Neither
+    # has anything else: no connect-src (falls to default-src 'none'; the parent
+    # bridge is the frame's one request path) and never plain 'unsafe-eval'.
+    assert "export function moduleFrameCsp(skill, origin = window.location.origin, assetBase = '') {" in module
     assert "const prefix = `${origin}${extensionRoutePrefix(skill)}`;" in module
-    assert "default-src 'none'" in module
-    assert "script-src 'unsafe-inline' 'wasm-unsafe-eval' blob: ${prefix}module/" in module
-    assert "'worker-src blob:'" in module
-    assert "style-src 'unsafe-inline'" in module
-    assert "img-src data: blob: ${prefix}" in module
-    assert "media-src data: blob: ${prefix}" in module
-    assert "font-src data: blob: ${prefix}" in module
-    assert "const csp = moduleFrameCsp(tab.skill);" in module
+    builders = module.split("export function moduleFrameCsp(", 1)[1].split("\n}\n", 1)[0]
+    assert "if (assetBase) return [" in builders
+    esm, classic = ([directive for _quote, directive in re.findall(r"""^\s*(["'`])(.*)\1,$""", body, re.M)]
+                    for body in re.findall(r"return \[\n(.*?)\]\.join\('; '\);", builders, re.S))
+    assert classic == ["default-src 'none'", "script-src 'unsafe-inline' 'wasm-unsafe-eval' blob: ${prefix}module/",
+                       "worker-src blob:", "style-src 'unsafe-inline'", "img-src data: blob: ${prefix}",
+                       "media-src data: blob: ${prefix}", "font-src data: blob: ${prefix}"]
+    assert esm == ["default-src 'none'", "script-src 'unsafe-inline' 'wasm-unsafe-eval' blob: ${assetBase}",
+                   "worker-src blob:", "style-src 'unsafe-inline' ${assetBase}", "img-src data: blob: ${assetBase}",
+                   "media-src data: blob: ${assetBase}", "font-src data: blob: ${assetBase}", "base-uri ${assetBase}"]
+    assert "const assetBase = lease?.baseUrl || '';" in module
+    assert "const csp = moduleFrameCsp(tab.skill, window.location.origin, assetBase);" in module
     assert "connect-src" not in source
     assert "'unsafe-eval'" not in source
     assert "window.OuroborosWidget = { fetch: request, onEvent, onTheme, download, openExternal: (url) => openExternal(url) };" in source
@@ -280,7 +287,11 @@ def test_widgets_frame_geometry_and_teardown_contract():
     assert "setVerticalOverflowSuppressed(outerHeight <" in source
     assert "setVerticalOverflowSuppressed(false);" in source
     assert "nonce, WIDGET_FRAME_DEFAULT_HEIGHT, maxHeight, WIDGET_FRAME_BORDER_RESERVE," in source
-    assert source.index("<script>${resizeBridge}</script>") < source.index("<script>${escapeScript(moduleSource)}</script>")
+    # The document runs the bridge, then the size reporter, then the entry: classic inline, or ESM as a module.
+    assert '<body><div id="root"></div><script>${bridge}</script><script>${resizeBridge}</script>${entryScript}</body>' in source
+    assert ": `<script>${escapeScript(moduleSource)}</script>`;" in source
+    assert ('? `<script type="module" crossorigin="anonymous" src="${escapeHtml(new URL(render.entry, assetBase).href)}">'
+            '</script>`') in source
     assert "ouro-widget-dispose" in source
     assert "if (iframe?.parentNode === mount) iframe.remove();" in source
     assert "pendingRequests.forEach((controller) => controller.abort());" in source

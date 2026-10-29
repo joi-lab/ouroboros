@@ -2649,6 +2649,7 @@ jobs:
       artifact-metadata: write
     outputs:
       archive_sha256: ${{ steps.release_asset.outputs.sha256 }}
+      signed_files: ${{ steps.sign.outputs.signed_files }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -2668,7 +2669,8 @@ jobs:
         env:
           EXPECTED_SHA256: ${{ needs.build.outputs.windows_archive_sha256 }}
         run: python scripts/release_proof.py locate --directory unsigned --expect-sha256 "$EXPECTED_SHA256" --github-output "$GITHUB_OUTPUT"
-      - name: Sign, verify and package Windows executable
+      - name: Sign, verify and package Windows executables
+        id: sign
         shell: pwsh
         env:
           ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
@@ -2693,8 +2695,9 @@ jobs:
 
   # No eSigner secrets on this fresh runner, in either mode: it checks the
   # final ZIP against its producer's job-output digest before extracting,
-  # verifies the signature when signing is configured, smokes the packaged
-  # app, then records the proof, SBOM and attestations for the release asset.
+  # verifies every catalogued signature when signing is configured, smokes
+  # the packaged app, then records the proof, SBOM and attestations for the
+  # release asset.
   windows-proof:
     if: ${{ always() && !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success' && (vars.ESIGNER_CERT_SHA1 == '' || needs.windows-sign.result == 'success') }}
     needs: [build, windows-sign]
@@ -2734,7 +2737,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $SmokeRoot, $HomeDir | Out-Null
           Expand-Archive -Path "${{ steps.release_asset.outputs.path }}" -DestinationPath $SmokeRoot
           if ($env:WINDOWS_SIGNER_THUMBPRINT) {
-              $Signer = & .\scripts\verify_windows_signature.ps1 -Executable "$SmokeRoot\Ouroboros\Ouroboros.exe" -ExpectedThumbprint $env:WINDOWS_SIGNER_THUMBPRINT
+              # Every catalogued executable; the record step binds their hashes to this ZIP.
+              $Signer = @(& .\scripts\verify_windows_signature.ps1 -ExtractedRoot $SmokeRoot -ExpectedThumbprint $env:WINDOWS_SIGNER_THUMBPRINT)[0]
               Add-Content -Path $env:GITHUB_OUTPUT -Value "signer_thumbprint=$($Signer.Thumbprint)", "signer_publisher=$($Signer.Publisher)"
           }
           # PyInstaller 6 onedir puts datas under _internal\ (the runtime resolves
@@ -2753,6 +2757,16 @@ jobs:
           # Source handoff uses this interpreter, not the launcher's frozen imports.
           & "$SmokeRoot\Ouroboros\_internal\python-standalone\python.exe" -I -B -c "import clr_loader, pythonnet, webview"
           if ($LASTEXITCODE -ne 0) { throw "packaged source-handoff desktop imports failed: $LASTEXITCODE" }
+          # The windowless interpreter reports through a file, within a bounded wait.
+          $Probe = Join-Path $env:RUNNER_TEMP "pythonw-probe-$env:GITHUB_RUN_ATTEMPT.txt"
+          $Start = [Diagnostics.ProcessStartInfo]::new("$SmokeRoot\Ouroboros\_internal\python-standalone\pythonw.exe",
+              "-I -B -c `"import sys;open(sys.argv[1],'w').write('ok')`" `"$Probe`"")
+          $Start.UseShellExecute = $false
+          $Process = [Diagnostics.Process]::Start($Start)
+          if (-not $Process.WaitForExit(60000)) { $Process.Kill(); throw "packaged pythonw.exe did not exit within 60 s" }
+          if ($Process.ExitCode -ne 0 -or (Get-Content -Raw -LiteralPath $Probe) -ne 'ok') {
+              throw "packaged pythonw.exe probe failed: $($Process.ExitCode)"
+          }
           & "$SmokeRoot\Ouroboros\bin\ouroboros.cmd" --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "packaged CLI smoke failed: $LASTEXITCODE" }
           $env:OUROBOROS_DATA_DIR = Join-Path $env:RUNNER_TEMP "ouroboros-claudexor-smoke"
@@ -2768,10 +2782,12 @@ jobs:
         env:
           SIGNER_THUMBPRINT: ${{ steps.smoke_windows.outputs.signer_thumbprint }}
           SIGNER_PUBLISHER: ${{ steps.smoke_windows.outputs.signer_publisher }}
+          SIGNED_FILES: ${{ needs.windows-sign.outputs.signed_files }}
         run: |
           SIGNED=()
           if [ -n "$WINDOWS_SIGNER_THUMBPRINT" ]; then
             SIGNED=(--authenticode-thumbprint "$SIGNER_THUMBPRINT" --authenticode-publisher "$SIGNER_PUBLISHER"
+                    --authenticode-files "$SIGNED_FILES"
                     --check authenticode_signer --check timestamp --check signed_payload_archive_match)
           fi
           python scripts/release_proof.py record-smoke \

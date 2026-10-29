@@ -13,6 +13,7 @@ import { openSkillDetailSheet } from './skill_detail_sheet.js';
 import {
     buttonHtml, catalogWhoHtml, chipHtml, connectsServices, connectsText, countsAsYoursText, factsText, officialMarkHtml, plural, relativeAge,
     skillIconHtml, skipReviewButtonHtml, statusHtml, trustSentence, versionText,
+    skillTitle,
 } from './skill_presentation.js';
 
 const HIDDEN_KEY = 'ouroboros.skills.recommendedHidden';
@@ -164,11 +165,11 @@ export function renderBrowseCard(item, { source, state, categoryLabels = new Map
         .filter((cat) => cat !== CONNECTORS || !connects).map((cat) => chipHtml(categoryLabels.get(cat) || cat, 'neutral')) : [])].join('');
     const icon = connects ? `<span class="skills-card-icon" aria-hidden="true">${skillIconHtml(item.icon, 18)}</span>` : '';
     return `<article class="marketplace-card skills-head-card" data-item="${id}" data-source="${escapeHtml(item.source_id)}">
-        <div class="skills-head-title">${icon}<button type="button" class="skills-card-name" data-browse-action="open" data-item="${id}">${escapeHtml(item.name)}<span class="skills-card-name-more" aria-hidden="true">›</span></button>${marks}</div>
+        <div class="skills-head-title">${icon}<button type="button" class="skills-card-name" data-browse-action="open" data-item="${id}"><span data-i18n-authored>${escapeHtml(skillTitle(item))}</span><span class="skills-card-name-more" aria-hidden="true">›</span></button>${marks}</div>
         <p class="skills-card-purpose"${long ? ' data-clamped' : ''} data-i18n-authored>${escapeHtml(item.description || '')}</p>
         ${long ? `<button type="button" class="skills-read-more" data-browse-action="open" data-item="${id}">Read more ›</button>` : ''}
         <div class="skills-card-meta-lines">
-            <div class="skills-card-who">${catalogWhoHtml(item)}</div>
+            <div class="skills-card-who"><span data-i18n-authored>${escapeHtml(item.name)}</span> · ${catalogWhoHtml(item)}</div>
             ${facts ? `<div class="skills-card-facts">${escapeHtml(facts)}</div>` : ''}
             ${yours ? `<div class="skills-card-facts">${escapeHtml(yours)}</div>` : ''}
             ${cats ? `<div class="skills-card-cats">${cats}</div>` : ''}

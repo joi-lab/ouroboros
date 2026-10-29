@@ -189,7 +189,7 @@ export function createProjectReadReceipt({ read, isShown, isReadingLatest, onRea
 // The feed the reader can see: its viewport less the chrome drawn over it, the
 // header above and the composer below; chrome covering it all leaves an empty
 // band, where nothing is on screen. Eviction keeps the whole viewport.
-function readBand(viewport, header, composer) {
+export function readBand(viewport, header, composer) {
     let { top, bottom } = viewport.getBoundingClientRect();
     if (header?.getClientRects?.().length) top = Math.max(top, header.getBoundingClientRect().bottom);
     if (composer?.getClientRects?.().length) bottom = Math.min(bottom, composer.getBoundingClientRect().top);

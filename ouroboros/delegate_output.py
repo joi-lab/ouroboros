@@ -176,6 +176,81 @@ def staged_output_address(drive_root: Any, entry: _RunCustody) -> Dict[str, str]
         return {}
 
 
+def project_output_readers(row: Dict[str, Any], publisher_task_id: str = "") -> Dict[str, Any]:
+    """Prefer the receipt-bound reader, without changing retained receipt bytes.
+
+    ``task_id`` on a source is its staging store, NOT its physical publisher.
+    The enclosing task/hop supplies the publisher; Wrap up rows also record it
+    as ``owner_task_id``. A legacy source_read is usable when neither is known.
+    Direct staging reads remain available to the owner for D7 acknowledgement.
+    No source is opened and no read grant or consumption receipt is created.
+    """
+    projected = dict(row)
+
+    def source(ref: Any) -> Any:
+        if not isinstance(ref, dict):
+            return ref
+        old = ref.get("source_read")
+        args = old.get("arguments") if isinstance(old, dict) else None
+        publisher = str(publisher_task_id or row.get("owner_task_id") or "")
+        if (not publisher and isinstance(args, dict) and old.get("tool") == "get_task_result"
+                and args.get("delegated_output_sha256") == ref.get("sha256")):
+            publisher = str(args.get("task_id") or "")
+        digest = str(ref.get("sha256") or "")
+        if not publisher or len(digest) != 64 or digest.strip("0123456789abcdef"):
+            return dict(ref)
+        reader = {"tool": "get_task_result", "arguments": {
+            "task_id": publisher, "delegated_output_sha256": digest}}
+        direct = ref.get("direct_read") or ref.get("read")
+        return {**ref, "read": reader, "source_read": reader,
+                **({"direct_read": direct} if isinstance(direct, dict)
+                   and direct.get("tool") == "read_file" else {})}
+
+    for key in ("staged_output", "terminal_observation"):
+        if key in row:
+            projected[key] = source(row[key])
+    for key in ("other_staged_outputs", "other_terminal_observations"):
+        if isinstance(row.get(key), list):
+            projected[key] = [source(ref) for ref in row[key]]
+    return projected
+
+
+def project_task_output_readers(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Read projection for current, predecessor and Wrap up receipt locators."""
+    def rows(value: Any, publisher: str) -> Any:
+        return ([project_output_readers(row, publisher) if isinstance(row, dict) else row
+                 for row in value] if isinstance(value, list) else value)
+
+    def audit(value: Any, publisher: str) -> Any:
+        if not isinstance(value, dict):
+            return value
+        out = dict(value)
+        if "terminal_runs" in out:
+            out["terminal_runs"] = rows(out["terminal_runs"], publisher)
+        receipt = out.get("owner_stop_children")
+        if isinstance(receipt, dict):
+            receipt = dict(receipt)
+            # Mixed predecessor runs carry their own owner_task_id; never use
+            # the Wrap up root (or a source's staging id) for all of them.
+            if "runs" in receipt:
+                receipt["runs"] = rows(receipt["runs"], "")
+            if isinstance(receipt.get("children"), list):
+                receipt["children"] = [{**child, "custody": audit(child["custody"], str(child.get("task_id") or ""))}
+                    if isinstance(child, dict) and isinstance(child.get("custody"), dict) else child
+                    for child in receipt["children"]]
+            out["owner_stop_children"] = receipt
+        return out
+
+    out = dict(data)
+    if "delegate_terminal_reconciliation" in out:
+        out["delegate_terminal_reconciliation"] = audit(
+            out["delegate_terminal_reconciliation"], str(data.get("task_id") or data.get("id") or ""))
+    if isinstance(data.get("retry_lineage"), list):
+        out["retry_lineage"] = [{**hop, "terminal_runs": rows(hop["terminal_runs"], str(hop.get("task_id") or ""))}
+            if isinstance(hop, dict) and "terminal_runs" in hop else hop for hop in data["retry_lineage"]]
+    return out
+
+
 def engine_locator(detail: Any) -> Dict[str, Any]:
     """The engine's OWN locators for a run's work, recorded on its SETTLED row.
 
@@ -678,10 +753,14 @@ def _resolve_full_primary_output(gateway: Any, run_id: str,
                                   "path": path, "reported_bytes": reported_bytes}
     if not path or gateway is None:
         disclosure["reason"] = "no_artifact_path" if not path else "no_transport"
+        disclosure["retry"] = "changed_input" if not path else "transient"
         return primary, False, disclosure
     try:
         raw = gateway.get_run_artifact(run_id, path)
     except Exception as exc:
+        from ouroboros.delegate_capture_attempt import failure_retry
+
+        disclosure["retry"] = failure_retry(exc)
         disclosure["reason"] = truncate_review_artifact(
             f"{getattr(exc, 'code', type(exc).__name__)}: {exc}", 300)
         return primary, False, disclosure

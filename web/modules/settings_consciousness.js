@@ -10,8 +10,10 @@ import { parseModelSource } from './route_editor_primitives.js';
 import { PLACES_CHANGED_EVENT, readPlaces } from './consciousness_api.js';
 import { AUTONOMY_LEVELS, placeStateWord } from './consciousness_words.js';
 import { skillIconHtml } from './skill_presentation.js';
-import { connectPlaceButtonHtml, openConnectPlace, openPlaceSheet } from './place_sheet.js';
+import { openPlaceSheet } from './place_sheet.js';
+import { connectPlaceButtonHtml, openConnectPlace } from './place_connect.js';
 import { settingsLinkHtml } from './settings_safety.js';
+import { tr, fmt } from './i18n.js';
 
 /** The section body under its title (settings_ui.js keeps the `<h3>`). */
 export function consciousnessSectionHtml() {
@@ -72,14 +74,14 @@ export function consciousnessSectionHtml() {
         </details>`;
 }
 
-/** One row of the places list: icon, label, state word, unanswered count; the whole row opens the sheet. */
+/** One row of the places list: icon, authored label, state word, open turns and connector readiness; the row's text is its accessible name. */
 export function settingsPlaceRowHtml(place) {
-    const count = Number.isInteger(place.unanswered) && place.unanswered > 0 ? `${place.unanswered} unanswered` : '';
-    return `<li><button type="button" class="consciousness-place-row" data-place-open="${escapeHtml(place.id)}"
-            aria-label="${escapeHtml(`Open ${place.label}: ${[placeStateWord(place.state), count].filter(Boolean).join(', ')}`)}">
+    const count = Number.isInteger(place.unanswered) && place.unanswered > 0 ? fmt('{n} open turns', { n: place.unanswered }) : '';
+    const readiness = place.readiness ? tr(`places.readiness.${place.readiness.text}`, place.readiness.text) : '';
+    return `<li><button type="button" class="consciousness-place-row" data-place-open="${escapeHtml(place.id)}">
         <span class="place-glyph" aria-hidden="true">${skillIconHtml(place.icon, 18)}</span>
-        <span class="consciousness-place-name">${escapeHtml(place.label)}</span>
-        <span class="consciousness-place-facts">${escapeHtml([placeStateWord(place.state), count].filter(Boolean).join(' · '))}</span>
+        <span class="consciousness-place-name" data-i18n-authored>${escapeHtml(place.label)}</span>
+        <span class="consciousness-place-facts">${escapeHtml([placeStateWord(place.state), count, readiness].filter(Boolean).join(' · '))}</span>
     </button></li>`;
 }
 
@@ -136,13 +138,13 @@ export function bindConsciousnessSettings(root, { read = readPlaces, state = nul
             problems = data.migrationProblems || [];
             paint({ places });
         } catch (error) {
-            if (current === generation) paint({ places, error: `Places could not be read: ${error?.message || error}` });
+            if (current === generation) paint({ places, error: fmt('Places could not be read: {reason}', { reason: error?.message || error }) });
         }
     }
     const onClick = (event) => {
         const goto = event.target.closest?.('[data-settings-goto]');
         if (goto && section.contains(goto)) { root.activateSettingsTab?.(goto.dataset.settingsGoto); return; }
-        if (event.target.closest?.('[data-place-connect]')) { openConnectPlace({ returnFocus: event.target.closest('[data-place-connect]') }); return; }
+        if (event.target.closest?.('[data-place-connect]')) { openConnectPlace({ returnFocus: event.target.closest('[data-place-connect]'), openSettingsTab: (tab) => root.activateSettingsTab?.(tab) }); return; }
         const row = event.target.closest?.('[data-place-open]');
         const place = row && (places || []).find((entry) => entry.id === row.dataset.placeOpen);
         if (place) openPlaceSheet(place, { returnFocus: row });
@@ -150,7 +152,7 @@ export function bindConsciousnessSettings(root, { read = readPlaces, state = nul
     const onShown = (event) => {
         if (event?.detail?.tab === 'behavior' || (event?.detail?.page === 'settings' && visible())) void refresh();
     };
-    const onChanged = () => { if (places !== null) void refresh(); };
+    const onChanged = () => { void refresh(); };
     section.addEventListener('click', onClick);
     window.addEventListener('ouro:settings-subtab-shown', onShown);
     window.addEventListener('ouro:page-shown', onShown);

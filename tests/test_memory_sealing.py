@@ -101,8 +101,9 @@ def test_end_page_links_only_own_later_terminal_rows_and_to_leaves_no_holes(tmp_
         {"chat_id": 1, "direction": "out", "ts": ts(22), "text": "Child final", "task_id": "child001", "root_task_id": "writer01", "terminal_origin": "model_final"},
     ])
     document = _memory_read(ctx, node_id=page["id"])
-    assert "Linked task final report of task writer01" in document and "Linked host summary of task writer01" in document
-    assert "child001" not in document and "not page coverage" in document
+    assert ("Later terminal rows of task writer01 (host-linked, not page coverage): task final report (status not "
+            "recorded); host summary (completed); memory_read(") in document
+    assert "child001" not in document and document.count("Later terminal rows") == 1
     assert set(store.get(page["id"])["covers"]["rows"]) == before
     assert not {sha(row) for row in terminal} & store.sealed_row_refs("1")
 
@@ -128,7 +129,7 @@ class _CountedReads:
 
 @pytest.mark.parametrize("writers,foreign", [(2, 30), (6, 120)])
 def test_story_links_terminal_rows_once_per_capture_without_reading_room_history(tmp_path, monkeypatch, writers, foreign):
-    from ouroboros import dialogue_store, memory_sealing
+    from ouroboros import dialogue_store, memory_inventory, memory_sealing
 
     ChronicleStore(tmp_path).ensure_activated()
     ids, pages, expected = [f"writer{i:02d}" for i in range(writers)], {}, {}
@@ -146,21 +147,23 @@ def test_story_links_terminal_rows_once_per_capture_without_reading_room_history
             {"chat_id": 1, "direction": "out", "ts": ts(500 + 2 * i), "text": "Final", "task_id": writer, "terminal_origin": "model_final"},
             {"chat_id": 1, "direction": "system", "ts": ts(501 + 2 * i), "text": "Done", "task_id": writer, "type": "task_summary",
              "status": "completed"}])
-        expected[writer] = [
-            f"- Linked task final report of task {writer} (status not recorded); not page coverage; "
-            f"memory_read(room_id='1', rows=true, from='{addr(final)}', to='{addr(final)}')",
-            f"- Linked host summary of task {writer} (completed); not page coverage; "
-            f"memory_read(room_id='1', rows=true, from='{addr(summary)}', to='{addr(summary)}')"]
+        expected[writer] = [  # one line per page: every row's kind and status, one reader over their span
+            f"- Later terminal rows of task {writer} (host-linked, not page coverage): task final report (status not "
+            f"recorded); host summary (completed); memory_read(room_id='1', rows=true, from='{addr(final)}', "
+            f"to='{addr(summary)}')"]
+    assert memory_inventory.fill_tail(tmp_path, lambda: False)["state"] == "done"  # the maintenance job's fill
     chain = _CountedReads(chat_chain, "iter_room_rows", "iter_rows", "_addressed")
     dialogue = _CountedReads(dialogue_store, "task_rows", "iter_rows")
+    tail = _CountedReads(chat_chain, "iter_stream")
     monkeypatch.setattr(memory_sealing, "chat_chain", chain)
     monkeypatch.setattr(memory_sealing, "dialogue_store", dialogue, raising=False)
+    monkeypatch.setattr(memory_inventory, "chat_chain", tail)
     task = {"id": "next0001", "chat_id": 1}
     story = mv.render_story(mv.capture_memory_view(tmp_path, task, mv.view_spec_for_task(task, tmp_path)))
     for writer in ids:
         block = story.split(f" · page {pages[writer]}\n", 1)[1].split("\n### ", 1)[0]
-        assert [line for line in block.splitlines() if line.startswith("- Linked")] == expected[writer]
+        assert [line for line in block.splitlines() if line.startswith("- Later terminal rows")] == expected[writer]
     assert "foreign1" not in story
-    # The capture reads the writers' own rows once; the room's foreign history is never visited.
-    assert chain.rows == 2 * writers
-    assert 2 * writers <= dialogue.rows <= 3 * writers
+    # The writers' terminal rows come from the stored facts of the rows after the frontier: the capture reads
+    # the stored prefix's last row again (its anchor) and nothing else, the room's foreign history least of all.
+    assert chain.rows == dialogue.rows == 0 and tail.rows == 1

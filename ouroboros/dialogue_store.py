@@ -40,7 +40,7 @@ import sqlite3
 import uuid
 from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Tuple
 
-from ouroboros import store
+from ouroboros import store, store_empty
 from ouroboros.store import StoreBusy, StoreError, StoreLost, StoreMigrating, TIER_ENFORCED, TIER_NAME
 from ouroboros.utils import utc_now_iso
 
@@ -178,13 +178,13 @@ def probed_tier(root: Any) -> str:
     return TIER_ENFORCED if kernel_file_locks_enforced(pathlib.Path(root) / "state" / LOCK_NAME) else TIER_NAME
 
 
-def header_tier(root: Any) -> Optional[str]:
-    """The tier the file's header names; ``None`` for a missing or foreign file."""
-    return store.header_tier(path(root), _APPLICATION_ID)
+def header_tier(root: Any, identity: Optional[tuple] = None) -> Optional[str]:
+    """The tier the file's header names; ``None`` for a missing or foreign file (read once per file ``identity``)."""
+    return store.header_tier(path(root), _APPLICATION_ID, identity)
 
 
-def _tier(root: pathlib.Path) -> str:
-    tier = header_tier(root)
+def _tier(root: pathlib.Path, identity: Optional[tuple] = None) -> str:
+    tier = header_tier(root, identity)
     if tier is None:
         if present(root):
             raise StoreLost(f"dialogue store unreadable or foreign, never replaced: {path(root)}")
@@ -276,6 +276,8 @@ def retier(root: Any) -> Optional[str]:
     if current is None or current == wanted:
         return None
     with store.process_lock(path(root)), store.name_lock(root, IMPORT_LOCK_NAME, timeout_sec=WAIT_SEC, stale_sec=600.0):
+        known = (str(path(root)), store.file_identity(path(root)))
+        store._TIERS[known] = None  # the header changes in place: read it every time until the new tier commits
         try:
             store.prepare_handoff(path(root), current, wait_sec=WAIT_SEC, seam=False)  # closes this process's handles
             with contextlib.closing(store.connect(path(root), current, wait_sec=WAIT_SEC)) as conn:
@@ -285,6 +287,7 @@ def retier(root: Any) -> Optional[str]:
                 store.commit(conn)
         except sqlite3.Error as exc:
             raise _typed(exc) from exc
+        store._TIERS[known] = wanted
     return current
 
 
@@ -307,23 +310,22 @@ def transaction(root: Any, *, write: bool, wait_sec: float = WAIT_SEC) -> Iterat
     in-memory schema for a read of a root that holds no dialogue at all."""
     wait_sec = store.bounded_wait(wait_sec)
     root = pathlib.Path(root)
-    if not present(root):
+    identity = store.file_identity(path(root))  # one stat: the presence and the file its header's tier is kept for
+    if identity is None:
         if write or holds_dialogue_files(root):
             ensure(root)
         else:
-            with contextlib.closing(sqlite3.connect(":memory:", isolation_level=None)) as conn:
-                conn.row_factory = sqlite3.Row
-                conn.executescript(_SCHEMA)
-                with store.transaction(conn, write=False):
-                    yield conn
+            with store_empty.empty_store(_SCHEMA) as conn, store.transaction(conn, write=False):
+                yield conn
             return
-    tier = _tier(root)
+    tier = _tier(root, identity)
     with contextlib.ExitStack() as stack:
         if tier == TIER_NAME:
             stack.enter_context(store.name_lock(root, LOCK_NAME, timeout_sec=wait_sec))
-        try:
-            conn = stack.enter_context(store.connection(path(root), tier, wait_sec=wait_sec, opener=_open))
-            with store.transaction(conn, write=write, commit_wait_sec=wait_sec if tier == TIER_ENFORCED else None):
+        try:  # a name-tier lease states its file again, behind the lock it may have waited for
+            conn = stack.enter_context(store.connection(path(root), tier, wait_sec=wait_sec, opener=_open,
+                                                        identity=identity if tier == TIER_ENFORCED else None))
+            with store.transaction(conn, write=write):  # the lease set the wait a write's COMMIT spends
                 yield conn
         except sqlite3.Error as exc:
             raise _typed(exc) from exc
@@ -407,7 +409,7 @@ def stream_row(stream: str, columns: Dict[str, Any]) -> bool:
     return stream == "chat" and (columns["chat_id"] is None or columns["chat_id"] >= 0)
 
 
-def _row(record: sqlite3.Row) -> Row:
+def _row(record: Any) -> Row:  # a ``sqlite3.Row``, or a record of ``_page``
     from ouroboros.place_arrivals import project_source
     return Row(record["stream"], record["seq"], project_source(record), record["dispatch"], record["length"])
 
@@ -640,23 +642,47 @@ def pending_dispatches(root: Any) -> List[Tuple[Row, Dict[str, Any]]]:
 # --- addressed reads -------------------------------------------------------------------------
 
 def row_at(root: Any, stream: str, seq: int) -> Optional[Row]:
+    return rows_at(root, stream, [seq]).get(int(seq))
+
+
+_PAGE = ("SELECT json_group_array(json_object('stream',stream,'seq',seq,'body',body,'dispatch',dispatch,"
+         "'dispatch_input',dispatch_input,'length',length)) FROM (SELECT stream, seq, body, dispatch, dispatch_input, "
+         "length FROM dialogue ")
+
+
+def _page(conn: sqlite3.Connection, where: str, params: Tuple[Any, ...]) -> str:
+    """The rows ``where`` selects in ONE step, as one text (``_decoded`` after the transaction closed): every
+    ``sqlite3_step`` releases the GIL, so beside busy threads a page re-queues once, not once per row."""
+    return conn.execute(_PAGE + where + ")", params).fetchone()[0] or "[]"
+
+
+def _decoded(*pages: str) -> List[Dict[str, Any]]:
+    """The records of captured pages by coordinate (``_row`` takes them as it takes ``sqlite3.Row``)."""
+    return sorted((record for page in pages for record in json.loads(page)), key=lambda record: record["seq"])
+
+
+def rows_at(root: Any, stream: str, seqs: Iterable[int]) -> Dict[int, Row]:
+    """The rows at many coordinates in one read (a statement per 500): each row found, by coordinate."""
+    wanted, pages = sorted({int(seq) for seq in seqs}), []
     with transaction(root, write=False) as conn:
-        record = conn.execute(f"{_SELECT} WHERE stream=? AND seq=?", (stream, seq)).fetchone()
-    return None if record is None else _row(record)
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start:start + 500]
+            pages.append(_page(conn, f"WHERE stream=? AND seq IN ({','.join('?' * len(chunk))})", (stream, *chunk)))
+    return {record["seq"]: _row(record) for record in _decoded(*pages)}
 
 
 def rows_between(root: Any, stream: str, lower: int, upper: int) -> List[Row]:
     """Every row with ``lower <= seq < upper`` in order (a frozen page replayed by its coordinates)."""
     with transaction(root, write=False) as conn:
-        records = conn.execute(f"{_SELECT} WHERE stream=? AND seq>=? AND seq<? ORDER BY seq", (stream, lower, upper)).fetchall()
-    return [_row(record) for record in records]
+        page = _page(conn, "WHERE stream=? AND seq>=? AND seq<?", (stream, lower, upper))
+    return [_row(record) for record in _decoded(page)]
 
 
 def rows_after(root: Any, stream: str, seq: int, *, limit: int = 1000) -> List[Row]:
     """The rows appended after ``seq`` (a live follower's next batch, a wake's window), in order."""
     with transaction(root, write=False) as conn:
-        records = conn.execute(f"{_SELECT} WHERE stream=? AND seq>? ORDER BY seq LIMIT ?", (stream, seq, limit)).fetchall()
-    return [_row(record) for record in records]
+        page = _page(conn, "WHERE stream=? AND seq>? ORDER BY seq LIMIT ?", (stream, seq, limit))
+    return [_row(record) for record in _decoded(page)]
 
 
 def iter_rows(root: Any, stream: str, *, lower: int = 0, upper: Optional[int] = None, batch: int = 500) -> Iterator[Row]:
@@ -666,8 +692,9 @@ def iter_rows(root: Any, stream: str, *, lower: int = 0, upper: Optional[int] = 
     bound = _bound(upper)
     while True:
         with transaction(root, write=False) as conn:
-            records = conn.execute(f"{_SELECT} WHERE stream=? AND seq>=? AND seq<? ORDER BY seq LIMIT ?",
-                                   (stream, lower, bound, batch)).fetchall()
+            page = _page(conn, "WHERE stream=? AND seq>=? AND seq<? ORDER BY seq LIMIT ?",
+                         (stream, lower, bound, batch))
+        records = _decoded(page)
         for record in records:
             yield _row(record)
         if len(records) < batch:
@@ -698,43 +725,55 @@ def _bound(before: Optional[int]) -> int:
 
 def probe_rows(root: Any, stream: str, keys: Iterable[Tuple[str, Any]], *, before: Optional[int] = None,
                lower: int = 0, limit: int = 200, newest_first: bool = True) -> List[Row]:
-    """The union of one indexed probe per ``(column, value)`` key in ``[lower, before)``, newest
-    first, at most ``limit`` rows: the candidate rows of a room or a task tree. Each probe reads
-    at most ``limit`` coordinates through its own index; only the union's winning rows fetch
-    bodies in that snapshot; JSON decoding follows release. ``("chat_id", None)`` probes NULL chats."""
+    """The union of the ``(column, value)`` keys' rows in ``[lower, before)``, newest first, at
+    most ``limit`` rows: the candidate rows of a room or a task tree. One statement per column reads
+    at most ``limit`` coordinates through its index; only the union's winning rows fetch bodies in
+    that snapshot; JSON decoding follows release. ``("chat_id", None)`` probes NULL chats."""
     with transaction(root, write=False) as conn:
-        records = _probe(conn, stream, keys, before=before, lower=lower, limit=limit, newest_first=newest_first)
-    return [_row(record) for record in records]
+        probed = _probe(conn, stream, keys, before=before, lower=lower, limit=limit, newest_first=newest_first)
+    return _probed(*probed)
+
+
+def _probed(chosen: List[int], pages: List[str]) -> List[Row]:
+    """``_probe``'s winning rows, decoded after the transaction closed, in its order."""
+    records = {record["seq"]: record for record in _decoded(*pages)}
+    return [_row(records[seq]) for seq in chosen]
 
 
 def _probe(conn: sqlite3.Connection, stream: str, keys: Iterable[Tuple[str, Any]], *, before: Optional[int],
-           lower: int, limit: int, newest_first: bool) -> List[sqlite3.Row]:
-    """Capture the winning stored records; the transaction owner decodes after release."""
-    found = set()
-    order = "DESC" if newest_first else "ASC"
+           lower: int, limit: int, newest_first: bool) -> Tuple[List[int], List[str]]:
+    """Capture the winning stored records; the transaction owner decodes after release.
+
+    One statement per column selects, through that column's index, the first ``limit`` coordinates
+    matching any of its values (one JSON list), so Python receives at most columns x ``limit``
+    integers however many keys a room has: a row among the union's first ``limit`` is among its own
+    column's first ``limit``, so the first ``limit`` of these is the union's."""
+    values: Dict[str, list] = {}
     for column, value in dict.fromkeys(tuple(keys)):
-        index = _PROBE_INDEX.get(column)
-        if index is None:
+        if column not in _PROBE_INDEX:
             raise ValueError(f"not a dialogue probe column: {column!r}")
-        if value is None and column != "chat_id":
-            continue  # the partial indexes hold only rows that carry the fact: nothing to probe
-        # ``IS`` reaches the NULL chat rows through the full room index; a partial index needs ``=``.
-        operator = "IS" if column == "chat_id" else "="
-        for record in conn.execute(f"SELECT seq FROM dialogue INDEXED BY {index} WHERE stream=? AND {column} {operator} ? AND seq<? AND seq>=? "
-                                   f"ORDER BY seq {order} LIMIT ?", (stream, value, _bound(before), lower, limit)):
-            found.add(record["seq"])
+        if value is not None or column == "chat_id":  # the partial indexes hold only rows that carry the fact
+            values.setdefault(column, []).append(value)
+    found = set()
+    order, bounds = ("DESC" if newest_first else "ASC"), (_bound(before), lower, limit)
+    for column, listed in values.items() if limit > 0 else ():  # each column's coordinates in one step
+        select = (f"SELECT json_group_array(seq) FROM (SELECT seq FROM dialogue INDEXED BY {_PROBE_INDEX[column]} "
+                  f"WHERE stream=? AND {column} ")
+        tail = f" AND seq<? AND seq>=? ORDER BY seq {order} LIMIT ?)"
+        if None in listed:  # the chat-less rows, through the full room index
+            found.update(json.loads(conn.execute(select + "IS NULL" + tail, (stream, *bounds)).fetchone()[0]))
+        if any(value is not None for value in listed):
+            found.update(json.loads(conn.execute(
+                select + "IN (SELECT +value FROM json_each(?))" + tail,  # unary + keeps the column's affinity
+                (stream, json.dumps([value for value in listed if value is not None]), *bounds)).fetchone()[0]))
     chosen = heapq.nlargest(limit, found) if newest_first else heapq.nsmallest(limit, found)
-    if not chosen:
-        return []
     # Python 3.10 has no getlimit; 999 is the default variable limit at our SQLite 3.24 floor.
     variables = conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) if hasattr(conn, "getlimit") else 999
-    records = {}
+    pages = []
     for start in range(0, len(chosen), variables - 1):  # one binding is the stream, including for 10,000-row readers
         batch = chosen[start:start + variables - 1]
-        marks = ",".join("?" for _ in batch)
-        for record in conn.execute(f"{_SELECT} WHERE stream=? AND seq IN ({marks})", (stream, *batch)):
-            records[record["seq"]] = record
-    return [records[seq] for seq in chosen]
+        pages.append(_page(conn, f"WHERE stream=? AND seq IN ({','.join('?' for _ in batch)})", (stream, *batch)))
+    return chosen, pages
 
 
 def room_candidates(root: Any, stream: str, chat_id: int, *, tasks: Iterable[str] = (), origins: Iterable[str] = (),
@@ -760,8 +799,8 @@ def main_candidates(root: Any, stream: str, *, exclude_chats: Iterable[int], pin
                  if record["chat_id"] not in excluded]
         keys: List[Tuple[str, Any]] = [("chat_id", chat) for chat in chats] + [("chat_id", None)]
         keys.extend(("kind", kind) for kind in pinned_kinds)
-        records = _probe(conn, stream, keys, before=before, lower=lower, limit=limit, newest_first=True)
-    return [_row(record) for record in records]
+        probed = _probe(conn, stream, keys, before=before, lower=lower, limit=limit, newest_first=True)
+    return _probed(*probed)
 
 
 def task_rows(root: Any, task_ids: Iterable[str], *, stream: str, after: int = -1,
@@ -821,12 +860,29 @@ def legacy_candidates(root: Any, gen: str, line: int) -> List[Row]:
     generation's first-line sha256 (``utils.jsonl_generation_signature``), ``line`` its physical
     line number. Two generations that start with the same line share a signature; the old
     reader checked each against the address's chat, time and hash -- the caller still does."""
-    if not gen or not line:
-        return []
+    return legacy_candidates_of(root, [(gen, line)]).get((str(gen), int(line)), []) if gen and line else []
+
+
+def legacy_candidates_of(root: Any, pairs: Iterable[Tuple[str, int]]) -> Dict[Tuple[str, int], List[Row]]:
+    """The candidates of many ``(gen, line)`` addresses in one read: each address's rows in chain order (a chunk
+    of addresses, then of rows, in ONE step each, as ``_page`` reads a page)."""
+    wanted = sorted({(str(gen), int(line)) for gen, line in pairs if gen and line})
+    seqs: Dict[Tuple[str, int], List[int]] = {}
+    pages = []
     with transaction(root, write=False) as conn:
-        records = conn.execute(f"{_SELECT} WHERE stream='chat' AND seq IN (SELECT seq FROM legacy_addresses WHERE gen=? AND line=?) "
-                               "ORDER BY seq", (gen, int(line))).fetchall()
-    return [_row(record) for record in records]
+        for start in range(0, len(wanted), 250):
+            chunk = wanted[start:start + 250]
+            listed = conn.execute("SELECT json_group_array(json_array(gen, line, seq)) FROM legacy_addresses WHERE "
+                                  + " OR ".join("(gen=? AND line=?)" for _pair in chunk),
+                                  [value for pair in chunk for value in pair]).fetchone()[0]
+            for gen, line, seq in json.loads(listed or "[]"):
+                seqs.setdefault((gen, line), []).append(seq)
+        found = sorted({seq for listed in seqs.values() for seq in listed})
+        for start in range(0, len(found), 500):
+            chunk = found[start:start + 500]
+            pages.append(_page(conn, f"WHERE stream='chat' AND seq IN ({','.join('?' * len(chunk))})", tuple(chunk)))
+    rows = {record["seq"]: _row(record) for record in _decoded(*pages)}
+    return {pair: [rows[seq] for seq in sorted(seqs.get(pair, ())) if seq in rows] for pair in wanted}
 
 
 def resolve_legacy(root: Any, gen: str, line: int) -> Optional[Row]:
@@ -837,11 +893,25 @@ def resolve_legacy(root: Any, gen: str, line: int) -> Optional[Row]:
 
 
 def legacy_address(root: Any, seq: int) -> Optional[Tuple[str, int]]:
-    """The ``(gen, line)`` an imported chat row had (``None`` for a row appended here); one indexed
-    probe (``legacy_seq``), whatever the other rooms imported."""
+    """The ``(gen, line)`` an imported chat row had (``None`` for a row appended here)."""
+    return legacy_addresses(root, [seq]).get(int(seq))
+
+
+def legacy_addresses(root: Any, seqs: Iterable[int]) -> Dict[int, Tuple[str, int]]:
+    """The ``(gen, line)`` each imported chat row had, for many rows in one indexed read (``legacy_seq``,
+    a statement and ONE step per 500 rows, whatever the other rooms imported): a row's first in
+    ``(gen, line)`` order when an alias gave it several; no entry for a row appended here."""
+    wanted = sorted({int(seq) for seq in seqs})
+    found: Dict[int, Tuple[str, int]] = {}
     with transaction(root, write=False) as conn:
-        record = conn.execute("SELECT gen, line FROM legacy_addresses INDEXED BY legacy_seq WHERE seq=? LIMIT 1", (seq,)).fetchone()
-    return None if record is None else (record["gen"], record["line"])
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start:start + 500]
+            listed = conn.execute("SELECT json_group_array(json_array(seq, gen, line)) FROM legacy_addresses "
+                                  f"INDEXED BY legacy_seq WHERE seq IN ({','.join('?' * len(chunk))})",
+                                  chunk).fetchone()[0]
+            for seq, gen, line in sorted(json.loads(listed or "[]")):
+                found.setdefault(seq, (gen, line))
+    return found
 
 
 def legacy_generation(root: Any, gen: str) -> Optional[Dict[str, Any]]:

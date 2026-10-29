@@ -1,20 +1,17 @@
-// A place's sheet: everything the owner decides about one place, on the delivered-document reader's geometry
-// (a dialog over the page, a full sheet on a phone), like the skill detail sheet. Its state (Active · Silent ·
-// Paused), what wakes it there and who added each item, the owner's accounts there, the notes with their
-// authors, the working folder (an address, not a fence) and the model. Every change is one owner write through
-// consciousness_api.js and repaints from the record the server answers; nothing is saved by a guess. The
-// Connect flow lives here too: an installed connector's place is created from its declaration, no id typed.
+// One PlaceSummary in a document-reader sheet. Owner writes repaint from the server and retain drafts.
+// Connect is separate in place_connect.js; the body stays here for the place-room integration.
 import { bindDialogFocus } from './ui_interactions.js';
 import { escapeHtmlAttr as escapeHtml } from './ui_primitives.js';
 import { renderSegmentedField } from './page_header.js';
 import { chipHtml, skillIconHtml } from './skill_presentation.js';
-import { connectPlace, disconnectPlace, PLACES_CHANGED_EVENT, readPlaces, updatePlace } from './consciousness_api.js';
+import { tr, fmt } from './i18n.js';
+import { fetchJson } from './api_client.js';
+import { bindModelChoosers, modelChooserHtml, updateModelChooser } from './model_chooser.js';
+import { disconnectPlace, normalizePlace, normalizePlaceStatus, PLACES_CHANGED_EVENT, readPlaceConnector, readPlaceRooms, updatePlace } from './consciousness_api.js';
+import { mountPlaceHistory, placeRoomsHtml } from './place_history.js';
 import {
-    PLACE_STATES, SILENT_CARD, accountIdText, authorWord, capitalized, listWords, placeScopeText, placeStateOf, wakeFactWord,
+    PLACE_STATES, SILENT_CARD, WAKE_FACT_WORDS, accountIdText, authorWord, capitalized, listWords, placeStateOf, placeStateWord, signalLabels, wakeFactWord,
 } from './consciousness_words.js';
-
-/** The one «Connect a place» control (Dashboard and Settings draw this, never their own); a press opens the flow. */
-export const connectPlaceButtonHtml = () => '<button type="button" class="btn btn-default btn-sm" data-place-connect>Connect a place</button>';
 
 /** Ask the Skills page for one installed skill's card, or Browse filtered to connectors. */
 export function openSkillsFor(detail) {
@@ -26,8 +23,8 @@ const shortDate = (value) => {
     const time = Date.parse(String(value || ''));
     return Number.isFinite(time) ? new Date(time).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) : '';
 };
-const statusLine = (status) => (status?.text
-    ? `<p class="place-sheet-status ui-status" data-tone="${escapeHtml(status.tone || 'muted')}" role="status">${escapeHtml(status.text)}</p>` : '');
+export const statusLine = (status) => (status?.text
+    ? `<p class="place-sheet-status ui-status" data-tone="${escapeHtml(status.tone || 'muted')}" role="status"${status.authored ? ' data-i18n-authored' : ''}>${escapeHtml(status.text)}</p>` : '');
 const section = (key, title, inner, ui) => `<section class="place-sheet-section" data-place-section="${key}">
     ${title ? `<h3>${escapeHtml(title)}</h3>` : ''}${inner}${statusLine(ui.status?.[key])}</section>`;
 
@@ -46,65 +43,88 @@ function stateHtml(place, ui) {
         ${silent ? `<p class="place-silent-card" role="note">${escapeHtml(`${state.note} ${SILENT_CARD}`)}</p>` : ''}`;
 }
 
-// What the wake list does in each state: Silent still wakes it (it reads and thinks; what it would say or change
-// there is held), Paused does not. An unreadable state claims nothing.
-const WAKE_NOTES = {
-    active: 'Everything else here is heard and waits for its own clock.',
-    silent: 'Silent: these still wake it to read and think; what it would say or change here is held.',
-    paused: 'While this place is not Active, nothing here wakes it.',
-};
+function wakesHtml(place, ui) {
+    const labels = { ...signalLabels(place.facts), ...place.labels, ...ui.labels };
+    const vocabulary = place.facts ?? Object.keys(WAKE_FACT_WORDS).filter((fact) => fact !== 'legacy_addressed'
+        || place.wakes.some((item) => item.fact === fact));
+    const items = vocabulary.map((item) => {
+        const fact = typeof item === 'string' ? item : item?.id;
+        if (!fact) return '';
+        const chosen = place.wakes.find((wake) => wake.fact === fact);
+        const authored = Boolean(labels[fact]);
+        const label = authored ? labels[fact] : capitalized(wakeFactWord(fact));
+        return `<li class="place-wake-item"><label class="place-wake-toggle ui-hit-area"><input class="ui-checkbox" type="checkbox" data-place-act="${chosen ? 'remove-wake' : 'add-wake'}" data-fact="${escapeHtml(fact)}"${chosen ? ' checked' : ''}>
+            <span${authored ? ' data-i18n-authored' : ''}>${escapeHtml(label)}</span></label>${chosen ? chipHtml(tr(`places.author.${chosen.author}`, authorWord(chosen.author)), 'neutral') : ''}</li>`;
+    }).join('');
+    const service = `<span data-i18n-authored>${escapeHtml(ui.serviceLabel || place.serviceLabel || place.provider)}</span>`;
+    return `<p class="place-sheet-note">${fmt('A checked kind calls it here at once, when {service} reports it.', { service })}</p>
+        <ul class="place-wake-list">${items}</ul>
+        ${vocabulary.includes('from_bot') ? `<p class="place-sheet-note">${tr('places.wake.bots', 'Bot messages need this check; once checked, they can wake it without another checked kind.')}</p>` : ''}
+        ${place.state === 'silent' ? `<p class="place-sheet-note">${tr('places.wake.silent', 'Silent: these still wake it to read and think; what it would say or change here is held.')}</p>` : ''}
+        ${place.state === 'paused' ? `<p class="place-sheet-note">${tr('places.wake.paused', 'While this place is Paused, nothing here wakes it.')}</p>` : ''}
+        <p class="place-sheet-note">${tr('places.wake.honesty', 'Everything else here it sees at its next own wake and decides what to read.')}</p>`;
+}
 
-function wakesHtml(place) {
-    const listed = new Set(place.wakes.map((item) => item.fact));
-    const items = place.wakes.map((item) => `<li class="place-wake-item">
-            <span>${escapeHtml(capitalized(wakeFactWord(item.fact)))}</span>
-            ${chipHtml(authorWord(item.author), 'neutral')}
-            <button type="button" class="btn btn-ghost btn-sm" data-place-act="remove-wake" data-fact="${escapeHtml(item.fact)}" aria-label="Stop waking for ${escapeHtml(wakeFactWord(item.fact))}">Remove</button>
-        </li>`).join('');
-    const offers = place.wakeSuggestions.filter((fact) => !listed.has(fact));
-    const add = offers.length ? `<div class="place-wake-offers" role="group" aria-label="Wake it also for">
-            <span class="place-sheet-note">Also wake it for:</span>
-            ${offers.map((fact) => `<button type="button" class="btn btn-default btn-sm" data-place-act="add-wake" data-fact="${escapeHtml(fact)}">${escapeHtml(capitalized(wakeFactWord(fact)))}</button>`).join('')}
-        </div>` : '';
-    const note = WAKE_NOTES[place.state] || '';
-    return `${items ? `<ul class="place-wake-list">${items}</ul>` : '<p class="place-sheet-note">Nothing here wakes it at once.</p>'}
-        ${add}${note ? `<p class="place-sheet-note">${escapeHtml(note)}</p>` : ''}`;
+function identityHtml(place, ui) {
+    // The same account-scoped match as the server's owner_account_matches: a confirmation for another account is not this one.
+    const withOwner = (entry) => ({ ...entry, owner: entry.kind === 'user' && place.ownerAccounts.some((account) =>
+        account.actorId === entry.id && (!account.accountId || account.accountId === place.accountId)) });
+    const sender = ui.identity?.sends_as && withOwner(ui.identity.sends_as);
+    const authored = (label) => `<span data-i18n-authored>${escapeHtml(label)}</span>`;
+    const readers = listWords((ui.identity?.reads_as || []).map(withOwner).map((entry) => authored(entry.label)));
+    const writes = sender ? fmt(sender.kind === 'bot' ? 'It writes here as the Ouroboros bot ({label})'
+        : sender.owner ? 'It writes here as you ({label})' : 'It writes here as {label}', { label: authored(sender.label) }) : '';
+    const reads = readers ? fmt(writes ? 'reads as {labels}' : 'It reads here as {labels}', { labels: readers }) : '';
+    if (!writes && !reads) return '';
+    const canConfirm = sender?.kind === 'user' && !sender.owner;
+    return `<div class="harness-account-row place-account">
+        <div class="harness-account-main"><span>${[writes, reads].filter(Boolean).join(' · ')}</span></div>
+        ${canConfirm ? `<div class="harness-account-actions"><button type="button" class="btn btn-default btn-sm" data-place-act="confirm" data-actor="${escapeHtml(sender.id)}" data-actor-label="${escapeHtml(sender.label)}">${escapeHtml(tr('places.account.confirm_identity', 'This is my account'))}</button></div>` : ''}
+    </div>`;
 }
 
 function accountsHtml(place, ui) {
+    const identity = ui.removed ? '' : identityHtml(place, ui);
     const rows = place.ownerAccounts.map((account) => `<div class="harness-account-row place-account">
-            <div class="harness-account-main"><strong>${escapeHtml(account.label || account.actorId)}</strong></div>
-            <div class="harness-account-meta">${escapeHtml(['you', account.confirmedAt ? `confirmed on ${shortDate(account.confirmedAt)}` : 'confirmed',
-                account.label && account.label !== account.actorId ? account.actorId : ''].filter(Boolean).join(' · '))}</div>
+            <div class="harness-account-main"><strong data-i18n-authored>${escapeHtml(account.label || account.actorId)}</strong></div>
+            <div class="harness-account-meta">${escapeHtml([tr('places.account.you', 'you'), account.confirmedAt ? fmt('confirmed on {date}', { date: shortDate(account.confirmedAt) }) : tr('places.account.confirmed', 'confirmed')].join(' · '))}${account.label && account.label !== account.actorId ? ` · <span data-i18n-authored>${escapeHtml(account.actorId)}</span>` : ''}</div>
             <div class="harness-account-actions"><button type="button" class="btn btn-ghost btn-sm" data-place-act="revoke" data-actor="${escapeHtml(account.actorId)}" aria-label="Not my account: remove ${escapeHtml(account.label || account.actorId)}">Remove</button></div>
         </div>`).join('');
     const mine = new Set(place.ownerAccounts.map((account) => account.actorId));
     const candidates = place.accountCandidates.filter((account) => !mine.has(account.actorId)).map((account) => `<div class="harness-account-row place-account">
-            <div class="harness-account-main"><strong>${escapeHtml(account.label || account.actorId)}</strong></div>
-            <div class="harness-account-meta">${escapeHtml(account.label ? account.actorId : 'seen here')}</div>
+            <div class="harness-account-main"><strong data-i18n-authored>${escapeHtml(account.label || account.actorId)}</strong></div>
+            <div class="harness-account-meta"${account.label ? ' data-i18n-authored' : ''}>${escapeHtml(account.label ? account.actorId : tr('places.account.seen', 'seen here'))}</div>
             <div class="harness-account-actions"><button type="button" class="btn btn-default btn-sm" data-place-act="confirm" data-actor="${escapeHtml(account.actorId)}" data-actor-label="${escapeHtml(account.label)}">This is me</button></div>
         </div>`).join('');
     const form = ui.adding ? `<div class="place-account-form">
             <div class="ui-field"><label for="place-account-id">Your account here</label>
                 <input class="ui-control" id="place-account-id" data-place-draft="actorId" value="${escapeHtml(ui.drafts.actorId || '')}" spellcheck="false" autocomplete="off" aria-describedby="place-account-help">
                 <div class="ui-field-help" id="place-account-help">${escapeHtml(`${capitalized(accountIdText(place.provider))}.`)}</div></div>
-            <label class="ui-field">Name (optional)<input class="ui-control" data-place-draft="actorLabel" value="${escapeHtml(ui.drafts.actorLabel || '')}" spellcheck="false" autocomplete="off"></label>
+            <label class="ui-field">${tr('places.account.name', 'Name (optional)')}<input class="ui-control" data-place-draft="actorLabel" data-i18n-authored value="${escapeHtml(ui.drafts.actorLabel || '')}" spellcheck="false" autocomplete="off"></label>
             <div class="place-sheet-actions"><button type="button" class="btn btn-default btn-sm" data-place-act="confirm-typed">This is me</button><button type="button" class="btn btn-ghost btn-sm" data-place-act="cancel-add">Cancel</button></div>
         </div>` : '<div class="place-sheet-actions"><button type="button" class="btn btn-ghost btn-sm" data-place-act="add-mine">Add mine</button></div>';
-    return `${rows || candidates ? `<div class="place-accounts">${rows}${candidates}</div>` : ''}${form}
+    return `${identity || rows || candidates ? `<div class="place-accounts">${identity}${rows}${candidates}</div>` : ''}${form}
         <p class="place-sheet-note">Anyone else here, whatever name they use, is talked to like anyone; their requests are theirs, not yours.</p>`;
 }
 
 function notesHtml(place, ui) {
+    const safety = {
+        full: 'Ouroboros reads your words every time; the Safety Supervisor reads them before actions.',
+        light: 'Ouroboros reads your words every time; the Safety Supervisor reads them before some actions.',
+        off: 'Ouroboros reads your words every time; the Safety Supervisor is off.',
+    }[place.safetyMode];
+    const honesty = safety ? `${tr(`places.notes.safety.${place.safetyMode}`, safety)} ${tr('places.notes.locks', 'Silent and Paused are locks; words are not.')}` : '';
+    const placeholder = tr('places.notes.questions', 'Who am I here? What may I do? What calls me at once? What matters here? What must I never do? What do you want to see afterwards?');
     const items = place.notes.map((note) => `<li class="place-note${OWNER_VOICE.has(note.author) ? ' is-owner' : ''}">
-            <p>${escapeHtml(note.text)}</p>
+            <p data-i18n-authored>${escapeHtml(note.text)}</p>
             <div class="place-note-foot">${chipHtml(authorWord(note.author), 'neutral')}${note.id
                 ? `<button type="button" class="btn btn-ghost btn-sm" data-place-act="remove-note" data-note="${escapeHtml(note.id)}">Remove</button>` : ''}</div>
         </li>`).join('');
-    return `<p class="place-sheet-note">It reads them at every wake here; the Safety Supervisor treats yours as your instructions.</p>
+    return `${honesty ? '' : '<p class="place-sheet-note">It reads them at every wake here; the Safety Supervisor treats yours as your instructions.</p>'}
         ${items ? `<ul class="place-note-list">${items}</ul>` : ''}
-        <label class="ui-field">New note<textarea class="ui-control consciousness-owner-words" rows="2" data-place-draft="note" spellcheck="false">${escapeHtml(ui.drafts.note || '')}</textarea></label>
-        <div class="place-sheet-actions"><button type="button" class="btn btn-default btn-sm" data-place-act="add-note">Add note</button></div>`;
+        <label class="ui-field">${tr('places.note.new', 'New note')}<textarea class="ui-control consciousness-owner-words" rows="${place.notes.length ? 2 : 6}" data-place-draft="note" data-i18n-authored spellcheck="false" placeholder="${escapeHtml(placeholder)}">${escapeHtml(ui.drafts.note || '')}</textarea></label>
+        <div class="place-sheet-actions"><button type="button" class="btn btn-default btn-sm" data-place-act="add-note">Add note</button></div>
+        ${honesty ? `<p class="place-sheet-note">${escapeHtml(honesty)}</p>` : ''}`;
 }
 
 function folderHtml(place, ui) {
@@ -123,7 +143,7 @@ function moreHtml(place, ui) {
             <div class="consciousness-more-body">
                 <label class="ui-field">Model
                     <div class="place-field-row">
-                        <input class="ui-control" data-place-draft="model" value="${escapeHtml(value)}" spellcheck="false" autocomplete="off" placeholder="Empty uses the consciousness model">
+                        ${modelChooserHtml(`data-place-draft="model" aria-label="${escapeHtml(tr('places.model', 'Model'))}"`, value, 'place-model-options', ui.models || [], { placeholder: tr('places.model.empty', 'Empty uses the consciousness model') })}
                         <button type="button" class="btn btn-default btn-sm" data-place-act="save-model">Save</button>
                     </div>
                 </label>
@@ -135,7 +155,7 @@ function moreHtml(place, ui) {
 function footHtml(place, ui) {
     if (ui.confirmDisconnect) {
         return `<div class="place-disconnect-confirm" role="group" aria-label="Disconnect ${escapeHtml(place.label)}">
-            <p>Disconnect ${escapeHtml(place.label)}? It stops hearing and acting here; the room's history stays.</p>
+            <p>${fmt("Disconnect {place}? It stops hearing and acting here; the room's history stays.", { place: `<span data-i18n-authored>${escapeHtml(place.label)}</span>` })}</p>
             <div class="place-sheet-actions"><button type="button" class="btn btn-danger btn-sm" data-place-act="disconnect-yes">Disconnect</button><button type="button" class="btn btn-default btn-sm" data-place-act="disconnect-no">Keep it</button></div>
         </div>`;
     }
@@ -148,23 +168,30 @@ function footHtml(place, ui) {
 /** The sheet's body for one normalized place and the sheet's own UI state (drafts, busy, statuses). */
 export function placeSheetBodyHtml(place, ui = {}) {
     const view = { drafts: {}, status: {}, ...ui };
+    if (view.removed) place = { ...place, notes: [], ownerAccounts: [], accountCandidates: [] };
     return [
-        section('state', '', stateHtml(place, view), view),
-        section('wakes', 'Wakes it at once', wakesHtml(place), view),
+        view.conflict || view.removed || view.readiness || place.readiness ? section('readiness', '',
+            (view.conflict ? statusLine({ text: tr('places.conflict', 'Changed elsewhere; your text is kept.'), tone: 'warn' }) : '')
+            + (view.removed ? statusLine({ text: tr('places.disconnected', 'This place is disconnected.'), tone: 'muted' })
+                : statusLine(view.readiness || (place.readiness && { ...place.readiness, text: tr(`places.readiness.${place.readiness.text}`, place.readiness.text) }))), view) : '',
+        view.removed ? '' : section('state', '', stateHtml(place, view), view),
+        view.removed ? '' : section('conversations', tr('places.conversations', 'Conversations'), placeRoomsHtml(view.roomIndex || { rooms: null }), view),
+        view.removed ? '' : section('wakes', tr('places.calls', 'What calls it here'), wakesHtml(place, view), view),
         section('accounts', 'Your accounts here', accountsHtml(place, view), view),
         section('notes', 'Notes', notesHtml(place, view), view),
         section('folder', 'Working folder', folderHtml(place, view), view),
         section('more', '', moreHtml(place, view), view),
-        section('foot', '', footHtml(place, view), view),
+        view.removed ? '' : section('foot', '', footHtml(place, view), view),
     ].join('');
 }
 
-export const placeSheetMetaText = (place) => [place.connectorLabel, placeScopeText(place)].filter(Boolean).join(' · ');
+export const placeSheetMetaText = (place) => [place.label, placeStateWord(place.state)].filter(Boolean).join(' · ');
 
-function sheetShell(titleHtml, metaText, modifier = '') {
+export function sheetShell(titleHtml, metaText, modifier = '') {
     const dialog = document.createElement('dialog');
     dialog.className = `document-reader place-sheet${modifier ? ` ${modifier}` : ''}`;
     dialog.setAttribute('aria-labelledby', 'place-sheet-title');
+    dialog.setAttribute('aria-modal', 'true');  // bindDialogFocus answers Escape (the shared Back) only for an explicit modal
     dialog.innerHTML = `<div class="document-reader-panel">
         <div class="document-reader-head">
             <div class="document-reader-identity">
@@ -172,14 +199,14 @@ function sheetShell(titleHtml, metaText, modifier = '') {
                 <div class="document-reader-meta" data-place-meta>${escapeHtml(metaText)}</div>
             </div>
             <div class="document-reader-actions"></div>
-            <button type="button" class="btn btn-default document-reader-close" data-place-close>Close</button>
+            <button type="button" class="btn btn-default document-reader-close" data-place-close>${tr('places.close', 'Close')}</button>
         </div>
         <div class="document-reader-body place-sheet-body is-quiet-focus" tabindex="-1" data-place-body></div>
     </div>`;
     return dialog;
 }
 
-function showSheet(dialog, { returnFocus, onClose }) {
+export function showSheet(dialog, { returnFocus, onClose, onBack }) {
     const body = dialog.querySelector('[data-place-body]');
     let closed = false;
     let disposeFocus = null;
@@ -191,14 +218,16 @@ function showSheet(dialog, { returnFocus, onClose }) {
         dialog.remove();
         onClose?.();
     };
-    dialog.addEventListener('cancel', (event) => { event.preventDefault(); close(); });
+    const back = () => { if (!onBack?.()) close(); };
+    dialog.addEventListener('cancel', (event) => { event.preventDefault(); back(); });
+    dialog.addEventListener('close', close);  // a native close (the shared Back's fallback) disposes the sheet too
     dialog.addEventListener('click', (event) => {
         if (event.target === dialog || event.target.closest('[data-place-close]')) close();
     });
     dialog.addEventListener('keydown', () => body.classList.remove('is-quiet-focus'), { once: true });
     document.body.appendChild(dialog);
     if (typeof dialog.showModal === 'function') dialog.showModal(); else dialog.setAttribute('open', '');
-    disposeFocus = bindDialogFocus(dialog, { initialFocus: body, returnFocus, onEscape: close });
+    disposeFocus = bindDialogFocus(dialog, { initialFocus: body, returnFocus, onEscape: back });
     return { close, body, get closed() { return closed; } };
 }
 
@@ -234,38 +263,102 @@ const DONE_WORDS = {
     'save-folder': () => 'Folder saved.', 'save-model': () => 'Model saved.',
 };
 
-/**
- * Open the sheet for a normalized place. `onChanged(place)` hears every confirmed write; Disconnect closes
- * the sheet. `update`, `disconnect` are injectable for tests.
- */
+/** Open one projected place; requests keep its revision and drafts survive a refused or concurrent write. */
 export function openPlaceSheet(place, { returnFocus = document.activeElement, onClose = null, update = updatePlace,
-    disconnect = disconnectPlace } = {}) {
+    disconnect = disconnectPlace, readStatus = readPlaceConnector, readModels = (init) => fetchJson('/api/model-catalog', init),
+    readRooms = readPlaceRooms, openRoomChatId = null } = {}) {
     let current = place;
-    const ui = { drafts: {}, status: {}, busy: false, adding: false, confirmDisconnect: false, moreOpen: false };
-    const dialog = sheetShell(`<span class="place-glyph" aria-hidden="true">${skillIconHtml(place.icon, 22)}</span><span>${escapeHtml(place.label)}</span>`,
+    const ui = { drafts: {}, status: {}, busy: false, adding: false, confirmDisconnect: false, moreOpen: false,
+        serviceLabel: place.serviceLabel || place.provider, roomIndex: { rooms: null } };
+    let disposeModels = () => {}, modelsRead = false;
+    let history = null, selected = null, editorScroll = 0, roomController = null, roomGeneration = 0;
+    const abort = new AbortController();
+    const dialog = sheetShell(`<span class="place-glyph" aria-hidden="true">${skillIconHtml(place.icon, 22)}</span><span data-place-label data-i18n-authored>${escapeHtml(place.label)}</span>`,
         placeSheetMetaText(place));
-    const sheet = showSheet(dialog, { returnFocus, onClose: () => { window.removeEventListener(PLACES_CHANGED_EVENT, onExternal); onClose?.(); } });
+    const sheet = showSheet(dialog, { returnFocus, onBack: () => { if (!history) return false; backToPlace(); return true; },
+        onClose: () => { abort.abort(); disposeModels(); roomGeneration += 1; roomController?.abort(); history?.close(); window.removeEventListener(PLACES_CHANGED_EVENT, onExternal); onClose?.(); } });
     const { body } = sheet;
+    // The editor holds the sections; a captured conversation opens in the reader beside it (one sheet, Back returns).
+    const editor = document.createElement('div'); editor.className = 'place-sheet-editor';
+    const reader = document.createElement('div'); reader.hidden = true;
+    body.append(editor, reader);
+    const readerPlace = () => ({ ...current, labels: { ...current.labels, ...ui.labels } });
+
+    function backToPlace() {
+        const id = selected?.room_chat_id;
+        history?.close(); history = null; selected = null;
+        reader.hidden = true; editor.hidden = false;
+        paint(); body.scrollTop = editorScroll;
+        editor.querySelector(`[data-place-room="${id}"]`)?.focus({ preventScroll: true });
+    }
+
+    function openRoom(room) {
+        if (ui.busy || sheet.closed || !current) return;
+        editorScroll = body.scrollTop; selected = room;
+        editor.hidden = true; reader.hidden = false;
+        history = mountPlaceHistory(reader, readerPlace(), room, { onBack: backToPlace });
+        paint(); body.scrollTop = 0;
+        reader.querySelector('[data-history-back]')?.focus({ preventScroll: true });
+    }
+
+    async function loadRooms() {
+        roomController?.abort(); roomController = new AbortController(); const version = ++roomGeneration;
+        ui.roomIndex = { rooms: null }; paint();
+        try {
+            const value = await readRooms(place.id, { signal: roomController.signal });
+            if (sheet.closed || version !== roomGeneration) return;
+            ui.roomIndex = value;
+            // A Dashboard door names the conversation; it opens once the index knows that room.
+            const wanted = openRoomChatId; openRoomChatId = null;
+            const room = wanted ? (value.rooms || []).find((item) => item.room_chat_id === wanted) : null;
+            if (room) { openRoom(room); if (history) return; }
+        } catch (error) {
+            if (sheet.closed || version !== roomGeneration) return;
+            ui.roomIndex = { error: error?.message || String(error) };
+        }
+        paint();
+    }
 
     function paint() {
+        if (sheet.closed) return;
         const scroll = body.scrollTop;
-        const focusKey = body.contains(document.activeElement) ? focusKeyOf(document.activeElement) : '';
-        body.innerHTML = placeSheetBodyHtml(current, ui);
+        const active = document.activeElement;
+        const focusKey = editor.contains(active) ? focusKeyOf(active) : '';
+        const selection = active?.selectionStart == null ? null : [active.selectionStart, active.selectionEnd, active.selectionDirection];
+        disposeModels();
+        editor.innerHTML = placeSheetBodyHtml(current || place, ui);
+        disposeModels = bindModelChoosers(editor);
+        body.querySelectorAll('[data-place-act]').forEach((control) => { control.disabled = ui.busy || ui.removed; });
         body.querySelectorAll(`[data-place-state] [data-effort-value]`).forEach((button) => {
-            const chosen = button.dataset.effortValue === current.state;
+            const chosen = button.dataset.effortValue === current?.state;
             button.classList.toggle('active', chosen);
             button.setAttribute('aria-pressed', String(chosen));
             button.disabled = ui.busy;
         });
         body.querySelector('[data-place-state]')?.setAttribute('aria-labelledby', 'place-state-label');
         body.scrollTop = scroll;
-        if (focusKey) body.querySelector(focusKey)?.focus();
+        if (focusKey) {
+            const field = editor.querySelector(focusKey);
+            field?.focus({ preventScroll: true });
+            if (selection) field?.setSelectionRange?.(...selection);
+        }
+        if (current && history) history.updatePlace(readerPlace());
         const meta = dialog.querySelector('[data-place-meta]');
-        if (meta) meta.textContent = placeSheetMetaText(current);
+        if (meta) meta.innerHTML = `<span data-i18n-authored>${escapeHtml((current || place).label)}</span> · ${escapeHtml(ui.removed ? tr('places.disconnected.word', 'disconnected') : tr(`places.state.${current.state}`, placeStateWord(current.state)))}`;
+        if (selected && meta) meta.innerHTML = `<span data-i18n-authored>${escapeHtml((current || place).label)}</span>`;
+        dialog.querySelector('[data-place-label]').textContent = selected?.label || selected?.address || (current || place).label;
+    }
+
+    function failed(error, key) {
+        if (error?.status === 409 && error.body?.code === 'place_revision_conflict' && Object.hasOwn(error.body, 'place')) {
+            current = error.body.place ? normalizePlace(error.body.place) : null;
+            ui.removed = !current; ui.conflict = true; ui.confirmDisconnect = false; ui.status = {}; ui.readiness = null;
+        } else ui.status = { [key]: { text: error?.message || String(error), tone: 'error' } };
     }
 
     async function write(action, options = {}) {
-        if (ui.busy) return;
+        if (ui.busy || !current) return;
+        const sent = { ...ui.drafts };
         const change = placeChangeFor(action, current, { ...options, drafts: ui.drafts });
         const key = SECTION_OF[action];
         if (!change) {
@@ -277,14 +370,14 @@ export function openPlaceSheet(place, { returnFocus = document.activeElement, on
         ui.status = { [key]: { text: 'Saving…', tone: 'muted' } };
         paint();
         try {
-            current = await update(current.id, change);
-            if (action === 'add-note') ui.drafts.note = '';
-            if (action === 'confirm-typed') { ui.drafts.actorId = ''; ui.drafts.actorLabel = ''; ui.adding = false; }
-            if (action === 'save-folder') delete ui.drafts.folder;
-            if (action === 'save-model') delete ui.drafts.model;
+            current = await update(current.id, { ...change, expected_revision: current.revision });
+            const keys = { 'add-note': ['note'], 'confirm-typed': ['actorId', 'actorLabel'], 'save-folder': ['folder'], 'save-model': ['model'] }[action] || [];
+            keys.forEach((draft) => { if (ui.drafts[draft] === sent[draft]) delete ui.drafts[draft]; });
+            if (action === 'confirm-typed' && !ui.drafts.actorId && !ui.drafts.actorLabel) ui.adding = false;
+            ui.conflict = false;
             ui.status = { [key]: { text: DONE_WORDS[action](current), tone: 'ok' } };
         } catch (error) {
-            ui.status = { [key]: { text: error?.message || String(error), tone: 'error' } };
+            failed(error, key);
         } finally {
             ui.busy = false;
             paint();
@@ -293,7 +386,9 @@ export function openPlaceSheet(place, { returnFocus = document.activeElement, on
 
     function onExternal(event) {
         const changed = event?.detail?.place;
-        if (!ui.busy && changed && changed.id === current.id && changed !== current) { current = changed; paint(); }
+        if (ui.busy || sheet.closed) return;
+        if (changed?.id === place.id) { current = changed; ui.removed = false; ui.readiness = null; paint(); }
+        if (event?.detail?.removed && event.detail.placeId === place.id) { current = null; ui.removed = true; ui.conflict = true; paint(); }
     }
     window.addEventListener(PLACES_CHANGED_EVENT, onExternal);
 
@@ -301,17 +396,33 @@ export function openPlaceSheet(place, { returnFocus = document.activeElement, on
         const field = event.target.closest?.('[data-place-draft]');
         if (field) ui.drafts[field.dataset.placeDraft] = field.value;
     });
-    body.addEventListener('toggle', (event) => {
-        if (event.target.classList?.contains('place-more')) ui.moreOpen = event.target.open;
+    body.addEventListener('toggle', async (event) => {
+        if (!event.target.classList?.contains('place-more')) return;
+        ui.moreOpen = event.target.open;
+        if (!ui.moreOpen || modelsRead) return;
+        modelsRead = true;
+        try {
+            const data = await readModels({ cache: 'no-store', signal: abort.signal });
+            if (!Array.isArray(data?.items) || data.read_state === 'failed') throw new Error();
+            ui.models = data.items;
+            if (!sheet.closed) updateModelChooser(body.querySelector('[data-model-chooser]'), ui.models);
+        } catch { ui.status.more = { text: tr('places.models.unavailable', 'Model suggestions could not be read; your model is kept.'), tone: 'warn' }; paint(); }
     }, true);
     body.addEventListener('click', async (event) => {
+        if (event.target.closest('[data-place-rooms-retry]')) { void loadRooms(); return; }
+        const roomButton = event.target.closest('[data-place-room]');
+        if (roomButton) {
+            const room = ui.roomIndex.rooms?.find((row) => String(row.room_chat_id) === roomButton.dataset.placeRoom);
+            if (room) openRoom(room);
+            return;
+        }
         const segment = event.target.closest('[data-place-state] [data-effort-value]');
         if (segment) {
-            if (segment.dataset.effortValue !== current.state) await write('state', { value: segment.dataset.effortValue });
+            if (segment.dataset.effortValue !== current?.state) await write('state', { value: segment.dataset.effortValue });
             return;
         }
         const button = event.target.closest('[data-place-act]');
-        if (!button || button.disabled) return;
+        if (!button || button.disabled || ui.busy || !current) return;
         const act = button.dataset.placeAct;
         if (act === 'add-mine') { ui.adding = true; paint(); body.querySelector('[data-place-draft="actorId"]')?.focus(); return; }
         if (act === 'cancel-add') { ui.adding = false; paint(); return; }
@@ -319,13 +430,13 @@ export function openPlaceSheet(place, { returnFocus = document.activeElement, on
         if (act === 'disconnect') { ui.confirmDisconnect = true; paint(); body.querySelector('[data-place-act="disconnect-no"]')?.focus(); return; }
         if (act === 'disconnect-no') { ui.confirmDisconnect = false; paint(); body.querySelector('[data-place-act="disconnect"]')?.focus(); return; }
         if (act === 'disconnect-yes') {
-            ui.busy = true;
+            ui.busy = true; paint();
             try {
-                await disconnect(current.id);
+                await disconnect(current.id, current.revision);
                 sheet.close();
             } catch (error) {
                 ui.busy = false;
-                ui.status = { foot: { text: error?.message || String(error), tone: 'error' } };
+                failed(error, 'foot');
                 paint();
             }
             return;
@@ -334,11 +445,21 @@ export function openPlaceSheet(place, { returnFocus = document.activeElement, on
             actor: button.dataset.actor || '', actorLabel: button.dataset.actorLabel || '' });
     });
     paint();
+    if (place.source) void readStatus(place, { signal: abort.signal }).then((data) => {
+        if (sheet.closed || current?.source?.url !== place.source.url) return;
+        const status = normalizePlaceStatus(data);
+        ui.identity = status.identity; ui.labels = status.labels;
+        if (status.readiness) ui.readiness = { ...status.readiness, authored: true };
+        paint();
+    }).catch(() => { ui.status.state = { text: tr('places.status.unavailable', 'The connector status could not be read.'), tone: 'warn' }; paint(); });
+    void loadRooms();
     return { close: sheet.close, get closed() { return sheet.closed; }, get place() { return current; } };
 }
 
 // A repaint keeps the owner's focus on the same control (the press that asked for it, or the field).
 function focusKeyOf(node) {
+    const room = node.closest?.('[data-place-room]');
+    if (room) return `[data-place-room="${room.dataset.placeRoom}"]`;
     const act = node.closest?.('[data-place-act]');
     if (act) {
         const extra = ['fact', 'note', 'actor'].map((name) => act.dataset[name] ? `[data-${name}="${CSS.escape(act.dataset[name])}"]` : '').join('');
@@ -348,65 +469,4 @@ function focusKeyOf(node) {
     if (draft) return `[data-place-draft="${draft.dataset.placeDraft}"]`;
     const segment = node.closest?.('[data-effort-value]');
     return segment ? `[data-place-state] [data-effort-value="${segment.dataset.effortValue}"]` : '';
-}
-
-/** The Connect list: installed connectors whose place is not connected yet; none → the way to Browse. */
-export function connectListHtml({ connectors = null, error = '', status = {} } = {}) {
-    if (error) return `<div class="place-sheet-section"><p class="place-sheet-status ui-status" data-tone="error" role="alert">${escapeHtml(error)}</p>
-        <div class="place-sheet-actions"><button type="button" class="btn btn-default btn-sm" data-connect-act="retry">Try again</button></div></div>`;
-    if (!connectors) return '<p class="place-sheet-section place-sheet-note" role="status">Reading the installed connectors…</p>';
-    const open = connectors.filter((connector) => !connector.connected);
-    if (!open.length) {
-        return `<section class="place-sheet-section">
-            <p>${connectors.length ? 'Every installed connector is connected.' : 'No installed connector can connect a place yet.'} A connector is a skill that connects a service such as Slack, Telegram or email.</p>
-            <div class="place-sheet-actions"><button type="button" class="btn btn-default btn-sm" data-connect-act="browse">Find connectors in Skills</button></div>
-        </section>`;
-    }
-    return `<section class="place-sheet-section">
-        <p class="place-sheet-note">Connecting a place lets it hear there and, while the place is Active, speak and act there. You choose its state after connecting.</p>
-        <div class="place-accounts">${open.map((connector) => `<div class="harness-account-row place-connector-row">
-            <div class="harness-account-main"><span class="place-glyph" aria-hidden="true">${skillIconHtml(connector.icon, 18)}</span><strong>${escapeHtml(connector.label)}</strong></div>
-            <div class="harness-account-meta">${escapeHtml([connector.destination.replace(/^vendor:/, 'Connects '),
-                connector.wakes.length ? `suggests waking for ${listWords(connector.wakes.map(wakeFactWord))}` : ''].filter(Boolean).join(' · '))}</div>
-            <div class="harness-account-actions"><button type="button" class="btn btn-default btn-sm" data-connect-act="connect" data-connector="${escapeHtml(connector.connector)}">Connect</button></div>
-            ${statusLine(status[connector.connector])}
-        </div>`).join('')}</div>
-    </section>`;
-}
-
-/** Open the Connect flow; a connected place opens its own sheet at once. */
-export function openConnectPlace({ returnFocus = document.activeElement, read = readPlaces, connect = connectPlace } = {}) {
-    const dialog = sheetShell('Connect a place', 'From the connectors installed here', 'place-connect');
-    const sheet = showSheet(dialog, { returnFocus });
-    const view = { connectors: null, error: '', status: {} };
-    const paint = () => { sheet.body.innerHTML = connectListHtml(view); };
-    const load = async () => {
-        view.error = '';
-        view.connectors = null;
-        paint();
-        try { view.connectors = (await read()).connectors; } catch (error) { view.error = `Couldn’t read the connectors: ${error?.message || error}`; }
-        if (!sheet.closed) paint();
-    };
-    sheet.body.addEventListener('click', async (event) => {
-        const button = event.target.closest('[data-connect-act]');
-        if (!button || button.disabled) return;
-        const act = button.dataset.connectAct;
-        if (act === 'retry') { await load(); return; }
-        if (act === 'browse') { sheet.close(); openSkillsFor({ category: 'connectors' }); return; }
-        if (act !== 'connect') return;
-        const name = button.dataset.connector;
-        button.disabled = true;
-        view.status = { [name]: { text: 'Connecting…', tone: 'muted' } };
-        paint();
-        try {
-            const place = await connect({ connector: name });
-            sheet.close();
-            openPlaceSheet(place, { returnFocus });
-        } catch (error) {
-            view.status = { [name]: { text: error?.message || String(error), tone: 'error' } };
-            if (!sheet.closed) paint();
-        }
-    });
-    void load();
-    return sheet;
 }

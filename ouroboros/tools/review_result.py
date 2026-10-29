@@ -4,7 +4,8 @@ One subject of the one review machinery. This module composes the subject — wh
 reply, what the task produced and the host-attested verification — and the result brief; the wave
 itself (the panel, custody, the paid stamp, $0 reuse, a rejoin, leaving on an addressed message,
 settlement and the ledger record) is ``review_change``'s own. Every seat answers one question,
-judged on the result, never on the method: the work trace is not part of the subject.
+judged on the result, and on the method only where the owner's words or explicit choice fixed
+it: the work trace is not part of the subject.
 
 The subject is frozen once, at the call: its exact text is retained in the task's artifact store
 and its sha is the wave's identity, so a second call over the same reply, material and request
@@ -158,9 +159,10 @@ def _declared_effects(ctx: Any, root: Any, task_id: str, issues: List[str]) -> L
 
 
 def _ask(ctx: Any) -> str:
-    """What was asked, host-attested: the task's own request fields, the claims it is held to
-    (an ingress contract's, else the latest plan revision's) and its owner's words."""
-    from ouroboros.owner_words import owner_words_text
+    """What was asked, host-attested: the task's own request fields (the objective with its author,
+    ``owner_words.objective_author_line``), the claims it is held to (an ingress contract's, else the
+    latest plan revision's) and its owner's words."""
+    from ouroboros.owner_words import objective_author_text, owner_words_text
     from ouroboros.review_evidence_sections import _accept_effective_claims, _accept_task_contract
 
     contract = _accept_task_contract(ctx)
@@ -169,6 +171,8 @@ def _ask(ctx: Any) -> str:
         value = contract.get(key)
         if value not in (None, "", [], {}):
             lines.append(f"{key}: {value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)}")
+            if key == "objective":
+                lines.append(f"The objective above: {objective_author_text(ctx)}.")
     try:
         claims, source, _exhibit = _accept_effective_claims(
             ctx, contract, getattr(ctx, "drive_root", None), str(getattr(ctx, "task_id", "") or ""))

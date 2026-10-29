@@ -289,7 +289,7 @@ def test_real_child_reconstructs_provider_field_display_after_settlement(child_f
     assert error.code == "invalid_request" and error.status_code == 400 and error.retryable is False
     assert error.operation_id == "operation-exact" and error.route == ROUTE and error.model_role == "vision"
     assert error.body == error.problem and error.problem["context"]["providerMessage"] == "private provider body"
-    assert "provider_code=string_above_max_length, parameter=instructions" in error.display_message[:220]
+    assert "provider_error_type=string_above_max_length, parameter=instructions" in error.display_message[:220]
     assert "private provider body" not in error.display_message
     assert str(error) == "invalid_request: controlled refusal"
     assert error.physical_attempt_capture.state == "settled"
@@ -487,7 +487,7 @@ def test_tool_result_carries_the_reconstructed_typed_provider_projection(child_f
     text = (vision._vlm_query(ctx, prompt="Describe only this image", image_url="data:image/png;base64,AAAA")
             if tool == "vlm_query" else vision._analyze_screenshot(ctx, prompt="Describe only this image"))
     first = text.splitlines()[0]
-    assert first.startswith(f"⚠️ {label}: ") and "provider_code=string_above_max_length" in first
+    assert first.startswith(f"⚠️ {label}: ") and "provider_error_type=string_above_max_length" in first
     assert "parameter=instructions" in first and "invalid_request: controlled refusal" in first
     assert "private provider body" not in text  # the raw provider body never joins the projection
     published = _published_tool_result(ctx, None)

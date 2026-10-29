@@ -77,7 +77,8 @@ def test_cold_resume_keeps_the_current_choice_and_never_a_stale_finish(tmp_path,
     state = json.loads(json.dumps(continuation_state(registry._ctx, ctx.messages, trace, {}, 2, [], set())))
 
     def restored(saved):
-        tools = SimpleNamespace(_ctx=SimpleNamespace())
+        # The resumed task's own live context: the same task and attempt that saved the state.
+        tools = SimpleNamespace(_ctx=SimpleNamespace(task_id=saved["task_id"], task_attempt=saved["task_attempt"]))
         restore_continuation_state(tools, saved, [], {}, {}, set())
         return tools
 

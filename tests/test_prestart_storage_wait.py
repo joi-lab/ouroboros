@@ -4,6 +4,11 @@
 Every test drives the real outer direct-turn lane (``worker_chat_lane._execute_chat_task``) or the real
 agent ``handle_task`` against a real SQLite lock on temporary stores (``exclusive_hold``). A fake clock
 stands in for long waits; no provider, server, port or live data is reached.
+
+Each attempt on a held store still spends its whole busy wait before it reports contention: 10 s on the
+current store (``store.STORE_WAIT_SEC``), 45 s on the money store (``USAGE_LOCK_TIMEOUT_SEC``). What the
+lane does next does not depend on that length, so ``short_waits`` cuts both to ``SHORT_WAIT_SEC`` through
+their call-time seams (``store.acquisition_budget``, the money store's read bound); production keeps its own.
 """
 
 from __future__ import annotations
@@ -20,6 +25,14 @@ from tests._store_journal_shared import exclusive_hold
 
 BINDING = {"billing_group_id": "S", "billing_group_limit_usd": 20.0,
            "billing_group_limit_source": "initial_task_admission", "billing_group_limit_revision": "cap-1"}
+SHORT_WAIT_SEC = 0.05
+
+
+@pytest.fixture(autouse=True)
+def short_waits(monkeypatch):
+    monkeypatch.setattr(usage_store, "USAGE_LOCK_TIMEOUT_SEC", SHORT_WAIT_SEC)
+    with store.acquisition_budget(SHORT_WAIT_SEC):
+        yield
 
 
 @pytest.fixture
@@ -917,13 +930,16 @@ def test_control_inside_successful_strict_budget_read_prevents_body(lane, monkey
     from ouroboros.gateway.task_pause import api_task_pause
     from ouroboros.gateway.tasks import api_task_cancel
     from ouroboros.task_results import write_task_result
+    from ouroboros.usage_ledger import USAGE_LOCK_TIMEOUT_SEC
     from supervisor import state
 
     write_task_result(lane.root, "S", "requested", billing_group=BINDING, chat_id=7)
     usage_store.migrate_from_journal(lane.root)
     # Leave time for the real HTTP consumer to accept the control inside SQLite's
-    # bounded acquisition, without converting this into the already-covered retry.
+    # bounded acquisition, without converting this into the already-covered retry:
+    # the read keeps production's wait (``short_waits`` would end it first).
     monkeypatch.setattr(_usage_wait, "ACQUISITION_SLICE_SEC", 2.0)
+    monkeypatch.setattr(usage_store, "USAGE_LOCK_TIMEOUT_SEC", USAGE_LOCK_TIMEOUT_SEC)
     monkeypatch.setenv("OUROBOROS_DIRECT_TURN_STOP_WAIT_SEC", "0.01")
     entered = threading.Event()
     reads, answers, failures = [], [], []

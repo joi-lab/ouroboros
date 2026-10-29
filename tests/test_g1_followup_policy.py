@@ -14,7 +14,7 @@ from ouroboros.usage_admission import task_billing_fields
 from supervisor import queue, queue_schedules as schedules
 from supervisor.followup_policy import observed_store, record_restart
 from tests.test_schedule_followup import _ctx
-from tests._store_shared import delete_result
+from tests._store_shared import delete_result, unreadable_result
 
 pytestmark = pytest.mark.serial
 ORIGIN = 'root-1'
@@ -598,7 +598,6 @@ def test_consumed_row_retained_until_actual_work_settles(world, monkeypatch, sta
     data = schedules.load_schedule_store(root)
     data['tasks'][0]['completed_at'] = '2000-01-01T00:00:00+00:00'
     schedules._write_scheduled_tasks(data, root)
-    path = root / 'task_results' / (task['id'] + '.json')
     if state != 'pending':
         pending.clear()
     if state in {'running', 'settled_live'}:
@@ -610,10 +609,15 @@ def test_consumed_row_retained_until_actual_work_settles(world, monkeypatch, sta
     elif state == 'missing':
         delete_result(root, task['id'])
     elif state == 'unreadable':
-        path.write_text('{torn')
+        unreadable_result(monkeypatch, task['id'], root=root)
     queue.check_scheduled_tasks()
     kept = schedules.load_schedule_store(root)['tasks']
     assert bool(kept) is (state != 'settled')
+    if state == 'unreadable':  # the store's own failure reached the receipt read, never an absence
+        from ouroboros.store import StoreError
+        from supervisor.schedule_occurrence import prepare_receipts
+        error = prepare_receipts(kept, drive_root=root).errors[task['id']]
+        assert isinstance(error, StoreError) and 'simulated unreadable row' in str(error)
     if state == 'pending':
         assert pending == [frozen]
         workers.assign_tasks()

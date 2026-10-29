@@ -84,6 +84,14 @@ def _startup_refusal_definite(payload: Mapping[str, Any]) -> bool:
     )
 
 
+def _document_retry_wake(payload: Mapping[str, Any]) -> bool:
+    """A definitely unrun start whose document import this child's next start settles without a
+    second key: it wakes the child instead of ending it, and its route stays available."""
+    from ouroboros.delegate_documents import RECOVERABLE_REFUSALS
+
+    return _startup_refusal_definite(payload) and str(payload.get("reason") or "") in RECOVERABLE_REFUSALS
+
+
 def refusal_facts(payload: Mapping[str, Any]) -> Dict[str, Any]:
     """The producer's typed refusal facts present on ``payload`` (never a handle)."""
     from ouroboros.delegate_shared import REFUSAL_FACT_KEYS
@@ -148,7 +156,8 @@ def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -
     before any metered round for fresh work. Saved cognition chooses its next operation. The nanny's
     model rounds exist for judgment on meaningful wakes. Blocked routes and
     definite start refusals end the child unrun and typed at $0; custody
-    uncertainty always wakes the model instead. Proven recovery handoffs are
+    uncertainty always wakes the model instead, and so does an unrun start
+    whose document import a later start settles. Proven recovery handoffs are
     still adopted first, and durable zero-run/unknown-evidence fences outrank
     every other branch — a fence may hide a live prior run, so no unrun
     terminal may be claimed over one.
@@ -278,6 +287,7 @@ def _pre_start_leaf(
     waiting is the model's own ``delegate_wait`` decision, so owner messages,
     hurry controls and parallel children stay live for the whole run."""
 
+    from ouroboros.delegate_documents import first_start_selection
     from ouroboros.delegate_shared import delegate_payload
     from ouroboros.subagent_runtime import exact_start
 
@@ -300,7 +310,8 @@ def _pre_start_leaf(
         "work_order_fingerprint": str(actor_bootstrap.get("work_order_fingerprint") or ""),
         "effort_fact": dict(actor_bootstrap.get("effort_fact") or {}), "_initial_bootstrap": True,
         **({"mode": actor_bootstrap["delegated_mode"]} if "delegated_mode" in actor_bootstrap else {}),
-        **{key: actor_bootstrap[key] for key in ("directory_strategy", "scope_paths") if key in actor_bootstrap},
+        **{key: actor_bootstrap[key] for key in ("directory_strategy", "scope_paths", "workspace") if key in actor_bootstrap},
+        **first_start_selection(actor_bootstrap),
     })
     try:
         payload = delegate_payload(started)
@@ -322,7 +333,7 @@ def _pre_start_leaf(
         return json.dumps({
             "status": "configured_session_startup_fault", "startup": payload,
         }, ensure_ascii=False, indent=2)
-    if _startup_refusal_definite(payload):
+    if _startup_refusal_definite(payload) and not _document_retry_wake(payload):
         _record_startup_refusal(
             ctx, task,
             reason=str(payload.get("reason") or ""),
@@ -332,8 +343,8 @@ def _pre_start_leaf(
         )
         return ""
     # Everything else — started_uncustodied, fence refusals raced in by the
-    # start path itself, unknown codes, unparseable output — is judgment
-    # material for the model episode.
+    # start path itself, unknown codes, unparseable output, a document retry
+    # wake — is judgment material for the model episode.
     return json.dumps({
         "status": "configured_session_startup_fault", "startup": payload,
     }, ensure_ascii=False, indent=2)
@@ -805,8 +816,9 @@ def _prepare_actor_first_bootstrap(
                          "source": str(task.get("effort_source") or "")}
                         if task.get("effort_source") else {}),
         **({"delegated_mode": task["delegated_mode"]} if "delegated_mode" in task else {}),
-        **{key: task[key] if key == "directory_strategy" else list(task[key])
-           for key in ("directory_strategy", "scope_paths") if key in task},
+        **{key: list(task[key]) if key in ("scope_paths", "attachment_paths") else task[key]
+           for key in ("directory_strategy", "scope_paths", "workspace", "attachment_paths", "attachment_import",
+                       "document_import_intent") if key in task},
     }
     zero_run_evidence_gaps: set[str] = set()
     durable_zero_run = _durable_zero_run_receipt(
@@ -875,8 +887,8 @@ def append_startup_receipt(
             "The exact configured leaf run is LIVE — the receipt carries its id. "
             "Waiting is your decision: call delegate_wait when you want its facts, "
             "or use this round for parallel judgment first (schedule auxiliary "
-            "children, prepare how you will verify its result). Never rebuild its work on metered "
-            "tokens. Replay an unresolved start with retry_of; an explicit selector and new "
+            "children, prepare how you will verify its result). Never rebuild its work. "
+            "Replay an unresolved start with retry_of; an explicit selector and new "
             "prompt create an independent run. Every captured result still needs your disposition."
         )
     elif receipt_status == "configured_session_recovered_wake":
@@ -895,6 +907,16 @@ def append_startup_receipt(
             "conversation and custody facts to decide; do not repeat completed effects "
             "or resend an unresolved invocation under a new identity. A further delegate_start remains your decision "
             "under the existing custody checks."
+        )
+    elif receipt_status == "configured_session_startup_fault" and isinstance(receipt.get("startup"), dict) \
+            and _document_retry_wake(receipt["startup"]):
+        guidance = (
+            "The host's first start was refused before any run began (definitely_unrun), so no run of this "
+            "work order exists. Its detail says how a later start settles it: delegate_start without "
+            "subagent_id or attachment_paths repeats that first start with the parent's selected documents, "
+            "keeping their saved import identity unless you ask for attachment_import='new'. Waiting first, "
+            "or a typed delegation_zero_run decision, stays yours; this receipt never authorizes native/API "
+            "fallback."
         )
     else:
         # Everything else is unresolved physical custody: a durable zero-run

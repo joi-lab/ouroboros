@@ -145,7 +145,11 @@ def test_actual_registry_dynamic_tools_keep_canonical_order_and_permissions(tmp_
     full = registry.schemas()
     selected = initial_tool_schemas(registry, "nano", ["mcp_example__lookup", name])
     assert _names(selected) == tuple(n for n in _names(full) if n in NANO_SCHEMA_META_NAMES or n in (name, "mcp_example__lookup"))
+    # An unpinned MCP server starts on demand in every mode; a pinned one keeps its schemas (#2332).
+    assert initial_tool_schemas(registry, "max") == [s for s in full if s["function"]["name"] != "mcp_example__lookup"]
+    mcp_rows[0]["schemas_at_start"] = True
     assert initial_tool_schemas(registry, "max") == full
+    mcp_rows[0]["schemas_at_start"] = False
     assert [r["name"] for r in compact_tool_catalog(full, schema_names=_names(selected))] == list(_names(full))
     mcp_rows.append({"name": "mcp_example__later", "description": "Added after startup.", "schema": {"type": "object", "properties": {}}})
     request = request_tool_schema_selection(registry._ctx, registry, ["mcp_example__later"],

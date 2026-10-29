@@ -115,7 +115,9 @@ def test_a_no_op_apply_is_refused_typed_even_with_no_recorded_result_hash(
     assert "✅" not in out and "provable non-mutation" in out
     # PC-F09: the consequence and the closing move are named at the point of need.
     assert "decision='reject'" in out
-    assert "Done with warnings" in out and "delegated_custody_unreconciled" in out
+    # #1583: the debt is named as the list beside the task's own reason, never as its reason.
+    assert "Done with warnings" in out and "delegated_runs_unreconciled beside your own reason" in out
+    assert "reason delegated_custody_unreconciled" not in out
     # Nothing disposed, no reconcile queued, and the apply intent is RESOLVED.
     assert entry.patch_disposed == ""
     assert entry.patch_apply_pending is False
@@ -172,7 +174,8 @@ def test_apply_hash_mismatch_receipt_names_a_followable_recovery(
     assert "acknowledge_ambiguous=true after inspection" in out, out
     assert "decision='acknowledge_ambiguous'" not in out, out
     assert "decision='reject'" in out, out
-    assert "Done with warnings" in out and "delegated_custody_unreconciled" in out
+    assert "Done with warnings" in out and "delegated_runs_unreconciled beside your own reason" in out
+    assert "reason delegated_custody_unreconciled" not in out
     custody._CUSTODY.clear()
 
 

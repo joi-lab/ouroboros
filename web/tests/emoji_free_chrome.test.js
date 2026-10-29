@@ -8,6 +8,7 @@ import test from 'node:test';
 
 import { createChatInstance } from '../modules/chat.js';
 import { restartNoticeText, senderLabel } from '../modules/chat_activity.js';
+import { budgetSavePresentation } from '../modules/costs.js';
 import { installDom, restoreDom, walkCard } from './chat_dom_fixture.js';
 import { fixture as mediaFixture } from './helpers/media_dom.js';
 
@@ -40,8 +41,11 @@ test('fixed warning decoration is gone while the tone and words stay', () => {
         assert.doesNotMatch(opening.replace("statusType = 'warn'", "statusType = 'ok'"), warningState);
         assert.doesNotMatch(opening.replace('Warnings: ', ''), warningState);
     }
-    assert.match(read('modules/costs.js'), /msg \+= ' Warnings: ' \+ data\.warnings\.join\(' \| '\);/);
-    assert.match(read('modules/costs.js'), /statusEl\.dataset\.tone = \(data\.warnings\?\.length \|\| data\.restart_required\) \? 'warn' : 'ok';/);
+    // Costs' save result says its warnings in words, in the warning tone, and no decoration is prefixed to either.
+    const warned = budgetSavePresentation({ immediate_changed: true, warnings: ['Limit is below known spend.', 'Cap lowered.'] });
+    assert.equal(warned.text, 'Saved. Took effect immediately. Warnings: Limit is below known spend. | Cap lowered.');
+    assert.equal(warned.tone, 'warn');
+    assert.doesNotMatch(warned.text, /\p{Extended_Pictographic}/u);
     assert.match(read('style.css'), /\.chat-delegated-problem \{\s*color: var\(--status-warn-fg\);/);
 });
 

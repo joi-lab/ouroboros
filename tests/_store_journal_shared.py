@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import hashlib
+import os
 import pathlib
 import sqlite3
 import time
@@ -54,6 +55,37 @@ def use_journal(monkeypatch, mode: str) -> None:
     for path, tier in idle:
         if path.is_file():
             configure_journal(path, tier)
+            _CONVERTED.append((path, tier))
+
+
+# The stores ``use_journal`` brought to a forced mode, given this interpreter's own journal back once the test's
+# monkeypatch is undone (tests/conftest.py): a WAL file never outlives its test on a SQLite that must not share WAL.
+_CONVERTED: list = []
+
+
+def give_back_converted_journals() -> None:
+    """A store an earlier test's late thread still leases keeps its forced mode until a later teardown:
+    the lease is that thread's (``use_journal``), and the test ending now broke nothing."""
+    from ouroboros.store_journal import configure_journal
+
+    waiting = []
+    while _CONVERTED:
+        path, tier = _CONVERTED.pop()
+        if not path.is_file():
+            continue
+        key = str(pathlib.Path(os.path.abspath(path)))
+        with store._CONNECTION_GUARD:
+            leased = any(entry.active for pool in list(store._CONNECTION_POOLS)
+                         for name, entry in pool.entries.items() if name == key)
+        try:
+            if not leased:
+                store.close_connections(path)
+                configure_journal(path, tier, wait_sec=0)  # a busy file waits for a later teardown, not here
+                continue
+        except store.StoreBusy:  # a lease taken since, or another process holding the file at the handoff
+            pass
+        waiting.append((path, tier))
+    _CONVERTED.extend(waiting)
 
 
 def exclusive_hold(path: Any, *, wait_sec: float = 5.0) -> sqlite3.Connection:
@@ -111,10 +143,17 @@ def committed_content(path: Any) -> Tuple[Any, ...]:
     """A SQLite file's committed content whatever its journal mode: its application id, user
     version, schema and rows, read through an independent connection (the WAL log's frames
     included). Equal content says the rows are as they were, not that nothing wrote: a VACUUM
-    keeps it (``StoreState`` adds the write's own trace)."""
+    keeps it (``StoreState`` adds the write's own trace). ``iterdump`` lists the tables by name,
+    each with its rows in rowid order, the order obligation sets and handoffs read back in, so a
+    rewrite of the same rows in another order still differs; only the index, trigger and view
+    statements are compared sorted: they follow in schema-row order, which a VACUUM rebuilds."""
     with contextlib.closing(sqlite3.connect(pathlib.Path(path), isolation_level=None)) as conn:
         header = tuple(conn.execute(f"PRAGMA {name}").fetchone()[0] for name in ("application_id", "user_version"))
-        return header + tuple(conn.iterdump())
+        schema = {f"{sql};" for (sql,) in conn.execute(
+            "SELECT sql FROM sqlite_master WHERE sql NOT NULL AND type IN ('index', 'trigger', 'view')")}
+        dump = tuple(conn.iterdump())
+        ordered = tuple(line for line in dump if line not in schema)
+        return header + ordered + tuple(sorted(line for line in dump if line in schema))
 
 
 @dataclasses.dataclass(frozen=True, eq=False)

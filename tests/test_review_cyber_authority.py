@@ -243,14 +243,8 @@ def test_skill_review_texts_state_the_gate_skill_exec_obeys(tmp_path, access, mo
         assert ran.startswith("⚠️ SKILL_EXEC_BLOCKED") and "review_pending" in ran
 
 
-def test_real_force_plan_decision_uses_cyber_authority(harness, access):  # noqa: F811
-    from ouroboros.owner_hurry import force_plan_decision
+def test_real_plan_gate_ignores_legacy_force_plan_in_every_access_mode(harness, access):  # noqa: F811
+    from ouroboros.owner_hurry import plan_gate_decision
 
-    ctx = harness.make_ctx(force_plan=True)
-    result = force_plan_decision(ctx, {}, enforcement="blocking")
-    assert result["allow"] == (access == "cyber_pro")
-    # An unmet Swarm planning obligation holds outside Cyber Pro; Cyber Pro's authority
-    # releases it and is named as the deciding authority.
-    assert result["enforcement"] == "blocking" and result["force_plan_met"] is False
-    assert result["status"] == ("clear" if access == "cyber_pro" else "force_plan_unmet")
-    assert result.get("decision_authority") == ("cyber_pro" if access == "cyber_pro" else None)
+    result = plan_gate_decision(harness.make_ctx(force_plan=True), {}, enforcement="blocking")
+    assert result["allow"] is True and result["status"] == "not_required"

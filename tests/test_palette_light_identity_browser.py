@@ -33,7 +33,7 @@ READERS = {
     "recommendation": ('[data-palette="quiz-open"] .chat-quiz-option-recommended', ("color",)),
     "question chip": ('[data-palette="quiz-open"] .chat-quiz-chip', COLOUR),
     "question status": ('[data-palette="quiz-open"] .chat-quiz-status', ("color",)),
-    "Project reference": ('[data-palette="quiz-open"] .chat-bubble-voice .chat-live-project-card-btn', CAPSULE),
+    "Project reference": ('[data-palette="quiz-open"] .chat-bubble-voice .chat-live-project-card-btn', (*CAPSULE, "backgroundImage")),
     "Send": ('[data-palette="quiz-open"] .chat-quiz-send', CAPSULE),
     "answer frame": ('[data-palette="quiz-open"] .chat-quiz-comment-box', ("backgroundColor", "borderTopColor")),
     "chosen answer": ('[data-palette="quiz-answered"] .chosen', CAPSULE),
@@ -100,7 +100,8 @@ LIGHT = {
     "question status": {"color": "rgb(85, 93, 105)"},
     "Project reference": {
         "color": "rgb(143, 36, 153)",
-        "backgroundColor": "rgba(232, 121, 249, 0.08)",
+        "backgroundColor": "rgba(0, 0, 0, 0)",
+        "backgroundImage": "linear-gradient(rgba(232, 121, 249, 0.08), rgba(232, 121, 249, 0.08)), none",
         "boxShadow": REST,
         "opacity": "1"},
     "Send": {

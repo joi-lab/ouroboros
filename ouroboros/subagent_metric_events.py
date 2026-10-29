@@ -5,15 +5,16 @@ import pathlib
 from ouroboros.subagent_metrics import publish
 
 
-def _call_evidence(root, call_id):
+def _call_evidence(root, call_id, *, refs=None):
     """Addressed ledger stamps, never prices, inferred execution time or a log scan."""
     from ouroboros import store, usage_store
     from ouroboros.subagent_metrics import CALLS
     from ouroboros.swarm_receipt import instant
 
     try:
-        with store.open_store(root, write=False) as txn:
-            refs = txn.get_row(CALLS, call_id) or {}
+        if refs is None:
+            with store.open_store(root, write=False) as txn:
+                refs = txn.get_row(CALLS, call_id) or {}
         ids = refs.get("ledger_attempt_ids") or []
         if not ids:
             return {}
@@ -49,12 +50,6 @@ def task_execution(root, task, usage):
     identity = execution_identity(snapshot)
     if identity["kind"] != "api_model":
         return
-    if usage.get("llm_call_refs"):
-        from ouroboros.subagent_metrics import catch_up
-        try:
-            catch_up(root)
-        except Exception:
-            pass  # The index carries its unknown coverage; last-execution disclosure still proceeds.
     model = identity["target_id"].removesuffix(" (local)").strip()
     for call in usage.get("llm_call_refs") or ():
         if (not isinstance(call, dict) or call.get("model") != model

@@ -190,8 +190,9 @@ def test_quoted_file_is_staged_on_the_recipient_drive_with_its_original_hash(tmp
         assert "read_file" in str(messages)
 
 
-def test_note_carries_the_tellers_summary_and_the_card_names_its_room(tmp_path, monkeypatch):
-    """The teller writes one line for the owner; the saved row names the room the note came from."""
+def test_note_carries_the_tellers_summary_and_the_card_names_its_rooms(tmp_path, monkeypatch):
+    """The teller writes one line for the owner; the saved row names the room the note came from and the work it was
+    written for, by the title it had then (Main's note card reads the receiver from it)."""
     from ouroboros.owner_relay import publish_relay, relay_sender_facts
     from ouroboros.task_results import write_task_result
     from ouroboros.tools.control_relay import _tell_task
@@ -206,12 +207,31 @@ def test_note_carries_the_tellers_summary_and_the_card_names_its_room(tmp_path, 
     assert "summary" not in write_relay(tmp_path, "receiver", relay_id="s2", note="plain", quotes=[], chat_id=1,
                                         teller_task_id="teller")[0]["relay"], "no summary, no key: older readers see today's shape"
     write_task_result(tmp_path, "teller", "running", origin_message_text="Teller work")
-    write_task_result(tmp_path, "receiver", "running", origin_message_text="Receiver work")
+    write_task_result(tmp_path, "receiver", "running", origin_message_text="Receiver work", title="Receiver title",
+                      suggested_name="Receiver work")
     sent = []
     publish_relay(tmp_path, "receiver", entry, SimpleNamespace(send_message=lambda chat_id, text, **kw: sent.append(kw)))
     relay = sent[0]["progress_meta"]["relay"]
     assert relay["summary"] == "Research is done; no safe fix yet"
     assert relay["sender"] == {"task_id": "teller", "chat_id": 1, "name": "Main"}
+    assert relay["target"] == {"task_id": "receiver", "title": "Receiver work"}, "the work's display name, as its card shows it"
     saved = next(found.row for found in dialogue_store.rows_by_client_id(tmp_path, entry["msg_id"]))
     assert saved["relay"]["sender"]["name"] == "Main", "history draws the same card as the live frame"
+    assert saved["relay"]["target"] == relay["target"]
     assert relay_sender_facts(tmp_path, "ghost") == {} and relay_sender_facts(tmp_path, "") == {}
+    # A row saved before the stamp (or by an older install) publishes as it is: no backfill, no invented receiver.
+    older, _ = write_relay(tmp_path, "receiver", relay_id="s3", note="older", quotes=[], chat_id=1, teller_task_id="teller")
+    log_chat = __import__("supervisor.message_bus", fromlist=["log_chat"]).log_chat
+    stored = log_chat("out", 1, 0, older["text"], ts=older["ts"], task_id="receiver", record_type="relay_entry",
+                      client_message_id=older["msg_id"], message_meta={"relay": older["relay"]}, drive_root=tmp_path,
+                      require_write=True)
+    assert "target" not in stored["relay"]
+    sent.clear()
+    publish_relay(tmp_path, "receiver", older, SimpleNamespace(send_message=lambda chat_id, text, **kw: sent.append(kw)))
+    assert "target" not in sent[0]["progress_meta"]["relay"] and "sender" not in sent[0]["progress_meta"]["relay"]
+    # A work without a readable name is stamped by id only: the card says `this work`, never the id or the text.
+    nameless, _ = write_relay(tmp_path, "nameless", relay_id="s4", note="to a nameless work", quotes=[], chat_id=1,
+                              teller_task_id="teller")
+    sent.clear()
+    publish_relay(tmp_path, "nameless", nameless, SimpleNamespace(send_message=lambda chat_id, text, **kw: sent.append(kw)))
+    assert sent[0]["progress_meta"]["relay"]["target"] == {"task_id": "nameless"}

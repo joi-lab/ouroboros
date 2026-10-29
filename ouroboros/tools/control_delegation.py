@@ -54,9 +54,13 @@ class DelegationAdmissionDecision:
 
 
 def check_delegation_admission(
-    parent_budget: Dict[str, Any], *, direct_child_count: int | None = 0,
+    parent_budget: Dict[str, Any], *, direct_child_count: int | None = 0, room_mode: str = "auto",
 ) -> DelegationAdmissionDecision:
     """Enforce explicit recursion rights while keeping omitted legacy permissive."""
+    if room_mode == "off":
+        from ouroboros.subagent_runtime import SUBAGENTS_OFF_DETAIL
+
+        return DelegationAdmissionDecision(False, "subagents_off_in_room", SUBAGENTS_OFF_DETAIL, direct_child_count)
     budget = parent_budget if isinstance(parent_budget, dict) else {}
     if direct_child_count is None:
         count = None

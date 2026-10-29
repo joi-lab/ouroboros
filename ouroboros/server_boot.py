@@ -40,6 +40,18 @@ def reconcile_projects(root: pathlib.Path) -> None:
     reconcile(root)
 
 
+def remember_log_listings(root: pathlib.Path) -> threading.Thread:
+    """The archive listing a process's first owner turn would make for its task's recent tools and
+    events, made once off the turn, so that turn starts from it (``Memory.remember_log_listings``).
+    It grows with the archive, so a daemon thread makes it, off the steps readiness waits for, as the
+    catalogue is observed; a turn that comes first lists for itself."""
+    from ouroboros.memory import Memory
+
+    thread = threading.Thread(target=Memory(root).remember_log_listings, daemon=True, name="log-listings")
+    thread.start()
+    return thread
+
+
 def start_background_services(settings: dict, *, local_model: bool, boot_managed_update: Callable[[], Any],
                               warm_daemon: bool) -> None:
     """P2: finalize a pending managed merge update (post-boot smoke / boot-loop rollback) and run a
@@ -47,8 +59,10 @@ def start_background_services(settings: dict, *, local_model: bool, boot_managed
     availability; both fail-soft. Local autostart goes FIRST: a local-only install's boot check
     may write its update letter through the local model, and the git fetch ahead of that call is
     the head start the model server gets (no readiness wait — a letter that still finds the model
-    loading fails typed and is rewritten by the next check). The owned daemon is warmed for
-    provisioned homes only: one background ensure, off the startup path."""
+    loading fails typed and is rewritten by the next check). The owned daemon is warmed, and an
+    OpenRouter install's model catalogue observed unless a process recorded a current one, for
+    provisioned homes only (``warm_daemon``): background work off the startup path, so a request
+    reads the catalogue and never waits for it."""
     if local_model and settings.get("LOCAL_MODEL_SOURCE"):
         from ouroboros.local_model_autostart import auto_start_local_model
 
@@ -58,6 +72,12 @@ def start_background_services(settings: dict, *, local_model: bool, boot_managed
         from ouroboros.claudexor_daemon import warm_owned_daemon
 
         warm_owned_daemon()
+    from ouroboros.provider_models import configured_kinds
+
+    if warm_daemon and "openrouter" in configured_kinds(settings):  # any OpenRouter key, built-in or added, that serves
+        from ouroboros.llm import LLMClient
+
+        threading.Thread(target=LLMClient.prefetch_openrouter_catalog, daemon=True, name="openrouter-catalog").start()
 
 
 async def serve_host_service(root: pathlib.Path, boot: Any) -> None:

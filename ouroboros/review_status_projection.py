@@ -380,14 +380,20 @@ def _review_status_attempt_to_dict(item: Any) -> Dict[str, Any]:
 
 
 def _review_status_actor_summary(attempt: Any) -> Dict[str, Any]:
+    from ouroboros.review_records import TYPED_FAILURE_FACT_KEYS
+
+    def actor(row):
+        return {key: row[key] for key in ("slot_id", "model_id", "status", *TYPED_FAILURE_FACT_KEYS,
+                                          "response_ref") if key in row}
+
     scope_raw = getattr(attempt, "scope_raw_result", None) or {}
     return {
         "triad_actors": [
-            {"model_id": r.get("model_id", "?"), "status": r.get("status", "?")}
+            actor(r)
             for r in (getattr(attempt, "triad_raw_results", None) or [])
         ],
         "scope_actor": (
-            {"model_id": scope_raw.get("model_id", "?"), "status": scope_raw.get("status", "?")}
+            actor(scope_raw)
             if scope_raw.get("status") else None
         ),
     }
@@ -445,7 +451,7 @@ def _review_status_message(projection: Dict[str, Any]) -> str:
                 f"Review NOT_PERFORMED: {NOT_PERFORMED_PHRASES['skill_unanswered']}. A skill review counts only a "
                 "PASS/FAIL answer; each seat's error is recorded in the attempt, and the skill stays pending."),
             "critical_findings": "Reviewers found critical issues. Repair or rebut (review_rebuttal) the findings listed, then re-run commit_reviewed.",
-            "review_quorum": "Not enough review models responded. Retry — usually transient.",
+            "review_quorum": "Not enough reviewers answered; the recorded seat causes follow below.",
             "parse_failure": "Review models could not produce parseable output. Retry the commit.",
             "infra_failure": "Infrastructure failure. Check block_details.",
             "scope_blocked": "Scope reviewer blocked the commit. Address scope review findings.",
@@ -472,6 +478,10 @@ def _review_status_message(projection: Dict[str, Any]) -> str:
             f"{reason_map.get(ca.block_reason, ca.block_reason or 'unknown')}"
             f"  |  {current}"
         )
+        if ca.block_reason == "review_quorum":
+            from ouroboros.review_records import review_failure_summary
+            current += "\n" + "\n".join(review_failure_summary(row) for row in (ca.triad_raw_results or [])
+                                         if row.get("status") != "responded")
     if projection.get("open_debts"):
         current = f"{current}  |  Commit-readiness debt: {len(projection['open_debts'])}"
     if projection.get("canonical_attempts_unreadable"):

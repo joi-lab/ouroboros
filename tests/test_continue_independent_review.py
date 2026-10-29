@@ -90,10 +90,12 @@ def _delegated(blockers):
     return sorted(b.get("run_id") or b.get("invocation_id") for b in blockers if b["kind"] == "delegated_run")
 
 
-def test_the_observation_carries_source_and_independence_without_filtering(tmp_path):
+def test_the_observation_carries_source_and_independence_without_filtering(tmp_path, monkeypatch):
+    from ouroboros import delegate_pending
     from ouroboros.budget_pause import observe_task_runs
 
     _rows(tmp_path, review_with_snapshot=True, review_investigation=True, pending_review=True)
+    monkeypatch.setattr(delegate_pending, "request_body", lambda *a: pytest.fail("census opened a request body"))
     observed = observe_task_runs(tmp_path, PRED, reason="continuation_writer_check", request_stop=False)
     assert observed["custody_read"] == "ok"
     by_id = {row["run_id"] or row["invocation_id"]: row for row in observed["runs"]}

@@ -26,6 +26,7 @@ from typing import Any, BinaryIO, Dict, Iterable, List, Optional, Sequence, Tupl
 
 from ouroboros.artifact_storage import compress_in_place
 from ouroboros.contracts.task_constraint import normalize_task_constraint
+from ouroboros.git_observation import numstat_paths
 from ouroboros.headless_status import (
     ARTIFACT_STATUS_FAILED,
     ARTIFACT_STATUS_READY_NO_CHANGES,
@@ -122,11 +123,10 @@ def write_workspace_patch_artifacts(
     except (OSError, ValueError) as exc:
         errors.append({"type": "file_capture_failed", "message": f"{type(exc).__name__}: {exc}"})
         file_baseline = {}
-    changed_tracked = _git_path_list(
-        ["git", "diff", "--name-only", "--no-renames", "-z", "--no-ext-diff", "--no-color", base_ref, "--"],
-        root,
-        errors,
-    )
+    # Confirm binary rows too, keeping unchanged large files out of outputs without index writes.
+    cmd = ["git", "diff", "--numstat", "--no-renames", "-z", "--no-ext-diff", "--no-color", base_ref, "--"]
+    changed_tracked = numstat_paths(_git_bytes(cmd, root, errors=errors), cmd,
+                                   lambda args: _git_bytes(args, root, errors=errors))
     # A tracked WAL index (committed beside its database, or staged in a copy) is shared memory as an
     # untracked one is: never diffed, and never named for an integration to stage over the target's own.
     wal_indexes = {rel: reason for rel in changed_tracked if (reason := _wal_index_reason(root, rel))}
@@ -317,10 +317,10 @@ def write_workspace_patch_artifacts(
         "manifest_name": "workspace_patch.json",
         "base_provenance": ("task_constraint" if task_base_sha else "admission_head" if preflight_head
                             else "empty_tree" if base_is_empty_tree else "capture_head"),
-        "base_explanation": ("Application patch relative to the recorded base; includes eligible workspace changes and may include branch differences. It does not attribute authorship."
+        "base_explanation": ("Current workspace at capture time relative to the recorded base; may include branch differences and later unrelated changes. It does not attribute authorship."
                              if task_base_sha or preflight_head else
-                             "Current workspace comparison at capture time; no original admission basis was recorded. It does not attribute authorship."),
-        "comparison_note": "No auxiliary comparison target was selected. Use vcs_diff(base=..., head=...) for two trees, or base only for the current worktree.",
+                             "Current workspace comparison at capture time; no original admission basis was recorded. It may include later unrelated changes and does not attribute authorship."),
+        "comparison_note": "No auxiliary comparison target was selected. Use vcs_read(action=diff, base=..., head=...) for two trees, or base only for the current worktree.",
         "current_branch": _git_stdout(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], root, allow_rc={0, 1}, errors=diagnostics).strip(),
         "tracking_upstream": _git_stdout(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], root, allow_rc={0, 128}, errors=diagnostics).strip(),
         "base_ref": base_ref,
@@ -547,12 +547,14 @@ def _git_bytes(
     allow_rc: Iterable[int] = (0,),
     errors: Optional[List[Dict[str, Any]]] = None,
 ) -> bytes:
+    from ouroboros.git_observation import host_git_env
     try:
         result = subprocess.run(
             list(cmd),
             cwd=str(cwd),
             capture_output=True,
             timeout=30,
+            env=host_git_env(),
         )
     except subprocess.TimeoutExpired:
         if errors is not None:
@@ -583,6 +585,7 @@ def _append_git_output(
     errors: List[Dict[str, Any]],
     diagnostics: List[Dict[str, Any]],
 ) -> int:
+    from ouroboros.git_observation import host_git_env
     written_box = {"value": 0}
     read_errors: List[str] = []
     try:
@@ -592,6 +595,7 @@ def _append_git_output(
                 cwd=str(cwd),
                 stdout=subprocess.PIPE,
                 stderr=stderr_fh,
+                env=host_git_env(),
             )
             assert proc.stdout is not None
 

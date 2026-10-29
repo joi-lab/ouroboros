@@ -151,7 +151,8 @@ def retain_owner_pause_park(root: pathlib.Path, task_id: str, attempt: int) -> D
 
     from ouroboros.artifacts import read_actor_source_bytes, store_actor_source_bytes
     from ouroboros.budget_pause import (
-        RAIL_OWNER_PAUSE, REASON_OWNER, STATE_PAUSED, budget_pause_row, set_budget_pause, task_owned_runs_open,
+        RAIL_OWNER_PAUSE, REASON_OWNER, STATE_PAUSED, budget_pause_row, episode_fields, set_budget_pause,
+        task_owned_runs_open,
     )
     from ouroboros.deadline_utils import parse_deadline_ts
 
@@ -174,6 +175,7 @@ def retain_owner_pause_park(root: pathlib.Path, task_id: str, attempt: int) -> D
              "scope": "root", "root_task_id": str(pause_meta.get("root_task_id") or task_id), "source_ref": source,
              "retained_owner_wait_id": wait.get("wait_id"), "owner_fence_id": str(pause_meta.get("fence_id") or ""),
              "settlement": "external_writers_running" if task_owned_runs_open(external) else "settled",
+             **episode_fields(pause_meta, external),  # the warm park's participants, partial if it kept no list
              "external_runs": external, "resume_point": {"round_idx": int(state.get("round_idx") or 0),
                                                          "phase": "boundary", "unanswered_tool_call_ids": [],
                                                          "budget_tail": "tool", "abandoned_model_attempts": []},

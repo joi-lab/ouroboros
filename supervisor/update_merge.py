@@ -31,7 +31,7 @@ from supervisor import git_ops as _g
 # re-exported: every caller and test reaches them via this module (F401 intended).
 from supervisor.update_candidate import (  # noqa: F401
     _MERGE_NEUTRAL_FLAGS, _git_run, _merge_head_sha, _preserve_failed_update_attempt,
-    _rev_parse, existing_failed_update_ref, live_unmerged_paths,
+    _rev_parse, existing_failed_update_ref, live_unmerged_paths, capture_update_step,
     UpdateTxCorrupt, managed_assisted_marker_check, managed_tests_evidence_covers,
     record_managed_tests_evidence,
     record_managed_tests_proof, update_tx_phase, update_tx_phase_or_keep,
@@ -404,21 +404,16 @@ def apply_managed_merge_update(branch: str, merge_commit: str) -> Tuple[bool, st
     so the worktree is reset away here. Returns (ok, message)."""
     if not merge_commit:
         return False, "no merge_commit to apply"
-    rc0, _o0, e0 = _g.git_capture(["git", "reset", "--hard", "HEAD"])
-    if rc0 != 0:
-        return False, f"reset before apply failed: {e0}"
-    rc_clean0, _co0, ce0 = _g.git_capture(["git", "clean", "-fd"])
-    if rc_clean0 != 0:
-        return False, f"clean before apply failed: {ce0}"
-    rc1, _o1, e1 = _g.git_capture(["git", "checkout", "-B", branch, merge_commit])
-    if rc1 != 0:
-        return False, f"checkout -B {branch} {merge_commit[:12]} failed: {e1}"
-    rc2, _o2, e2 = _g.git_capture(["git", "reset", "--hard", merge_commit])
-    if rc2 != 0:
-        return False, f"reset --hard {merge_commit[:12]} failed: {e2}"
-    rc_clean, _co, clean_error = _g.git_capture(["git", "clean", "-fd"])
-    if rc_clean != 0:
-        return False, f"clean after apply failed: {clean_error}"
+    for step, (cmd, failure) in enumerate((
+        (["git", "reset", "--hard", "HEAD"], "reset before apply failed"),
+        (["git", "clean", "-fd"], "clean before apply failed"),
+        (["git", "checkout", "-B", branch, merge_commit], f"checkout -B {branch} {merge_commit[:12]} failed"),
+        (["git", "reset", "--hard", merge_commit], f"reset --hard {merge_commit[:12]} failed"),
+        (["git", "clean", "-fd"], "clean after apply failed"),
+    )):
+        rc, _out, error = capture_update_step(cmd, first=step == 0)
+        if rc:
+            return False, f"{failure}: {error}"
     return True, f"applied merge {merge_commit[:12]} to {branch}"
 
 
@@ -431,7 +426,7 @@ def rollback_managed_update(
     to pre_update_sha and cleans unless that verified target already holds, and logs. Boot
     recovery retains a clear-only transaction until the restored process starts, protecting
     returned work from bootstrap reset; other callers clear it immediately. Does NOT push
-    (unlike rollback_to_version, which can push origin — wrong for an internal recovery).
+    (manual Restore likewise stays local).
 
     Marker admission is STRICT (F14): a FUTURE-schema marker was recorded by a newer
     release — this code cannot interpret its semantics, so the rollback refuses typed
@@ -559,10 +554,14 @@ def _finish_rollback(
     except Exception:
         return False, "rollback restored the repository but could not close writer admission; " + stash_note
     rescue = tx.get("rollback_rescue") if isinstance(tx.get("rollback_rescue"), dict) else {}
+    tx["rollback_outcome"] = "not_applied" if in_place and (tx.get("git_failure") or {}).get("before_tree_effects") else "rolled_back"
     if not _log_supervisor(
         {"type": "managed_update_rolled_back", "reason": reason,
          "pre_update_sha": pre, "branch": branch, **({"checkout_already_restored": True} if in_place else {}),
          "stash_note": stash_note, "stash_restore_status": result.status,
+         "error": str(tx.get("rollback_error") or ""),
+         **(tx.get("git_failure") or {}),
+         "outcome": tx["rollback_outcome"],
          **({"failed_update_ref": tx["failed_update_ref"]} if tx.get("failed_update_ref") else {}),
          **{f"rescue_{key}": rescue[key] for key in ("path", "ref", "ts") if rescue.get(key)},
          **({"rescue_error": tx["rollback_rescue_error"]} if tx.get("rollback_rescue_error") else {})},
@@ -591,7 +590,8 @@ def _finish_rollback(
         except Exception:
             _g.log.warning("rollback restored the repository but could not reopen writer admission", exc_info=True)
             return False, "rollback restored the repository but could not reopen writer admission; " + stash_note
-    message = f"rolled back to {pre[:12]}" + (
+    message = (f"update not applied; checkout remains at {pre[:12]}" if in_place and
+               (tx.get("git_failure") or {}).get("before_tree_effects") else f"rolled back to {pre[:12]}") + (
         "; the checkout already matched it and needed no reset/checkout" if in_place else "")
     if tx.get("failed_update_ref"):
         message += f"; the attempt is preserved on branch {tx['failed_update_ref']}"
@@ -879,7 +879,7 @@ def _cleanup_observed(tx: Dict[str, Any]) -> Dict[str, Any]:
         return _observed(tx, "not_applied")
     reason = tx.get("gate_blocked_reason")
     if reason == "rollback_restart_pending":
-        return _observed(tx, "rolled_back")
+        return _observed(tx, tx.get("rollback_outcome") or "rolled_back")
     if reason == "replace_abandon_tx_cleanup_failed":
         return _observed(tx, "not_applied")
     if reason == "stash_marker_cleanup_failed" and tx.get("gate_blocked_from_phase") == "pending_boot_smoke":

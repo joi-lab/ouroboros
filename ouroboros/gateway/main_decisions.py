@@ -19,10 +19,15 @@ log = logging.getLogger(__name__)
 def question_display_rooms(drive_root: Any, task_id: str, quizzes: Any, *, rooms=None, project_ids=None) -> dict:
     """Shared detail/census proof; context and immutable delivery are not display authority."""
     from ouroboros.projects_registry import RoomResolver, list_reserved_projects
+    from ouroboros.presence_owner_contact import private_main_contact
 
     if not isinstance(quizzes, dict) or not quizzes:
         return {}
-    unknown = {qid: {"state": "unknown"} for qid in quizzes}
+    private = {qid: {"state": "known", "chat_id": 1, "project_id": ""} for qid, block in quizzes.items()
+               if isinstance(block, dict) and block.get("quiz_id") == qid and private_main_contact(block, task_id)}
+    if len(private) == len(quizzes):
+        return private
+    unknown = {qid: private.get(qid, {"state": "unknown"}) for qid in quizzes}
     try:
         rooms = rooms or RoomResolver(drive_root, strict=True)
         chat = rooms(task_id)
@@ -39,6 +44,9 @@ def question_display_rooms(drive_root: Any, task_id: str, quizzes: Any, *, rooms
                 result[qid] = {"state": "unknown"}
                 continue
             display = chat or own.get("chat_id")
+            if qid in private:
+                result[qid] = private[qid]
+                continue
             # Hidden authors have no display room until THIS quiz's recorded Main publication.
             if display == 0:
                 display = (1 if type(block.get("publication_chat_id")) is int

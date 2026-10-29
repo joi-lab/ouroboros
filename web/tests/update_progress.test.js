@@ -9,6 +9,15 @@ const observed = (stage, extra = {}) => ({
     update_progress: { operation_id: 'operation-a', generation: 'server-a', stage, active: true, ...extra },
 });
 
+test('only a completed update with a known base offers its local Restore target', () => {
+    for (const outcome of ['applied', 'not_applied', 'rolled_back', 'failed', 'unknown']) {
+        const view = updateAttemptView({ operation_id: 'a', outcome, active: false, base_sha: 'a'.repeat(40) });
+        assert.equal(view.restoreTarget, outcome === 'applied' ? 'a'.repeat(40) : '');
+    }
+    assert.equal(updateAttemptView({ operation_id: 'a', outcome: 'applied', active: false }).restoreTarget, '');
+    assert.equal(updateAttemptView({ operation_id: 'a', active: true, base_sha: 'a'.repeat(40) }).restoreTarget, undefined);
+});
+
 test('server stages refine the pending apply and survive reopening before a transaction exists', () => {
     for (const phase of ['updating', '', 'loading']) {
         const verdict = updateVerdict(observed('stopping_workers'), phase);
@@ -133,7 +142,8 @@ test('only the restarted server concludes success; reconnect, version and SHA ar
     assert.deepEqual([unknown.pill, unknown.tone, unknown.terminal], ['Update outcome unconfirmed', 'neutral', true]);
     assert.match(unknown.text, /running version alone does not establish the outcome/);
     const applied = updateAttemptView({ ...awaiting, outcome: 'applied', concluded_by: 'boot' });
-    assert.deepEqual([applied.pill, applied.tone], ['Update completed', 'ok']);
+    // Owner 1B: the confirmed success is a record (headline, facts, Restore target), never a capsule word.
+    assert.deepEqual([applied.pill, applied.tone, applied.headline], ['', 'ok', 'Update completed.']);
     assert.equal(updateAttemptView({ ...awaiting, outcome: 'unknown', reason: 'startup_unconfirmed' }).text,
         'The restarted server did not confirm its startup checks.');
 });
@@ -176,51 +186,105 @@ test('a restart need belongs to the server that had it', () => {
     assert.doesNotMatch(updateAttemptView({ ...failure, current_generation: false }).text, /needs a restart/);
 });
 
-test('the indicator shows the stage, then the outcome until dismissed, then the next attempt', async () => {
+// One indicator on the DOM double: its listeners, storage and a window whose events reach their listeners.
+async function withIndicator(run) {
     const env = installDomDouble();
     const stored = new Map();
     const priorStorage = globalThis.localStorage;
-    let controller;
+    const priorDispatch = globalThis.window.dispatchEvent;
     globalThis.localStorage = { getItem: (key) => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, String(value)) };
+    globalThis.window.dispatchEvent = (event) => globalThis.window.emit(event.type);
+    let controller;
     try {
         env.doc.body.append(env.el('span', { attrs: { id: 'nav-version' } }));
         const listeners = new Map();
         const ws = { on(name, fn) { listeners.set(name, fn); return () => listeners.delete(name); } };
         const opened = [];
-        let reads = 0;
-        let status = { managed: true, available: false,
-            update_progress: { ...refusal, active: true, outcome: '', result: '', stage: 'stopping_workers', work_stop: 'invoked' } };
+        const world = { status: null, reads: 0 };
         controller = initUpdateStatus({ ws, showPage: (page) => opened.push(page), openDashboardTab: (tab) => opened.push(tab),
-            readStatus: async () => { reads += 1; if (!status) throw new Error('offline'); return structuredClone(status); } });
-        await settle();
-        const pill = env.doc.getElementById('update-pill');
-        assert.deepEqual([pill.hidden, pill.textContent, pill.dataset.tone], [false, 'Stopping work…', 'neutral']);
-        status = { ...status, update_progress: refusal };
-        listeners.get('update_progress_changed')();
-        await settle();
-        assert.deepEqual([pill.textContent, pill.dataset.tone], ['Update not applied', 'error']);
-        assert.match(pill.title, /No update was applied\./);
-        pill.click();
-        assert.deepEqual(opened, ['updates'], 'subtab navigation owns its one guarded page transition');
-        const before = reads;
-        dismissUpdateAttempt('attempt-a');
-        globalThis.window.emit('ouro:update-attempt-dismissed');
-        assert.equal(pill.hidden, true, 'hidden: no available update to point at');
-        assert.equal(reads, before, 'dismissing sends no request');
-        status = { ...status, update_progress: { ...refusal, operation_id: 'attempt-b', outcome: 'unknown',
-            reason: 'no_completion_record', work_stop: '' } };
-        listeners.get('update_status_ready')();
-        await settle();
-        assert.deepEqual([pill.hidden, pill.textContent, pill.dataset.tone], [false, 'Update outcome unconfirmed', 'neutral']);
-        status = null;
-        listeners.get('open')({ previouslyConnected: true });
-        await settle();
-        assert.equal(pill.textContent, 'Update outcome unconfirmed', 'a failed read hides nothing already known');
+            readStatus: async () => { world.reads += 1; if (!world.status) throw new Error('offline'); return structuredClone(world.status); } });
+        const show = async (status, event = 'update_progress_changed') => {
+            world.status = status;
+            listeners.get(event)();
+            await settle();
+        };
+        const pill = () => env.doc.getElementById('update-pill');
+        const close = () => env.doc.body.querySelector('.update-notice-close');
+        await run({ env, show, pill, close, opened, world, stored, listeners });
     } finally {
         controller?.dispose();
+        globalThis.window.dispatchEvent = priorDispatch;
         globalThis.localStorage = priorStorage;
         env.restore();
     }
+}
+
+const applied = { ...refusal, operation_id: 'attempt-ok', outcome: 'applied', result: 'applied', concluded_by: 'boot',
+    blockers: [], work_stop: '', reason: '' };
+
+test('a confirmed success never wears the indicator, hides nothing, and never masks a newer version', async () => {
+    await withIndicator(async ({ show, pill, close, stored }) => {
+        await show({ managed: true, available: false, update_progress: { ...refusal, active: true, outcome: '', result: '',
+            stage: 'checking', work_stop: 'invoked' } });
+        assert.deepEqual([pill().hidden, pill().textContent], [false, 'Checking update…']);
+        assert.equal(close().hidden, true, 'a stage has no close: it ends by itself');
+        // The server concludes: nothing announces it. The record stays in Dashboard → Updates (updateAttemptView).
+        await show({ managed: true, available: false, update_progress: applied });
+        assert.equal(pill().hidden, true, 'no capsule, no toast, no timer: the success lives in the panel alone');
+        assert.equal(pill().dataset.tone, undefined);
+        assert.equal(stored.size, 0, 'nothing is stored: there is nothing to dismiss');
+        assert.equal(updateAttemptView(applied).headline, 'Update completed.', 'the retained record is untouched');
+        // An old success must not stand where a newer version is announced.
+        await show({ managed: true, available: true, latest_version: '7.1.0', update_progress: applied });
+        assert.deepEqual([pill().hidden, pill().textContent, pill().dataset.tone], [false, 'Update available', undefined]);
+        assert.equal(close().hidden, true, 'availability is a current fact: it ends with the fact');
+    });
+});
+
+test('a failed or unconfirmed outcome stays with its own close; closing hides this notice and nothing else', async () => {
+    await withIndicator(async ({ env, show, pill, close, opened, world, stored }) => {
+        await show({ managed: true, available: false, update_progress: refusal });
+        assert.deepEqual([pill().hidden, pill().textContent, pill().dataset.tone], [false, 'Update not applied', 'error']);
+        assert.equal(close().hidden, false, 'the close stands beside the notice it ends');
+        assert.equal(close().getAttribute('aria-label'), 'Hide this notice');
+        assert.equal(close().tagName, 'BUTTON');
+        pill().click();
+        assert.deepEqual(opened, ['updates'], 'the capsule still opens the one panel');
+        const before = world.reads;
+        close().click();
+        assert.equal(pill().hidden, true, 'hidden: no available update to point at');
+        assert.equal(world.reads, before, 'hiding sends no request');
+        assert.deepEqual([...stored], [['ouroboros.update-attempt-dismissed', 'attempt-a']], 'one attempt id, this browser only');
+        assert.equal(updateAttemptView(refusal).headline, 'No update was applied.', 'the saved result is untouched');
+        // A newer notice-worthy attempt shows again, closable, and a failure does not outlast a newer version.
+        await show({ managed: true, available: true, update_progress: { ...refusal, operation_id: 'attempt-b', outcome: 'unknown',
+            reason: 'no_completion_record', work_stop: '', blockers: [] } });
+        assert.deepEqual([pill().hidden, pill().textContent, pill().dataset.tone], [false, 'Update outcome unconfirmed', 'neutral']);
+        assert.equal(close().hidden, false, 'unconfirmed stays until closed, even beside a newer version');
+        close().focus();
+        assert.equal(env.doc.activeElement, close());
+        close().click();
+        assert.equal(env.doc.activeElement, pill(), 'a keyboard reader lands on what the close unmasked, not on the page');
+        assert.deepEqual([pill().hidden, pill().textContent, pill().dataset.tone], [false, 'Update available', undefined],
+            'once hidden, the version it was hiding shows');
+        assert.equal(close().hidden, true);
+        // Another browser has no such memory: the same record shows the notice again there.
+        stored.clear();
+        globalThis.window.emit('ouro:update-attempt-dismissed');
+        assert.deepEqual([pill().textContent, close().hidden], ['Update outcome unconfirmed', false]);
+    });
+});
+
+test('restart messages are untouched: a needed restart is a stage without a close, a failed one keeps its words', async () => {
+    await withIndicator(async ({ show, pill, close }) => {
+        await show({ managed: true, available: false, update_progress: { ...refusal, active: false, outcome: '',
+            result: 'restart_required', restart_required: true, stage: 'stopping_services', blockers: ['service:mcp'] } });
+        assert.deepEqual([pill().textContent, pill().dataset.tone, close().hidden], ['Restart needed', 'neutral', true]);
+        await show({ managed: true, available: false, update_progress: { ...refusal, outcome: 'failed', restart_required: true,
+            blockers: ['service:mcp'], work_stop: 'invoked', error: 'A service could not be stopped.' } });
+        assert.deepEqual([pill().textContent, pill().dataset.tone, close().hidden], ['Update failed', 'error', false]);
+        assert.match(pill().title, /Ouroboros needs a restart before updates can continue\./);
+    });
 });
 
 test('the indicator coalesces notices, never renders a superseded read, and disposes every subscription', async () => {

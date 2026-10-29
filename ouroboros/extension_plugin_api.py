@@ -101,7 +101,7 @@ class ExtensionStaleRecoveryError(ExtensionRegistrationError):
     bundle is created, nothing is staged, ``auth_token.json`` is neither
     created nor rotated, no companion env is materialized, and nothing may be
     disposed by the caller. Infrastructure reads on the way to the fence (the
-    settings lock inside ``load_settings``, a state-dir mkdir via the
+    ``load_settings`` read, a state-dir mkdir via the
     liveness/grant projection) may occur — the same settings/grant read idiom
     used everywhere in the runtime (fix-round-7 scope)."""
 
@@ -438,12 +438,16 @@ class PluginAPIImpl:
         key = f"{self._skill}:{clean_tab}"
         validated_render = _validate_runtime_ui_render({} if render is None else render)
         span = _widget_span_from_render(validated_render)
+        from ouroboros.extension_widget_assets import capture_widget_sources
+
+        esm = validated_render.get("entry_type") == "module"
+        widget_sources = capture_widget_sources(self._loaded_skill, validated_render) if esm else {}
         # A module widget's reviewed JavaScript (its entry plus every sibling
         # .js/.mjs) is captured here (disk read, outside the lock) so the module
         # endpoint serves the loaded bundle's bytes, not the disk.
         module_sources = (
             read_module_sources(self._skill_dir, str(validated_render.get("entry") or ""))
-            if str(validated_render.get("kind") or "") == "module" else None
+            if str(validated_render.get("kind") or "") == "module" and not esm else None
         )
         with _lock:
             self._stage_surface_locked(_ui_tabs, self._staged.ui_tabs, key, {
@@ -462,6 +466,7 @@ class PluginAPIImpl:
                 # ``_publish_registrations`` is the only place sources become
                 # servable (ABI-9 atomicity).
                 self._staged.module_sources.update(module_sources)
+            self._staged.widget_sources.update(widget_sources)
 
     def register_settings_section(
         self,
@@ -848,6 +853,7 @@ class PluginAPIImpl:
                     live[key] = value
                     bundle_keys.append(key)
             bundle.module_sources.update(staged.module_sources)
+            bundle.widget_sources.update(staged.widget_sources)
             if staged.contributions is not None:
                 bundle.contributions = staged.contributions
                 bundle.contribution_problems = staged.contribution_problems

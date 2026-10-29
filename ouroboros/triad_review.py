@@ -37,6 +37,7 @@ class ReviewActorRecord:
     http_status: Optional[int] = None
     transport_status: str = ""
     reported_cause: str = ""  # the failing owner's reported cause; opaque, "" = none
+    failure_details: Dict[str, Any] = field(default_factory=dict)
     operation_id: str = ""
     operation_state: str = "settled"
     late_result_pending: bool = False
@@ -89,6 +90,7 @@ class ReviewActorRecord:
             "http_status": self.http_status,
             "transport_status": self.transport_status,
             **({"reported_cause": self.reported_cause} if self.reported_cause else {}),
+            **({"failure_details": dict(self.failure_details)} if self.failure_details else {}),
             "operation_id": self.operation_id,
             "operation_state": self.operation_state,
             "late_result_pending": self.late_result_pending,
@@ -157,6 +159,7 @@ def _actor_record(
         http_status=(int(actor["http_status"]) if isinstance(actor.get("http_status"), int) else None),
         transport_status=str(actor.get("transport_status") or ""),
         reported_cause=str(actor.get("reported_cause") or ""),
+        failure_details=dict(actor.get("failure_details") or {}),
         operation_id=str(actor.get("operation_id") or ""),
         operation_state=str(actor.get("operation_state") or "settled"),
         late_result_pending=bool(actor.get("late_result_pending")),

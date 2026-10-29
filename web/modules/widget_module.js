@@ -10,6 +10,7 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
 import { bridgeChunkBuffer, moduleBridgeScript, moduleResizeScript } from './widget_frame.js';
 import { boundedNumber, WIDGET_DISPOSE_ACK_TIMEOUT_MS, WIDGET_REQUEST_TIMEOUT_MS } from './widget_job.js';
 import { onThemeChange } from './theme_palette.js';
+import { openWidgetAssetLease, readWidgetAsset, revokeWidgetAssetLease, maintainWidgetAssetLease } from './widget_assets.js';
 import { setWidgetCardFault } from './widget_card.js';
 import { downloadViaHostBridge, downloadBlobViaHostBridge, openExternalViaHostBridge } from './ui_helpers.js';
 
@@ -20,7 +21,8 @@ export const WIDGET_FRAME_BORDER_RESERVE = 2;
 // widget's code can read the nonce and post directly. The kinds and clips are the frame's (widget_frame.js).
 export const WIDGET_FAULT_REPORTS_PER_MOUNT = 10;
 const FAULT_KINDS = ['error', 'rejection', 'csp'];
-const faultText = (value, max) => (typeof value === 'string' ? value.slice(0, max) : '');
+const faultText = (value, max) => (typeof value === 'string'
+    ? value.replace(/(\/api\/widget-assets\/)[A-Za-z0-9_-]+/g, '$1[redacted]').slice(0, max) : '');
 
 // One capability set for both framed mounts (route iframe and module srcdoc):
 // scripts, pointer lock and downloads; autoplay, fullscreen and clipboard
@@ -39,15 +41,22 @@ function createWidgetFrame() {
     return iframe;
 }
 
-// The module frame's document policy. Sources are absolute: an opaque frame's
-// `'self'` matches nothing, so the page origin is spelled out. Scripts run
-// inline, from `blob:` and from this skill's module prefix (`'wasm-unsafe-eval'`
-// lets them instantiate WebAssembly); workers come from `blob:`; images, media
-// and fonts load passively from `data:`, `blob:` and this skill's route prefix.
-// Everything else falls to `default-src 'none'` — the frame has no scriptable
-// network of its own, the parent bridge is its one request path.
-export function moduleFrameCsp(skill, origin = window.location.origin) {
+// Sources are absolute because an opaque frame's 'self' matches nothing.
+// Classic widgets keep the skill route sources; ESM uses only this mount's
+// finite file prefix. Neither mode admits a scriptable network source: requests
+// fall to default-src 'none', and the parent bridge carries fetch.
+export function moduleFrameCsp(skill, origin = window.location.origin, assetBase = '') {
     const prefix = `${origin}${extensionRoutePrefix(skill)}`;
+    if (assetBase) return [
+        "default-src 'none'",
+        `script-src 'unsafe-inline' 'wasm-unsafe-eval' blob: ${assetBase}`,
+        'worker-src blob:',
+        `style-src 'unsafe-inline' ${assetBase}`,
+        `img-src data: blob: ${assetBase}`,
+        `media-src data: blob: ${assetBase}`,
+        `font-src data: blob: ${assetBase}`,
+        `base-uri ${assetBase}`,
+    ].join('; ');
     return [
         "default-src 'none'",
         `script-src 'unsafe-inline' 'wasm-unsafe-eval' blob: ${prefix}module/`,
@@ -99,11 +108,9 @@ export function mountRouteIframeWidget(mount, tab, render) {
 // fault(text)}` — the message's size policy replaces the board's floor and declared height,
 // and a fault is the card's to show.
 export async function mountModuleWidget(mount, tab, render, mountSignal = null, messageHandlers = null, inline = null) {
-    // Reviewed JS runs in an opaque iframe; the parent bridge is its only
-    // scriptable I/O path and only reaches this skill's extension route prefix
-    // and this skill's namespaced WebSocket events, preserving route IO without
-    // cookies. Passive image / media / font loads and sibling scripts come
-    // straight from that prefix under the document policy (moduleFrameCsp).
+    // The parent owns API I/O and WebSocket forwarding. Native imports and
+    // passive resources use the policy above; neither exposes the parent DOM
+    // or session to the opaque frame.
     const entryName = String(render.entry).replace(/[^A-Za-z0-9._-]/g, '');
     const entryUrl = `${extensionRoutePrefix(tab.skill)}module/${encodeURIComponent(entryName)}`;
     const sourceController = new AbortController();
@@ -117,9 +124,14 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
     }, WIDGET_REQUEST_TIMEOUT_MS);
     let resp;
     let moduleSource;
+    let lease = null;
     try {
-        resp = await apiFetch(entryUrl, { cache: 'no-store', signal: sourceController.signal });
-        moduleSource = await resp.text();
+        if (render.entry_type === 'module') {
+            lease = await openWidgetAssetLease(tab, sourceController.signal);
+        } else {
+            resp = await apiFetch(entryUrl, { cache: 'no-store', signal: sourceController.signal });
+            moduleSource = await resp.text();
+        }
     } catch (error) {
         if (sourceTimedOut) {
             const timeoutError = new Error('widget module request timed out');
@@ -132,15 +144,16 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
         clearTimeout(sourceTimeout);
         mountSignal?.removeEventListener('abort', relayAbort);
     }
-    if (mountSignal?.aborted) return;
-    if (!resp.ok) {
+    if (mountSignal?.aborted) { revokeWidgetAssetLease(lease); return; }
+    if (resp && !resp.ok) {
         mount.innerHTML = `<div class="skills-load-error">module load failed: ${escapeHtml(moduleSource || `HTTP ${resp.status}`)}</div>`;
         return;
     }
     const expectedPrefix = extensionRoutePrefix(tab.skill);
     const wsPrefix = String(tab.ws_prefix || '').trim();
     const nonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const csp = moduleFrameCsp(tab.skill);
+    const assetBase = lease?.baseUrl || '';
+    const csp = moduleFrameCsp(tab.skill, window.location.origin, assetBase);
     const escapeScript = (value) => String(value || '')
         .replace(/<\/script/gi, '<\\/script')
         .replace(/<!--/g, '<\\!--');
@@ -151,7 +164,7 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
         return ['light', 'dark'].includes(candidate) ? candidate : 'dark';
     };
     const initialTheme = resolvedTheme();
-    const bridge = moduleBridgeScript(nonce, `${window.location.origin}${expectedPrefix}`, initialTheme);
+    const bridge = moduleBridgeScript(nonce, `${window.location.origin}${expectedPrefix}`, initialTheme, assetBase);
     const resizeBridge = autoHeight
         ? moduleResizeScript(
             nonce, WIDGET_FRAME_DEFAULT_HEIGHT, maxHeight, WIDGET_FRAME_BORDER_RESERVE,
@@ -160,11 +173,16 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
     // The initial theme is carried inside the bridge bootstrap, not as a
     // document attribute: a module must explicitly subscribe before it gets
     // appearance data or changes its own palette.
-    const srcdoc = `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body><div id="root"></div><script>${bridge}</script><script>${resizeBridge}</script><script>${escapeScript(moduleSource)}</script></body></html>`;
+    const base = assetBase ? `<meta name="referrer" content="no-referrer"><base href="${escapeHtml(assetBase)}">` : '';
+    const entryScript = assetBase
+        ? `<script type="module" crossorigin="anonymous" src="${escapeHtml(new URL(render.entry, assetBase).href)}"></script>`
+        : `<script>${escapeScript(moduleSource)}</script>`;
+    const srcdoc = `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="${csp}">${base}</head><body><div id="root"></div><script>${bridge}</script><script>${resizeBridge}</script>${entryScript}</body></html>`;
     // The document goes in through the `srcdoc` property (no attribute
     // escaping round-trip of a module-sized payload); the frame carries the
     // shared sandbox / permissions set — nothing that re-exposes the SPA origin.
     const iframe = createWidgetFrame();
+    if (assetBase) iframe.referrerPolicy = 'no-referrer';
     iframe.srcdoc = srcdoc;
     mount.replaceChildren(iframe);
     let appliedHeight = frameHeight(render);
@@ -190,6 +208,7 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
     let onDisposed = null;
     let themeSubscribed = false;
     let stopTheme = () => {};
+    let releaseLease = () => {};
     const post = (message, transfer = []) => {
         if (!disposed) iframe.contentWindow?.postMessage({ ...message, nonce }, '*', transfer);
     };
@@ -254,15 +273,19 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
             : 0;
         const frame = (fields, transfer) => post({ type: 'ouro-widget-fetch-chunk', id, ...fields }, transfer);
         try {
-            const parsed = new URL(String(msg.url || ''), window.location.origin);
-            if (parsed.origin !== window.location.origin || !parsed.pathname.startsWith(expectedPrefix)) {
+            const parsed = new URL(String(msg.url || ''), assetBase || window.location.origin);
+            const asset = assetBase && parsed.href.startsWith(assetBase);
+            const method = String(init.method || 'GET').toUpperCase();
+            if (parsed.origin !== window.location.origin
+                || (!parsed.pathname.startsWith(expectedPrefix) && !asset)
+                || (asset && !['GET', 'HEAD'].includes(method))) {
                 throw new Error('module widget fetch outside extension route prefix');
             }
             const r = await apiFetch(parsed.pathname + parsed.search, {
-                method: String(init.method || 'GET').toUpperCase(),
+                method,
                 headers: init.headers || {},
                 body: init.body ?? undefined,
-                credentials: 'same-origin',
+                credentials: asset ? 'omit' : 'same-origin',
                 // The prefix above is checked once, before the request. A followed
                 // redirect would carry the frame's method, body, headers and the
                 // owner's session to whatever the hop names — another skill's
@@ -297,11 +320,15 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
             if (source instanceof Blob || (typeof source === 'string' && source.startsWith('data:'))) {
                 result = await downloadBlobViaHostBridge(source, name);
             } else {
-                const parsed = new URL(String(source || ''), window.location.origin);
-                if (parsed.origin !== window.location.origin || !parsed.pathname.startsWith(expectedPrefix)) {
+                const parsed = new URL(String(source || ''), assetBase || window.location.origin);
+                const asset = Boolean(assetBase) && parsed.href.startsWith(assetBase);
+                if (parsed.origin !== window.location.origin || (!parsed.pathname.startsWith(expectedPrefix) && !asset)) {
                     throw new Error('module widget download outside extension route prefix');
                 }
-                result = await downloadViaHostBridge(parsed.pathname + parsed.search, name, { streaming: true });
+                // A declared file goes to the byte owner as captured bytes; a skill route may stream.
+                result = asset
+                    ? await downloadBlobViaHostBridge(await readWidgetAsset(parsed.pathname + parsed.search), name)
+                    : await downloadViaHostBridge(parsed.pathname + parsed.search, name, { streaming: true });
             }
         } catch (error) {
             result = { ok: false, error: error?.message || String(error) };
@@ -348,7 +375,7 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
         }
         if (msg.type === 'ouro-widget-error') {
             const label = msg.kind === 'csp' ? 'Widget blocked by frame policy' : 'Widget script error';
-            const detail = msg.kind === 'csp' ? (msg.source || msg.message) : msg.message;
+            const detail = faultText(msg.kind === 'csp' ? (msg.source || msg.message) : msg.message, 500);
             if (inline) inline.fault(`${label}: ${detail || 'unknown'}`);
             else setWidgetCardFault(mount.closest('[data-widget-key]'), `${label}: ${detail || 'unknown'}`);
             reportFault(msg);
@@ -389,7 +416,7 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
     // on `ouro-widget-disposed` or after WIDGET_DISPOSE_ACK_TIMEOUT_MS —
     // whichever comes first. The frame stays in its card until then; nothing
     // here blocks a page switch. Returns the settle promise; repeat calls share it.
-    return () => {
+    const dispose = () => {
         if (disposing) return disposing;
         disposing = new Promise((resolve) => {
             let ackTimer = 0;
@@ -397,6 +424,7 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
                 if (disposed) return;
                 disposed = true;
                 clearTimeout(ackTimer);
+                releaseLease();
                 stopThemeSubscription();
                 pendingRequests.forEach((controller) => controller.abort());
                 pendingRequests.clear();
@@ -413,4 +441,10 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
         });
         return disposing;
     };
+    if (lease) releaseLease = maintainWidgetAssetLease(lease, () => {
+        if (inline) inline.fault('Widget file access ended');
+        else setWidgetCardFault(mount.closest('[data-widget-key]'), 'Widget file access ended');
+        dispose();
+    });
+    return dispose;
 }

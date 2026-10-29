@@ -117,15 +117,23 @@ def test_request_snapshot_is_coherent_and_never_leaks_into_the_next_read(tmp_pat
 
 @pytest.mark.parametrize("damaged_body", ["{}", "[]"])
 def test_legacy_shape_error_is_unknown_until_the_authority_changes(tmp_path, monkeypatch, damaged_body):
+    """Only the damaged row is unknown; its neighbours in the same store keep their phases."""
     _seed(tmp_path, 0)
-    call = _census(tmp_path, monkeypatch)
+    availability = {"complete": True}
+    call = _census(tmp_path, monkeypatch, availability)
     with store.open_store(tmp_path, write=True) as txn:
         _old_task(txn, "working")
         txn.conn.execute("UPDATE task_bodies SET body=? WHERE task_id='working'", (damaged_body,))
-    assert all(row["phase"] == "unknown" for row in call())
+    phases = {"working": "working", "finalizing": "finalizing", "pausing": "budget_pausing",
+              "queued": "queued", "paused": "budget_paused", "direct": "budget_paused"}
+    rows = {row["activity_id"]: row for row in call()}
+    assert {tid: row["phase"] for tid, row in rows.items()} == {**phases, "working": "unknown"}
+    assert availability["complete"] is False and rows["working"]["can_resume"] is False
+    availability["complete"] = True
     with store.open_store(tmp_path, write=True) as txn:
         _task(txn, "working")
-    assert next(row for row in call() if row["activity_id"] == "working")["phase"] == "working"
+    assert {row["activity_id"]: row["phase"] for row in call()} == phases
+    assert availability["complete"] is True
 
 
 def test_phase_and_fence_publication_roll_back_with_the_body(tmp_path):

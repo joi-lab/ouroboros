@@ -7,6 +7,7 @@ import types
 
 import pytest
 
+from ouroboros.preflight_inventory import SELECT
 from ouroboros.preflight_runner import LANE_EXCLUSION_EXPR, PARALLEL_PASS_FLAGS, SERIAL_PASS_FLAGS
 from ouroboros.safe_test_supervisor import _GRACE_SEC as SAFE_TEST_INT_WINDOW_SEC
 from tests import conftest
@@ -20,6 +21,15 @@ def run_tests():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture(autouse=True)
+def recorded(run_tests, monkeypatch):
+    """A battery here sizes its serial groups by today's rule unless a test records durations itself (the real
+    reader, returned, reads the evidence beside the running test session)."""
+    real = run_tests.recorded_durations
+    monkeypatch.setattr(run_tests, "recorded_durations", lambda: (None, "no recorded durations"))
+    return real
 
 
 @pytest.fixture
@@ -50,6 +60,35 @@ def _group(item):
 @pytest.mark.parametrize("workers, shards", [(2, 1), (4, 1), (7, 1), (8, 2), (12, 3), (16, 4), (64, 4)])
 def test_serial_overlap_is_bounded_by_the_worker_count(run_tests, workers, shards):
     assert run_tests.serial_shards(workers) == shards
+
+
+def test_serial_groups_take_the_recorded_serial_share_of_the_workers(run_tests, recorded, monkeypatch, tmp_path,
+                                                                     capsys, standalone_budget):
+    """With recorded durations the serial tests get the workers their share of the time needs: at least one
+    group, at most half the workers. A run without a table of its own reads the newest earlier one-run battery
+    beside its evidence that ended (an interrupted one favours the serial groups handed out first); the plan
+    names each group's predicted seconds."""
+    from tests.ci_verdicts import platform_name, serial_group
+    from tests.test_ci_durations import _projection, _row
+
+    system = platform_name(run_tests.sys.platform)
+    rows = {system: {"tests/test_a.py": 7000, "tests/test_s.py": 3000}}
+    assert [run_tests.serial_shards(18, {"platforms": rows, "serial": {system: {"tests/test_s.py": ms}}})
+            for ms in (3000, 0, 10_000)] == [5, 1, 9]
+    assert run_tests.serial_shards(18, {"platforms": rows}) == 4  # a table that does not split the time
+    for run, code, serial in (("run-ended", 1, 5.0), ("run-interrupted", 130, 1.0)):
+        _projection(tmp_path / run / "pytest" / "overlapped", [_row("tests/test_s.py::test_s@serial0", serial),
+                                                               _row("tests/test_a.py::test_a@tests/test_a.py", 5.0)],
+                    system=run_tests.sys.platform)
+        (tmp_path / run / "result.json").write_text(json.dumps({"returncode": code}), encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_TEST_EVIDENCE_ROOT", str(tmp_path / "run-now"))
+    monkeypatch.setattr(run_tests, "recorded_durations", recorded)
+    monkeypatch.setenv("OUROBOROS_PREFLIGHT_TEST_WORKERS", "8")
+    ((_label, command),) = run_tests.battery_commands(sequential=False)
+    assert command[-1] == "--serial-shards=4"  # half the time is serial; today's rule would say 2
+    plan = capsys.readouterr().out
+    assert "4 serial groups of 8 workers, sized by the battery of run-ended" in plan
+    assert f"predicted seconds per group: {serial_group('tests/test_s.py', 4)} 5;" in plan
 
 
 def test_sequential_mode_keeps_the_gate_marker_split_and_xdist_flags(run_tests, monkeypatch):
@@ -212,7 +251,7 @@ def test_a_deferred_full_escalation_runs_the_floor_and_says_so(run_tests, monkey
     assert ran[0] == "node" and ran[1][0] == "parallel"  # the leg still runs the Node lane and a pytest pass
     if tier == "full":  # the PR minimum runs here; the rest goes to the landed shards
         assert record["deferred_full"] is True and record["files"] == sorted(test_selection.FLOOR_TESTS)
-        assert all(path in ran[1][1] for path in test_selection.FLOOR_TESTS)
+        assert all(f"{SELECT}={path}" in ran[1][1] for path in test_selection.FLOOR_TESTS)
         assert "tests/conftest.py: verification apparatus changed" in summary.read_text(encoding="utf-8")
     else:
         assert "deferred_full" not in record and record["files"] == ["tests/test_floor.py"]

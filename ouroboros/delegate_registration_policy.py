@@ -50,6 +50,8 @@ def review_owned_source(source: Any) -> bool:
 INVESTIGATION_AUTHORITY = "investigation"
 _NO_APPLY_AUTHORITY_SOURCES = frozenset({INVESTIGATION_AUTHORITY, "readonly"})
 INVESTIGATION_NOTE = "Evidence-only investigation: the captured changes are retained as evidence and never applied."
+NO_CHANGES_NOTE = ("No changes: the run's result holds exactly the files its copy started from (files Git ignores "
+                   "are never part of a result), so it closed itself; there is nothing to apply or reject.")
 
 
 def no_write_authority(root: str, *, investigation: bool) -> dict:
@@ -99,9 +101,9 @@ def candidate_apply_possible(record: Any) -> bool:
 
 def _recorded_readonly_ask(record: Any) -> bool:
     """The read-only reviewer's own recorded shape: a STARTED row's granted
-    ``access``/``mode``, or a pending row's stored wire request, is readonly Ask
+    ``access``/``mode``, or a pending row's wire shape, is readonly Ask
     with no private execution binding. Absent shape facts prove nothing."""
-    request = _fact(record, "request")
+    request = _fact(record, "request_shape") or _fact(record, "request")
     request = request if isinstance(request, dict) else {}
     return (str(_fact(record, "access") or request.get("access") or "") == "readonly"
             and str(_fact(record, "mode") or request.get("mode") or "") == "ask"
@@ -269,7 +271,7 @@ STARTED_PROGRESS_FLAGS: Tuple[str, ...] = (
 # or the owner's recorded terminal-wake acknowledgement.
 STARTED_SETTLEMENT_FACTS: Tuple[str, ...] = (
     "terminal_state", "terminal_reason", "engine_model", "access_profile",
-    "spend_disclosed", "spend_estimated", "cost_usd",
+    "spend_disclosed", "spend_estimated", "cost_usd", "cost_partial",
     "settled_at", "engine_locator", "terminal_ack_attempt")
 # Binding/authority facts are FIRST-WINS (R1-2): a later idempotent STARTED row
 # may be minted by a context that no longer knows the original binding; the

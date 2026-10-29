@@ -200,5 +200,11 @@ def test_public_preflight_exhibit_requires_exact_subject(h, monkeypatch, proof):
     monkeypatch.setattr(preflight_receipts, "execution_exhibit", lambda _ctx: exhibit)
     payload = _payload(h.tool(root="system_repo", subject="index", goal="test the subject"))
     record = h.written[payload["record_id"]]
-    assert record["preflight_execution"]["status"] == ("passed" if proof == "exact" else "unobserved")
+    execution = record["preflight_execution"]
+    if proof == "different":
+        # A green run of other bytes stays an observation beside the subject, never its result.
+        assert execution["status"] == "not_run"
+        assert [entry.get("relation") for entry in execution["observed"]] == ["other_bytes"]
+    else:
+        assert execution["status"] == ("passed" if proof == "exact" else "unobserved")
     assert len(h.wave.calls) == 1, "test evidence is a fact, never a dispatch gate"

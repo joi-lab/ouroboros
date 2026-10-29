@@ -12,6 +12,11 @@ python-standalone interpreter then runs the agent as a subprocess.
 import os
 import sys
 
+# PyInstaller imports modules recursively, and the default limit (1000) holds about 115 nested imports.
+# The Windows build of 7.9.0 passed that depth (RecursionError during analysis, tag run 40778443901);
+# PyInstaller's documented remedy is a higher limit for the spec's own process.
+sys.setrecursionlimit(sys.getrecursionlimit() * 5)
+
 block_cipher = None
 
 # ---------------------------------------------------------------------------

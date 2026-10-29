@@ -108,6 +108,8 @@ def test_envelope_enable_parsing(monkeypatch):
 
 def test_v5_eligibility_and_canonical():
     assert pte._eligible({"type": "task"}) is True
+    # Failure is useful input to the opt-in chooser, not a success prerequisite.
+    assert pte._eligible({"type": "task", "status": "failed", "success": False}) is True
     assert pte._eligible({"type": "evolution"}) is False
     assert pte._eligible({"type": "deep_self_review"}) is False
     assert pte._eligible({"type": "task", "delegation_role": "subagent"}) is False
@@ -759,7 +761,7 @@ def test_promotion_chooser_uses_main_model_slot(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_MODEL", "test-provider/main-model")
 
     env = types.SimpleNamespace(drive_root=str(tmp_path))
-    pte._decide_promotion(env, {"id": "t1"}, None, object(), force=False)
+    pte._decide_promotion(env, {"id": "t1"}, None, object())
 
     assert calls.get("model") == "test-provider/main-model"
     assert calls.get("reasoning_effort") == "medium"
@@ -768,7 +770,7 @@ def test_promotion_chooser_uses_main_model_slot(tmp_path, monkeypatch):
     # Empty env falls back to the SETTINGS_DEFAULTS main-slot value.
     calls.clear()
     monkeypatch.setenv("OUROBOROS_MODEL", "")
-    pte._decide_promotion(env, {"id": "t2"}, None, object(), force=False)
+    pte._decide_promotion(env, {"id": "t2"}, None, object())
     assert calls.get("model") == config.SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
 
 

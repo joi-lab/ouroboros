@@ -17,8 +17,8 @@ set to zero (owner decision Q1 = A; the background pass keeps its days): G1 thro
 proven drive into ``state/custody_trash``; the maintenance child deletes it, asked at once
 through ``maintenance.child.request``), G2 through ``subagent_worktrees.prune_orphans``/
 ``prune_execution_snapshots``, one copy per call with a stop check between calls (each call
-decides under the ops lock, as the custody cadence does: the registry row, pin and own-body
-verdict logic live there, and a move-aside would need a second row state). It runs on its own
+decides under that copy's record lock, as the custody cadence does: the record, pin and own-body
+verdict logic live there, and a move-aside would need a second record state). It runs on its own
 thread and stops between items on the owner's Stop, the server's stop or a closed supervisor
 generation (``_closed``), with no reconcile latch; concurrency is the retirers' own locks. A
 moved folder counts as removed only once its trash entry is gone, "still being deleted"
@@ -26,6 +26,15 @@ meanwhile, and "stuck" once the maintenance child's ``custody_trash`` job record
 entry survived its removal (the child retries it at its next run); free space is read
 fresh on every projection. Words (labels, loss sentences) live in the client with the other
 storage copy; this module reports ids, counts, sizes and typed reasons.
+
+Five more groups hold what no background retirer removes, so only the owner's press frees them
+(the client starts those holding saved work unchecked): G3, reviewer seat homes of tasks proven
+over whose copy is gone (``review_checking_prune.finished_seat_homes``; moved into the custody
+trash like G1); G4, isolated review checkouts no task owns (``orphan_review_checkouts``); G5,
+folders in the copies' root no copy record names; G6, the environment folder of a copy that is
+gone and finished test-run records there; G7, the two Git pins of a writer's saved result whose
+task is over without applying or rejecting it (sized by ``git rev-list --disk-usage``; the
+record and the saved patch stay, the space returns at Git's next prune).
 """
 
 from __future__ import annotations
@@ -33,13 +42,14 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import pathlib
 import shutil
 import subprocess
 import threading
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from ouroboros.utils import utc_now_iso
 
@@ -52,7 +62,13 @@ log = logging.getLogger(__name__)
 
 GROUP_WORK_FOLDERS = "work_folders"
 GROUP_WORKING_COPIES = "working_copies"
-GROUPS = (GROUP_WORK_FOLDERS, GROUP_WORKING_COPIES)
+GROUP_REVIEW_EVIDENCE = "review_evidence"
+GROUP_REVIEW_CHECKOUTS = "review_checkouts"
+GROUP_LOST_COPIES = "lost_copies"
+GROUP_SERVICE_FOLDERS = "service_folders"
+GROUP_RESULT_PINS = "result_pins"
+GROUPS = (GROUP_WORK_FOLDERS, GROUP_WORKING_COPIES, GROUP_REVIEW_EVIDENCE, GROUP_REVIEW_CHECKOUTS,
+          GROUP_LOST_COPIES, GROUP_SERVICE_FOLDERS, GROUP_RESULT_PINS)
 LARGEST_ITEMS = 20
 # A retirer's typed reason -> the owner's reason (the client's sentences): results or messages
 # still being saved (late mail and call records that moved under the pass included: the next pass
@@ -76,7 +92,7 @@ class StorageFreeItem(TypedDict):
 
 
 class StorageFreeGroup(TypedDict):
-    id: str  # work_folders | working_copies
+    id: str  # one of GROUPS
     count: int
     inside_wait: int  # finished less than retention_days ago (the background would still wait)
     in_use: int  # live, pending, unknown or non-terminal: offered nowhere, named here
@@ -123,7 +139,7 @@ class StorageFreeRequest(TypedDict):
     """``POST /api/storage/free``: the plan id the preview answered with and the groups to free of it."""
 
     plan: str
-    groups: List[str]  # work_folders | working_copies
+    groups: List[str]  # ids of GROUPS
 
 
 class _Stopped(Exception):
@@ -131,13 +147,60 @@ class _Stopped(Exception):
 
 
 class _Candidate:
-    __slots__ = ("group", "key", "path", "layout", "inside_wait", "bytes", "unreadable", "name")
+    __slots__ = ("group", "key", "path", "layout", "inside_wait", "bytes", "unreadable", "name", "task", "row")
 
-    def __init__(self, group: str, key: str, path: pathlib.Path, layout: str, *, inside_wait: bool = False) -> None:
+    def __init__(self, group: str, key: str, path: pathlib.Path, layout: str, *, inside_wait: bool = False,
+                 task: str = "", row: Optional[Dict[str, Any]] = None) -> None:
         self.group, self.key, self.path, self.layout, self.inside_wait = group, key, path, layout, inside_wait
         self.bytes: Optional[int] = None  # None until sized, and when the folder could not be listed
         self.unreadable = 0  # entries inside it the sizing could not read
         self.name = key
+        self.task = task  # the owner task its name is read from; none: the folder's name
+        self.row = row or {}  # a copy record (G7 pins)
+
+
+def _sorted_into(group: Dict[str, Any], verdict: str, candidate: "_Candidate") -> None:
+    """A lister's verdict: offered, in use (named only) or unreadable (shown, never freed)."""
+    if verdict == "offer":
+        group["candidates"].append(candidate)
+    else:
+        group["unreadable" if verdict == "unreadable" else "in_use"] += 1
+
+
+def _copy_owner(name: str) -> str:
+    """The owner task a copies-root folder name carries (``dlg_<task>_<snapshot>``, ``body_<task>``, a task id)."""
+    for prefix in ("dlg_", "dlgp_"):
+        if name.startswith(prefix):
+            return name[len(prefix):].rsplit("_", 1)[0]
+    return name[len("body_"):] if name.startswith("body_") else name
+
+
+def _run_finished(run: pathlib.Path) -> bool:
+    """A test-run record whose run ended: its result is written, or its supervisor is provably gone."""
+    from ouroboros.platform_layer import pid_provably_gone
+
+    if (run / "result.json").is_file():
+        return True
+    try:
+        pid = json.loads((run / "owner.json").read_text(encoding="utf-8")).get("supervisor_pid")
+        return isinstance(pid, int) and not isinstance(pid, bool) and pid_provably_gone(pid)
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _pins_size(row: Dict[str, Any]) -> Optional[int]:
+    """Bytes of the objects only this copy's pins reach (Git 2.31+); None when Git cannot say."""
+    from ouroboros.subagent_worktrees import isolated_git_env
+
+    refs = [str(row.get(key) or "") for key in ("baseline_ref", "result_ref") if row.get(key)]
+    try:
+        proc = subprocess.run(["git", "rev-list", "--disk-usage", "--objects", *refs, "--not",
+                               *(f"--exclude={ref}" for ref in refs), "--all"],
+                              cwd=str(row.get("git_dir") or row.get("target_root") or "."), capture_output=True,
+                              text=True, timeout=120, env={**isolated_git_env(), "GIT_OPTIONAL_LOCKS": "0"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return int(proc.stdout.strip()) if proc.returncode == 0 and proc.stdout.strip().isdigit() else None
 
 
 def _free_bytes(root: pathlib.Path) -> Optional[int]:
@@ -248,8 +311,8 @@ class FreeSpace:
             "items": [{"id": item.key, "name": item.name, "bytes": item.bytes} for item in ranked],
         }
 
-    def _run_view(self, root: pathlib.Path, run: Dict[str, Any]) -> StorageFreeRun:
-        """The result as it stands now: a moved folder is removed once its trash entry is gone,
+    def _settled(self, root: pathlib.Path, run: Dict[str, Any]) -> Tuple[List[str], List[str], List[str]]:
+        """The run's folders as they stand now, by id: a moved folder is removed once its trash entry is gone,
         stuck once the ``custody_trash`` job recorded that this very entry survived its removal."""
         from ouroboros.task_custody import custody_trash_entries
 
@@ -260,6 +323,11 @@ class FreeSpace:
         deleting = [key for key in run["moved"] if key.split(":", 1)[-1] in waiting]
         stuck = [key for key in run["moved"] if key not in deleting and key.split(":", 1)[-1] in blocked]
         removed = [key for key in run["moved"] if key not in deleting and key not in stuck] + run["removed"]
+        return removed, deleting, stuck
+
+    def _run_view(self, root: pathlib.Path, run: Dict[str, Any], settled: Optional[Tuple[List[str], ...]] = None) -> StorageFreeRun:
+        """The result as it stands now (``_settled``)."""
+        removed, deleting, stuck = settled or self._settled(root, run)
         sizes = run["sizes"]
         return {
             "groups": run["groups"], "selected": run["selected"], "done": run["done"],
@@ -370,22 +438,21 @@ class FreeSpace:
                         group["in_use"] += 1
                     else:
                         group["candidates"].append(_Candidate(GROUP_WORK_FOLDERS, f"{layout}:{task_id}", base / task_id,
-                                                              layout, inside_wait=inside))
+                                                              layout, inside_wait=inside, task=task_id))
             groups.append(group)
+        from ouroboros.subagent_worktrees import _resolve_root, _task_proven_over, list_worktrees, snapshot_released
+
+        rows = list_worktrees(data_dir=root)  # one record read per copy; an unreadable one lists nothing
+        open_ids: Optional[set] = None
+        if any(row.get("kind") == "delegated_exec" for row in rows):
+            try:
+                from ouroboros.delegate_custody import open_snapshot_ids
+
+                open_ids = open_snapshot_ids(root)
+            except Exception:
+                log.debug("Delegated custody unreadable: snapshots stay out of the preview", exc_info=True)
         if GROUP_WORKING_COPIES in self._offered:
-            from ouroboros.subagent_worktrees import list_worktrees, snapshot_released
-
             group = {"id": GROUP_WORKING_COPIES, "candidates": [], "in_use": 0, "unreadable": 0}
-            rows = list_worktrees(data_dir=root)  # the soft reader: a malformed registry lists nothing
-            delegated = [row for row in rows if row.get("kind") == "delegated_exec"]
-            open_ids: Optional[set] = None
-            if delegated:
-                try:
-                    from ouroboros.delegate_custody import open_snapshot_ids
-
-                    open_ids = open_snapshot_ids(root)
-                except Exception:
-                    log.debug("Delegated custody unreadable: snapshots stay out of the preview", exc_info=True)
             for row in rows:
                 if self._closed():
                     raise _Stopped()
@@ -408,21 +475,92 @@ class FreeSpace:
                 if kind != "body_candidate":
                     over = over and live(task_id) is False
                 if over:
-                    group["candidates"].append(_Candidate(GROUP_WORKING_COPIES, f"{kind or 'plain'}:{task_id}", path, kind or "plain"))
+                    group["candidates"].append(_Candidate(GROUP_WORKING_COPIES, f"{kind or 'plain'}:{task_id}", path,
+                                                          kind or "plain", task=task_id))
                 else:
                     group["in_use"] += 1
+            groups.append(group)
+        if {GROUP_REVIEW_EVIDENCE, GROUP_REVIEW_CHECKOUTS} & set(self._offered):
+            from ouroboros import review_checking_prune as seats
+
+            homes = seats.finished_seat_homes(root, live, self._closed)  # one proof per seat task for both groups
+            if GROUP_REVIEW_EVIDENCE in self._offered:
+                group = {"id": GROUP_REVIEW_EVIDENCE, "candidates": [], "in_use": 0, "unreadable": 0}
+                for home, verdict, task_id in homes:
+                    _sorted_into(group, verdict, _Candidate(GROUP_REVIEW_EVIDENCE, f"seat:{home.name}", home, "seat",
+                                                            task=task_id))
+                groups.append(group)
+            if GROUP_REVIEW_CHECKOUTS in self._offered:
+                group = {"id": GROUP_REVIEW_CHECKOUTS, "candidates": [], "in_use": 0, "unreadable": 0}
+                for entry, verdict in seats.orphan_review_checkouts(root, live, homes):
+                    _sorted_into(group, verdict, _Candidate(GROUP_REVIEW_CHECKOUTS, f"checkout:{entry.name}", entry,
+                                                            "checkout"))
+                groups.append(group)
+            if self._closed():
+                raise _Stopped()
+        from ouroboros.unindexed import COPIES
+
+        # Older copies sit at the root, new ones in COPIES, each with its environment and test runs beside it.
+        folders = [_resolve_root(), _resolve_root() / COPIES]
+        listing = [entry for folder in folders if folder.is_dir() and not folder.is_symlink()
+                   and {GROUP_LOST_COPIES, GROUP_SERVICE_FOLDERS} & set(self._offered)
+                   for entry in sorted(folder.iterdir()) if entry.name != COPIES]
+        recorded = {str(pathlib.Path(str(row["path"])).resolve(strict=False)) for row in rows if row.get("path")}
+        if GROUP_LOST_COPIES in self._offered:
+            # A copy's record precedes its folder, so a folder no record names is no copy being made.
+            group = {"id": GROUP_LOST_COPIES, "candidates": [], "in_use": 0, "unreadable": 0}
+            for entry in listing:
+                if (entry.name.startswith(".") or entry.name.endswith(".env") or entry.is_symlink()
+                        or not entry.is_dir() or str(entry.resolve(strict=False)) in recorded):
+                    continue
+                _sorted_into(group, "in_use" if live(_copy_owner(entry.name)) is not False else "offer",
+                             _Candidate(GROUP_LOST_COPIES, f"lost:{entry.name}", entry, "lost"))
+            groups.append(group)
+        if GROUP_SERVICE_FOLDERS in self._offered:
+            group = {"id": GROUP_SERVICE_FOLDERS, "candidates": [], "in_use": 0, "unreadable": 0}
+            for entry in listing:  # a copy's environment folder beside it, once the copy is gone
+                if entry.name.endswith(".env") and entry.is_dir() and not entry.is_symlink() \
+                        and not os.path.lexists(entry.with_name(entry.name[:-len(".env")])):
+                    _sorted_into(group, "in_use" if live(_copy_owner(entry.name[:-len(".env")])) is not False else "offer",
+                                 _Candidate(GROUP_SERVICE_FOLDERS, f"env:{entry.name}", entry, "env"))
+            for runs in (folder / ".test-evidence" for folder in folders):  # runs inside copies without a task drive
+                for run in sorted(runs.iterdir()) if runs.is_dir() and not runs.is_symlink() else ():
+                    if run.is_dir() and not run.is_symlink():
+                        _sorted_into(group, "offer" if _run_finished(run) else "in_use",
+                                     _Candidate(GROUP_SERVICE_FOLDERS, f"test_run:{run.name}", run, "test_run"))
+            groups.append(group)
+        if GROUP_RESULT_PINS in self._offered:
+            # Held by custody (no disposition) while its task is over and its checkout is gone: only the pins remain.
+            group = {"id": GROUP_RESULT_PINS, "candidates": [], "in_use": 0, "unreadable": 0}
+            for row in rows:
+                snap = str(row.get("snapshot_id") or "")
+                if row.get("kind") != "delegated_exec" or not (row.get("baseline_ref") or row.get("result_ref")) \
+                        or os.path.lexists(str(row.get("path") or "")) or (open_ids is not None and snap not in open_ids):
+                    continue  # a checkout is G2's; a snapshot custody releases goes with the custody GC
+                verdict = "unreadable" if open_ids is None else "offer" if _task_proven_over(
+                    str(row.get("task_id") or ""), root, live) else "in_use"
+                _sorted_into(group, verdict, _Candidate(GROUP_RESULT_PINS, f"pins:{snap}", pathlib.Path(
+                    str(row.get("path") or "")), "pins", task=str(row.get("task_id") or ""), row=row))
             groups.append(group)
         return groups
 
     def _size(self, root: pathlib.Path, repo_dir: pathlib.Path, candidates: List[_Candidate]) -> None:
-        """Size every candidate folder in the count child; each answer lands as it is known."""
+        """Size every candidate folder in the count child and every pin pair through Git; each answer
+        lands as it is known."""
         from ouroboros.startup_historical_audit import read_job_lines, spawn_maintenance_job
         from ouroboros.storage import PURPOSE
 
-        by_path = {str(item.path): item for item in candidates}
+        by_path = {str(item.path): item for item in candidates if item.layout != "pins"}
         with self._lock:
             self._progress = {"done": 0, "total": len(candidates)}
-        if not candidates:
+        for item in candidates:
+            if item.layout == "pins":
+                if self._closed():
+                    raise _Stopped()
+                item.bytes = _pins_size(item.row)
+                with self._lock:
+                    self._progress["done"] += 1
+        if not by_path:
             return
         process = spawn_maintenance_job(root, repo_dir, PURPOSE, args=("--size-paths",), stdin=subprocess.PIPE)
         with self._lock:
@@ -472,7 +610,7 @@ class FreeSpace:
             self._size(root, repo_dir, candidates)
             for group in groups:
                 for item in sorted(group["candidates"], key=lambda item: -(item.bytes or 0))[:LARGEST_ITEMS]:
-                    item.name = _title(root, item.key.split(":", 1)[-1]) if item.layout != "delegated" else item.path.name
+                    item.name = _title(root, item.task) if item.task else item.path.name
             with self._lock:
                 self._plan, self._state = {**plan, "finished_at": utc_now_iso()}, "ready"
         except _Stopped:
@@ -501,10 +639,10 @@ class FreeSpace:
                     continue
                 run["selected"] += len(group["candidates"])
                 run["sizes"].update({item.key: item.bytes for item in group["candidates"]})
-                if group["id"] == GROUP_WORK_FOLDERS:
-                    self._free_drives(root, group["candidates"], run)
-                else:
-                    self._free_copies(root, group["candidates"], run)
+                free = {GROUP_WORK_FOLDERS: self._free_drives, GROUP_WORKING_COPIES: self._free_copies,
+                        GROUP_REVIEW_EVIDENCE: self._free_seats, GROUP_REVIEW_CHECKOUTS: self._free_checkouts,
+                        GROUP_RESULT_PINS: self._free_pins}.get(group["id"], self._free_leftovers)
+                free(root, group["candidates"], run)
         except _Stopped:
             run["stopped"] = True
         except Exception as exc:
@@ -513,18 +651,24 @@ class FreeSpace:
         with self._lock:
             self._state = "stopped" if run["stopped"] else "failed" if run["error"] else "done"
             self._plan = {**plan, "finished_at": utc_now_iso()}
-        view = self._run_view(root, run)
-        self._record(root, view, time.monotonic() - started)
+        settled = self._settled(root, run)
+        view = self._run_view(root, run, settled)
+        self._record(root, view, time.monotonic() - started, settled)
         supervisor_row(root, "storage_free", {"phase": self._state, "duration_seconds": round(time.monotonic() - started, 2),
                                                **{key: view[key] for key in ("groups", "selected", "removed", "removed_bytes",
                                                                              "deleting", "stuck", "kept", "free_before", "free_after")}})
 
     @staticmethod
-    def _record(root: pathlib.Path, view: StorageFreeRun, seconds: float) -> None:
+    def _record(root: pathlib.Path, view: StorageFreeRun, seconds: float, settled: Tuple[List[str], ...]) -> None:
         try:
             from ouroboros.server_maintenance import _prune_event
 
-            _prune_event("storage_free", ("removed", "deleting", "kept"), report={**view, "duration_seconds": round(seconds, 2)})
+            # The folders by the ids the preview named them with (a work folder: ``layout:task_id``), as the
+            # cadence's own prune names what it removed: who removed a task's folder is then one search.
+            removed, deleting, stuck = settled
+            _prune_event("storage_free", ("removed", "deleting", "kept"), report={
+                **view, "duration_seconds": round(seconds, 2),
+                "removed_ids": removed, "deleting_ids": deleting, "stuck_ids": stuck})
         except Exception:
             log.debug("storage_free event not recorded", exc_info=True)
 
@@ -597,7 +741,7 @@ class FreeSpace:
             maintenance.child.request()  # the moved drives' deletion is the maintenance child's job
 
     def _free_copies(self, root: pathlib.Path, candidates: List[_Candidate], run: Dict[str, Any]) -> None:
-        """One retirer call per copy, so Stop lands between copies and each ops-lock hold covers
+        """One retirer call per copy, so Stop lands between copies and each record-lock hold covers
         one checkout; a stop leaves the remaining copies as they were."""
         from ouroboros.subagent_worktrees import prune_execution_snapshots, prune_orphans
 
@@ -626,12 +770,132 @@ class FreeSpace:
                 run["kept"][reason] = run["kept"].get(reason, 0) + 1
             self._tick(run, run["done"] + 1)
 
+    def _settle(self, run: Dict[str, Any], item: _Candidate, reason: str, *, moved: bool = False) -> None:
+        """One attempted item of G3-G7: removed (or moved into the trash) when ``reason`` is empty, else kept."""
+        if reason:
+            run["kept"][reason] = run["kept"].get(reason, 0) + 1
+        else:
+            run["moved" if moved else "removed"].append(item.key)
+        self._tick(run, run["done"] + 1)
+
+    def _free_seats(self, root: pathlib.Path, candidates: List[_Candidate], run: Dict[str, Any]) -> None:
+        """G3: each seat home, re-checked under its seat lock, moves into the custody trash."""
+        from ouroboros import maintenance
+        from ouroboros.review_checking_prune import retire_seat_home
+
+        live, proven, moved = self._probe(), {}, False
+        for item in candidates:
+            if self._closed():
+                raise _Stopped()
+            try:
+                reason = retire_seat_home(root, item.path, live, proven) if item.path.is_dir() else ""
+            except ValueError:
+                reason = "unreadable_record"
+            except OSError:
+                reason = "other"
+            moved |= not reason and not item.path.exists()
+            self._settle(run, item, reason, moved=True)
+        if moved:
+            maintenance.child.request()  # the moved homes' deletion is the maintenance child's job
+
+    def _free_checkouts(self, root: pathlib.Path, candidates: List[_Candidate], run: Dict[str, Any]) -> None:
+        """G4: re-judged once under the review prune's pass lock, then removed one by one."""
+        from ouroboros.review_checking_prune import retire_orphan_checkouts
+
+        outcome = retire_orphan_checkouts(root, [item.path for item in candidates], self._probe(), self._closed)
+        for item in candidates:
+            if item.path in outcome:
+                reason = outcome[item.path]
+                self._settle(run, item, "unreadable_record" if reason == "unreadable" else reason)
+        if len(outcome) < len(candidates):
+            raise _Stopped()
+
+    def _free_leftovers(self, root: pathlib.Path, candidates: List[_Candidate], run: Dict[str, Any]) -> None:
+        """G5/G6: folders in the copies' root, each re-checked, then removed in this thread (a linked
+        worktree also leaves its repository's registration)."""
+        from ouroboros.review_checking import CheckingAreaUnavailable, _remove_checking_area
+        from ouroboros.subagent_worktrees import _deletable, _resolve_root, registered_checkout
+
+        live, copies = self._probe(), _resolve_root()
+        for item in candidates:
+            if self._closed():
+                raise _Stopped()
+            path, name = item.path, item.path.name
+            owner = _copy_owner(name[:-len(".env")] if item.layout == "env" else name)
+            if item.layout == "test_run":
+                holds = not _run_finished(path)
+            else:
+                holds = live(owner) is not False or (registered_checkout(path, root) if item.layout == "lost"
+                                                     else os.path.lexists(path.with_name(name[:-len(".env")])))
+            reason = "in_use" if holds else ""
+            if not reason and os.path.lexists(path):  # gone already counts as removed
+                try:
+                    if not _deletable(path, copies):
+                        raise CheckingAreaUnavailable(f"{path} is not inside the copies' root")
+                    _remove_checking_area(path)
+                except (CheckingAreaUnavailable, OSError):
+                    reason = "other"
+            self._settle(run, item, reason)
+
+    def _free_pins(self, root: pathlib.Path, candidates: List[_Candidate], run: Dict[str, Any]) -> None:
+        """G7: each held result's two pins, dropped under its disposition and record locks."""
+        live = self._probe()
+        for item in candidates:
+            if self._closed():
+                raise _Stopped()
+            try:
+                reason = _release_pins(root, item.key.split(":", 1)[1], live)
+            except Exception:
+                log.warning("Pins of %s were not released", item.key, exc_info=True)
+                reason = "other"
+            self._settle(run, item, reason)
+
+
+def _release_pins(root: pathlib.Path, snapshot_id: str, live: Callable[[str], Optional[bool]]) -> str:
+    """Drop one finished writer's baseline and result pins while custody still holds its result
+    undisposed; the record says so and keeps the rest, the saved patch stays. Why not, or ``""``."""
+    from ouroboros import delegate_custody as custody
+    from ouroboros import subagent_worktrees as sw
+    from ouroboros.delegate_custody_current import runs
+    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
+
+    entry = next((row for row in runs(root).values() if row.snapshot_id == snapshot_id), None)
+    if entry is None:
+        return "unreadable_record"
+    lock = custody.disposition_lock_path(root, entry)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = acquire_exclusive_file_lock(lock, timeout_sec=0, owner_aware_stale=True)
+    if fd is None:
+        return "busy"  # an apply, a reject or a collection holds this result
+    try:
+        row = sw.find_execution_snapshot(snapshot_id, root)
+        if row is None or not (row.get("baseline_ref") or row.get("result_ref")):
+            return ""  # already gone
+        if os.path.lexists(str(row.get("path") or "")) or snapshot_id not in custody.open_snapshot_ids(root):
+            return "other"  # a checkout came back, or custody let it go: the custody GC owns it now
+        if not sw._task_proven_over(str(row.get("task_id") or ""), root, live):
+            return "in_use"
+        with sw._record_lock(row["path"], root, op="release_pins", task_id=str(row.get("task_id") or "")):
+            current = sw._record_at(row["path"], root, op="release_pins") or row
+            sw._unpin_snapshot(pathlib.Path(str(current.get("git_dir") or current.get("target_root") or ".")), current)
+            sw._put_record({**{key: value for key, value in current.items()
+                               if key not in ("baseline_ref", "result_ref", "result_sha", "result_tree")},
+                            "pins_released": utc_now_iso()}, root)
+        return ""
+    finally:
+        release_exclusive_file_lock(lock, fd)
+
 
 free = FreeSpace()
 
 
 __all__ = [
     "GROUPS",
+    "GROUP_LOST_COPIES",
+    "GROUP_RESULT_PINS",
+    "GROUP_REVIEW_CHECKOUTS",
+    "GROUP_REVIEW_EVIDENCE",
+    "GROUP_SERVICE_FOLDERS",
     "GROUP_WORKING_COPIES",
     "GROUP_WORK_FOLDERS",
     "FreeSpace",

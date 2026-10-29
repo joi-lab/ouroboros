@@ -354,8 +354,8 @@ def test_page_bars_hold_their_navigation_on_a_desk_and_keep_it_under_the_row_on_
         assert about.evaluate("""el => { const s = el.closest('.app-tab-strip').getBoundingClientRect(), r = el.getBoundingClientRect();
             return r.left >= s.left - 1 && r.right <= s.right + 1; }""")
         assert page.evaluate("document.querySelector('#page-settings').dataset.activeSettingsTab") == 'about'
-        # The macOS window: the bar is the band, its controls centred on it; Widgets keeps the plain band, its first
-        # card one inset (not two) under it.
+        # The macOS window: the bar is the band, its controls centred on it; an empty header (Widgets) is only the
+        # window's handle over the page, and the page's first card sits one inset (not two) under the band.
         _band(page)
         settings_band = page.evaluate(BAR, 'settings')
         assert settings_band['height'] == 52 and abs(settings_band['centres'][0] - 26) <= 1, settings_band
@@ -402,13 +402,17 @@ BOARD_EDGES = """() => {
     const page = document.querySelector('#page-widgets'), band = page.querySelector('.app-page-header');
     const list = page.querySelector('.widgets-scroll'), style = getComputedStyle(list);
     const b = band.getBoundingClientRect(), l = list.getBoundingClientRect();
-    // Every point of the band across the board lands on the plain strip, never on a card or its frame.
+    // Every point of the band across the board lands on the window's handle, never on a card or its frame, even
+    // while a card passes under it.
     const missed = [];
     for (let y = b.top + 1; y < b.bottom; y += 10) for (let x = l.left + 1; x < l.right; x += 20) {
         const hit = document.elementFromPoint(x, y);
         if (hit !== band) missed.push([x, y, hit ? hit.className || hit.tagName : '']);
     }
+    const under = [...page.querySelectorAll('.widgets-card')].some((c) => {
+        const r = c.getBoundingClientRect(); return r.top < b.bottom && r.bottom > b.top; });
     return {scrolled: list.scrollTop, room: list.scrollHeight - list.clientHeight, mask: style.maskImage,
+        padTop: parseFloat(style.paddingTop), under,
         webkitMask: style.webkitMaskImage, band: b.height, empty: band.hasAttribute('data-empty'),
         cursor: getComputedStyle(band).cursor, listTop: l.top, missed: missed.length, first: missed.slice(0, 4),
         frame: page.querySelector('[data-widget-key="gate_skill:cache"] iframe')?.__kept === true,
@@ -419,9 +423,11 @@ BOARD_EDGES = """() => {
 @pytest.mark.parametrize('theme', ['light', 'dark'])
 def test_the_widgets_board_scrolls_with_crisp_edges_under_its_plain_band(engine_ui, theme):
     """The owner's window (1100 × 750, macOS band): scrolled, the board's live cards keep crisp edges where the list
-    cuts them, with no fade (DESIGN "Widgets board"), while other scroll bodies keep `.scroll-fade-y`. The band
-    stays a plain strip above the board, and a frame the owner keeps running is the same frame, never reloaded,
-    across scrolling, another page and a phone width."""
+    cuts them, with no fade (DESIGN "Widgets board"), while other scroll bodies keep `.scroll-fade-y`. The band is
+    the window's, not a row of the page (owner 22.10: the empty strip cut the board): the board starts at the window's
+    top edge, its first row below the band, scrolled cards pass under the band, and a press anywhere in the band still
+    lands on the window's handle. A frame the owner keeps running is the same frame, never reloaded, across
+    scrolling, another page and a phone width."""
     engine = engine_ui['engine']
     settle = '() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))'
     loads = []
@@ -452,8 +458,16 @@ def test_the_widgets_board_scrolls_with_crisp_edges_under_its_plain_band(engine_
         setup_browser.capture(page, f'widgets-board-scrolled-{engine}-{theme}-1100')
         assert edges['scrolled'] == 300 and edges['room'] > 300, edges
         assert edges['mask'] in (None, 'none') and edges['webkitMask'] in (None, 'none'), 'no fade over the cards'
-        assert edges['empty'] and edges['band'] == 52 and edges['listTop'] == 52 and edges['cursor'] == 'auto', edges
+        assert edges['empty'] and edges['band'] == 52 and edges['listTop'] == 0 and edges['cursor'] == 'auto', edges
+        assert edges['padTop'] >= 52 + 16 - 0.5 and edges['under'], edges
         assert not edges['missed'] and edges['frame'] and edges['page'] <= 0, edges
+        # A dragged card: the band lets the pointer through to the board's top edge, where the engine scrolls a drag
+        # upward, and is the window's handle again once the card is dropped.
+        through = """dragging => { const card = document.querySelector('#widgets-list .widgets-card');
+            card.classList.toggle('dragging', dragging); const l = document.querySelector('#page-widgets .widgets-scroll');
+            return Boolean(document.elementFromPoint(l.getBoundingClientRect().left + 40, 10)?.closest('.widgets-scroll')); }"""
+        assert page.evaluate(through, True), 'a drag reaches the board under the band'
+        assert not page.evaluate(through, False), 'at rest the band is the handle'
         # Another page's scroll body keeps the shared fade.
         _goto(page, 'settings')
         settings = page.locator('#page-settings .settings-scroll').element_handle()
@@ -708,6 +722,7 @@ def test_answered_question_keeps_its_choice_and_words_after_reload_without_the_h
         page.locator('#chat-messages .chat-quiz-card[data-quiz-id="q-words"]').wait_for()
         for attempt in ('live', 'reload'):
             if attempt == 'reload':
+                engine_ui['errors'].watch(page)  # the reload may cut off its own reads (tests/ui_console_errors.py)
                 page.reload()
                 page.locator('#chat-messages .chat-quiz-card[data-quiz-id="q-words"]').wait_for()
             views = {view['id']: view for view in page.evaluate(CHOICE_VIEW)}

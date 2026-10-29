@@ -17,7 +17,7 @@ archive cache.
 DOES NOT PROVE — by default, that any vendor harness installs, logs in or runs:
 ``harness install`` is never invoked, a vendor package download is not a toolchain
 fact, and no account exists in CI. This is the Ouroboros half of that path — the
-managed toolchain ``claudexor_daemon.install_missing_harness_cli`` hands to the
+managed toolchain ``claudexor_harness_install.install_missing_harness_cli`` hands to the
 engine — and nothing more.
 
 ``--harness-install codex`` (the Windows consumer lane) then goes one step further,
@@ -290,7 +290,7 @@ def _reports_version(text: str, version: str) -> bool:
 def verify_install_receipt(receipt: Dict[str, Any], harness: str, toolchain: pathlib.Path, *,
                            windows: bool = os.name == "nt") -> pathlib.Path:
     """The installed executable, once the receipt meets the embedding contract and more."""
-    from ouroboros.claudexor_daemon import _valid_install_success
+    from ouroboros.claudexor_harness_install import _valid_install_success
 
     if not _valid_install_success(receipt, harness):
         raise WitnessFailure("harness_receipt_invalid", f"not the embedding-host receipt: {receipt}")
@@ -400,7 +400,7 @@ def harness_install_witness(harness: str, node: pathlib.Path, command: List[str]
     toolchain = pathlib.Path(os.environ["HOME"]).joinpath(*ENGINE_TOOLCHAIN)
     if toolchain.exists():
         raise WitnessFailure("harness_preinstalled", f"{toolchain} exists before any install")
-    from ouroboros.claudexor_daemon import install_missing_harness_cli
+    from ouroboros.claudexor_harness_install import install_missing_harness_cli
     from ouroboros.config import get_claudexor_harness_install_timeout_sec
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 

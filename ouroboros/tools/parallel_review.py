@@ -154,7 +154,8 @@ def _format_coupling_advisory_msg(outcome) -> str:
 def _commit_review_retry_key(
     ctx, commit_message, *, goal, scope, review_rebuttal, binding_fingerprint="",
 ):
-    """Bind one logical review cycle to canonical staged material and intent."""
+    """Bind one logical review cycle to canonical staged material and intent (an author-named
+    ``since_review`` included, only when given; host observations never)."""
     material = str(binding_fingerprint or "").strip()
     if not material:
         try:
@@ -171,6 +172,7 @@ def _commit_review_retry_key(
         "goal": goal, "scope": scope,
         "rebuttal": hashlib.sha256(str(review_rebuttal or "").encode()).hexdigest(),
         "contract": str(getattr(ctx, "_current_review_contract_fingerprint", "") or ""),
+        **({"since_review": ctx._review_since} if getattr(ctx, "_review_since", "") else {}),
     }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 

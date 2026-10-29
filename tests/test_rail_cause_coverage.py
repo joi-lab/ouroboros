@@ -230,7 +230,7 @@ def test_the_kill_notice_leads_with_the_cause_and_keeps_the_typed_task_done(qenv
     tr.reap_timed_out_task({
         "worker_id": 0, "proc": None, "task_id": "reap1", "task": {"id": "reap1", "chat_id": 4},
         "task_type": "chat", "terminal_reason": "absolute_ceiling", "attempt": 3, "owner_chat_id": 0,
-        "runtime_sec": 10.0, "will_retry": False, "ceiling_reached": True,
+        "runtime_sec": 10.0, "ceiling_reached": True,
     })
     (chat_id, text, kw), = sent
     assert chat_id == 4

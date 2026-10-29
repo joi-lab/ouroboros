@@ -51,6 +51,30 @@ def test_one_carrier_is_produced_for_new_roots_and_read_back_everywhere(tmp_path
     assert resolve_project_id({"workspace_root": str(tmp_path), "metadata": {}}).startswith("proj_")
 
 
+def test_only_a_matching_host_late_answer_snapshot_attributes_new_roots():
+    from copy import deepcopy
+    from ouroboros.dialogue_provenance import (
+        presence_binding_authority_metadata, presence_metadata_binding, presence_root_carrier,
+    )
+
+    block = {"quiz_id": "question", "state": "answered", "answered_after_terminal": True,
+             "presence_contact": {"task_id": "source", "binding_id": BINDING, "source_event_id": "event"}}
+    owner = {"late_answer": {"task_id": "source", "quiz_id": "question",
+                            "answer_snapshot": {"task_id": "source", "quiz": block}}}
+    assert presence_metadata_binding(owner) is None
+    assert presence_binding_authority_metadata(owner) == {}, "the owner's delegates retain owner authority"
+    assert presence_root_carrier(owner) == {"presence_binding_authority": {"binding_id": BINDING}}
+    for path, value in [("quiz_id", "other"), ("state", "open"), ("answered_after_terminal", False)]:
+        changed = deepcopy(owner)
+        changed["late_answer"]["answer_snapshot"]["quiz"][path] = value
+        assert presence_root_carrier(changed) == {}
+    lost = deepcopy(owner)
+    lost["late_answer"]["answer_snapshot"]["quiz"]["presence_contact"]["task_id"] = "other"
+    assert presence_root_carrier(lost) == {}
+    assert presence_root_carrier(owner, task_contract={"capability_ceiling": {}}) == {
+        "presence_binding_authority": {"binding_id": ""}}
+
+
 def test_a_presence_childs_promote_and_follow_up_stay_its_bindings_work_under_the_ceiling(tmp_path, monkeypatch):
     """A delegated descendant carries the binding, not the speaker. The real promote tool,
     the real supervisor admission, the readers, steer and a follow-up of that root keep

@@ -38,7 +38,7 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 SEEDS = REPO / "skills"
 UNIX = "unix_computer_use"
 WINDOWS = "windows_computer_use"
-EVERYWHERE = ["ui_design", "design_demo", "templates", "device_voice"]  # on by default on every host
+EVERYWHERE = ["ui_design", "templates", "device_voice"]  # on by default on every host
 UNIX_043 = "1e237c1bc89f0600a7362f69eddafdff4ddd1f2d"  # official history: os any, permissions with net
 log = logging.getLogger(__name__)
 
@@ -503,8 +503,9 @@ def test_a_dirty_tree_is_reconciled_without_a_receipt(seed_repo):
 def test_a_failed_phase_writes_no_receipt_and_the_next_boot_retries(seed_repo, monkeypatch, phase):
     repo, drive = seed_repo
     ensure(repo, drive)
+    shutil.rmtree(repo / "skills" / "second")  # merged into `first`: retired only by a pass where `first` arrived
     _write(repo / "skills", "first", "1.1.0")
-    _git(repo, "commit", "-qam", "first 1.1.0")
+    _git(repo, "commit", "-qam", "first 1.1.0 takes in second")
     if phase == "reseed":
         real = skill_builtin.install_builtin_skill
         monkeypatch.setattr(skill_builtin, "install_builtin_skill",
@@ -514,6 +515,7 @@ def test_a_failed_phase_writes_no_receipt_and_the_next_boot_retries(seed_repo, m
 
     ensure(repo, drive)
     assert receipt(drive) is None  # the stale receipt went before the pass; none replaced it
+    assert (drive / "skills" / "native" / "second" / ".seed-origin").is_file(), "the retired partner waits"
 
     monkeypatch.undo()
     monkeypatch.setattr("ouroboros.config.SETTINGS_PATH", drive / "settings.json")
@@ -521,7 +523,7 @@ def test_a_failed_phase_writes_no_receipt_and_the_next_boot_retries(seed_repo, m
     if phase == "reseed":
         assert skill_builtin.install_builtin_skill is real
     ensure(repo, drive)
-    assert receipt(drive) is not None
+    assert receipt(drive) is not None and not (drive / "skills" / "native" / "second").exists()
     assert skill_builtin._version(drive / "skills" / "native" / "first") == "1.1.0"
 
 
@@ -827,7 +829,7 @@ def test_an_existing_unix_copy_is_turned_on_once_unless_the_owner_chose(data, mo
 
     _boot(data, monkeypatch)
 
-    assert skill_builtin._version(native / UNIX) == "0.5.1"
+    assert skill_builtin._version(native / UNIX) == "0.5.3"
     assert load_enabled(data, UNIX) is (choice is None)
     assert (state / "connections.json").read_bytes() == connections
     if choice is None:

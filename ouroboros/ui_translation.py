@@ -201,7 +201,10 @@ def _usage_scope(drive_root: pathlib.Path):
 
 def _call_light(drive_root: pathlib.Path, messages: List[Dict[str, Any]], *, client: Any = None,
                 cache_affinity: str = "") -> Tuple[str, str]:
-    """One accounted light call. Returns ``(content, stop)``; raises on transport failure."""
+    """One accounted call; one deadline covers preparation, slot waiting and recovery.
+
+    Returns ``(content, stop)``; raises on transport failure so the batch can requeue.
+    """
     from ouroboros import model_concurrency
     from ouroboros.llm import LLMClient
     from ouroboros.llm_observability import chat_observed
@@ -220,6 +223,7 @@ def _call_light(drive_root: pathlib.Path, messages: List[Dict[str, Any]], *, cli
                 client or LLMClient(), drive_root=drive_root, task_id=SYSTEM_TASK_ID, call_type=USAGE_CATEGORY,
                 messages=messages, model=model, tools=None, reasoning_effort="low", model_role="light",
                 max_tokens=UI_TRANSLATION_MAX_TOKENS, use_local=use_local, timeout=remaining,
+                caller_deadline_ts=deadline_ts,
                 response_format={"type": "json_object"}, cache_affinity=cache_affinity)
     body_error = (usage or {}).get("provider_error")
     if isinstance(body_error, dict) and body_error:

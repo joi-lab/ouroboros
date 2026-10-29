@@ -11,15 +11,34 @@ function getStack(host = null) {
         stack.setAttribute('aria-live', 'polite');
         stack.setAttribute('aria-relevant', 'additions');
         (host || document.body).appendChild(stack);
+        // A window that grows or shrinks cuts the column or releases it with no notice coming or going.
+        if (!host && typeof ResizeObserver === 'function') new ResizeObserver(() => markCut(stack)).observe(stack);
     }
     return stack;
 }
 
+// The page's stack ends above the screen's bottom and scrolls past it (style.css); cut there, it is reached by
+// keyboard too, as a wide table is (docs/DESIGN.md). Measured when a notice comes or goes and when the column's box
+// changes size; room stacks keep their place.
+function markCut(stack) {
+    if (stack.id !== 'toast-stack') return;
+    const cut = stack.scrollHeight > stack.clientHeight;
+    if (cut === stack.hasAttribute('tabindex')) return;
+    if (cut) {
+        stack.tabIndex = 0;
+        stack.setAttribute('role', 'region');
+        stack.setAttribute('aria-label', 'Scrollable notices');
+    } else {
+        ['tabindex', 'role', 'aria-label'].forEach((name) => stack.removeAttribute(name));
+    }
+}
+
 /**
- * One toast; a press anywhere on it dismisses it. `ttl` 0 keeps it until then. `action` ({label, run}) adds one
- * button that dismisses the toast and runs (a recovery notice's way back, host_modules.js). `dismissLabel` adds an
- * accessible close button; hover or focus pauses the auto-dismiss timer. An error toast answers the owner's own
- * action and plays Telegram's error haptic (haptics.js); a notice the owner did not cause passes `{ haptic: false }`.
+ * One toast; a press anywhere on it dismisses it, a scroll over it never does. `ttl` 0 keeps it until then. `action`
+ * ({label, run}) adds one button that dismisses the toast and runs (a recovery notice's way back, host_modules.js).
+ * `dismissLabel` adds an accessible close button, the words beside it in their own box; hover or focus pauses the
+ * auto-dismiss timer. An error toast answers the owner's own action and plays Telegram's error haptic (haptics.js); a
+ * notice the owner did not cause passes `{ haptic: false }`.
  * Optional `host` confines the stack above a room's composer. Its owner calls the returned node's `dispose()` on teardown.
  */
 export function showToast(message, tone = 'info', { ttl = 6000, action = null, haptic: felt = true, dismissLabel = '', host = null } = {}) {
@@ -29,7 +48,12 @@ export function showToast(message, tone = 'info', { ttl = 6000, action = null, h
     if (felt && cleanTone === 'danger') haptic('error');
     toast.className = `toast toast-${cleanTone}`;
     toast.setAttribute('role', cleanTone === 'danger' ? 'alert' : 'status');
-    toast.textContent = message || '';
+    const words = dismissLabel ? document.createElement('span') : toast;
+    if (words !== toast) {
+        words.className = 'toast-words';
+        toast.append(words);
+    }
+    words.textContent = message || '';
     let timer = 0;
     let removalTimer = 0;
     let hovered = false;
@@ -40,6 +64,7 @@ export function showToast(message, tone = 'info', { ttl = 6000, action = null, h
         clearTimeout(removalTimer);
         globalThis.window?.removeEventListener?.('pagehide', dispose);
         toast.remove();
+        markCut(stack);
     };
     toast.dispose = dispose;
     const dismiss = () => {
@@ -50,7 +75,7 @@ export function showToast(message, tone = 'info', { ttl = 6000, action = null, h
         // shift is measured here, the glide is the stylesheet's (none with reduced motion).
         const stay = [...(stack.children || [])].filter((el) => el !== toast);
         const before = stay.map((el) => el.offsetTop);
-        Object.assign(toast.style, { position: 'absolute', top: `${toast.offsetTop}px`, right: '0', width: `${toast.offsetWidth}px` });
+        Object.assign(toast.style, { position: 'absolute', top: `${toast.offsetTop}px`, left: `${toast.offsetLeft}px`, width: `${toast.offsetWidth}px` });
         toast.classList.add('is-hiding');
         const moved = stay.filter((el, i) => {
             const shift = before[i] - el.offsetTop;
@@ -90,6 +115,7 @@ export function showToast(message, tone = 'info', { ttl = 6000, action = null, h
         toast.append(close);
     }
     stack.appendChild(toast);
+    markCut(stack);
     if (ttl > 0) {
         toast.addEventListener('pointerenter', () => { hovered = true; clear(); });
         toast.addEventListener('pointerleave', () => { hovered = false; arm(); });

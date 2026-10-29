@@ -302,6 +302,75 @@ def test_threads_keep_fifo_and_capacity(monkeypatch, isolated_queue):
     assert order == [0, 1, 2, 3]
 
 
+def test_a_turn_the_owner_awaits_goes_ahead_of_background_calls_not_yet_started(monkeypatch, isolated_queue):
+    """A call of a turn the owner awaits takes the next free slot before background calls still waiting; the call
+    holding the slot keeps it, and awaited and background calls each keep their arrival order."""
+    monkeypatch.setenv("OUROBOROS_MODEL_MAX_CONCURRENCY", "1")
+    monkeypatch.setattr(mc, "_owner_awaits", lambda: threading.current_thread().name.startswith("owner"))
+    order, errors = [], []
+
+    def run():
+        try:
+            with mc.model_call_slot("model", route=ROUTE):
+                order.append(threading.current_thread().name)
+        except BaseException as error:
+            errors.append(error)
+
+    threads = []
+    with mc.model_call_slot("model", route=ROUTE):  # a background call already holds the one slot
+        for count, name in enumerate(("background-1", "owner-1", "background-2", "owner-2"), start=1):
+            thread = threading.Thread(target=run, name=name)
+            threads.append(thread)
+            thread.start()
+            _until(lambda: len(_records(isolated_queue, "ticket")) == count)
+        assert not order
+    for thread in threads:
+        thread.join(35)
+        assert not thread.is_alive()
+    assert not errors
+    assert order == ["owner-1", "owner-2", "background-1", "background-2"]
+
+
+def test_only_a_direct_turn_the_owner_awaits_counts_as_awaited():
+    """The queue's predicate is the turn receipt's: a direct turn the owner's door stamped; a wake, a Presence
+    correspondent's turn and a promoted root task the owner also awaits all queue as background calls."""
+    from types import SimpleNamespace
+
+    from ouroboros import model_wait
+
+    ref = {"chat_id": 1, "client_message_id": "c1", "ts": "2026-10-26T12:00:00+00:00"}
+    cases = [({"_is_direct_chat": True, "metadata": {"origin_message_ref": ref}}, True),
+             ({"_is_direct_chat": True, "metadata": {"source": "consciousness"}}, False),
+             ({"_is_direct_chat": True, "metadata": {"origin_message_ref": ref, "presence": {"room": "r"}}}, False),
+             ({"type": "task", "metadata": {"origin_message_ref": ref}}, False)]
+    for task, awaited in cases:
+        token = model_wait._CURRENT.set(SimpleNamespace(task=task))
+        try:
+            assert model_wait.owner_awaits_current_call() is awaited, task
+            assert mc._owner_awaits() is awaited
+        finally:
+            model_wait._CURRENT.reset(token)
+    assert model_wait.owner_awaits_current_call() is False  # no bound task: a background call
+
+
+def test_the_same_turn_s_work_after_its_answer_queues_as_background(tmp_path):
+    """After the answer, the turn's post-task worker (synthesis, memory drafts, scratchpad consolidation) keeps the
+    turn's wait owner but no longer prepares a reply: a new owner turn must not wait behind it."""
+    from types import SimpleNamespace
+
+    from ouroboros import model_wait
+    from ouroboros.usage_accounting import UsageScope, usage_scope
+
+    ref = {"chat_id": 1, "client_message_id": "c1", "ts": "2026-10-26T12:00:00+00:00"}
+    token = model_wait._CURRENT.set(SimpleNamespace(task={"_is_direct_chat": True, "metadata": {"origin_message_ref": ref}}))
+    try:
+        for category, awaited in (("task", True), ("post_task", False), ("consolidation", False), ("web_search", True)):
+            with usage_scope(UsageScope(drive_root=tmp_path, category=category, source="probe")):
+                assert model_wait.owner_awaits_current_call() is awaited, category
+    finally:
+        model_wait._CURRENT.reset(token)
+
+
 def test_async_cancellation_has_no_orphan_ticket(monkeypatch, isolated_queue):
     monkeypatch.setenv("OUROBOROS_MODEL_MAX_CONCURRENCY", "1")
 

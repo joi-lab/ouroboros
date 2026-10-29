@@ -667,7 +667,7 @@ def test_classify_skips_xdist_diagnoses_on_a_non_parallel_pass():
     (4, "pytest: error: unrecognized arguments: -n auto --dist loadscope\n",
      "PREFLIGHT_PLUGIN_MISSING", "pyproject.toml", "unrecognized arguments"),
     (1, "worker gw3 crashed while running 'tests/test_x.py::test_y'\n",
-     "PARALLEL_WORKER_CRASH", "@pytest.mark.serial", "worker gw3 crashed"),
+     "PARALLEL_WORKER_CRASH", "nothing recorded why", "worker gw3 crashed"),
 ])
 def test_hard_block_remediation_survives_caller_truncation(
     returncode, output, label, remediation_marker, body_marker
@@ -694,66 +694,102 @@ def test_hard_block_remediation_survives_caller_truncation(
     )
 
 
+_CALLBACK_LINE = ("[gw0] pytest-timeout callback invoked (300s) while running 'tests/test_slow.py::test_slow'; "
+                  "worker subsequently lost\n")
+# A pass's own results.json (tests/ci_evidence.py): the worker recorded dead and its matched crash row.
+_RECORDED = {"worker_crash": {"worker": "gw0"}, "reports": [
+    {"nodeid": "tests/test_slow.py::test_slow", "phase": "crash", "outcome": "failed", "error_type": "WorkerCrash",
+     "worker": "gw0", "timeout_callback_seconds": 300.0}]}
+
+
 def test_per_test_timeout_kill_is_not_told_to_mark_the_test_serial():
-    """pytest-timeout's thread method (Windows) does not FAIL a slow test — it
-    `os._exit`s the whole worker, which xdist reports with its crash phrasing.
-    The generic remediation would then tell the author to mark a merely-slow
-    test `@pytest.mark.serial`, which only moves the hang: the serial pass
-    carries the same per-test timeout. Same hard block, different instruction."""
+    """pytest-timeout's thread method does not FAIL a slow test: it `os._exit`s the
+    whole worker, which xdist reports with its crash phrasing. Its banner goes to the
+    worker's stdout, which execnet discards (#1949), so the cause comes from this pass's
+    own crash row, which names the timeout only for the record that worker's callback
+    left. Marking the test serial would only move the hang: the serial pass carries the
+    same per-test timeout. Same hard block, different instruction."""
     from ouroboros.preflight_runner import _classify_pass_result
 
-    output = (
-        "+++++++++++++++++++++++++++ Timeout +++++++++++++++++++++++++++\n"
-        "~~~~~~~~~~~~~~ Stack of MainThread (123) ~~~~~~~~~~~~~~\n"
-        '  File "tests/test_slow.py", line 4, in test_slow\n'
-        "    time.sleep(600)\n"
-        "+++++++++++++++++++++++++++ Timeout +++++++++++++++++++++++++++\n"
-        "[gw0] node down: Not properly terminated\n"
-        "worker gw0 crashed and worker restarting disabled\n"
-    )
-    result = _classify_pass_result("parallel", 1, output, 8000, parallel=True)
+    output = (".[gw0] node down: Not properly terminated\n" + _CALLBACK_LINE
+              + "worker gw0 crashed and worker restarting disabled\n"
+              + "worker 'gw0' crashed while running 'tests/test_sl\n")
+    result = _classify_pass_result("parallel", 1, output, 8000, parallel=True, recorded=_RECORDED)
 
     assert result is not None
-    assert "PARALLEL_WORKER_CRASH" in result, "a killed worker is still a hard block"
-    assert "300s per-test limit" in result
+    assert "PARALLEL_WORKER_CRASH" in result, "a lost worker is still a hard block"
     assert "faster or split" in result
     assert "Do NOT mark it @pytest.mark.serial" in result, (
         "the serial pass carries the same per-test timeout, so the wrong instruction only relocates the hang"
     )
-    assert "Find the test that spawns a real process" not in result, (
-        "the generic crash remediation must not be emitted for a timeout kill"
-    )
-    assert "never a flake/retry" not in result
-    # The evidence the author needs is still there.
-    assert "time.sleep(600)" in result
+    assert "nothing recorded why" not in result and "never a flake/retry" not in result
+    assert "tests/test_slow.py::test_slow" in result  # The evidence the author needs is still there.
 
 
-def test_signal_method_timeout_banner_also_avoids_the_serial_remediation():
-    """The signal method (the default with SIGALRM) spells the same event
-    `Failed: Timeout >300.0s`; a crash beside it keeps the timeout diagnosis."""
+@pytest.mark.parametrize("evidence", [
+    # The thread method's banner never reaches the controller from a worker; text alone proves nothing.
+    "+++++++++++++++++++++++++++ Timeout +++++++++++++++++++++++++++\n",
+    # The signal method fails its test and the worker lives on: that line cannot explain a crash.
+    "E   Failed: Timeout >300.0s\n",
+    _CALLBACK_LINE.replace("[gw0]", "[gw1]"),  # another worker's timeout
+    _CALLBACK_LINE,  # even the dead worker's own line: any test can print it
+], ids=["thread-banner", "signal-failure", "another-worker", "dead-workers-line"])
+def test_timeout_text_beside_a_crash_does_not_name_its_cause(evidence):
+    """Printed text names no cause. A banner, a signal-method failure or a controller
+    line beside the crash leave it unknown without the pass's own record, and an
+    unknown cause asks for a diagnosis instead of prescribing serial."""
     from ouroboros.preflight_runner import _classify_pass_result
 
-    output = "E   Failed: Timeout >300.0s\nworker gw2 crashed while running 'tests/test_slow.py::test_slow'\n"
+    output = evidence + "worker gw0 crashed while running 'tests/test_x.py::test_y'\n"
     result = _classify_pass_result("parallel", 1, output, 8000, parallel=True)
 
     assert "PARALLEL_WORKER_CRASH" in result
-    assert "Find the test that spawns a real process" not in result
-    assert "300s per-test limit" in result
+    assert "nothing recorded why" in result and "faster or split" not in result
 
 
-def test_genuine_crash_still_gets_the_mark_it_serial_remediation():
-    """The timeout branch must not swallow the ordinary case: a worker that dies
-    with no pytest-timeout banner is the real-process/port/global-state class,
-    and `@pytest.mark.serial` IS the fix for it."""
+@pytest.mark.parametrize("change", [
+    {"worker_crash": None}, {"worker_crash": {"worker": "gw1"}}, {"reports": []},
+    {"reports": 1}, {"reports": "malformed"},
+    {"reports": [{**_RECORDED["reports"][0], "timeout_callback_seconds": None}]},
+    {"reports": [{**_RECORDED["reports"][0], "timeout_callback_seconds": "300"}]},
+    {"reports": [{**_RECORDED["reports"][0], "worker": None}]},
+    {"reports": [*_RECORDED["reports"], {**_RECORDED["reports"][0], "worker": "gw1", "timeout_callback_seconds": None}]},
+], ids=["no-dead-worker", "dead-worker-unmatched", "no-crash-row", "integer-reports", "string-reports", "unmatched-row", "malformed-seconds",
+        "row-without-worker", "one-of-two-unmatched"])
+def test_a_crash_names_a_timeout_only_from_its_own_recorded_rows(change):
+    from ouroboros.preflight_runner import _classify_pass_result
+
+    output = "worker gw0 crashed and worker restarting disabled\n" + _CALLBACK_LINE
+    assert "faster or split" in _classify_pass_result("parallel", 1, output, 8000, parallel=True, recorded=_RECORDED)
+    result = _classify_pass_result("parallel", 1, output, 8000, parallel=True, recorded={**_RECORDED, **change})
+    assert "nothing recorded why" in result and "faster or split" not in result
+
+
+def test_a_pass_without_its_own_readable_results_has_no_record(tmp_path):
+    from ouroboros import preflight_runner as pr
+
+    assert pr._recorded_session(tmp_path) is None  # no controller of this pass located one
+    pr._results_pointer(tmp_path).write_text(str(tmp_path / "evidence"), encoding="utf-8")
+    assert pr._recorded_session(tmp_path) is None  # located, never exported
+    (tmp_path / "evidence").mkdir()
+    for torn in ("{torn", "[]"):
+        (tmp_path / "evidence" / "results.json").write_text(torn, encoding="utf-8")
+        assert pr._recorded_session(tmp_path) is None
+
+
+def test_unrecorded_crash_asks_for_a_diagnosis_before_any_serial_mark():
+    """A worker that dies with no record of why may be a native crash, an OS kill,
+    an os._exit or a timeout nothing recorded. Serial fixes only the shared-resource
+    class, so the gate asks for the cause first and never for a retry."""
     from ouroboros.preflight_runner import _classify_pass_result
 
     output = "worker gw0 crashed and worker restarting disabled\n"
     result = _classify_pass_result("parallel", 1, output, 8000, parallel=True)
 
     assert "PARALLEL_WORKER_CRASH" in result
-    assert "@pytest.mark.serial" in result
+    assert "nothing recorded why" in result and "Rerun the test" in result
     assert "never a flake/retry" in result
-    assert "300s per-test limit" not in result
+    assert "faster or split" not in result
 
 
 def test_crash_diagnosis_keeps_the_full_pytest_output():
@@ -866,11 +902,11 @@ def test_crash_pattern_still_matches_the_mid_line_short_summary_form():
 
 
 def test_a_genuine_crash_is_not_reclassified_by_timeout_text_elsewhere_in_the_output():
-    """`_crash_remediation` INVERTS the instruction, so its patterns must be as
-    tight as the crash patterns. Matching a bare `Timeout >30s` anywhere in the
-    pass output let one unrelated test's assertion text rewrite a real crash's
-    remediation into "make it faster, do NOT mark it serial" — the one
-    instruction that leaves the real-process test breaking every parallel run."""
+    """The timeout instruction INVERTS the serial one, so no output text may select
+    it. Matching a bare `Timeout >30s` anywhere in the pass output let one
+    unrelated test's assertion text rewrite a real crash's remediation into
+    "make it faster, do NOT mark it serial" — the one instruction that leaves
+    the real-process test breaking every parallel run."""
     from ouroboros.preflight_runner import _classify_pass_result
 
     output = (
@@ -881,9 +917,9 @@ def test_a_genuine_crash_is_not_reclassified_by_timeout_text_elsewhere_in_the_ou
     result = _classify_pass_result("parallel", 1, output, 8000, parallel=True)
 
     assert "PARALLEL_WORKER_CRASH" in result
-    assert "@pytest.mark.serial" in result, "a real crash lost its mark-it-serial fix"
+    assert "nothing recorded why" in result, "a real crash lost its request for a diagnosis"
     assert "never a flake/retry" in result
-    assert "300s per-test limit" not in result
+    assert "faster or split" not in result
 
 
 def test_diagnosis_keeps_the_failure_summary_tail_when_output_is_cut():
@@ -3126,8 +3162,8 @@ def test_hermetic_pytest_reaps_owned_children_and_preserves_unrelated_process(
 
 @requires_preflight_plugins
 def test_worker_crash_is_hard_block(tmp_path, two_pass_env):
-    """A dead xdist worker is a HARD BLOCK with mark-it-serial remediation, never
-    an ordinary failure and never a retryable flake. Fail-fast: no pass 2."""
+    """A dead xdist worker is a HARD BLOCK whose unrecorded cause is to be diagnosed,
+    never an ordinary failure and never a retryable flake. Fail-fast: no pass 2."""
     from ouroboros.preflight_runner import run_hermetic_pytest
 
     marker_serial = tmp_path / "ran_serial.txt"
@@ -3156,9 +3192,74 @@ def test_worker_crash_is_hard_block(tmp_path, two_pass_env):
 
     assert result is not None, "a crashed worker must block the commit"
     assert "PARALLEL_WORKER_CRASH" in result, result
-    assert "@pytest.mark.serial" in result, result
+    assert "nothing recorded why" in result, result
     assert "never a flake/retry" in result, result
     assert not marker_serial.exists(), "fail-fast broken: the serial pass ran after a red pass 1"
+
+
+def _gate_pass(tmp_path, monkeypatch, source):
+    """One red gate run through its own loop, nonce probe and parallel pass, over a candidate whose
+    plugins are this checkout's tests/conftest.py and whose pytest-timeout method is the thread one
+    (Windows' default): (verdict, every record the loop read for its classifier)."""
+    from ouroboros import preflight_runner as pr
+
+    repo = _make_repo(tmp_path, {
+        "pytest.ini": _FIXTURE_PYTEST_INI + "timeout_method = thread\n", "tests/test_case.py": source,
+        "conftest.py": f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\npytest_plugins = ['tests.conftest']\n"})
+    read, original = [], pr._recorded_session
+    monkeypatch.setattr(pr, "_recorded_session", lambda root: read.append(original(root)) or read[-1])
+    return pr.run_hermetic_pytest(repo, timeout=120), read
+
+
+@requires_preflight_plugins
+def test_thread_timeout_worker_loss_is_named_from_the_callback_record(tmp_path, monkeypatch, two_pass_env):
+    """#1949 through the gate's own loop: the thread method's banner dies with the worker's
+    stdout, so the cause reaches the gate as this pass's crash row, which its controller
+    attributed from the record that worker's callback left and the loop hands its classifier."""
+    result, _ = _gate_pass(tmp_path, monkeypatch, """
+        import time
+        import pytest
+        @pytest.mark.timeout(2)
+        def test_slow():
+            time.sleep(60)
+        class TestOther:
+            def test_quick(self):
+                pass
+    """)
+    assert "PARALLEL_WORKER_CRASH" in result and "faster or split" in result, result
+    assert "pytest-timeout callback invoked (2s) while running '" in result, result  # its readable display
+
+
+@requires_preflight_plugins
+def test_a_printed_timeout_line_names_no_cause_for_another_workers_crash(tmp_path, monkeypatch, two_pass_env):
+    """A test prints the controller's timeout line, for both worker ids, straight to the
+    controller's stderr while its neighbour's worker calls os._exit. That pass's crash row
+    names no timeout, so the printed line attributes nothing and the cause stays unknown."""
+    flag = tmp_path / "printed"
+    result, read = _gate_pass(tmp_path, monkeypatch, f"""
+        import os, sys, time
+        from pathlib import Path
+        def test_prints_the_line(capsys):
+            with capsys.disabled():
+                sys.stderr.write("\\n" + "".join(
+                    f"[gw{{n}}] pytest-timeout callback invoked (2s) while running "
+                    f"'tests/test_case.py::TestNeighbour::test_exits'; worker subsequently lost\\n" for n in (0, 1)))
+            Path({str(flag)!r}).write_text("printed", encoding="utf-8")
+        class TestNeighbour:
+            def test_exits(self):
+                deadline = time.monotonic() + 30
+                while not Path({str(flag)!r}).exists():
+                    assert time.monotonic() < deadline
+                    time.sleep(0.05)
+                os._exit(3)
+    """)
+    assert "[gw0] pytest-timeout callback invoked (2s)" in result, result  # the printed line reached the gate
+    assert len(read) == 1 and read[0] is not None, result  # the loop read this pass's own record
+    crashes = [row for row in read[0]["reports"] if row["phase"] == "crash"]
+    assert [(row["nodeid"], "timeout_callback_seconds" in row) for row in crashes] == [
+        ("tests/test_case.py::TestNeighbour::test_exits", False)], read
+    assert "PARALLEL_WORKER_CRASH" in result and "nothing recorded why" in result, result
+    assert "faster or split" not in result
 
 
 @requires_preflight_plugins

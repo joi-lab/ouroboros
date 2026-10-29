@@ -29,7 +29,8 @@ test('enabled consciousness keeps historical pause and unknown wake outcomes vis
         const line = () => env.doc.getElementById('evo-consciousness');
         // A paused or unknown wake-up goes on by itself: the neutral sentence, never the owner's amber.
         for (const [next, label, tone] of [['wake_paused', 'paused', 'neutral'],
-            ['wake_outcome_unknown', 'unknown', 'neutral'], ['sleeping', 'sleeping', 'ok'], ['disabled', 'off', 'neutral']]) {
+            ['wake_outcome_unknown', 'unknown', 'neutral'], ['sleeping', 'sleeping', 'ok'], ['due', 'due', 'ok'],
+            ['future_status', 'off', 'neutral'], ['disabled', 'off', 'neutral']]) {
             status = next;
             ws.emit('open');
             await flush();
@@ -40,8 +41,9 @@ test('enabled consciousness keeps historical pause and unknown wake outcomes vis
         translate({ language: 'ru', english: false, entries: {
             'code:consciousness.wake_paused': { text: 'приостановлено', provenance: 'imported' },
             'code:consciousness.wake_outcome_unknown': { text: 'исход неизвестен', provenance: 'imported' },
+            'code:consciousness.due': { text: 'пора', provenance: 'imported' },
         } });
-        for (const [next, label] of [['wake_paused', 'приостановлено'], ['wake_outcome_unknown', 'исход неизвестен']]) {
+        for (const [next, label] of [['wake_paused', 'приостановлено'], ['wake_outcome_unknown', 'исход неизвестен'], ['due', 'пора']]) {
             status = next; ws.emit('open'); await flush();
             assert.equal(line().textContent, `Consciousness ${label}`);
         }
@@ -55,7 +57,7 @@ test('enabled consciousness keeps historical pause and unknown wake outcomes vis
 
 test("a runtime tone is amber only for the owner's move: a first conversation, the owner's chat, a spending stop", () => {
     const tones = {
-        ok: ['running', 'queued', 'idle_ready', 'thinking', 'sleeping'],
+        ok: ['running', 'queued', 'idle_ready', 'thinking', 'sleeping', 'due'],
         warn: ['waiting_for_first_conversation', 'waiting_for_owner_chat', 'budget_blocked', 'budget_stopped'],
         error: ['paused_failures', 'error_backoff', 'allowance_exhausted', 'allowance_unknown', 'wake_failed', 'wake_rejected'],
         // What goes on by itself, or is off, keeps the neutral tone.

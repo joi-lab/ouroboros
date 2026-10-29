@@ -16,7 +16,7 @@ The context-delivery registry:
 
 | Flow | BIBLE.md | ARCHITECTURE.md | DEVELOPMENT.md |
 |------|----------|-----------------|----------------|
-| Main task context (`context.py`) | full tier-0 in every mode | full in Max; book navigation in Low/Nano and for a subagent child | Max: a stable block after the common governance prefix when the active binding targets the system repository, else a visible on-demand pointer; book navigation in Low/Nano and for a subagent child |
+| Main task context (`context.py`) | full tier-0 in every mode | full in Max; book navigation in Low/Nano and for a subagent child | Max: a stable block after the governance prefix for body work (`development_resident`; unknown keeps it), else the chapter map; book navigation in Low/Nano and for a subagent child |
 | Change review, Part 1 (`tools/review.py`) | full (API preamble or retrieving task) | tier 3 navigation; packet rows also get sections naming touched files within the inline share | tier 2 within the share: the review protocol and chapters naming touched files |
 | ↳ `review_change` by layer (`review_body_fact.layer_for`) | body: as Part 1; core: `not_applicable`, the preamble names no constitution (`review_prompt_text.review_preamble("core")`) | body: as Part 1; core: `not_applicable`, the navigation indexes the subject's documents (`subject_root`) | body: as Part 1; core: the universal `Change Review Checklist` alone, with an empty-by-rule required-source manifest |
 | Background consciousness wake-up (`consciousness.py` → `handle_wake_direct`) | = Main task context | = Main task context | = Main task context |
@@ -49,7 +49,7 @@ Known-window no-result-room predictions and typed size refusals use two model-fr
 When a core governance artifact does not fit the available budget:
 
 - Where the flow requires inline delivery, inability to fit is an assembly failure, not a smaller pack (BIBLE P3): a typed entry names the artifact and the reason, the review does not proceed on the remainder, and the disclosure accompanies the refusal rather than replacing it. Elsewhere the omission is named where the reader sees it (`Reference book source unavailable: …`, `⚠️ OMISSION NOTE`), never silent; a reviewer without ARCHITECTURE.md is not operating with full context.
-- Retain exact tool sources before projecting the complete Main batch; preserve outcomes, requested ranges and source gaps. Producer pages lie outside this frame; no tool/path is exempt. Read receipts count the actual consumer projection, not a predicted head cut.
+- Retain exact tool sources before projecting Main batches, without exemptions. Measure host cut reasons inside partial envelopes; preserve outcomes, ranges and source gaps. Producer pages stay outside this frame; read receipts count the consumer projection.
 - Book navigation (`context_layout.book_navigation`), heading maps and named pointers index available sources; they do not deliver source bodies. Low/Nano use them, never `[:N]` on a document.
 - Bound strings through `utils.truncate_review_artifact` (display previews) or `utils.truncate_within_limit` (a strict wire/prompt bound), never a hand-rolled `text[:cap] + marker`, which loses the anti-waste floor and can return a value longer than its input.
 - A list obeys the same rule: a `[:N]` slice carries the omitted count and, where downstream compares an identity, a durable hash or reference for the full set (`_outcome_receipts.receipt_identity_projection`). Bounding a set is allowed; hiding that it was bounded is the P1 violation.

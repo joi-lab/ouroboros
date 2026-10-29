@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { cardRowView, createRoomWork, latestRepresentedRoot, workCard } from '../modules/room_work.js';
 import { markView } from '../modules/status_mark.js';
@@ -347,7 +348,8 @@ test('the one mark after the word is the room\'s shape, the owner\'s amber dot i
         // owner's move together, as chat.js writes them.
         const paint = (view) => {
             badge.textContent = view.text;
-            Object.assign(badge.dataset, { tone: view.tone, mark: view.mark, owner: view.owner ? '1' : '', amber: view.amber });
+            Object.assign(badge.dataset, { tone: view.tone, mark: view.mark, owner: view.owner ? '1' : '', amber: view.amber,
+                step: view.step || '' });
             work.update();
             return [trigger.dataset.tone, mark.hidden ? 'hidden' : mark.dataset.shape, mark.dataset.hue,
                 waitNote.hidden ? '' : waitNote.textContent];
@@ -380,6 +382,62 @@ test('the one mark after the word is the room\'s shape, the owner\'s amber dot i
         // One mark node throughout, repainted in place.
         assert.equal(trigger.children.filter(el => el.classList.contains('status-mark')).length, 1);
         assert.equal(trigger.children.find(el => el.classList.contains('status-mark')), mark);
+    } finally { work?.destroy(); restoreDom(prior); }
+});
+
+// DESIGN "Shell" on a phone (375 px), where the bar leaves the status about 90 px: a preparing room's start step goes
+// first, then the word whole; the mark stays and the control's name keeps the whole status (touch has no hover).
+test('on a phone-width bar a preparing room drops its start step before its word, and the name keeps both', () => {
+    const css = readFileSync(new URL('../room_work.css', import.meta.url), 'utf8');
+    for (const rule of ['.status-badge[data-step]:not([data-step=""])::after { content: " · " attr(data-step); }',
+        '.rw-trigger[data-step="off"] .status-badge::after { content: none; }',
+        '.rw-trigger[data-word="off"] .status-badge { display: none; }']) assert.ok(css.includes(rule), rule);
+    const { prior, mount } = installDom(async () => ({ ok: true, json: async () => ({}) }));
+    let work, resized = null;
+    try {
+        globalThis.ResizeObserver = class { constructor(fn) { resized = fn; } observe() {} disconnect() {} };
+        const node = (tag, cls, parent) => {
+            const el = document.createElement(tag); el.className = cls; parent.appendChild(el); return el;
+        };
+        const page = node('div', 'page', mount);
+        const header = node('div', 'chat-page-header', page);
+        const titleRow = node('div', 'app-page-title-row', node('div', 'app-page-title-block', header));
+        const badge = node('span', 'status-badge thinking', node('div', 'app-page-actions ui-chrome-group', header));
+        // Those rules at 7 px a character: the step shows unless the control drops it, the word unless the control
+        // drops it whole, and the badge clips at the width the bar leaves it.
+        let space = 600;
+        const shown = () => {
+            const off = badge.parentNode.dataset;
+            if (off.word === 'off') return '';
+            return badge.textContent + (badge.dataset.step && off.step !== 'off' ? ` · ${badge.dataset.step}` : '');
+        };
+        Object.defineProperty(badge, 'scrollWidth', { get: () => 7 * shown().length });
+        Object.defineProperty(badge, 'clientWidth', { get: () => Math.min(7 * shown().length, space) });
+        Object.defineProperty(titleRow, 'clientWidth', { get: () => space });
+        work = createRoomWork({ page, statusBadge: badge, messagesDiv: node('div', 'chat-messages', page),
+            ws: { isConnected: () => true }, reading: { cancel() {}, scroll() {} },
+            works: () => workState(), liveCardRecords: new Map(), pendingSubmissions: new Map() });
+        const trigger = titleRow.children.find(el => el.classList.contains('rw-trigger'));
+        const paint = (state) => {
+            const view = roomStatusView(state);
+            badge.textContent = view.text;
+            Object.assign(badge.dataset, { tone: view.tone, mark: view.mark, owner: view.owner ? '1' : '', amber: view.amber,
+                step: view.step || '' });
+            work.update();
+            return [shown(), trigger.title];
+        };
+        const resize = (width) => { space = width; resized([{ target: header }]); return [shown(), trigger.title]; };
+        const whole = 'Preparing · Building context';
+        const preparing = reconcileWorkState(emptyWorkState(),
+            { supervisor_ready: true, ...structuredClone(SERVER_CASES.direct_preparing) }, 1);
+        assert.deepEqual(paint(preparing), [whole, whole], 'a wide bar says both');
+        assert.deepEqual(resize(90), ['Preparing', whole], 'room for the word, not for its step');
+        assert.deepEqual(resize(40), ['', whole], 'narrower still: the word goes whole, the mark stays');
+        assert.deepEqual(resize(90), ['Preparing', whole], 'a wider bar brings the word back first');
+        assert.deepEqual(resize(600), [whole, whole]);
+        // A room without a step is fitted by its word alone.
+        assert.deepEqual(paint(workState([], room('working'))), ['Working', 'Working']);
+        assert.deepEqual(resize(40), ['', 'Working']);
     } finally { work?.destroy(); restoreDom(prior); }
 });
 

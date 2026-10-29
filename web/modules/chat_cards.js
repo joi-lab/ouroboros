@@ -16,6 +16,7 @@ import { createCardPresses, mountCardComponents, setCardPinned } from './card_co
 import { createInlineFit, mountCardApp } from './card_frames.js';
 import { getHolds, HELD_LINES, settleAfterFrameLoad, START_SETTLE_MS } from './holds.js';
 import { escapeHtmlText as escapeHtml } from './utils.js';
+import { widgetPublication } from './widget_list.js';
 import { frameHeight, mountModuleWidget, mountRouteIframeWidget } from './widget_module.js';
 import { mountDeclarativeWidget } from './widgets.js';
 
@@ -60,6 +61,11 @@ function liveWidgetTabs() {
     widgetTabs ||= apiClient.widgets().then((data) => (Array.isArray(data?.ui_tabs) ? data.ui_tabs : []))
         .catch((error) => { widgetTabs = null; throw error; });
     return widgetTabs;
+}
+
+/** What a skill's widget card draws from; another value draws it again (the board's rule, widget_list.js). */
+function chatWidgetSignature(tab) {
+    return JSON.stringify([tab.revision, widgetPublication(tab), tab.render]);
 }
 
 const pressLedger = (cardId) => {
@@ -283,7 +289,7 @@ export function createChatCards({ frameNode, decorate = () => {}, composer = () 
         if (!current()) return;
         if (!tab) { showFallback(record, 'This skill is off.'); return; }
         record.tab = tab;
-        record.widgetSignature = JSON.stringify([tab.revision, tab.render]);
+        record.widgetSignature = chatWidgetSignature(tab);
         if (tab.render?.kind === 'declarative') {
             // Under the message's size policy like a frame: the content is measured, its box is capped, Expand
             // lifts the cap. The declarative host paints its first frame synchronously: inside this write.
@@ -471,7 +477,7 @@ export function createChatCards({ frameNode, decorate = () => {}, composer = () 
         liveWidgetTabs().then((tabs) => shown.forEach((record) => {
             const ref = record.data?.widget;
             const tab = tabs.find((item) => item.skill === ref?.skill && item.tab_id === ref?.tab_id && !item.pinned_card);
-            if (records.get(record.id) !== record || (tab && JSON.stringify([tab.revision, tab.render]) === record.widgetSignature)) return;
+            if (records.get(record.id) !== record || (tab && chatWidgetSignature(tab) === record.widgetSignature)) return;
             drawBody(record);
         }), () => {});
     }

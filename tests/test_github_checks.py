@@ -862,9 +862,10 @@ def test_checks_reader_is_registered_read_only():
     assert {"target", "wait_seconds", "repo"} <= set(entry.schema["parameters"]["properties"])
     assert github_checks._CHECKS_WAIT_CAP_SEC + github_checks._CHECKS_READ_BUDGET_SEC < entry.timeout_sec
     assert "max 240" in entry.schema["parameters"]["properties"]["wait_seconds"]["description"]
-    for listing in (OBSERVE_DISABLED, tool_capabilities.OBSERVE_WORLD_MUTATION_TOOLS, tool_capabilities.READ_ONLY_PARALLEL_TOOLS,
-                    tool_capabilities.LOCAL_READONLY_SUBAGENT_TOOL_NAMES, tool_capabilities.ACTING_SUBAGENT_TOOL_NAMES):
+    for listing in (OBSERVE_DISABLED, tool_capabilities.OBSERVE_WORLD_MUTATION_TOOLS, tool_capabilities.READ_ONLY_PARALLEL_TOOLS):
         assert "github_read" not in listing
+    for children in (tool_capabilities.LOCAL_READONLY_SUBAGENT_TOOL_NAMES, tool_capabilities.ACTING_SUBAGENT_TOOL_NAMES):
+        assert "github_read" in children and "github_write" not in children
     assert "github_write" in OBSERVE_DISABLED  # The same lists do carry the family's write tool.
     # The reader's module is a helper of the family: the family module registers the tool, in frozen builds too.
     from ouroboros.tools.registry import ToolRegistry

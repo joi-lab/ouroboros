@@ -17,7 +17,9 @@
  * the veil over its words). On release the drawer settles at the finger's speed (`--drawer-settle`). The owner of the drawer's state
  * commits the result, so history, focus and inert stay the layer stack's, and a gesture that does not commit leaves
  * no trace. The drag is a shortcut: every gesture has a visible control (☰ and ×). One constant switches it off in
- * one line: DRAWER_DRAG. */
+ * one line: DRAWER_DRAG. While a pinch magnifies the page, a sideways finger pans it, as the browser means it to. */
+
+import { pinchMagnified } from './layout.js';
 
 export const DRAWER_DRAG = true;
 
@@ -50,10 +52,10 @@ export const FIELD_SELECTOR = 'input, textarea, select, video, audio, [role="sli
 // What scrolls sideways itself: code, tables, tab strips, anything that declares it.
 export const SIDEWAYS_SELECTOR = 'pre, code, table, .md-table-wrap, .app-tab-strip, [data-scroll-x]';
 // What lies over the room and owns the finger while it is open (shown, not merely mounted): a dialog, the reader,
-// a menu, the Shade. A Project open on the phone is the room: the drag opens the drawer over it, as ☰ does. A menu's
-// picture leaving after it closed (motion.js leaveAsPicture) and a Shade folding away are closed already.
+// a menu, the work list. A Project open on the phone is the room: the drag opens the drawer over it, as ☰ does. A
+// menu's picture leaving after it closed (motion.js leaveAsPicture) and a work list folding away are closed already.
 export const BLOCKING_SELECTOR = 'dialog[open], .marketplace-modal-backdrop, .ui-popup:not([data-leaving]), .task-control-menu, '
-    + '.chat-photo-menu:not([data-leaving]), .rw-shade:not([hidden]):not([inert]), details.chat-header-more[open]';
+    + '.chat-photo-menu:not([data-leaving]), .rw-shade:not([hidden]):not([inert])';
 
 /** The chain under the finger keeps its own sideways gesture: a `touch-action: none` element (the effort strip) or a
  * scroller that can move sideways. */
@@ -177,7 +179,7 @@ export function bindDrawerDrag({
         const count = event.touches?.length || 0;
         // A second finger, or a new touch after a gesture whose end never came: back to the start.
         if (g) { restore(); if (count > 1) return; }
-        if (count !== 1 || !isStack() || !isCoarse()) return;
+        if (count !== 1 || !isStack() || !isCoarse() || pinchMagnified(win)) return;
         const touch = event.changedTouches?.[0] || event.touches?.[0];
         const target = event.target;
         if (!touch || !target) return;

@@ -747,7 +747,15 @@ def prospective_wrapup_attempt_request(
 
     processing_preference = resolve_processing_preference(model_role, override=processing_preference)
 
-    if not callable(getattr(llm, "_resolve_remote_target", None)):
+    resolved = None
+    if callable(getattr(llm, "_resolve_remote_target", None)):
+        from ouroboros.llm_attempt import ConnectionUnavailable
+
+        try:
+            resolved = llm._resolve_remote_target(model)
+        except ConnectionUnavailable:  # the send refuses it ($0) and walks the configured routes; the probe estimates
+            resolved = None
+    if resolved is None:
         return _merge_scope(AttemptRequest(
             model=model, provider=infer_provider_from_model(model),
             prompt_tokens_estimate=prompt_tokens,
@@ -756,7 +764,7 @@ def prospective_wrapup_attempt_request(
             force_unknown_reservation=bool(processing_preference),
         ))[0]
 
-    target = {**llm._resolve_remote_target(model), "processing_preference": processing_preference}
+    target = {**resolved, "processing_preference": processing_preference}
     if target.get("provider") == "claudexor":
         from ouroboros.llm_claudexor import _request, prepare_processing_target
 

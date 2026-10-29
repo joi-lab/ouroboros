@@ -125,6 +125,7 @@ def _handle_cognitive_operation(evt: Dict[str, Any], ctx: Any) -> None:
             "round_id": str(evt.get("round_id") or ""),
             "slot_id": str(evt.get("slot_id") or ""),
             "owner_id": str(evt.get("model_wait_owner_id") or ""),
+            "wait_for_tasks": list(evt.get("wait_for_tasks") or ()) if evt.get("kind") == "in_slot_wait" else [],
         }
 
 

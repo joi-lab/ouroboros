@@ -1,5 +1,5 @@
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
-import { tr } from './i18n.js';
+import { tr, fmt } from './i18n.js';
 import { hostRowDisplayText } from './host_notice_text.js';
 import { strokeIcon } from './page_icons.js';
 import { showToast } from './toast.js';
@@ -138,6 +138,26 @@ export function safeHttpUrl(value) {
     }
 }
 
+// Host-held source attribution belongs to the voice line, never the author's words.
+export function decorateContactSource(bubble, contact) {
+    const sender = bubble.querySelector('.sender');
+    if (!sender || !contact?.task_id || !contact.binding_id || !contact.source_event_id) return;
+    const href = safeHttpUrl(contact.url);
+    const source = document.createElement(href ? 'a' : 'span');
+    source.dataset.contactSource = contact.task_id;
+    source.textContent = String(contact.label || tr('Connected place'));
+    source.title = fmt('Source work: {task_id}', { task_id: contact.task_id });
+    if (href) {
+        source.className = 'md-link';
+        source.href = href;
+        source.target = '_blank';
+        source.rel = 'noopener noreferrer';
+    }
+    const separator = document.createElement('span');
+    separator.textContent = ' · ';
+    sender.append(separator, source);
+}
+
 export function bindComposerFileTargets({ page, inputArea, input, stagePendingFiles }) {
     // The two implicit routes a file takes into the composer beside
     // "+" → Attach file: an image pasted into the textarea, and a file dropped
@@ -271,6 +291,7 @@ export function createChatMedia({
             ${bodyHtml}
             ${timeHtml}
         `;
+        decorateContactSource(bubble, msg.presence_contact || msg.quiz?.presence_contact);
         stampNodeTimestamp(bubble, rawTs);
         // The row's address makes a delivered photo, file, link card or question a reply target (CONTRACTS K6).
         if (msg.row_address) bubble.dataset.rowAddress = String(msg.row_address);
@@ -1140,6 +1161,7 @@ export function createChatMedia({
     }
 
     return {
+        openReview: openReader,
         buildMediaBubble,
         buildDocumentBubble,
         buildLinksMessage,

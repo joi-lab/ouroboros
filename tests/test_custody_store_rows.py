@@ -381,7 +381,7 @@ def test_task_snapshot_materializes_only_own_runs_and_pending_requests(tmp_path,
     audit = usage["delegate_terminal_reconciliation"]
     assert audit["audit_status"] == "ok" and not writes
     assert sorted(decoded) == ["own-closed", "own-open", "own-review"]
-    assert sorted(hydrated) == ["own-pending", "review-pending"]
+    assert hydrated == [], "typed pending identities need no historical request body"
     assert audit["open_run_ids"] == ["own-open"]
     assert audit["pending_invocation_ids"] == ["own-pending"]
     assert [row["run_id"] for row in audit["terminal_runs"]] == ["own-closed"]
@@ -398,3 +398,77 @@ def test_task_snapshot_keeps_a_legacy_numeric_request_task_identity(tmp_path):
         }})
     assert [row["invocation_id"] for row in current.task_snapshot(tmp_path, "17")["pending"]] == ["legacy"]
     assert current.task_snapshot(tmp_path, "18")["pending"] == []
+
+
+def test_a_flush_records_the_chain_length_exactly_and_lists_the_archive_only_after_it_changed(tmp_path, monkeypatch):
+    """Every flush records the chain's length right after its own append (the fold's P6' boundary,
+    ``CHAIN_BOUNDARY``) exactly: before a rotation, after one, after another writer's rows, after a
+    segment is removed. It reads that length from the previous flush's measurement (``CHAIN_LIVE``:
+    the live segment's identity and size, the archive directory's stamp): while the closed segments
+    are unchanged a flush lists no archive and opens no segment (one stat of the directory), and a
+    rotation or a removed segment is measured once by the walk, never on every emit and never inside
+    a store transaction (the chain is measured between the append and the row's delete)."""
+    from supervisor.state import rotate_jsonl_log_if_needed
+    from tests._cost_meter import CostMeter, tagged
+
+    path = c.event_log_path(tmp_path)
+    archive = tmp_path / "archive"
+    open_transactions, measured_inside = [0], []
+    real_open, real_measure = store.open_store, c.chain_measure
+
+    @contextmanager
+    def counted(root, **kwargs):
+        with real_open(root, **kwargs) as txn:
+            open_transactions[0] += 1
+            try:
+                yield txn
+            finally:
+                open_transactions[0] -= 1
+
+    def measure(chain):
+        measured_inside.append(open_transactions[0] > 0)
+        return real_measure(chain)
+
+    monkeypatch.setattr(store, "open_store", counted)
+    monkeypatch.setattr(c, "chain_measure", measure)
+
+    def emit(number):
+        """Commit the event with its append parked, then meter the flush alone."""
+        tag = f"flush-{number}"
+        with monkeypatch.context() as parked:
+            parked.setattr(current, "_append_durable", lambda *args: None)
+            assert c.emit(tmp_path, c.STARTED, {"run_id": f"run-{number}", "task_id": "task"})
+        with CostMeter(tmp_path) as meter:
+            assert tagged(tag, lambda: current.flush_outbox(tmp_path)) == 1
+        assert current.outbox_depth(tmp_path) == 0
+        with store.open_store(tmp_path, write=False) as txn:
+            boundary, live = txn.meta(current.CHAIN_BOUNDARY), txn.meta(current.CHAIN_LIVE)
+        assert live["offset"] == c.chain_length(path), f"flush {number} measured the chain wrongly"
+        counts = meter.snapshot(tag)["counts"]
+        return boundary, {key: counts.get(key, 0) for key in ("scandir:archive", "open:archive", "stat:archive")}
+
+    rested = {"scandir:archive": 0, "open:archive": 0, "stat:archive": 1}  # the directory's stamp, nothing listed or opened
+    boundary, counts = emit(1)  # the first flush measures
+    assert boundary == c.chain_length(path) and counts["scandir:archive"] == 1
+    assert emit(2) == (c.chain_length(path), rested)  # the next advances by its own growth
+    for number in range(3):  # another writer's rows grow the live file between flushes
+        assert append_jsonl(path, {"ts": "2026-01-01T00:00:00+00:00", "type": "task_received", "n": number})
+    assert emit(3) == (c.chain_length(path), rested)
+    rotate_jsonl_log_if_needed(tmp_path, "events.jsonl", "events", max_bytes=1)
+    assert len(list(archive.glob("events_*.jsonl"))) == 1 and path.stat().st_size == 0
+    boundary, counts = emit(4)  # a rotation: measured once by the walk (the segment opened, the live file empty)
+    assert boundary == c.chain_length(path) and counts["scandir:archive"] == 1
+    assert emit(5) == (c.chain_length(path), rested)
+    rotate_jsonl_log_if_needed(tmp_path, "events.jsonl", "events", max_bytes=1)
+    boundary, counts = emit(6)
+    assert boundary == c.chain_length(path) and counts["scandir:archive"] == 1
+    assert emit(7) == (c.chain_length(path), rested)
+    oldest = sorted(archive.glob("events_*.jsonl"))[0]
+    oldest.unlink()  # a removed segment: the directory's stamp moves, the next flush measures again
+    _boundary, counts = emit(8)
+    assert counts["scandir:archive"] == 1
+    assert emit(9)[1] == rested
+    rows = [row["run_id"] for row in c.custody_rows(tmp_path)]  # every flush landed; the removed segment took 1-3
+    assert rows == [f"run-{number}" for number in range(4, 10)], rows
+    # The first flush, two rotations and the removal each measured the chain; none did so under a store transaction.
+    assert len(measured_inside) >= 4 and not any(measured_inside), measured_inside

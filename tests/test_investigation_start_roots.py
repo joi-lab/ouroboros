@@ -2,8 +2,8 @@
 
 A non-acting session keeps its configured access as an evidence-only investigation
 in a private copy. Two starting folders schedule_subagent hands such children used
-to die before the start: a Git SUBDIRECTORY (the investigation clones the enclosing
-worktree and starts in the matching folder) and a folderless Project task's scratch
+to die before the start: a Git SUBDIRECTORY (the investigation copies the enclosing
+worktree as a linked worktree and starts in the matching folder) and a folderless Project task's scratch
 (the existing input owner stages this invocation's inputs and the engine copies that
 host-prepared folder, never the live scratch). Explicit readonly keeps reading in
 place. Every start goes through the registered ``delegate_start`` handler with the
@@ -21,6 +21,7 @@ import pytest
 from ouroboros import delegate_custody as custody
 from ouroboros.delegate_registration_policy import INVESTIGATION_AUTHORITY
 from ouroboros.delegate_start_instructions import INVESTIGATION_INSTRUCTION, scratch_fact
+from ouroboros.unindexed import COPIES
 from ouroboros.workspace_preflight import SNAPSHOT_ENVIRONMENT_NOTE
 
 ENGINE_VERSION = "3.25.1"  # carries workspaceRoot (3.8.1+) and scope.ephemeral (3.3.7+)
@@ -132,7 +133,7 @@ def _live_state(root):
 
 
 @pytest.mark.parametrize("access", ["full", "workspace_write"])
-def test_git_subdirectory_investigation_clones_the_worktree_and_starts_in_the_folder(tmp_path, monkeypatch, access):
+def test_git_subdirectory_investigation_copies_the_worktree_and_starts_in_the_folder(tmp_path, monkeypatch, access):
     from ouroboros.subagent_worktrees import find_execution_snapshot
     from ouroboros.tools.delegate_integration import capture_terminal_patch_for_drive
     from ouroboros.tools.subagent_integration import _integrate_delegated_patch
@@ -166,8 +167,10 @@ def test_git_subdirectory_investigation_clones_the_worktree_and_starts_in_the_fo
     assert f"authority/project root {folder} is a read-only" in request["instructions"]
     assert result["execution_root"] == str(start_folder) and result["authority_target_root"] == str(folder)
     assert "evidence-only investigation" in result["note"] and "apply or reject" not in result["note"]
-    # The whole worktree, at its real current bytes, is the checking input.
+    # The whole worktree, at its real current bytes, is the checking input: a linked worktree of
+    # the source at its snapshot commit (a `.git` FILE, the source's own object database).
     assert Path(snapshot["target_root"]) == project.resolve()
+    assert (clone / ".git").is_file() and not (clone / ".git" / "objects").exists()
     assert (clone / "conftest.py").read_text() == "ROOT_FIXTURE = 1\n"
     assert (start_folder / "mod.py").read_text() == "VALUE = 2\n"
     assert (start_folder / "draft.txt").read_text() == "untracked input\n"
@@ -188,9 +191,8 @@ def test_git_subdirectory_investigation_clones_the_worktree_and_starts_in_the_fo
     assert block["named_evidence"]["status"] == "retained"
     retained = Path(block["named_evidence"]["evidence_dir"]) / "files" / ".review-evidence" / "coverage.xml"
     assert retained.read_bytes() == b"<coverage line-rate='1'/>\n"
-    # Drift is read against the enclosing worktree the clone was made from.
-    assert block["target_drift_checked"] is True and "target_drift_unknown" not in block
-    assert "target_mutated_during_run" not in block
+    # The capture is the copy's own result; target drift is no longer read or reported.
+    assert not {"target_drift_checked", "target_mutated_during_run", "target_drift_unknown"} & set(block)
     assert block["disposition"] == custody.EVIDENCE_RETAINED and not clone.exists()
     assert find_execution_snapshot(held.snapshot_id) is None
     assert "INTEGRATE_DELEGATED_INVESTIGATION_EVIDENCE" in _integrate_delegated_patch(ctx, held.run_id, "apply", "no")
@@ -209,7 +211,9 @@ def _source_local(project, policy):
         _git(project, "config", "core.autocrlf", "true")
     else:
         (project / ".git" / "info").mkdir(exist_ok=True)
-        (project / ".git" / "info" / "attributes").write_text("*.py text\n*.txt text\n")
+        # The policy names its line end: a bare `text` checks out the host's native one (CRLF on Windows).
+        (project / ".git" / "info" / "attributes").write_text("*.py text eol=lf\n*.txt text eol=lf\n",
+                                                              encoding="utf-8", newline="\n")
     for path in (project / "conftest.py", *(project / "pkg" / "component").iterdir()):
         path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
 
@@ -239,8 +243,14 @@ def test_source_local_comparison_settings_reach_the_investigation_copy(tmp_path,
     assert result["status"] == "started" and len(engine.starts) == 1, result
     held = custody.replay(ctx.drive_root)[result["run_id"]]
     clone = Path(find_execution_snapshot(held.snapshot_id)["path"])
-    # The copy holds the source's working bytes, and its Git sees them unchanged.
-    assert {rel: (clone / rel).read_bytes() for rel in before[2]} == before[2]
+    # The copy holds the source's current files as Git checks them out under the source's own
+    # (shared) settings, and its Git sees them unchanged. autocrlf and filemode reproduce the
+    # working bytes; the `text eol=lf` attributes check normalized files out with LF.
+    copied = {rel: (clone / rel).read_bytes() for rel in before[2]}
+    if policy == "info_attributes":
+        assert {rel: raw.replace(b"\r\n", b"\n") for rel, raw in before[2].items()} == copied
+    else:
+        assert copied == before[2]
     assert _git(clone, "status", "--porcelain", "--untracked-files=all") == ""
     # One edited line is one ordinary patch line, never a whole-file rewrite.
     mod = clone / "pkg" / "component" / "mod.py"
@@ -250,104 +260,45 @@ def test_source_local_comparison_settings_reach_the_investigation_copy(tmp_path,
     patch = Path(block["patch_artifact"]).read_bytes()
     assert patch.count(b"diff --git") == 1 and b"-VALUE = 2\n+VALUE = 3\n" in patch
     assert b"\r" not in patch and b"mode" not in patch
-    assert block["target_drift_checked"] is True and "target_mutated_during_run" not in block
+    assert not {"target_drift_checked", "target_mutated_during_run"} & set(block)
     assert block["disposition"] == custody.EVIDENCE_RETAINED and not clone.exists()
     assert _live_state(project) == before and (project / ".git" / "config").read_bytes() == config
     assert _git(project, "ls-files", "--stage") == index
 
 
 @pytest.mark.parametrize("policy", ["autocrlf", "info_attributes", "filemode"])
-def test_an_unchanged_copy_is_empty_and_only_a_genuine_source_edit_is_drift(tmp_path, monkeypatch, policy):
+def test_an_unchanged_copy_captures_nothing_while_the_source_moves_on(tmp_path, monkeypatch, policy):
+    """The copy is a snapshot: a source edit made after it reaches neither the copy nor its capture,
+    and the capture reads no target drift (the owner's edit is the owner's, not the run's)."""
+    from ouroboros.subagent_worktrees import find_execution_snapshot
+
     project, folder = _project(tmp_path)
     _source_local(project, policy)
     ctx, engine, start = _consumer(tmp_path, monkeypatch, "full", workspace=folder)
     result = start()
     assert result["status"] == "started", result
     held = custody.replay(ctx.drive_root)[result["run_id"]]
+    clone = Path(find_execution_snapshot(held.snapshot_id)["path"])
+    copied = (clone / "conftest.py").read_bytes()
     mod = folder / "mod.py"
     mod.write_bytes(mod.read_bytes())  # same bytes, new stat
     (project / "conftest.py").write_bytes(b"ROOT_FIXTURE = 2\r\n")  # the owner's real edit
+    assert (clone / "conftest.py").read_bytes() == copied
     block = _settled_capture(ctx, held)
     manifest = json.loads(Path(block["manifest_artifact"]).read_text())
     assert block["status"] == "ready_no_changes" and block["patch_artifact"] is None, block
     assert manifest["patch_size"] == 0 and manifest["tracked_changed"] == []
-    assert block["target_drift_checked"] is True and block["target_mutated_during_run"] == ["conftest.py"]
+    assert manifest["result_commit"] and _git(project, "rev-parse", f"{manifest['result_commit']}^{{tree}}") \
+        == _git(project, "rev-parse", f"{held.baseline_sha}^{{tree}}")
+    assert not {"target_drift_checked", "target_mutated_during_run", "target_drift_unknown"} & set(block)
+    assert block["disposition"] == custody.EVIDENCE_RETAINED and not clone.exists()
+    assert (project / "conftest.py").read_bytes() == b"ROOT_FIXTURE = 2\r\n"  # the source keeps its edit
 
 
-def test_a_source_edit_during_provisioning_still_refuses_the_investigation(tmp_path, monkeypatch):
-    from ouroboros import subagent_worktrees
-    from ouroboros.subagent_worktrees import _load_registry
-
-    project, folder = _project(tmp_path)
-    _source_local(project, "autocrlf")
-    copy = subagent_worktrees._fill_private_copy
-
-    def owner_edits_while_copied(source, destination, copy_root):
-        if Path(source).name == "mod.py":
-            Path(source).write_bytes(b"VALUE = 9\r\n")
-        return copy(source, destination, copy_root)
-
-    monkeypatch.setattr(subagent_worktrees, "_fill_private_copy", owner_edits_while_copied)
-    ctx, engine, start = _consumer(tmp_path, monkeypatch, "full", workspace=folder)
-    refused = start()
-    assert refused["reason"] == "execution_snapshot_failed" and refused["definitely_unrun"] is True, refused
-    assert not engine.starts and _load_registry(None) == []
-    assert _git(project, "for-each-ref", "refs/ouroboros") == ""
-    assert not [p for p in (tmp_path / "snaps").iterdir() if p.is_dir()]
-    assert (folder / "mod.py").read_bytes() == b"VALUE = 9\r\n"
-    custody._CUSTODY.clear()
-
-
-@pytest.mark.parametrize("access", ["full", "workspace_write"])
-@pytest.mark.parametrize("geometry", ["root", "subdirectory"])
-@pytest.mark.parametrize("edited", [False, True])
-@pytest.mark.parametrize("tree_override", [False, True])
-def test_ignored_relative_attributes_are_private_inputs_not_live_config(
-        tmp_path, monkeypatch, access, geometry, edited, tree_override):
-    from ouroboros.subagent_worktrees import find_execution_snapshot
-
-    project, folder = _project(tmp_path)
-    _git(project, "config", "core.autocrlf", "false")
-    _git(project, "config", "core.attributesFile", ".attributes-local")
-    attributes = project / ".attributes-local"
-    attributes.write_bytes(b"*.py -text\n*.txt -text\n" if tree_override else b"*.py text\n*.txt text\n")
-    if tree_override:
-        (project / ".gitattributes").write_bytes(b"*.py text\n*.txt text\n")
-    (project / ".git" / "info" / "exclude").write_bytes(b".attributes-local\n")
-    for path in (project / "conftest.py", *folder.iterdir()):
-        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
-    before, config = _live_state(project), (project / ".git" / "config").read_bytes()
-    index = _git(project, "ls-files", "--stage")
-    ctx, engine, start = _consumer(tmp_path, monkeypatch, access,
-                                  workspace=project if geometry == "root" else folder)
-    result = start()
-    assert result["status"] == "started" and len(engine.starts) == 1, result
-    held = custody.replay(ctx.drive_root)[result["run_id"]]
-    clone = Path(find_execution_snapshot(held.snapshot_id)["path"])
-    copied_attributes = Path(_git(clone, "config", "--path", "--get", "core.attributesFile").strip())
-    assert copied_attributes.is_relative_to(clone / ".git")
-    assert copied_attributes.read_bytes() == attributes.read_bytes()
-    assert not (clone / ".attributes-local").exists()
-    mod = clone / "pkg" / "component" / "mod.py"
-    assert mod.read_bytes() == b"VALUE = 2\r\n"
-    assert _git(clone, "status", "--porcelain") == ""
-    if edited:
-        mod.write_bytes(b"VALUE = 3\r\n")
-    block = _settled_capture(ctx, held)
-    assert block["status"] == ("ready_with_changes" if edited else "ready_no_changes"), block
-    if edited:
-        patch = Path(block["patch_artifact"]).read_bytes()
-        assert patch.count(b"diff --git") == 1 and b"-VALUE = 2\n+VALUE = 3\n" in patch
-        assert b"\r" not in patch
-    else:
-        assert block["patch_artifact"] is None
-    assert block["target_drift_checked"] is True and "target_mutated_during_run" not in block
-    assert _live_state(project) == before and (project / ".git" / "config").read_bytes() == config
-    assert _git(project, "ls-files", "--stage") == index
-
-
-def test_git_subdirectory_continuation_keeps_the_same_clone_and_folder(tmp_path, monkeypatch):
-    from ouroboros import review_checking
+def test_git_subdirectory_continuation_of_a_retained_investigation_starts_in_a_fresh_copy_of_the_folder(
+        tmp_path, monkeypatch):
+    """Retained evidence of any size releases the copy (no 64 MiB bound keeps it); the continuation
+    then starts from a fresh copy of the current tree, again in the matching folder."""
     from ouroboros.subagent_worktrees import find_execution_snapshot
     from ouroboros.tools.delegate_integration import capture_terminal_patch_for_drive
 
@@ -361,17 +312,18 @@ def test_git_subdirectory_continuation_keeps_the_same_clone_and_folder(tmp_path,
     (start_folder / ".review-evidence" / "large.log").write_bytes(b"x" * 256)
     assert custody.emit(ctx.drive_root, custody.SETTLED, {"run_id": held.run_id, "state": "succeeded"})
     held = custody.replay(ctx.drive_root)[held.run_id]
-    monkeypatch.setattr(review_checking, "EVIDENCE_RETAIN_BYTES", 64)  # the copy must be kept
     block = capture_terminal_patch_for_drive(ctx.drive_root, held)
-    assert block["named_evidence"]["status"] == "partial" and start_folder.is_dir()
+    assert block["named_evidence"]["status"] == "retained" and block["disposition"] == custody.EVIDENCE_RETAINED
+    assert not start_folder.exists() and find_execution_snapshot(held.snapshot_id) is None
     custody._CUSTODY.clear()
     second = start(continue_from=held.run_id)
     assert second["status"] == "started", second
-    assert second["continuation"]["workspace"] == "same_snapshot"
-    assert engine.starts[1]["execution"]["workspaceRoot"] == str(start_folder)
+    assert second["continuation"]["workspace"] == "fresh"
     successor = custody.replay(ctx.drive_root)[second["run_id"]]
-    assert (successor.snapshot_id, successor.execution_root) == (held.snapshot_id, str(start_folder))
-    assert find_execution_snapshot(held.snapshot_id)["path"] == str(start_folder.parent.parent)
+    fresh = Path(find_execution_snapshot(successor.snapshot_id)["path"])
+    assert successor.snapshot_id != held.snapshot_id and fresh != start_folder.parent.parent
+    assert engine.starts[1]["execution"]["workspaceRoot"] == str(fresh / "pkg" / "component") == successor.execution_root
+    assert (fresh / "pkg" / "component" / "mod.py").read_text() == "VALUE = 2\n"
     custody._CUSTODY.clear()
 
 
@@ -492,7 +444,7 @@ def test_a_data_drive_subfolder_names_the_readonly_repair(tmp_path, monkeypatch)
 
 
 def test_a_starting_folder_outside_the_snapshot_is_refused_and_released(tmp_path, monkeypatch):
-    from ouroboros.subagent_worktrees import _load_registry
+    from ouroboros.subagent_worktrees import _records
 
     project, _folder = _project(tmp_path)
     (project / ".gitignore").write_text("build/\n")
@@ -503,7 +455,8 @@ def test_a_starting_folder_outside_the_snapshot_is_refused_and_released(tmp_path
     refused = start()
     assert refused["reason"] == "execution_snapshot_failed" and refused["definitely_unrun"] is True
     assert "build/out" in refused["detail"] and "access='readonly'" in refused["detail"]
-    assert not engine.starts and _load_registry(None) == []
+    assert not engine.starts and _records() == []
     assert _git(project, "for-each-ref", "refs/ouroboros") == ""
-    assert not [p for p in (tmp_path / "snaps").iterdir() if p.is_dir()]
+    assert not [p for p in (tmp_path / "snaps").rglob("*") if p.is_dir() and p.name != COPIES]  # no copy is left
+    assert _git(project, "worktree", "list", "--porcelain").count("worktree ") == 1  # no admin dir left
     custody._CUSTODY.clear()

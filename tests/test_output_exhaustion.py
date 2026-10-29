@@ -38,6 +38,7 @@ from ouroboros.loop_llm_call import (
     provider_no_call_source,
     transient_retry_max,
 )
+from tests._shared import saved_settings
 
 MESSAGES = [{"role": "user", "content": "work"}]
 OK_RESPONSE = ({"role": "assistant", "content": "done"}, {"prompt_tokens": 1, "completion_tokens": 1})
@@ -306,7 +307,7 @@ def test_exhaustion_adds_one_host_fact_and_the_next_ordinary_round_answers(tmp_p
 def test_repeated_exhaustion_ends_without_purchasing_a_recap(tmp_path, loop_env, no_sleep, monkeypatch):
     """The owner chose finite recovery, not repeated ordinary rounds. No eligible source
     view or configured reserve here: two empty replies hand back the saved work."""
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "")
+    saved_settings(monkeypatch, tmp_path, OUROBOROS_MODEL_FALLBACKS="")  # a saved blank: no chain
     llm = _ScriptedLLM(*[_incident_reply(index) for index in range(6)])
     result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, llm, []))
 

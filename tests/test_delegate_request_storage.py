@@ -186,7 +186,8 @@ def test_unreadable_ref_keeps_request_unknown_and_retry_refuses(tmp_path, damage
     assert custody.invocation_record(tmp_path, "lost")["request"] is None
     pending = custody.pending_invocations(tmp_path)
     assert [row["invocation_id"] for row in pending] == ["lost"]
-    assert pending[0]["request"] is None and "request_ref" not in pending[0]
+    assert pending[0]["request"] is None and pending[0]["request_ref"] == row["request_ref"]
+    assert request_body(tmp_path, pending[0]) is None
     record, refusal = _validated_invocation(tmp_path, "lost", "task", "exact original")
     assert record is None
     assert json.loads(refusal.text)["reason"] == "invocation_request_unrecorded"
@@ -323,8 +324,10 @@ def test_pending_scan_only_reads_blobs_for_surviving_invocations(tmp_path, monke
     monkeypatch.setattr(observability, "read_blob_ref", read)
     pending = custody.pending_invocations(tmp_path)
     assert [row["invocation_id"] for row in pending] == ["pending"]
-    assert reads == ["pending"]
-    assert "request_ref" not in pending[0]
+    assert reads == []  # current inventory reads typed facts, not canonical bodies
+    assert pending[0]["request"] is None and pending[0]["request_ref"]
+    assert request_body(tmp_path, pending[0]) == {"prompt": "pending"}
+    assert reads == ["pending"]  # only an addressed replay resolves the surviving body
 
 
 @pytest.mark.parametrize("different", [False, True])

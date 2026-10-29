@@ -357,6 +357,13 @@ def server_stop_source() -> str:
     return _stop_source
 
 
+def server_stop_cause(restart_requested: bool | None = None) -> str:
+    """The cause a shutdown records: ``restart_requested``, else the stop ingress; diagnostic only.
+    Doors read the live restart flag; the late row passes the one its custody write used."""
+    restart = _restart_requested.is_set() if restart_requested is None else restart_requested
+    return "restart_requested" if restart else _stop_source
+
+
 class _SignalStopServer(uvicorn.Server):
     """uvicorn.Server whose SIGTERM/SIGINT handler stops the supervisor loop AT THE SIGNAL.
 

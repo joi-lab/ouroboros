@@ -14,6 +14,7 @@ from .telegram_api import (
     TelegramRequestRejected,
     TelegramTransportError,
     next_telegram_retry_delay,
+    _LOCALIZED_TEXTS,
 )
 from .telegram_state import (
     _data_dir,
@@ -27,7 +28,7 @@ from .telegram_state import (
 from ..scripts.telegram_settings import telegram_proxy
 from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID, is_project_chat_id
 from ouroboros import i18n_memory as _memory
-from ouroboros.project_dialogue import OUTCOME_PHASE_HEADLINE
+from ouroboros.project_dialogue import OUTCOME_PHASE_HEADLINE, routing_option_label
 
 from . import telegram_i18n
 from .telegram_i18n import Index
@@ -221,6 +222,35 @@ def _relay_text(relay: Any, note: str, lang: str) -> str:
         lines += [_RELAY[lang].format("files", names=", ".join(names))] if names else []
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks + ([note] if note else [])) if blocks else ""
+
+
+def _routing_notice_text(event: Dict[str, Any], lang: str) -> Tuple[str, bool]:
+    """A routing receipt's owner notice as ONE message, and whether it asks for a choice.
+
+    The refused act's target and cause, as the host wrote them (unless the host chose the
+    System row as this notice's carrier); then the picker when the host asks for a target, a
+    numbered list the owner answers in plain words (the router reads it from history, P5) or
+    on the web picker card; then the files it could not attach. A landed act says nothing,
+    and a picker gets a reason line only when the host sent a cause, never an invented one.
+    """
+    lines = []
+    if str(event.get("cause") or "").strip() and event.get("routing_notice_carrier") != "system":
+        lines.append(" · ".join(str(event[key]).strip() for key in ("target_label", "cause") if str(event.get(key) or "").strip()))
+    options = event.get("options") if isinstance(event.get("options"), list) else []
+    labels = [label for label in map(routing_option_label, options) if label][:8] \
+        if str(event.get("status") or "") == "needs_manual_target" else []
+    texts = _LOCALIZED_TEXTS[lang]  # the bridge's own lines; the host's cause and labels stay as written
+    if labels:
+        lines.append(texts["routing_choose_target"])
+        lines.extend(f"{index}. {label}" for index, label in enumerate(labels, 1))
+        if len(options) > len(labels):
+            lines.append(texts.format("routing_more_targets", count=len(options) - len(labels)))
+        lines.append(texts["routing_reply_with_number"])
+    names = [str(row.get("label") or "file") for row in event.get("attachment_manifest") or []
+             if isinstance(row, dict) and row.get("status") == "rejected"]
+    if names:
+        lines.append(texts.format("attachments_not_attached", names=", ".join(names)))
+    return "\n".join(lines), bool(labels)
 
 # Completion notices are opt-in for every outcome. The task's evidence stays in
 # its details even when the owner chooses no additional phone messages.

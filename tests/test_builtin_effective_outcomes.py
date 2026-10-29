@@ -55,9 +55,9 @@ def invoke(tmp_path, monkeypatch):
     ("EVOLUTION_COMMIT_ORPHANED", "TOOL_ERROR"),
     ("EVOLUTION_PUBLICATION_STOPPED", "LEGACY_BLOCKED"),
 ])
-def test_confirmed_identifiers_reach_existing_trace_and_reflection_consumers(identifier, code):
+def test_confirmed_identifiers_reach_existing_trace_consumers(identifier, code):
+    from ouroboros._outcome_tool_errors import _OK_TOOL_STATUSES
     from ouroboros.loop_tool_execution import _typed_execution_failure, _typed_result_metadata
-    from ouroboros.reflection import _trace_call_errored
 
     text = f"⚠️ {identifier}: source-confirmed result\nretained detail"
     result = LegacyTextResultAdapter.from_text("fixture_builtin", text)
@@ -65,7 +65,7 @@ def test_confirmed_identifiers_reach_existing_trace_and_reflection_consumers(ide
     assert dict(result.meta) == {}  # text never proves no effect or settles custody
     failed = _typed_execution_failure(True, result)
     facts = _typed_result_metadata("fixture_builtin", text, failed, result)
-    assert failed and _trace_call_errored({**facts, "is_error": failed})
+    assert failed and facts["status"] not in _OK_TOOL_STATUSES
     assert facts["status"] == TOOL_CODE_SPECS[code].outcome_bucket
     assert facts["tool_result_code"] == code
 
@@ -225,7 +225,8 @@ def test_cherry_pick_conflict_keeps_earlier_effects(invoke, monkeypatch, earlier
 @pytest.mark.parametrize("paths", [None, ["changed.txt"]])
 def test_restore_partial_keeps_checkout_effect_and_target_receipt(invoke, tmp_path, monkeypatch, paths):
     from ouroboros.tools import git, git_vcs_ops
-    binding = SimpleNamespace(root="active_workspace", base_path=tmp_path)
+    # repository_path is ResolvedResourceBinding's default: no nested repository was selected.
+    binding = SimpleNamespace(root="active_workspace", base_path=tmp_path, repository_path=None)
     monkeypatch.setattr(git, "_vcs_binding", lambda *a, **k: binding)
     monkeypatch.setattr(git, "binding_targets_system_repo", lambda *a: False)
     monkeypatch.setattr("ouroboros.tools.review_helpers.list_changed_paths_from_git_status", lambda *a, **k: ["changed.txt"])
@@ -281,13 +282,14 @@ def test_tool_enablement_distinguishes_total_refusal_from_partial_effect(invoke,
     catalog = SimpleNamespace(
         get_schema_by_name=lambda name: {"function": {"name": name}} if name == "known" else None,
         policy_hidden_reason=lambda name: "restricted" if name == "hidden" else "",
+        callable_rows=lambda namespace="": [],
     )
     resident = []
     result = invoke(lambda ctx: enable_tools(catalog, ctx, names, resident))
     assert result.code == code
     assert len(resident) == int("known" in names)
     if "known,missing" == names:
-        assert "registered late" in result.text and "Not found: missing" in result.text
+        assert "Call schemas loaded" in result.text and "Not found: missing" in result.text
 
 
 @pytest.mark.parametrize("handler", ["_list_available_tools", "_enable_tools"])
@@ -362,16 +364,15 @@ def test_recent_tasks_snapshot_refusal_differs_from_partial_read(invoke, monkeyp
 
 
 def _assert_consumers(result, code):
-    from ouroboros._outcome_tool_errors import _classify_tool_errors
+    from ouroboros._outcome_tool_errors import _OK_TOOL_STATUSES, _classify_tool_errors
     from ouroboros.loop_tool_execution import _typed_execution_failure, _typed_result_metadata
-    from ouroboros.reflection import _trace_call_errored
 
     assert result.code == code, result.text
     failed = _typed_execution_failure(True, result)
     facts = _typed_result_metadata("census", result.text, failed, result)
     row = {"tool": "census", "result": result.text, **facts, "is_error": failed}
     assert facts["status"] == TOOL_CODE_SPECS[code].outcome_bucket
-    assert _trace_call_errored(row) == failed
+    assert (row["status"] in _OK_TOOL_STATUSES) is not failed
     classified = _classify_tool_errors({"tool_calls": [row]})
     if TOOL_CODE_SPECS[code].status == "ok":
         assert not any(classified.values())

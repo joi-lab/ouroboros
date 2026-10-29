@@ -311,7 +311,8 @@ async def _query_model(
         return _actor_query_result(model, actor, slot_id)
     except Exception as e:
         # Preserve full review errors; helper adds an omission note if needed.
-        error_msg = _rev().truncate_review_artifact(str(e), limit=4000)
+        from ouroboros.utils import sanitize_tool_result_for_log
+        error_msg = sanitize_tool_result_for_log(str(e))
         error = f"Error: {error_msg}"
         return model, _rev()._review_query_error_payload(ctx=ctx, model=model, messages=messages, slot_id=slot_id, error=error, slot=slot), None
 

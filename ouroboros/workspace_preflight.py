@@ -784,6 +784,7 @@ def _apply_node_exec_probe(tools: Dict[str, Dict[str, Any]]) -> None:
 
 
 def _git_stdout(root: pathlib.Path, cmd: List[str], *, timeout: int) -> str:
+    from ouroboros.git_observation import host_git_env
     try:
         result = subprocess.run(
             cmd,
@@ -792,6 +793,7 @@ def _git_stdout(root: pathlib.Path, cmd: List[str], *, timeout: int) -> str:
             text=True,
             timeout=timeout,
             check=False,
+            env=host_git_env(),
         )
     except Exception:
         return ""

@@ -270,6 +270,7 @@ def test_a_drain_refusal_is_not_applied_stopped_nobody_and_retries_nothing(isola
     monkeypatch.setattr(workers, "drain_repo_writers", lambda: ["Main conversation"])
     monkeypatch.setattr(workers, "kill_workers_for_update", lambda **_kw: kills.append(1) or [])
 
+    monkeypatch.setattr(control, "_index_lock_precondition", lambda: None)  # synthetic repo
     response = control._apply_smart_update_fenced(None, expected_base_sha="a" * 40, expected_target_sha="b" * 40)
 
     view = progress.snapshot({})
@@ -390,6 +391,7 @@ def test_a_request_refused_before_admission_leaves_the_retained_attempt(isolated
     _restart_requested_attempt()
     before = dict(isolated_progress.saved[progress.STATE_KEY])
     monkeypatch.setattr(update_merge, "plan_managed_update_merge", lambda **_kw: _plan(target_sha="c" * 40))
+    monkeypatch.setattr(control, "_index_lock_precondition", lambda: None)  # synthetic repo
     refused = control._apply_smart_update_fenced(None, expected_base_sha="a" * 40, expected_target_sha="b" * 40)
     assert refused.status_code == 409 and json.loads(refused.body)["reason"] == "release_moved"
     assert isolated_progress.saved[progress.STATE_KEY] == before

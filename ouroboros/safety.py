@@ -10,7 +10,6 @@ actual execution remain independent of the Cyber advisory decision.
 import ast
 import json
 import logging
-import math
 import pathlib
 import hashlib
 import threading
@@ -24,7 +23,7 @@ from ouroboros.config import get_safety_model, get_runtime_mode, get_safety_call
 from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
 from ouroboros.llm import LLMClient
 from ouroboros.loop_llm_call import classify_llm_exception, is_rate_limit_text
-from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_provider_from_model
+from ouroboros.pricing import emit_llm_usage_event, normalize_usage_cost, infer_provider_from_model
 from ouroboros.utils import sanitize_tool_result_for_log
 from ouroboros.config import runtime_setting
 
@@ -56,8 +55,6 @@ TOOL_POLICY: Dict[str, str] = {
     "maintain_harness": POLICY_SKIP,
     "read_file": POLICY_SKIP,
     "list_files": POLICY_SKIP,
-    "vcs_status": POLICY_SKIP,
-    "vcs_diff": POLICY_SKIP,
     "chat_history": POLICY_SKIP,
     "recent_tasks": POLICY_SKIP,
     "live_roots": POLICY_SKIP,
@@ -119,6 +116,7 @@ TOOL_POLICY: Dict[str, str] = {
     "tell_task": POLICY_CHECK,
     "update_scratchpad": POLICY_SKIP,
     "update_identity": POLICY_SKIP,
+    "update_world": POLICY_SKIP,
     "memory_update_registry": POLICY_SKIP,
     "vcs_pull_ff": POLICY_SKIP,
     "vcs_restore": POLICY_SKIP,
@@ -646,20 +644,6 @@ def _classify_safety_parse_failure(msg: Dict[str, Any], usage: Optional[Dict[str
     return "unparseable"
 
 
-_REMOTE_PROVIDER_KEYS = (
-    "OPENROUTER_API_KEY",
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "MINIMAX_API_KEY",
-    "DEEPSEEK_API_KEY",
-    "ZAI_API_KEY",
-    "OPENAI_COMPATIBLE_API_KEY",
-    "OPENAI_COMPATIBLE_BASE_URL",  # an endpoint without auth is configured access too
-    "CLOUDRU_FOUNDATION_MODELS_API_KEY",
-    "GIGACHAT_CREDENTIALS",
-    "GIGACHAT_PASSWORD",
-)
-
 _LOCAL_ROUTING_KEYS = (
     "USE_LOCAL_MAIN",
     "USE_LOCAL_HEAVY",
@@ -668,22 +652,11 @@ _LOCAL_ROUTING_KEYS = (
     "USE_LOCAL_FALLBACK",
 )
 
-# Provider-specific API key mapped from ``infer_api_key_type`` result.
-_PROVIDER_KEY_ENV = {
-    "openrouter": "OPENROUTER_API_KEY",
-    "openai": "OPENAI_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "minimax": "MINIMAX_API_KEY",
-    "deepseek": "DEEPSEEK_API_KEY",
-    "zai": "ZAI_API_KEY",
-    "openai-compatible": "OPENAI_COMPATIBLE_API_KEY",
-    "cloudru": "CLOUDRU_FOUNDATION_MODELS_API_KEY",
-    "gigachat": "GIGACHAT_CREDENTIALS",
-}
-
 
 def _any_remote_provider_configured() -> bool:
-    return any(str(runtime_setting(k, "") or "").strip() for k in _REMOTE_PROVIDER_KEYS)
+    from ouroboros.provider_models import any_api_connection_configured
+
+    return any_api_connection_configured()
 
 
 def _any_local_routing_enabled() -> bool:
@@ -694,27 +667,17 @@ def _any_local_routing_enabled() -> bool:
 
 
 def _light_model_has_reachable_provider(light_model: str) -> bool:
-    """Return whether the light model's direct provider config is reachable."""
+    """Return whether the light model's connection is reachable (its key, or a keyless endpoint)."""
+    from ouroboros.provider_models import PROVIDER_KINDS, model_has_credentials, parse_model_route, provider_has_credentials
+
+    if parse_model_route(light_model).connection:
+        return model_has_credentials(light_model)
     try:
         from ouroboros.pricing import infer_api_key_type
         key_type = infer_api_key_type(light_model)
     except Exception:  # pragma: no cover — defensive
         return True  # don't over-block on classifier failure
-    if key_type == "gigachat":
-        # GigaChat accepts either an authorization key (OAuth) or user/password.
-        has_creds = bool(str(runtime_setting("GIGACHAT_CREDENTIALS", "") or "").strip())
-        has_basic = bool(str(runtime_setting("GIGACHAT_USER", "") or "").strip()) and bool(
-            str(runtime_setting("GIGACHAT_PASSWORD", "") or "").strip()
-        )
-        return has_creds or has_basic
-    if key_type == "openai-compatible":  # the lane's one endpoint/key pair, blank key = no auth
-        from ouroboros.provider_models import provider_has_credentials
-
-        return provider_has_credentials("openai-compatible")
-    env_key = _PROVIDER_KEY_ENV.get(key_type)
-    if env_key is None:
-        return True
-    return bool(str(runtime_setting(env_key, "") or "").strip())
+    return provider_has_credentials(key_type) if key_type in PROVIDER_KINDS else True
 
 
 def _safety_deadline_epoch(ctx: Optional[Any]) -> Optional[float]:
@@ -1070,41 +1033,10 @@ def _run_llm_check(
     def _emit_safety_usage(usage_payload: Optional[Dict[str, Any]]) -> None:
         if not usage_payload:
             return
-        # Use provider-canonical model identity for cost/events.
-        resolved_model = str(usage_payload.get("resolved_model") or light_model)
-        if _use_local_light:
-            provider = "local"
-            model_name = f"{light_model} (local)"
-        else:
-            provider = str(usage_payload.get("provider") or infer_provider_from_model(light_model))
-            model_name = resolved_model
-        raw_cost = usage_payload.get("cost")
-        cost = None
-        if raw_cost is not None and not isinstance(raw_cost, bool):
-            try:
-                cost = float(raw_cost)
-            except (TypeError, ValueError):
-                cost = None
-            if cost is not None and not (math.isfinite(cost) and cost >= 0):
-                cost = None
-        if raw_cost is not None and cost is None:
-            log.warning("safety usage carried an invalid reported cost (%s); treating as unknown",
-                        type(raw_cost).__name__)
-            usage_payload["cost"] = None
-        if _use_local_light:
-            cost = 0.0
-        elif cost is None:
-            cost = estimate_cost_optional(
-                resolved_model,
-                int(usage_payload.get("prompt_tokens") or 0),
-                int(usage_payload.get("completion_tokens") or 0),
-                cache_usage={
-                    "cached_tokens": int(usage_payload.get("cached_tokens") or 0),
-                    "cache_write_tokens": int(usage_payload.get("cache_write_tokens") or 0),
-                },
-                provider=provider,
-            )
-            usage_payload["cost"] = cost
+        cost, model_name, provider, _estimated = normalize_usage_cost(
+            usage_payload, model=light_model, use_local=_use_local_light,
+            provider=infer_provider_from_model(light_model),
+        )
         _eq = getattr(ctx, "event_queue", None) if ctx is not None else None
         if _eq is not None:
             emit_llm_usage_event(

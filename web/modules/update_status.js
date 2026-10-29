@@ -1,12 +1,14 @@
 // Main-screen Update affordance (P2): one compact pill. While an update attempt runs it names the
-// real stage; afterwards that attempt's last confirmed outcome or its explicit uncertainty, until
-// the owner dismisses it (owner 3A, #1818); otherwise it appears when a managed update is available
-// (status is populated by the boot-time check-on-restart). The pill is a pointer, not a second apply
-// surface: clicking it opens Dashboard -> Updates, where the ONE apply flow (with its verified
-// preflight and typed outcomes) lives. The former pill-local staged dialog was removed (owner
-// decision 2026-08-31) so two hand-rolled apply controllers cannot drift apart again.
+// real stage; afterwards a failed or unconfirmed outcome stays on it until the owner hides it with the
+// close button beside it (owner 3A, #1818); a confirmed success never wears it (owner 1B): that record
+// lives in Dashboard -> Updates alone and cannot mask a newer version. Otherwise the pill appears when a
+// managed update is available (status is populated by the boot-time check-on-restart). The pill is a
+// pointer, not a second apply surface: clicking it opens Dashboard -> Updates, where the ONE apply flow
+// (with its verified preflight and typed outcomes) lives. The former pill-local staged dialog was removed
+// (owner decision 2026-08-31) so two hand-rolled apply controllers cannot drift apart again.
 
 import { apiClient, updateStrategyForPlan } from './api_client.js';
+import { SHELL_ICONS } from './page_icons.js';
 
 // Fail-soft wrapper around the api_client update helpers (the pill must never throw the app).
 async function safe(fn) {
@@ -54,6 +56,91 @@ export function verifiedUpdatePlan(preflight) {
     return { plan, strategy };
 }
 
+export function bindPreflightDescription(status, preflight) {
+    const plan = preflight?.merge_plan || {};
+    const letter = preflight?.letter;
+    const matches = letter?.key?.base_sha === plan.base_sha && letter?.key?.target_sha === plan.target_sha;
+    return { ...status, preflight_range: plan, checked_target_sha: plan.target_sha,
+        latest_sha: plan.target_sha, letter: matches ? letter : null };
+}
+
+export function preflightEvidenceText(preflight) {
+    const plan = preflight?.merge_plan || {};
+    const letter = bindPreflightDescription({}, preflight).letter;
+    const facts = preflight?.qualification;
+    const lines = [letter?.description_current && letter.text
+        ? letter.text : 'No description is available for this exact preflight range.'];
+    if (!facts || facts.base_sha !== plan.base_sha || facts.target_sha !== plan.target_sha) {
+        lines.push('Qualification for this range is unknown.');
+        return lines.join('\n');
+    }
+    for (const commit of facts.commits || []) {
+        const name = `${String(commit.sha).slice(0, 8)} ${commit.subject || ''}`;
+        if (!commit.receipt) {
+            lines.push(`${name}: ${commit.body_read === false ? 'commit body not read; qualification unknown' : 'no qualification receipt'}.`);
+            continue;
+        }
+        for (const check of commit.receipt.checks || []) {
+            lines.push(`${name}: ${check.name} ${check.status} (${check.source || 'unknown source'})${check.detail ? `; ${check.detail}` : ''}.`);
+        }
+        const review = commit.receipt.review || {};
+        lines.push(`${name}: review observed ${review.observed || 'unknown'}, author declared ${review.declared || 'unknown'}.`);
+    }
+    const github = facts.github || {};
+    lines.push(`GitHub checks: ${github.status || 'unknown'}${github.reason ? `; ${github.reason}` : ''}.`);
+    for (const run of github.runs || []) {
+        lines.push(`${String(run.sha).slice(0, 8)} post-merge: ${run.conclusion || run.status || 'unknown'} ${run.url || ''}`);
+        if (run.covered_shas?.length) lines.push(`This run also covers: ${run.covered_shas.map((sha) => sha.slice(0, 8)).join(', ')}.`);
+    }
+    if (github.missing_shas?.length) lines.push(`No matching run observed: ${github.missing_shas.map((sha) => sha.slice(0, 8)).join(', ')}.`);
+    return lines.join('\n');
+}
+
+// The retained attempt's before/after samples as labelled rows of its Last attempt (owner 25.10: A). Only a number
+// is a measurement, so null stays "unobserved", never 0. Peak RSS keeps its word; lifetime CPU time and one
+// interval's share are separate rows; the dispatch time runs from acceptance to the first model call, not to an
+// answer. Each side is one recorded sample: history, never a verdict about the update.
+const measured = (value, unit) => (typeof value === 'number' ? `${value.toFixed(2)} ${unit}` : 'unobserved');
+
+function utcOffset(date) {
+    const minutes = -date.getTimezoneOffset();
+    const whole = Math.abs(minutes);
+    const rest = whole % 60;
+    return `UTC${minutes < 0 ? '-' : '+'}${Math.floor(whole / 60)}${rest ? `:${String(rest).padStart(2, '0')}` : ''}`;
+}
+
+function sampleRows(sample) {
+    if (!sample) return [{ label: 'Sample', value: 'unobserved' }];
+    const direct = sample.direct_message_first_dispatch;
+    const when = attemptTime(sample.observed_at);
+    const percent = measured(sample.cpu_percent, '%');
+    const interval = measured(sample.cpu_interval_seconds, 'seconds');
+    return [
+        { label: 'Source', value: sample.source_sha || 'unknown source' },
+        // The local minute to read, with the exact recorded stamp under it.
+        when ? { label: 'Observed', value: `${when} ${utcOffset(new Date(sample.observed_at))}`, exact: sample.observed_at }
+            : { label: 'Observed', value: sample.observed_at || 'unknown time' },
+        { label: `RSS${sample.rss_measure === 'peak' ? ' peak' : ''}`,
+            value: measured(typeof sample.rss_bytes === 'number' ? sample.rss_bytes / 1048576 : null, 'MiB') },
+        { label: 'CPU time, process lifetime', value: measured(sample.cpu_seconds, 'seconds') },
+        { label: 'CPU share, sample interval',
+            value: percent === 'unobserved' && interval === 'unobserved' ? 'unobserved' : `${percent} over ${interval}` },
+        { label: 'Duty overruns', value: sample.duty_overruns == null ? 'unobserved' : JSON.stringify(sample.duty_overruns) },
+        { label: 'Direct message to first model call', value: typeof direct?.seconds === 'number'
+            ? `${measured(direct.seconds, 'seconds')} from acceptance${direct.task_id ? ` · task ${direct.task_id}` : ''}`
+            : 'unobserved' },
+    ];
+}
+
+/** `after_update` as rows: each side's heading (`head`), then its `{label, value, exact?}` rows; [] without facts. */
+export function afterUpdateRows(facts) {
+    if (!facts) return [];
+    return [['before', 'Before the update'], ['after', 'After the update']].flatMap(([side, name]) => {
+        const sample = facts[side] || null;
+        return [{ head: sample ? `${name} (recorded sample, server process)` : name }, ...sampleRows(sample)];
+    });
+}
+
 // The executor's real stages (no percentages or timers): the panel headline, and the pill's shorter word.
 export const UPDATE_STAGE_LABELS = {
     draining_writers: 'Finishing current work…',
@@ -77,9 +164,10 @@ const PILL_STAGES = {
     restart_requested: 'Restart requested…',
 };
 
-// Only the server concludes an attempt; a reconnect, a version or a SHA never does.
+// Only the server concludes an attempt; a reconnect, a version or a SHA never does. A word for the pill is the
+// outcome's claim to wear it: a confirmed success has none (owner 1B), so its record stays in the panel alone.
 const OUTCOMES = {
-    applied: { tone: 'ok', pill: 'Update completed', headline: 'Update completed.' },
+    applied: { tone: 'ok', pill: '', headline: 'Update completed.' },
     not_applied: { tone: 'error', pill: 'Update not applied', headline: 'No update was applied.' },
     rolled_back: { tone: 'error', pill: 'Previous version restored',
         headline: 'The update failed; the previous version was restored.' },
@@ -165,6 +253,7 @@ export function updateAttemptView(progress) {
     const outcome = OUTCOMES[key];
     if (outcome && !progress.active) {
         return { ...base, terminal: true, tone: outcome.tone, pill: outcome.pill, headline: outcome.headline,
+            restoreTarget: key === 'applied' ? String(progress.base_sha || '') : '',
             text: [attemptText({ ...progress, outcome: key }), retention].filter(Boolean).join(' ') };
     }
     // Not concluded: this server's stage, a restart it needs, a reviewed resolution, or a later server's checks.
@@ -188,8 +277,8 @@ export function attemptTime(value) {
     }).format(date);
 }
 
-// One bounded per-browser preference: the one terminal attempt dismissed from the pill. It is never
-// sent anywhere and changes neither the server's record nor the panel.
+// One bounded per-browser preference: the one terminal attempt hidden from the pill. It is never sent anywhere
+// and changes neither the server's record nor the panel; another browser shows the notice again.
 const DISMISSED_KEY = 'ouroboros.update-attempt-dismissed';
 
 export function dismissedUpdateAttempt() {
@@ -212,12 +301,18 @@ export function dismissUpdateAttempt(id) {
 export function initUpdateStatus({ showPage, openDashboardTab, ws, readStatus = () => apiClient.updateStatus() } = {}) {
     let latest = null;
 
-    let ownedPill = null;
+    let ownedNotice = null;
+    let closeButton = null;
+    let hideable = '';  // the terminal attempt the close button hides now; '' while it is not offered
+    // The capsule and its close button: one notice whose end sits where the notice does (a hide on another page is
+    // no ending). The close is drawn inside the capsule's end, so no other control moves when it comes and goes.
     function ensurePill() {
         let pill = document.getElementById('update-pill');
         if (!pill) {
+            ownedNotice = document.createElement('span');
+            ownedNotice.className = 'update-notice';
+            ownedNotice.hidden = true;
             pill = document.createElement('button');
-            ownedPill = pill;
             pill.id = 'update-pill';
             pill.type = 'button';
             pill.className = 'btn btn-default btn-sm update-pill';
@@ -226,11 +321,30 @@ export function initUpdateStatus({ showPage, openDashboardTab, ws, readStatus = 
                 if (openDashboardTab) openDashboardTab('updates');
                 else showPage?.('dashboard');
             });
+            closeButton = document.createElement('button');
+            closeButton.type = 'button';
+            closeButton.className = 'update-notice-close ui-hit-area';
+            closeButton.hidden = true;
+            closeButton.setAttribute('aria-label', 'Hide this notice');
+            closeButton.title = 'Hide this notice. The update record stays in Dashboard → Updates.';
+            closeButton.innerHTML = SHELL_ICONS.close;
+            closeButton.addEventListener('click', () => {
+                if (!hideable) return;
+                const held = document.activeElement === closeButton;
+                dismissUpdateAttempt(hideable);  // the event repaints this notice at once
+                // The control that ended the notice is gone: a keyboard reader lands on what is left of it (the
+                // availability it unmasked), else on the sidebar's last row, never on the page.
+                if (held) {
+                    const rows = document.body.querySelectorAll?.('#primary-sidebar [data-nav-page]') || [];
+                    (pill.hidden ? [...rows].pop() : pill)?.focus?.({ preventScroll: true });
+                }
+            });
+            ownedNotice.append(pill, closeButton);
             const anchor = document.getElementById('nav-version');
             if (anchor && anchor.parentNode) {
-                anchor.parentNode.insertBefore(pill, anchor.nextSibling);
+                anchor.parentNode.insertBefore(ownedNotice, anchor.nextSibling);
             } else {
-                document.body.appendChild(pill);
+                document.body.appendChild(ownedNotice);
             }
         }
         return pill;
@@ -239,26 +353,29 @@ export function initUpdateStatus({ showPage, openDashboardTab, ws, readStatus = 
     function renderPill(status) {
         const pill = ensurePill();
         const attempt = updateAttemptView(status?.update_progress);
-        const shown = attempt && !(attempt.terminal && attempt.id === dismissedUpdateAttempt());
+        // A stage always shows; a concluded attempt shows only if its outcome has a word for the pill (a success has
+        // none) and this browser has not hidden it. What is hidden is the notice: the record stays in the panel.
+        const shown = Boolean(attempt?.pill) && !(attempt.terminal && attempt.id === dismissedUpdateAttempt());
         // Content or uncommitted work of the checkout's own is a caveat about an AVAILABLE update, not a
         // count of commits ahead; while an attempt shows, its stage or outcome is the pill's one fact.
         pill.classList.toggle('has-local', Boolean(!shown && status?.available
             && (status.dirty || status.local_changes !== 'absent')));
+        hideable = shown && attempt.terminal ? attempt.id : '';
+        if (closeButton) closeButton.hidden = !hideable;
+        pill.classList.toggle('has-close', Boolean(hideable));
         if (shown) {
             pill.textContent = attempt.pill;
             pill.title = [attempt.headline, attempt.text].filter(Boolean).join(' ');
             pill.dataset.tone = attempt.tone;
-            pill.hidden = false;
-            return;
+        } else {
+            delete pill.dataset.tone;
+            if (status?.available) {
+                pill.textContent = updatePillText(status);
+                pill.title = updatePillDetail(status);
+            }
         }
-        delete pill.dataset.tone;
-        if (!status || !status.available) {
-            pill.hidden = true;
-            return;
-        }
-        pill.textContent = updatePillText(status);
-        pill.title = updatePillDetail(status);
-        pill.hidden = false;
+        pill.hidden = !shown && !status?.available;
+        if (ownedNotice) ownedNotice.hidden = pill.hidden;
     }
 
     // The panel's coalescing (updates.js loadStatus): one read in flight; a newer notice owns the next read.
@@ -305,7 +422,7 @@ export function initUpdateStatus({ showPage, openDashboardTab, ws, readStatus = 
             disposers.splice(0).forEach((dispose) => dispose());
             window.removeEventListener('ouro:update-attempt-dismissed', onDismissed);
             window.removeEventListener('ouro:page-shown', onPageShown);
-            ownedPill?.remove();
+            ownedNotice?.remove();
         },
     };
 }

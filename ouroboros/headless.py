@@ -15,7 +15,7 @@ from hashlib import sha256
 from typing import Any, BinaryIO, Dict, Iterable, List, Optional, Sequence, Tuple  # noqa: F401
 
 from ouroboros.contracts.task_constraint import normalize_task_constraint  # noqa: F401
-from ouroboros.post_task_checkpoint import project_replica_task_result_fields
+from ouroboros.post_task_checkpoint import CANONICAL_CUSTODY_FIELDS, project_replica_task_result_fields
 from ouroboros.workspace_file_outputs import _directory_direct_artifacts
 from ouroboros.task_results import (
     cancellation_blocks_child_result, load_task_result, validate_task_id, write_task_result,
@@ -126,7 +126,7 @@ def prepare_task_drive(parent_drive_root: pathlib.Path, task_id: str, memory_mod
     """Create a forked or empty execution drive; other modes keep the parent.
 
     Forks copy identity/world/registry and global knowledge except on Project
-    tasks, which copy only the shared patterns file. Memory initializes empties.
+    tasks, which copy no knowledge file. Memory initializes empties.
     """
 
     mode = str(memory_mode or "shared").strip().lower()
@@ -151,6 +151,9 @@ def prepare_task_drive(parent_drive_root: pathlib.Path, task_id: str, memory_mod
     )
     if mode == "forked":
         _copy_stable_memory(parent, child, project_id=str(project_id or "").strip())
+    from ouroboros.task_custody import record_drive_arrival
+
+    record_drive_arrival(parent, parent / HEADLESS_TASKS_DIR, task_id)  # the settlement lap looks at it alone
     return child
 
 
@@ -208,15 +211,17 @@ def _drive_retention_rows(parent: pathlib.Path, names: List[str], stop: Any, *,
 
 
 def drive_candidates(base: pathlib.Path, parent: pathlib.Path, cutoff: float, stop: Any = None,
-                     *, after: str = "", record: bool = True) -> Iterable[Tuple[str, str, Optional[float], bool, Dict[str, Any]]]:
+                     *, after: str = "", record: bool = True,
+                     names: Optional[List[str]] = None) -> Iterable[Tuple[str, str, Optional[float], bool, Dict[str, Any]]]:
     """The selection half the prune and the free-space preview share: every drive folder under
     BASE in name order (wrapping after AFTER), each with the cheap canonical facts of its task row
     as ``(task_id, status, drive_retention_at, inside_wait, fact)``. ``inside_wait`` says the
     row is terminal but its retention instant is after CUTOFF; a missing row yields ``""`` as
     status and None as the instant (the strict reader decides later). A hint never authorizes
     removal: the prune re-reads the strict row before any settlement. ``record=False`` (the
-    preview) classifies a legacy row in memory only; the prune fills the projection."""
-    names = sorted(entry.name for entry in base.iterdir() if entry.is_dir())
+    preview) classifies a legacy row in memory only; the prune fills the projection. ``names``
+    (the drives whose own rows changed) replaces the listing: only those are selected."""
+    names = _drive_names(base) if names is None else sorted(names)
     names = [name for name in names if name > after] + [name for name in names if name <= after]
     for task_id, fact in _drive_retention_rows(parent, names, stop, record=record):
         status, retention_at, inside = "", None, False
@@ -233,30 +238,104 @@ def drive_candidates(base: pathlib.Path, parent: pathlib.Path, cutoff: float, st
         yield task_id, status, retention_at, inside, fact if usable else {}
 
 
+def _drive_names(base: pathlib.Path) -> List[str]:
+    """The drive folders of a layout in name order, from one listing (the entry's type, never a stat per name)."""
+    with os.scandir(base) as entries:
+        return sorted(entry.name for entry in entries if entry.is_dir())
+
+
+def _earliest(known: Optional[float], instant: float) -> float:
+    return float(instant) if known is None else min(float(known), float(instant))
+
+
+def _moved_inputs(recorded: Any, basis: Dict[str, Any]) -> Optional[set]:
+    """The inputs of the layout's recorded basis that differ from the current one, when each has an
+    addressed reading: the terminal-write counter (rows were written terminal somewhere: look at the
+    drives whose rows those are), the published arrivals (drive creators published: look at those
+    drives), the layout directory together with the arrivals (the moved mtime is the published drives').
+    ``None`` when another input moved, or the directory moved and nobody published: a whole walk."""
+    if not isinstance(recorded, dict):
+        return None
+    moved = {key for key in set(recorded) | set(basis) if recorded.get(key) != basis.get(key)}
+    explained = (moved <= {"terminal", "arrivals", "directory"} and ("directory" not in moved or "arrivals" in moved)
+                 and ("terminal" not in moved or isinstance(recorded.get("terminal"), int)))
+    return moved if explained else None
+
+
+def _changed_drives(base: pathlib.Path, parent: pathlib.Path, since: int) -> List[str]:
+    """The drives of BASE whose own task rows were written terminal since the counter stood at SINCE: one
+    indexed read of those rows (``task_store.terminal_writes_since``) and one stat per row, never a listing."""
+    from ouroboros.task_store import terminal_writes_since
+
+    changed = []
+    for task_id in terminal_writes_since(parent, since):
+        try:
+            validate_task_id(task_id)
+        except ValueError:
+            continue
+        if (base / task_id).is_dir():
+            changed.append(task_id)
+    return changed
+
+
 def _prune_drives(base: pathlib.Path, parent: pathlib.Path, *, drive_of: Any, not_terminal: str,
                   retention_days: Optional[int], now: Optional[float], live: Any, guard: Any, stop: Any,
-                  budget: Optional[int], after: str, extra_checks: Any, rested: Optional[Dict] = None,
-                  only: Optional[Any] = None, progress: Any = None) -> Dict[str, Any]:
+                  budget: Optional[int], after: str, extra_checks: Any, rested: Any = None,
+                  only: Optional[Any] = None, progress: Any = None, rest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """The prune both layouts share: cheap per-name facts select possible work;
     fresh strict canonical status/date and existing checks still decide eligibility.
     Settlement through ``task_custody.settle_child_drive`` runs in name order after ``after`` (wrapping), at
-    most ``budget`` attempts per call; ``cursor`` is the last attempted drive, ``deferred`` the unreached rest;
-    ``rested`` the caller's durable verdicts (``task_custody.rested_verdict``), updated in place. ``only``
-    restricts the pass to those task ids (the free action's previewed folders; every other drive is untouched);
-    ``progress`` is called with the report after each settlement attempt."""
+    most ``budget`` attempts per call; ``cursor`` is the last attempted drive, ``deferred`` the unreached rest
+    (no verdict is read and no row decoded for it). ``rested`` is the caller's durable verdicts
+    (``task_custody.rested_verdict``), updated in place, or a callable that loads them: a pass that walks reads
+    them, one that looks at named drives only when one of them reaches a verdict (a running or young drive
+    never does), one at rest never. ``rest`` is the layout's durable rest, updated in place: the inputs
+    (``task_custody.layout_basis``) and the earliest retention instant of a drive it left young; while both
+    hold, the pass lists nothing (``rested`` in the report). When only inputs with an addressed reading moved
+    (``_moved_inputs``: the terminal-write counter, rows written terminal somewhere; the published arrivals,
+    with or without the directory's mtime they moved), the pass looks only at the drives whose own rows
+    those were (``_changed_drives``) and at the drives published (``task_custody.arrived_drives``; the
+    report's ``arrivals``, which the caller forgets in the transaction recording the pass): a completion
+    elsewhere or a new drive leaves the rest standing under the moved inputs, still without a listing. A
+    whole pass that attempted nothing records the rest; any other pass clears it.
+    ``only`` restricts the pass to those task ids (the free action's previewed folders; every other drive is
+    untouched, no rest is kept); ``progress`` is called with the report after each settlement attempt."""
     from ouroboros.retention import age_cutoff
-    from ouroboros.task_custody import forget_departed, record_rest, rested_verdict, settle_child_drive
+    from ouroboros.task_custody import (arrived_drives, forget_departed, layout_basis, record_rest, rested_verdict,
+                                        settle_child_drive)
 
     days = _resolve_retention_days(retention_days)
     cutoff = age_cutoff(days, now)
     report: Dict[str, Any] = {"retention_days": days, "scanned": 0, "pruned": [], "skipped": [], "errors": [],
-                              "deferred": [], "cursor": after}
+                              "deferred": [], "cursor": after, "rested": False, "arrivals": []}
     if not base.is_dir():
         return report
     chosen = None if only is None else {str(task_id) for task_id in only}
-    forget_departed(rested, base.name, [entry.name for entry in base.iterdir() if entry.is_dir()])
-    attempts = 0
-    for task_id, status, _retention_at, inside_wait, fact in drive_candidates(base, parent, cutoff, stop, after=after):
+    basis = layout_basis(parent, base, days) if rest is not None and chosen is None else None
+    young_due = basis is not None and rest.get("youngest") is not None and float(rest["youngest"]) <= cutoff
+    if basis is not None and rest.get("basis") == basis and not young_due:
+        report["rested"] = True
+        return report  # nothing listed, decoded, copied or hashed: what the last whole pass saw still stands
+    names = None
+    if basis is not None:
+        report["arrivals"] = arrived_drives(parent, base)  # looked at by this pass, alone or inside the walk
+    if basis is not None and not young_due and (moved := _moved_inputs(rest.get("basis"), basis)) is not None:
+        changed = _changed_drives(base, parent, rest["basis"]["terminal"]) if "terminal" in moved else []
+        names = sorted({*changed, *report["arrivals"]})
+        if not names:
+            rest["basis"] = basis  # the rows written and the drives published were none of this layout's: its rest stands
+            report["rested"] = True
+            return report
+    def verdicts() -> Any:  # the durable verdicts, decoded by the first drive whose verdict is compared or kept
+        nonlocal rested
+        rested = rested() if callable(rested) else rested
+        return rested
+
+    if names is None:
+        forget_departed(verdicts(), base.name, _drive_names(base))
+    attempts, youngest = 0, (None if names is None else rest.get("youngest"))
+    for task_id, status, retention_at, inside_wait, fact in drive_candidates(base, parent, cutoff, stop, after=after,
+                                                                               names=names):
         if chosen is not None and task_id not in chosen:
             continue
         task_dir = base / task_id
@@ -268,12 +347,13 @@ def _prune_drives(base: pathlib.Path, parent: pathlib.Path, *, drive_of: Any, no
                     report["skipped"].append({"task_id": task_id, "reason": not_terminal, "status": status})
                     continue
                 if inside_wait:
+                    youngest = _earliest(youngest, retention_at if retention_at is not None else task_dir.stat().st_mtime)
                     report["skipped"].append({"task_id": task_id, "reason": "younger_than_retention"})
                     continue
-            if stop is not None and stop():
-                report["deferred"].append(task_id)
+            if (stop is not None and stop()) or (budget is not None and attempts >= budget):
+                report["deferred"].append(task_id)  # unreached this pass: its turn comes after the cursor
                 continue
-            if verdict := rested_verdict(rested, parent, task_id, task_dir, drive_of(task_dir)):
+            if verdict := rested_verdict(verdicts(), parent, task_id, task_dir, drive_of(task_dir)):
                 report["skipped"].append({"task_id": task_id, "reason": "custody_unchanged", "retained": verdict.get("reason")})
                 continue
             # A hint never authorizes removal. In particular a date changed after
@@ -283,26 +363,29 @@ def _prune_drives(base: pathlib.Path, parent: pathlib.Path, *, drive_of: Any, no
             if status not in _FINAL_STATUSES:
                 report["skipped"].append({"task_id": task_id, "reason": not_terminal, "status": status})
                 continue
-            if not _prompt_settlement(result) and _timestamp_from_result(result, task_dir.stat().st_mtime) > cutoff:
+            instant = _timestamp_from_result(result, task_dir.stat().st_mtime)
+            if not _prompt_settlement(result) and instant > cutoff:
+                youngest = _earliest(youngest, instant)
                 report["skipped"].append({"task_id": task_id, "reason": "younger_than_retention"})
                 continue
             skip = extra_checks(task_dir, result)
             if skip is not None:
                 report["skipped"].append({"task_id": task_id, **skip})
                 continue
-            if (budget is not None and attempts >= budget) or (stop is not None and stop()):
-                report["deferred"].append(task_id)
-                continue
             attempts += 1
             report["cursor"] = task_id
             if (outcome := settle_child_drive(parent, task_id, drive_of(task_dir), live=live, guard=guard, stop=stop,
                                               report=report))["status"] == "removed":
                 report["pruned"].append({"task_id": task_id, "path": str(task_dir)})
-            record_rest(rested, base.name, parent, task_id, task_dir, drive_of(task_dir), outcome)
+            record_rest(verdicts(), base.name, parent, task_id, task_dir, drive_of(task_dir), outcome)
             if progress is not None:
                 progress(report)
         except Exception as exc:
             report["errors"].append({"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"})
+    if basis is not None:
+        rest.clear()
+        if not (attempts or report["deferred"] or report["errors"] or (stop is not None and stop())):
+            rest.update({"basis": basis, "youngest": youngest})  # a whole pass with nothing to do: its inputs stand
     return report
 
 
@@ -316,9 +399,10 @@ def prune_headless_task_drives(
     stop: Any = None,
     budget: Optional[int] = None,
     after: str = "",
-    rested: Optional[Dict[str, Any]] = None,
+    rested: Any = None,
     only: Optional[Any] = None,
     progress: Any = None,
+    rest: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Prune terminal child drives past retention (a cancelled subagent's at once). Removal is
     ``task_custody.settle_child_drive``'s decision alone: ``live`` is the supervisor's probe (without it nothing
@@ -340,7 +424,7 @@ def prune_headless_task_drives(
     return _prune_drives(parent / HEADLESS_TASKS_DIR, parent, drive_of=lambda task_dir: task_dir / "data",
                          not_terminal="parent_not_terminal", retention_days=retention_days, now=now, live=live,
                          guard=guard, stop=stop, budget=budget, after=after, extra_checks=checks, rested=rested,
-                         only=only, progress=progress)
+                         only=only, progress=progress, rest=rest)
 
 
 def prune_task_drives(
@@ -353,9 +437,10 @@ def prune_task_drives(
     stop: Any = None,
     budget: Optional[int] = None,
     after: str = "",
-    rested: Optional[Dict[str, Any]] = None,
+    rested: Any = None,
     only: Optional[Any] = None,
     progress: Any = None,
+    rest: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Prune direct-task scratch drives past retention (``settle_child_drive`` decides;
     same knobs as ``prune_headless_task_drives``)."""
@@ -363,7 +448,7 @@ def prune_task_drives(
     return _prune_drives(parent / TASK_DRIVES_DIR, parent, drive_of=lambda task_dir: task_dir,
                          not_terminal="task_not_terminal", retention_days=retention_days, now=now, live=live,
                          guard=guard, stop=stop, budget=budget, after=after, extra_checks=lambda *_a: None,
-                         rested=rested, only=only, progress=progress)
+                         rested=rested, only=only, progress=progress, rest=rest)
 
 
 def prune_task_trees(
@@ -376,7 +461,7 @@ def prune_task_trees(
     """Prune ephemeral task-tree ledgers once the root is terminal or absent and
     older than GC retention; durable project memory is outside this plane."""
 
-    from ouroboros.retention import age_cutoff
+    from ouroboros.retention import age_cutoff, keep_until
 
     parent = pathlib.Path(parent_drive_root)
     base = parent / "task_trees"
@@ -401,6 +486,7 @@ def prune_task_trees(
                 report["skipped"].append({"root_task_id": root_id, "reason": "root_not_terminal", "status": status})
                 continue
             if _timestamp_from_result(result, dir_mtime) > cutoff:
+                keep_until(report, _timestamp_from_result(result, dir_mtime), days)
                 report["skipped"].append({"root_task_id": root_id, "reason": "younger_than_retention"})
                 continue
             shutil.rmtree(tree_dir)
@@ -479,8 +565,7 @@ def _copy_child_task_result_locked(parent_drive_root: pathlib.Path, task: Dict[s
         except Exception:
             child_result.pop("artifact_bundle", None)
     child_result.setdefault("headless_child_drive_root", str(child_drive))
-    if (child_status in _FINAL_STATUSES and _workspace_root_from_task(task) is not None
-            and not task_is_readonly_subagent(task)):
+    if child_status in _FINAL_STATUSES and task_requires_workspace_capture(task):
         artifact_status = str(canonical_existing.get("artifact_status") or "").strip().lower()
         if artifact_status in ARTIFACT_TERMINAL_STATUSES | {ARTIFACT_STATUS_PENDING, ARTIFACT_STATUS_FINALIZING}:
             child_result["artifacts"] = _merge_artifacts(
@@ -562,7 +647,8 @@ def _retry_child_task_refs_locked(parent: pathlib.Path, child: pathlib.Path, tas
                 return write_task_result(parent, task_id, source["status"],
                                          _field_projector=project, strict_existing_dict=True,
                                          _terminal_time_source=replica,
-                                         **{key: value for key, value in (replica or {}).items() if key not in {"status", "task_id"}})
+                                         **{key: value for key, value in (replica or {}).items()
+                                            if key not in {"status", "task_id", *CANONICAL_CUSTODY_FIELDS}})
             except _RefPublicationChanged:
                 continue
             except _GenerationClosed:
@@ -598,9 +684,8 @@ def terminal_task_files_ready(canonical_root: pathlib.Path, task: Dict[str, Any]
                 return False
     except (OSError, ValueError, RuntimeError):
         return False
-    return not (
-        _workspace_root_from_task(task) is not None and not task_is_readonly_subagent(task)
-        and str(result.get("artifact_status") or "") in {ARTIFACT_STATUS_PENDING, ARTIFACT_STATUS_FINALIZING}
+    return not task_requires_workspace_capture(task) or (
+        str(result.get("artifact_status") or "").strip().lower() in ARTIFACT_TERMINAL_STATUSES
     )
 
 
@@ -633,7 +718,11 @@ def prepare_terminal_task_files(canonical_root: pathlib.Path, task: Dict[str, An
             current = copy_child_task_result(root, {**task, "id": task_id}) or current
         if str(current.get("status") or "") not in _FINAL_STATUSES:
             raise ValueError("terminal task result is missing or not settled")
-        if not task_is_readonly_subagent(task) and current.get("artifact_status") not in ARTIFACT_TERMINAL_STATUSES:
+        # Workspace capture and a workspace-free child's memory export share the
+        # existing finalizer. Inline turns have no workspace capture obligation.
+        memory_export = child is not None and _workspace_root_from_task(task) is None and not task_is_readonly_subagent(task)
+        if (not cancelled and (task_requires_workspace_capture(task) or memory_export)
+                and str(current.get("artifact_status") or "").strip().lower() not in ARTIFACT_TERMINAL_STATUSES):
             finalize_task_artifacts(root, {**task, "id": task_id})
         report["result"] = load_task_result(root, task_id, strict=True)
         from ouroboros.obligations import drive_finished
@@ -766,6 +855,18 @@ def task_is_readonly_subagent(task: Dict[str, Any]) -> bool:
         str(task.get("delegation_role") or metadata.get("delegation_role") or "") == "subagent"
         and str(task_constraint.get("mode") or "") == _LOCAL_READONLY_SUBAGENT_MODE
     )
+
+
+def task_requires_workspace_capture(task: Dict[str, Any]) -> bool:
+    """Capture applicability shared by completion, preparation and status readers.
+
+    The actual execution owner wins over historical direct/Presence origin.
+    Source verification, cancellation and split-result adoption precede this test.
+    """
+    from ouroboros.task_carrier import inline_execution
+
+    return (_workspace_root_from_task(task) is not None
+            and not task_is_readonly_subagent(task) and not inline_execution(task))
 
 
 def _build_deliverable_manifest(
@@ -1017,10 +1118,8 @@ def _copy_stable_memory(parent: pathlib.Path, child: pathlib.Path, *, project_id
     parent_memory = parent / "memory"
     child_memory = child / "memory"
     project = bool(str(project_id or "").strip())
-    # Projects inherit shared patterns, never the global knowledge topics/index.
+    # A project child inherits none of the global knowledge topics or index.
     paths = ["identity.md", "WORLD.md", "registry.md"]
-    if project:
-        paths.append("knowledge/patterns.md")
     for rel in paths:
         src = parent_memory / rel
         if src.is_file():
@@ -1075,6 +1174,7 @@ __all__ = [
     "terminal_task_files_ready",
     "finalize_task_artifacts",
     "task_is_readonly_subagent",
+    "task_requires_workspace_capture",
     "prepare_task_drive",
     "drive_candidates",
     "prune_headless_task_drives",

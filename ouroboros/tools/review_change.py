@@ -112,11 +112,12 @@ class ReviewChangeRequest:
     treat_as_body: bool = False
     surface: str = SURFACE
     answer: str = ""  # subject=result: the reply under review (omitted = the task's latest reply)
+    since_review: str = ""  # a change review record to compare against (review_history.subject_comparison)
 
 
 _ARG_NAMES = frozenset(ReviewChangeRequest.__dataclass_fields__)
 _TEXT_ARGS = ("root", "workspace_root", "subject", "base", "head", "surface", "goal", "scope",
-              "reason", "reviewer_effort", "review_rebuttal", "answer")
+              "reason", "reviewer_effort", "review_rebuttal", "answer", "since_review")
 
 
 def wave_tool_name(request: Any) -> str:
@@ -189,6 +190,8 @@ def parse_request(args: Dict[str, Any]) -> ReviewChangeRequest:
         problems.append(f"coupling_only belongs to a change review; a {subject} review asks one question of every seat")
     if text["answer"].strip() and subject != RESULT:
         problems.append("answer belongs to subject=result")
+    if text["since_review"].strip() and subject not in CHANGE_KINDS:
+        problems.append("since_review belongs to a change review (subject index, worktree or base..head)")
     effort = text["reviewer_effort"].strip()
     if effort and effort not in EFFORT_SCALE:
         problems.append(f"reviewer_effort must be one of {', '.join(EFFORT_SCALE)}, got {effort!r}")
@@ -204,7 +207,7 @@ def parse_request(args: Dict[str, Any]) -> ReviewChangeRequest:
         reviewers=lists["reviewers"], reason=text["reason"], coupling_only=lists["coupling_only"],
         reviewer_effort=effort, review_rebuttal=text["review_rebuttal"],
         treat_as_body=treat is True and subject not in SINGLE_QUESTION,
-        answer=text["answer"],
+        answer=text["answer"], since_review=text["since_review"].strip(),
         surface=surface)
 
 
@@ -404,7 +407,8 @@ def _round_sha(request: ReviewChangeRequest, frozen: Any) -> str:
     from ouroboros.tools.commit_gate import compute_rebuttal_sha256
 
     return review_round_sha(frozen, rebuttal_sha=str(compute_rebuttal_sha256(request.review_rebuttal) or ""),
-                            questions=request.author_questions, goal=request.goal, scope=request.scope)
+                            questions=request.author_questions, goal=request.goal, scope=request.scope,
+                            since_review=request.since_review)
 
 
 def _wave_label(request: ReviewChangeRequest, root: pathlib.Path) -> str:
@@ -469,7 +473,7 @@ _CTX_FIELDS = (
     "_review_paid_stamp", "_review_reserved_roster", "_review_reserved_operations",
     "_review_pending_invocation_checkpoint", "_last_review_slot_executions", "_pending_review_attempt",
     "_commit_preflight", "_commit_review_panel",
-    "_review_dispute_history", "_review_dispute_input", "_preflight_execution",
+    "_review_dispute_history", "_review_dispute_input", "_preflight_execution", "_review_since",
 )
 
 
@@ -488,7 +492,7 @@ def _wave_context(ctx: ToolContext, wave: _Wave) -> Iterator[None]:
         ctx._current_review_contract_fingerprint = wave.contract_fp
         ctx._review_history, ctx._review_iteration_count, ctx._coupling_review_history = [], 0, {}
         ctx._review_dispute_history, ctx._review_dispute_input = None, None
-        ctx._preflight_execution = wave.execution
+        ctx._preflight_execution, ctx._review_since = wave.execution, wave.request.since_review
         from ouroboros import review_pause
         if wave.rejoin is not None:
             with review_pause.receptive_author(review_pause.rejoin_binding(ctx, wave.record_id)):
@@ -608,6 +612,7 @@ def wave_facts(ctx: ToolContext, wave: _Wave, *, outcome: Dict[str, Any], forens
         "governance_root": str(wave.frozen.spec.governance_root or ""), "layer": wave.layer,
         "body_fact": str(wave.fact.body), "body_how": str(wave.fact.how),
         "goal": wave.request.goal, "scope": wave.request.scope, "author_questions": list(wave.request.author_questions),
+        "since_review": wave.request.since_review,
         "binding_fingerprint": str(wave.frozen.diff_sha), "review_contract_fingerprint": wave.contract_fp,
         "rebuttal_sha256": wave.rebuttal_sha, "enforcement": wave.enforcement, "mode": mode,
         "dispute_input": forensic.get("dispute_input"),
@@ -1046,14 +1051,11 @@ def run_review_change(ctx: ToolContext, **args: Any) -> Dict[str, Any]:
         if rejoin is None and public_execution:
             from ouroboros.review_waiting import bind_panel
             bind_panel(ctx, panel)
-        if public_execution and (supplied_execution or {}).get("tested", {}) != {}:
-            tested = supplied_execution["tested"]
-            if (tested.get("head"), tested.get("tree")) != (frozen.parent_sha, frozen.tree_sha):
-                supplied_execution = None
         with _panel_in_force(panel):
             wave = dataclasses.replace(_prepare_wave(ctx, request, frozen, panel, root=root, fact=fact, layer=layer,
                                                      rejoin=rejoin),
-                                       execution=bind_execution_exhibit(supplied_execution, frozen))
+                                       execution=bind_execution_exhibit(supplied_execution, frozen,
+                                                                        public=public_execution))
             if rejoin is not None:
                 record_id = str(rejoin.review_record_id or wave.record_id)
                 wave = dataclasses.replace(wave, rejoin=rejoin, record_id=record_id,
@@ -1120,7 +1122,7 @@ def _handle_new_review_change(
     base: str = "", head: str = "", surface: str = SURFACE, goal: str = "", scope: str = "",
     author_questions: Optional[List[str]] = None, reviewers: Optional[List[str]] = None, reason: str = "",
     coupling_only: Optional[List[str]] = None, reviewer_effort: str = "", review_rebuttal: str = "",
-    treat_as_body: bool = False, answer: str = "", _resolved_binding: Any = None,
+    treat_as_body: bool = False, answer: str = "", since_review: str = "", _resolved_binding: Any = None,
     wake_on: Any = None,
 ) -> str:
     from ouroboros import review_pause
@@ -1144,8 +1146,9 @@ def _handle_new_review_change(
                 ctx, root=root, workspace_root=workspace_root, subject=subject, base=base, head=head, surface=surface,
                 goal=goal, scope=scope, author_questions=author_questions, reviewers=reviewers, reason=reason,
                 coupling_only=coupling_only, reviewer_effort=reviewer_effort, review_rebuttal=review_rebuttal,
-                treat_as_body=treat_as_body, answer=answer, _resolved_binding=_resolved_binding,
-                _preflight_execution=exhibit if exhibit.get("status") == "passed" else None, _public_execution=True)
+                treat_as_body=treat_as_body, answer=answer, since_review=since_review,
+                _resolved_binding=_resolved_binding, _preflight_execution=exhibit if exhibit.get("status") == "passed" or exhibit.get("observed") else None,
+                _public_execution=True)
     except ValueError as exc:
         return argument_refusal(ctx, "TOOL_ARG_ERROR (review_change)", [str(exc)], effect="No reviewer was dispatched.")
     result.pop("usage", None)
@@ -1209,7 +1212,8 @@ _DESCRIPTION = (
     "(default: the Main model) reads the whole system against BIBLE.md and returns a report. subject=result "
     "(surface=result) reviews THIS task's result instead of a change: the reply (answer, default your latest reply), "
     "the files and effects the task produced, and what was asked; every seat answers one question, whether the "
-    "result does what was asked, judged on the result, never the method. On a Required root, Blocking widens a "
+    "result does what was asked, judged on the result, and on the method only where the owner's words or "
+    "explicit choice fixed it. On a Required root, Blocking widens a "
     "named subset to every ticked reviewer; Advisory names ticked reviewers and needs a reason when narrowed "
     "(missing reason is a typed $0 refusal); if you did not review before delivery the host seats the whole pool. "
     "Auto composes the rows you name in every strictness. Cyber Pro composes freely and never holds. A child's "
@@ -1261,6 +1265,12 @@ def get_tools() -> List[ToolEntry]:
         "treat_as_body": {"type": "boolean", "default": False, "description": (
             "Raise a root whose body fact is unknown (git cannot place it: no remote, no copy binding) to the "
             "body layer. A recognized body and a recognized foreign root are unchanged; the record notes the raise.")},
+        "since_review": _string(
+            "A review_record_id of an earlier change review of this same repository (another task or copy of "
+            "it) to compare with: seats are shown what changed since that review's subject, its verdict only as a "
+            "label of those earlier bytes; no PASS, finding or obligation carries over. An unknown, foreign or "
+            "unreadable record is a stated comparison gap. Omitted: the reviews this task already bound on this "
+            "checkout are compared."),
     }
     schema = {"name": "review_change", "description": _DESCRIPTION,
               "parameters": {"type": "object", "properties": properties, "required": []}}

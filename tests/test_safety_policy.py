@@ -636,13 +636,13 @@ def test_unknown_tool_under_local_only_config_uses_local_light(monkeypatch):
 
 
 def test_minimax_key_enables_remote_safety_routing(monkeypatch):
+    from ouroboros.provider_models import ROUTE_CREDENTIAL_SETTING_KEYS
     from ouroboros.safety import (
-        _REMOTE_PROVIDER_KEYS,
         _any_remote_provider_configured,
         _light_model_has_reachable_provider,
     )
 
-    for key in _REMOTE_PROVIDER_KEYS:
+    for key in ROUTE_CREDENTIAL_SETTING_KEYS:
         monkeypatch.delenv(key, raising=False)
 
     assert not _any_remote_provider_configured()

@@ -145,6 +145,22 @@ def test_root_owner_question_and_late_answer_keep_address(setup, tmp_path, monke
     assert "int-current" in live and "starter submits" in live
 
 
+def test_owner_question_id_does_not_rejoin_a_different_reply_target(setup, tmp_path, monkeypatch):
+    from ouroboros.owner_quiz import quiz_states
+    from ouroboros.tools import owner_delivery
+
+    _, _, address = setup
+    delivered = []
+    monkeypatch.setattr(owner_delivery, "deliver_owner_event", lambda ctx, event: delivered.append(event) or "queued")
+    ctx = _ctx(tmp_path, "root")
+    fields = {"question": "Which port?", "assumption": "Keep waiting", "request_id": "port-choice"}
+    assert _escalate(ctx, **fields, reply_to=address).startswith("OK:")
+    assert "QUIZ_REQUEST_CONFLICT" in _escalate(ctx, **fields)
+    assert len(delivered) == 1
+    block, = quiz_states(tmp_path, "root").values()
+    assert block["reply_to"] == address
+
+
 def test_multi_question_address_allows_an_explicit_partial_answer(setup):
     ctx, stub, address = setup
     stub.detail["pendingInteractions"][0]["questions"].append({"id": "other", "question": "Other?"})

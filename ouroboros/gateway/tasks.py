@@ -88,6 +88,7 @@ from ouroboros.workspace_executor import normalize_executor_ref
 log = logging.getLogger(__name__)
 
 _RESERVED_METADATA_KEYS = frozenset({
+    "work_diagnostic",
     "work_kind", "schedule_writer_kind", "wake_cause", "focus", "consciousness_cause", "origin_wake_task_id",
     "task_id",
     "parent_task_id",
@@ -107,9 +108,9 @@ _RESERVED_METADATA_KEYS = frozenset({
     "executor_ref",
     "workspace_executor",
     "project_id",
-    # Owner provenance belongs to the host, never to a caller.
+    # Owner provenance (and its recorded absence) belongs to the host, never to a caller.
     "origin_message_ref",
-    "origin_suppressed",
+    "origin_suppressed", "origin_message_absent",
 })
 
 
@@ -626,6 +627,7 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     from ouroboros.artifacts import attachment_manifest_projection
     metadata.setdefault("session_id", str(body.get("session_id") or uuid.uuid4().hex))
     metadata.setdefault("actor_id", str(body.get("actor_id") or "cli")); metadata["work_kind"] = "owner"
+    metadata.pop("subagents_mode", None)  # The queue stamps admission; an API caller supplies no prior host fact.
     metadata.setdefault("source", str(body.get("source") or "api_task"))
     # Owner Surface Fact: assembled at its PRODUCER. An external admission
     # carries no browser observables, and a caller-built descriptor must not
@@ -775,24 +777,12 @@ def _tasks_list_payload(
 ) -> Dict[str, Any]:
     """Assemble the /api/tasks response off the event loop.
 
-    Unfiltered requests slice BEFORE projection (v6.9x P2): sort raw filenames
-    by the creation-stable raw ts, decode/project only the top-`limit` files,
-    then re-sort that slice by EFFECTIVE ts (a child-drive merge can replace ts
-    with the child's). Residual, disclosed: top-N membership is decided on raw
-    ts, so an old task freshly completed through its child can fall outside the
-    slice until its raw file is rewritten. Status-filtered requests keep the
-    full projection path — filtering needs every row's effective status (the
-    child-drive promotion contract pinned by test_headless_cli).
-
-    Admission at the slice boundary (ABI-2): a MALFORMED candidate discovered
-    by the sort scan reaches the admission reader even when it lies beyond
-    the slice window (the scan had to read its bytes anyway), so it is
-    quarantined and counted in the same ONE batched scan event. Disclosed
-    residual: a PARSEABLE but inadmissible row (unstamped/future stamp)
-    beyond the window is not classified by this sliced request — its raw ts
-    is all the sort reads — and is quarantined by the next scan that
-    actually reaches it (a filtered request, ``limit=0``, or any
-    list_task_results caller)."""
+    Filtered requests overlay every uncertain row plus the newest matching
+    stable rows, then take the global effective top N. Only the returned page
+    pays the public deep clone. Unfiltered requests retain their raw-ts slice
+    followed by effective sorting within it: a child can still move an older
+    task outside that slice until copy-back rewrites its raw ts.
+    """
     if queue_only:
         return {"tasks": [], "queue": _queue_snapshot(drive_root)}
     # One shared events-tail parse for every stale-running orphan check in this
@@ -801,22 +791,17 @@ def _tasks_list_payload(
     # List view is a status/cost projection: never materialize artifacts (no child
     # rebase copies, no artifact-dir scans, no disposition/sha claims) on a GET list.
     if wanted:
-        # The stored status is the WHERE prefilter; the filter below runs on the EFFECTIVE status
-        # (the overlay may rename a stored status), so the prefilter admits every row whose stored
-        # status could project into a wanted one: the wanted ones themselves plus the live rows.
-        from ouroboros.task_store import list_documents
-        stored = list_documents(drive_root, statuses=wanted | _OVERLAY_SOURCE_STATUSES)
-        rows = [
-            _compact_list_row(public_task_result(effective_task_result(
-                drive_root, row, materialize_artifacts=False, _events_index=events_index,
-            )))
-            for row in stored
-        ]
+        from ouroboros.task_store import filtered_list_candidates
+        stored = filtered_list_candidates(drive_root, wanted, limit)
+        rows = [effective_task_result(
+            drive_root, row, materialize_artifacts=False, _events_index=events_index,
+        ) for row in stored]
         rows = [row for row in rows if str(row.get("status") or "").lower() in wanted]
         rows.sort(key=lambda item: str(item.get("ts") or ""), reverse=True)
         if limit is not None:
             rows = rows[:limit]
-        return {"tasks": rows, "queue": _queue_snapshot(drive_root)}
+        return {"tasks": [_compact_list_row(public_task_result(row)) for row in rows],
+                "queue": _queue_snapshot(drive_root)}
     from ouroboros.task_store import documents_by_ids, newest_ids
     # The unfiltered list keeps the raw-``ts`` slice: the newest ``limit`` stored rows, read whole.
     ids = newest_ids(drive_root, limit)
@@ -828,11 +813,6 @@ def _tasks_list_payload(
     # ts, and the response order is the displayed order.
     rows.sort(key=lambda item: str(item.get("ts") or ""), reverse=True)
     return {"tasks": rows, "queue": _queue_snapshot(drive_root)}
-
-
-# Stored statuses the effective overlay can still project into another status (a live or
-# interrupted row may read as scheduled/running/failed): a filtered list prefilters them in too.
-_OVERLAY_SOURCE_STATUSES = frozenset({"running", "interrupted", "scheduled", "requested", "cancel_requested"})
 
 
 async def api_tasks_list(request: Request) -> JSONResponse:
@@ -1358,16 +1338,26 @@ async def api_task_resume(request: Request) -> JSONResponse:
     revocation, an acceptance fence at restore) is granted by the same call once
     its durable authority validates again; a fence-lifted zero-dispatch sibling
     is released by this same call as an explicit selection. A paused direct
-    owner-chat turn is resumed here too, under its own task id.
+    owner-chat turn is resumed here too, under its own task id. The optional
+    body (``TaskResumeRequest``) names held calls whose outcome is unknown that
+    the owner goes on past (a refusal's ``acceptable_unknown``), never re-run.
     """
     try:
         task_id = validate_task_id(request.path_params.get("task_id"))
     except ValueError as exc:
         return json_error(str(exc), 400)
+    body = await request_json_or(request, {}) or {}
+    named = body.get("accept_unknown", []) if isinstance(body, dict) else None
+    if (not isinstance(named, list) or set(body) - {"accept_unknown", "reason"}
+            or not all(isinstance(value, str) for value in named)):
+        return json_error('resume accepts only {"accept_unknown", "reason"}', 400, task_id=task_id,
+                          reason_code="unexpected_fields")
     try:
+        from ouroboros.control_actor import accepting_unknown
         from supervisor.queue import resume_budget_paused_task
 
-        result = resume_budget_paused_task(task_id)
+        with accepting_unknown(named, str(body.get("reason") or "")):
+            result = resume_budget_paused_task(task_id)
     except Exception as exc:
         return json_exception(exc, 503)
     if result.get("ok"):
@@ -1399,8 +1389,8 @@ async def api_task_resume(request: Request) -> JSONResponse:
         # a held Continue's observed blockers (#1721): an existing successor, never Not Found
         "predecessor_writers_unsettled", "selection_owner_held",
     } else 404
-    return JSONResponse({"error": error, "task_id": task_id,
-                         **{key: result[key] for key in ("action", "blockers", "message") if result.get(key)}},
+    return JSONResponse({"error": error, "task_id": task_id, **{key: result[key] for key in (
+                             "action", "blockers", "message", "acceptable_unknown") if result.get(key)}},
                         status_code=status)
 
 

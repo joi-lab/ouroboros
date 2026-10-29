@@ -82,19 +82,19 @@ def test_event_promotion_refuses_while_managed_update_is_active(monkeypatch):
     assert released == [token]
 
 
-def test_git_capture_repairs_corrupt_index(monkeypatch, tmp_path):
+def test_explicit_writer_repairs_corrupt_index(monkeypatch, tmp_path):
     git_dir = tmp_path / ".git"
     git_dir.mkdir()
     (git_dir / "index").write_text("broken", encoding="utf-8")
     monkeypatch.setattr(git_ops, "REPO_DIR", tmp_path)
 
-    calls = {"status": 0, "rebuild": 0}
+    calls = {"writer": 0, "rebuild": 0}
 
     def fake_run(cmd, cwd=None, capture_output=False, text=False, check=False, env=None,
                  timeout=None):
-        if cmd == ["git", "status", "--porcelain"]:
-            calls["status"] += 1
-            if calls["status"] == 1:
+        if cmd == ["git", "reset", "--hard", "HEAD"]:
+            calls["writer"] += 1
+            if calls["writer"] == 1:
                 return subprocess.CompletedProcess(
                     cmd,
                     128,
@@ -109,17 +109,17 @@ def test_git_capture_repairs_corrupt_index(monkeypatch, tmp_path):
 
     monkeypatch.setattr(git_ops.subprocess, "run", fake_run)
 
-    rc, stdout, stderr = git_ops.git_capture(["git", "status", "--porcelain"])
+    rc, stdout, stderr = git_ops.git_capture(["git", "reset", "--hard", "HEAD"], repair_index=True)
 
     assert rc == 0
     assert stdout == "M changed.py"
     assert stderr == ""
-    assert calls["status"] == 2
+    assert calls["writer"] == 2
     assert calls["rebuild"] == 1
     assert any(path.name.startswith("index.corrupt.") for path in git_dir.iterdir())
 
 
-def test_bounded_git_capture_bounds_corrupt_index_rebuild(monkeypatch, tmp_path):
+def test_bounded_writer_bounds_corrupt_index_rebuild(monkeypatch, tmp_path):
     git_dir = tmp_path / ".git"
     git_dir.mkdir()
     (git_dir / "index").write_text("broken", encoding="utf-8")
@@ -129,25 +129,25 @@ def test_bounded_git_capture_bounds_corrupt_index_rebuild(monkeypatch, tmp_path)
 
     def fake_bounded(cmd, *, timeout, cwd=None, env=None, text=True):
         calls.append((cmd, timeout, cwd, text))
-        if cmd == ["git", "status", "--porcelain"] and len(calls) == 1:
+        if cmd == ["git", "reset", "--hard", "HEAD"] and len(calls) == 1:
             return 128, "", "fatal: .git/index: index file smaller than expected"
         if cmd == ["git", "reset", "--mixed", "HEAD"]:
             return 0, "", ""
-        if cmd == ["git", "status", "--porcelain"]:
+        if cmd == ["git", "reset", "--hard", "HEAD"]:
             return 0, " M changed.py\n", ""
         raise AssertionError(cmd)
 
     monkeypatch.setattr(git_ops, "_run_git_process_bounded", fake_bounded)
 
     rc, stdout, stderr = git_ops.git_capture(
-        ["git", "status", "--porcelain"], timeout=17,
+        ["git", "reset", "--hard", "HEAD"], timeout=17, repair_index=True,
     )
 
     assert (rc, stdout, stderr) == (0, "M changed.py", "")
     assert [call[0] for call in calls] == [
-        ["git", "status", "--porcelain"],
+        ["git", "reset", "--hard", "HEAD"],
         ["git", "reset", "--mixed", "HEAD"],
-        ["git", "status", "--porcelain"],
+        ["git", "reset", "--hard", "HEAD"],
     ]
     assert all(call[1] == 17 for call in calls)
 

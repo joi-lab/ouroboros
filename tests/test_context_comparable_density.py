@@ -100,7 +100,7 @@ def test_round_one_uses_only_comparable_same_model_evidence(
         tmp_path, monkeypatch, witness_size, model, basis, observed, expected):
     plan = _plan(preferred="max", window=1_000_000)
     monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(ce, "_load", lambda root: {"token_density": {
+    monkeypatch.setattr(ce, "_read", lambda root: {"token_density": {
         model: {"pairs": [_witness(witness_size, basis=basis, observed=observed,
                                    route="route-a" if model == plan.model else "foreign-route")]}}})
     ctx = SimpleNamespace(context_fit_plan=plan, active_context_mode="max", active_model=plan.model,
@@ -117,7 +117,7 @@ def test_round_one_uses_only_comparable_same_model_evidence(
 
 @pytest.mark.parametrize("route", ["route-a", "other-route"])
 def test_comparability_is_symmetric_and_never_crosses_routes(monkeypatch, tmp_path, route):
-    monkeypatch.setattr(ce, "_load", lambda root: {"token_density": {"openai/test-model": {"pairs": [
+    monkeypatch.setattr(ce, "_read", lambda root: {"token_density": {"openai/test-model": {"pairs": [
         _witness(97_000, 0.8), _witness(600_000, route=route),
     ]}}})
     assert ce.resolve_main_token_density(tmp_path, "route-a", "openai/test-model",

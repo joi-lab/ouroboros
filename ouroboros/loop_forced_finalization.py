@@ -96,8 +96,14 @@ def _direct_child_results(ctx: _RoundLimitContext) -> list[Dict[str, Any]]:
         return []
 
 
+# Child states that need no further author disposition before this task finishes.
+HANDLED_CHILD_DISPOSITIONS = frozenset({
+    "integrated", "irrelevant", "deferred", "discarded", "cancelled", "host_attention",
+})
+
+
 def _child_disposition_state(child: Dict[str, Any]) -> str:
-    """Return cancellation or the current task-tree exact-hash disposition."""
+    """Return cancellation, the current task-tree exact-hash disposition, or host attention."""
 
     # Explicit cancellation wins every completion race; late scratch results are
     # not recovered. Only a SETTLED ``cancelled`` counts as handled (GR2-8c):
@@ -115,7 +121,14 @@ def _child_disposition_state(child: Dict[str, Any]) -> str:
             return current
     except Exception:
         pass
-    return ""
+    # A host-minted silence diagnostic is attention to this task, not work it
+    # delegated: it stays listed, accounted and readable, but owes no author
+    # disposition, pending or settled (#1376). An explicit one above still wins.
+    from ouroboros.work_diagnostics import diagnostic_ref
+
+    ref = diagnostic_ref(child)
+    minted = bool(ref) and str(child.get("task_id") or child.get("id") or "") == "silence-" + ref["episode_id"]
+    return "host_attention" if minted and str(child.get("parent_task_id") or "") == ref["task_id"] else ""
 
 
 def _project_child_result_dispositions(
@@ -163,6 +176,7 @@ def _record_forced_finalization(
     # answer (`_forced_final_answer`) and the no-spend host-fallback fence
     # path (`_handle_budget_exceeded` -> `_forced_fallback_result`).
     ctx.accumulated_usage.setdefault("terminal_origin", TERMINAL_ORIGIN_HOST_NOTICE)
+    ctx.accumulated_usage.pop("wake_summary", None)  # Only the accepting exit can publish the author's sentence.
     # Every rail returns this candidate's bytes. A wake's quiet selection stays
     # internal here too (the pipeline publishes only the host's outcome notice);
     # an ordinary replacement or the host's own fallback text is speech.
@@ -280,10 +294,8 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
         note_chat_id = getattr(tools_ctx, "current_chat_id", None)
 
         def _undecided(c: Dict[str, Any]) -> bool:
-            if _loop()._child_disposition_state(c) in {
-                "integrated", "irrelevant", "deferred", "discarded", "cancelled",
-            }:
-                return False  # explicitly handled
+            if _loop()._child_disposition_state(c) in HANDLED_CHILD_DISPOSITIONS:
+                return False  # explicitly handled, or host attention
             if (
                 canonical_task_summary_reached_chat(c, note_chat_id)
                 and str(c.get("task_id") or c.get("id") or "") not in claimed
@@ -401,9 +413,7 @@ def _undispositioned_children(ctx: _RoundLimitContext) -> list[Dict[str, Any]]:
     try:
         return [
             child for child in _loop()._direct_child_results(ctx)
-            if _loop()._child_disposition_state(child) not in {
-                "integrated", "irrelevant", "deferred", "discarded", "cancelled",
-            }
+            if _loop()._child_disposition_state(child) not in HANDLED_CHILD_DISPOSITIONS
         ]
     except Exception:
         return []
@@ -450,11 +460,11 @@ def _plan_gate_identity(decision: Dict[str, Any]) -> str:
     own typed fields (status, the holding objections, the pending asks, the hurry
     attribution) — never the rendered English (astra F3)."""
     return "|".join(str(decision.get(key) or "") for key in (
-        "status", "allow", "enforcement", "owner_hurry_local_advisory", "unreadable", "force_plan_met",
+        "status", "allow", "enforcement", "owner_hurry_local_advisory", "unreadable",
     )) + "|" + ",".join(str(x) for x in decision.get("holding") or []) + "|" + ",".join(str(x) for x in decision.get("pending_asks") or [])
 
 
-def _enforce_swarm_actions(
+def _enforce_plan_gate(
     content: str,
     messages: List[Dict[str, Any]],
     tools: ToolRegistry,
@@ -475,9 +485,9 @@ def _enforce_swarm_actions(
     no-chat contract forbids putting into ``messages``
     (``loop_round_limits.py``) — that is the only release this fires on."""
 
-    decision = _loop()._force_plan_decision(tools._ctx, llm_trace)
+    decision = _loop()._plan_gate_decision(tools._ctx, llm_trace)
     if decision.get("required"):
-        llm_trace["force_plan_decision"] = decision
+        llm_trace["plan_gate"] = decision
     identity = _plan_gate_identity(decision) if decision.get("required") else ""
     told = str(getattr(tools._ctx, "_plan_gate_told_identity", "") or "")
     if decision.get("allow"):
@@ -507,7 +517,7 @@ def _enforce_swarm_actions(
         return True
     if content.strip():
         messages.append({"role": "assistant", "content": content})
-    reminder = _loop()._force_plan_reminder(decision)
+    reminder = _loop()._plan_gate_reminder(decision)
     _loop()._append_or_merge_user_message(messages, reminder)
     llm_trace["reasoning_notes"].append(reminder)
     tools._ctx._plan_gate_told_identity = identity
@@ -542,7 +552,7 @@ def _plan_gate_facts(decision: Dict[str, Any]) -> str:
         return ""
     objections, pending = decision.get("open_objections") or [], decision.get("pending_asks") or []
     status = str(decision.get("status") or "")
-    if not objections and not pending and status not in {"force_plan_unmet", "unreadable", "held"}:
+    if not objections and not pending and status not in {"unreadable", "held"}:
         return ""
     parts = ["plan_review_open=true", f"plan_gate_status={status}",
              f"plan_open_objections={len(objections)}", f"plan_holding={len(decision.get('holding') or [])}",
@@ -554,8 +564,6 @@ def _plan_gate_facts(decision: Dict[str, Any]) -> str:
     if decision.get("owner_hurry_local_advisory"):
         parts.append("owner_hurry_local_advisory=true")
         parts.append(f"configured_enforcement={decision.get('configured_enforcement') or 'blocking'}")
-    if decision.get("force_plan_met") is False:
-        parts.append("force_plan_met=false")
     if decision.get("unreadable"):
         parts.append("plan_record_unreadable=true")
     return " ".join(parts)
@@ -568,10 +576,10 @@ def _forced_state_facts(ctx: _RoundLimitContext, llm_trace: Dict[str, Any]) -> s
     Never raises: a forced answer outranks its own annotation."""
     try:
         tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
-        projected = llm_trace.get("force_plan_decision")
+        projected = llm_trace.get("plan_gate", llm_trace.get("force_plan_decision"))
         decision = (
             projected if isinstance(projected, dict)
-            else (_loop()._force_plan_decision(tools_ctx, llm_trace) if tools_ctx is not None else {})
+            else (_loop()._plan_gate_decision(tools_ctx, llm_trace) if tools_ctx is not None else {})
         )
         lines = [line for line in (_plan_gate_facts(decision),) if line]
         undecided = _undispositioned_children(ctx)
@@ -616,6 +624,20 @@ def _prepare_forced_prompt(
         + _presence_forced_contract(ctx, tools_ctx)
         + _forced_subject_prompt(ctx, llm_trace)
     )
+
+
+def _deliver_forced_late_results(ctx: _RoundLimitContext, llm_trace: Dict[str, Any]) -> bool:
+    """Locators of timed-out calls that settled since (``late_tool_results``) join the forced candidate
+    on the live transcript before it is priced and sealed: an authorized forced send is the task's next
+    turn too. Rails that end without a send never call this; a budget candidate priced and then not
+    sent leaves them in the transcript its pause or next ordinary round carries."""
+    tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+    if tools_ctx is not None:
+        from ouroboros.late_tool_results import deliver_late_results
+
+        return deliver_late_results(ctx.messages, tools_ctx, llm_trace, ctx.drive_logs,
+                                    _loop()._append_or_merge_user_message)
+    return False
 
 
 def _presence_forced_contract(ctx: _RoundLimitContext, tools_ctx: Any) -> str:
@@ -1083,7 +1105,7 @@ def _forced_fallback_result(
     (``host_salvage``); ``None`` keeps the rail's previous provenance."""
     tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     plan_suffix = (
-        _loop()._force_plan_disclosure(tool_ctx, llm_trace, forced_reason=reason_code)
+        _loop()._plan_gate_disclosure(tool_ctx, llm_trace, forced_reason=reason_code)
         if tool_ctx is not None else ""
     )
     suffix = plan_suffix + _loop()._forced_orphan_note(ctx)
@@ -1331,14 +1353,27 @@ def _forced_final_answer(
         return finish(ctx, reason=reason_code)
     tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     _loop()._retire_main_reasoning(ctx)
+    if _admitted_request is None:  # an admitted candidate was priced with them (``loop_budget``)
+        _deliver_forced_late_results(ctx, llm_trace)
     _loop()._append_or_merge_user_message(ctx.messages, prompt)
     from ouroboros.transcript_prefix import append_reasoning_retirement_fact
     append_reasoning_retirement_fact(ctx.accumulated_usage, getattr(ctx, "round_idx", None), ctx.messages)
     extracted = ""
     response_meta: Dict[str, Any] = {}
     attempt = 0
+    refresh_late = False
     while attempt < (1 if single_semantic_turn else 2):
         try:
+            if refresh_late and _deliver_forced_late_results(ctx, llm_trace) and _admitted_request is not None:
+                from ouroboros import task_pacing
+
+                _admitted_request, _initial_messages = task_pacing.prepared_wrapup_candidate(
+                    ctx, [dict(row) for row in ctx.messages],
+                    allow_server_web_search=_loop()._server_web_allowed_by_task(tools_ctx))
+                if _admission is not None and task_pacing.wrapup_reservation_fits(
+                        request=_admitted_request, **_admission) is False:
+                    raise ForcedCandidateUnaffordable("late result changed the resumed wrap-up price")
+            refresh_late = False
             ctx.accumulated_usage.pop("_forced_response_meta", None)
             if attempt == 0 and _admitted_request is not None:
                 forced = _send_admitted_forced_candidate(
@@ -1352,6 +1387,7 @@ def _forced_final_answer(
             controlled = _loop()._handle_model_wait_control(ctx, error)
             if controlled is not None:
                 return controlled
+            refresh_late = True
             continue  # only an actual warm Resume returns; retry the same intent
         except BudgetExceeded:
             _loop()._drain_forced_owner_directives(ctx, llm_trace)
@@ -1406,6 +1442,7 @@ def _forced_final_answer(
             "[FORCED_OWNER_REFRESH] Answer all current directives; ignore the stale draft."
             + _forced_subject_prompt(ctx, llm_trace),
         )
+        refresh_late = True
         attempt += 1
 
     # Control resolution runs BEFORE the incomplete branch: a retained candidate
@@ -1435,7 +1472,7 @@ def _forced_final_answer(
     if extracted:
         ctx.accumulated_usage["_best_effort_extracted"] = True
         plan_suffix = (
-            _loop()._force_plan_disclosure(tools_ctx, llm_trace, forced_reason=reason_code)
+            _loop()._plan_gate_disclosure(tools_ctx, llm_trace, forced_reason=reason_code)
             if tools_ctx is not None else ""
         )
         if plan_suffix:  # absent = not open: a clean result carries no key (pinned usage shapes)

@@ -116,7 +116,8 @@ def test_continuing_focus_checks_autonomous_gate_before_generation(focus, monkey
     monkeypatch.setattr('ouroboros.presence_continuation.reentry_note', lambda *_: 'resume')
     messages = []
     try:
-        presence_review_wait(ReviewWaitBinding(lease, root, task['id'], '', event), ctx, {}, messages)
+        presence_review_wait(ReviewWaitBinding(lease, root, task['id'], '', event), ctx,
+                           {'review_binding': 'left-review'}, messages)
         assert calls and calls[0][0]['metadata']['wake_cause'] == 'focus'
         assert lease.held() is enabled
         assert bool(messages) is enabled

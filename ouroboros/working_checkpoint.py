@@ -144,10 +144,13 @@ def _write(ctx: Any, limit_ctx: Any, boundary: str, *, model_call: Any = None) -
         {key: value for key, value in usage.items() if key not in _TRANSIENT_USAGE},
         int(limit_ctx.round_idx), list(limit_ctx.tool_schemas or []), set(limit_ctx.owner_msg_seen or ()))
     if model_call is not None:  # a provisional alternative can checkpoint before route adoption
+        from ouroboros.route_choice import after_fallback
+
         state["messages"] = model_call.messages
         state["route"].update(active_model=model_call.active_model, active_model_override=model_call.active_model,
                               active_use_local=model_call.active_use_local, active_use_local_override=model_call.active_use_local,
-                              active_context_mode=model_call.active_context_mode, active_role_override=model_call.model_role)
+                              active_context_mode=model_call.active_context_mode, active_role_override=model_call.model_role,
+                              route_choice=after_fallback(ctx, not str(model_call.model_role or "").startswith("fallback:")))
         state["context_model_role"] = model_call.model_role or state["context_model_role"]
     if boundary == RESUMED:  # written before the rebind: the plan is still the new worker's
         state["context_model_role"] = limit_ctx.context_model_role
@@ -258,7 +261,12 @@ def save_terminal(limit_ctx: Any) -> None:
     (a failure exit) saves and ACKs nothing, as would a caller's own handled one;
     a failed save leaves the mail unread."""
     ctx = getattr(getattr(limit_ctx, "tools", None), "_ctx", None)
-    if ctx is None or not getattr(ctx, "_pending_content_acks", None) or sys.exc_info()[0] is not None:
+    if ctx is None:
+        return
+    from ouroboros.owner_relay import flush_held_state
+
+    flush_held_state(ctx)  # owner sources a busy store refused during the turn: carried on either exit
+    if not getattr(ctx, "_pending_content_acks", None) or sys.exc_info()[0] is not None:
         return
     try:
         save_ready(limit_ctx)
@@ -542,7 +550,7 @@ def complete_pause_from_working(root: Any, task_id: str, row: Dict[str, Any], at
     from ouroboros.artifacts import store_actor_source_bytes
     from ouroboros.budget_pause import (
         RESUME_POLICY, STATE_PAUSING, STOP_POLICY_ALL, STOP_POLICY_OBSERVE, STOP_POLICY_TASK_OWNED,
-        observe_task_runs, set_budget_pause, task_owned_runs_open,
+        episode_fields, observe_task_runs, set_budget_pause, task_owned_runs_open,
     )
     from ouroboros.model_wait import budget_paused_seconds
 
@@ -579,8 +587,9 @@ def complete_pause_from_working(root: Any, task_id: str, row: Dict[str, Any], at
                  "replay_safe": False, "auto_resume": False, "resume_policy": RESUME_POLICY,
                  "started_at": started, "paused_duration_sec": budget_paused_seconds(model_state),
                  "model_wait_quota_clock": model_state.get("quota_clock", {}),
-                 **({"settlement": "external_writers_running" if task_owned_runs_open(external) else "settled"}
-                    if reason == "owner" else {})}
+                 # The seed keeps no list: stops its dead worker issued may have settled unseen (partial).
+                 **({"settlement": "external_writers_running" if task_owned_runs_open(external) else "settled",
+                     **episode_fields(row, external)} if reason == "owner" else {})}
     set_budget_pause(pathlib.Path(root), str(task_id), completed, expected_pause_id=str(row.get("pause_id") or ""),
                      expected_state=STATE_PAUSING)
     return completed

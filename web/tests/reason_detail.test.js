@@ -178,7 +178,7 @@ test('one status-word family: the card phase matches the host over the shared fi
     );
     assert.ok(fixture.cases.length >= 10);
     for (const { name, record, phase, headline, acceptance_clause: clause, described_clause: described,
-        undescribed = [] } of fixture.cases) {
+        undescribed = [], exact_clause = false } of fixture.cases) {
         const resolved = taskDoneIsTerminal(record) ? taskTerminalPhase(record) : 'working';
         assert.deepEqual(taskPresentation(resolved), { phase, headline }, name);
         if (clause !== undefined) {
@@ -187,6 +187,7 @@ test('one status-word family: the card phase matches the host over the shared fi
             const expected = described ?? clause;
             const detail = taskReasonDetail(record);
             assert.ok(expected === detail || expected === `${detail}.`, `${name}: ${detail} vs ${expected}`);
+            if (exact_clause) assert.equal(detail, expected, name);
             assert.deepEqual(taskReasonCodes(record), undescribed, name);
         }
     }
@@ -288,11 +289,11 @@ test('a stored rationale never reaches the row, however it is written', () => {
     assert.doesNotMatch(taskReasonDetail(noisy), /lines/);
 });
 
-// The custody overlay stamps `delegated_custody_unreconciled` as the row's
-// reason_code while a delegated run is still unreconciled. The debt then heals
-// from the WRITE side while the stored code may not be rewritten, so the code
-// outlives the fact. The host renderer already selects on the row's own debt
-// list (project_dialogue._custody_debt_reason); these cases mirror
+// Rows written before #1583 carry `delegated_custody_unreconciled` as their
+// reason_code whenever a delegated run was unreconciled at the terminal; new rows
+// keep their own cause. The debt heals from the WRITE side while the stored code may
+// not be rewritten, so the host renderer selects on the row's own debt list
+// (project_dialogue._custody_debt_reason); these cases mirror
 // tests/test_terminal_truth_projection_p5.py so the card and the plain rows
 // name the same cause on the same record.
 
@@ -362,14 +363,63 @@ test('a debt list of an unreadable shape carries no readable debt', () => {
 });
 
 test('a healed debt with no execution cause states nothing on the card', () => {
-    // The warn headline still comes from the frozen objective warning; inventing
-    // a Reason line here is exactly the false statement this rule removes.
+    // Inventing a Reason line here is exactly the false statement this rule removes;
+    // the headline reads the same known-empty list (outcome_phase_parity).
     assert.equal(taskReasonDetail({
         status: 'completed',
         reason_code: 'delegated_custody_unreconciled',
         delegated_runs_unreconciled: [],
         outcome_axes: { execution: { status: 'ok' } },
     }), '');
+});
+
+test('the census row and the final frame read the current debt list beside the cause it never replaces', async () => {
+    // #1583: the live census (display keys) and the final frame (progress_meta) carry the row's list,
+    // so an older stamp heals with it and a new row warns from the list alone.
+    const { censusTaskFacts } = await import('../modules/task_phase_chip.js');
+    const stamp = 'delegated_custody_unreconciled';
+    const answered = {
+        status: 'completed', reason_code: stamp, root_phase_checkpoint: { post_task_synthesis: 'running' },
+        outcome_axes: { execution: { status: 'ok', reason_code: 'final_message' },
+            objective: { status: 'not_evaluated', source: 'none', warning: stamp, warnings: [stamp] } },
+    };
+    assert.equal(censusTaskFacts({ ...answered, delegated_runs_unreconciled: [] }).outcome, 'done');
+    assert.equal(censusTaskFacts({ ...answered, delegated_runs_unreconciled: ['run-1'] }).outcome, 'warn');
+    assert.equal(censusTaskFacts(answered).outcome, 'warn', 'no list is no proof of reconciliation');
+    const frame = {
+        task_id: 'root', task_terminal_status: 'completed', reason_code: 'final_message',
+        delegated_runs_unreconciled: ['run-1'], outcome_axes: { execution: { status: 'ok', reason_code: 'final_message' } },
+    };
+    assert.equal(taskTerminalPhase(frame), 'warn');
+    assert.equal(taskReasonDetail(frame), 'Some delegated work was never reconciled.');
+    assert.equal(taskTerminalPhase({ ...frame, delegated_runs_unreconciled: [] }), 'done');
+});
+
+test('a legacy failed stamp read back as its own execution reason names no current debt', () => {
+    // R1 QA (synthetic-stamp-no-cause): the history row an earlier server normalized carries the stamp as
+    // execution.reason_code; with the debt list known empty the card names no debt and invents no cause.
+    const stamp = 'delegated_custody_unreconciled';
+    const replayed = {
+        task_id: 'synthetic-stamp-no-cause', task_terminal_status: 'failed', reason_code: stamp,
+        delegated_runs_unreconciled: [], outcome_phase: 'error', outcome_final: true,
+        continuation_offer: { cause: stamp, eligible: false, refusal: 'interruption_cause_unrecorded' },
+        outcome_axes: {
+            artifacts: { status: 'not_applicable' }, execution: { reason_code: stamp, status: 'failed' },
+            lifecycle: { status: 'failed' }, review: { status: 'skipped', trigger: 'not_evaluated' }, schema_version: 1,
+            objective: { source: 'none', status: 'not_evaluated', warning: stamp, warnings: [stamp] },
+        },
+    };
+    assert.equal(taskTerminalPhase(replayed), 'error');
+    assert.equal(taskReasonDetail(replayed), '');
+    assert.equal(taskReasonDetail({ ...replayed, delegated_runs_unreconciled: ['run-1'] }),
+        'Some delegated work was never reconciled.', 'a current debt still speaks');
+    // synthetic-debt-unknown: an older finished row carrying no list keeps its warning headline.
+    const { delegated_runs_unreconciled: _known, ...unlisted } = replayed;
+    const finished = { ...unlisted, task_terminal_status: 'completed', outcome_phase: 'warn', outcome_axes: {
+        ...replayed.outcome_axes, execution: { reason_code: 'final_message', status: 'ok' },
+        lifecycle: { status: 'completed' } } };
+    assert.equal(taskTerminalPhase(finished), 'warn', 'no list is no proof of reconciliation');
+    assert.equal(taskTerminalPhase({ ...finished, delegated_runs_unreconciled: [] }), 'done');
 });
 
 // The plan review's outcome CLASS at delivery (outcome_axes.execution.plan_review) picks the

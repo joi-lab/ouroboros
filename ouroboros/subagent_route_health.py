@@ -72,17 +72,14 @@ def _exhausted_window(gateway: Any, route_id: str, route_model: str = "",
     A stale/missing subject stays unknown and fail-open; a healthy sibling cannot
     rescue a strict pin. Unsupported embedded gateways likewise prove nothing.
     """
-    from ouroboros.claudexor_observations import default_subject_aliases, quota_availability, read_quota
+    from ouroboros.claudexor_observations import quota_availability, read_quota
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
     if not callable(getattr(gateway, "quota_state", None)):
         return False, ""
     try:
         value = read_quota(gateway, model=route_model or None)
-        aliases = ()
-        if pinned_profile == f"{route_id}-default" and callable(getattr(gateway, "credential_profiles", None)):
-            aliases = default_subject_aliases(gateway.credential_profiles(), route_id, pinned_profile)
     except ClaudexorUnavailable:
         return False, ""
-    verdict = quota_availability(value, route_id, model=route_model or None, profile=pinned_profile, aliases=aliases)
+    verdict = quota_availability(value, route_id, model=route_model or None, profile=pinned_profile)
     return verdict["state"] in ("exhausted", "cooldown"), verdict.get("resets_at") or ""

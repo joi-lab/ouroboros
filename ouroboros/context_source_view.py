@@ -6,6 +6,8 @@ It never writes a summary or claims that the mind understood an omitted body.
 """
 from __future__ import annotations
 
+import hashlib
+import logging
 import pathlib
 import json
 from collections import Counter, defaultdict, deque
@@ -14,8 +16,12 @@ from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequen
 
 from ouroboros import context_compaction as compaction
 from ouroboros.context_budget import (HOST_CONTEXT_KIND_KEY, ContextReclaimRequest, ContextReclaimReceipt, _AtomicUnit,
-                                      _Selection, host_row_intact)
+                                      _Selection, bound_host_row, host_row_intact)
 from ouroboros.tool_result_record import read_tool_result_record
+
+log = logging.getLogger(__name__)
+# The one record of superseded host state retired at a departure; a later record supersedes it.
+HOST_STATE_RETIRED_NAME = "ouroboros_host_state_retired"
 
 EmergencyRung = Literal["host_copies", "bodies", "unseen_bodies", "chosen_bodies"]
 _EMERGENCY_LABELS = {  # the record's honest heading: no summary, exact rows retained by checkpoint
@@ -52,7 +58,8 @@ def _obsolete_host_rows(messages: Sequence[Mapping[str, Any]]) -> set[int]:
 
     obsolete = set()
     for full_name, names in ((CONTEXT_FACTS_NAME, {CONTEXT_FACTS_NAME}), (CLOCK_ROW_NAME, {CLOCK_ROW_NAME}),
-                             (ROSTER_SNAPSHOT_NAME, {ROSTER_SNAPSHOT_NAME, ROSTER_UPDATE_NAME})):
+                             (ROSTER_SNAPSHOT_NAME, {ROSTER_SNAPSHOT_NAME, ROSTER_UPDATE_NAME}),
+                             (HOST_STATE_RETIRED_NAME, {HOST_STATE_RETIRED_NAME})):
         latest = max((i for i, row in enumerate(messages)
                       if row.get("role") == "user" and row.get(HOST_CONTEXT_KIND_KEY) == full_name
                       and host_row_intact(row)), default=-1)
@@ -61,6 +68,72 @@ def _obsolete_host_rows(messages: Sequence[Mapping[str, Any]]) -> set[int]:
                         and host_row_intact(row))
     return obsolete | set(obsolete_review_index_positions(messages)) | obsolete_snapshot_positions(messages)
 
+
+
+def superseded_host_fact(messages: Sequence[Mapping[str, Any]]) -> str:
+    """The count, for the facts row being written now, of superseded host rows in view: the latest facts
+    row is one of them once this one follows it. They leave where the conversation is next rebuilt."""
+    from ouroboros.loop_messages import CONTEXT_FACTS_NAME
+    from ouroboros.utils import estimate_tokens
+
+    latest = max((i for i, row in enumerate(messages) if row.get("role") == "user"
+                  and row.get(HOST_CONTEXT_KIND_KEY) == CONTEXT_FACTS_NAME and host_row_intact(row)), default=None)
+    positions = _obsolete_host_rows(messages) | ({latest} if latest is not None else set())
+    tokens = sum(estimate_tokens(str(messages[i].get("content") or "")) for i in positions)
+    return f"superseded host rows {len(positions)} ~{tokens:,} (leave at the next rebuild)" if positions else ""
+
+
+def retire_superseded_at_departure(slot: Any, messages: list, tools: Any, *, drive_root: Any,
+                                   task_id: str) -> Tuple[list, Optional[Dict[str, Any]]]:
+    """Superseded host state leaves where this request already departs from the last send.
+
+    From the departure on (``transcript_prefix.departure``: a tool load re-reads from the start, a
+    rewrite from its first change) every row is read again anyway, so retiring
+    the superseded host rows there costs no extra re-read and retires no reasoning the departure
+    itself does not. Their exact rows are retained first; one host record names what left and
+    where it is. Nothing before the departure moves, and a round that only appends keeps its
+    cached prefix: this never starts a rewrite, it only rides one. Without a recorded send nothing
+    proves the provider's cached prefix is gone, so nothing leaves.
+    """
+    from ouroboros.transcript_prefix import departure
+    from ouroboros.utils import estimate_tokens
+
+    superseded = _obsolete_host_rows(messages)  # the cheap scan first: most rounds have nothing to retire
+    found = departure(slot, messages, tools) if superseded else None
+    if found is None or found[1] == "no_baseline":
+        return messages, None
+    start, cause = found
+    first_user = next((i for i, row in enumerate(messages) if row.get("role") == "user"), -1)
+    positions = sorted(i for i in superseded if i >= start and i != first_user
+                       and messages[i].get(HOST_CONTEXT_KIND_KEY) != HOST_STATE_RETIRED_NAME)
+    if not positions:
+        return messages, None
+    # One record names what left: earlier records from the departure on join its exact rows.
+    positions = sorted({*positions, *(i for i, row in enumerate(messages) if i >= start and host_row_intact(row)
+                                      and row.get(HOST_CONTEXT_KIND_KEY) == HOST_STATE_RETIRED_NAME)})
+    rows = [messages[i] for i in positions]
+    data = json.dumps({"departure": start, "cause": cause, "positions": positions, "rows": rows},
+                      ensure_ascii=False, sort_keys=True).encode("utf-8")
+    try:
+        from ouroboros.artifacts import store_actor_source_bytes
+
+        ref = store_actor_source_bytes(pathlib.Path(drive_root), str(task_id or "context"), category="context_checkpoints",
+                                       source_id="host-state-" + hashlib.sha256(data).hexdigest()[:16], data=data,
+                                       extension="json")
+    except Exception:
+        log.warning("Superseded host state kept: its exact rows could not be retained", exc_info=True)
+        return messages, None
+    kinds = Counter(str(row.get(HOST_CONTEXT_KIND_KEY) or "") for row in rows)
+    tokens = sum(estimate_tokens(str(row.get("content") or "")) for row in rows)
+    address = {key: ref[key] for key in ("kind", "root", "path", "size", "sha256") if key in ref}
+    record = bound_host_row(HOST_STATE_RETIRED_NAME, (
+        f"[Host record: {len(rows)} superseded host rows (" + ", ".join(f"{kind} {count}" for kind, count in sorted(kinds.items()))
+        + f"), ≈{tokens} tokens, left at message {start}, where this request already departs from the last one "
+        f"({cause}); nothing summarized; the latest of each stays; exact rows: {json.dumps(address, sort_keys=True)}]"))
+    gone = set(positions)
+    rebuilt = [record if i == positions[0] else row for i, row in enumerate(messages) if i == positions[0] or i not in gone]
+    return rebuilt, {"departure": start, "cause": cause, "rows": len(rows), "tokens": tokens,
+                     "kinds": dict(kinds), "checkpoint_ref": address}
 
 
 def retire_host_rows_after_fold(messages: list, receipt: dict, *, observed_messages=(), keep_unit_ids=()) -> list:

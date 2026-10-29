@@ -1,4 +1,4 @@
-"""Real retry -> Pause -> pending Stop -> public Resume, across all grant doors.
+"""Historical retry -> Pause -> pending Stop -> public Resume, across all grant doors.
 
 Cancellation is written by request_cancel, never replaced by a boolean double.
 The common fixtures double OS/model boundaries; warm park saves through the real
@@ -14,10 +14,11 @@ from ouroboros import budget_pause, cancel_intents, owner_pause, owner_wait
 from supervisor import queue, workers
 from supervisor.owner_pause_control import request_owner_pause, refresh_owner_pause_tree
 from tests._budget_pause_exact_helpers import _loop_ctx
+from tests._silence_reaper_support import historical_unsaved_pause_hold
 from tests.test_execution_clock_resume_handover import clock as clock
 from tests.test_retry_pause_generations import _park, _running_actor
 from tests.test_retry_pause_identity import (
-    _assign, _fresh_plan, _loop_once, _ordinary_retry, _reap, reaper as reaper,
+    _assign, _fresh_plan, _loop_once, _ordinary_retry, reaper as reaper,
 )
 from tests.test_swarm_host_admission import host as host
 
@@ -73,7 +74,7 @@ def paused_retry(host, monkeypatch, clock, reaper, door):
                 with pytest.raises(Parked):
                     budget_pause.enter_owner_pause(limit)
             budget_pause.end_dispatch_fence(task["id"])
-            _reap(clock, reaper, task["id"])
+            historical_unsaved_pause_hold(clock, task["id"])  # what the pre-upgrade idle kill left
             task = next(row for row in host.pending if row["id"] == task["id"])
             assert task["_budget_pause_hold"]["reason"] == "unsaved_pause_intent"
         refresh_owner_pause_tree("held")

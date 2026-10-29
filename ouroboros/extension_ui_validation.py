@@ -485,6 +485,8 @@ def validate_ui_render(render: Dict[str, Any]) -> Dict[str, Any]:
         raise ExtensionRegistrationError("ui render must be an object")
     clean = copy.deepcopy(render)
     kind = _text(clean.get("kind"))
+    if kind != "module" and ("entry_type" in clean or "assets" in clean):
+        raise ExtensionRegistrationError("entry_type/assets apply to module widgets only")
     if kind not in _UI_RENDER_KINDS:
         raise ExtensionRegistrationError(f"ui render kind {kind!r} is unsupported; expected one of {sorted(_UI_RENDER_KINDS - {''})}")
     _validate_start_mode(clean, kind=kind)
@@ -494,6 +496,11 @@ def validate_ui_render(render: Dict[str, Any]) -> Dict[str, Any]:
     if kind == "iframe" and not _text(clean.get("route")):
         raise ExtensionRegistrationError("iframe widget render requires route (the extension route the frame loads)")
     if kind == "module":
+        from ouroboros.extension_widget_assets import validate_widget_files
+
+        validate_widget_files(clean)
+        if clean.get("entry_type") == "module":
+            return clean
         entry = _text(clean.get("entry"))
         if not entry:
             raise ExtensionRegistrationError("module widget render requires entry filename (e.g. 'widget.js')")
@@ -702,7 +709,7 @@ def _contribution_source(value: Any) -> dict:
 
 
 def _place_contribution(item: dict, manifest: Any) -> dict:
-    from ouroboros.places import WAKE_FACTS
+    from ouroboros.places import WAKE_FACTS, is_wake_signal
 
     if not manifest.is_extension() or "presence" not in manifest.permissions:
         raise ValueError("place requires type: extension and permissions: [presence]")
@@ -712,9 +719,27 @@ def _place_contribution(item: dict, manifest: Any) -> dict:
     item.setdefault("scope", "account")
     if item["scope"] not in ("account", "conversation"):
         raise ValueError("place scope must be account or conversation")
+    supported = set(WAKE_FACTS)
+    if "facts" in item:
+        if not isinstance(item["facts"], list):
+            raise ValueError("place facts must be a list of core facts or labelled kinds")
+        supported = set()
+        for fact in item["facts"]:
+            if isinstance(fact, dict):
+                if set(fact) != {"id", "label"} or not (fact.get("id") in WAKE_FACTS or is_wake_signal(fact.get("id"))):
+                    raise ValueError("place fact needs a core id or signal.<slug> and label")
+                fact["label"] = _contribution_text(fact["label"], "facts.label", 120)
+                name = fact["id"]
+            elif isinstance(fact, str) and fact in WAKE_FACTS:
+                name = fact
+            else:
+                raise ValueError("place facts must contain core fact names or labelled kinds")
+            if name in supported:
+                raise ValueError("place facts must have unique ids")
+            supported.add(name)
     wakes = item.get("wakes", [])
-    if not isinstance(wakes, list) or any(not isinstance(wake, str) or wake not in WAKE_FACTS for wake in wakes):
-        raise ValueError(f"place wakes must be a list of typed facts from {WAKE_FACTS}")
+    if not isinstance(wakes, list) or any(not isinstance(wake, str) or wake not in supported for wake in wakes):
+        raise ValueError("place wakes must be a subset of declared facts (core facts when facts is absent)")
     item["wakes"] = list(dict.fromkeys(wakes))
     if "source" in item:
         item["source"] = _contribution_source(item["source"])
@@ -730,7 +755,7 @@ def _place_contribution(item: dict, manifest: Any) -> dict:
 def _validate_contribution(entry: dict, manifest: Any, skill_dir: pathlib.Path | None) -> dict:
     common = ("id", "label", "title", "icon", "order", "render")
     fields = (("placement", "action", "source") if "placement" in entry else
-              ("provides", "destination", "scope", "wakes", "source", "settings", "read_only") if entry.get("provides") == "place" else
+              ("provides", "destination", "scope", "facts", "wakes", "source", "settings", "read_only") if entry.get("provides") == "place" else
               ("provides", "runtime", "route", "destination", "languages", "formats", "install_size", "max_bytes", "max_seconds"))
     item = _contribution_object(entry, "contribution", common + fields)
     item["label"] = _contribution_text(item.get("label"), "label", 40)

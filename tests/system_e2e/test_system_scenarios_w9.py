@@ -120,9 +120,8 @@ def test_s36_body_candidate_on_a_real_server_keeps_the_serving_clone_and_types_i
             task_log = oracle.task_drive(task_id)
 
             # 1. One candidate, every spelling of the body path inside it.
-            registries = sorted(server.data_root.rglob("state/subagent_worktrees.json"))
-            rows = [row for path in registries for row in json.loads(path.read_text())["worktrees"]
-                    if row.get("kind") == "body_candidate"]
+            registries = _record_files(server.data_root)
+            rows = _candidate_rows(server.data_root)
             assert len(rows) == 1, registries
             candidate = pathlib.Path(rows[0]["path"])
             assert candidate.resolve().is_relative_to(worktrees.resolve()), candidate
@@ -171,9 +170,15 @@ def _git(repo: pathlib.Path, *args: str) -> str:
     return subprocess.run(["git", *args], cwd=str(repo), check=True, capture_output=True, text=True).stdout.strip()
 
 
+def _record_files(data_root: pathlib.Path) -> list:
+    """Every private copy's record file (one per copy) under any data root of the scenario."""
+    return [path for path in sorted(pathlib.Path(data_root).rglob("state/private_copies/*.json"))
+            if not path.name.startswith(".")]
+
+
 def _candidate_rows(data_root: pathlib.Path) -> list:
-    return [row for path in sorted(pathlib.Path(data_root).rglob("state/subagent_worktrees.json"))
-            for row in json.loads(path.read_text(encoding="utf-8"))["worktrees"] if row.get("kind") == "body_candidate"]
+    return [row for path in _record_files(data_root)
+            for row in [json.loads(path.read_text(encoding="utf-8"))] if row.get("kind") == "body_candidate"]
 
 
 def _record_fixture_qualification(data_root: pathlib.Path, candidate: pathlib.Path, commit: str) -> str:
@@ -548,12 +553,11 @@ def test_s38_boot_recovers_a_crashed_evolution_candidate_commit_without_absorbin
             campaign["active_transaction"].pop(key, None)
         campaign["active_transaction"]["restart_required"] = False
         campaign_path.write_text(json.dumps(campaign), encoding="utf-8")
-        for registry in sorted(data_root.rglob("state/subagent_worktrees.json")):
-            stored = json.loads(registry.read_text(encoding="utf-8"))
-            for row in stored["worktrees"]:
-                if row.get("kind") == "body_candidate":
-                    row["reviewed_commits"] = []
-            registry.write_text(json.dumps(stored), encoding="utf-8")
+        for record in _record_files(data_root):
+            stored = json.loads(record.read_text(encoding="utf-8"))
+            if stored.get("kind") == "body_candidate":
+                stored["reviewed_commits"] = []
+                record.write_text(json.dumps(stored), encoding="utf-8")
         assert not list(state_dir.glob("pending_restart_verify*"))
         state_path = state_dir / "state.json"
         state_blob = json.loads(state_path.read_text(encoding="utf-8"))

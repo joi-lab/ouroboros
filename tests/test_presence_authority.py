@@ -66,6 +66,7 @@ def test_ceiling_compiles_exact_tools_scripts_resources_and_digest():
         "tell_task",
         "update_identity",
         "update_scratchpad",
+        "update_world",
     ]
     scoped = {grant.name: [(item.argument_path, item.static_value) for item in grant.bindings]
               for grant in ceiling.tool_grants if grant.name in {"get_task_result", "recent_tasks", "tell_task"}}
@@ -245,6 +246,7 @@ def test_registry_filters_schema_dispatch_and_resolved_targets(tmp_path):
         "tell_task",
         "update_identity",
         "update_scratchpad",
+        "update_world",
     }
     # Own memory is advertised and it runs; nothing that acts outside this mind
     # comes with it, in the schemas or in dispatch.

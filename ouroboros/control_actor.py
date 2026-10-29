@@ -2,16 +2,36 @@
 
 No authority is stored here. The supervisor binds the requesting mind for one
 control call; the existing fence/grant/CAS records retain who requested it.
+A call may also carry the caller's named decision to go on past held calls
+whose outcome is unknown (``accepting_unknown``); the addressed action's own
+census applies it to its tree and records it (``local_custody_repair``).
 """
 
 from contextlib import contextmanager
 from contextvars import ContextVar
 
 _ACTOR = ContextVar("lifecycle_control_actor", default=None)
+_ACCEPT_UNKNOWN = ContextVar("lifecycle_accept_unknown", default=None)
 
 
 def control_actor() -> dict:
     return dict(_ACTOR.get() or {})
+
+
+@contextmanager
+def accepting_unknown(ids, text: str = ""):
+    """Bind, for this one call, the named held calls (operation or model attempt ids) to go on past."""
+    named = sorted({str(value) for value in ids or () if value})
+    token = _ACCEPT_UNKNOWN.set({"ids": named, "text": str(text or "").strip()} if named else None)
+    try:
+        yield
+    finally:
+        _ACCEPT_UNKNOWN.reset(token)
+
+
+def accepted_unknown() -> dict:
+    """The bound decision, ``{}`` when the call named none."""
+    return dict(_ACCEPT_UNKNOWN.get() or {})
 
 
 PAUSE_AUTHORS = ("owner", "ouroboros")

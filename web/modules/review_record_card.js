@@ -15,7 +15,73 @@ export const actorUnresolved = (actor) => ['in_flight', 'custody_lost'].includes
 // A ledger seat whose answer is still owed (its planned wait, an open operation, or the ledger's own
 // `pending` status) is awaiting, never "not reached"; a seat with a readable answer was reached.
 export const actorOwed = (actor) => actorAwaiting(actor) || actorUnresolved(actor) || text(actor?.transport_status) === 'pending';
-const actorAnswered = (actor) => ['valid', 'partial'].includes(text(actor?.parse_status));
+export const actorAnswered = (actor) => ['valid', 'partial'].includes(text(actor?.parse_status));
+// An adviser is heard, never counted: a pool-era record says so in `additional`, an earlier one in its role.
+export const seatAdviser = (actor) => actor?.additional === true || /\badditional\b/.test(text(actor?.actor_role));
+// A settled record's lost seat is terminal (its outcome unknown, never re-sent): not reached, never awaited.
+export const seatOwed = (actor, panel) => actorOwed(actor)
+    && !(text(panel?.record_state) === 'settled' && text(actor?.operation_state) === 'custody_lost');
+
+// The owner's words for the review vocabulary (DESIGN §4 "Reviews inside task cards"): a card row says these,
+// while Record facts and Logs keep the recorded token. A token outside the table is shown as recorded.
+// An earlier-schema plan wave's aggregate (GREEN, REVISE_PLAN, REVIEW_REQUIRED) reads in the same table.
+const VERDICT_WORDS = Object.freeze({
+    PASS: 'passed', GREEN: 'passed', FAIL: 'rejected', QUORUM_FAILED: 'no verdict', NOT_PERFORMED: 'no verdict', DEGRADED: 'no verdict',
+    NOT_DISPATCHED: 'not sent', UNKNOWN: 'verdict not recorded', rail_degraded: 'released at the task deadline',
+    cycles_exhausted: 'review rounds used up', revise_plan: 'plan revision asked', review_required: 'review required',
+    terminal: 'no verdict', running: 'in progress', unavailable: 'verdict unavailable',
+});
+const SEAT_VERDICT_WORDS = Object.freeze({ PASS: 'passed it', FAIL: 'rejected it', DEGRADED: 'inconclusive', UNKNOWN: 'outcome unknown' });
+
+/** A row's state phrase in words: its leading verdict or lifecycle token says what it means, the rest stays. */
+export function reviewStateWords(phrase) {
+    const value = text(phrase);
+    const [lead, ...rest] = value.split(' ');
+    const word = VERDICT_WORDS[lead] || VERDICT_WORDS[lead.toUpperCase()] || VERDICT_WORDS[lead.toLowerCase()];
+    return word ? [word, ...rest].join(' ') : value;
+}
+
+const plainCount = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+/** One seat's state in words, tone and wait: from its own answer, else whether it is owed, else how it ended. */
+export function seatStateView(actor, panel, { live = false } = {}) {
+    const verdict = text(actor?.semantic_verdict).toUpperCase();
+    const findings = (Array.isArray(actor?.findings) ? actor.findings.length : 0) + count(actor?.findings_omitted);
+    if (actorAnswered(actor) && (verdict === 'PASS' || verdict === 'FAIL')) {
+        return { word: verdict === 'PASS' && findings ? `passed it · ${plainCount(findings, 'note')}` : SEAT_VERDICT_WORDS[verdict],
+            tone: verdict === 'PASS' ? 'ok' : 'error', findings };
+    }
+    if (seatOwed(actor, panel)) {
+        return { word: `awaiting${actorAwaiting(actor) || actorUnresolved(actor) ? sinceLocalTime(actor?.awaiting_since) : ''}`,
+            tone: live ? 'working' : 'neutral', findings, owed: true };
+    }
+    if (text(actor?.operation_state) === 'custody_lost') return { word: 'outcome unknown', tone: 'neutral', findings };
+    if ([actor?.transport_status, actor?.operation_state, verdict.toLowerCase()].map(text).includes('not_dispatched')) {
+        return { word: 'not sent', tone: 'warn', findings };
+    }
+    if (SEAT_VERDICT_WORDS[verdict]) return { word: SEAT_VERDICT_WORDS[verdict], tone: verdict === 'UNKNOWN' ? 'neutral' : 'warn', findings };
+    if (actorAnswered(actor)) return { word: 'answered without a readable verdict', tone: 'warn', findings };
+    return { word: 'unavailable', tone: 'warn', findings };
+}
+
+/** The sentence a failed seat's cause reads in, the engine's own words first; a bare failure code stays in facts. */
+export function seatCauseText(actor) {
+    const reported = text(actor?.reported_cause);
+    if (reported) return { by: 'Engine report', text: reported };
+    const reason = text(actor?.reason).split('\n')[0];
+    return reason && reason !== text(actor?.failure_code) ? { by: '', text: reason } : null;
+}
+
+/** A refusal's typed measurement when the engine recorded one (`limit`, `measured`, `units`), else ''. */
+export function seatLimitText(actor) {
+    const details = actor?.failure_details && typeof actor.failure_details === 'object' ? actor.failure_details : {};
+    const number = (value) => (value !== null && value !== '' && Number.isFinite(Number(value)) ? Number(value) : null);
+    const [limit, measured] = [number(details.limit), number(details.measured)];
+    if (limit === null) return '';
+    const units = text(details.units || details.unit).replaceAll('_', ' ');
+    const amount = (value) => `${value.toLocaleString('en-US')}${units ? ` ${units}` : ''}`;
+    return measured === null ? `limit ${amount(limit)}` : `${amount(measured)}, limit ${amount(limit)}`;
+}
 
 function compactCoverage(coverage) {
     if (!coverage || typeof coverage !== 'object') return '';
@@ -105,9 +171,7 @@ export function panelPoolLines(panel) {
         : reason || (facts.reason_missing === true ? 'no reason given' : '');
     if (why) lines.push(`Why these reviewers: ${why}`);
     const actors = (Array.isArray(panel?.actors) ? panel.actors : []).filter((actor) => actor && typeof actor === 'object');
-    // A settled record's lost seat is terminal (its outcome unknown, never re-sent): not reached, never awaited.
-    const settled = text(panel?.record_state) === 'settled';
-    const owedHere = (actor) => actorOwed(actor) && !(settled && text(actor?.operation_state) === 'custody_lost');
+    const owedHere = (actor) => seatOwed(actor, panel);
     const owed = actors.filter(owedHere).map((actor) => `${text(actor.slot_id) || '?'}${actor.additional ? ' (adviser)' : ''}`);
     if (owed.length) lines.push(`Awaiting an answer: ${owed.join(', ')}`);
     // The record's list is read against each seat's own status, which a late answer moves on.
@@ -207,8 +271,10 @@ export function formatReviewProjection(projection) {
             const slotId = String(actor.slot_id || '?');
             // A pool-era seat leads with the two facts that differ seat by seat: counted or not, and its cost.
             const seat = pooled ? `${actor.additional ? 'adviser, not counted' : 'counted'} · ${seatCostText(actor.cost)} · ` : '';
+            // A model nobody reported keeps the requested one beside it, labelled as a request.
+            const model = text(actor.model) || (text(actor.requested_model) ? `not reported · requested=${text(actor.requested_model)}` : 'unknown');
             lines.push(
-                `Reviewer ${slotId}: ${seat}role=${String(actor.actor_role || 'reviewer')} · provider=${String(actor.provider || 'unknown')} · model=${String(actor.model || 'unknown')} · transport=${actorAwaiting(actor) ? 'awaiting' : String(actor.transport_status || 'unknown')} · parse=${actorAwaiting(actor) ? 'awaiting' : String(actor.parse_status || 'unknown')} · verdict=${String(actor.semantic_verdict || 'none')}${actor.outcome_tier ? ` · outcome_tier=${String(actor.outcome_tier)}` : ''}${actor.dialogue_status ? ` · dialogue=${String(actor.dialogue_status)}` : ''} · quorum=${actor.quorum_contribution ? 'contributes' : 'abstains'} · enforcement=${String(actor.enforcement_impact || 'unknown')}${actorAwaiting(actor) || actorUnresolved(actor) ? sinceLocalTime(actor.awaiting_since) : ''}`,
+                `Reviewer ${slotId}: ${seat}role=${String(actor.actor_role || 'reviewer')} · provider=${String(actor.provider || 'unknown')} · model=${model} · transport=${actorAwaiting(actor) ? 'awaiting' : String(actor.transport_status || 'unknown')} · parse=${actorAwaiting(actor) ? 'awaiting' : String(actor.parse_status || 'unknown')} · verdict=${String(actor.semantic_verdict || 'none')}${actor.outcome_tier ? ` · outcome_tier=${String(actor.outcome_tier)}` : ''}${actor.dialogue_status ? ` · dialogue=${String(actor.dialogue_status)}` : ''} · quorum=${actor.quorum_contribution ? 'contributes' : 'abstains'} · enforcement=${String(actor.enforcement_impact || 'unknown')}${actorAwaiting(actor) || actorUnresolved(actor) ? sinceLocalTime(actor.awaiting_since) : ''}`,
             );
             const actorCoverage = compactCoverage(actor.coverage);
             if (actorCoverage) lines.push(`Reviewer ${slotId} coverage: ${actorCoverage}`);
@@ -244,5 +310,9 @@ export function formatReviewProjection(projection) {
         });
         lines.push(...authorDoctrineLines(panel.author_decision));
     });
+    // A record that could not be read stays a line of its own; its readable neighbours are listed above.
+    for (const gap of Array.isArray(projection?.gaps) ? projection.gaps : []) {
+        if (gap && typeof gap === 'object') lines.push(`Review record unavailable (${text(gap.review_gap) || 'unreadable'})${text(gap.record_id) ? `: ${text(gap.record_id)}` : ''}`);
+    }
     return lines.join('\n');
 }

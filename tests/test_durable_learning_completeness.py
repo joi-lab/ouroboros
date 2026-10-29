@@ -41,7 +41,7 @@ def test_closed_objective_before_old_horizon_reaches_chooser(tmp_path, monkeypat
     monkeypatch.setattr("ouroboros.llm_observability.chat_observed", fake_chat)
     monkeypatch.setattr(pte, "_active_campaign_objective", lambda: "")
     env = type("Env", (), {"drive_root": tmp_path})()
-    decision = pte._decide_promotion(env, {"id": "root"}, None, object(), force=False)
+    decision = pte._decide_promotion(env, {"id": "root"}, None, object())
     assert decision and decision["promote"] is False
     assert old_objective in captured["prompt"]
 
@@ -69,7 +69,7 @@ def test_closed_objective_unavailable_abstains_before_chooser(tmp_path, monkeypa
 
     monkeypatch.setattr("ouroboros.llm_observability.chat_observed", chooser)
     env = type("Env", (), {"drive_root": tmp_path})()
-    assert pte._decide_promotion(env, {"id": "root"}, None, object(), force=False) is None
+    assert pte._decide_promotion(env, {"id": "root"}, None, object()) is None
     assert called == []
 
 

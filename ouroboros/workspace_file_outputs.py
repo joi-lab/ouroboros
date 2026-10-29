@@ -121,26 +121,6 @@ def _archive_files(records, cap_dir):
     return files
 
 
-def copy_snapshot_file_inputs(source, destination, paths):
-    """Copy selected inputs outside Git's object database and retain their identities."""
-    from ouroboros.artifacts import copy_artifact_file
-    baseline = {}
-    for relative in paths:
-        original, copied = _path(source, relative), _path(destination, relative)
-        before = _side(original)
-        if before is None:
-            raise OSError(f"snapshot input disappeared before copy: {relative}")
-        if before["kind"] == "file":
-            copy_artifact_file(original, copied, expected=before)
-        else:
-            copied.parent.mkdir(parents=True, exist_ok=True)
-            copied.symlink_to(before["link_target"])
-        if not _matches(_side(copied), before, exact_mode=True):
-            raise OSError(f"snapshot input changed during copy: {relative}")
-        baseline[relative] = before
-    return baseline
-
-
 def changed_file_inputs(root, file_baseline):
     """Compare only materialized inputs, including files subsequently deleted."""
     changed = []

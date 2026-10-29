@@ -9,7 +9,7 @@ import { renderSegmentedField } from './page_header.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
 import {
     EFFORT_CHOICES, ROUTE_KIND_AGENT_SESSION, ROUTE_KIND_API_MODEL,
-    compoundSessionEffort, compoundSessionEffortConflict, configuredApiProviders, changeRouteChoice, routeModelFields,
+    compoundSessionEffort, compoundSessionEffortConflict, apiConnections, configuredApiProviders, changeRouteChoice, routeModelFields,
     routeModelInputHtml, routeTargetFromModel, routeSupportsAccount, effortSelectHtml,
     encodeRouteChoice, indexProfilesByHarness, mintStableId, profileOptionsFor,
     routeChoiceGroups, sameEngineAs, selectHtml, serializeRouteSpec, sessionModelOptions, updateRouteControlOptions,
@@ -555,7 +555,7 @@ export function availableSubagentRowMarkup(row, state, index = 0) {
     const harnesses = harnessMap(state.snapshot);
     const routeGroups = routeChoiceGroups({
         harnesses: state.catalogKnown ? (state.snapshot?.harnesses || []) : [],
-        modelSources: state.modelSources, providers: state.providers,
+        modelSources: state.modelSources, providers: state.providers, connections: state.connections,
         providerProfiles: state.providerProfiles, currentChoice: encodeRouteChoice(row),
         catalogKnown: state.catalogKnown, accountsKnown: state.accountsKnown,
     });
@@ -642,7 +642,7 @@ export function availableSubagentsRenderSignature(state, nowMs = Date.now()) {
         (state.setting?.items || []).map((row) => row?.route?.kind === ROUTE_KIND_AGENT_SESSION
             ? sessionRouteVerdict(row, state, nowMs).text : ''),
         state.apiModels, state.modelSources, state.modelCatalogNote, state.processingPreference,
-        state.providers, state.providerProfiles, state.reviewPool, state.allowEmptyReviewPool,
+        state.providers, state.connections, state.providerProfiles, state.reviewPool, state.allowEmptyReviewPool,
     ]);
 }
 
@@ -683,8 +683,8 @@ export function createAvailableSubagentsEditor({
         quotaKnown: false,
         snapshot: null,
         apiModels: [], modelSources: [], modelCatalogNote: '', processingPreference: '',
-        // Providers with a stored key, named by the contract (setSourceContext).
-        providers: [], providerProfiles: {},
+        // Sources with a stored key, and every connection for a saved one's label (setSourceContext).
+        providers: [], connections: [], providerProfiles: {},
         signature: '',
         statusDisposer: null,
         catalogDisposer: null,
@@ -1284,6 +1284,7 @@ export function createAvailableSubagentsEditor({
         setProcessingPreference(value) { state.processingPreference = String(value || ''); paint({ discoveryOnly: true }); },
         setSourceContext({ settings = {}, providerProfiles = {} } = {}) {
             state.providerProfiles = providerProfiles || {};
+            state.connections = apiConnections(settings, state.providerProfiles);
             state.providers = configuredApiProviders(settings, state.providerProfiles);
             paint({ discoveryOnly: true });
         },

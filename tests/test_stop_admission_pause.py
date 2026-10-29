@@ -140,7 +140,7 @@ def owner_restart_context(env, monkeypatch):
     monkeypatch.setattr(server_restart, "_safe_restart_serialized", lambda *_a, **_kw: (True, ""))
     monkeypatch.setattr(server_restart, "_managed_update_pending_kwargs", lambda: {})
     monkeypatch.setattr(server_restart, "_stop_owned_daemon", lambda *_a: None)
-    monkeypatch.setattr("ouroboros.owned_shutdown.begin_owned_stop", lambda *_a: None)
+    monkeypatch.setattr("ouroboros.owned_shutdown.begin_owned_stop", lambda *_a, **_kw: None)
     monkeypatch.setattr("ouroboros.owned_shutdown.stop_owned_work", lambda *_a: None)
     monkeypatch.setattr("ouroboros.delegate_custody.reconcile_orphaned_runs", lambda *_a, **_kw: [])
     monkeypatch.setattr("supervisor.active_activity.get_direct_activity_registry",

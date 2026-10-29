@@ -1,11 +1,12 @@
 // Pure chat-activity helpers shared by chat.js and dependency-free node tests:
 // live-card presentation projections (moved verbatim from chat.js) plus the
 // census snapshot hydration. The room's status word is the server's (work_status.js).
-import { META_PART_SEPARATOR, executorIdentityMarkup, executorModelText, formatCoordinatorProvenance } from './harness_presentation.js';
+import { META_PART_SEPARATOR, executorIdentityMarkup, executorModelText, formatCoordinatorProvenance, harnessPresentation } from './harness_presentation.js';
 import { effortChipMarkup } from './effort_chip.js';
 import { resultFilesItemHtml } from './result_files.js';
 import { taskSourceDownloadUrl, apiFetch } from './api_client.js';
 import { compactModel, formatLogDuration, modelExecutionView } from './log_events.js';
+import { connectionLabel, routeConnectionId } from './connection_labels.js';
 import { fitText, fullText } from './text_fit.js';
 import { delegatedActivityBodyHtml, delegatedHeadline, delegatedLineView } from './delegated_activity.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
@@ -15,7 +16,7 @@ import { formatMsgTime } from './utils.js';
 import { hostRowDisplayText } from './host_notice_text.js';
 export { bootPhase, startingStatus, supervisorReady } from './host_starting_status.js';
 import {
-    joinMarkdownHeadings, MARKDOWN_FENCED_CODE, accountedUpperBound,
+    projectMarkdownLines, MARKDOWN_FENCED_CODE, accountedUpperBound,
     accountedUpperBoundWithChildren,
     escapeHtmlAttr,
     escapeHtmlText as escapeHtml,
@@ -121,11 +122,13 @@ export function buildTimelineItemHtml(item, record) {
     // P3: when expanded, prefer the genuinely-full fetched output, then the capped
     // fullBody, then the preview body. A server-truncated line shows the fetched full
     // text in a bounded-scroll box so a huge research output never grows the chat.
-    const displayBody = expanded ? (item.fetchedFull || item.fullBody || item.body) : item.body;
+    const displayBody = expanded ? (item.fullReadError || item.fetchedFull || item.fullBody || item.body) : item.body;
     const showingFetched = expanded && Boolean(item.fetchedFull);
-    const loadingFull = expanded && Boolean(item.truncated && item.fullRef && !item.fetchedFull);
+    const loadingFull = expanded && Boolean(item.truncated && item.fullRef && !item.fetchedFull && !item.fullReadError);
     // A late-review row offers its exact applied review record (`cardRowSummary`).
     const evidenceHtml = evidenceLinkHtml(item.evidenceRef);
+    const bodyHtml = !displayBody ? '' : item.bodyFormat === 'text'
+        ? escapeHtml(displayBody) : renderMarkdown(displayBody, { inlineHeadingBreaks: true });
     const isProgressLine = item.phase === 'working' || item.phase === 'thinking';
     const bodyId = `chat-live-line-body-${String(record.groupId || 'task').replace(/[^A-Za-z0-9_-]/g, '-')}-${String(item.lineKey || '').replace(/[^A-Za-z0-9_-]/g, '-')}`;
     const headContent = `
@@ -157,7 +160,7 @@ export function buildTimelineItemHtml(item, record) {
         >
             ${headHtml}
             ${delegated ? `<div class="chat-live-line-body chat-delegated-activity" id="${escapeHtmlAttr(bodyId)}">${delegatedActivityBodyHtml(delegated, { expanded })}</div>`
-        : displayBody || evidenceHtml ? `<div class="chat-live-line-body${showingFetched ? ' chat-live-line-body-full' : ''}" id="${escapeHtmlAttr(bodyId)}">${displayBody ? renderMarkdown(displayBody, { inlineHeadingBreaks: true }) : ''}${evidenceHtml}${loadingFull ? '<div class="chat-live-line-loading">Loading full output…</div>' : ''}</div>` : ''}
+        : displayBody || evidenceHtml ? `<div class="chat-live-line-body${showingFetched ? ' chat-live-line-body-full' : ''}"${item.bodyFormat === 'text' ? ' data-body-format="text"' : ''} id="${escapeHtmlAttr(bodyId)}">${bodyHtml}${evidenceHtml}${loadingFull ? '<div class="chat-live-line-loading">Loading full output…</div>' : ''}</div>` : ''}
         </div>
     `;
 }
@@ -209,7 +212,7 @@ export function noteToolCall(record, observation) {
 /**
  * The host's totals for the turn, merged FIELD-WISE onto what the host already
  * stated. An ABSENT field (null/undefined) stays absent and keeps the previous
- * known value: a partial snapshot that carries `tool_calls` alone must not read
+ * known value; invocation totals never decrease on replay. A partial snapshot carrying `tool_calls` must not read
  * as "no addressing calls" and turn a block that only addressed work into
  * content, and it must not erase an error or routing count a complete snapshot
  * already gave. `counts` is known only as a NON-EMPTY object, so an empty or
@@ -229,10 +232,10 @@ export function noteToolHostMetrics(record, host) {
     const counts = host?.counts && typeof host.counts === 'object' && Object.keys(host.counts).length > 0
         ? host.counts : (known.counts ?? null);
     fold.host = {
-        calls: carry(host?.calls, known.calls),
+        calls: host?.calls == null ? (known.calls ?? null) : Math.max(host.calls, known.calls ?? 0),
         errors: carry(host?.errors, known.errors),
-        routing: carry(host?.routing, known.routing),
-        completion: carry(host?.completion, known.completion),
+        routing: host?.routing == null ? (known.routing ?? null) : Math.max(host.routing, known.routing ?? 0),
+        completion: host?.completion == null ? (known.completion ?? null) : Math.max(host.completion, known.completion ?? 0),
         counts,
     };
     return toolEvidenceView(record.toolFold);
@@ -407,7 +410,7 @@ export function restartConfirmBody(activities) {
     const lines = [
         'Running tasks stop, then eligible saved work resumes after the restart. Tasks already paused stay paused.',
         'Runnable queued tasks return to the queue. Existing holds and limits still apply.',
-        'Saved settings apply after the restart.',
+        'Saved settings apply after the restart: work that follows a model setting resumes on the current setting; task-specific choices stay.',
     ];
     if (!Array.isArray(activities) || activities.some((row) => row?.phase === 'unknown')) {
         lines.push('Pause status could not be read: a task that is still pausing would be interrupted instead of staying paused.');
@@ -815,6 +818,8 @@ export function mergeStickyCostMeta(previous, next) {
 export function clearStickyCardState(record) {
     if (!record) return record;
     record.collapsedActivity = '';
+    record.collapsedActivityLead = '';
+    record.causeHeld = false;  // an outcome's cause owns the line from then on; equal narration words never take it
     record.costMeta = null;
     // The executor chip is cycle state like the cost projection: a recycled
     // slot must not claim the previous cycle's delegated route as its own.
@@ -831,14 +836,17 @@ export function clearStickyCardState(record) {
     if (record.activityEl) {
         fitText(record.activityEl, '', 0);  // also drops a portal line's word-cut fit
         record.activityEl.removeAttribute('title');
+        if (record.activityEl.dataset) delete record.activityEl.dataset.lead;
     }
     record.modelExecution = null;
     record.effort = null;
     record.toolCalls = null;
+    record.rounds = null;
     record.toolErrors = null;
     // The folded evidence is cycle state too: a recycled slot must not count
     // the previous cycle's invocations.
     record.toolFold = null;
+    record.waitFolds = null;
     record.durationSec = null;
     record.historicalUnavailable = false;
     record.historicalUnconfirmed = false;
@@ -866,24 +874,22 @@ export const COLLAPSED_ACTIVITY_MAX = 240;
  * strikethrough, headings, bullets, links, table pipes. It strips line by line
  * without the renderer's block context, so a stray pipe row or list marker the
  * timeline would show literally is dropped here too: over-stripping is the
- * accepted side of that trade, a leaked marker is not. Headings follow the
- * renderer's own rule (`joinMarkdownHeadings`: markers off, ` — ` before the
- * text under a real heading). A headline that is nothing but markers keeps its
- * source text: an empty projection would flip the reserved activity band's
+ * accepted side of that trade, a leaked marker is not. The line-anchored markers
+ * (headings with ` — ` before the text under a real heading, bullets, table rows)
+ * go through `projectMarkdownLines`, the one projection `describeText` also runs
+ * before a preview loses its newlines. A headline that is nothing but markers keeps
+ * its source text: an empty projection would flip the reserved activity band's
  * `:empty` rules.
  */
 export function plainActivityText(text = '') {
     const source = String(text || '');
-    const plain = joinMarkdownHeadings(source)
+    const plain = projectMarkdownLines(source)
         .replace(MARKDOWN_FENCED_CODE, '$1')
         .replace(/(``|`)(.+?)\1/g, '$2')
         .replace(/\*\*(.+?)\*\*/g, '$1')
         .replace(/\*(.+?)\*/g, '$1')
         .replace(/~~(.+?)~~/g, '$1')
-        .replace(/^- (.+)$/gm, '$1')
-        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1')
-        .replace(/^\|(.+)\|$/gm, (_, row) => row.split('|').map((cell) => cell.trim()).join(' '))
-        .replace(/^[\s\-:|]+$/gm, '');
+        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1');
     const trimmed = plain.trim();
     return trimmed || source;
 }
@@ -928,17 +934,34 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
  * first forced caller receives that request, the others resolve to null once
  * the follow-up has applied or failed. Gated requests settle via `apply`/`fail` even if a callback throws.
  * Only `fail` fans out `onUnavailable`; socket changes and confirmed mutations `retire()` older bodies.
+ *
+ * Each request names its `path`: once a full `task_bindings` map arrived with its revision, the
+ * next read asks `bindings_since=<revision>`, and a body answering `task_bindings_unchanged` is
+ * filled with that held map for that exact revision only; any other answer drops the held map,
+ * so the read after it asks for the whole map again.
  */
 export function createStateSnapshotSequencer(onApply, now = () => Date.now(), onUnavailable = () => {}) {
     let requestedGeneration = 0;
     let appliedGeneration = 0;
     // Newest applied body until a failed read or retire() clears it (late-mount seed).
     let latest = null;
+    let held = null;  // {revision, bindings}: the last full task_bindings map this page applied
     let inflight = null;
     let settled = null;
     let followUp = null;
     const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
-    const begin = () => ({ generation: ++requestedGeneration, requestedAt: now() });
+    const begin = () => ({ generation: ++requestedGeneration, requestedAt: now(),
+        path: held ? `/api/state?bindings_since=${encodeURIComponent(held.revision)}` : '/api/state' });
+    const withBindings = (data) => {
+        if (!data || typeof data !== 'object') return data;
+        const revision = typeof data.task_bindings_revision === 'string' ? data.task_bindings_revision : '';
+        if (data.task_bindings_unchanged === true && held && revision === held.revision) {
+            return { ...data, task_bindings: held.bindings };
+        }
+        held = revision && data.task_bindings && typeof data.task_bindings === 'object'
+            ? { revision, bindings: data.task_bindings } : null;
+        return data;
+    };
     const open = () => { settled = deferred(); inflight = begin(); return inflight; };
     const settle = (request) => {
         if (!inflight || request !== inflight) return;
@@ -950,7 +973,7 @@ export function createStateSnapshotSequencer(onApply, now = () => Date.now(), on
     };
     return {
         begin,
-        retire() { appliedGeneration = begin().generation; latest = null; },
+        retire() { appliedGeneration = begin().generation; latest = null; held = null; },
         gate(force = false) {
             if (!inflight) return Promise.resolve(open());
             if (!force) return settled.promise.then(() => null);
@@ -962,7 +985,7 @@ export function createStateSnapshotSequencer(onApply, now = () => Date.now(), on
                 const generation = Number(request?.generation) || 0;
                 if (!generation || generation <= appliedGeneration) return false;
                 appliedGeneration = generation;
-                latest = data;
+                latest = data = withBindings(data);
                 onApply(data, request.requestedAt, generation);
                 return true;
             } finally { settle(request); }
@@ -1303,12 +1326,78 @@ export function refitCollapsedActivity(record) {
 export function renderCollapsedActivity(record, text) {
     if (!record?.activityEl) return false;
     const el = record.activityEl;
+    // A child's report names its reader before its words: the label is drawn by CSS from
+    // `data-lead`, so the fit below counts its room and a copy of the line keeps only the words.
+    const lead = text ? String(record.collapsedActivityLead || '') : '';
+    const leadChanged = (el.dataset?.lead || '') !== lead;
+    if (leadChanged && el.dataset) {
+        if (lead) el.dataset.lead = lead;
+        else delete el.dataset.lead;
+    }
     // A collapsed card's line is cut on a word with a clean ending (never `.…`; text_fit.js).
     const shown = fullText(el);
-    const changed = shown !== text || Boolean(el.hasAttribute?.('title'));
-    if (shown !== text) fitText(el, text, collapsedActivityLines(record));
+    const changed = shown !== text || leadChanged || Boolean(el.hasAttribute?.('title'));
+    if (shown !== text || leadChanged) fitText(el, text, collapsedActivityLines(record));
     if (el.hasAttribute?.('title')) el.removeAttribute('title');
     return Boolean(changed && el.isConnected);
+}
+
+// The terminal observation names only this task's loose files. Keep paths and
+// HEAD in the existing Details timeline; the compact line lives in taskReasonDetail.
+export function readCandidateRemainder(item, detail, ok = true) {
+    const body = ok ? candidateRemainderBody(detail, item.remainderFact) : null;
+    item.fullReadError = body !== null ? '' : ok
+        ? 'The saved file list is unavailable for this observation. Close and reopen this detail to retry.'
+        : 'The saved file list could not be loaded. Close and reopen this detail to retry.';
+    return body;
+}
+
+export function candidateRemainderBody(detail, fact) {
+    const snapshot = detail?.mutation_evidence?.terminal_candidate_snapshot;
+    const exact = fact?.snapshot_at && snapshot?.captured_at === fact.snapshot_at
+        && snapshot?.baseline_hash === fact.baseline_hash && Array.isArray(snapshot.surfaces);
+    // Older terminal rows carried the exact list inline. A newer observation
+    // never substitutes a different saved snapshot for the one the summary names.
+    const paths = exact ? snapshot.surfaces.filter(row => Array.isArray(row.uncommitted_paths)).map(row => ({
+        root: row.canonical_root, commit: row.base_commit, paths: row.uncommitted_paths,
+    })) : Array.isArray(fact?.surfaces) ? fact.surfaces : null;
+    if (!paths) return null;
+    return [fact.state === 'unknown' ? 'The uncommitted remainder could not be checked.' : '',
+        ...paths.filter(row => Array.isArray(row.paths) && row.paths.length).map(row =>
+            `Candidate: ${row.root || 'Saved candidate'}\nHEAD: ${row.commit || 'unknown'}\n\nFiles:\n${row.paths.join('\n')}`)]
+        .filter(Boolean).join('\n\n');
+}
+
+export function syncCandidateRemainderItem(record, detail) {
+    const fact = detail?.outcome_axes?.execution?.mutation_attribution?.uncommitted_remainder;
+    if (!record || !fact) return false;
+    const key = `candidate-remainder|${record.groupId}`;
+    const index = record.items.findIndex(item => item.dedupeKey === key);
+    const previous = record.items[index];
+    const same = previous && JSON.stringify(previous.remainderFact) === JSON.stringify(fact);
+    const full = candidateRemainderBody(detail, fact);
+    const fullRef = fact.snapshot_at ? String(fact.task_id || detail.task_id || record.groupId) : '';
+    const body = fact.state === 'known' && fact.count === 0 ? '' : full
+        ?? (same && !previous.truncated ? previous.body : null)
+        ?? [fact.state === 'unknown' ? 'The uncommitted remainder could not be checked.' : '',
+        fact.paths_omitted > 0 ? `${fact.paths_omitted} recorded file path${fact.paths_omitted === 1 ? ' is' : 's are'} not loaded.` : '',
+        fullRef ? 'Expand to read the saved file list.' : 'The saved file list is unavailable.']
+        .filter(Boolean).join('\n\n');
+    if (!body) {
+        if (index < 0) return false;
+        record.items.splice(index, 1);
+        return true;
+    }
+    if (same && previous.body === body) return false;
+    const item = { phase: 'info', headline: 'Uncommitted files', fullHeadline: 'Uncommitted files',
+        body, fullBody: body, bodyFormat: 'text', receipt: true, count: 1, ts: '', sourceTs: String(detail.ts || ''),
+        dedupeKey: key, lineKey: `candidate-remainder-${String(record.groupId).replace(/[^A-Za-z0-9_-]/g, '-')}`,
+        remainderFact: fact, fullField: 'candidate_remainder', fullRef,
+        truncated: full === null && Boolean(fullRef) && !(same && !previous.truncated),
+        fetchedFull: same ? previous.fetchedFull : '', fullReadError: same ? previous.fullReadError : '' };
+    if (index < 0) record.items.push(item);
+    else Object.assign(record.items[index], item);
+    return true;
 }
 
 // The 13 cost-meta keys shared by both subagent whitelists (the delegation
@@ -1383,6 +1472,7 @@ function metaLineHtml(parts) {
 function paintLiveFacts(record, rows) {
     const el = ownLiveDetail(record, 'liveFacts');
     if (!el) return false;
+    if (record.wakeSummary) rows.unshift([tr('task.fact.wake_summary', 'In its words'), `<span data-i18n-authored>${escapeHtml(record.wakeSummary)}</span>`]);
     const html = rows.filter(([, value]) => value).map(([label, value]) =>
         `<div class="chat-live-fact"><dt>${escapeHtml(label)}</dt><dd>${value}</dd></div>`).join('');
     if (el.innerHTML === html && el.hidden === !html) return false;
@@ -1394,6 +1484,7 @@ function paintLiveFacts(record, rows) {
 export function renderLiveCardMeta(record, { agentModel = record?.agentModel || '' } = {}) {
     if (!record?.metaEl) return false;
     const toolCalls = Number.isInteger(record.toolCalls) ? `${record.toolCalls} tool ${record.toolCalls === 1 ? "call" : "calls"}` : '';
+    const rounds = Number.isInteger(record.rounds) && record.rounds >= 0 ? `${record.rounds} round${record.rounds === 1 ? '' : 's'}` : '';
     const cost = (record.costMeta && Array.isArray(record.costMeta.meta)) ? record.costMeta.meta : [];
     // A Main portal is the collapsed form of a work that lives in its Project room: tool calls ·
     // cost · updated, plus the facts that change what the owner may trust. Executor, model and
@@ -1405,8 +1496,9 @@ export function renderLiveCardMeta(record, { agentModel = record?.agentModel || 
     // evidence; any other card the model a usable solve response observed, else its agent model, and an
     // unobserved execution in its own words. Effort is the selected leaf's dispatch level, not the nanny's
     // reasoning level or a provider echo (subagent_runtime.resolve_configured_actor_dispatch).
-    // Coordinator, routine counts and provenance are details; effort and exceptions stay on the line.
+    // Session counters belong to the supervising agent, never the foreign executor.
     const chip = record.executorChip;
+    const supervision = chip && harnessPresentation(chip.harness).kind === 'harness';
     const execution = modelExecutionView(record.modelExecution);
     const coordinator = compactModel(agentModel);
     const provenance = chip ? formatCoordinatorProvenance(
@@ -1414,6 +1506,9 @@ export function renderLiveCardMeta(record, { agentModel = record?.agentModel || 
     ) : '';
     const model = chip ? executorModelText(chip, compactModel)
         : execution && !execution.observed ? execution.value : execution?.model || coordinator;
+    // A key added under Accounts follows its model ("claude-opus-5.5 · Claude credits"); the built-in key adds nothing.
+    const keyRoute = chip || (execution && !execution.observed) ? '' : execution ? record.modelExecution?.used_model : agentModel;
+    const key = connectionLabel(routeConnectionId(keyRoute));
     const updated = record.finished ? updatedTime(record) : '';
     // The executor block is ONE part of this line, joined by the same text
     // separator as the rest: concatenating it left the chip and the first fact
@@ -1426,7 +1521,7 @@ export function renderLiveCardMeta(record, { agentModel = record?.agentModel || 
         // final (with its own end time) arrives as a message.
         toolCalls, ...cost, record.finished ? '' : clockLabel(record),
     ].filter(Boolean).map(text)) : metaLineHtml([
-        chip ? executorIdentityMarkup(chip, { model }) : (model ? text(model) : ''),
+        chip ? executorIdentityMarkup(chip, { model }) : (model ? text(key ? `${model} · ${key}` : model) : ''),
         effortChipMarkup(record.effort),
         ...[
             record.historicalUnavailable ? 'Outcome unavailable' : (record.historicalUnconfirmed ? 'Activity unconfirmed' : ''),
@@ -1434,6 +1529,7 @@ export function renderLiveCardMeta(record, { agentModel = record?.agentModel || 
             record.historyRetentionProblem || '',
             record.toolErrors > 0 ? `${record.toolErrors} error${record.toolErrors === 1 ? '' : 's'}` : '',
             Number.isFinite(record.durationSec) ? formatLogDuration(record.durationSec) : '',
+            !supervision && record.toolCalls > 0 ? toolCalls : '',
             ...(Array.isArray(record._lastFrameMeta) ? record._lastFrameMeta : []),
             ...cost,
             record.finished ? '' : clockLabel(record),
@@ -1445,8 +1541,11 @@ export function renderLiveCardMeta(record, { agentModel = record?.agentModel || 
         [chip ? 'Coordinator' : 'Agent model', coordinator ? escapeHtml(provenance ? `${coordinator} (${provenance})` : coordinator) : ''],
         // An unobserved execution of a card without an executor is its compact model fact already.
         [execution?.label || 'Model execution', execution && (chip || execution.observed) ? escapeHtml(execution.value) : ''],
-        ['Started by', record.initiator === 'consciousness' ? 'Consciousness' : ''],
-        ['Tool calls', Number.isInteger(record.toolCalls) ? String(record.toolCalls) : ''],
+        ['Started by', record.scheduleName ? `${tr('task.fact.started_by.schedule', 'Schedule')} · <span data-i18n-authored>${escapeHtml(record.scheduleName)}</span>` : record.initiator === 'consciousness' ? 'Consciousness' : ''],
+        ['Tool calls', !supervision && record.toolCalls === 0 ? '0' : ''],
+        ['Rounds', !supervision && rounds ? `${record.rounds} · usable solve response${record.rounds === 1 ? '' : 's'}` : ''],
+        ['Supervision', supervision && (rounds || toolCalls)
+            ? `${[rounds, toolCalls].filter(Boolean).join(META_PART_SEPARATOR)} (supervising agent; executor session counts are not reported)` : ''],
         ['Updated', escapeHtml(updated)],
     ]);
     const detailChanged = paintLiveDetail(record, 'liveCostDetail', String(record.costMeta?.detail || ''));
@@ -1458,9 +1557,9 @@ export function renderLiveCardMeta(record, { agentModel = record?.agentModel || 
 // Only host-attested cancelable queue roots receive this control.
 // A card's OWN actions row: a nested child card carries a row of its own, and a
 // descendant lookup would hand a root without one its child's.
-// The row lives at the end of the card's own foot, beside its meta line (right-docked, after the quiet
-// Reviews count): a single control never floats on an empty row of its own, and the summary above it
-// keeps its own inset. A nested child's foot is its own, so a descendant lookup is never used.
+// The row lives at the end of the card's own foot, under its meta line (right-docked, after the quiet
+// Reviews count or a portal's Project reference), and the summary above it keeps its own inset. A nested
+// child's foot is its own, so a descendant lookup is never used.
 function ownFootEnd(record) {
     const foot = record?.footEl;
     const end = record?.footEndEl;

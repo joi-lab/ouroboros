@@ -60,7 +60,7 @@ def test_probes_import_their_own_tree_because_no_project_is_installed():
 
 def test_the_steps_check_retry_attribute_hand_over_and_report_in_order():
     order = [step.get("id") for step in JOB["steps"] if step.get("id")]
-    assert order == ["setup_python", "setup_node", "base", "selected", "classify", "attribute", "route"]
+    assert order == ["setup_python", "setup_node", "base", "selected", "classify", "attribute", "route", "cost_contract"]
     selected = STEPS["selected"]
     assert selected["continue-on-error"] is True  # the retry, not this step, decides FAILED vs FLAKY
     assert "scripts/run_tests.py --selected --base \"$BASE\" --sequential --keep-going" in selected["run"]
@@ -82,3 +82,17 @@ def test_nothing_reverts_pushes_or_schedules():
     lowered = TEXT.lower()
     for forbidden in ("git push", "git revert", "git reset", "schedule:", "workflow_dispatch", "pull_request"):
         assert forbidden not in lowered, forbidden
+
+
+def test_cost_contract_runs_whole_module_even_when_selected_tests_fail():
+    import shlex
+
+    step = STEPS["cost_contract"]
+    args = shlex.split(step["run"])
+    assert args[:3] == ["python", "-m", "pytest"]
+    assert args[args.index("-m", 3) + 1] == "scale and not integration"
+    assert "tests/test_cost_contract.py" in args
+    assert "-k" not in args and not any("::" in arg for arg in args)
+    assert "--selected" not in args and "continue-on-error" not in step
+    assert "!cancelled()" in step["if"] and "selected.outcome" not in step["if"]
+    assert "--ci-evidence-dir" in args and step["timeout-minutes"] == 8

@@ -326,13 +326,13 @@ def _snapshot(drive_root: Any, owners: List[Mapping[str, Any]], raw: Dict[str, M
         if live_roots:
             row, facts, member, current_root = max(live_roots, key=lambda item: float(item[0].get("started_at") or 0.0))
             episode = {"task_id": row["activity_id"], "state": member}
-            outcome = ws._outcome(row) if row.get("phase") == "finalizing" else ""
+            outcome = ws.shown_outcome(row) if row.get("phase") == "finalizing" else ""
             room_row, current_row, current_state = row, row, member
         else:
             episode_id = sorted(entry["roots"])[-1] if entry["roots"] else work_id
             stored = obs.result(episode_id) or {}
             episode = {"task_id": episode_id}
-            outcome = ws._outcome(stored)
+            outcome = ws.shown_outcome(stored)
             room_row = next((item[0] for item in entry["rows"]), stored)
             facts = raw.get(episode_id) or stored
         if not members and not entry["runs"]:

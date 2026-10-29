@@ -160,7 +160,7 @@ test('generation ordering is unchanged: a synthetic bump makes the in-flight rea
 test('gate requests carry the same clock as begin() and settle through apply of the same object only', async () => {
     const h = harness();
     const a = await h.sequencer.gate(true);
-    assert.deepEqual(a, { generation: 1, requestedAt: 1000 });
+    assert.deepEqual(a, { generation: 1, requestedAt: 1000, path: '/api/state' });
     const pending = () => Promise.race([h.sequencer.gate(false).then(() => 'settled'), tick().then(() => 'pending')]);
     assert.equal(await pending(), 'pending');
     // A different object with the same generation does not settle the gate.
@@ -168,7 +168,7 @@ test('gate requests carry the same clock as begin() and settle through apply of 
     assert.equal(await pending(), 'pending');
     assert.equal(h.sequencer.apply(a, 'same'), false);
     // Settled: the next tick opens a fresh read instead of joining.
-    assert.deepEqual(await h.sequencer.gate(false), { generation: 2, requestedAt: 1000 });
+    assert.deepEqual(await h.sequencer.gate(false), { generation: 2, requestedAt: 1000, path: '/api/state' });
 });
 
 test('only an actual failed read fans out, and a throwing fan-out still releases the gate', async () => {
@@ -190,4 +190,46 @@ test('only an actual failed read fans out, and a throwing fan-out still releases
     assert.notEqual(next, 'stuck', 'the failed request settled despite the throwing fan-out');
     assert.equal(sequencer.fail(next), true);
     assert.equal(unavailable.length, 2);
+});
+
+// The bindings map is held with its revision; `?bindings_since` lets the server answer "unchanged".
+const bound = { t1: { project_id: 'alpha', chat_id: 5, project_name: 'Alpha' } };
+
+test('a held bindings map fills an unchanged body for its own revision only', () => {
+    const applied = [];
+    const sequencer = createStateSnapshotSequencer((data) => applied.push(data));
+    const first = sequencer.begin();
+    assert.equal(first.path, '/api/state');
+    sequencer.apply(first, { task_bindings: bound, task_bindings_revision: 'r1', task_bindings_unchanged: false });
+    const second = sequencer.begin();
+    assert.equal(second.path, '/api/state?bindings_since=r1');
+    sequencer.apply(second, { task_bindings: null, task_bindings_revision: 'r1', task_bindings_unchanged: true });
+    assert.deepEqual(applied[1].task_bindings, bound);
+    assert.deepEqual(sequencer.latest().task_bindings, bound, 'the late-mount seed carries the filled map');
+    const third = sequencer.begin();
+    sequencer.apply(third, { task_bindings: null, task_bindings_revision: 'r2', task_bindings_unchanged: true });
+    assert.equal(applied[2].task_bindings, null, 'a revision this page never held is never filled');
+    assert.equal(sequencer.begin().path, '/api/state', 'and the next read asks for the whole map');
+});
+
+test('an old server, a failed bindings read or a retire hold nothing', () => {
+    const sequencer = createStateSnapshotSequencer(() => {});
+    sequencer.apply(sequencer.begin(), { task_bindings: bound });
+    assert.equal(sequencer.begin().path, '/api/state');
+    sequencer.apply(sequencer.begin(), { task_bindings: {}, task_bindings_revision: '', task_bindings_unchanged: false });
+    assert.equal(sequencer.begin().path, '/api/state');
+    sequencer.apply(sequencer.begin(), { task_bindings: bound, task_bindings_revision: 'r1' });
+    sequencer.retire();
+    assert.equal(sequencer.begin().path, '/api/state', 'a socket change or a confirmed mutation reads the map whole');
+});
+
+test('an older answer can neither fill nor replace the held map', () => {
+    const applied = [];
+    const sequencer = createStateSnapshotSequencer((data) => applied.push(data));
+    const older = sequencer.begin();
+    const newer = sequencer.begin();
+    assert.equal(sequencer.apply(newer, { task_bindings: bound, task_bindings_revision: 'r2' }), true);
+    assert.equal(sequencer.apply(older, { task_bindings: {}, task_bindings_revision: 'r1' }), false);
+    assert.equal(sequencer.begin().path, '/api/state?bindings_since=r2');
+    assert.equal(applied.length, 1);
 });

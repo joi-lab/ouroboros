@@ -587,7 +587,12 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "upload_unavailable": (False, "gateway/files.py: a chat attachment is missing or not a regular file; HTTP 404, not a task terminal"),
     "upload_unreadable": (False, "gateway/files.py: a chat attachment's confined read failed; HTTP 503, not a task terminal"),
     "history_source_unavailable": (False, "gateway/history_paging.py: readable recent projection with explicit source gap; no task attempt was truncated"),
+    "review_history_unavailable": (False, "gateway/task_reviews.py: a task's saved review history could not be read; HTTP 503 on a read-only route, not a task terminal"),
+    "review_source_invalid": (False, "gateway/task_reviews.py: the exact saved-review selector is malformed; HTTP 400, not a task terminal"),
+    "review_source_changed": (False, "gateway/task_reviews.py: the exact selected saved review source is no longer named by its owning record; HTTP 409, not a task terminal"),
+    "review_source_unavailable": (False, "gateway/task_reviews.py: saved review text failed its integrity check or cannot be read; HTTP 404, not a task terminal"),
     "quiz_delivery_failed": (False, "gateway/task_decision.py: the answer was recorded and its delivery stays owed (503, retry); never a task terminal or trial truncation"),
+    "quiz_answer_unconfirmed": (False, "503 before any answer was recorded; not a task terminal or truncation"),
     "awaiting_recipient_read": (False, "question_answers.py: a recorded answer is in its living recipient's mailbox (paused or held too), read pending; a delivery fact on the question, never a task terminal"),
     "asker_not_reading": (False, "question_answers.py: no living asker or successor holds the answer, so it goes to named ingress in its room (the asker's live late-answer head, else a fresh head); a delivery fact, never a task terminal"),
     "promotion_not_started": (False, "promotion_intent.py: boot reconciliation of a start_task intent proven never admitted; that separate work never ran (explicit retry), so nothing was truncated and it is never a trial root's code"),
@@ -646,7 +651,7 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     ),
     "delegated_custody_unreconciled": (
         False,
-        "agent_task_pipeline.py terminal custody overlay; an additive custody-debt disclosure (Done with warnings) on any task that finished with an undisposed own delegated patch, never a truncation; a truncation rail code is preserved",
+        "stored reason of rows written before #1583 (the removed terminal custody overlay); new rows keep their own reason beside the delegated_runs_unreconciled debt list; never a truncation",
     ),
     "provider_outcome_unknown": (
         False,
@@ -881,8 +886,9 @@ def _runtime_reason_code_literals() -> dict[str, str]:
     return found
 
 
-# Historical outcomes remain classified even after their producing rail is retired.
-_RETIRED_TRUNCATION_CODES = {"children_unabsorbed"}
+# Historical reason codes keep their recorded decision, truncating or not, after their producing rail is retired:
+# old records still carry them.
+_RETIRED_REASON_CODES = {"children_unabsorbed", "delegated_custody_unreconciled"}
 
 
 def test_truncation_vocabulary_is_derived_from_the_runtime_not_restated():
@@ -902,8 +908,8 @@ def test_truncation_vocabulary_is_derived_from_the_runtime_not_restated():
     assert {"round_limit", "deadline_local"} <= RUNTIME_TRUNCATION_REASON_CODES
 
     emitted = _runtime_reason_code_literals()
-    assert _RETIRED_TRUNCATION_CODES.isdisjoint(emitted)
-    for code in sorted(RUNTIME_TRUNCATION_REASON_CODES - _RETIRED_TRUNCATION_CODES):
+    assert _RETIRED_REASON_CODES.isdisjoint(emitted)
+    for code in sorted(RUNTIME_TRUNCATION_REASON_CODES - _RETIRED_REASON_CODES):
         assert code in emitted, f"{code} is published but no line in ouroboros/ emits it"
 
 
@@ -916,8 +922,10 @@ def test_every_runtime_reason_code_has_a_recorded_truncation_decision():
     assert not undecided, "new runtime reason code(s) with no recorded decision in _TRUNCATION_DECISIONS: " + ", ".join(
         f"{code} ({emitted[code]})" for code in undecided
     )
-    stale = sorted(set(_TRUNCATION_DECISIONS) - set(emitted) - _RETIRED_TRUNCATION_CODES)
+    stale = sorted(set(_TRUNCATION_DECISIONS) - set(emitted) - _RETIRED_REASON_CODES)
     assert not stale, f"decision recorded for code(s) the runtime no longer emits: {stale}"
+    forgotten = sorted(_RETIRED_REASON_CODES - set(_TRUNCATION_DECISIONS))
+    assert not forgotten, f"retired code(s) whose old records lost their decision: {forgotten}"
 
     decided_truncating = {c for c, (yes, _why) in _TRUNCATION_DECISIONS.items() if yes}
     assert decided_truncating == set(RUNTIME_TRUNCATION_REASON_CODES)

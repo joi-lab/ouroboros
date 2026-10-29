@@ -614,7 +614,8 @@ test('terminal task-bound review lifecycle resyncs canonical verdict without rec
         const owner = messages.children.find((node) => node.dataset.taskId === 'live-review');
         assert.ok(owner, 'source-complete lifecycle attaches to its owner card');
         const reviewHost = owner.querySelector('[data-live-reviews-host]');
-        assert.match(reviewHost?.innerHTML || '', /running/);
+        // A live run reads as work in progress (the moving mark beside its words), never a verdict.
+        assert.match(reviewHost?.innerHTML || '', /data-tone="working"><span class="status-mark"[^>]*data-shape="moving"[\s\S]*?in progress/);
         const initialHistoryCalls = calls.filter((url) => url.startsWith('/api/chat/history')).length;
         historyRows = [{
             chat_id: 2, role: 'system', system_type: 'skill_review',
@@ -1339,9 +1340,12 @@ for (const order of ['final-first', 'done-first', 'cold']) {
             assert.ok(card);
             assert.equal(card.dataset.finished, '1');
             assert.equal(card.querySelector('[data-live-title]').textContent, 'Task activity');
-            assert.match(card.querySelector('[data-live-facts]').innerHTML, /<dt>Tool calls<\/dt><dd>2<\/dd>/);
+            assert.match(card.querySelector('[data-live-meta]').innerHTML, /2 tool calls/);
             // The compact line names the model the solve response reported; the details keep the route and request.
             assert.match(card.querySelector('[data-live-meta]').innerHTML, />model-b-provider</);
+            assert.equal(card.querySelector('[data-live-counters]'), null);
+            assert.doesNotMatch(card.querySelector('[data-live-meta]').innerHTML, /rounds/);
+            assert.match(card.querySelector('[data-live-facts]').innerHTML, /<dt>Rounds<\/dt><dd>2 · usable solve responses<\/dd>/);
             assert.match(card.querySelector('[data-live-facts]').innerHTML,
                 /<dt>Last solve response<\/dt><dd>model-b-provider \(initial request: model-a\) · provider · route: provider\/model-b<\/dd>/);
             if (card.dataset.expanded !== '1') card.querySelector('[data-live-disclosure]').listeners.get('click')[0]({ detail: 0 });

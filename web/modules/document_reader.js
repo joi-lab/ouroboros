@@ -250,6 +250,9 @@ export function decodeDocumentText(bytes, { partial = false } = {}) {
 }
 
 const FAILURES = {
+    review_source_changed: 'The selected saved answer changed or is unavailable. This view has not switched to another answer.',
+    review_source_unavailable: 'The selected saved review text is missing, unreadable, or failed its integrity check. Readable neighboring reviews remain available.',
+    review_source_invalid: 'This review has no valid saved source selector.',
     artifact_unverified: 'This delivered copy is missing or did not pass its integrity check, so it is not shown. Ask Ouroboros to send the file again.',
     artifact_identity_changed: 'This file changed after it was delivered, so the delivered copy cannot be shown. Ask Ouroboros to send the file again.',
     artifact_unavailable: 'This device cannot read the delivered copy right now.',

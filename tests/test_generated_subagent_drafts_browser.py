@@ -13,6 +13,9 @@ pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 
 
 def _watch_previews(page):
+    # The SPA records about 250 resources before its first preview (191 modules at 7.8.1), and a full Resource
+    # Timing buffer (250 entries by default) drops every later entry, the previews included.
+    page.add_init_script("performance.setResourceTimingBufferSize(5000)")
     page.evaluate("performance.clearResourceTimings()")
 
 

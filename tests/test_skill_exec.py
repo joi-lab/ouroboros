@@ -619,12 +619,13 @@ def test_skill_exec_refuses_instruction_type_skill(tmp_path, monkeypatch):
     assert "'instruction'" in result, result
 
 
-def test_skill_exec_rejects_runtime_outside_allowlist(tmp_path, monkeypatch):
+@pytest.mark.parametrize("runtime", ["", "perl"])
+def test_skill_exec_rejects_runtime_outside_allowlist(tmp_path, monkeypatch, runtime):
     skills_root = tmp_path / "skills"
     skill_dir = _build_skill(
         skills_root,
         "hello",
-        manifest=_valid_script_manifest("hello", runtime="perl"),
+        manifest=_valid_script_manifest("hello", runtime=runtime),
     )
     ctx = _make_ctx(tmp_path)
     _mark_reviewed_and_enabled(ctx.drive_root, skill_dir, "hello")
@@ -634,6 +635,7 @@ def test_skill_exec_rejects_runtime_outside_allowlist(tmp_path, monkeypatch):
         ctx, skill="hello", script="scripts/hello.py"
     )
     assert "SKILL_EXEC_ERROR" in result
+    assert f"declared runtime {runtime!r}" in result
     assert "allowlist" in result
 
 

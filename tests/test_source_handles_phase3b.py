@@ -233,6 +233,8 @@ def test_over_limit_pageable_results_persist_their_exact_source(tmp_path):
     """The agent can page `read_file`; a reader of the trace cannot. Skipping
     persistence for pageable tools left a partial row whose exact source did not
     exist."""
+    from ouroboros.tool_result_delivery import RECOVER_PAGEABLE
+
     for tool_name in ("read_file", "query_code", "chat_history"):
         ctx, visible, trace_row = _project_large_result(
             tmp_path, tool_name=tool_name, call_id=f"page-{tool_name}",
@@ -243,16 +245,21 @@ def test_over_limit_pageable_results_persist_their_exact_source(tmp_path):
         assert "FULL_RESULT_SOURCE_JSON=" in visible
         assert "exact source persistence failed" not in visible
         # The wording keeps the tool's own affordance instead of forbidding it.
-        assert "or page this tool (offset/limit) for the omitted range" in visible
+        assert RECOVER_PAGEABLE in visible
         ref = _source_ref_from_visible_result(visible)
         assert trace_row["result_source_ref"] == ref
         assert "DECISIVE_TAIL=FAIL" in _read_source(ctx, ref, start_char=100_000)
 
 
 def test_a_non_pageable_tool_keeps_its_do_not_rerun_wording(tmp_path):
-    _ctx, visible, _row = _project_large_result(
-        tmp_path, tool_name="run_command", call_id="page-run",
-        result="cmd\n" + ("z" * 120_000),
-    )
-    assert "Do not rerun this tool to recover omitted output." in visible
-    assert "or page this tool" not in visible
+    from ouroboros.tool_result_delivery import RECOVER_OTHER, RECOVER_PAGEABLE
+
+    for tool in ("run_command", "vcs_read", "github_read"):
+        ctx, visible, row = _project_large_result(
+            tmp_path, tool_name=tool, call_id=f"page-{tool}",
+            result="cmd\n" + ("z" * 120_000),
+        )
+        assert RECOVER_OTHER in visible and RECOVER_PAGEABLE not in visible
+        ref = _source_ref_from_visible_result(visible)
+        assert row["result_source_ref"] == ref
+        assert "z" * 100 in _read_source(ctx, ref, start_char=100_000)

@@ -14,6 +14,7 @@
 import { allowanceLabel, formatUsd2 } from './utils.js';
 import { apiFetch } from './api_client.js';
 import { openConfirmDialog } from './confirm_dialog.js';
+import { chooseAndSendReview } from './review_command.js';
 import { tr } from './i18n.js';
 import { bindScrollFade } from './scroll_fade.js';
 import { showToast } from './toast.js';
@@ -32,13 +33,14 @@ const NEEDS_OWNER = ['waiting_for_first_conversation', 'waiting_for_owner_chat']
  * limit that stopped it); error for a failure; neutral for everything that goes on by itself or is off.
  */
 export function runtimeTone(status) {
-    if (['running', 'queued', 'idle_ready', 'thinking', 'sleeping'].includes(status)) return 'ok';
+    if (['running', 'queued', 'idle_ready', 'thinking', 'sleeping', 'due'].includes(status)) return 'ok';
     if ([...NEEDS_OWNER, 'budget_blocked', 'budget_stopped'].includes(status)) return 'warn';
     if (['paused_failures', 'error_backoff', 'allowance_exhausted', 'allowance_unknown', 'wake_failed', 'wake_rejected'].includes(status)) return 'error';
     return 'neutral';
 }
 
 function shortStatusLabel(status, fallback = 'off') {
+    if (status === 'due') return tr('consciousness.due', 'due');
     if (status === 'wake_paused') return tr('consciousness.wake_paused', 'paused');
     if (status === 'wake_outcome_unknown') return tr('consciousness.wake_outcome_unknown', 'unknown');
     if (status === 'state_unknown' || status === 'unknown') return 'unknown';  // a null control is never "off"
@@ -511,7 +513,7 @@ function element(tag, className, attrs = {}) {
  * Mount the page. `stateSnapshots` is app.js's sequencer of every `/api/state` read on the page; app.js hands each of
  * its answers (and each failed read, as null) to the returned `hydrateStateSnapshot`.
  */
-export function initEvolution({ ws, state, mount, stateSnapshots = null }) {
+export function initEvolution({ ws, state, mount, stateSnapshots = null, dialog = openConfirmDialog }) {
     const page = element('div', 'settings-embedded-content', { id: 'page-evolution' });
     const scroll = element('div', 'costs-scroll');
     const root = element('div', 'evo-root');
@@ -543,7 +545,10 @@ export function initEvolution({ ws, state, mount, stateSnapshots = null }) {
     const stopBtn = element('button', 'btn btn-default', { id: 'evo-stop', type: 'button' });
     stopBtn.textContent = 'Pause';
     stopBtn.hidden = true;
-    actions.append(startBtn, stopBtn);
+    // A deep self-review beside the campaign (owner 25.10, 5A): the one reviewer picker `/review` uses.
+    const reviewBtn = element('button', 'btn btn-default', { id: 'evo-review', type: 'button' });
+    reviewBtn.textContent = 'Run review…';
+    actions.append(startBtn, stopBtn, reviewBtn);
     campaign.append(main, side, actions);
 
     const story = element('section', 'evo-story ui-card', { 'aria-labelledby': 'evo-story-title' });
@@ -702,7 +707,7 @@ export function initEvolution({ ws, state, mount, stateSnapshots = null }) {
     startBtn.addEventListener('click', async () => {
         if (commandPending) return;
         const running = campaignView(runtime)?.enabled === true;
-        const asked = await promptCampaignObjective({ running });
+        const asked = await promptCampaignObjective({ dialogImpl: dialog, running });
         // Cancel = no campaign start (semantic fix, owner-approved Б1-8: the
         // old `prompt() || ''` started a paid campaign even on Cancel/null).
         // A running campaign asked for nothing new keeps its objective: nothing to send.
@@ -712,6 +717,7 @@ export function initEvolution({ ws, state, mount, stateSnapshots = null }) {
     stopBtn.addEventListener('click', () => {
         if (!commandPending) sendCommand('/evolve off', stopBtn);
     });
+    reviewBtn.addEventListener('click', () => chooseAndSendReview({ openConfirmDialog: dialog, ws }));
 
     // ---- History ----
     function statusHtml() {

@@ -13,6 +13,8 @@ import copy
 from pathlib import Path
 from typing import Any, Mapping
 
+WORK_OUTPUT_VERSION = 1  # Canonical output_ref, producer task_id and independent child_work_ref.
+
 
 def retained_turn_facts(stored: Mapping[str, Any], task_id: str) -> dict[str, Any]:
     """Facts for an already-classified retained turn, never an authored answer.
@@ -145,10 +147,12 @@ def retained_work_view(stored: Mapping[str, Any], reference: str,
             return continued
         result = presence_result_from_stored(stored, reference, drive_root)
         return 200, {"ok": True, "status": status, "outcome": result.outcome, "text": result.text,
-                     "work_ref": reference, "delivery_reporting_version": result.delivery_reporting_version}
+                     "work_ref": reference, "task_id": result.task_id, "output_ref": result.output_ref,
+                     "child_work_ref": result.work_ref,
+                     "delivery_reporting_version": result.delivery_reporting_version}
     if not attempt_ended(stored, drive_root):
         if continued is None:
-            return 202, {"ok": True, "status": "pending", "work_ref": reference,
+            return 202, {"ok": True, "status": "pending", "work_ref": reference, "task_id": reference,
                          "delivery_reporting_version": presence.get("delivery_reporting_version", 0)}
         # A live author stays observed even after its row recorded a terminal without an answer:
         # its execution may still back-fill a child before it ends.
@@ -162,4 +166,4 @@ def retained_work_view(stored: Mapping[str, Any], reference: str,
         "outputs", "continuation_ref", "continuation_version") if key in continued[1]} if continued else {}
     return 200, {"ok": True, "status": "cancelled" if status == "cancelled" else "failed",
                  "outcome": "silent", "text": "", "output_ref": "", **facts,
-                 "work_ref": reference, "child_work_ref": child, **released}
+                 "work_ref": reference, "task_id": reference, "child_work_ref": child, **released}

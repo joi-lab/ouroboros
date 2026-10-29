@@ -26,9 +26,63 @@ export const CHECKPOINT_LABELS = {
 };
 
 const WAIT_LABELS = {
-    usage_lock_wait: ['Waiting for accounting access', 'Accounting wait ended'],
-    control_store_wait: ['Waiting for control storage', 'Control storage wait ended'],
+    usage_lock_wait: ['Waiting for accounting access', 'Accounting wait ended', 'Accounting waits'],
+    control_store_wait: ['Waiting for control storage', 'Control storage wait ended', 'Control storage waits'],
 };
+
+function waitSeconds(s) {
+    if (s < 10) return `${s.toFixed(1)} s`;
+    const whole = Math.round(s);
+    return whole < 60 ? `${whole} s` : `${Math.floor(whole / 60)} min${whole % 60 ? ` ${whole % 60} s` : ''}`;
+}
+
+/** A host wait (accounting, control storage) is how the host ran, not the turn's work. Its episode
+ *  facts, or null for any other checkpoint; the producer still writes both phases of every episode.
+ *  Python twin: ``ouroboros/checkpoint_waits.py`` (cases in ``web/tests/fixtures/wait_fold_parity.json``). */
+export function waitEpisode(evt = {}) {
+    if (!Object.hasOwn(WAIT_LABELS, evt.checkpoint_kind) || !evt.episode_id) return null;
+    const elapsed = evt.elapsed_sec;
+    return { kind: evt.checkpoint_kind, id: String(evt.episode_id), ended: evt.phase === 'ended',
+        elapsed: typeof elapsed === 'number' && Number.isFinite(elapsed) && elapsed >= 0 ? elapsed : null };
+}
+
+/** One line for a kind's episodes (id -> {ended, elapsed}): live while one is open, then how many
+ *  ended and the longest measured one. */
+export function waitFoldLine(kind, episodes) {
+    const closed = [...episodes.values()].filter((episode) => episode.ended);
+    const [waiting, ended, plural] = WAIT_LABELS[kind];
+    const known = closed.map((episode) => episode.elapsed).filter((elapsed) => elapsed !== null);
+    const longest = known.length ? waitSeconds(Math.max(...known)) : '';
+    const done = closed.length === 1 ? [ended, longest].filter(Boolean).join(' · ')
+        : closed.length ? `${plural} ×${closed.length}${longest ? ` · longest ${longest}` : ''}` : '';
+    return [closed.length < episodes.size ? waiting : '', done].filter(Boolean).join(' · ');
+}
+
+/** All of a block's episodes of one kind are ONE receipt row (it never makes a block on its own):
+ *  live while an episode is open, then the count and the longest closed one, as measured. Live
+ *  frames and history replay land in the same row; an episode seen twice counts once. ``earliest``
+ *  (replay) moves the row to an older episode a later-loaded page brings, where live placed it. */
+export function foldWaitRow(record, summary, { ts = '', sourceTs = '', earliest = false } = {}) {
+    const { kind, id, ended, elapsed } = summary.waitEpisode;
+    const folds = record.waitFolds || (record.waitFolds = {});
+    const episodes = folds[kind] || (folds[kind] = new Map());
+    const seen = episodes.get(id);
+    episodes.set(id, { ended: Boolean(seen?.ended) || ended, elapsed: ended ? elapsed : seen?.elapsed ?? null });
+    const headline = waitFoldLine(kind, episodes);
+    const phase = [...episodes.values()].every((episode) => episode.ended) ? 'result' : 'thinking';
+    const index = record.items.findIndex((item) => item.dedupeKey === summary.dedupeKey);
+    if (index !== -1) {
+        const item = record.items[index];
+        const moved = earliest && Date.parse(sourceTs) < Date.parse(item.sourceTs);
+        if (item.headline === headline && item.phase === phase && !moved) return { changed: false, index, moved };
+        Object.assign(item, { headline, fullHeadline: headline, phase }, moved ? { ts, sourceTs } : {});
+        return { changed: true, index, moved };
+    }
+    record.items.push({ phase, headline, fullHeadline: headline, body: '', fullBody: '', fullRef: '', truncated: false,
+        evidenceRef: null, receipt: true, ts, sourceTs, count: 1, dedupeKey: summary.dedupeKey,
+        lineKey: `wait-${String(summary.dedupeKey).replace(/[^A-Za-z0-9_-]/g, '-')}` });
+    return { changed: true, index: -1, moved: false };
+}
 
 // What a cost crossing measured (the producer's typed `budget_axis`). A row without one comes
 // from a historical producer, whose notice was advice: it keeps its kind's label below.

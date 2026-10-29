@@ -36,6 +36,7 @@ from tests.system_e2e.harness import (
 from tests.test_owner_wait_integration import wait_clone as clone_fixture
 from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET
 from tests.ci_evidence import output_dir
+from tests.ui_console_errors import PageErrors
 from tests.ui_failure_evidence import FailureEvidence
 
 wait_clone = clone_fixture
@@ -245,8 +246,7 @@ def test_project_root_main_notice_reaches_main_only_and_keeps_the_project_answer
                 browser = getattr(pw, engine).launch()
                 page = browser.new_page(viewport={"width": width, "height": 900}, has_touch=width < 980,
                                         color_scheme=theme)
-                errors, state_reads = [], []
-                page.on("pageerror", lambda error: errors.append(str(error)))
+                errors, state_reads = PageErrors(page, engine), []
                 page.on("request", lambda request: state_reads.append(time.monotonic())
                         if request.url.split("?")[0].endswith("/api/state") else None)
                 page.add_init_script(f"({_CAPTURE_TEST_SOCKET})()")
@@ -404,7 +404,7 @@ def test_project_root_main_notice_reaches_main_only_and_keeps_the_project_answer
                     _panel_cover(page)
                     capture.checkpoint("7-reloaded-project")
                     assert not strangers, strangers
-                    assert not errors, errors
+                    assert not errors.unexpected(), errors
         finally:
             before_notice.release.set()
             before_answer.release.set()

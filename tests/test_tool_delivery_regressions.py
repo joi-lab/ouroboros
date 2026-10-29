@@ -93,7 +93,7 @@ def test_completed_batch_measurement_includes_auto_image(tmp_path, monkeypatch, 
     ctx.messages = messages
     attached, stamps = [], []
 
-    def attach(inner, path, *, stamp=None):
+    def attach(inner, path, *, stamp=None, observation=None):
         attached.append(path)
         stamps.append(stamp)
         inner.messages.append({"role": "user", "content": [

@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -42,6 +43,20 @@ def _digest(path: Path) -> str:
 
 SIGNER = "0123456789ABCDEF0123456789ABCDEF01234567"  # synthetic SHA-1 thumbprint
 GREEN_GATES = [f"{name}=success" for name in release_proof.RELEASE_GATES]
+CATALOG = release_proof.WINDOWS_SIGNING_CATALOG
+
+
+def _signed_zip(path: Path) -> list[dict]:
+    """A final ZIP holding the catalogued executables, and the signing job's record of them."""
+    record = []
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("Ouroboros/_internal/other.dll", b"not catalogued")
+        for entry in CATALOG["files"]:
+            signed = b"signed " + entry["path"].encode()
+            archive.writestr(entry["path"], signed)
+            record.append({"path": entry["path"], "sha256": hashlib.sha256(signed).hexdigest(),
+                           "unsignedSha256": entry.get("upstreamSha256") or "e" * 64})
+    return record
 
 
 def _verdict(tmp_path: Path, *, flaky=(), accepted=(), failed=(), not_run=()) -> Path:
@@ -90,6 +105,8 @@ def _fixture_release(
                 )
                 receipt["authenticode"] = {
                     "status": "signed", "signerThumbprint": signer, "publisher": "Example Publisher",
+                    "files": _signed_zip(tmp_path / "signed-fixture.zip"),
+                    "pythonUpstream": CATALOG["pythonUpstream"],
                 }
         if proof_id == release_proof.NOTARIZATION_PROOF_ID:
             receipt["notarization"] = {"status": "not_notarized"}
@@ -725,10 +742,15 @@ def test_configured_signing_publishes_the_verified_signer(tmp_path: Path):
 
     assert windows["authenticode"] == {
         "status": "signed", "signerThumbprint": SIGNER, "publisher": "Example Publisher",
+        "files": _signed_zip(tmp_path / "expected.zip"), "pythonUpstream": CATALOG["pythonUpstream"],
     }
     assert f"from **Example Publisher** (certificate SHA-1 `{SIGNER}`)" in notes
-    assert "timestamped Authenticode signature" in notes
-    assert "not signed individually" in notes and "SmartScreen may still warn" in notes
+    assert "`Ouroboros.exe` and the bundled interpreter's `python.exe` and `pythonw.exe`" in notes
+    assert "(CPython 3.10.22 from python-build-standalone 20261009)" in notes
+    assert "timestamped Authenticode signatures" in notes and "before and after signing" in notes
+    # The scope boundary: nothing else in the ZIP, no later environment or Git update.
+    assert "signs no other file in the ZIP" in notes and "later created from that interpreter" in notes
+    assert "later Git updates" in notes and "SmartScreen or antivirus may still warn" in notes
     assert "this ZIP is unsigned" not in notes
 
 
@@ -741,9 +763,21 @@ def test_configured_signing_publishes_the_verified_signer(tmp_path: Path):
         (SIGNER, SIGNER, "drop-timestamp", "missing signing checks"),
         (SIGNER, SIGNER, "drop-publisher", "configured certificate"),
         (SIGNER, SIGNER, "drop-state", "configured certificate"),
+        # Exactly the catalogued executables, each once, with their pins.
+        (SIGNER, SIGNER, "drop-files", "path, unsignedSha256 and sha256"),
+        (SIGNER, SIGNER, "missing-file", "not exactly the catalogued"),
+        (SIGNER, SIGNER, "duplicate-file", "not exactly the catalogued"),
+        (SIGNER, SIGNER, "extra-file", "not exactly the catalogued"),
+        (SIGNER, SIGNER, "venv-template", "not exactly the catalogued"),
+        (SIGNER, SIGNER, "wrong-upstream", "not the catalogued upstream"),
+        (SIGNER, SIGNER, "unchanged-hash", "lacks distinct SHA-256"),
+        (SIGNER, SIGNER, "short-hash", "lacks distinct SHA-256"),
+        (SIGNER, SIGNER, "extra-field", "path, unsignedSha256 and sha256"),
+        (SIGNER, SIGNER, "other-python", "catalogued upstream Python"),
         # Without configuration, a receipt may not claim a signature.
         (SIGNER, "", None, "does not record an unsigned archive"),
         ("", "", "claim-timestamp", "does not record an unsigned archive"),
+        ("", "", "claim-files", "does not record an unsigned archive"),
         ("", "", "drop-state", "does not record an unsigned archive"),
         # A set but malformed thumbprint is a broken configuration.
         ("", " ", None, "not a 40-hex"),
@@ -765,6 +799,31 @@ def test_windows_signing_state_must_match_the_configuration(
         receipt["authenticode"]["publisher"] = " "
     elif mutate == "drop-state":
         del receipt["authenticode"]
+    elif mutate == "claim-files":
+        receipt["authenticode"]["files"] = _signed_zip(tmp_path / "claimed.zip")
+    elif mutate is not None:
+        files = receipt["authenticode"]["files"]
+        python, pythonw = files[1], files[2]
+        if mutate == "drop-files":
+            del receipt["authenticode"]["files"]
+        elif mutate == "missing-file":
+            files.remove(pythonw)
+        elif mutate == "duplicate-file":
+            files[2] = dict(python)
+        elif mutate == "extra-file":
+            files.append({**python, "path": "Ouroboros/_internal/other.dll"})
+        elif mutate == "venv-template":
+            files[2] = {**pythonw, "path": "Ouroboros/_internal/python-standalone/Lib/venv/scripts/nt/pythonw.exe"}
+        elif mutate == "wrong-upstream":
+            pythonw["unsignedSha256"] = "f" * 64
+        elif mutate == "unchanged-hash":
+            python["sha256"] = python["unsignedSha256"]
+        elif mutate == "short-hash":
+            files[0]["sha256"] = files[0]["sha256"][:-1]
+        elif mutate == "extra-field":
+            python["signedAt"] = "2026-10-26"
+        elif mutate == "other-python":
+            receipt["authenticode"]["pythonUpstream"] = {**CATALOG["pythonUpstream"], "release": "20260211"}
     path.write_text(json.dumps(receipt), encoding="utf-8")
 
     with pytest.raises(ValueError, match=message):
@@ -809,17 +868,41 @@ def test_handoff_archive_digest_is_checked_before_extraction(tmp_path: Path):
 
 def test_windows_receipt_records_signing_state_and_android_callers_stay_compatible(tmp_path: Path):
     archive = tmp_path / "Ouroboros-6.87.5-windows-x64.zip"
-    archive.write_bytes(b"zip")
+    record = _signed_zip(archive)
     common = ["record-smoke", "--proof-id", "windows-x64", "--artifact", str(archive),
               "--commit", "a" * 40, "--tag", "v6.87.5", "--check", "packaged_cli_help"]
+    signer = ["--authenticode-thumbprint", SIGNER.lower(), "--authenticode-publisher", "Example Publisher"]
     unsigned, signed = tmp_path / "unsigned.json", tmp_path / "signed.json"
     assert _run_cli(*common, "--output", str(unsigned)).returncode == 0
     assert json.loads(unsigned.read_text())["authenticode"] == {"status": "unsigned"}
-    assert _run_cli(*common, "--output", str(signed), "--authenticode-thumbprint", SIGNER.lower(),
-                    "--authenticode-publisher", "Example Publisher").returncode == 0
+    # The signing job reports in its own order; the receipt keeps the catalog's.
+    shuffled = json.dumps(record[::-1])
+    result = _run_cli(*common, "--output", str(signed), *signer, "--authenticode-files", shuffled)
+    assert result.returncode == 0, result.stderr
     assert json.loads(signed.read_text())["authenticode"] == {
         "status": "signed", "signerThumbprint": SIGNER, "publisher": "Example Publisher",
+        "files": record, "pythonUpstream": CATALOG["pythonUpstream"],
     }
+    # Each recorded hash must be the final ZIP's bytes, and every catalogued file must be there.
+    stale = [dict(row) for row in record]
+    stale[1]["sha256"] = "0" * 64
+    pruned = tmp_path / "pruned.zip"
+    with zipfile.ZipFile(archive) as source, zipfile.ZipFile(pruned, "w") as target:
+        for name in source.namelist():
+            if name != record[2]["path"]:
+                target.writestr(name, source.read(name))
+    for args, message in (
+        ([*signer, "--authenticode-files", json.dumps(stale)], "not the signed"),
+        ([*signer], "path, unsignedSha256 and sha256"),
+        (["--authenticode-files", json.dumps(record)], "need the verified signer"),
+    ):
+        refused = _run_cli(*common, "--output", str(tmp_path / "refused.json"), *args)
+        assert refused.returncode != 0 and message in refused.stderr, refused.stderr
+    pruned_args = [arg if arg != str(archive) else str(pruned) for arg in common]
+    refused = _run_cli(*pruned_args, "--output", str(tmp_path / "refused.json"), *signer,
+                       "--authenticode-files", json.dumps(record))
+    assert refused.returncode != 0 and "does not hold every catalogued executable" in refused.stderr
+    assert not (tmp_path / "refused.json").exists()
 
     # scripts/build_android_release.py builds its own Namespace without these fields.
     apk = tmp_path / "Ouroboros-6.87.5-android.apk"
@@ -849,12 +932,17 @@ def test_workflow_shell_handoff_receipt_and_release_consumer(tmp_path: Path, ver
     dist.mkdir()
     name = release_proof.release_asset_name("windows-x64", version)
     archive = dist / name
-    archive.write_bytes(b"final mocked signed ZIP" if signer else b"final unsigned ZIP")
+    if signer:
+        signed_files = _signed_zip(archive)
+    else:
+        archive.write_bytes(b"final unsigned ZIP")
     output = tmp_path / "output"
     env = dict(os.environ, GITHUB_OUTPUT=str(output), WINDOWS_SIGNER_THUMBPRINT=signer,
                SIGNED_SHA256=_digest(archive) if signer else "wrong-unused-signed-digest",
                UNSIGNED_SHA256="wrong-unused-unsigned-digest" if signer else _digest(archive),
                SIGNER_THUMBPRINT=signer, SIGNER_PUBLISHER="Example Publisher" if signer else "",
+               # The windows-sign job output; unset jobs yield an empty string.
+               SIGNED_FILES=json.dumps(signed_files) if signer else "",
                GITHUB_REF_NAME=f"v{version}", GITHUB_SHA="a" * 40, GITHUB_REPOSITORY="example/project",
                GITHUB_SERVER_URL="https://example.test", GITHUB_RUN_ID="123",
                ANDROID_BUILD_RESULT="skipped", ANDROID_ATTESTATION_RESULT="not_run",
@@ -894,7 +982,9 @@ def test_workflow_shell_handoff_receipt_and_release_consumer(tmp_path: Path, ver
     windows = next(row for row in evidence["artifacts"] if row["proofId"] == "windows-x64")
     assert windows["sha256"] == _digest(archive)
     assert windows["authenticode"] == ({"status": "signed", "signerThumbprint": signer,
-                                        "publisher": "Example Publisher"} if signer else {"status": "unsigned"})
+                                        "publisher": "Example Publisher", "files": signed_files,
+                                        "pythonUpstream": CATALOG["pythonUpstream"]}
+                                       if signer else {"status": "unsigned"})
     notes = (tmp_path / "release-notes.md").read_text()
     assert ("timestamped Authenticode signature" if signer else "this ZIP is unsigned") in notes
     # The assembly consumer also rejects bytes changed after proof generation.

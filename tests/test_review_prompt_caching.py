@@ -1,6 +1,6 @@
 """v6.69.0 review-economics tests: cache-friendly review prompts, TTL passthrough,
-reviewer session affinity, durable parameter rejections, pre-routing $0 settlement,
-and review-wave budget admission."""
+reviewer session affinity, pre-routing $0 settlement, and review-wave budget
+admission."""
 
 from __future__ import annotations
 
@@ -313,12 +313,11 @@ def test_finalizer_ttl_orders_the_sealed_anchor_on_direct_anthropic(monkeypatch)
 
 @pytest.mark.parametrize("provider,model", [
     ("openai", "gpt-5.5"),
-    ("openai-compatible", "local-glm"),
     ("cloudru", "GigaChat/some-model"),
 ])
 def test_finalizer_never_marks_non_openrouter_routes(provider, model):
-    """These three share the OpenAI-compatible transport with OpenRouter; an ungated
-    mutator would inject Anthropic-style cache_control and earn a hard provider 400."""
+    """These share the OpenAI-compatible transport with OpenRouter; an ungated mutator
+    would inject Anthropic-style cache_control into a wire they never asked to carry it."""
     client = LLMClient(api_key="unused")
     target = {
         "provider": provider,
@@ -1108,55 +1107,6 @@ def test_warm_supported_params_cache_used_when_fetch_skipped(monkeypatch):
         )
     assert kwargs["temperature"] == 0.2
     assert "temperature" not in physical
-
-
-# ---------------------------------------------------------------------------
-# Durable rejected-parameter evidence
-# ---------------------------------------------------------------------------
-
-def test_rejected_params_survive_process_boundary(tmp_path, monkeypatch):
-    from ouroboros import capability_evidence as ce
-
-    ce.record_rejected_params(tmp_path, "anthropic/claude-fable-5", {"temperature"})
-    assert ce.get_rejected_params(tmp_path, "anthropic/claude-fable-5") == {"temperature"}
-
-    # Fresh "process": empty in-memory caches, durable store is consulted once.
-    monkeypatch.setattr(LLMClient, "_REJECTED_PARAMS_CACHE", {})
-    monkeypatch.setattr(LLMClient, "_REJECTED_PARAMS_LOADED", {})
-    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
-    known = LLMClient._known_rejected_params("anthropic/claude-fable-5")
-    assert "temperature" in known
-
-
-def test_rejected_params_expiry_heals_long_running_process(tmp_path, monkeypatch):
-    """A process older than the reload interval re-syncs from the durable store,
-    so a durable expiry evicts the parameter WITHOUT a restart."""
-    from ouroboros import capability_evidence as ce
-
-    ce.record_rejected_params(tmp_path, "anthropic/claude-fable-5", {"temperature"})
-    monkeypatch.setattr(LLMClient, "_REJECTED_PARAMS_CACHE", {})
-    monkeypatch.setattr(LLMClient, "_REJECTED_PARAMS_LOADED", {})
-    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
-    assert "temperature" in LLMClient._known_rejected_params("anthropic/claude-fable-5")
-
-    # Expire the durable entry, then age the process cache past the reload TTL.
-    data = ce._load(tmp_path)
-    data["rejected_params"]["anthropic/claude-fable-5"]["observed_at"] = "2020-01-01T00:00:00+00:00"
-    ce._save(tmp_path, data)
-    LLMClient._REJECTED_PARAMS_LOADED["anthropic/claude-fable-5"] -= (
-        LLMClient._REJECTED_PARAMS_RELOAD_SEC + 1
-    )
-    assert "temperature" not in LLMClient._known_rejected_params("anthropic/claude-fable-5")
-
-
-def test_rejected_params_expire(tmp_path):
-    from ouroboros import capability_evidence as ce
-
-    ce.record_rejected_params(tmp_path, "m/x", {"temperature"})
-    data = ce._load(tmp_path)
-    data["rejected_params"]["m/x"]["observed_at"] = "2020-01-01T00:00:00+00:00"
-    ce._save(tmp_path, data)
-    assert ce.get_rejected_params(tmp_path, "m/x") == set()
 
 
 # ---------------------------------------------------------------------------

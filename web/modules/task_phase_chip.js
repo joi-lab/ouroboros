@@ -254,7 +254,7 @@ export function desiredLiveCardPhase(record = {}, terminalPhase = 'done') {
         ...(secondary ? { secondary } : {}), ...(view.detail ? { detail: view.detail } : {}) };
 }
 
-// The look a chip's view carries to its painter (and to a Shade row that says a card's words).
+// The look a chip's view carries to its painter (and to a work-list row that says a card's words).
 function chipLook(view) {
     return { mark: view.mark, tone: view.tone, owner: Boolean(view.owner), ...(view.outcome ? { outcome: view.outcome } : {}) };
 }

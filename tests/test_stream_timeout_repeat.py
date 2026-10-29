@@ -24,6 +24,7 @@ from ouroboros.loop import run_llm_loop
 from ouroboros.loop_llm_call import TIMEOUT_REPEAT_KEY, call_llm_with_retry, provider_no_call_source
 from ouroboros.tools.registry import ToolRegistry
 from tests._usage_store_testing import ledger_rows
+from tests._shared import saved_settings
 
 MODEL = "vendor/fixture-model"
 CHILD, PARENT = "child-1886", "parent-1886"
@@ -164,7 +165,7 @@ def wire_env(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "fixture-key")
     monkeypatch.setenv("TOTAL_BUDGET", "100")
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    monkeypatch.delenv("OUROBOROS_MODEL_FALLBACKS", raising=False)
+    saved_settings(monkeypatch, tmp_path, OUROBOROS_MODEL_FALLBACKS="")  # a saved blank: no chain
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     (tmp_path / "logs").mkdir()
     # The child bills as its own root here; the parent link is the stored task row's (``deliver_to_parent``).

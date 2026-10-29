@@ -214,6 +214,7 @@ class TestAliasProducerFanOutSweep:
         ("ouroboros/evolution_checkpoints.py", "cost_usd", "append_evolution_checkpoint"): ("evolution checkpoint records", 1),
         # custody settlement events
         ("ouroboros/delegate_collection.py", "cost_usd", "record_terminal_money"): ("custody SETTLED event row", 1),
+        ("ouroboros/delegate_custody_usage.py", "cost_usd", "disclosed_cost"): ("one delegated run's disclosed cash facts, read field by field by the ledger session writer, custody collection, review session usage and the delegate terminal evidence row; never a gateway cost projection", 1),
         ("ouroboros/owner_stop_receipt.py", "cost_usd", "retained_run_facts"): ("frozen per-run custody accounting receipt (disclosed spend + finality), passed through as evidence; not the task's ledger upper bound", 1),
     }
 

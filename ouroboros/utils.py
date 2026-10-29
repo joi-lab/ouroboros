@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
@@ -353,6 +353,84 @@ def read_json_dict(path: pathlib.Path) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+# path -> (file identity, object, parse error, its bytes while racy): one entry per path in use
+_JSON_SNAPSHOTS: Dict[str, tuple] = {}
+# A filesystem clock bound, not a policy: a coarse file clock (FAT's two seconds, HFS+ seconds,
+# Linux's jiffy, Windows' tick) can give a later write the same stamp, so a file changed this
+# recently when it was read is compared byte for byte at the next read (the racy-git rule).
+_RACY_NS = 2_000_000_000
+
+
+def file_identity(st: Any) -> tuple:
+    """What every write changes: a rename-replace is a new inode, an in-place write a new change
+    time (``st_ctime_ns``, which no ``utime`` sets back on POSIX; Windows reports creation time)."""
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def json_snapshot(path: pathlib.Path, *, strict: bool = False) -> Optional[Dict[str, Any]]:
+    """The JSON object at ``path``, parsed once per file identity and shared: no reader mutates it.
+
+    For read-mostly state its writers replace by rename (``atomic_write_json``); a writer reads
+    its own fresh copy (``read_json_dict``). ``None`` when absent. A malformed or non-object
+    document is ``None``, with ``strict`` a ``ValueError`` (also once a lenient read remembered
+    it); an unreadable file is ``None``, with ``strict`` its ``OSError``, never remembered.
+    A file changed within ``_RACY_NS`` of its read is read again and parsed only if its bytes moved.
+    """
+    key = str(path)
+    try:
+        held = _JSON_SNAPSHOTS.get(key)
+        if held is None or held[3] is not None or held[0] != file_identity(os.stat(key)):
+            started = time.time_ns()
+            with open(key, "rb") as handle:  # the identity and the bytes come from one open file
+                info, raw = os.fstat(handle.fileno()), handle.read()
+            if held is not None and held[3] == raw:
+                data, error = held[1], held[2]
+            else:
+                try:
+                    data, error = json.loads(raw.decode("utf-8")), None
+                except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError alike
+                    data, error = None, exc
+                if error is None and not isinstance(data, dict):
+                    data, error = None, ValueError(f"not a JSON object but {type(data).__name__}")
+                if error is not None:
+                    log.warning("Failed to parse JSON file %s: %s", key, error)
+            racy = max(info.st_mtime_ns, info.st_ctime_ns) >= started - _RACY_NS
+            held = _JSON_SNAPSHOTS[key] = (file_identity(info), data, error, raw if racy else None)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        if strict:
+            raise
+        log.warning("Failed to read JSON file %s", key, exc_info=True)
+        return None
+    if strict and held[2] is not None:
+        raise ValueError(f"{key} holds no readable JSON object: {held[2]}") from held[2]
+    return held[1]
+
+
+@contextlib.contextmanager
+def json_update_lock(path: pathlib.Path, *, timeout_sec: float = 4.0, stale_sec: float = 90.0) -> Iterator[None]:
+    """Hold the sidecar ``<file>.lock`` that serializes the locked writers of the JSON file ``path``.
+
+    Never the file itself, whose inode each atomic write replaces. ``update_json_locked`` holds it
+    around its read-modify-write; a store with its own load and save holds it around those. Raises
+    ``TimeoutError`` past ``timeout_sec``: proceeding unlocked would reopen the lost update.
+    """
+    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
+
+    path = pathlib.Path(path)
+    lock_path = path.with_name(path.name + ".lock")
+    lock_fd = acquire_exclusive_file_lock(
+        lock_path, timeout_sec=timeout_sec, stale_sec=stale_sec, owner_aware_stale=True,
+    )
+    if lock_fd is None:
+        raise TimeoutError(f"could not acquire {lock_path} within {timeout_sec}s")
+    try:
+        yield
+    finally:
+        release_exclusive_file_lock(lock_path, lock_fd)
+
+
 def update_json_locked(
     path: pathlib.Path,
     mutator: Any,
@@ -365,7 +443,7 @@ def update_json_locked(
 ) -> Dict[str, Any]:
     """Locked read-modify-write of a durable JSON dict file.
 
-    Acquires a sidecar ``<file>.lock``, re-reads the CURRENT on-disk JSON
+    Acquires the sidecar ``<file>.lock`` (``json_update_lock``), re-reads the CURRENT on-disk JSON
     inside the lock (so the mutator always sees the latest state, closing the
     lost-update window of unlocked load→merge→write sequences), applies
     ``mutator(current) -> dict | None`` (``None`` aborts: the file is left
@@ -380,21 +458,8 @@ def update_json_locked(
     from an existing empty object for schema-bearing callers: only absence may
     initialize a new schema.
     """
-    from ouroboros.platform_layer import (
-        acquire_exclusive_file_lock,
-        release_exclusive_file_lock,
-    )
-
     path = pathlib.Path(path)
-    lock_path = path.with_name(path.name + ".lock")
-    lock_fd = acquire_exclusive_file_lock(
-        lock_path, timeout_sec=timeout_sec, stale_sec=stale_sec, owner_aware_stale=True,
-    )
-    if lock_fd is None:
-        raise TimeoutError(
-            f"update_json_locked: could not acquire {lock_path} within {timeout_sec}s"
-        )
-    try:
+    with json_update_lock(path, timeout_sec=timeout_sec, stale_sec=stale_sec):
         existed = path.exists()
         current = read_json_dict(path)
         if current is None:
@@ -414,8 +479,6 @@ def update_json_locked(
         if after_write is not None:
             after_write(updated)  # still under the writer lock; a crash leaves extra debt
         return updated
-    finally:
-        release_exclusive_file_lock(lock_path, lock_fd)
 
 
 def jsonl_append_lock_path(path: pathlib.Path) -> pathlib.Path:
@@ -458,7 +521,7 @@ def assert_test_data_path(path: pathlib.Path) -> None:
 
 def append_jsonl(
     path: pathlib.Path, obj: Dict[str, Any], *, ensure_record_boundary: bool = False,
-    require_lock: bool = False, lock_timeout_sec: float = 2.0,
+    require_lock: bool = False, lock_timeout_sec: float = 2.0, live: bool = True,
 ) -> bool:
     """Append a JSON object as a line to a JSONL file (concurrent-safe).
 
@@ -472,7 +535,8 @@ def append_jsonl(
     shutdown callers whose grace has expired; unlocked fallback is unchanged.
     Runtime ``logs/*.jsonl`` rows are streamed to the ``set_log_sink`` sink, minus
     types with a dedicated live owner (``WORKER_LOG_SINK_SUPPRESSED_TYPES``, server
-    superset ``SERVER_LOG_SINK_SUPPRESSED_TYPES``): one event, one live frame.
+    superset ``SERVER_LOG_SINK_SUPPRESSED_TYPES``): one event, one live frame, so a
+    durable replica of a row its writer already streamed passes ``live=False``.
     Returns ``True`` on successful write, ``False`` when all retries
     failed (which is also logged at WARNING). Important events
     (``task_done``, ``llm_round``, escalation messages) need that signal
@@ -499,9 +563,8 @@ def append_jsonl(
     _written = False
 
     try:
-        # One owner-aware lock primitive for both lanes: a live holder (e.g. the
-        # memory-journal compactor) is waited out, never displaced; the
-        # non-required lane then appends unlocked.
+        # Both lanes wait out a live lock holder, never displacing it;
+        # the non-required lane then appends unlocked.
         lock_fd = acquire_exclusive_file_lock(
             lock_path,
             timeout_sec=lock_timeout_sec,
@@ -542,7 +605,8 @@ def append_jsonl(
 
         for attempt in range(write_retries):
             try:
-                fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                # Byte-exact: a Windows descriptor is text mode without O_BINARY and would write CRLF.
+                fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644)
             except Exception:
                 if attempt < write_retries - 1:
                     time.sleep(retry_sleep_base_sec * (2 ** attempt))
@@ -567,8 +631,8 @@ def append_jsonl(
 
         for attempt in range(write_retries):
             try:
-                with path.open("a", encoding="utf-8") as f:
-                    f.write(append_data.decode("utf-8"))
+                with path.open("ab") as f:
+                    f.write(append_data)
                 _written = True
                 return True
             except Exception:
@@ -582,6 +646,7 @@ def append_jsonl(
         # and state/memory/receipt stores are durable data, not a log feed.
         if (
             _written
+            and live
             and _log_sink is not None
             and path.parent.name == "logs"
             and path.suffix == ".jsonl"
@@ -753,14 +818,21 @@ def jsonl_chain_handles(
     path: pathlib.Path, *, strict: bool = False,
     start_offset: Optional[int] = None,
     snapshot: Optional[Dict[str, Any]] = None,
-) -> Iterator[List[Tuple[pathlib.Path, Any]]]:
+    sequential: bool = False,
+) -> Iterator[Iterable[Tuple[pathlib.Path, Any]]]:
     """Open binary handles for a rotated JSONL chain; the context owns closing.
 
-    By default yield every ``(path, handle)`` in archive filename order, with
-    the initially opened live generation last. Open live BEFORE enumeration;
-    device/inode identity excludes its renamed archive alias after rotation.
-    On Windows that open handle can prevent the rotator's rename. This is not
-    an atomic content snapshot, a JSON-row deduplicator, or an event-time sort.
+    By default yield the list of every ``(path, handle)`` in archive filename
+    order, with the initially opened live generation last. Open live BEFORE
+    enumeration; device/inode identity excludes its renamed archive alias after
+    rotation. On Windows that open handle can prevent the rotator's rename. This
+    is not an atomic content snapshot, a JSON-row deduplicator, or an event-time sort.
+
+    ``sequential`` yields the same pairs lazily: each archive opens when reached
+    and closes when the caller moves on, so a whole-chain pass holds the live
+    handle pinned at entry plus one archive, whatever the chain's length, and
+    reads the live generation through that handle to its EOF at read time.
+    Strict failures then raise during iteration; a lenient one skips its segment.
 
     ``start_offset`` counts bytes across the captured chain lengths, skipping
     consumed segments without opening them and seeking within selected ones.
@@ -819,15 +891,15 @@ def jsonl_chain_handles(
             raise JsonlChainUnreadable(f"shortened or missing chain at {path}")
         first = bisect_right(ends, start_offset) if start_offset is not None else 0
         stop = min(len(entries), first + 1) if snapshot is not None else len(entries)
-        handles = []
-        for index in range(first, stop):
+
+        def opened(index: int, owner: contextlib.ExitStack) -> Optional[Tuple[pathlib.Path, Any]]:
             segment, expected, was_live = entries[index]
             try:
                 if was_live:
                     handle = live_handle
                     if handle is None:
                         with contextlib.suppress(FileNotFoundError):
-                            handle = stack.enter_context(segment.open("rb"))
+                            handle = owner.enter_context(segment.open("rb"))
                     identity = (expected.st_dev, expected.st_ino)
                     actual = os.fstat(handle.fileno()) if handle is not None else None
                     if actual is None or (actual.st_dev, actual.st_ino) != identity:
@@ -841,18 +913,30 @@ def jsonl_chain_handles(
                                     break
                         else:
                             raise JsonlChainUnreadable(f"original live generation missing at {path}")
-                        handle = stack.enter_context(segment.open("rb"))
+                        handle = owner.enter_context(segment.open("rb"))
                 else:
-                    handle = stack.enter_context(segment.open("rb"))
+                    handle = owner.enter_context(segment.open("rb"))
                 if start_offset is not None:
                     if os.fstat(handle.fileno()).st_size < expected.st_size:
                         raise JsonlChainUnreadable(f"shortened chain segment {segment}")
                     handle.seek(max(0, start_offset - (ends[index - 1] if index else 0)))
-                handles.append((segment, handle))
+                return segment, handle
             except OSError as exc:
                 if strict:
                     raise JsonlChainUnreadable(f"cannot read {segment}: {exc}") from exc
-        yield handles
+                return None
+
+        def one_at_a_time() -> Iterator[Tuple[pathlib.Path, Any]]:
+            for index in range(first, stop):
+                with contextlib.ExitStack() as owner:
+                    pair = opened(index, owner)
+                    if pair:
+                        yield pair
+
+        if sequential:
+            yield stack.enter_context(contextlib.closing(one_at_a_time()))
+        else:
+            yield [pair for pair in (opened(index, stack) for index in range(first, stop)) if pair]
 
 def iter_jsonl_chain_objects(
     path: pathlib.Path,
@@ -1107,7 +1191,9 @@ def run_cmd(
     # Tool output is PARSED (git error signatures, porcelain text), so it must not
     # depend on the operator's locale: a Russian-locale git answers «метка … уже
     # существует» where the code and its tests match "already exists".
-    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    from ouroboros.git_observation import host_git_env
+
+    env = host_git_env()
     res = subprocess.run(
         cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True, env=env,
         timeout=timeout,

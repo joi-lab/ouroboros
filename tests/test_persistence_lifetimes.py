@@ -27,7 +27,6 @@ _LIFETIME_RE = re.compile(r"^\[(record|bounded|disposable: ([\w.]+))\]")
 DISPOSABLE_WITHOUT_RETIRER = frozenset({
     "state/presence_turn_gate/last-<sha256>.json",
     "state/betterleaks/",
-    "state/pycache/",
     "state/skills/<name>/jobs/<job>/",
     "playwright-browsers/",
     # Owner choice A (quiz 44dd72, 2026-10-21): one shared download cache, no bespoke cleaner; it is

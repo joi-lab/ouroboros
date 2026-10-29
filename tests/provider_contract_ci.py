@@ -41,24 +41,33 @@ class ProviderCanary:
     reasoning_effort: str
     named_tool_choice: bool = True
     continue_to_final: bool = False
+    skip_reason: str = ""  # a route this run cannot reach: optional, skipped, and the reason is in the report
 
+
+# Release 7.9.0 only: the OpenRouter key in CI is refused by Google, Anthropic and OpenAI models (HTTP 403,
+# provider terms), so these four routes are optional and skipped with this reason. The direct Anthropic and
+# OpenAI canaries stay required. Splitting the CI keys brings the four back as required.
+_ROUTE_REFUSED_TO_CI_KEY = (
+    "skipped on this release: the CI OpenRouter key is refused by this provider (HTTP 403, provider terms); "
+    "the route returns as required once CI has a key that reaches it"
+)
 
 _OPENROUTER_CANARIES = (
     ProviderCanary(
         "openrouter_gemini", "google/gemini-3.8-flash", "openrouter",
-        "OPENROUTER_API_KEY", True, "medium",
+        "OPENROUTER_API_KEY", False, "medium", skip_reason=_ROUTE_REFUSED_TO_CI_KEY,
     ),
     ProviderCanary(
         "openrouter_opus", "anthropic/claude-opus-5", "openrouter",
-        "OPENROUTER_API_KEY", True, "medium",
+        "OPENROUTER_API_KEY", False, "medium", skip_reason=_ROUTE_REFUSED_TO_CI_KEY,
     ),
     ProviderCanary(
         "openrouter_fable", "anthropic/claude-fable-5.1", "openrouter",
-        "OPENROUTER_API_KEY", True, "medium", named_tool_choice=False,
+        "OPENROUTER_API_KEY", False, "medium", named_tool_choice=False, skip_reason=_ROUTE_REFUSED_TO_CI_KEY,
     ),
     ProviderCanary(
         "openrouter_gpt", "openai/gpt-5.6-luna", "openrouter",
-        "OPENROUTER_API_KEY", True, "medium",
+        "OPENROUTER_API_KEY", False, "medium", skip_reason=_ROUTE_REFUSED_TO_CI_KEY,
     ),
     ProviderCanary(
         "openrouter_grok", "x-ai/grok-4.6", "openrouter",

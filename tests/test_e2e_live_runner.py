@@ -466,10 +466,10 @@ def test_submit_injects_no_budget_profile_into_the_stand_roots(monkeypatch):
     bodies: list = []
     monkeypatch.setattr(scenarios, "_api", lambda base, method, path, payload=None, timeout=0:
                         bodies.append((method, path, payload)) or {"task_id": "t-1"})
-    assert _ctx().submit("do it", metadata={"force_plan": True, "force_plan_source": "swarm"}) == "t-1"
+    assert _ctx().submit("do it", metadata={"purpose": "probe"}) == "t-1"
     (method, path, body), = bodies
     assert (method, path) == ("POST", "/api/tasks") and body["timeout_sec"] == 1
-    assert body["metadata"] == {"source": "e2e_live", "delegation_role": "root", "force_plan": True, "force_plan_source": "swarm"}
+    assert body["metadata"] == {"source": "e2e_live", "delegation_role": "root", "purpose": "probe"}
     assert not hasattr(scenarios, "STAND_BUDGET_PROFILE") and "budget_profile" not in json.dumps(body)
 
 
@@ -1530,3 +1530,20 @@ def test_orphan_after_stop_fails_a_passing_lane_with_a_typed_reason(tmp_path):
     assert recorded["status"] == "fail" and recorded["reason_code"] == "checks_failed"
     index = [json.loads(ln) for ln in (out / "result_index.jsonl").read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert [(r["instance_id"], r["status"], r["reason_code"]) for r in index] == [("SM1_a1", "fail", "checks_failed")]
+
+
+def test_sw1_api_fallback_saves_room_mode_without_one_shot_metadata(monkeypatch):
+    from types import SimpleNamespace
+    from devtools.e2e_live import scenarios
+
+    calls, submitted = [], []
+    def api(base, method, path, body, **kwargs):
+        calls.append((method, path, body))
+        return {"ok": True, "subagents_mode": "swarm"}
+    monkeypatch.setattr(scenarios, "_api", api)
+    ctx = SimpleNamespace(ui=None, ui_reason="no browser", server=SimpleNamespace(base_url="http://localhost"),
+                          submit=lambda *args, **kwargs: submitted.append(kwargs) or "",
+                          check=lambda *args, **kwargs: None)
+    scenarios.run_sw1(ctx)
+    assert calls == [("POST", "/api/owner/subagents-mode", {"mode": "swarm"})]
+    assert submitted == [{}]

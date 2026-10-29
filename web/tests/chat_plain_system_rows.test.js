@@ -190,6 +190,7 @@ function installDom(fetchImpl = async () => ({ ok: true, json: async () => ({ ac
         WebSocket: globalThis.WebSocket,
         ResizeObserver: globalThis.ResizeObserver,
         requestAnimationFrame: globalThis.requestAnimationFrame,
+        getComputedStyle: globalThis.getComputedStyle,
     };
     const document = {
         byId: new Map(), hidden: false, activeElement: null,
@@ -206,6 +207,7 @@ function installDom(fetchImpl = async () => ({ ok: true, json: async () => ({ ac
     const mount = new ElementStub('div', document);
     document.byId.set('content', mount);
     const storage = new Map();
+    globalThis.getComputedStyle = () => ({ lineHeight: '24px', height: '168px', getPropertyValue: () => '7' });
     globalThis.document = document;
     globalThis.window = {
         document, location: { href: 'http://local/' }, history: { replaceState() {} },

@@ -111,6 +111,8 @@ def write_uninstall_tombstone(drive_root: pathlib.Path, name: str, *, source: st
                 SKILL_OWNER_STATE_SCHEMA_VERSION,
             ),
         )
+        from ouroboros.maintenance_retirement import artifact_changed
+        artifact_changed(drive_root, immediate=True)
     except Exception:
         log.debug("uninstall tombstone write failed for %s", name, exc_info=True)
 

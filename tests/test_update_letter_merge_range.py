@@ -96,11 +96,13 @@ def test_real_merge_material_reaches_write_letter_messages(merged_range, letter_
     assert record["key"]["base_sha"] == local and record["key"]["target_sha"] == target
 
 
-@pytest.mark.parametrize("failed_read", ["subjects", "bodies", "readme"])
+@pytest.mark.parametrize("failed_read", ["subjects", "bodies", "readme", "first_parent"])
 def test_each_material_read_failure_is_typed(merged_range, failed_read):
     repo, base, target, *_ = merged_range
 
     def capture(cmd):
+        if failed_read == "first_parent" and cmd[:2] == ["git", "rev-list"]:
+            return 128, "", "fixture read failure"
         kind = "readme" if "README.md" in cmd else "bodies" if "-n" in cmd else "subjects"
         if cmd[:2] == ["git", "log"] and kind == failed_read:
             return 128, "", "fixture read failure"

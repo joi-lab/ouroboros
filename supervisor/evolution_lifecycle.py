@@ -1134,6 +1134,7 @@ def _resume_evolution_terminal_effects(
     campaign_id: str, task_id: str, tx: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Finish idempotent effects that follow the durable terminal transition."""
+    from ouroboros.server_restart import defer_evolution_restart
     from supervisor import queue
 
     resumed = dict(tx or {})
@@ -1145,7 +1146,8 @@ def _resume_evolution_terminal_effects(
         except Exception:
             log.warning("Failed to persist evolution cleanup evidence for %s", task_id, exc_info=True)
     if (
-        resumed.get("cycle_outcome") == "waiting_for_restart"
+        not defer_evolution_restart(resumed)
+        and resumed.get("cycle_outcome") == "waiting_for_restart"
         and resumed.get("restart_required")
         and not resumed.get("restart_verified")
     ):
@@ -1188,7 +1190,10 @@ def update_evolution_campaign_after_task(
     try:
         # The complete read/check/mutate/write is protected by the same state lock
         # used by pause, owner stop, boot reconciliation, and transaction updates.
-        campaign = _read_evolution_campaign()
+        campaign = read_json_dict(_evolution_campaign_path())
+        if campaign is None:
+            return {"accepted": True, "persisted": False, "replay": False,
+                    "reason": "campaign_unavailable", "transaction": {}}
         if campaign.get("status") not in {"active", "paused"}:
             return {
                 "accepted": False, "persisted": False, "replay": False,
@@ -1336,6 +1341,7 @@ def update_evolution_campaign_after_task(
             else:
                 campaign["cost_accounting_status"] = "unavailable"
             campaign["updated_at"] = utc_now_iso()
+            write_failure = "campaign_write_refused"
             try:
                 persisted = _write_evolution_campaign(
                     campaign,
@@ -1344,14 +1350,11 @@ def update_evolution_campaign_after_task(
                 )
             except Exception:
                 log.warning("Failed to persist evolution terminal for %s", task_id, exc_info=True)
-                return {
-                    "accepted": True, "persisted": False, "replay": False,
-                    "reason": "campaign_write_failed", "transaction": {},
-                }
+                persisted, write_failure = False, "campaign_write_failed"
             if not persisted:
                 return {
                     "accepted": True, "persisted": False, "replay": False,
-                    "reason": "campaign_write_refused", "transaction": {},
+                    "reason": write_failure, "transaction": {},
                 }
     finally:
         state.release_file_lock(state.STATE_LOCK_PATH, lock_fd)
@@ -1537,25 +1540,34 @@ def write_pending_restart_marker(
     return path
 
 
-def request_evolution_restart(drive_root: pathlib.Path, tx: Dict[str, Any], log: Any = None) -> None:
-    """Write the exact restart-verify claim, then ask the server to restart.
-    ``OUROBOROS_EVOLUTION_AUTO_RESTART`` off skips ONLY the restart: the marker is
-    what lets the next boot — the owner's manual one included — attribute the cycle
-    by exact claim rather than the weaker markerless reconcile (W4-F3)."""
+def request_evolution_restart(drive_root: pathlib.Path, tx: Dict[str, Any], log: Any = None,
+                              *, request: Optional[Dict[str, Any]] = None) -> str:
+    """Prepare the exact boot claim, including for manual restart when auto-restart is off.
+    Return a known decision or unconfirmed; an agent intent retries the latter on its drain tick."""
+    auto = str(os.environ.get("OUROBOROS_EVOLUTION_AUTO_RESTART", "true") or "true").lower() not in {"0", "false", "no", "off"}
     commit_sha = str(tx.get("commit_sha") or "").strip()
     if not commit_sha:
-        return
+        return "evolution_commit_missing"
     claim = {key: str(tx.get(key) or "") for key in ("campaign_id", "transaction_id", "task_id")}
     claim["commit_sha"] = commit_sha
-    authority = check_evolution_authority(**claim)
-    if not authority.get("ok"):
-        if log is not None:
-            log.warning("Automatic evolution restart cancelled: exact authority changed (%s)",
-                        authority.get("reason") or "unknown")
-        return
     try:
+        authority = check_evolution_authority(**claim)
+        if not authority.get("ok"):
+            reason = str(authority.get("reason") or "")
+            if not auto:
+                return "evolution_auto_restart_off"
+            if reason == "owner_stopped":  # authority also uses this for unreadable stop evidence
+                from supervisor.state import control_is, read_state
+
+                if (not control_is(read_state().projection(), "evolution_owner_stopped", True)
+                        and evolution_stop_reason() not in {"stop_latched", "stop_intent", "panic_flag"}):
+                    return "unconfirmed"
+            if log is not None:
+                log.warning("Automatic evolution restart not requested: authority check (%s)", reason or "unknown")
+            return ("unconfirmed" if reason in {"", "state_lock_unavailable", "state_controls_unknown"}
+                    else f"evolution_{reason}")
         existing = read_json_dict(pathlib.Path(drive_root) / "state" / "pending_restart_verify.json") or {}
-        restart_reason = (
+        restart_reason = str((request or {}).get("reason") or "").strip() or (
             str(existing.get("reason") or "").strip() if existing.get("evolution_claim") == claim else ""
         ) or "supervisor_auto_evolution_restart"
         write_pending_restart_marker(
@@ -1563,19 +1575,26 @@ def request_evolution_restart(drive_root: pathlib.Path, tx: Dict[str, Any], log:
             reason=restart_reason, evolution_claim=claim,
         )
         from ouroboros import body_adoption
-        if not body_adoption.authorize_for_task(drive_root, claim["task_id"], commit_sha, restart_reason):
-            return  # a candidate commit with no authorized adoption cannot be restarted into
-        if str(os.environ.get("OUROBOROS_EVOLUTION_AUTO_RESTART", "true") or "true").lower() in {"0", "false", "no", "off"}:
+
+        authorized = body_adoption.authorize_for_task(drive_root, claim["task_id"], commit_sha, restart_reason)
+        if not auto:
             if log is not None:
                 log.info("Automatic evolution restart is off; the restart-verify marker for %s awaits "
                          "a manual restart", commit_sha[:12])
-            return
+            return "evolution_auto_restart_off"
+        if not authorized:
+            return "unconfirmed"  # this bool also covers unreadable/partially prepared adoption
         from supervisor import workers
 
         workers.get_event_q().put({
             "type": "restart_request", "reason": restart_reason,
+            "task_id": claim["task_id"],
             "evolution_restart": True, "ts": utc_now_iso(),
+            **({"phase": "ready", "request_id": request["request_id"], "task_attempt": request["task_attempt"]}
+               if request else {}),
         })
+        return "requested"
     except Exception:
         if log is not None:
             log.debug("Failed to request automatic evolution restart", exc_info=True)
+        return "unconfirmed" if auto else "evolution_auto_restart_off"

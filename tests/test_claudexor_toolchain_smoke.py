@@ -344,7 +344,6 @@ def test_a_vendor_probe_leaves_no_process_behind(tmp_path, mode):
 @pytest.mark.parametrize("version_output", ["codex-cli 1.2.3", "codex-cli 1.2.30"])
 def test_vendor_launch_uses_managed_transport_and_engine_doctor_in_custody(
         tmp_path, monkeypatch, kind, version_output):
-    import ouroboros.claudexor_daemon as owned
     import ouroboros.config as config
 
     toolchain = tmp_path / ".claudexor" / "node"
@@ -374,7 +373,8 @@ def test_vendor_launch_uses_managed_transport_and_engine_doctor_in_custody(
         return {"daemon_stop": "stopped"}
 
     monkeypatch.setattr(witness.os, "environ", {"HOME": str(tmp_path)})
-    monkeypatch.setattr(owned, "install_missing_harness_cli", install)
+    import ouroboros.claudexor_harness_install as installer
+    monkeypatch.setattr(installer, "install_missing_harness_cli", install)
     monkeypatch.setattr(config, "get_claudexor_harness_install_timeout_sec", lambda: 1)
     monkeypatch.setattr(witness, "_cli_json", lambda *_args, **_kwargs: _receipt(image))
     monkeypatch.setattr(witness, "_run", uncontained)

@@ -234,7 +234,6 @@ def test_directory_link_metadata_is_retained_whole_beside_the_paid_result(
     tmp_path, writable_engine, monkeypatch,  # noqa: F811
 ):
     root, drive = _subject(tmp_path, "task_acceptance", links=True), tmp_path / "drive"
-    monkeypatch.setattr(rc, "EVIDENCE_RETAIN_BYTES", 128)  # investigations' bound; never a reviewer's
     observed = {}
 
     def edit(area):

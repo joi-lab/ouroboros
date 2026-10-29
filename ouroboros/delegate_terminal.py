@@ -60,11 +60,26 @@ def terminal_reconcile_task(
         )
     except Exception:
         log.warning("Terminal delegated custody reconciliation failed for %s", mine, exc_info=True)
+    try:
+        _name_unread_results(drive_root, mine)
+    except Exception:
+        log.warning("Never-read disclosure failed for %s", mine, exc_info=True)
     if audit:
         _audit_task_custody(drive_root, mine, result)
     else:
         result["audit_status"] = "pending"
     return result
+
+
+def _name_unread_results(drive_root: Any, task_id: str) -> None:
+    """The attempt ends with a settled result staged in full and never read: name it once (D7, #1573).
+    Since #2205 the body's collector, not this boundary, retains outputs; the omission is still this
+    boundary's fact, so the next context shows NEVER READ instead of an available result."""
+    from ouroboros.delegate_custody_current import task_snapshot
+
+    for run in task_snapshot(drive_root, task_id)["runs"].values():
+        if not run.review_owned:
+            custody.record_settled_unread(drive_root, run)
 
 
 def terminal_custody_disclosure(
@@ -222,9 +237,8 @@ def _answer_locators(drive_root: Any, row: Any) -> Dict[str, Any]:
     ``engine_locator`` is the engine's own run folder and primary-output metadata
     (never text; engine-owned and possibly reclaimed). ``staged_output`` is the
     retained full terminal payload: its exact ``task_source`` ref with the ACTUAL
-    staging task, completeness, the ``read_file`` address the existing lineage read
-    admits, and ``source_read``: the exact ``get_task_result`` call that reads it
-    from any drive, pinned to the PHYSICAL task publishing this receipt (the run's
+    staging task and completeness. ``read`` keeps the staging-file path;
+    ``source_read`` reads from any drive, pinned to the PHYSICAL task publishing this receipt (the run's
     owner, which a retry successor's staging task need not be). ``terminal_observation``
     is the engine read-back the body retained (#1564), with the same pinned reader:
     complete as an observation, never proof that the whole output was collected. A row
@@ -378,7 +392,9 @@ def _stored_evidence_stale(existing: Mapping[str, Any], live: Mapping[str, Any])
         for key in _EVIDENCE_COUNTER_KEYS:
             if _as_int(stored_ev.get(key)) != _as_int(live.get(key)):
                 return True
-        if stored_ev.get("subscription_cost_usd") != live.get("subscription_cost_usd"):
+        if (stored_ev.get("subscription_cost_usd") != live.get("subscription_cost_usd")
+                or any(bool(stored_ev.get(key)) != bool(live.get(key)) for key in
+                       ("subscription_cost_estimated", "subscription_cost_partial"))):
             return True
     try:
         from ouroboros.subagents import actual_substrate
@@ -447,7 +463,9 @@ def refresh_terminal_reconciliation(
     rows (``sweep_refresh`` | ``boot_backfill`` | ``kill_path_clear`` | ``output_spilled``);
     ``snapshot`` shares one ``custody_audit_snapshot`` across a batch. An audit
     that MATCHES the stored disclosure (and finds no stale evidence mirror)
-    performs no write and no emit — a permanently-unreconcilable row must not
+    performs no write and no emit unless a separate cost_revision owes a
+    monetary projection. That debt uses the existing cost writer; merely adding
+    the optional coverage field emits nothing. A permanently-unreconcilable row must not
     grow events.jsonl on every boot. Returns True only when a row was really
     refreshed: the audit evidence is emitted AFTER — and only after — the
     recorder confirms a changed persisted row, so a lock timeout or a refused
@@ -455,6 +473,7 @@ def refresh_terminal_reconciliation(
     mine = str(task_id or "")
     if not mine:
         return False
+    _refresh_custody_cost(drive_root, mine)
     try:
         from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
 
@@ -686,10 +705,17 @@ def refresh_recently_settled_terminals(drive_root: Any, live_task_ids: Any = Non
     None means unknown and heals whatever holds a receipt.
     """
     from ouroboros import store
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES
 
     try:
         with store.open_store(drive_root, write=False) as txn:
-            owed = sorted(tid for tid, facts in txn.set_rows("delegated_runs").items() if facts.get("closed_runs"))
+            # Missing/nonterminal owners keep debt without body reads or refresh
+            # attempts each sweep. Their terminal write makes it eligible here.
+            slots = ",".join("?" for _ in _TRULY_TERMINAL_STATUSES)
+            owed = [row["id"] for row in txn.conn.execute(
+                "SELECT o.id FROM obligations o JOIN tasks t ON t.task_id=o.id "
+                f"WHERE o.set_name='delegated_runs' AND t.status IN ({slots}) ORDER BY o.id",
+                tuple(_TRULY_TERMINAL_STATUSES))]
     except store.StoreError:
         log.debug("Settled-terminal refresh skipped: custody receipts unavailable", exc_info=True)
         return 0
@@ -877,8 +903,39 @@ def _ack_current_receipts(root, tid, snapshot):
             return
         held = {rid: raw for rid, raw in facts.get("closed_runs", {}).items()
                 if rid not in state or vars(_decode(raw)) != vars(state[rid])}
-        if not held and not row.get("delegated_runs_unreconciled"):
+        if not held and not row.get("delegated_runs_unreconciled") and not facts.get("cost_revision"):
             txn.delete_row("delegated_runs", tid)
-        else:
+        elif {**facts, "closed_runs": held} != facts:  # an unchanged retained debt writes nothing
             txn.put_row("delegated_runs", tid, {**facts, "closed_runs": held})
         # The result itself is never rewritten here.
+
+
+def _refresh_custody_cost(root, tid):
+    """Pay only the observed revision, through the existing monetary projector.
+
+    Failed writes, missing/live results and a concurrent custody change retain
+    the same obligation for the next ordinary terminal sweep. No ledger write.
+    """
+    from ouroboros import store
+    from supervisor.events_task_done import _refresh_terminal_task_cost
+    from supervisor.queue import task_has_live_ownership
+    from supervisor.task_ownership import TaskOwnershipRead
+
+    try:
+        with store.open_store(root, write=False) as txn:
+            debt = txn.get_row("delegated_runs", tid) or {}
+        revision = debt.get("cost_revision")
+        if not revision or task_has_live_ownership(tid, ownership=TaskOwnershipRead(root)):
+            return
+        if not _refresh_terminal_task_cost(root, tid):
+            return
+        with store.open_store(root, write=True) as txn:
+            latest = txn.get_row("delegated_runs", tid) or {}
+            if latest.get("cost_revision") == revision:
+                latest.pop("cost_revision")
+                if latest.get("closed_runs"):
+                    txn.put_row("delegated_runs", tid, latest)
+                else:
+                    txn.delete_row("delegated_runs", tid)
+    except Exception:
+        log.warning("Custody cost refresh remains owed for %s", tid, exc_info=True)

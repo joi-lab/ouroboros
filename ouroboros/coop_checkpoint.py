@@ -24,8 +24,9 @@ def _run_git(cmd: Sequence[str], cwd: pathlib.Path) -> "subprocess.CompletedProc
     """Bounded git call returning the full CompletedProcess (checkpoint-commit path).
     A timeout/spawn failure returns a synthetic rc=124 result — callers treat any
     non-zero rc as a fail-soft skip, so this never raises."""
+    from ouroboros.git_observation import host_git_env
     try:
-        return subprocess.run(list(cmd), cwd=str(cwd), capture_output=True, text=True, timeout=60)
+        return subprocess.run(list(cmd), cwd=str(cwd), capture_output=True, text=True, timeout=60, env=host_git_env())
     except Exception as exc:  # noqa: BLE001 — includes TimeoutExpired
         return subprocess.CompletedProcess(list(cmd), 124, stdout="", stderr=f"{type(exc).__name__}: {exc}")
 

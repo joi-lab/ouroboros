@@ -76,9 +76,8 @@ def seat_environment_facts(area: str, source: Any, data_root: Any, service: Any 
             body = body_fact(source.get("root"), system_repo=resolve_repo_dir(), data_dir=data_root).body == BODY_TRUE
         except Exception:  # an unrecognized subject is foreign: a named recipe gap, never a guess
             body = False
-    outside = f"in {service.scratch}, the scratch your engine grants this run" if service.scratch else "outside this copy"
-    where = (f"where this copy's .gitignore ignores it (an ignored folder is listed, not retained) or {outside}"
-             if kind == "git_tree" else outside)
+    where = (f"in {service.scratch}, the scratch your engine grants this run, never inside this copy"
+             if service.scratch else "outside this copy")
     return session_environment_facts(area, data_root=data_root, body=body, service=service,
                                      environment_note=f"{where}, since its changes are retained as evidence")
 
